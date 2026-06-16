@@ -59,6 +59,25 @@ fn main() {
 
     // Bypass checks (3-layer per §7).
     if should_bypass() {
+        // #2158: audit a SUB-AGENT's own `AGEND_GIT_BYPASS=1 git <mutating>` op —
+        // the stray-worktree / drift vector the daemon-side bypass audit
+        // (git_helpers.rs, #2242 PR2(iii)) cannot see. The shim is a SEPARATE
+        // binary on the AGENT PATH; the daemon PATH is shim-free, so the two audits
+        // cover DISJOINT callers (no double-log). Top-level ops only
+        // (`shim_depth()==0` skips git re-invoked by a hook); commit/add excluded
+        // (Option B — agents bypass-commit into their OWN worktree constantly, so
+        // logging those floods fleet_events for ~zero forensic value). Best-effort,
+        // never blocks: the `exec_real_git` below is unchanged.
+        if shim_depth() == 0 {
+            let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
+            if bypass_op_is_audited(subcommand, &args) {
+                let home = env::var("AGEND_HOME").unwrap_or_default();
+                if !home.is_empty() {
+                    let agent = env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+                    log_bypass_mutating_op(&home, &agent, &args);
+                }
+            }
+        }
         exec_real_git(&args, None);
     }
 
@@ -700,6 +719,36 @@ fn branch_tag_names_ref(subcmd: &str, args: &[String]) -> bool {
     })
 }
 
+/// #2158: which `AGEND_GIT_BYPASS=1 git <subcmd>` ops are worth auditing — Option B
+/// (lead-chosen), the stray-worktree / drift / stray-tree-push vector. EXCLUDES
+/// `commit`/`add`: agents bypass-commit into their OWN worktree constantly, so
+/// logging those would flood fleet_events for ~zero forensic value (a bypass commit
+/// lands in the agent's own tree, not a stray one). Read-only ops never match.
+/// `branch` is audited only in its ref-MUTATING form (create/delete/move — reuse
+/// `branch_tag_names_ref`), not the bare list; `tag` is excluded (not a worktree
+/// vector). Pure → unit-testable.
+fn bypass_op_is_audited(subcmd: &str, args: &[String]) -> bool {
+    matches!(
+        subcmd,
+        "worktree" | "checkout" | "switch" | "reset" | "clean" | "push"
+    ) || (subcmd == "branch" && branch_tag_names_ref(subcmd, args))
+}
+
+/// #2158: which bypass layer authorized this op — forensics that distinguishes a
+/// blanket env grant from a scoped/time-boxed one. Mirrors `should_bypass`'s
+/// precedence order; `"unknown"` only if the env changed between the two checks.
+fn active_bypass_layer() -> &'static str {
+    if env::var("AGEND_GIT_BYPASS").is_ok() {
+        "env"
+    } else if env::var("AGEND_GIT_BYPASS_AGENT").is_ok() {
+        "agent"
+    } else if env::var("AGEND_GIT_BYPASS_UNTIL").is_ok() {
+        "until"
+    } else {
+        "unknown"
+    }
+}
+
 /// #1463 (A) + #2027: convert a bound-agent `ChdirPass` into `Passthrough` when
 /// cwd is a foreign repo AND the command is a local mutating one (#1463) or a
 /// ref-naming `branch`/`tag` (#2027). Pure so the matrix is unit-testable;
@@ -1294,6 +1343,69 @@ fn log_nonagent_canonical_checkout(home: &str, agent: &str, args: &[String]) {
     }
     eprintln!(
         "[agend-git #2234] non-agent canonical-cwd {subcmd} passthrough (HEAD-touching): target={target_branch} ppid={ppid} cwd={cwd} ancestry={ancestry:?}"
+    );
+}
+
+/// #2158: build the bypass-mutating-op audit record. Pure — the caller supplies the
+/// process context — so the json SHAPE is unit-testable without touching the live
+/// process. Mirrors `log_nonagent_canonical_checkout`'s record + adds `bypass_layer`.
+fn build_bypass_audit_event(
+    agent: &str,
+    subcmd: &str,
+    args: &[String],
+    cwd: &str,
+    ppid: i32,
+    ancestry: &[String],
+    bypass_layer: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "git_event",
+        "event": "bypass_mutating_op",
+        "agent": agent,
+        "subcommand": subcmd,
+        "argv": args,
+        "cwd": cwd,
+        "ppid": ppid,
+        "process_ancestry": ancestry,
+        "bypass_layer": bypass_layer,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// #2158: audit a SUB-AGENT's own `AGEND_GIT_BYPASS=1 git <mutating>` op — the
+/// stray-worktree vector the daemon-side bypass audit (git_helpers.rs, #2242
+/// PR2(iii)) cannot see (it audits only the daemon's OWN bypass; the shim is the
+/// disjoint agent-side surface). Best-effort append to fleet_events.jsonl (the
+/// operator forensics surface, same sink as the #2235 checkout log) + a greppable
+/// stderr line; NEVER blocks — the caller `exec`s real git immediately after. The
+/// caller gates this to audited ops (Option B) at `shim_depth()==0`.
+fn log_bypass_mutating_op(home: &str, agent: &str, args: &[String]) {
+    let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ppid = parent_pid();
+    let ancestry = process_ancestry(8);
+    let event = build_bypass_audit_event(
+        agent,
+        subcmd,
+        args,
+        &cwd,
+        ppid,
+        &ancestry,
+        active_bypass_layer(),
+    );
+    let events_path = PathBuf::from(home).join("fleet_events.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{event}");
+    }
+    eprintln!(
+        "[agend-git #2158] AGEND_GIT_BYPASS mutating {subcmd} (stray-worktree vector): ppid={ppid} cwd={cwd} ancestry={ancestry:?}"
     );
 }
 
@@ -3860,5 +3972,64 @@ mod tests {
             msg.contains("/home/ws/ag") && msg.contains("/home/wt"),
             "must name both the cwd clone and the worktree: {msg}"
         );
+    }
+
+    // ── #2158: shim-side bypass mutating-op audit ──────────────────────────
+    /// Option B gate: the stray-worktree / drift / stray-tree-push vector IS
+    /// audited; read-only ops and the high-frequency `commit`/`add` (agent
+    /// self-worktree, ~zero forensic value) are NOT.
+    #[test]
+    fn bypass_op_is_audited_option_b_gate_2158() {
+        let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Audited: worktree-lifecycle + drift + destructive + stray-tree push.
+        for op in ["worktree", "checkout", "switch", "reset", "clean", "push"] {
+            assert!(
+                bypass_op_is_audited(op, &a(&[op])),
+                "bypass `{op}` must be audited (Option B vector)"
+            );
+        }
+        // `branch` audited ONLY in its ref-mutating form, not the bare list.
+        assert!(
+            bypass_op_is_audited("branch", &a(&["branch", "-D", "feat/x"])),
+            "bypass `branch -D` (ref delete) must be audited"
+        );
+        assert!(
+            !bypass_op_is_audited("branch", &a(&["branch"])),
+            "bare `branch` (list, read) must NOT be audited"
+        );
+        // NOT audited: high-frequency self-worktree mutators (Option B exclusion).
+        for op in ["commit", "add"] {
+            assert!(
+                !bypass_op_is_audited(op, &a(&[op])),
+                "bypass `{op}` must NOT be audited (Option B: floods, ~0 value)"
+            );
+        }
+        // NOT audited: read-only ops.
+        for op in ["status", "log", "diff", "rev-parse", "show", "tag"] {
+            assert!(
+                !bypass_op_is_audited(op, &a(&[op])),
+                "bypass read-only `{op}` must NOT be audited"
+            );
+        }
+    }
+
+    /// The audit record carries the forensic fields (event type, subcommand, argv,
+    /// process ancestry, bypass layer) so a stray-worktree culprit is traceable.
+    #[test]
+    fn build_bypass_audit_event_shape_2158() {
+        let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let argv = a(&["worktree", "add", "/tmp/stray", "origin/main"]);
+        let ancestry = vec!["100 1 git".to_string(), "1 0 launchd".to_string()];
+        let ev =
+            build_bypass_audit_event("dev-2", "worktree", &argv, "/cwd/x", 4242, &ancestry, "env");
+        assert_eq!(ev["event"], "bypass_mutating_op");
+        assert_eq!(ev["agent"], "dev-2");
+        assert_eq!(ev["subcommand"], "worktree");
+        assert_eq!(ev["ppid"], 4242);
+        assert_eq!(ev["cwd"], "/cwd/x");
+        assert_eq!(ev["bypass_layer"], "env");
+        assert_eq!(ev["argv"][2], "/tmp/stray");
+        assert_eq!(ev["process_ancestry"][0], "100 1 git");
+        assert!(ev["timestamp"].is_string(), "must carry a timestamp");
     }
 }
