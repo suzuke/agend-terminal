@@ -893,6 +893,71 @@ pub fn detach_workspace_to_holding(workspace: &Path) -> Result<(), String> {
         .map_err(|e| format!("rollback detach failed: {e}"))
 }
 
+/// #2234 cure-(B) ROLLBACK primitive (flag-independent — callable in ANY flag
+/// state). Revert an agent whose `/workspace/<agent>` was converted to a (B)
+/// worktree back to a standalone, so OFF legacy dispatch works correctly again
+/// (it leases a SEPARATE `worktrees/<agent>/<branch>`; if `/workspace` stayed a
+/// gitlink worktree, OFF would re-introduce the #2234 cwd↔binding split AND a
+/// same-branch lease would hit git's "already checked out at /workspace").
+///
+/// **Work-safety**:
+/// - COMMITTED work is preserved BY CONSTRUCTION — `/workspace` is a worktree of
+///   the canonical repo, so its commits live in canonical's object store and the
+///   branch ref (`refs/heads/<X>`) lives in canonical. `git worktree remove
+///   --force` removes ONLY the working dir + admin, never the branch ref/commits;
+///   the agent's next OFF lease of branch `<X>` checks them back out. (Empirically
+///   verified.) We deliberately do NOT restore from `reconcile-backups` — that is
+///   the FORWARD (standalone→worktree) snapshot and does not contain
+///   post-conversion commits, so using it would LOSE that work.
+/// - UNCOMMITTED/untracked work is the only at-risk class → Phase-0
+///   `worktree_has_work_at_risk` + whole-dir backup, fail-closed (a backup error
+///   ABORTS the revert and leaves `/workspace` untouched).
+///
+/// No-op (`Ok`) when `/workspace` is NOT a (B) worktree (already standalone /
+/// absent / plain dir). Restores a clean git-init standalone, matching pre-(B).
+/// Edge: a deleted (never re-leased) agent leaves its branch + commits in
+/// canonical (branch_sweep keeps unpushed branches) — recoverable, not lost.
+pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
+    let ws = crate::paths::workspace_dir(home).join(agent);
+    // Only a real (B) worktree has a `.git` gitlink FILE. Standalone (dir) / plain
+    // dir / absent are already OFF-compatible → nothing to revert.
+    if !ws.join(".git").is_file() {
+        return Ok(());
+    }
+    // Save uncommitted/untracked work BEFORE any destructive step (committed work
+    // is already safe in canonical). Fail-closed: backup error → abort, untouched.
+    if worktree_has_work_at_risk(&ws) {
+        backup_worktree_dir(home, agent, None, &ws).map_err(|e| {
+            format!(
+                "reverse_reconcile aborted (fail-closed): backup of {} failed: {e} — workspace left untouched",
+                ws.display()
+            )
+        })?;
+    }
+    // Remove the (B) worktree via the SAME primitive dev-2's Phase 2 / Phase-0
+    // teardown use (git worktree remove --force from the owning repo; branch ref +
+    // commits remain in canonical).
+    let source_repo = resolve_owning_repo(home, agent, &ws);
+    match remove_worktree(agent, &ws, &source_repo) {
+        WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => {}
+        WorktreeRemoval::Unmanaged(m) => {
+            return Err(format!("reverse_reconcile: {m}"));
+        }
+        WorktreeRemoval::Failed(e) => {
+            return Err(format!("reverse_reconcile: worktree remove failed: {e}"));
+        }
+    }
+    // Clear the (B) binding so the next dispatch leases fresh (legacy path).
+    crate::binding::unbind(home, agent);
+    // Restore `/workspace/<agent>` as a clean standalone (git-init), matching the
+    // pre-(B) state. `git worktree remove` deleted the dir, so recreate it; the
+    // next spawn's `ensure_project_root` would also do this, but doing it here
+    // makes the revert self-contained + testable.
+    let _ = std::fs::create_dir_all(&ws);
+    crate::instructions::ensure_project_root(&ws);
+    Ok(())
+}
+
 fn clear_binding_state(home: &Path, agent: &str) {
     crate::binding::unbind(home, agent);
     crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
@@ -2511,6 +2576,176 @@ mod tests {
             !workspace_as_worktree_enabled("z"),
             "guard drop restores the env-default (off)"
         );
+    }
+
+    // ── #2234 rollback primitive: reverse_reconcile ─────────────────────────
+
+    /// Helper: convert /workspace into a (B) worktree on `branch` with one
+    /// committed-but-unpushed commit (simulates post-conversion in-place work).
+    fn converted_workspace_with_commit(
+        home: &Path,
+        repo: &Path,
+        agent: &str,
+        branch: &str,
+    ) -> PathBuf {
+        let ws = crate::paths::workspace_dir(home).join(agent);
+        reconcile_workspace_to_worktree(home, agent, &ws, repo, None).expect("reconcile");
+        // Create the branch in canonical, check it out in the workspace worktree,
+        // commit there (commit lands in canonical's object store + refs/heads).
+        std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git branch");
+        checkout_workspace_branch(&ws, branch).expect("checkout");
+        std::fs::write(ws.join("work.rs"), "fn main() {}").unwrap();
+        for args in [
+            vec!["add", "work.rs"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "unpushed C1",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&ws)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git commit");
+        }
+        ws
+    }
+
+    fn rev_parse(dir: &Path, rev: &str) -> Option<String> {
+        crate::git_helpers::git_cmd(dir, &["rev-parse", rev]).ok()
+    }
+
+    /// #2234 (毀-work core): a committed-but-unpushed commit on the converted
+    /// workspace's branch is preserved BY CONSTRUCTION across reverse_reconcile —
+    /// it lives in canonical, and a subsequent OFF lease of the branch recovers it.
+    #[test]
+    fn reverse_reconcile_preserves_committed_work_via_canonical() {
+        let home = tmp_home("rr-commit");
+        let repo = tmp_repo("rr-commit-repo");
+        let ws = converted_workspace_with_commit(&home, &repo, "deva", "feat/rr");
+        let c1 = rev_parse(&ws, "HEAD").expect("ws HEAD");
+
+        reverse_reconcile(&home, "deva").expect("reverse_reconcile");
+
+        // Workspace is no longer a (B) worktree (restored to a standalone).
+        assert!(
+            !ws.join(".git").is_file(),
+            "workspace reverted from gitlink worktree to standalone"
+        );
+        // The commit + branch ref SURVIVE in canonical (not lost).
+        assert_eq!(
+            rev_parse(&repo, "feat/rr").as_deref(),
+            Some(c1.as_str()),
+            "committed work preserved in canonical (not via reconcile-backups)"
+        );
+        // An OFF-style lease of the branch recovers the commit's tree.
+        let l = lease(&home, &repo, "deva", "feat/rr").expect("re-lease recovers branch");
+        assert_eq!(
+            std::fs::read_to_string(l.path.join("work.rs")).unwrap(),
+            "fn main() {}",
+            "re-leased worktree has the recovered committed work"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Uncommitted/untracked work IS at risk → backed up before the revert.
+    #[test]
+    fn reverse_reconcile_backs_up_uncommitted_work() {
+        let home = tmp_home("rr-uncommitted");
+        let repo = tmp_repo("rr-uncommitted-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devb");
+        reconcile_workspace_to_worktree(&home, "devb", &ws, &repo, None).expect("reconcile");
+        std::fs::write(ws.join("WIP.txt"), "unsaved").unwrap();
+
+        reverse_reconcile(&home, "devb").expect("reverse_reconcile");
+
+        let backup = backup_dir_for(&home, "devb").expect("uncommitted work backed up");
+        assert_eq!(
+            std::fs::read_to_string(backup.join("WIP.txt")).unwrap(),
+            "unsaved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Fail-closed: if the uncommitted-work backup fails, the revert ABORTS and
+    /// leaves the (B) worktree untouched (never destroy work without a backup).
+    #[test]
+    fn reverse_reconcile_backup_fail_aborts() {
+        let home = tmp_home("rr-bkfail");
+        let repo = tmp_repo("rr-bkfail-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devc");
+        reconcile_workspace_to_worktree(&home, "devc", &ws, &repo, None).expect("reconcile");
+        std::fs::write(ws.join("WIP.txt"), "precious").unwrap();
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(home.join("reconcile-backups"), "blocker").unwrap();
+
+        let err = reverse_reconcile(&home, "devc").expect_err("must abort on backup failure");
+        assert!(err.contains("backup"), "names backup failure: {err}");
+        assert!(
+            ws.join(".git").is_file(),
+            "still a (B) worktree (untouched on abort)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("WIP.txt")).unwrap(),
+            "precious",
+            "work not destroyed on backup failure"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// "Can turn off" proof: after reverse_reconcile, the workspace worktree is
+    /// gone from canonical's registry (no "already checked out" block for a future
+    /// OFF lease) and the (B) binding is cleared. Also no-op on an unconverted dir.
+    #[test]
+    fn reverse_reconcile_clears_registration_and_is_noop_when_unconverted() {
+        let home = tmp_home("rr-offready");
+        let repo = tmp_repo("rr-offready-repo");
+        // No-op on an absent/unconverted workspace.
+        reverse_reconcile(&home, "devd").expect("no-op on unconverted");
+
+        let ws = converted_workspace_with_commit(&home, &repo, "devd", "feat/off");
+        crate::binding::bind_full(&home, "devd", "T-1", "feat/off", &ws, &repo).ok();
+        let wt_listed = |repo: &Path| {
+            crate::git_helpers::git_cmd(repo, &["worktree", "list", "--porcelain"])
+                .unwrap_or_default()
+        };
+        assert!(
+            wt_listed(&repo).contains(&ws.display().to_string().replace('\\', "/"))
+                || wt_listed(&repo).contains(&ws.display().to_string())
+        );
+
+        reverse_reconcile(&home, "devd").expect("reverse_reconcile");
+
+        let after = wt_listed(&repo);
+        assert_eq!(
+            after.lines().filter(|l| l.starts_with("worktree ")).count(),
+            1,
+            "only canonical remains — workspace worktree deregistered (OFF lease won't conflict): {after}"
+        );
+        assert!(
+            !after.contains("prunable"),
+            "no orphan registration: {after}"
+        );
+        assert!(
+            crate::binding::read(&home, "devd").is_none(),
+            "(B) binding cleared"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     fn tmp_repo(tag: &str) -> PathBuf {
