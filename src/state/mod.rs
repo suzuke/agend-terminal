@@ -1039,6 +1039,45 @@ fn throttle_indicator_adjacent(flat: &str, matched: &str) -> bool {
     crate::state::patterns::line_has_error_indicator(&flat[win_start..end])
 }
 
+/// Chars around a UsageLimit match within which the banner's STRUCTURAL markers
+/// must sit for the [`flattened_guarded_detect`] prose-FP guard. The Claude
+/// weekly/session-limit banner renders inside a `⎿` box-draw block whose phrase is
+/// immediately followed by a `· resets <time>` reset stamp; after the hard-wrap
+/// flatten the box-draw lands a few tokens before the phrase and the reset stamp a
+/// few after, so 40 chars each side covers a short row prefix while staying tight.
+const USAGELIMIT_BANNER_PROXIMITY: usize = 40;
+
+/// #2090 P2: the `\n`-less line-scope replacement for UsageLimit (the analogue of
+/// SRL's [`throttle_indicator_adjacent`]). A real hard-wrapped usage-limit banner
+/// carries BOTH a `⎿` box-draw prefix BEFORE the phrase and a `resets` stamp AFTER
+/// it, within proximity. A prose verbatim quote of the phrase (an agent pasting
+/// "You've hit your weekly limit" into chat) has neither, so it is rejected — the
+/// residual FP (agent quotes the FULL banner incl. box-draw + reset stamp while
+/// itself idle) is vanishingly rare. Conservative by design: a banner variant
+/// without a `resets` stamp (e.g. the credit-balance form) is NOT rescued here —
+/// the raw non-wrapped path still catches it, and the #2090 shadow only observed
+/// the weekly/session `· resets` banners hard-wrapping.
+fn usagelimit_banner_adjacent(flat: &str, matched: &str) -> bool {
+    let Some(start) = flat.find(matched) else {
+        return false;
+    };
+    let end = start + matched.len();
+    // `⎿` box-draw block prefix within proximity BEFORE the phrase.
+    let raw_before = start.saturating_sub(USAGELIMIT_BANNER_PROXIMITY);
+    let before_start = (raw_before..=start)
+        .find(|&i| flat.is_char_boundary(i))
+        .unwrap_or(start);
+    let has_box = flat[before_start..start].contains('⎿');
+    // `resets` reset stamp within proximity AFTER the phrase.
+    let raw_after = (end + USAGELIMIT_BANNER_PROXIMITY).min(flat.len());
+    let after_end = (end..=raw_after)
+        .rev()
+        .find(|&i| flat.is_char_boundary(i))
+        .unwrap_or(end);
+    let has_reset = flat[end..after_end].contains("resets");
+    has_box && has_reset
+}
+
 /// #1562: best-effort append of one JSON record as a single `line\n` to `path`,
 /// creating parent dirs / the file as needed. Returns `Err` for the caller to
 /// log; never panics. The single small `write_all` relies on `O_APPEND`
@@ -1387,17 +1426,26 @@ impl StateTracker {
                 Some((detected, matched))
                     if !is_high_fp_state(detected)
                         && !matches!(detected, AgentState::UsageLimit)
-                        && screen_has_throttle_hint(screen_text)
-                        && self.try_hard_wrap_throttle(patterns, screen_text) =>
+                        // Each rescue has its OWN wrap-surviving cheap pre-filter:
+                        // THROTTLE_HINT_TOKENS are single words for SRL, but the
+                        // usage-limit hint must survive a hard-wrap — the multi-word
+                        // "hit your" splits across narrow-pane rows, so gate the
+                        // UsageLimit rescue on the single word `resets` (the reset
+                        // stamp the banner + `usagelimit_banner_adjacent` both carry).
+                        && ((screen_has_throttle_hint(screen_text)
+                            && self.try_hard_wrap_throttle(patterns, screen_text))
+                            || (screen_text.contains("resets")
+                                && self.try_hard_wrap_usagelimit(patterns, screen_text))) =>
                 {
-                    // #2089: `detect_with_match` landed a BENIGN state (Idle/Thinking
-                    // — the ❯ prompt / a spinner) because a long SRL error
-                    // word-wrapped across a narrow pane and the single-line regex
-                    // missed it. The cheap throttle-hint pre-filter gates the cost;
-                    // `try_hard_wrap_throttle` re-detected the throttle on the
-                    // flattened tail and transitioned to it (overriding the
-                    // idle-prompt chrome). Nothing more to do this arm. `matched` is
-                    // unused on this path.
+                    // #2089/#2090: `detect_with_match` landed a BENIGN state
+                    // (Idle/Thinking — the ❯ prompt / a spinner) because a long
+                    // SRL error OR usage-limit banner word-wrapped across a narrow
+                    // pane and the single-line regex missed it. The cheap
+                    // throttle/quota-hint pre-filter (THROTTLE_HINT_TOKENS covers
+                    // both) gates the cost; `try_hard_wrap_throttle` then (#2090 P2)
+                    // `try_hard_wrap_usagelimit` re-detected it on the flattened
+                    // tail under its own structural guard and transitioned
+                    // (overriding the idle-prompt chrome). `matched` is unused here.
                     let _ = matched;
                 }
                 Some((detected, matched)) => {
@@ -1784,9 +1832,44 @@ impl StateTracker {
         true
     }
 
+    /// #2090 P2: rescue a hard-wrapped UsageLimit banner that single-line
+    /// `detect_with_match` missed (narrow-pane word-wrap landed the bottom `❯`
+    /// idle prompt instead). Flatten-rematches with a {UsageLimit} accept-set and
+    /// the `usagelimit_banner_adjacent` structural guard (box-draw + reset stamp),
+    /// then transitions. UsageLimit is a hard quota (no recovered→Idle downgrade
+    /// like SRL); `gate_on_heartbeat` is a no-op for it. Returns `true` if rescued.
+    /// Sibling of [`try_hard_wrap_throttle`]; called from the SAME two arms.
+    fn try_hard_wrap_usagelimit(
+        &mut self,
+        patterns: &'static StatePatterns,
+        screen_text: &str,
+    ) -> bool {
+        let Some(state) = flattened_guarded_detect(
+            patterns,
+            screen_text,
+            self.input_line_markers,
+            HARD_WRAP_TAIL_LINES,
+            |s| matches!(s, AgentState::UsageLimit),
+            usagelimit_banner_adjacent,
+        ) else {
+            return false;
+        };
+        let gated = self.gate_on_heartbeat(state);
+        self.transition(gated);
+        true
+    }
+
     fn handle_no_raw_match(&mut self, patterns: &'static StatePatterns, screen_text: &str) {
-        if self.try_hard_wrap_throttle(patterns, screen_text) {
-            // hard-wrapped throttle rescued + transitioned.
+        // #2090: throttle rescue stays UNGATED here (THROTTLE_HINT_TOKENS omits the
+        // net-error tokens, so hint-gating would drop a hard-wrapped ECONNRESET);
+        // the UsageLimit rescue is gated on the wrap-surviving `resets` stamp (the
+        // multi-word quota tokens split across narrow-pane rows) to bound the
+        // flatten cost on no-match frames.
+        if self.try_hard_wrap_throttle(patterns, screen_text)
+            || (screen_text.contains("resets")
+                && self.try_hard_wrap_usagelimit(patterns, screen_text))
+        {
+            // hard-wrapped throttle / usage-limit rescued + transitioned.
         } else if matches!(self.current, AgentState::Starting)
             && is_generic_startup_prompt(screen_text)
         {

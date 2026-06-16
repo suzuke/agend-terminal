@@ -2269,26 +2269,29 @@ fn claude_server_throttle_fixture_triggers_server_rate_limit() {
     assert_eq!(t.get_state(), AgentState::ServerRateLimit);
 }
 
-/// #2090 P2 shadow — the instrument MUST NOT change classification (zero-behavior):
-/// a narrow-pane hard-wrapped UsageLimit that the raw grid misses stays
-/// mis-classified (the shadow only LOGS a candidate; it does not rescue).
+/// #2090 P2 shadow — the instrument MUST NOT change classification (zero-behavior)
+/// for a pattern that has NOT been promoted to a rescue. UsageLimit was promoted
+/// (see `usagelimit_hard_wrapped_banner_rescued_2090`), so this now pins the
+/// invariant on ContextFull, which stays shadow-only: a narrow-pane hard-wrapped
+/// `compacting context` that the raw grid misses is LOGGED as a candidate but NOT
+/// rescued, so the state stays Idle.
 #[test]
 fn hardwrap_miss_shadow_is_zero_behavior_2090() {
-    // "You've hit your weekly limit" hard-wrapped across narrow rows → the
-    // single-line UsageLimit regex misses it; the ❯ prompt lands Idle.
-    let screen = "⎿ You've hit\n\
-                  your weekly\n\
-                  limit · resets\n\
-                  4am\n\
+    // "compacting context" hard-wrapped across narrow rows → the single-line
+    // ContextFull regex misses it; the ❯ prompt lands Idle. The shadow logs a
+    // candidate but does not classify (no ContextFull rescue in P2).
+    let screen = "the agent is\n\
+                  compacting\n\
+                  context now\n\
                   \n\
                   ❯\n";
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
     t.feed(screen);
     assert_ne!(
         t.get_state(),
-        AgentState::UsageLimit,
-        "#2090 P2 shadow is instrument-only — it must NOT rescue/relatch (zero behavior); \
-         the raw grid still misses the hard-wrapped banner"
+        AgentState::ContextFull,
+        "#2090: ContextFull stays shadow-only (instrument-only) — the hard-wrapped \
+         phrase is logged as a candidate but NOT rescued/relatched (zero behavior)"
     );
 }
 
@@ -2456,6 +2459,117 @@ fn prose_throttle_mention_without_indicator_not_misclassified_2089() {
         t.get_state(),
         AgentState::RateLimit,
         "#2089 FP guard: prose mention must not latch RateLimit either"
+    );
+}
+
+// ── #2090 P2: UsageLimit hard-wrap rescue + ContextFull broad-arm tighten ──────
+
+/// #2090 P2: the UsageLimit banner structural guard requires BOTH the `⎿`
+/// box-draw prefix AND a `resets` stamp within proximity of the phrase — so a real
+/// (flattened) hard-wrapped banner passes while a prose quote (missing either)
+/// does not. Pins the both-required logic directly (the `\n`-less anchor analogue
+/// of SRL's `throttle_indicator_adjacent`).
+#[test]
+fn usagelimit_banner_guard_2090() {
+    let phrase = "You've hit your weekly limit";
+    // real flattened banner: box-draw before + reset stamp after → accept.
+    assert!(usagelimit_banner_adjacent(
+        "⎿ You've hit your weekly limit · resets 4am",
+        phrase
+    ));
+    // prose quote: neither marker → reject.
+    assert!(!usagelimit_banner_adjacent(
+        "the agent reported You've hit your weekly limit in its summary",
+        phrase
+    ));
+    // box-draw but no reset stamp → reject (both required).
+    assert!(!usagelimit_banner_adjacent(
+        "⎿ You've hit your weekly limit and then stopped working",
+        phrase
+    ));
+    // reset stamp but no box-draw → reject.
+    assert!(!usagelimit_banner_adjacent(
+        "note: You've hit your weekly limit, it resets soon enough",
+        phrase
+    ));
+}
+
+/// #2090 P2 (RED→GREEN, real §3.9 capture): the narrow-pane usage-limit banner
+/// from the live hardwrap_miss shadow — "You've hit your weekly limit · resets 4am"
+/// hard-wrapped across rows with the idle `❯` below, so single-line detect lands
+/// Idle. The flatten+guard rescue must recover UsageLimit. Pre-fix (no rescue) the
+/// agent read Idle while actually quota-blocked.
+#[test]
+fn usagelimit_hard_wrapped_banner_rescued_2090() {
+    let raw =
+        std::fs::read_to_string("tests/fixtures/state-replay/claude-usagelimit-narrow-wrap.raw")
+            .expect("real usage-limit narrow-wrap fixture");
+    let screen = strip_ansi_2089(&raw);
+    let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+    // precondition: the hard-wrapped banner is invisible to single-line detect.
+    assert_ne!(
+        patterns.detect(&screen),
+        Some(AgentState::UsageLimit),
+        "#2090 precondition: hard-wrapped banner must miss the single-line regex"
+    );
+    // the rescue (feed's benign arm) recovers UsageLimit.
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(&screen);
+    assert_eq!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#2090 P2: hard-wrapped usage-limit banner must be rescued to UsageLimit"
+    );
+}
+
+/// #2090 P2 FP guard (e2e): a WRAPPED prose quote of the banner phrase — no `⎿`
+/// box-draw, no `resets` stamp — must NOT be rescued. The flatten finds the phrase
+/// but the structural guard rejects it, so the agent stays Idle (not UsageLimit).
+#[test]
+fn usagelimit_wrapped_prose_quote_not_rescued_2090() {
+    // The quote is itself hard-wrapped (so the raw single-line path misses it and
+    // the flatten path is the one under test), but carries neither banner marker.
+    let screen = "⏺ I think the\n\
+                  \"You've hit your\n\
+                  weekly limit\"\n\
+                  message wraps in\n\
+                  a narrow pane.\n\
+                  \n\
+                  ❯\n";
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(screen);
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "#2090 P2 FP guard: a wrapped prose quote (no box-draw/reset stamp) must not latch UsageLimit"
+    );
+}
+
+/// #2090 P2: the ContextFull broad arm is char-bounded (`context.{0,16}(full|limit)`,
+/// was `context.*(full|limit)`). Real same-context wording still matches; the
+/// cross-sentence "context … limit" prose (the dominant ~97% shadow FP) no longer
+/// does. RED on the old unbounded `.*`.
+#[test]
+fn contextfull_broad_arm_bounded_2090() {
+    let p = StatePatterns::for_backend(&Backend::ClaudeCode);
+    // real wording within the bound still classifies ContextFull.
+    assert_eq!(
+        p.detect("context window full"),
+        Some(AgentState::ContextFull),
+        "#2090: real 'context window full' must still match the bounded arm"
+    );
+    assert_eq!(
+        p.detect("compacting context"),
+        Some(AgentState::ContextFull),
+        "#2090: the concrete 'compacting context' arm is kept verbatim"
+    );
+    // cross-sentence prose (a real shadow FP shape) no longer matches ContextFull.
+    let prose =
+        "context 95%, harness will auto-summarize; fixup-dev is transient rate_limit not usage_limit";
+    assert_ne!(
+        p.detect(prose),
+        Some(AgentState::ContextFull),
+        "#2090: bounded arm must not match cross-sentence 'context … limit' prose"
     );
 }
 
