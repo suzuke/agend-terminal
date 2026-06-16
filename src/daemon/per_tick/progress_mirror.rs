@@ -9,10 +9,16 @@
 //! It is bounded by four invariants the dual-review must hold:
 //! 1. **Default OFF** — only runs when the operator opts into `progress_mode = 1`.
 //! 2. **Active-turn gate, origin channel ONLY** — an agent is mirrored only while
-//!    it has an external-channel turn armed (`reply_to_channel`), and the relay
-//!    goes to THAT channel by name — never a broadcast. An idle agent (no origin
-//!    channel) is skipped AND its tail position is evicted, so nothing leaks
-//!    across turns.
+//!    it has an UNANSWERED external-channel turn in flight: `pending_user_turn`
+//!    present with `reply_outcome == Pending` (the same real active-turn signal
+//!    the progress-backstop uses — NOT the sticky "last channel seen"
+//!    `reply_to_channel`, which never clears in headless mode). The instant the
+//!    reply lands the turn settles (`pending_user_turn` → None) and mirroring
+//!    stops; an internal / peer / `[AGEND-AUTO]` / `[AGEND-RESUME]` / idle turn
+//!    has no pending external turn, so it is NEVER mirrored. The relay goes to
+//!    the origin channel by name — never a broadcast. On any non-active tick the
+//!    tail position is evicted, so nothing leaks across turns. Mirror relays real
+//!    content, so this gate is strictly tighter than the nudge-only backstop.
 //! 3. **No backlog replay** — first sight seeds the tail at EOF (see
 //!    `transcript_tail`); only text produced during the live turn is relayed.
 //! 4. **Truncated** — a single relay is capped at [`MAX_MIRROR_LEN`].
@@ -23,6 +29,7 @@
 use super::{PerTickHandler, TickContext};
 use crate::daemon::cadence_gate::CadenceGate;
 use crate::daemon::transcript_tail::{self, TailPos};
+use crate::reply_ledger::ReplyOutcome;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
@@ -33,8 +40,8 @@ const MAX_MIRROR_LEN: usize = 3500;
 pub(crate) struct ProgressMirrorHandler {
     gate: CadenceGate,
     /// Per-agent tail position (keyed by agent name). Bounded two ways: evicted
-    /// the moment an agent's active external turn ends (`reply_to_channel` None),
-    /// and latch-pruned each run against the live config set.
+    /// on any tick where the F1 active-turn gate fails (turn settled / not a
+    /// pending external turn), and latch-pruned each run against the live config set.
     state: Mutex<HashMap<String, TailPos>>,
 }
 
@@ -96,11 +103,26 @@ impl ProgressMirrorHandler {
         working_dir: &std::path::Path,
         state: &mut HashMap<String, TailPos>,
     ) {
-        // Active-turn gate: mirror ONLY while an external-channel turn is armed.
-        // No origin channel → not an external turn → evict any tail position so
-        // the next turn re-seeds (no cross-turn leakage) and skip.
-        let Some(channel) = crate::daemon::heartbeat_pair::snapshot_for(name).reply_to_channel
-        else {
+        let snap = crate::daemon::heartbeat_pair::snapshot_for(name);
+        // F1 active-turn gate: mirror ONLY while an UNANSWERED external turn is in
+        // flight — `pending_user_turn` present + `reply_outcome == Pending` (the
+        // real active-turn signal, NOT the sticky `reply_to_channel`). Settled /
+        // internal / peer / AUTO / RESUME / idle turns are not pending external
+        // turns → no relay. Also honour an explicit per-turn opt-out. On any
+        // non-active tick, evict the tail position so the next active turn
+        // re-seeds (no cross-turn leakage).
+        let outcome_pending = snap
+            .pending_user_turn
+            .as_ref()
+            .map(|t| t.reply_outcome == ReplyOutcome::Pending)
+            .unwrap_or(false);
+        if !should_mirror(outcome_pending, snap.mirror_skip_until_next_turn) {
+            state.remove(name);
+            return;
+        }
+        // Destination: the origin channel by name (set alongside the pending turn
+        // at arming). Never a broadcast. Absent → nothing to send to → evict+skip.
+        let Some(channel) = snap.reply_to_channel else {
             state.remove(name);
             return;
         };
@@ -129,6 +151,16 @@ impl ProgressMirrorHandler {
             let _ = ch.send_from_agent(name, crate::channel::AgentOutboundOp::Reply { text });
         }
     }
+}
+
+/// F1 active-turn gate (pure, so the leak-relevant decision is unit-testable):
+/// relay ONLY when an external turn's reply is still `Pending` (`outcome_pending`)
+/// AND the turn hasn't opted out of mirroring. A settled turn, a non-channel turn
+/// (no `pending_user_turn` → `outcome_pending` false), or an explicit skip → no
+/// relay. This is what makes "idle / internal / peer / AUTO turn = zero send"
+/// hold: those never carry a pending external turn.
+fn should_mirror(outcome_pending: bool, skip_until_next_turn: bool) -> bool {
+    outcome_pending && !skip_until_next_turn
 }
 
 /// Truncate `s` to at most `max` bytes on a char boundary, appending " …" when
@@ -170,12 +202,36 @@ mod tests {
         assert_eq!(&out, &format!("{} …", "a".repeat(MAX_MIRROR_LEN - 1)));
     }
 
-    /// Active-turn eviction: an agent whose turn has ended (modelled here by a
-    /// direct state probe) must not retain a tail position — the per-turn evict
-    /// in `mirror_agent` removes it so the next turn re-seeds (no cross-turn
-    /// leak). This pins the eviction contract on the state map directly.
+    /// F1 (the leak fix): the active-turn gate relays ONLY for an unanswered
+    /// external turn. A pending external turn mirrors; everything else — a settled
+    /// turn, and crucially a NON-channel/internal/peer turn (no pending external
+    /// turn → `outcome_pending` false) — does NOT. This is the invariant that
+    /// closes the cross-turn exfil leak: `reply_to_channel` being sticky no longer
+    /// matters because the gate keys off the converging `pending_user_turn`.
     #[test]
-    fn turn_end_evicts_tail_state() {
+    fn gate_relays_only_unanswered_external_turn() {
+        // Unanswered external turn → relay.
+        assert!(
+            should_mirror(true, false),
+            "pending external turn must mirror"
+        );
+        // Reply landed / turn settled (pending_user_turn → None → not pending)
+        // OR an internal/peer/AUTO/RESUME/idle turn (no pending external turn).
+        assert!(
+            !should_mirror(false, false),
+            "settled / non-channel turn must NOT mirror — closes the cross-turn leak"
+        );
+        // Explicit per-turn opt-out is honoured even while pending.
+        assert!(
+            !should_mirror(true, true),
+            "mirror_skip_until_next_turn must suppress the relay"
+        );
+    }
+
+    /// On a non-active tick `mirror_agent` evicts the tail position so the next
+    /// active turn re-seeds (no cross-turn carry-over of the read offset).
+    #[test]
+    fn non_active_tick_evicts_tail_state() {
         let mut state: HashMap<String, TailPos> = HashMap::new();
         state.insert(
             "dev".to_string(),
@@ -184,11 +240,11 @@ mod tests {
                 offset: 10,
             },
         );
-        // Simulate the no-origin-channel branch of mirror_agent.
+        // Models the `!should_mirror(..)` branch of mirror_agent.
         state.remove("dev");
         assert!(
             !state.contains_key("dev"),
-            "ended turn must evict tail state"
+            "a non-active tick must evict tail state"
         );
     }
 }

@@ -50,7 +50,13 @@ pub(crate) fn extract_new_assistant_text_in(
         None => true,
     };
     if is_new_session {
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // F2: seed at the CURRENT file length. A metadata Err must NOT fall back
+        // to offset 0 — that would replay the ENTIRE file (the whole backlog) on
+        // the next tick. On transient failure, leave `*pos` unchanged (None / the
+        // prior session) so the seed is retried next tick; never seed 0.
+        let Some(len) = current_eof(&path) else {
+            return Vec::new();
+        };
         *pos = Some(TailPos { path, offset: len });
         return Vec::new();
     }
@@ -102,6 +108,13 @@ pub(crate) fn extract_new_assistant_text(
     pos: &mut Option<TailPos>,
 ) -> Vec<String> {
     extract_new_assistant_text_in(working_dir, &default_projects_root(), pos)
+}
+
+/// Current EOF (byte length) of `path`, or `None` on any metadata error. F2:
+/// callers must treat `None` as "retry the seed next tick", NEVER as offset 0 —
+/// a 0 seed would replay the entire file on the next tick.
+fn current_eof(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).map(|m| m.len()).ok()
 }
 
 /// Parse one jsonl line; if it is a top-level `type == "assistant"` record,
@@ -228,6 +241,47 @@ mod tests {
         assert!(
             extract_new_assistant_text_in(&base.join("wt"), &base.join("projects"), &mut pos)
                 .is_empty()
+        );
+    }
+
+    /// F2: a metadata failure must yield `None` (→ "retry the seed next tick"),
+    /// NEVER offset 0 (which would replay the whole file). `current_eof` of a
+    /// nonexistent path is `None`; of a real file it is the byte length.
+    #[test]
+    fn current_eof_none_on_missing_never_zero() {
+        let base = std::env::temp_dir().join(format!("agend-2090-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let missing = base.join("nope.jsonl");
+        assert_eq!(
+            current_eof(&missing),
+            None,
+            "missing path must be None, not 0"
+        );
+        std::fs::create_dir_all(&base).unwrap();
+        let f = base.join("f.jsonl");
+        std::fs::write(&f, b"abcde").unwrap();
+        assert_eq!(current_eof(&f), Some(5));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// F2 end-to-end: a first-sight seed whose `current_eof` is unavailable must
+    /// leave `pos` unset (None) so the NEXT tick re-seeds — it must never seed 0
+    /// and replay backlog. Modelled by a project dir whose `.jsonl` vanishes
+    /// between the dir-listing and the metadata read is hard to force
+    /// deterministically; the `current_eof`-None contract above + the
+    /// `let Some(len) = current_eof(..) else { return }` guard pin the behaviour.
+    #[test]
+    fn first_sight_does_not_seed_when_eof_unavailable() {
+        // `pos` stays None when there is no session file at all (the analogous
+        // "no usable EOF" path), so nothing is ever seeded to 0.
+        let base = std::env::temp_dir().join(format!("agend-2090-noseed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut pos = None;
+        let out = extract_new_assistant_text_in(&base.join("wt"), &base.join("projects"), &mut pos);
+        assert!(out.is_empty());
+        assert!(
+            pos.is_none(),
+            "no seed → pos stays None (re-seed next tick), never offset 0"
         );
     }
 
