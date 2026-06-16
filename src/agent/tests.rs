@@ -157,6 +157,24 @@ fn progress_marker_distinct_from_auto_and_resume_markers() {
     }
 }
 
+/// #2282: the `[AGEND-HANDOFF]` context-handoff marker is a FOURTH distinct token —
+/// neither a prefix of, nor prefixed by, `[AGEND-AUTO]` / `[AGEND-RESUME]` /
+/// `[AGEND-PROGRESS]` (so an agent can't confuse the save-state directive with the
+/// never-act nudge, the recovery trigger, or the progress nudge).
+#[test]
+fn handoff_marker_distinct_from_auto_resume_progress_markers_2282() {
+    assert_eq!(super::DAEMON_HANDOFF_INJECT_MARKER, "[AGEND-HANDOFF]");
+    for other in [
+        super::DAEMON_AUTO_INJECT_MARKER,
+        super::DAEMON_RESUME_INJECT_MARKER,
+        super::DAEMON_PROGRESS_INJECT_MARKER,
+    ] {
+        assert_ne!(super::DAEMON_HANDOFF_INJECT_MARKER, other);
+        assert!(!super::DAEMON_HANDOFF_INJECT_MARKER.starts_with(other));
+        assert!(!other.starts_with(super::DAEMON_HANDOFF_INJECT_MARKER));
+    }
+}
+
 /// fresh-restart self-kick prompt (must-follows ①+③): an actionable
 /// `[AGEND-RESUME]` self-bootstrap; the task board + `list_instances` are named as
 /// the AUTHORITATIVE live sources BEFORE the stale-tolerant `SESSION-HANDOFF.md`

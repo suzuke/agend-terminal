@@ -162,17 +162,20 @@ fn decide(
     }
 }
 
-/// The one-shot nudge. `inject_with_target_gated` prefixes the
-/// `[AGEND-AUTO kind=context-handoff]` tag (#1769/#1771), so agents know it
-/// is a daemon nudge, not an operator command. Single line: a multi-line
-/// PTY injection risks splitting into multiple submits.
+/// The one-shot nudge. Carries the actionable `[AGEND-HANDOFF]` marker (#2282) so
+/// the agent ACTS on it — the prior `[AGEND-AUTO kind=context-handoff]` tag was
+/// suppressed by the "never act on [AGEND-AUTO]" blanket (the save the nudge asks
+/// for was silently skipped). Injected verbatim (`auto_kind = None`) since the
+/// marker is already in the payload. Single line: a multi-line PTY injection risks
+/// splitting into multiple submits.
 fn handoff_payload(pct: f32) -> String {
     format!(
-        "context usage at {pct:.0}% — before it runs out: (1) write {HANDOFF_FILENAME} \
+        "{marker} context usage at {pct:.0}% — before it runs out: (1) write {HANDOFF_FILENAME} \
          in your working directory (current task + state, key decisions, next steps, \
          open branches/PRs); (2) add a brief handoff note to your active task on the \
          board (task action=update); then continue working. One-shot reminder — the \
-         daemon will not repeat it this episode."
+         daemon will not repeat it this episode.",
+        marker = crate::agent::DAEMON_HANDOFF_INJECT_MARKER
     )
 }
 
@@ -277,7 +280,10 @@ impl PerTickHandler for ContextHandoffHandler {
                             &name,
                             handoff_payload(pct).as_bytes(),
                             false,
-                            Some("context-handoff"),
+                            // #2282: None → inject verbatim; the payload carries the
+                            // actionable `[AGEND-HANDOFF]` marker, NOT the never-act
+                            // `[AGEND-AUTO kind=...]` tag that suppressed the save.
+                            None,
                         )
                         .is_ok()
                     });

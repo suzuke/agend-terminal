@@ -2160,6 +2160,18 @@ pub(crate) const DAEMON_RESUME_INJECT_MARKER: &str = "[AGEND-RESUME]";
 /// the report-mode backstop must be acted on, so it can't wear the never-act tag.
 pub(crate) const DAEMON_PROGRESS_INJECT_MARKER: &str = "[AGEND-PROGRESS]";
 
+/// #2282: context-handoff marker — a FOURTH distinct daemon token, actionable like
+/// [`DAEMON_RESUME_INJECT_MARKER`] / [`DAEMON_PROGRESS_INJECT_MARKER`] and unlike the
+/// never-act [`DAEMON_AUTO_INJECT_MARKER`]. The context-handoff watchdog
+/// (`daemon::per_tick::context_handoff`) injects it near context-full to ask the
+/// agent to SAVE its state (write `SESSION-HANDOFF.md` + annotate its task) before
+/// the context window runs out. It must NOT use `[AGEND-AUTO]`: that marker's "never
+/// act" blanket would suppress the very save the nudge asks for — the latent bug
+/// this fixes (the nudge was silently ignored, leaving only the 92% operator
+/// escalation as a degraded backstop). A separate marker keeps the `[AGEND-AUTO]`
+/// blanket clean (mirrors the `[AGEND-RESUME]` / `[AGEND-PROGRESS]` design).
+pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
+
 /// The fixed first turn injected ONCE after a fresh-restart respawn. It is an
 /// actionable SELF-bootstrap trigger (recover the agent's OWN in-flight state),
 /// NOT an operator command and NOT authority to dispatch new work. Ordering per
