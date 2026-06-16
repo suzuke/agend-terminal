@@ -925,6 +925,32 @@ pub(crate) mod claude_session {
             .any(|e| jsonl_has_user_entry(&e.path()))
     }
 
+    /// #2090 M2 (mode-1 mirror): resolve `working_dir`'s project dir (the SAME
+    /// canonicalize + encode path as [`has_resumable`]) and return the `.jsonl`
+    /// with the newest mtime, or `None` if the dir is missing / has no `.jsonl`.
+    /// Used by the progress-mirror tail to locate the agent's live transcript.
+    /// Fail-open: any read/metadata error yields `None`. Pure read — never
+    /// mutates anything (additive sibling of `has_resumable`; the #2262
+    /// `pub(crate)` exposure of this module is reused, its logic untouched).
+    pub(crate) fn newest_session_jsonl(
+        working_dir: &Path,
+        projects_root: &Path,
+    ) -> Option<PathBuf> {
+        let canonical = canonicalize_for_encode(working_dir);
+        let project_dir = projects_root.join(encode_project_dir(&canonical));
+        std::fs::read_dir(&project_dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .filter_map(|p| {
+                let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                Some((p, mtime))
+            })
+            .max_by_key(|(_, mtime)| *mtime)
+            .map(|(p, _)| p)
+    }
+
     /// Canonicalize `working_dir` so the encoded project-dir name matches what
     /// claude CLI's Node `fs.realpathSync.native` produces before writing the
     /// session jsonl. Falls back to the raw input on canonicalize Err so cold

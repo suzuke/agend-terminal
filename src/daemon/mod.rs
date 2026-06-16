@@ -38,6 +38,7 @@ pub(crate) mod supervisor;
 pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
 pub(crate) mod ticker;
+pub(crate) mod transcript_tail;
 mod tui_bridge;
 pub(crate) mod usage_limit;
 pub(crate) mod utils;
@@ -683,6 +684,12 @@ pub(crate) fn build_default_handlers(
         // never authors/relays content itself (zero exfil). Default progress_mode
         // is 0 (off) → this is a cheap early-return no-op for a default fleet.
         Box::new(per_tick::ProgressBackstopHandler::new()),
+        // #2090 (mirror mode): progress-mirror — every tick. Only relays when
+        // `progress_mode == 1`; tails each agent's transcript and sends NEW
+        // assistant text to its origin channel (active-turn gated, no broadcast,
+        // no backlog replay, truncated). ⚠ exfil surface — default OFF, so this
+        // is a cheap early-return no-op for a default fleet.
+        Box::new(per_tick::ProgressMirrorHandler::new()),
         // Daemon-side deferred-notification flush — every tick (~10s). The
         // #1513 busy-gate defers notifications into the queue whose only other
         // flusher is the TUI loop; headless `run_core` (`start --foreground`)

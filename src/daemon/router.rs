@@ -171,6 +171,14 @@ fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription
 
 /// Attempt to dispatch accumulated mirror text to the originating channel.
 fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer) {
+    // #2090 mode-1: when the transcript-tail progress mirror is active it OWNS
+    // the origin-channel relay; suppress this legacy PTY-buffer mirror to avoid
+    // double-sending the same turn's output. (Default progress_mode 0 → no-op.)
+    if crate::runtime_config::get().progress_mode == 1 {
+        buf.buffer.clear();
+        buf.active = false;
+        return;
+    }
     let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
 
     if pair.mirror_dispatched_for_turn {

@@ -236,6 +236,27 @@ The daemon reloads it every tick, which makes it suitable for live tuning.
 | `dev_idle_threshold_secs` | `3600` | Idle threshold for a single agent |
 | `fleet_idle_threshold_secs` | `1800` | Idle threshold for the fleet as a whole |
 | `hang_auto_recovery_enabled` | `false` | Whether hang auto-recovery is enabled |
+| `progress_mode` | `0` | Origin-aware long-task progress reporting: `0` off, `1` mirror, `2` report. See the warning below. |
+
+### `progress_mode` — origin-aware progress reporting (⚠ exfil in mirror mode)
+
+Surfaces an agent's long-task progress back to the channel a request came from
+(e.g. Telegram), so the operator need not watch the PTY. **Default `0` (off).**
+Opt-in per fleet via `config set progress_mode <n>`.
+
+- **`0` — off (default):** no progress reporting; zero behaviour change.
+- **`2` — report:** the agent self-reports on the origin channel. The daemon only
+  *nudges* the agent (via an `[AGEND-PROGRESS]` inject) if an external-channel turn
+  runs long with no reply — it never authors or relays content, so **nothing is
+  exfiltrated by the daemon**.
+- **`1` — mirror (⚠ EXFILTRATION SURFACE):** the daemon tails the agent's
+  transcript and **auto-relays the agent's raw assistant text** to the origin
+  channel. This sends the agent's full assistant output off-box — **any secret,
+  credential, or injected content the agent echoes is relayed to that external
+  channel.** Enable only when you accept that risk for the bound channel. It is
+  bounded by: an active-turn gate (relays only during an armed external-channel
+  turn, to **that channel only — never a broadcast**), no historical backlog
+  replay (tailing starts at the live position), and per-message truncation.
 
 ### How to change it
 

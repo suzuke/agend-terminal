@@ -47,15 +47,22 @@ pub struct RuntimeConfig {
     #[serde(default = "default_true")]
     pub show_pane_state: bool,
     /// #2090: origin-aware long-task progress reporting mode. `0` = off
-    /// (DEFAULT — zero behaviour change), `2` = report: the agent self-reports
-    /// progress on the channel a request came from, and the daemon's
-    /// progress-backstop watchdog nudges it if a long external-channel turn goes
-    /// quiet. In report mode the daemon NEVER authors or relays content itself —
-    /// it only prods the agent — so no raw transcript is ever exfiltrated. `1`
-    /// (mirror — daemon auto-relays the agent's raw output stream) is RESERVED
-    /// and not yet active in this build; `set` rejects it. `#[serde(default)]`
-    /// fills 0 for older configs (additive — no schema bump). Hot-reloadable via
-    /// the `config` MCP tool.
+    /// (DEFAULT — zero behaviour change).
+    ///
+    /// `2` = report: the agent self-reports progress on the channel a request came
+    /// from; the daemon's progress-backstop watchdog only NUDGES it if a long
+    /// external-channel turn goes quiet — it never authors or relays content, so
+    /// no transcript is exfiltrated.
+    ///
+    /// `1` = mirror: the daemon tails the agent's transcript and **auto-relays the
+    /// agent's raw assistant text** back to the origin channel. ⚠ EXFILTRATION
+    /// SURFACE — this sends the FULL assistant output stream off-box: any secret
+    /// or injected content the agent echoes is relayed to the external channel.
+    /// Opt-in only; bounded by an active-turn gate (origin channel only, never
+    /// broadcast), no-backlog-replay, and truncation. See `progress_mirror.rs`.
+    ///
+    /// `#[serde(default)]` fills 0 for older configs (additive — no schema bump).
+    /// Hot-reloadable via the `config` MCP tool.
     #[serde(default)]
     pub progress_mode: i64,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
@@ -240,12 +247,11 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
             let m: i64 = value
                 .parse()
                 .map_err(|_| format!("invalid integer: {value}"))?;
-            // 0 = off (default), 2 = report. 1 (mirror) is reserved — not yet
-            // active in this build (gated separately) — so reject it explicitly
-            // rather than letting an operator set a silently-inert mode.
-            if !matches!(m, 0 | 2) {
+            // 0 = off (default), 1 = mirror (⚠ exfil — relays raw assistant
+            // output to the origin channel), 2 = report (self-report + nudge).
+            if !matches!(m, 0..=2) {
                 return Err(format!(
-                    "invalid progress_mode: {m} (0 = off, 2 = report; 1/mirror not yet available)"
+                    "invalid progress_mode: {m} (0 = off, 1 = mirror, 2 = report)"
                 ));
             }
             config.progress_mode = m;
@@ -368,21 +374,19 @@ mod tests {
 
     #[test]
     #[serial(runtime_config)]
-    fn progress_mode_accepts_report_rejects_mirror_and_garbage() {
+    fn progress_mode_accepts_0_1_2_rejects_garbage() {
         let dir = std::env::temp_dir().join("agend-test-runtime-config-progress");
         std::fs::create_dir_all(&dir).ok();
-        // 2 (report) is accepted and round-trips.
-        set(&dir, "progress_mode", "2").unwrap();
-        reload(&dir);
-        assert_eq!(get_key("progress_mode").unwrap(), "2");
-        // 0 (off) is accepted.
-        set(&dir, "progress_mode", "0").unwrap();
-        reload(&dir);
-        assert_eq!(get_key("progress_mode").unwrap(), "0");
-        // 1 (mirror) is reserved / not yet active → rejected, not a silent no-op.
-        assert!(set(&dir, "progress_mode", "1").is_err());
+        // 0 (off), 1 (mirror), 2 (report) all accepted + round-trip.
+        for v in ["0", "1", "2"] {
+            set(&dir, "progress_mode", v).unwrap();
+            reload(&dir);
+            assert_eq!(get_key("progress_mode").unwrap(), v);
+        }
+        // Out-of-range integer → rejected.
+        assert!(set(&dir, "progress_mode", "3").is_err());
         // Non-integer → rejected.
-        assert!(set(&dir, "progress_mode", "report").is_err());
+        assert!(set(&dir, "progress_mode", "mirror").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
