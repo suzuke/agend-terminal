@@ -62,13 +62,15 @@ const MODULE_SCOPE: &[&str] = &[
     "claim_verifier.rs",
     "deployments.rs",
     "bootstrap/canonical_hygiene.rs",
-    // W1.2 slice 3: agent_ops (best-effort worktree-remove → git_ok). ci/mod's
-    // worktree-remove is kept raw (deliberate non-bypass, already bounded via
-    // spawn_group_bounded, surfaces stderr in JSON note) via git-raw-allowed.
-    // auto_release + retention/worktrees already do all LOCAL git via git_bypass
-    // (zero raw Command::new in production) — sealed against a future regression.
+    // W1.2 slice 3: agent_ops (best-effort worktree-remove → git_ok). ci's
+    // worktree-remove (in handle_release_repo) is kept raw (deliberate non-bypass,
+    // already bounded via spawn_group_bounded, surfaces stderr in JSON note) via
+    // git-raw-allowed. #t-61: the ci handler was split into per-action submodules,
+    // so the seal moved from ci/mod.rs to ci/release.rs (where handle_release_repo
+    // now lives). auto_release + retention/worktrees already do all LOCAL git via
+    // git_bypass (zero raw Command::new in production) — sealed against regression.
     "agent_ops.rs",
-    "mcp/handlers/ci/mod.rs",
+    "mcp/handlers/ci/release.rs",
     "daemon/auto_release.rs",
     "daemon/retention/worktrees.rs",
     // W1.2 worktree slice + #2128: worktree.rs is now FULLY migrated — ZERO

@@ -2,7 +2,7 @@
 //! `ci::base_drift_refusal`.
 //!
 //! **Division of labour** (the two gates are deliberately complementary):
-//! - `base_drift_refusal` (ci/mod.rs) = a LOOSE, best-effort all-behind guard
+//! - `base_drift_refusal` (ci/merge.rs) = a LOOSE, best-effort all-behind guard
 //!   keyed on GitHub's `mergeStateStatus` (`BEHIND`/`DIRTY`). It defends the
 //!   #1798 phantom-reversion class, but `mergeStateStatus` is GitHub's
 //!   eventually-consistent cache — right after an interleaved merge it can still
@@ -148,7 +148,7 @@ mod tests {
     // ── is_invariant_input ──
     #[test]
     fn invariant_input_matches_known_oversized_and_invariant_tests() {
-        assert!(is_invariant_input("src/mcp/handlers/ci/mod.rs"));
+        assert!(is_invariant_input("src/mcp/handlers/dispatch_hook/mod.rs"));
         assert!(is_invariant_input("src/mcp/handlers/dispatch_hook/mod.rs"));
         assert!(is_invariant_input("tests/file_size_invariant.rs"));
         assert!(is_invariant_input("tests/git_subprocess_invariant.rs"));
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn up_to_date_is_fresh_even_touching_invariant_2140() {
         assert_eq!(
-            classify_freshness(0, &[s("src/mcp/handlers/ci/mod.rs")], &[]),
+            classify_freshness(0, &[s("src/mcp/handlers/dispatch_hook/mod.rs")], &[]),
             FreshnessVerdict::Fresh
         );
     }
@@ -171,10 +171,14 @@ mod tests {
     #[test]
     fn behind_and_pr_touches_invariant_is_stale_2140() {
         assert_eq!(
-            classify_freshness(2, &[s("src/mcp/handlers/ci/mod.rs")], &[s("src/other.rs")]),
+            classify_freshness(
+                2,
+                &[s("src/mcp/handlers/dispatch_hook/mod.rs")],
+                &[s("src/other.rs")]
+            ),
             FreshnessVerdict::StaleRisky {
                 behind_by: 2,
-                files: vec![s("src/mcp/handlers/ci/mod.rs")]
+                files: vec![s("src/mcp/handlers/dispatch_hook/mod.rs")]
             }
         );
     }
@@ -188,13 +192,13 @@ mod tests {
             classify_freshness(
                 1,
                 &[s("tests/file_size_invariant.rs")], // PR's own (e.g. ceiling-setter)
-                &[s("src/mcp/handlers/ci/mod.rs")],   // behind-main (the file-grower)
+                &[s("src/mcp/handlers/dispatch_hook/mod.rs")], // behind-main (the file-grower)
             ),
             FreshnessVerdict::StaleRisky {
                 behind_by: 1,
                 // both invariant-input files surfaced, deduped + sorted
                 files: vec![
-                    s("src/mcp/handlers/ci/mod.rs"),
+                    s("src/mcp/handlers/dispatch_hook/mod.rs"),
                     s("tests/file_size_invariant.rs")
                 ]
             }
@@ -290,14 +294,14 @@ mod tests {
             },
             CompareResult {
                 behind_by: 0,
-                files: vec![s("src/mcp/handlers/ci/mod.rs")], // behind-main: the grower
+                files: vec![s("src/mcp/handlers/dispatch_hook/mod.rs")], // behind-main: the grower
             },
         );
         assert_eq!(
             check_merge_freshness(&mock, "owner/repo", "deadbeef", "main"),
             FreshnessVerdict::StaleRisky {
                 behind_by: 1,
-                files: vec![s("src/mcp/handlers/ci/mod.rs")]
+                files: vec![s("src/mcp/handlers/dispatch_hook/mod.rs")]
             }
         );
         assert_eq!(mock.call_count(), 2, "both compare directions queried");

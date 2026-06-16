@@ -41,7 +41,9 @@ const SKIP_FILES: &[&str] = &["dispatch.rs"];
 /// debt — each may SHRINK but must not grow past its ceiling (can-shrink-not-
 /// grow), and must be removed once split back under `MAX_LOC`.
 const KNOWN_OVERSIZED: &[(&str, usize)] = &[
-    ("src/mcp/handlers/ci/mod.rs", 1435),
+    // #t-61: src/mcp/handlers/ci/mod.rs was split into per-action submodules
+    // (checkout/watch/merge/cleanup/release), each under MAX_LOC — its
+    // KNOWN_OVERSIZED entry is removed so the guard re-arms for the file.
     // #2234 Phase 1c: +12 for the (B) in-place-checkout dispatch branch + rollback
     // (the workspace-worktree resolution itself is extracted to worktree_pool).
     // dispatch_hook/mod.rs remains slated for a split (its own follow-up).

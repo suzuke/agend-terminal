@@ -21,6 +21,7 @@
 /// invariant AND gated as merge-freshness invariant inputs. Add a new path here
 /// (and its ceiling in `KNOWN_OVERSIZED`) when grandfathering another file.
 pub const GRANDFATHERED_OVERSIZED_HANDLERS: &[&str] = &[
-    "src/mcp/handlers/ci/mod.rs",
+    // #t-61: src/mcp/handlers/ci/mod.rs was split into per-action submodules and is
+    // no longer oversized — removed from here AND from KNOWN_OVERSIZED (kept in sync).
     "src/mcp/handlers/dispatch_hook/mod.rs",
 ];
