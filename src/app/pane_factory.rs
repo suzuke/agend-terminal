@@ -62,6 +62,16 @@ pub(super) fn spawn_pane_tab(
 }
 
 /// Create a pane backed by spawn_agent.
+///
+/// #render-first phase (a): this is now the back-to-back composition of two
+/// halves — [`build_pane_placeholder`] (cheap, synchronous shell: name + cwd +
+/// pane-id + empty VTerm + the forwarder receiver) and [`attach_agent_to_pane`]
+/// (the expensive agent spawn + subscribe + VTerm seed + forwarder thread). The
+/// composition is **byte-identical** to the prior single-function form: the
+/// same side effects run in the same order and the returned `Pane` is unchanged.
+/// Splitting here is what lets a later phase render the placeholder shell before
+/// the per-agent spawn runs (in the background); phase (a) keeps the call site
+/// fully synchronous.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_pane(
     layout: &mut Layout,
@@ -79,6 +89,45 @@ pub(super) fn create_pane(
     wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
 ) -> Result<Pane> {
+    let (mut pane, fwd_tx) = build_pane_placeholder(
+        layout,
+        home,
+        base_name,
+        command,
+        working_dir,
+        cols,
+        rows,
+        name_counter,
+    );
+    attach_agent_to_pane(
+        &mut pane, fwd_tx, registry, home, command, args, spawn_mode, env, submit_key, cols, rows,
+        wakeup_tx,
+    )?;
+    Ok(pane)
+}
+
+/// Cheap, synchronous half of [`create_pane`]: dedup the name, resolve the
+/// working directory, allocate the pane id, and build a `Pane` with an EMPTY
+/// VTerm plus the forwarder's receiver end. It does NOT spawn the agent or touch
+/// the registry — [`attach_agent_to_pane`] does that and seeds the VTerm with
+/// the first screen dump. Returns the placeholder pane together with the
+/// `fwd_tx` sender the attach step wires the agent's output into.
+///
+/// The empty VTerm is deliberate (phase-(a) byte-identical: the prior code also
+/// built a fresh `VTerm::new` and only filled it from the dump in the attach
+/// step). The forwarder channel is created up front so the pane owns a valid
+/// receiver immediately, independent of when the agent spawns.
+#[allow(clippy::too_many_arguments)]
+fn build_pane_placeholder(
+    layout: &mut Layout,
+    home: &Path,
+    base_name: &str,
+    command: &str,
+    working_dir: Option<&Path>,
+    cols: u16,
+    rows: u16,
+    name_counter: &mut HashMap<String, usize>,
+) -> (Pane, crossbeam_channel::Sender<Vec<u8>>) {
     // Auto-dedup name
     let count = name_counter.entry(base_name.to_string()).or_insert(0);
     let name = if *count == 0 {
@@ -91,6 +140,58 @@ pub(super) fn create_pane(
     // Resolve working directory
     let work_dir = working_dir
         .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(&name));
+
+    let pane_id = layout.next_pane_id();
+    let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let backend = Backend::from_command(command);
+
+    let pane = Pane {
+        agent_name: name.into(),
+        // Filled by `attach_agent_to_pane` once the agent's authoritative UUID
+        // is resolved; `Default` is the never-routed placeholder until then.
+        instance_id: crate::types::InstanceId::default(),
+        vterm: VTerm::new(cols, rows),
+        rx: fwd_rx,
+        id: pane_id,
+        backend,
+        working_dir: Some(work_dir),
+        display_name: None,
+        scroll_offset: 0,
+        has_notification: false,
+        fleet_instance_name: None,
+        last_input_at: None,
+        pending_notification_count: 0,
+        selection: None,
+        source: crate::layout::PaneSource::Local,
+    };
+    (pane, fwd_tx)
+}
+
+/// Agent-backed half of [`create_pane`]: generate the MCP config + skills, spawn
+/// the agent (the expensive fork/exec), resolve its authoritative UUID, subscribe
+/// to its output, seed the pane's VTerm with the initial screen dump, and park
+/// the forwarder thread that drives the placeholder's `fwd_tx`. Mutates `pane` in
+/// place (`instance_id` + `vterm`); all other fields were set by the placeholder.
+#[allow(clippy::too_many_arguments)]
+fn attach_agent_to_pane(
+    pane: &mut Pane,
+    fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
+    registry: &AgentRegistry,
+    home: &Path,
+    command: &str,
+    args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
+    env: &HashMap<String, String>,
+    submit_key: &str,
+    cols: u16,
+    rows: u16,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
+) -> Result<()> {
+    let name = pane.agent_name.to_string();
+    let work_dir = pane
+        .working_dir
+        .clone()
         .unwrap_or_else(|| crate::paths::workspace_dir(home).join(&name));
 
     // Generate MCP config for agent backends
@@ -156,6 +257,7 @@ pub(super) fn create_pane(
     // resolution — is guaranteed present.
     let instance_id = crate::fleet::resolve_uuid(home, &name)
         .ok_or_else(|| anyhow::anyhow!("agent '{name}' has no fleet UUID after spawn"))?;
+    pane.instance_id = instance_id;
 
     // Subscribe to the agent's output
     let (rx, dump) = {
@@ -166,52 +268,29 @@ pub(super) fn create_pane(
         agent::subscribe_with_dump(handle)
     };
 
-    // Create local VTerm and feed the screen dump
-    let mut vterm = VTerm::new(cols, rows);
-    vterm.process(&dump);
+    // Feed the screen dump into the placeholder's (empty) local VTerm
+    pane.vterm.process(&dump);
 
-    // Forward subscriber output to wakeup channel
-    let pane_id = layout.next_pane_id();
+    // Forward subscriber output to wakeup channel via the placeholder's fwd_tx
+    let pane_id = pane.id;
     let tx = wakeup_tx.clone();
-    let pane_rx = {
-        let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        // fire-and-forget: forwarder exits when fwd_tx.send() fails (pane
-        // dropped → fwd_rx dropped → send returns Err) or rx.recv() fails
-        // (agent removed → broadcast sender dropped). H1: lifecycle is
-        // correct — pane drop triggers forwarder exit via channel close.
-        std::thread::Builder::new()
-            .name(format!("{name}_fwd"))
-            .spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if fwd_tx.send(data).is_err() {
-                        break; // H1: pane closed, fwd_rx dropped
-                    }
-                    let _ = tx.send(pane_id);
+    // fire-and-forget: forwarder exits when fwd_tx.send() fails (pane
+    // dropped → fwd_rx dropped → send returns Err) or rx.recv() fails
+    // (agent removed → broadcast sender dropped). H1: lifecycle is
+    // correct — pane drop triggers forwarder exit via channel close.
+    std::thread::Builder::new()
+        .name(format!("{name}_fwd"))
+        .spawn(move || {
+            while let Ok(data) = rx.recv() {
+                if fwd_tx.send(data).is_err() {
+                    break; // H1: pane closed, fwd_rx dropped
                 }
-            })
-            .ok();
-        fwd_rx
-    };
+                let _ = tx.send(pane_id);
+            }
+        })
+        .ok();
 
-    let backend = Backend::from_command(command);
-
-    Ok(Pane {
-        agent_name: name.into(),
-        instance_id,
-        vterm,
-        rx: pane_rx,
-        id: pane_id,
-        backend,
-        working_dir: Some(work_dir),
-        display_name: None,
-        scroll_offset: 0,
-        has_notification: false,
-        fleet_instance_name: None,
-        last_input_at: None,
-        pending_notification_count: 0,
-        selection: None,
-        source: crate::layout::PaneSource::Local,
-    })
+    Ok(())
 }
 
 /// Attach a pane to an already-running agent (no spawn — subscribe only).
