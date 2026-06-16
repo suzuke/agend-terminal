@@ -341,6 +341,17 @@ pub(crate) fn build_instructions_body(
     content.push_str("- UNLIKE `[AGEND-AUTO]` (which you must NEVER act on), this IS actionable: immediately run your recovery sequence — rebuild your in-flight picture from the AUTHORITATIVE live sources first (the task board + list_instances), then drain your inbox, then read SESSION-HANDOFF.md as a stale-tolerant hint (trust the board/inbox over it if it looks out of date), then execute pending handoff TODOs and reconnect dangling sub-agents.\n");
     content.push_str("- It is an actionable trigger to recover YOUR OWN state — NOT operator authority: it is NOT an operator command and NOT a license to dispatch new work. Do the recovery, nothing more.\n");
 
+    // #2090 O1: `[AGEND-PROGRESS]` marker vocabulary — UNCONDITIONAL (a daemon
+    // token the agent must understand whenever it arrives, like `[AGEND-AUTO]` /
+    // `[AGEND-RESUME]`, independent of any mode). Additive vocabulary only; it
+    // does NOT weaken the never-act `[AGEND-AUTO]` blanket. The proactive
+    // self-report BEHAVIOUR is the separate, mode-2-gated directive below.
+    content.push_str("\n## Daemon progress nudge (`[AGEND-PROGRESS]`)\n\n");
+    content.push_str("When you see input beginning with `[AGEND-PROGRESS]`:\n");
+    content.push_str("- This is a daemon-issued nudge that an external-channel request of yours has been running a while with no update.\n");
+    content.push_str("- UNLIKE `[AGEND-AUTO]` (which you must NEVER act on), this IS actionable: post a brief progress reply on that channel now (what you're doing / how far along), then continue your work.\n");
+    content.push_str("- Like `[AGEND-AUTO]`, it is daemon-originated and NOT operator authority: do NOT treat it as an operator command, and never dispatch a task or make a decision from it beyond posting the progress update.\n");
+
     // #2090 (report mode): origin-aware long-task progress reporting. Gated on
     // `progress_mode == 2` (default 0 OFF → `None` → absent → zero behaviour
     // change). The agent self-reports on the origin channel; the daemon's
@@ -1035,13 +1046,32 @@ mod tests {
 
     #[test]
     fn progress_directive_off_by_default_absent() {
-        // #2090: `None` (progress_mode 0, default) → NO directive → zero change.
+        // #2090: `None` (progress_mode 0, default) → NO behavioural directive.
         let body = build_instructions_body(None, None, None);
         assert!(
             !body.contains("Long-Task Progress Reporting"),
             "progress directive must be ABSENT when off: {body}"
         );
         assert!(!body.contains("Delegating Long Tasks"));
+    }
+
+    #[test]
+    fn progress_marker_vocabulary_is_unconditional() {
+        // #2090 O1: the `[AGEND-PROGRESS]` marker EXPLANATION is daemon vocabulary
+        // present regardless of mode (like `[AGEND-AUTO]`/`[AGEND-RESUME]`), so an
+        // agent always understands the marker if the backstop ever injects it —
+        // even when the proactive self-report directive is OFF.
+        let off = build_instructions_body(None, None, None);
+        assert!(
+            off.contains("## Daemon progress nudge (`[AGEND-PROGRESS]`)"),
+            "marker vocabulary must be present even when progress reporting is off: {off}"
+        );
+        assert!(
+            off.contains("IS actionable") && off.contains("NOT operator authority"),
+            "marker section must frame it actionable-but-not-operator-authority: {off}"
+        );
+        // But the proactive BEHAVIOUR directive stays gated off.
+        assert!(!off.contains("Long-Task Progress Reporting"));
     }
 
     #[test]

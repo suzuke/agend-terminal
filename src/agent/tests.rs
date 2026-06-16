@@ -140,6 +140,23 @@ fn resume_marker_distinct_from_auto_marker() {
     assert!(!super::DAEMON_AUTO_INJECT_MARKER.starts_with(super::DAEMON_RESUME_INJECT_MARKER));
 }
 
+/// #2090 O1: the `[AGEND-PROGRESS]` backstop marker is a THIRD distinct token —
+/// neither a prefix of, nor prefixed by, the never-act `[AGEND-AUTO]` or the
+/// recovery `[AGEND-RESUME]` markers (so an agent can't confuse an actionable
+/// progress nudge with either).
+#[test]
+fn progress_marker_distinct_from_auto_and_resume_markers() {
+    assert_eq!(super::DAEMON_PROGRESS_INJECT_MARKER, "[AGEND-PROGRESS]");
+    for other in [
+        super::DAEMON_AUTO_INJECT_MARKER,
+        super::DAEMON_RESUME_INJECT_MARKER,
+    ] {
+        assert_ne!(super::DAEMON_PROGRESS_INJECT_MARKER, other);
+        assert!(!super::DAEMON_PROGRESS_INJECT_MARKER.starts_with(other));
+        assert!(!other.starts_with(super::DAEMON_PROGRESS_INJECT_MARKER));
+    }
+}
+
 /// fresh-restart self-kick prompt (must-follows ①+③): an actionable
 /// `[AGEND-RESUME]` self-bootstrap; the task board + `list_instances` are named as
 /// the AUTHORITATIVE live sources BEFORE the stale-tolerant `SESSION-HANDOFF.md`
