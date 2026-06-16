@@ -1,0 +1,49 @@
+#!/bin/sh
+# agend-git #2234 — canonical-HEAD-detach instrument (daemon-managed via
+# binding.rs::install_hooks → $AGEND_HOME/hooks, the ACTIVE core.hooksPath).
+#
+# WHY here and not <repo>/.git/hooks/: the canonical repo + every managed worktree
+# have core.hooksPath set to $AGEND_HOME/hooks, which SHADOWS .git/hooks — a hook
+# dropped there never fires (the empty-culprit-log mystery, #2234 Phase 1). This is
+# the one git-CLI layer no caller can bypass: real git always honors core.hooksPath
+# regardless of AGEND_GIT_BYPASS (that env var is the agend-git shim's, not git's),
+# so this catches the shim-bypassing detach culprits (agent BYPASS git, operator
+# real-git, daemon Command::new).
+#
+# SAFETY — FAIL-OPEN, NEVER ABORT A REF TRANSACTION:
+#   A reference-transaction hook that exits NON-ZERO in the `prepared` phase ABORTS
+#   the whole transaction → would block EVERY fleet commit/ref update. So this hook
+#   (a) acts ONLY in the `committed` phase (post-durable; git ignores the exit code
+#   there) and (b) unconditionally `exit 0` at the end. Every step swallows errors.
+#
+# SCOPE — bug SIGNATURE only, not every ref update:
+#   Canonical's ref-update path carries ALL worktree commits + FF pulls (high rate).
+#   We log ONLY the observed bug shape: HEAD directly rewritten to origin/main's
+#   commit (the `git checkout origin/main` detach). A symref HEAD (normal branch
+#   work) reports under refs/heads/*, NOT HEAD; normal commits/pulls never land the
+#   detached HEAD exactly on origin/main. So this stays silent on routine churn.
+#
+# Instrument-only, zero behavior. Reversible: delete this file.
+[ "$1" = "committed" ] || exit 0
+{
+  log_dir="${AGEND_HOME:-$HOME/.agend-terminal}"
+  log="$log_dir/head-detach-culprit.log"
+  om=$(git rev-parse -q --verify refs/remotes/origin/main 2>/dev/null)
+  [ -n "$om" ] || exit 0
+  while read -r old new ref; do
+    # Bug signature: a direct HEAD rewrite (detach) landing on origin/main's SHA.
+    [ "$ref" = "HEAD" ] && [ "$new" = "$om" ] || continue
+    {
+      echo "==== $(date '+%F %T %z') HEAD detach -> origin/main ($old -> $new) wt=$(git rev-parse --show-toplevel 2>/dev/null) ===="
+      echo "  pid=$$ ppid=$PPID cwd=$PWD"
+      p=$PPID
+      for _ in 1 2 3 4 5 6 7 8; do
+        [ "$p" -gt 1 ] 2>/dev/null || break
+        line=$(ps -o pid=,ppid=,command= -p "$p" 2>/dev/null) || break
+        echo "    $line"
+        p=$(echo "$line" | awk '{print $2}')
+      done
+    } >> "$log" 2>&1
+  done
+} 2>/dev/null
+exit 0

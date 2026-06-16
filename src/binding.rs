@@ -477,6 +477,23 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
     let ps_path = hooks_dir.join("prepare-commit-msg.ps1");
     let _ = std::fs::write(&ps_path, ps_hook);
 
+    // #2234: canonical-HEAD-detach instrument. A reference-transaction hook dropped
+    // in `<repo>/.git/hooks/` is SHADOWED by this same `core.hooksPath` and never
+    // fires (the empty-culprit-log mystery, Phase 1) — it MUST live here. It is the
+    // one git-CLI layer no caller can bypass (real git always honors core.hooksPath,
+    // independent of AGEND_GIT_BYPASS). The script is fail-open (observes only in the
+    // `committed` phase + always exits 0, so it can NEVER abort a ref transaction)
+    // and scoped to the bug signature (HEAD detached to origin/main), so routine ref
+    // churn is not logged. Instrument-only — no behavior change.
+    let reftx_hook = include_str!("../assets/hooks/reference-transaction");
+    let reftx_path = hooks_dir.join("reference-transaction");
+    let _ = std::fs::write(&reftx_path, reftx_hook);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&reftx_path, std::fs::Permissions::from_mode(0o755));
+    }
+
     // Set core.hooksPath on the worktree.
     // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (this site previously
     // ran raw `git` with NO bypass env). `git config` against a fleet-managed
@@ -784,6 +801,136 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #2234: install_hooks must write the reference-transaction detach instrument
+    /// into the ACTIVE hooks dir (`$AGEND_HOME/hooks`) — a hook in `<repo>/.git/hooks`
+    /// is shadowed by `core.hooksPath` and never fires (Phase 1 root cause). Pins
+    /// that the artifact is installed (+ executable on unix) and carries the
+    /// fail-open safety shape, so a refactor can't silently drop it or its safety.
+    #[test]
+    fn install_hooks_writes_reference_transaction_2234() {
+        let home = tmp_home("reftx-install");
+        // The worktree need not be a real git repo: the hook FILES are written
+        // before the `git config core.hooksPath` step (which only warns on a
+        // non-repo), so the artifact lands regardless.
+        install_hooks(&home, &home.join("not-a-repo"));
+        let hook = home.join("hooks").join("reference-transaction");
+        assert!(
+            hook.exists(),
+            "reference-transaction must be installed in $AGEND_HOME/hooks (active hooksPath)"
+        );
+        let body = std::fs::read_to_string(&hook).unwrap();
+        assert!(
+            body.contains("[ \"$1\" = \"committed\" ] || exit 0"),
+            "fail-open gate (act only in the committed phase) must be present"
+        );
+        assert!(
+            body.trim_end().ends_with("exit 0"),
+            "hook must unconditionally exit 0 (fail-open — never abort a ref txn)"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "hook must be executable");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2234: the reference-transaction hook is (1) FAIL-OPEN — always exits 0, even
+    /// in the `prepared` phase, so it can NEVER abort a ref transaction and wedge the
+    /// fleet — and (2) SIGNATURE-SCOPED — logs ONLY a HEAD detach to origin/main, NOT
+    /// routine ref churn (FF pull / branch commits). Drives the REAL installed hook
+    /// with a stubbed `git` on PATH (hermetic, no real git / no host repo touched).
+    #[cfg(unix)]
+    #[test]
+    fn reference_transaction_hook_fail_open_and_signature_scoped_2234() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let home = tmp_home("reftx-behavior");
+        install_hooks(&home, &home.join("not-a-repo"));
+        let hook = home.join("hooks").join("reference-transaction");
+
+        // Stub `git` early on PATH: origin/main = OMSHA, toplevel = /fake/canonical.
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let git_stub = bin.join("git");
+        std::fs::write(
+            &git_stub,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+               *refs/remotes/origin/main*) echo OMSHA ;;\n\
+               *--show-toplevel*) echo /fake/canonical ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let log = home.join("head-detach-culprit.log");
+
+        let run = |state: &str, stdin: &str| -> i32 {
+            let mut c = Command::new("sh")
+                .arg(&hook)
+                .arg(state)
+                .env("AGEND_HOME", &home)
+                .env("PATH", &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            {
+                // Best-effort write: a fail-open hook legitimately exits (and closes
+                // stdin) before reading, so a BrokenPipe here is expected, not a bug.
+                let mut si = c.stdin.take().unwrap();
+                let _ = si.write_all(stdin.as_bytes());
+            } // drop stdin → the committed-phase read loop gets EOF
+            c.wait().unwrap().code().unwrap_or(-1)
+        };
+
+        // (1) FAIL-OPEN: prepared phase with garbage stdin → exit 0, no log.
+        assert_eq!(
+            run("prepared", "garbage not a ref line\n"),
+            0,
+            "prepared phase must exit 0 (a non-zero exit there ABORTS the ref txn)"
+        );
+        assert!(!log.exists(), "must not log outside the committed phase");
+
+        // (2) SIGNATURE MATCH: committed + HEAD landing on origin/main (detach) → log.
+        assert_eq!(
+            run("committed", "OLDSHA OMSHA HEAD\n"),
+            0,
+            "committed phase must still exit 0"
+        );
+        let detach_count = || -> usize {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("HEAD detach -> origin/main"))
+                .count()
+        };
+        assert_eq!(detach_count(), 1, "the detach signature must be logged");
+
+        // (3) NOISE GUARD: a normal FF pull (refs/heads/main → origin/main, ref is NOT
+        // HEAD) and a normal commit (HEAD → some other sha) must NOT add a log line.
+        assert_eq!(run("committed", "OLDSHA OMSHA refs/heads/main\n"), 0);
+        assert_eq!(run("committed", "OLDSHA OTHERSHA HEAD\n"), 0);
+        assert_eq!(
+            detach_count(),
+            1,
+            "routine ref churn (FF pull / non-origin-main HEAD move) must NOT be logged"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #1688 (codex): the daemon startup must NOT auto-bless a sidecar-less
