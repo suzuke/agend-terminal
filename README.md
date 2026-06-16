@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/suzuke/agend-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/suzuke/agend-terminal/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/agend-terminal)](https://crates.io/crates/agend-terminal)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Status: Pre-alpha](https://img.shields.io/badge/Status-Pre--alpha-orange)
 
 # AgEnD Terminal
@@ -152,4 +152,4 @@ agend-terminal modifies git behavior for spawned agents (PATH shim, commit trail
 
 ## License
 
-MIT
+Licensed under the [Apache License 2.0](LICENSE).

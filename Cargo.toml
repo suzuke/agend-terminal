@@ -4,7 +4,7 @@ version = "0.8.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 35 MCP tools"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/suzuke/agend-terminal"
 keywords = ["agent", "pty", "terminal", "mcp", "orchestration"]
 categories = ["command-line-utilities", "development-tools"]
@@ -41,6 +41,7 @@ include = [
     "Cargo.lock",
     "README.md",
     "LICENSE",
+    "NOTICE",
     "CHANGELOG.md",
 ]
 
