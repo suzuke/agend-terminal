@@ -1481,6 +1481,18 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).to_string()
     }
 
+    /// Number of registered worktrees (one `worktree ` line each). Counting +
+    /// the `prunable` marker is path-format-independent — a path-STRING
+    /// `.contains(wt.display())` is Windows-fragile (git lists forward slashes,
+    /// `Path::display` emits backslashes), which is unrelated to the orphan
+    /// property under test.
+    fn worktree_entry_count(repo: &Path) -> usize {
+        worktree_list(repo)
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count()
+    }
+
     /// #2234 Phase 0 (RED→GREEN): tearing down a per-agent workspace that is a
     /// daemon-managed worktree must route through `git worktree remove` (clearing
     /// the canonical registration) — NOT a bare `remove_dir_all`, which deletes
@@ -1490,16 +1502,24 @@ mod tests {
         let home = tmp_home("p0-wt-noorphan");
         let repo = tmp_repo("p0-wt-noorphan-repo");
         let wt = managed_workspace_worktree(&home, &repo, "devw", "feat/p0");
-        assert!(worktree_list(&repo).contains(&wt.display().to_string()));
+        assert_eq!(
+            worktree_entry_count(&repo),
+            2,
+            "baseline: main + the agent worktree are registered"
+        );
 
         crate::agent_ops::cleanup_working_dir(&home, "devw", &wt);
 
         assert!(!wt.exists(), "worktree dir must be removed");
+        let after = worktree_list(&repo);
+        assert_eq!(
+            after.lines().filter(|l| l.starts_with("worktree ")).count(),
+            1,
+            "only main may remain — a bare remove_dir_all would leave the entry: {after}"
+        );
         assert!(
-            !worktree_list(&repo).contains(&wt.display().to_string()),
-            "no ORPHAN worktree registration may survive in the canonical repo \
-             (a bare remove_dir_all would leave one): {}",
-            worktree_list(&repo)
+            !after.contains("prunable"),
+            "no ORPHAN (prunable) worktree registration may survive: {after}"
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -1590,10 +1610,15 @@ mod tests {
             "gitlink present → must take the worktree path even sans marker"
         );
         assert!(!wt.exists(), "worktree removed");
+        let after = worktree_list(&repo);
+        assert_eq!(
+            after.lines().filter(|l| l.starts_with("worktree ")).count(),
+            1,
+            "only main may remain (marker-less worktree still git-removed): {after}"
+        );
         assert!(
-            !worktree_list(&repo).contains(&wt.display().to_string()),
-            "no orphan registration may survive: {}",
-            worktree_list(&repo)
+            !after.contains("prunable"),
+            "no orphan (prunable) registration may survive: {after}"
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
