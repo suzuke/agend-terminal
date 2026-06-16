@@ -483,6 +483,34 @@ pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,
+/// binding-driven so cure-(B) `workspace/<agent>` worktrees are removable.
+///
+/// - Derived `worktrees/<agent>/<branch>` exists → return it (OFF/legacy
+///   byte-identical: the path that `remove_worktree` always used).
+/// - Derived path GONE → fall back to the binding's recorded `worktree`, but
+///   ONLY when the binding is bound to the SAME `branch`. A stale
+///   `remove(branchX)` fired AFTER the agent rebound to `branchY` must NOT delete
+///   the live `branchY` workspace (a `git worktree remove --force` is
+///   destructive — the #2234-cluster lifecycle race). The branch guard makes
+///   that case a correct no-op: `branchX`'s standalone worktree is genuinely gone
+///   (in-place checkout folded it into another branch).
+/// - `None` ⟹ nothing matching → the caller no-ops.
+fn resolve_removable_worktree(home: &Path, agent: &str, branch: &str) -> Option<PathBuf> {
+    let derived = worktree_path(home, agent, branch);
+    if derived.exists() {
+        return Some(derived);
+    }
+    let binding = crate::binding::read(home, agent)?;
+    let wt = PathBuf::from(binding.get("worktree")?.as_str()?);
+    let bound_branch = binding.get("branch")?.as_str()?;
+    if bound_branch == branch && wt.exists() {
+        Some(wt)
+    } else {
+        None
+    }
+}
+
 /// Remove a worktree and its tracking branch. Returns Ok(()) on success,
 /// Err with message on failure. Pre-flight: caller must check
 /// `has_uncommitted_changes` first.
@@ -498,10 +526,14 @@ pub fn remove_worktree(
     agent: &str,
     branch: &str,
 ) -> Result<(), String> {
-    let wt_dir = worktree_path(home, agent, branch);
-    if !wt_dir.exists() {
-        return Ok(()); // already gone
-    }
+    // #2234 Phase 2: binding-driven resolution (byte-identical OFF — the derived
+    // path exists and is removed exactly as before). `None` = already gone, OR
+    // the binding is bound to a DIFFERENT branch → no-op (never delete the wrong
+    // branch's live worktree; see `resolve_removable_worktree`).
+    let wt_dir = match resolve_removable_worktree(home, agent, branch) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
     // #2128: bounded `git_cmd` (AGEND_GIT_BYPASS + LOCAL_GIT_TIMEOUT +
     // process-group-kill) so a `worktree remove` wedged on `.git/index.lock`
     // contention fails in 60s instead of hanging. The two DISTINCT contracted Err
@@ -1346,6 +1378,117 @@ mod tests {
         assert!(
             ws.join(".git").is_file(),
             "workspace reconciled into a gitlink worktree"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #2234 Phase 2: remove_worktree binding-driven (destroy-work-safe) ──
+    fn write_test_binding(home: &Path, agent: &str, branch: &str, worktree: &Path) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = serde_json::json!({
+            "version": 1, "agent": agent, "task_id": "T-test",
+            "branch": branch, "worktree": worktree.display().to_string(),
+        });
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::to_string_pretty(&v).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// ① OFF/legacy: the derived `worktrees/<agent>/<branch>` exists → resolve to
+    /// it (byte-identical with the pre-#2234 behavior).
+    #[test]
+    fn resolve_removable_derived_exists_off_byte_identical_2234() {
+        let home = tmp_home("rrw-derived");
+        let derived = worktree_path(&home, "dev", "fix/x");
+        std::fs::create_dir_all(&derived).unwrap();
+        assert_eq!(
+            resolve_removable_worktree(&home, "dev", "fix/x"),
+            Some(derived)
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ② cure-(B): derived path gone, binding bound to the SAME branch → resolve
+    /// to the binding's `workspace/<agent>` worktree.
+    #[test]
+    fn resolve_removable_b_same_branch_uses_binding_2234() {
+        let home = tmp_home("rrw-b-same");
+        let ws = crate::paths::workspace_dir(&home).join("devb");
+        std::fs::create_dir_all(&ws).unwrap();
+        write_test_binding(&home, "devb", "feat/y", &ws);
+        assert_eq!(
+            resolve_removable_worktree(&home, "devb", "feat/y"),
+            Some(ws)
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ③ branch-mismatch (the destroy-work guard): derived gone + binding bound
+    /// to a DIFFERENT branch → None. A stale `remove(branchX)` after the agent
+    /// rebound to branchY must NOT resolve (and thus must not delete) the live
+    /// branchY workspace.
+    #[test]
+    fn resolve_removable_branch_mismatch_is_noop_no_destroy_2234() {
+        let home = tmp_home("rrw-mismatch");
+        let ws = crate::paths::workspace_dir(&home).join("devm");
+        std::fs::create_dir_all(&ws).unwrap();
+        write_test_binding(&home, "devm", "feat/Y", &ws);
+        assert_eq!(
+            resolve_removable_worktree(&home, "devm", "feat/X"),
+            None,
+            "#2234: stale remove(branchX) after rebind to branchY must NOT resolve the live branchY workspace"
+        );
+        assert!(
+            ws.exists(),
+            "the live workspace must be untouched by resolution"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ④ derive-miss + no binding → None (already gone).
+    #[test]
+    fn resolve_removable_no_binding_is_noop_2234() {
+        let home = tmp_home("rrw-none");
+        assert_eq!(resolve_removable_worktree(&home, "devn", "feat/z"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// End-to-end destroy-work prevention: a REAL `workspace/<agent>` worktree on
+    /// branchY + a binding to branchY; a stale `remove_worktree(agent, branchX)`
+    /// must be a graceful no-op and leave the live workspace intact (the critical
+    /// #2234-cluster guard — `git worktree remove --force` is destructive).
+    #[test]
+    fn remove_worktree_stale_branch_does_not_destroy_live_workspace_2234() {
+        let home = tmp_home("rrw-e2e");
+        let repo = tmp_repo("rrw-e2e-repo");
+        let ws = crate::paths::workspace_dir(&home).join("deve");
+        std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "feat/Y", &ws.display().to_string()])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        write_test_binding(&home, "deve", "feat/Y", &ws);
+
+        let r = remove_worktree(&home, &repo, "deve", "feat/X");
+
+        assert!(
+            r.is_ok(),
+            "stale-branch remove must be a graceful no-op: {r:?}"
+        );
+        assert!(
+            ws.exists(),
+            "#2234: the live branchY workspace must NOT be destroyed by a stale remove(branchX)"
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
