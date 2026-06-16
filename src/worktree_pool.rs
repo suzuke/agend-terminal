@@ -652,14 +652,17 @@ pub struct GcCandidate {
 /// flat (`<agent>-<enc>/` = depth 1), nested (`<agent>/<branch>/` = depth 2), and
 /// slash-branch (`<agent>/fix/xxx/` = depth 3) layouts with headroom; bounded so a
 /// pathological tree can't make the walk unbounded.
-const MARKER_WALK_MAX_DEPTH: usize = 5;
+pub(crate) const MARKER_WALK_MAX_DEPTH: usize = 5;
 
 /// t-worktree-leak (reviewer-2 #4): recursively collect daemon-managed worktree
 /// dirs (those holding a `.agend-managed` marker) under `root`, to any depth up to
 /// `max_depth`. Once a dir carries the marker it IS a worktree → collected and NOT
 /// descended into (so we never walk a worktree's own working tree). This replaces
 /// the old fixed-depth scan that missed slash-branch worktrees.
-fn collect_managed_worktrees(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
+///
+/// Shared by `gc_candidates` and (#restart-freeze) `binding::reconcile_hooks` —
+/// both need every real worktree leaf regardless of slash-branch nesting depth.
+pub(crate) fn collect_managed_worktrees(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
     if max_depth == 0 {
         return;
     }

@@ -321,9 +321,18 @@ pub(crate) fn resolve_fleet_and_reconcile(
     time_step("protocol::extract_default", || {
         crate::protocol::extract_default(home);
     });
-    time_step("binding::reconcile_hooks", || {
-        crate::binding::reconcile_hooks(home);
-    });
+    // #restart-freeze: hook installation only matters at COMMIT time, never
+    // before the render loop — running the worktree walk inline blocked boot
+    // (~1.3s of the restart-freeze window, on the main thread before TUI render).
+    // fire-and-forget: install_hooks is idempotent + per-worktree (writes
+    // $AGEND_HOME/hooks/* + sets each worktree's core.hooksPath via bypass git),
+    // independent of the rest of boot, so it runs safely off the critical path.
+    {
+        let home_owned = home.to_path_buf();
+        let _ = std::thread::Builder::new()
+            .name("reconcile-hooks".into())
+            .spawn(move || crate::binding::reconcile_hooks(&home_owned));
+    }
     time_step("binding::symlink_shim", || {
         crate::binding::symlink_shim(home);
     });
@@ -870,7 +879,10 @@ mod tests {
             "boot_sweep_zombies",
             "migrate_legacy_watch_filenames",
             "protocol::extract_default",
-            "binding::reconcile_hooks",
+            // #restart-freeze: `binding::reconcile_hooks` is intentionally NOT a
+            // synchronous bootstrap-step anymore — it runs fire-and-forget off the
+            // boot critical path (hooks only matter at commit time), so it no
+            // longer emits a `time_step` line. Removed from this pin deliberately.
             "binding::symlink_shim",
             "binding::reconcile_orphans",
             "worktree_pool::reconcile_orphan_leases",

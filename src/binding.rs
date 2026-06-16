@@ -500,23 +500,22 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
 
 /// Install hooks on all existing worktrees (daemon startup reconcile).
 pub fn reconcile_hooks(home: &Path) {
-    // New layout: <home>/worktrees/<agent>/<branch>/
+    // New layout: <home>/worktrees/<agent>/<branch>/. #restart-freeze: marker-walk
+    // to the real worktree LEAVES (mirrors gc_candidates / collect_managed_worktrees).
+    // The old fixed 2-level descent hit the INTERMEDIATE dir for a slash branch
+    // (`<agent>/fix`, NOT a git worktree) → `git config core.hooksPath` failed
+    // there → the prepare-commit-msg hook was silently never installed for
+    // slash-branch worktrees (the common case), plus one wasted failing `git
+    // config` subprocess per intermediate dir on the boot critical path.
     let new_root = crate::worktree_pool::daemon_managed_worktree_root(home);
-    if new_root.is_dir() {
-        if let Ok(agents) = std::fs::read_dir(&new_root) {
-            for agent_entry in agents.flatten() {
-                if !agent_entry.path().is_dir() {
-                    continue;
-                }
-                if let Ok(branches) = std::fs::read_dir(agent_entry.path()) {
-                    for branch_entry in branches.flatten() {
-                        if branch_entry.path().is_dir() {
-                            install_hooks(home, &branch_entry.path());
-                        }
-                    }
-                }
-            }
-        }
+    let mut worktrees = Vec::new();
+    crate::worktree_pool::collect_managed_worktrees(
+        &new_root,
+        crate::worktree_pool::MARKER_WALK_MAX_DEPTH,
+        &mut worktrees,
+    );
+    for wt in &worktrees {
+        install_hooks(home, wt);
     }
 
     // Legacy layout: <home>/workspace/*/.worktrees/*/
@@ -1143,6 +1142,65 @@ mod tests {
             "audit lines must carry caller process context: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #restart-freeze: reconcile_hooks marker-walk (correctness) ──────────
+    /// RED→GREEN: a SLASH-branch daemon worktree (`<home>/worktrees/<agent>/fix/x`)
+    /// must get its prepare-commit-msg hook wired (`core.hooksPath` set on the
+    /// LEAF). The old fixed 2-level descent hit the intermediate `<agent>/fix`
+    /// (not a git worktree) → `git config` failed there → the leaf's hook was
+    /// silently never installed. The marker-walk targets the real leaf.
+    #[test]
+    fn reconcile_hooks_installs_into_slash_branch_worktree_restart_freeze() {
+        use std::process::Command;
+        let home = tmp_home("reconcile-slash");
+        let repo = tmp_home("reconcile-slash-repo");
+        let git = |args: &[&str], dir: &std::path::Path| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git")
+        };
+        // Source repo with one commit so `worktree add` has a base.
+        assert!(git(&["init", "-b", "main"], &repo).status.success());
+        std::fs::write(repo.join("README.md"), "x\n").unwrap();
+        assert!(git(&["add", "README.md"], &repo).status.success());
+        assert!(git(&["commit", "-m", "init"], &repo).status.success());
+
+        // A SLASH-branch daemon worktree at <home>/worktrees/dev/fix/x.
+        let wt = home.join("worktrees").join("dev").join("fix").join("x");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(
+            git(
+                &["worktree", "add", "-b", "fix/x", &wt.display().to_string()],
+                &repo
+            )
+            .status
+            .success(),
+            "git worktree add (slash branch) must succeed"
+        );
+        // Daemon-managed marker (as lease() writes it).
+        std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "").unwrap();
+
+        reconcile_hooks(&home);
+
+        // GREEN: the LEAF worktree's core.hooksPath points at <home>/hooks.
+        // RED (fixed-depth): the leaf was never visited → core.hooksPath unset.
+        let out = git(&["config", "--get", "core.hooksPath"], &wt);
+        let cfg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            cfg,
+            home.join("hooks").display().to_string(),
+            "slash-branch worktree must have core.hooksPath set (hook installed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
 
