@@ -4,7 +4,7 @@
 //!   "handle_release_repo leaks .git/worktrees metadata when worktree .git is
 //!    not a readable file"
 //!
-//! In `handle_release_repo` (`src/mcp/handlers/ci/mod.rs`) `source_repo` is
+//! In `handle_release_repo` (`src/mcp/handlers/ci/release.rs`) `source_repo` is
 //! derived ONLY when `canonical.join(".git").is_file()` AND the file is readable
 //! AND its `gitdir:` line parses with three resolvable parents. If any of those
 //! fail, `source_repo` is `None`. On the two fallback arms (git worktree remove
@@ -79,17 +79,17 @@ fn release_repo_surfaces_unprunable_metadata_leak_mcp_ci_worktree() {
     collect_rs(&src, &mut files);
     assert!(!files.is_empty(), "no src/*.rs files found");
 
-    let ci_mod = files
+    let ci_release = files
         .iter()
-        .find(|p| p.ends_with(Path::new("mcp/handlers/ci/mod.rs")))
+        .find(|p| p.ends_with(Path::new("mcp/handlers/ci/release.rs")))
         .cloned()
-        .expect("src/mcp/handlers/ci/mod.rs must exist");
-    let text = std::fs::read_to_string(&ci_mod).expect("read ci/mod.rs");
+        .expect("src/mcp/handlers/ci/release.rs must exist");
+    let text = std::fs::read_to_string(&ci_release).expect("read ci/release.rs");
 
     let body = fn_body_after(&text, "fn handle_release_repo");
     assert!(
         !body.is_empty(),
-        "could not locate `handle_release_repo` in ci/mod.rs — re-check signature drift"
+        "could not locate `handle_release_repo` in ci/release.rs — re-check signature drift"
     );
 
     // Sanity: confirm we located the RIGHT function — it must contain the

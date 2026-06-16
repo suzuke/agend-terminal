@@ -5,7 +5,7 @@
 //!    per-watch flock used everywhere else"
 //!
 //! Both MCP handlers (`handle_watch_ci`, `handle_unwatch_ci` in
-//! `src/mcp/handlers/ci/mod.rs`) read the watch JSON, mutate it in memory, then
+//! `src/mcp/handlers/ci/watch.rs`) read the watch JSON, mutate it in memory, then
 //! `crate::store::atomic_write` it back — WITHOUT acquiring the per-watch flock.
 //! Every OTHER writer of the same file holds the sibling `<hash>.lock` via
 //! `crate::store::acquire_file_lock` precisely to serialize this read→write RMW
@@ -82,12 +82,12 @@ fn mcp_ci_watch_handlers_hold_per_watch_flock_mcp_ci_worktree() {
     assert!(!files.is_empty(), "no src/*.rs files found");
 
     // Locate the ci MCP handler module that owns the two RMW handlers.
-    let ci_mod = files
+    let ci_watch = files
         .iter()
-        .find(|p| p.ends_with(Path::new("mcp/handlers/ci/mod.rs")))
+        .find(|p| p.ends_with(Path::new("mcp/handlers/ci/watch.rs")))
         .cloned()
-        .expect("src/mcp/handlers/ci/mod.rs must exist");
-    let text = std::fs::read_to_string(&ci_mod).expect("read ci/mod.rs");
+        .expect("src/mcp/handlers/ci/watch.rs must exist");
+    let text = std::fs::read_to_string(&ci_watch).expect("read ci/watch.rs");
 
     // The two handlers that perform a read→mutate→atomic_write RMW on the watch
     // file. Each must serialize that window under the SAME flock the daemon-side
@@ -102,7 +102,7 @@ fn mcp_ci_watch_handlers_hold_per_watch_flock_mcp_ci_worktree() {
         let body = fn_body_after(&text, sig);
         assert!(
             !body.is_empty(),
-            "could not locate `{sig}` in ci/mod.rs — re-check signature drift"
+            "could not locate `{sig}` in ci/watch.rs — re-check signature drift"
         );
         // Sanity: this body really does an atomic_write RMW (so the guard is
         // load-bearing, not vacuously satisfied).
