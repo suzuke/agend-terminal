@@ -3247,6 +3247,41 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #2234 Phase 2 gc-safety (r6 #2269 observation): a MARKER-LESS
+    /// `workspace/<agent>` gitlink worktree — a real worktree (`.git` is a gitlink
+    /// FILE) but missing the `.agend-managed` marker (e.g. an interrupted
+    /// reconcile) — is enumerated by the new (B) `workspace_gitlink_worktrees`
+    /// scan (gitlink-alone gate), so it DOES reach `evaluate_candidate`; it MUST
+    /// NOT become a GC candidate because the `is_daemon_managed` marker-gate
+    /// rejects it. The sibling `gc_candidates_includes_only_daemon_tagged` only
+    /// covers a NESTED `.worktrees/human` dir that the marker-walk collect stage
+    /// filters BEFORE evaluate, so it never exercises this workspace-gitlink path.
+    #[test]
+    fn gc_candidates_excludes_marker_less_workspace_gitlink_2234() {
+        let home = tmp_home("gc-markerless-ws");
+        let repo = tmp_repo("gc-markerless-ws-repo");
+        // Same fixture as `managed_workspace_worktree`, minus the marker write.
+        let ws = managed_workspace_worktree(&home, &repo, "deve", "feat/markerless");
+        std::fs::remove_file(ws.join(MANAGED_MARKER)).expect("drop marker");
+        assert!(
+            ws.join(".git").is_file(),
+            "fixture is a real gitlink worktree"
+        );
+        // Precondition: the (B) scan DOES enumerate it (so it reaches evaluate).
+        assert!(
+            fs_managed_worktrees(&home).iter().any(|p| p == &ws),
+            "marker-less workspace gitlink must be enumerated (reaches evaluate_candidate)"
+        );
+        // Property under test: the marker-gate keeps it OUT of the candidate set.
+        let candidates = gc_candidates(&home);
+        assert!(
+            candidates.iter().all(|c| c.path != ws),
+            "marker-less workspace gitlink must NOT be a GC candidate: {candidates:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
     #[test]
     fn gc_candidates_excludes_pinned() {
         let home = tmp_home("gc-pinned");
