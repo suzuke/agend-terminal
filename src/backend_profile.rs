@@ -99,6 +99,18 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
 fn agy_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
+            // #2236: agy's individual-quota wall. FIRST so it outranks the Idle
+            // markers below (a quota-reached pane still renders "Type your
+            // message" / "? for shortcuts" chrome → first-match must pick
+            // UsageLimit, not Idle). Feeds #2233's quota-wedge escalate-once-latch
+            // so a quota-stuck agy stops spamming the stuck-watchdog every 30min
+            // (r5 motivating case: "Individual quota reached … Resets in 146h",
+            // wedged 6 days). Phrases are agy UI chrome (not generic) → no FP on
+            // an agent merely mentioning a quota in its output.
+            (
+                AgentState::UsageLimit,
+                r"Individual quota reached|Contact your administrator to enable overages",
+            ),
             (
                 AgentState::PermissionPrompt,
                 r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
@@ -471,6 +483,42 @@ mod opencode_resumed_idle_2020 {
             patterns.detect(&working),
             Some(AgentState::Thinking),
             "statusline must not outrank the working marker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agy_quota_2236 {
+    use super::*;
+
+    /// #2236: agy's individual-quota wall must classify as `UsageLimit` so it
+    /// feeds #2233's quota-wedge escalate-once-latch (otherwise the stuck-
+    /// watchdog re-pings every 30min — r5 wedged 6 days). Verbatim shape from the
+    /// r5 live snapshot, WITH the Idle chrome ("Type your message") that co-
+    /// renders on the quota pane — proving UsageLimit outranks Idle (first-match
+    /// priority), which is why the pattern is ordered first in `agy_profile`.
+    const AGY_QUOTA_PANE: &str = "  \u{26a0} Individual quota reached. Contact your administrator to enable overages. Resets in 146h\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_quota_reached_detects_usage_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_QUOTA_PANE),
+            Some(AgentState::UsageLimit),
+            "#2236: agy quota-reached pane must read UsageLimit (not Idle), feeding the #2233 latch"
+        );
+    }
+
+    /// FP guard: a normal agy idle pane (no quota chrome) must still read Idle —
+    /// the new UsageLimit pattern must not over-match ordinary output.
+    #[test]
+    fn agy_normal_idle_not_misread_as_usage_limit() {
+        let idle = "  Antigravity CLI\n  Type your message\n  ? for shortcuts";
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(idle),
+            Some(AgentState::Idle),
+            "#2236: ordinary agy idle pane must NOT be misread as UsageLimit"
         );
     }
 }
