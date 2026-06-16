@@ -2559,6 +2559,178 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 
+    // ── #2234 (B) ARCHITECTURE VALIDATION (task t-…29025-1, operator-required) ──
+    //
+    // Two empirical real-git experiments, run via `--nocapture` to dump the data
+    // for the operator decision. NOT a guard — characterization only.
+    //   A. all-backend config × dirty-guard: does each backend's MCP config (written
+    //      by the REAL `mcp_config::configure`) make `worktree_has_work_at_risk`
+    //      return true in a (B) worktree? (→ a porcelain dirty-guard would flag
+    //      EVERY normal dispatch.)
+    //   B. cross-project re-dispatch: re-provisioning the SAME /workspace path with
+    //      a DIFFERENT source_repo — what happens to the first repo's work, cost.
+
+    /// EXPERIMENT A. For each of the 5 backends, provision a (B) workspace worktree
+    /// of a source repo that does NOT gitignore agent config (the realistic user
+    /// project), write the backend's real MCP config via `mcp_config::configure`,
+    /// then measure `git status --porcelain` + `worktree_has_work_at_risk`. Also
+    /// confirms the config survives an in-place checkout (untracked carry).
+    #[test]
+    fn experiment_a_backend_config_vs_work_at_risk_in_b_worktree() {
+        let backends: &[(&str, &str)] = &[
+            ("claude", ".claude/settings.local.json"),
+            ("kiro-cli", ".kiro/settings/mcp.json"),
+            ("agy", ".agents/mcp_config.json"),
+            ("opencode", "opencode.json"),
+            ("codex", ".codex/config.toml"),
+        ];
+        eprintln!(
+            "\n=== EXPERIMENT A: backend config × worktree_has_work_at_risk (B worktree) ==="
+        );
+        let mut at_risk_count = 0;
+        for (cmd, cfg_rel) in backends {
+            let home = tmp_home(&format!("expA-{cmd}"));
+            // Source repo with NO agent-config gitignore (realistic user project).
+            let repo = tmp_repo(&format!("expA-{cmd}-repo"));
+            let agent = format!("dev-{cmd}");
+            let ws = crate::paths::workspace_dir(&home).join(&agent);
+            reconcile_workspace_to_worktree(&home, &agent, &ws, &repo, None)
+                .expect("provision (B)");
+
+            // Real producer: the same call the daemon makes before spawn
+            // (daemon/mod.rs:1968 → mcp_config::configure(wd, command, Some(name))).
+            crate::mcp_config::configure(&ws, cmd, Some(&agent));
+
+            let porcelain = crate::git_helpers::git_bypass(&ws, &["status", "--porcelain"])
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "<git failed>".into());
+            let cfg_written = ws.join(cfg_rel).exists();
+            let at_risk = worktree_has_work_at_risk(&ws);
+            if at_risk {
+                at_risk_count += 1;
+            }
+            eprintln!(
+                "  backend={cmd:<9} cfg_written={cfg_written} at_risk={at_risk}\n    porcelain: {}",
+                porcelain.replace('\n', " | ")
+            );
+            std::fs::remove_dir_all(&home).ok();
+            std::fs::remove_dir_all(&repo).ok();
+        }
+        eprintln!("  => {at_risk_count}/5 backends flag work_at_risk in a (B) worktree\n");
+        // CHARACTERIZATION: in a (B) worktree `ensure_project_root` is a NO-OP
+        // (already inside a work tree) so AGEND_GITIGNORE is NEVER written → the
+        // backend config is untracked → a porcelain dirty-guard flags EVERY dispatch.
+        assert!(
+            at_risk_count >= 4,
+            "#2234: ≥4/5 backends' config makes a (B) worktree look at-risk (dirty-guard would reject normal dispatch)"
+        );
+    }
+
+    /// EXPERIMENT B. Cross-project re-dispatch: provision /workspace as a (B)
+    /// worktree of repo A (with committed + uncommitted work), then re-provision
+    /// the SAME path with source_repo = repo B. Measures: reconcile case taken,
+    /// A's work backed up, the path becomes a B worktree, and a B→A round trip.
+    #[test]
+    fn experiment_b_cross_project_re_dispatch() {
+        eprintln!("\n=== EXPERIMENT B: cross-project re-dispatch (same /workspace path) ===");
+        let home = tmp_home("expB");
+        let repo_a = tmp_repo("expB-repoA");
+        let repo_b = tmp_repo("expB-repoB");
+        let agent = "devx";
+        let ws = crate::paths::workspace_dir(&home).join(agent);
+
+        // (B) worktree of repo A, with committed + uncommitted work.
+        reconcile_workspace_to_worktree(&home, agent, &ws, &repo_a, None).expect("provision A");
+        let git_a = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_a)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git A");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git_a(&["branch", "feat/a"]);
+        checkout_workspace_branch(&ws, "feat/a").expect("on feat/a");
+        std::fs::write(ws.join("committed_a.txt"), "A committed\n").unwrap();
+        for args in [
+            vec!["add", "committed_a.txt"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "A work",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&ws)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("commit A");
+        }
+        std::fs::write(ws.join("uncommitted_a.txt"), "A WIP\n").unwrap();
+        let matches_a_before = worktree_common_dir_matches(&ws, &repo_a);
+        eprintln!("  setup: ws is a worktree of A (common_dir_matches_A={matches_a_before}), +committed +uncommitted");
+
+        // RE-DISPATCH to repo B (different source_repo), SAME /workspace path.
+        let matches_b_pre = worktree_common_dir_matches(&ws, &repo_b);
+        let res = reconcile_workspace_to_worktree(&home, agent, &ws, &repo_b, None);
+        eprintln!(
+            "  reconcile(→B) result={:?}",
+            res.as_ref().map(|_| "Ok").map_err(|e| e.as_str())
+        );
+        let matches_b_after = worktree_common_dir_matches(&ws, &repo_b);
+        let backup = backup_dir_for(&home, agent);
+        let backup_has_uncommitted = backup
+            .as_ref()
+            .map(|b| b.join("uncommitted_a.txt").exists())
+            .unwrap_or(false);
+        let backup_has_committed = backup
+            .as_ref()
+            .map(|b| b.join("committed_a.txt").exists())
+            .unwrap_or(false);
+        eprintln!(
+            "  after →B: case(iii)_matched_B_before={matches_b_pre} now_a_B_worktree={matches_b_after} \
+             backup_made={} backup_has_uncommitted_A={backup_has_uncommitted} backup_has_committed_A={backup_has_committed}",
+            backup.is_some()
+        );
+
+        // B→A round trip: re-provision with A again.
+        let res2 = reconcile_workspace_to_worktree(&home, agent, &ws, &repo_a, None);
+        let matches_a_after = worktree_common_dir_matches(&ws, &repo_a);
+        eprintln!(
+            "  after →A (round trip): result={:?} now_a_A_worktree={matches_a_after} (each switch = backup whole dir + remove + git worktree add)",
+            res2.as_ref().map(|_| "Ok").map_err(|e| e.as_str())
+        );
+
+        // CHARACTERIZATION asserts: cross-project re-dispatch is destructive-to-path
+        // — it tears the A worktree down (backing up its work) and rebuilds as B.
+        assert!(
+            res.is_ok(),
+            "re-provision to B succeeds (falls to case ii: backup+remove+add)"
+        );
+        assert!(
+            matches_b_after,
+            "the SAME /workspace path is now a functional worktree of B"
+        );
+        assert!(
+            backup.is_some(),
+            "A's work (incl uncommitted) is backed up, not silently lost"
+        );
+        assert!(
+            backup_has_uncommitted,
+            "the uncommitted A WIP is captured in the backup"
+        );
+        eprintln!();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo_a).ok();
+        std::fs::remove_dir_all(&repo_b).ok();
+    }
+
     /// #2234 Phase 1c: the production flag decision (`workspace_as_worktree_from_env`)
     /// — pure over (flag, allowlist) inputs, no process-global env (so no leak).
     #[test]
