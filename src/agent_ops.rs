@@ -415,7 +415,16 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
             _ => false,
         };
     if under_workspace {
-        if let Err(e) = std::fs::remove_dir_all(working_dir) {
+        // #2234 Phase 0: under cure-(B) the workspace dir IS a daemon-managed
+        // canonical worktree (its `.git` is a gitlink FILE). A bare
+        // remove_dir_all would destroy uncommitted/unpushed work AND orphan the
+        // worktree registration in the canonical repo. Route a worktree through
+        // `git worktree remove --force` (work-at-risk backed up first). A
+        // standalone clone / plain dir (the pre-(B) state) returns false here →
+        // the byte-identical remove_dir_all below still runs.
+        if crate::worktree_pool::teardown_workspace_worktree(home, name, working_dir) {
+            // handled (gitlink worktree): removal + registry cleanup done.
+        } else if let Err(e) = std::fs::remove_dir_all(working_dir) {
             tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
         } else {
             tracing::info!(dir = %working_dir.display(), "removed workspace");

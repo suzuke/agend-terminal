@@ -368,6 +368,168 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
     }
 }
 
+/// #2234 Phase 0 (cure-(B) safety, independent value): tear down a per-agent
+/// WORKSPACE directory that is a git WORKTREE via `git worktree remove --force`
+/// from the OWNING repo, so no orphan registration survives in
+/// `<canonical>/.git/worktrees/`. Returns `true` when it took responsibility
+/// (the path is a worktree) — the caller MUST then NOT `remove_dir_all` (the
+/// orphan-leaving bug #2234). Returns `false` for a NON-worktree (`.git` is a
+/// directory = pre-(B) `git init`'d standalone clone, or absent = plain dir) →
+/// the caller keeps its byte-identical `remove_dir_all`.
+///
+/// r6/lead dialectic #1 (the critical safety direction): the **gitlink alone**
+/// gates this path. The `.agend-managed` marker is logged as a confidence
+/// signal but is NEVER a veto — a managed worktree whose marker write was lost
+/// (interrupted reconcile) still has a gitlink, and falling through to
+/// `remove_dir_all` would orphan it. This fn is only ever called for the
+/// per-agent workspace path (daemon-owned by construction), so removal is
+/// unconditional once a gitlink is present.
+///
+/// Work-at-risk guard (must-resolve #2): a worktree with uncommitted/untracked
+/// changes OR local commits not on any remote is backed up WHOLE to
+/// `<home>/reconcile-backups/<agent>-<epoch>/` BEFORE removal. If the backup
+/// FAILS, removal is ABORTED fail-closed (returns `true`, dir left in place for
+/// operator recovery) — never destroy work without a durable backup.
+pub fn teardown_workspace_worktree(home: &Path, agent: &str, working_dir: &Path) -> bool {
+    // Discriminator: a git WORKTREE has a `.git` gitlink FILE; a `git init`'d
+    // standalone clone has a `.git` DIRECTORY; a plain dir has neither.
+    if !working_dir.join(".git").is_file() {
+        return false;
+    }
+    if !is_daemon_managed(working_dir) {
+        tracing::warn!(agent, path = %working_dir.display(),
+            "#2234 teardown: workspace worktree missing .agend-managed marker \
+             (interrupted reconcile?) — removing via git anyway, NOT remove_dir_all");
+    }
+
+    let source_repo = resolve_owning_repo(home, agent, working_dir);
+
+    if worktree_has_work_at_risk(working_dir) {
+        match backup_worktree_dir(home, agent, working_dir) {
+            Ok(dest) => tracing::warn!(agent, backup = %dest.display(),
+                "#2234 teardown: workspace worktree had uncommitted/unpushed work — backed up before removal"),
+            Err(e) => {
+                tracing::error!(agent, path = %working_dir.display(), error = %e,
+                    "#2234 teardown: backup FAILED — aborting removal (fail-closed); worktree left for operator recovery");
+                return true;
+            }
+        }
+    }
+
+    // Mirror `remove_worktree`'s git call, WITHOUT the marker veto: run from the
+    // owning repo so the registration is cleared (not just the dir).
+    let wt_str = working_dir.display().to_string();
+    let result = if source_repo.as_os_str().is_empty() {
+        std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", &wt_str])
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+    } else {
+        crate::git_helpers::git_bypass(&source_repo, &["worktree", "remove", "--force", &wt_str])
+    };
+    let removed = matches!(&result, Ok(o) if o.status.success());
+    if !removed {
+        if let Ok(o) = &result {
+            tracing::warn!(agent, error = %String::from_utf8_lossy(&o.stderr).trim(), path = %working_dir.display(),
+                "#2234 teardown: git worktree remove failed — falling back to remove_dir_all + prune");
+        }
+        let _ = std::fs::remove_dir_all(working_dir);
+        if !source_repo.as_os_str().is_empty() {
+            let _ = crate::git_helpers::git_bypass(&source_repo, &["worktree", "prune"]);
+        }
+    }
+    true
+}
+
+/// Resolve the canonical repo that OWNS a worktree, from its gitlink's
+/// common-dir (the binding may already be cleared at teardown). Falls back to
+/// the binding's recorded `source_repo`.
+fn resolve_owning_repo(home: &Path, agent: &str, working_dir: &Path) -> PathBuf {
+    if let Ok(o) = crate::git_helpers::git_bypass(working_dir, &["rev-parse", "--git-common-dir"]) {
+        if o.status.success() {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !raw.is_empty() {
+                let common = if Path::new(&raw).is_absolute() {
+                    PathBuf::from(&raw)
+                } else {
+                    working_dir.join(&raw)
+                };
+                let common = dunce::canonicalize(&common).unwrap_or(common);
+                // common = `<repo>/.git`; its parent is the repo root.
+                if let Some(repo) = common.parent() {
+                    return repo.to_path_buf();
+                }
+            }
+        }
+    }
+    crate::binding::read(home, agent)
+        .map(|b| source_repo_from_binding(&b, working_dir))
+        .unwrap_or_default()
+}
+
+/// True if a worktree holds work that must not be silently destroyed:
+/// uncommitted/untracked changes, or — when a remote exists to be ahead of —
+/// local commits not reachable from any remote-tracking ref (committed-orphan).
+fn worktree_has_work_at_risk(wt: &Path) -> bool {
+    if crate::worktree::has_uncommitted_changes(wt) {
+        return true;
+    }
+    // "Unpushed" only has meaning when a remote exists; in a remote-less repo
+    // every commit looks unreachable-from-remotes, which is not work-at-risk.
+    let has_remote = crate::git_helpers::git_bypass(wt, &["remote"])
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    if !has_remote {
+        return false;
+    }
+    crate::git_helpers::git_bypass(wt, &["rev-list", "--count", "HEAD", "--not", "--remotes"])
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
+/// Back up a worktree WHOLE to `<home>/reconcile-backups/<agent>-<epoch>/`,
+/// skipping the regenerable build cache (`target`) and the gitlink (`.git`).
+/// Conservative (lead Q2): never auto-deleted — operator / gc reclaim later.
+fn backup_worktree_dir(home: &Path, agent: &str, wt: &Path) -> std::io::Result<PathBuf> {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = home
+        .join("reconcile-backups")
+        .join(format!("{agent}-{epoch}"));
+    std::fs::create_dir_all(&dest)?;
+    copy_dir_excluding(wt, &dest, &["target", ".git"])?;
+    Ok(dest)
+}
+
+fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if exclude.iter().any(|e| name == std::ffi::OsStr::new(e)) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_excluding(&from, &to, exclude)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 fn clear_binding_state(home: &Path, agent: &str) {
     crate::binding::unbind(home, agent);
     crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
@@ -1273,6 +1435,194 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #2234 Phase 0: build a daemon-managed git WORKTREE at the per-agent
+    /// workspace path (`<home>/workspace/<agent>`), mirroring the cure-(B)
+    /// world where the workspace dir IS the bound worktree (its `.git` a gitlink
+    /// FILE). Returns the worktree path.
+    fn managed_workspace_worktree(home: &Path, repo: &Path, agent: &str, branch: &str) -> PathBuf {
+        let wt = crate::paths::workspace_dir(home).join(agent);
+        std::fs::create_dir_all(wt.parent().expect("workspace parent")).ok();
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", branch, &wt.display().to_string()])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git worktree add");
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Daemon-managed marker (as lease() writes).
+        std::fs::write(wt.join(MANAGED_MARKER), "").ok();
+        assert!(
+            wt.join(".git").is_file(),
+            "worktree .git must be a gitlink file"
+        );
+        wt
+    }
+
+    /// `git worktree list --porcelain` for `repo` — used to assert no orphan
+    /// registration survives a teardown.
+    fn worktree_list(repo: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git worktree list");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// #2234 Phase 0 (RED→GREEN): tearing down a per-agent workspace that is a
+    /// daemon-managed worktree must route through `git worktree remove` (clearing
+    /// the canonical registration) — NOT a bare `remove_dir_all`, which deletes
+    /// the dir but leaves an ORPHAN worktree entry in `<canonical>/.git/worktrees/`.
+    #[test]
+    fn cleanup_working_dir_managed_worktree_removes_via_git_no_orphan() {
+        let home = tmp_home("p0-wt-noorphan");
+        let repo = tmp_repo("p0-wt-noorphan-repo");
+        let wt = managed_workspace_worktree(&home, &repo, "devw", "feat/p0");
+        assert!(worktree_list(&repo).contains(&wt.display().to_string()));
+
+        crate::agent_ops::cleanup_working_dir(&home, "devw", &wt);
+
+        assert!(!wt.exists(), "worktree dir must be removed");
+        assert!(
+            !worktree_list(&repo).contains(&wt.display().to_string()),
+            "no ORPHAN worktree registration may survive in the canonical repo \
+             (a bare remove_dir_all would leave one): {}",
+            worktree_list(&repo)
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Find the single reconcile-backup dir for `agent` (epoch suffix varies).
+    fn backup_dir_for(home: &Path, agent: &str) -> Option<PathBuf> {
+        std::fs::read_dir(home.join("reconcile-backups"))
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("{agent}-")))
+            })
+    }
+
+    /// #2234 Phase 0: a worktree with UNCOMMITTED work is backed up WHOLE before
+    /// the git removal — never silently destroyed.
+    #[test]
+    fn cleanup_working_dir_dirty_worktree_backs_up_before_remove() {
+        let home = tmp_home("p0-wt-dirty");
+        let repo = tmp_repo("p0-wt-dirty-repo");
+        let wt = managed_workspace_worktree(&home, &repo, "devd", "feat/p0d");
+        std::fs::write(wt.join("WIP.txt"), "unsaved work").unwrap();
+
+        crate::agent_ops::cleanup_working_dir(&home, "devd", &wt);
+
+        assert!(!wt.exists(), "worktree removed");
+        let backup = backup_dir_for(&home, "devd").expect("backup dir created");
+        assert_eq!(
+            std::fs::read_to_string(backup.join("WIP.txt")).unwrap(),
+            "unsaved work",
+            "uncommitted work must be preserved in the backup"
+        );
+        assert!(
+            !backup.join(".git").exists() && !backup.join("target").exists(),
+            "backup excludes the gitlink + regenerable target/"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 0: a worktree with a local commit not on any remote
+    /// (committed-orphan) is backed up before removal — the has_uncommitted
+    /// guard alone would miss it.
+    #[test]
+    fn cleanup_working_dir_committed_orphan_backs_up_before_remove() {
+        let home = tmp_home("p0-wt-orphan");
+        let repo = tmp_repo("p0-wt-orphan-repo");
+        let wt = managed_workspace_worktree(&home, &repo, "devo", "feat/p0o");
+        // A remote exists but nothing is pushed → HEAD's commits are unreachable
+        // from remotes = committed-orphan. Tree itself is clean.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", &repo.display().to_string()])
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git remote add");
+
+        crate::agent_ops::cleanup_working_dir(&home, "devo", &wt);
+
+        assert!(!wt.exists(), "worktree removed");
+        assert!(
+            backup_dir_for(&home, "devo").is_some(),
+            "committed-orphan worktree must be backed up before removal"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 0 (r6/lead dialectic #1): a gitlink worktree MISSING the
+    /// `.agend-managed` marker (e.g. interrupted reconcile) still routes through
+    /// `git worktree remove` — the marker is NEVER a veto into the
+    /// orphan-leaving remove_dir_all path.
+    #[test]
+    fn teardown_marker_missing_still_removes_via_git_no_orphan() {
+        let home = tmp_home("p0-wt-nomarker");
+        let repo = tmp_repo("p0-wt-nomarker-repo");
+        let wt = managed_workspace_worktree(&home, &repo, "devn", "feat/p0n");
+        std::fs::remove_file(wt.join(MANAGED_MARKER)).unwrap();
+        assert!(!is_daemon_managed(&wt));
+
+        let handled = teardown_workspace_worktree(&home, "devn", &wt);
+
+        assert!(
+            handled,
+            "gitlink present → must take the worktree path even sans marker"
+        );
+        assert!(!wt.exists(), "worktree removed");
+        assert!(
+            !worktree_list(&repo).contains(&wt.display().to_string()),
+            "no orphan registration may survive: {}",
+            worktree_list(&repo)
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 0: a pre-(B) STANDALONE clone (`.git` is a DIRECTORY) is NOT
+    /// a worktree → `teardown_workspace_worktree` declines (returns false) and
+    /// `cleanup_working_dir` falls back to the byte-identical remove_dir_all.
+    #[test]
+    fn teardown_standalone_clone_declines_byte_identical() {
+        let home = tmp_home("p0-standalone");
+        let ws = crate::paths::workspace_dir(&home).join("devs");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&ws)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git init");
+        assert!(
+            ws.join(".git").is_dir(),
+            ".git must be a directory (standalone)"
+        );
+
+        // Helper declines (not a worktree).
+        assert!(!teardown_workspace_worktree(&home, "devs", &ws));
+        // Public path still removes the whole dir (byte-identical pre-(B)).
+        crate::agent_ops::cleanup_working_dir(&home, "devs", &ws);
+        assert!(!ws.exists(), "standalone workspace dir removed as before");
+        assert!(
+            backup_dir_for(&home, "devs").is_none(),
+            "no backup for standalone"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     fn tmp_repo(tag: &str) -> PathBuf {
