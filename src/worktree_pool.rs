@@ -1288,6 +1288,43 @@ fn parse_worktree_porcelain(out: &str) -> Vec<(PathBuf, Option<String>)> {
     records
 }
 
+/// #2234 Phase 2: cure-(B) workspace worktrees — `workspace/<agent>` dirs whose
+/// `.git` is a gitlink FILE (a real worktree, Phase 0's discriminator). Empty
+/// when (B) is OFF (no workspace dir is a worktree), so every consumer stays
+/// byte-identical until (B) ships. Marker-LESS interrupted-reconcile worktrees
+/// are still caught here (gitlink-alone). Single impl shared by
+/// `fs_managed_worktrees` (→ enumerate / gc) and `worktree::list_residual`.
+pub(crate) fn workspace_gitlink_worktrees(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(crate::paths::workspace_dir(home)) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.join(".git").is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// #2234 Phase 2: the fs-scan portion of [`enumerate_managed_worktrees`] —
+/// every daemon-managed worktree dir on disk across BOTH layouts:
+/// `worktrees/<agent>/<branch...>` (marker-walk, slash-branch aware) +
+/// cure-(B) `workspace/<agent>` (gitlink). The SINGLE marker-walk impl shared by
+/// `enumerate` (registry ∪ fs) and `gc_candidates` — no parallel rewrite, no
+/// drift. Home-only (no `source_repo`): gc/list are home-wide and need no
+/// `git worktree list`. byte-identical when (B) OFF (the workspace part is empty).
+pub(crate) fn fs_managed_worktrees(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_managed_worktrees(
+        &daemon_managed_worktree_root(home),
+        MARKER_WALK_MAX_DEPTH,
+        &mut out,
+    );
+    out.extend(workspace_gitlink_worktrees(home));
+    out
+}
+
 /// #2234 Phase 2: enumerate EVERY daemon-managed worktree across BOTH layouts
 /// (`worktrees/<agent>/<branch>` and cure-(B) `workspace/<agent>`), unioning the
 /// canonical registry (authoritative for any path) with an fs-scan of the known
@@ -1355,22 +1392,10 @@ pub fn enumerate_managed_worktrees(home: &Path, source_repo: &Path) -> Vec<Manag
         }
     }
 
-    // fs pass — catch orphan dirs the registry doesn't know. worktrees_root:
-    // marker-walk (slash-branch aware). workspace: gitlink-alone gate (a `.git`
-    // FILE ⟹ a worktree, aligned with Phase 0's discriminator — marker-less
-    // interrupted-reconcile worktrees are still caught; the registry pass covers
-    // the rest).
-    let mut fs_found = Vec::new();
-    collect_managed_worktrees(&worktrees_root, MARKER_WALK_MAX_DEPTH, &mut fs_found);
-    if let Ok(entries) = std::fs::read_dir(&workspace) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.join(".git").is_file() {
-                fs_found.push(p);
-            }
-        }
-    }
-    for p in fs_found {
+    // fs pass — catch orphan dirs the registry doesn't know. Shared
+    // `fs_managed_worktrees` is the SINGLE marker-walk + workspace-gitlink impl
+    // (also used by gc_candidates / list_residual — no parallel rewrite).
+    for p in fs_managed_worktrees(home) {
         let cp = canon(&p);
         by_path
             .entry(cp.clone())
@@ -1395,18 +1420,13 @@ pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
             .into_iter()
             .collect();
 
-    // New layout: <home>/worktrees/<agent>/<branch>/ — but a SLASH branch
-    // (`fix/xxx`, `feat/yyy` = the common case) nests an EXTRA level
-    // (`<agent>/fix/xxx`), so the old fixed 1-level descent enumerated `fix` (not a
-    // worktree, no marker) and missed the real worktree entirely (reviewer-2 #4, a
-    // pre-existing GC bug that silently disabled GC — clean-release AND
-    // force-reclaim — for most branches). Walk DOWN to the `.agend-managed` marker
-    // instead of assuming a fixed depth.
-    let new_root = daemon_managed_worktree_root(home);
-    let mut managed = Vec::new();
-    collect_managed_worktrees(&new_root, MARKER_WALK_MAX_DEPTH, &mut managed);
-    for wt_path in &managed {
-        if let Some(candidate) = evaluate_candidate(home, wt_path, &live_agents) {
+    // New layout `worktrees/<agent>/<branch>/` (marker-walk, slash-branch aware)
+    // + cure-(B) `workspace/<agent>` gitlink worktrees, via the shared
+    // `fs_managed_worktrees` (#2234 Phase 2 — single marker-walk impl). The
+    // workspace part is empty when (B) is OFF → byte-identical candidate set; the
+    // `evaluate_candidate` marker-gate filters anything non-managed regardless.
+    for wt_path in fs_managed_worktrees(home) {
+        if let Some(candidate) = evaluate_candidate(home, &wt_path, &live_agents) {
             candidates.push(candidate);
         }
     }
@@ -4610,6 +4630,42 @@ mod tests {
         assert!(
             !orp.registered,
             "orphan dir is NOT git-registered (caught only by the fs-scan)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 2 byte-identical-OFF: with no cure-(B) workspace worktree,
+    /// `fs_managed_worktrees` == the worktrees_root marker-walk (gc's prior scan).
+    #[test]
+    fn fs_managed_worktrees_off_byte_identical_2234() {
+        let home = tmp_home("fsm-off");
+        let wt = home.join("worktrees").join("dev").join("fix").join("x");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(MANAGED_MARKER), "agent=dev\n").unwrap();
+        let mut collected = Vec::new();
+        collect_managed_worktrees(
+            &daemon_managed_worktree_root(&home),
+            MARKER_WALK_MAX_DEPTH,
+            &mut collected,
+        );
+        assert_eq!(
+            fs_managed_worktrees(&home),
+            collected,
+            "#2234 OFF: fs_managed == worktrees_root marker-walk (workspace part empty → byte-identical)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2234 Phase 2 (B) ON: a `workspace/<agent>` gitlink worktree is included.
+    #[test]
+    fn fs_managed_worktrees_includes_workspace_gitlink_2234() {
+        let home = tmp_home("fsm-b");
+        let repo = tmp_repo("fsm-b-repo");
+        let ws = managed_workspace_worktree(&home, &repo, "devb", "feat/y");
+        assert!(
+            fs_managed_worktrees(&home).iter().any(|p| p == &ws),
+            "#2234: cure-(B) workspace gitlink worktree must be enumerated by fs_managed_worktrees"
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();

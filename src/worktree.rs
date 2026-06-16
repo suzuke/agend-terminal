@@ -659,11 +659,9 @@ pub fn sync_worktree_to_head(worktree_dir: &Path) {
 /// is repo-independent — agent dirs live under the central daemon
 /// state, not per-repo.
 pub fn list_residual(home: &Path) -> Vec<String> {
+    // `worktrees/<...>` first-level entries — UNCHANGED (byte-identical OFF).
     let wt_base = home.join("worktrees");
-    if !wt_base.exists() {
-        return Vec::new();
-    }
-    std::fs::read_dir(&wt_base)
+    let mut out: Vec<String> = std::fs::read_dir(&wt_base)
         .ok()
         .map(|entries| {
             entries
@@ -672,7 +670,15 @@ pub fn list_residual(home: &Path) -> Vec<String> {
                 .map(|e| e.file_name().to_string_lossy().to_string())
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // #2234 Phase 2: also surface cure-(B) `workspace/<agent>` gitlink worktrees
+    // (shared single-impl scan). Empty when (B) is OFF → byte-identical.
+    out.extend(
+        crate::worktree_pool::workspace_gitlink_worktrees(home)
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from)),
+    );
+    out
 }
 
 #[cfg(test)]
@@ -1489,6 +1495,34 @@ mod tests {
         assert!(
             ws.exists(),
             "#2234: the live branchY workspace must NOT be destroyed by a stale remove(branchX)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 2: list_residual also surfaces cure-(B) `workspace/<agent>`
+    /// gitlink worktrees (the worktrees_root first-level scan is unchanged →
+    /// byte-identical OFF; this adds the workspace coverage when (B) is on).
+    #[test]
+    fn list_residual_includes_workspace_gitlink_2234() {
+        let home = tmp_home("lr-ws");
+        let repo = tmp_repo("lr-ws-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devw");
+        std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "feat/y", &ws.display().to_string()])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            list_residual(&home).contains(&"devw".to_string()),
+            "#2234: cure-(B) workspace gitlink agent must appear in list_residual"
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
