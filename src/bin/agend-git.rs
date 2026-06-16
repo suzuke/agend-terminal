@@ -84,16 +84,20 @@ fn main() {
     let binding = read_binding(&home, &agent);
     let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
 
-    // #2234 (C): observability stopgap for the cwd↔bound-worktree drift. When a
-    // bound agent's cwd is its `<home>/workspace/<agent>` clone — a SEPARATE git
-    // object store from its bound worktree — the shim routes git to the worktree
-    // (ChdirPass) while the agent's file edits / cargo / `AGEND_GIT_BYPASS=1 git`
-    // act on the clone, so git reads look "fake" (clean / already-merged) and the
-    // agent silently works against a stale tree. Surface it ONCE (stderr +
-    // fleet_events) instead of corrupting the agent's git cognition. Purely
-    // additive — does NOT change any routing decision below. Fire-once + latch on
-    // the drifted cwd (see `warn_workspace_drift_once`) so it never spams per op.
-    maybe_warn_workspace_drift(&home, &agent, &binding);
+    // #2234: loud WARN for the cwd↔bound-worktree drift. When a bound agent's cwd
+    // is its `<home>/workspace/<agent>` clone — a SEPARATE git object store from its
+    // bound worktree — the shim routes git to the worktree (ChdirPass) while the
+    // agent's file edits / cargo / `AGEND_GIT_BYPASS=1 git` act on the clone, so git
+    // reads look "fake" (clean / already-merged) and the agent silently works
+    // against a stale tree. Surface it with an ACTIONABLE recovery hint (stderr +
+    // fleet_events) instead of corrupting the agent's git cognition. operator
+    // ruling (d-20260616134854749703-2): warn-only — NEVER block (a fail-closed
+    // block would deny 100% of bound agents, whose cwd is always this clone; the
+    // harm is rare and recoverable). Purely additive — does NOT change any routing
+    // decision below. Latched per `(cwd, is_mutating)` (see
+    // `warn_workspace_drift_once`): ≤2 warns per cwd (first read + first mutating
+    // op) so the agent sees the hint before its first write without per-op spam.
+    maybe_warn_workspace_drift(&home, &agent, &binding, subcommand);
 
     // #1463: non-destructive forensic capture of backend `init` heartbeat
     // commits. The RCA established these are produced by a backend process
@@ -514,26 +518,43 @@ fn is_workspace_clone_drift(home: &str, agent: &str, cwd: &Path, worktree: &Path
     cwd_c.starts_with(&ws_c) && paths_are_foreign(&cwd_c, worktree)
 }
 
-/// #2234 (C): emit a ONE-SHOT drift warning (stderr + a `cwd_worktree_drift`
-/// fleet_events line) when `cwd` is the agent's stale workspace clone. Latched on
-/// the canonical drifted cwd via `<home>/runtime/<agent>/cwd_drift_warned`: a
-/// standing drift warns exactly once (the cheap marker read short-circuits the
-/// commondir walk on every subsequent git op); a NEW drifted cwd re-warns (new
-/// info). Best-effort — every step swallows errors so it can NEVER block or
-/// alter the git command. Returns whether it warned (for tests). Takes `cwd`
-/// explicitly so the latch + emit are testable without mutating the process cwd.
-fn warn_workspace_drift_once(home: &str, agent: &str, cwd: &Path, worktree: &Path) -> bool {
+/// #2234: emit a drift warning (stderr + a `cwd_worktree_drift` fleet_events line)
+/// when `cwd` is the agent's stale workspace clone. Latched on the `(cwd,
+/// is_mutating)` pair via two per-class markers
+/// (`<home>/runtime/<agent>/cwd_drift_warned.{read,mut}`): a standing drift warns
+/// at most ONCE per class — the first read-class op AND the first mutating-class
+/// op each warn, so the agent is guaranteed to see the hint before its first
+/// dangerous write, while no op-class spams (≤2 warns per cwd). The cheap marker
+/// read short-circuits the commondir walk on every subsequent op of that class; a
+/// NEW drifted cwd re-warns (new info). `is_mutating` (from `is_mutating_local` at
+/// the call site) selects the class. Best-effort — every step swallows errors so
+/// it can NEVER block or alter the git command (warn-only). Returns whether it
+/// warned (for tests). Takes `cwd` explicitly so the latch + emit are testable
+/// without mutating the process cwd.
+fn warn_workspace_drift_once(
+    home: &str,
+    agent: &str,
+    cwd: &Path,
+    worktree: &Path,
+    is_mutating: bool,
+) -> bool {
     let cwd_c = match std::fs::canonicalize(cwd) {
         Ok(c) => c,
         Err(_) => return false,
     };
     let cwd_s = cwd_c.to_string_lossy().to_string();
+    // Per-class latch: `.mut` for mutating ops, `.read` for everything else, so
+    // each class warns at most once per cwd (≤2 total) without spamming.
     let marker = PathBuf::from(home)
         .join("runtime")
         .join(agent)
-        .join("cwd_drift_warned");
-    // Cheap latch check FIRST — already warned for this exact cwd → skip the
-    // (filesystem-walking) drift detection entirely.
+        .join(if is_mutating {
+            "cwd_drift_warned.mut"
+        } else {
+            "cwd_drift_warned.read"
+        });
+    // Cheap latch check FIRST — already warned for this exact cwd in this class →
+    // skip the (filesystem-walking) drift detection entirely.
     if std::fs::read_to_string(&marker)
         .map(|s| s.trim() == cwd_s)
         .unwrap_or(false)
@@ -543,15 +564,7 @@ fn warn_workspace_drift_once(home: &str, agent: &str, cwd: &Path, worktree: &Pat
     if !is_workspace_clone_drift(home, agent, &cwd_c, worktree) {
         return false;
     }
-    eprintln!(
-        "agend-git: \u{26a0} #2234 cwd/worktree drift — your cwd '{}' is a SEPARATE \
-         git repo from your bound worktree '{}'. git runs against the worktree (via \
-         the shim) while file edits / cargo / `AGEND_GIT_BYPASS=1 git` act on this \
-         cwd clone, so git reads look stale/'fake'. `cd {}` to work in your worktree.",
-        cwd_c.display(),
-        worktree.display(),
-        worktree.display()
-    );
+    eprintln!("{}", drift_warning_message(&cwd_c, worktree));
     write_git_event_typed(
         home,
         agent,
@@ -573,17 +586,46 @@ fn subcmd_for_drift_event() -> &'static str {
     "(cwd-drift)"
 }
 
-/// #2234 (C): thin env wrapper wiring `warn_workspace_drift_once` to the live
-/// process cwd + binding. No-op when unbound (no worktree to compare against) or
-/// the cwd is unreadable. Called once per shim invocation from `main`.
-fn maybe_warn_workspace_drift(home: &str, agent: &str, binding: &Binding) {
+/// #2234: the loud drift WARN's actionable recovery message — single source of
+/// truth for both the `eprintln!` emit and the contract test (#1493: route the
+/// consumer through the producer, never hand-copy the shape). operator ruling
+/// (d-20260616134854749703-2): the shim does NOT run `git status` or maintain a
+/// backend-config exclusion set itself (keep it simple) — it tells the agent the
+/// concrete commands to run. Names the cwd-clone vs worktree, how to CHECK what
+/// mislanded, and how to RECOVER (absolute-path re-edit / `cp`), with r2's
+/// correction that `cd` alone is insufficient (git keys on the binding, not cwd;
+/// Edit/Write use absolute paths unaffected by cd).
+fn drift_warning_message(cwd: &Path, worktree: &Path) -> String {
+    let cwd_d = cwd.display();
+    let wt_d = worktree.display();
+    format!(
+        "agend-git: \u{26a0} #2234 cwd/worktree drift — your cwd '{cwd_d}' is a \
+         SEPARATE git repo from your bound worktree '{wt_d}'. git (via this shim) \
+         runs against the worktree, but file edits made with a cwd-relative path \
+         land in THIS cwd clone where git can't see them — so reads look \
+         stale/'fake' and commits can come up empty.\n  \
+         CHECK what mislanded:  git -C '{cwd_d}' status --short   \
+         (any real source files listed there were written to the wrong repo)\n  \
+         RECOVER: re-make those edits using ABSOLUTE paths under '{wt_d}', or copy \
+         them across (`cp '{cwd_d}/<file>' '{wt_d}/<file>'`) — `cd` alone does NOT \
+         move edits already written by absolute path. git already routes to the \
+         worktree; verify with  AGEND_GIT_BYPASS=1 git -C '{wt_d}' status"
+    )
+}
+
+/// #2234: thin env wrapper wiring `warn_workspace_drift_once` to the live process
+/// cwd + binding. No-op when unbound (no worktree to compare against) or the cwd is
+/// unreadable. Called once per shim invocation from `main`. `subcmd` selects the
+/// per-class latch via `is_mutating_local` so the read- and mutating-class warnings
+/// latch independently (≤2 per cwd).
+fn maybe_warn_workspace_drift(home: &str, agent: &str, binding: &Binding, subcmd: &str) {
     let Some(ref wt) = binding.worktree else {
         return;
     };
     let Ok(cwd) = env::current_dir() else {
         return;
     };
-    let _ = warn_workspace_drift_once(home, agent, &cwd, Path::new(wt));
+    let _ = warn_workspace_drift_once(home, agent, &cwd, Path::new(wt), is_mutating_local(subcmd));
 }
 
 /// #1463 (A): the LOCAL mutating subcommands eligible for foreign-repo
@@ -3692,7 +3734,7 @@ mod tests {
     }
 
     #[test]
-    fn drift_warns_once_then_latches_2234() {
+    fn drift_warns_per_class_then_latches_2234() {
         let home = drift_home("latch");
         let agent = "ag";
         let h = home.to_str().unwrap();
@@ -3701,30 +3743,122 @@ mod tests {
         let worktree = home.join("wt");
         drift_git_init(&worktree);
 
-        // First sighting → warns, writes the latch marker + a fleet_events line.
+        // First read-class sighting → warns, writes the .read latch + a fleet_events
+        // line.
         assert!(
-            warn_workspace_drift_once(h, agent, &ws, &worktree),
-            "first drift sighting must warn"
+            warn_workspace_drift_once(h, agent, &ws, &worktree, false),
+            "first read-class drift sighting must warn"
         );
-        let marker = home.join("runtime").join(agent).join("cwd_drift_warned");
-        assert!(marker.exists(), "latch marker must be written");
+        let read_marker = home
+            .join("runtime")
+            .join(agent)
+            .join("cwd_drift_warned.read");
+        assert!(
+            read_marker.exists(),
+            "read-class latch marker must be written"
+        );
         let events = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
         assert!(
             events.contains("cwd_worktree_drift"),
             "a cwd_worktree_drift event must be logged: {events}"
         );
 
-        // Second call, same drifted cwd → latched, no second warn.
+        // Second read-class call, same drifted cwd → latched, no second warn.
         assert!(
-            !warn_workspace_drift_once(h, agent, &ws, &worktree),
-            "standing drift must warn only once (latched)"
+            !warn_workspace_drift_once(h, agent, &ws, &worktree, false),
+            "standing read-class drift must warn only once (latched)"
         );
-        // Aligned cwd never warns.
+
+        // The FIRST mutating-class op on the SAME cwd is a distinct latch class →
+        // warns again (so the agent sees the hint before its first write). ≤2/cwd.
         assert!(
-            !warn_workspace_drift_once(h, agent, &worktree, &worktree),
-            "aligned cwd must not warn"
+            warn_workspace_drift_once(h, agent, &ws, &worktree, true),
+            "first mutating-class drift sighting must warn (independent latch class)"
+        );
+        let mut_marker = home
+            .join("runtime")
+            .join(agent)
+            .join("cwd_drift_warned.mut");
+        assert!(
+            mut_marker.exists(),
+            "mutating-class latch marker must be written"
+        );
+
+        // Second mutating-class call → latched, no third warn (cadence capped at 2).
+        assert!(
+            !warn_workspace_drift_once(h, agent, &ws, &worktree, true),
+            "standing mutating-class drift must warn only once (latched)"
+        );
+
+        // Aligned cwd never warns (guard), in either class.
+        assert!(
+            !warn_workspace_drift_once(h, agent, &worktree, &worktree, false),
+            "aligned cwd must not warn (read class)"
+        );
+        assert!(
+            !warn_workspace_drift_once(h, agent, &worktree, &worktree, true),
+            "aligned cwd must not warn (mutating class)"
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // #2234: a NEW drifted cwd re-warns even after a prior cwd latched — the latch
+    // keys on the exact cwd string, so moving to a different clone is new info.
+    #[test]
+    fn drift_new_cwd_rewarns_2234() {
+        let home = drift_home("newcwd");
+        let agent = "ag";
+        let h = home.to_str().unwrap();
+        let ws1 = home.join("workspace").join(agent);
+        drift_git_init(&ws1);
+        let worktree = home.join("wt");
+        drift_git_init(&worktree);
+
+        assert!(
+            warn_workspace_drift_once(h, agent, &ws1, &worktree, false),
+            "first cwd must warn"
+        );
+        assert!(
+            !warn_workspace_drift_once(h, agent, &ws1, &worktree, false),
+            "same cwd latched"
+        );
+        // A DIFFERENT clone path under the workspace dir → not yet latched → re-warns.
+        let ws2 = ws1.join("nested");
+        drift_git_init(&ws2);
+        assert!(
+            warn_workspace_drift_once(h, agent, &ws2, &worktree, false),
+            "a new drifted cwd must re-warn (new info)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // #2234: the warning carries the ACTIONABLE recovery hint (operator ruling:
+    // replace the cd-only message). Routes through the SAME `drift_warning_message`
+    // producer the emit uses (#1493 — no hand-copied shape) and pins the concrete
+    // recovery tokens so the message can't silently regress to cd-only.
+    #[test]
+    fn drift_message_has_actionable_recovery_hint_2234() {
+        let msg = drift_warning_message(Path::new("/home/ws/ag"), Path::new("/home/wt"));
+        // The actionable recovery contract: a check command, absolute-path guidance,
+        // and the explicit "cd alone does NOT" correction (r2's finding).
+        assert!(
+            msg.contains("status --short"),
+            "must tell the agent how to CHECK what mislanded: {msg}"
+        );
+        assert!(
+            msg.contains("ABSOLUTE paths"),
+            "must give the absolute-path recovery action: {msg}"
+        );
+        assert!(
+            msg.contains("`cd` alone does NOT"),
+            "must correct the insufficient cd-only advice (r2): {msg}"
+        );
+        // Names both endpoints so the agent knows which dir is which.
+        assert!(
+            msg.contains("/home/ws/ag") && msg.contains("/home/wt"),
+            "must name both the cwd clone and the worktree: {msg}"
+        );
     }
 }
