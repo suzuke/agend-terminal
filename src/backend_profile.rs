@@ -214,7 +214,10 @@ fn opencode_profile() -> BackendProfile {
                 AgentState::ServerRateLimit,
                 crate::state::patterns::SERVER_RATE_LIMIT_NET_ERRORS,
             ),
-            (AgentState::UsageLimit, r"Quota Limit Exceeded"),
+            (
+                AgentState::UsageLimit,
+                r"Quota Limit Exceeded|monthly usage limit reached",
+            ),
             (
                 AgentState::ApiError,
                 r"Error from provider:|request validation errors",
@@ -494,6 +497,42 @@ mod opencode_resumed_idle_2020 {
             patterns.detect(&working),
             Some(AgentState::Thinking),
             "statusline must not outrank the working marker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opencode_monthly_usage_limit_2026_06 {
+    use super::*;
+
+    /// Operator-captured 2026-06-16 from mlx-pair (OpenCode 1.15.13 / DeepSeek
+    /// V4 Pro): a real monthly usage-limit wall the prior pattern
+    /// (`Quota Limit Exceeded`) did not match, so the agent read as Idle and the
+    /// #2233 quota-wedge escalate-once-latch never fired. Verbatim shape (the
+    /// `monthly usage limit reached` phrase is the stable anchor; the reset
+    /// countdown and truncation chrome vary).
+    const MONTHLY_USAGE_LIMIT_PANE: &str = "\u{2b1d}monthly usage limit reached. It will reset in 11 days 20 hours. To continue usin... (click to ex\n retrying in ~1 week attempt #1";
+
+    #[test]
+    fn monthly_usage_limit_detects_usage_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(MONTHLY_USAGE_LIMIT_PANE),
+            Some(AgentState::UsageLimit),
+            "operator-captured OpenCode 'monthly usage limit reached' must read UsageLimit (feeds the #2233 quota-wedge latch)"
+        );
+    }
+
+    /// FP guard (#2236 lesson): the new alternation must not over-match ordinary
+    /// output. A normal opencode idle pane (no quota wall) must still read Idle.
+    #[test]
+    fn normal_idle_not_misread_as_usage_limit() {
+        let idle = "  \u{2503}\n  \u{2503}  Build \u{b7} DeepSeek V4 Pro OpenCode Go\n\n          270.3K (27%) \u{b7} $2.23  ctrl+p commands";
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(idle),
+            Some(AgentState::Idle),
+            "#2236: ordinary opencode idle pane must NOT be misread as UsageLimit"
         );
     }
 }
