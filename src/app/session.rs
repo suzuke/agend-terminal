@@ -244,7 +244,7 @@ pub(super) fn restore_with_reconciliation(
                 )
                 .ok();
                 tracing::info!(
-                    target: "restart_timing",
+                    phase = "restore-spawn",
                     agent = %name,
                     elapsed_ms = spawn_start.elapsed().as_millis() as u64,
                     ok = pane.is_some(),

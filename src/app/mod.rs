@@ -369,7 +369,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // per-agent PTY spawns are done. Sum of the per-agent `restore-spawn`
     // lines ≈ this; the gap to `pre-render-loop` below is post-spawn wiring.
     tracing::info!(
-        target: "restart_timing",
+        phase = "restore-complete",
         elapsed_ms = restore_start.elapsed().as_millis() as u64,
         attached = attached_mode,
         "restore-complete: session restore + fleet PTY spawns done"
@@ -466,7 +466,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // boot critical path the operator perceives as the restart freeze
     // (restore + per-agent spawns + post-spawn wiring). Pure tracing.
     tracing::info!(
-        target: "restart_timing",
+        phase = "pre-render-loop",
         elapsed_ms = restore_start.elapsed().as_millis() as u64,
         attached = attached_mode,
         "pre-render-loop: entering render loop (first draw imminent)"
