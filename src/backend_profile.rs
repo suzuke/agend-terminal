@@ -353,8 +353,19 @@ fn claudecode_profile() -> BackendProfile {
                 r"You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
             ),
             (
+                // #2090 P2: the broad `context.*(full|limit)` arm is replaced by a
+                // char-BOUNDED same-context arm `context.{0,16}(full|limit)`. The
+                // unbounded `.*` was the dominant hard-wrap-shadow false-positive
+                // source: flattening the bottom-N rows joins them into one line, so
+                // `.*` spanned the whole conversation blob and matched any "context"
+                // + any later "full"/"limit" (agents discussing context/limits while
+                // actively working — 1162 shadow records, ~97% FP). The {0,16} bound
+                // keeps real same-context wording ("context window full",
+                // "context window is full", "context limit") while killing the
+                // cross-row/cross-sentence amplification. The concrete
+                // `compacting context` arm is kept verbatim (zero FP, real signal).
                 AgentState::ContextFull,
-                r"compacting context|context.*(full|limit)",
+                r"compacting context|context.{0,16}(full|limit)",
             ),
             (
                 AgentState::PermissionPrompt,
