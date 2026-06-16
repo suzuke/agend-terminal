@@ -588,12 +588,70 @@ fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Resu
 /// agents once the flag is on). Per lead Q1: a flag (not a per-instance field) —
 /// default off → opt-in a few agents → flip the default at cutover.
 pub fn workspace_as_worktree_enabled(agent: &str) -> bool {
-    match std::env::var("AGEND_WORKSPACE_AS_WORKTREE").as_deref() {
-        Ok("1") | Ok("true") => match std::env::var("AGEND_WORKSPACE_AS_WORKTREE_AGENTS") {
-            Ok(list) if !list.trim().is_empty() => list.split(',').any(|a| a.trim() == agent),
-            _ => true,
-        },
-        _ => false,
+    // Test-injectable seam (#2234 Phase 1c): tests enable (B) via a THREAD-LOCAL
+    // override (`workspace_worktree_test_seam::force`) instead of a process-global
+    // `set_var`, so a flag-ON test never leaks the flag to other tests running in
+    // parallel in the same binary (the env-leak flake class r6 caught twice). The
+    // production read-path below is byte-identical — the daemon still reads
+    // `AGEND_WORKSPACE_AS_WORKTREE` (+ allowlist). Compiled out of release builds.
+    #[cfg(test)]
+    if let Some(forced) = workspace_worktree_test_seam::get() {
+        return forced;
+    }
+    workspace_as_worktree_from_env(
+        std::env::var("AGEND_WORKSPACE_AS_WORKTREE").ok().as_deref(),
+        std::env::var("AGEND_WORKSPACE_AS_WORKTREE_AGENTS")
+            .ok()
+            .as_deref(),
+        agent,
+    )
+}
+
+/// Pure flag decision over (flag, allowlist) inputs — unit-testable without any
+/// process-global env mutation. `AGEND_WORKSPACE_AS_WORKTREE` must be `1`/`true`;
+/// a non-empty `AGEND_WORKSPACE_AS_WORKTREE_AGENTS` then scopes to listed agents.
+fn workspace_as_worktree_from_env(
+    flag: Option<&str>,
+    allowlist: Option<&str>,
+    agent: &str,
+) -> bool {
+    if !matches!(flag, Some("1") | Some("true")) {
+        return false;
+    }
+    match allowlist {
+        Some(list) if !list.trim().is_empty() => list.split(',').any(|a| a.trim() == agent),
+        _ => true,
+    }
+}
+
+/// #2234 Phase 1c test seam: a THREAD-LOCAL (B)-flag override. Tests force the
+/// flag on/off for their OWN thread — `workspace_as_worktree_enabled` runs
+/// synchronously on the caller thread (dispatch / resolve_auto_worktree), so the
+/// override is observed there but is invisible to other tests' threads. This
+/// roots out the process-global `set_var` leak class (no serial-grouping needed).
+#[cfg(test)]
+pub(crate) mod workspace_worktree_test_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub(crate) fn get() -> Option<bool> {
+        OVERRIDE.with(|c| c.get())
+    }
+    fn set(v: Option<bool>) {
+        OVERRIDE.with(|c| c.set(v));
+    }
+    /// RAII: force the flag for the current thread; restores on drop (incl. panic).
+    #[must_use]
+    pub(crate) struct ForceGuard;
+    pub(crate) fn force(enabled: bool) -> ForceGuard {
+        set(Some(enabled));
+        ForceGuard
+    }
+    impl Drop for ForceGuard {
+        fn drop(&mut self) {
+            set(None);
+        }
     }
 }
 
@@ -2414,6 +2472,45 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 1c: the production flag decision (`workspace_as_worktree_from_env`)
+    /// — pure over (flag, allowlist) inputs, no process-global env (so no leak).
+    #[test]
+    fn workspace_as_worktree_from_env_flag_and_allowlist() {
+        // Off by default / unset / wrong value.
+        assert!(!workspace_as_worktree_from_env(None, None, "a"));
+        assert!(!workspace_as_worktree_from_env(Some("0"), None, "a"));
+        assert!(!workspace_as_worktree_from_env(Some("yes"), None, "a"));
+        // On for all agents when set and no allowlist.
+        assert!(workspace_as_worktree_from_env(Some("1"), None, "a"));
+        assert!(workspace_as_worktree_from_env(Some("true"), Some(""), "a"));
+        // Allowlist scopes to listed agents only.
+        assert!(workspace_as_worktree_from_env(Some("1"), Some("a,b"), "a"));
+        assert!(workspace_as_worktree_from_env(
+            Some("1"),
+            Some(" a , b "),
+            "b"
+        ));
+        assert!(!workspace_as_worktree_from_env(Some("1"), Some("a,b"), "c"));
+    }
+
+    /// #2234 Phase 1c: the thread-local test seam overrides the env decision for
+    /// the current thread only, and the RAII guard restores on drop.
+    #[test]
+    fn workspace_worktree_test_seam_is_thread_scoped_and_restores() {
+        assert!(!workspace_as_worktree_enabled("z"), "default off");
+        {
+            let _g = workspace_worktree_test_seam::force(true);
+            assert!(
+                workspace_as_worktree_enabled("z"),
+                "forced on for this thread"
+            );
+        }
+        assert!(
+            !workspace_as_worktree_enabled("z"),
+            "guard drop restores the env-default (off)"
+        );
     }
 
     fn tmp_repo(tag: &str) -> PathBuf {

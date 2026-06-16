@@ -1242,11 +1242,7 @@ mod tests {
     /// default `workspace/<name>` dir even when it has been git-init'd and
     /// `source_repo` is set (the deploy non-branch shape — `deployments.rs`
     /// writes exactly `source_repo` + a `workspace/<name>` working_directory).
-    // #2234: env-sensitive (reads AGEND_WORKSPACE_AS_WORKTREE via the gate) →
-    // shares the serial group with the flag tests so a flag-on test can't race
-    // this default-OFF assertion.
     #[test]
-    #[serial_test::serial(ws_as_worktree_env)]
     fn resolve_auto_worktree_skips_workspace_default_allows_explicit_repo_1858() {
         // (b) explicit real repo as working_directory → worktree still created.
         let home_b = tmp_repo("1858-b-home");
@@ -1313,9 +1309,8 @@ mod tests {
     /// #2234 cure-(B): with the flag OFF (default), a default workspace dir
     /// resolves to `None` exactly as pre-(B) — byte-identical, no reconcile.
     #[test]
-    #[serial_test::serial(ws_as_worktree_env)]
     fn resolve_auto_worktree_flag_off_workspace_none_2234() {
-        std::env::remove_var("AGEND_WORKSPACE_AS_WORKTREE");
+        let _flag = crate::worktree_pool::workspace_worktree_test_seam::force(false);
         let home = tmp_repo("2234-off-home");
         let repo = tmp_repo("2234-off-repo");
         let ws = crate::paths::workspace_dir(&home).join("agent");
@@ -1331,16 +1326,17 @@ mod tests {
     /// #2234 cure-(B): with the flag ON + a `source_repo`, the gate reconciles
     /// the workspace dir into a worktree and returns that SAME path (stable cwd).
     #[test]
-    #[serial_test::serial(ws_as_worktree_env)]
     fn resolve_auto_worktree_flag_on_workspace_reconciles_2234() {
         let home = tmp_repo("2234-on-home");
         let repo = tmp_repo("2234-on-repo");
         let ws = crate::paths::workspace_dir(&home).join("agent");
         let resolved = mk_resolved(ws.clone(), Some(repo.clone()), None, None);
 
-        std::env::set_var("AGEND_WORKSPACE_AS_WORKTREE", "1");
-        let got = resolve_auto_worktree(&home, "agent", &resolved);
-        std::env::remove_var("AGEND_WORKSPACE_AS_WORKTREE");
+        // Thread-local seam (not process-global set_var) → no cross-test leak.
+        let got = {
+            let _flag = crate::worktree_pool::workspace_worktree_test_seam::force(true);
+            resolve_auto_worktree(&home, "agent", &resolved)
+        };
 
         assert_eq!(
             got.as_deref(),

@@ -103,7 +103,6 @@ fn ci_watch_binding_corrupt_returns_error() {
 // ── EC9: bind_self ambiguous_args ───────────────────────────────────────
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ec9_bind_self_both_args_rejected_as_ambiguous() {
     let home = tmp_home("ec9");
     let sender = crate::identity::Sender::new("alpha");
@@ -216,7 +215,6 @@ fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std
 // release_full never mutates ci-watch state. Subscriptions persist
 // across release per operator intent in #931 body.
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ec7_release_full_unsubscribes_matching_branch() {
     let home = tmp_home("ec7-match");
     setup_git_repo(&home, "alpha");
@@ -252,7 +250,6 @@ fn ec7_release_full_unsubscribes_matching_branch() {
 // watches the agent subscribed to MUST persist across release. Hygiene
 // is delegated to TTL + PR-terminal + explicit unwatch.
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn release_full_unsubscribes_agent_from_cross_branch_watches_too() {
     let home = tmp_home("931-cross-branch-persists");
     setup_git_repo(&home, "alpha");
@@ -287,7 +284,6 @@ fn release_full_unsubscribes_agent_from_cross_branch_watches_too() {
 // on other repos that the agent subscribed to remain intact across
 // release — same persistence rule as cross-branch.
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn release_full_unsubscribes_agent_from_cross_repo_watches_too() {
     let home = tmp_home("931-cross-repo-persists");
     setup_git_repo_with_remote(&home, "alpha", "https://github.com/o/repo-a.git");
@@ -328,7 +324,6 @@ fn release_full_unsubscribes_agent_from_cross_repo_watches_too() {
 // persists across release. The file preserves `next_after_ci` chain +
 // polling state for any next agent who re-subscribes.
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ec7_release_full_removes_watch_file_when_last_subscriber() {
     let home = tmp_home("ec7-last");
     setup_git_repo(&home, "alpha");
@@ -359,7 +354,6 @@ fn ec7_release_full_removes_watch_file_when_last_subscriber() {
 // the guard keying is `(home, agent)`, so two SAME-home SAME-agent
 // dispatches in sequence both succeed (RAII releases between calls).
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ec11_sequential_same_agent_same_home_succeeds_via_raii_release() {
     let home = tmp_home("ec11-seq");
     setup_git_repo(&home, "alpha");
@@ -428,7 +422,6 @@ instances:
 // is invoked.
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
     let home = tmp_home("ec6-fleet");
     let src = home.join("src-tier2");
@@ -485,7 +478,6 @@ fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
 // ── EC4 (cont.) repo-override-wins-over-derivation through dispatch ─────
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ec4_fleet_repo_override_wins_over_derive() {
     let home = tmp_home("ec4-override");
     let src = home.join("src-noremote");
@@ -556,7 +548,6 @@ fn ec4_fleet_repo_override_wins_over_derive() {
 // ── bind_self with source_repo arg succeeds (positive new-shape proof) ──
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn bind_self_with_source_repo_arg_succeeds() {
     let home = tmp_home("bs-src-arg");
     let src = setup_git_repo(&home, "alpha");
@@ -573,7 +564,6 @@ fn bind_self_with_source_repo_arg_succeeds() {
 // ── #1044: bind_self task_id plumbing ──────────────────────────────────
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn bind_self_with_task_id_arg_persists_real_task_id() {
     let home = tmp_home("bs-tid");
     let src = setup_git_repo(&home, "beta");
@@ -599,7 +589,6 @@ fn bind_self_with_task_id_arg_persists_real_task_id() {
 }
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn bind_self_without_task_id_arg_uses_empty_not_self() {
     let home = tmp_home("bs-no-tid");
     let src = setup_git_repo(&home, "gamma");
@@ -626,7 +615,6 @@ fn bind_self_without_task_id_arg_uses_empty_not_self() {
 // ── source_repo override via bind_self_with_source param ────────────────
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn dispatch_with_source_repo_override_wins_over_fleet() {
     let home = tmp_home("override-wins");
     let stub_src = crate::paths::workspace_dir(&home).join("alpha");
@@ -686,7 +674,6 @@ fn dispatch_with_source_repo_override_wins_over_fleet() {
 // ── ci(watch) auto-derive from binding ──────────────────────────────────
 
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn ci_watch_uses_binding_source_repo_when_repo_arg_absent() {
     let home = tmp_home("ci-auto");
     setup_git_repo(&home, "alpha"); // configures origin → derive succeeds
@@ -760,7 +747,6 @@ fn ci_watch_no_origin_remote_returns_non_github_error() {
 /// branch) instead of leasing a fresh `worktrees/<agent>/<branch>`. All the
 /// existing dispatch tests run with the flag OFF → legacy lease (byte-identical).
 #[test]
-#[serial_test::serial(ws_as_worktree_env)]
 fn dispatch_workspace_as_worktree_binds_workspace_path_2234() {
     let git = |dir: &std::path::Path, args: &[&str]| {
         std::process::Command::new("git")
@@ -808,7 +794,10 @@ fn dispatch_workspace_as_worktree_binds_workspace_path_2234() {
     )
     .unwrap();
 
-    std::env::set_var("AGEND_WORKSPACE_AS_WORKTREE", "1");
+    // Enable (B) via the thread-local seam (NOT process-global set_var) so this
+    // flag-ON test cannot leak into the other p0b / dispatch_hook tests running in
+    // parallel in the same binary.
+    let _flag = crate::worktree_pool::workspace_worktree_test_seam::force(true);
     let r = super::dispatch_hook::dispatch_auto_bind_lease(
         &home,
         "agent",
@@ -816,7 +805,6 @@ fn dispatch_workspace_as_worktree_binds_workspace_path_2234() {
         "feat/b-disp",
         Some("o/r"),
     );
-    std::env::remove_var("AGEND_WORKSPACE_AS_WORKTREE");
 
     assert!(r.is_ok(), "(B) dispatch must succeed: {r:?}");
     let binding = crate::binding::read(&home, "agent").expect("binding written");
