@@ -282,6 +282,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let mut known_remote_agents: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // restart-freeze RCA (t-…55279): anchor for the boot critical path the
+    // operator sees freeze on daemon restart — session restore + the
+    // synchronous per-agent PTY spawns, then post-spawn wiring, up to the
+    // first render. Logged at restore-complete and pre-render-loop below.
+    // Pure tracing, zero behavior.
+    let restore_start = std::time::Instant::now();
+
     if let Some(ref run_dir) = attached_run_dir {
         // Attached (#895 fix): tabs derive from the union of
         //   (a) daemon's `*.port` files (live agent registry — source of truth
@@ -357,6 +364,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // controlling TTY (e.g. a winsize written to fd 0/1 instead of a pane's
     // pty master).
     trace_tty_size(size_debug, "post-fleet-spawn");
+
+    // restart-freeze RCA (t-…55279): session restore + all synchronous
+    // per-agent PTY spawns are done. Sum of the per-agent `restore-spawn`
+    // lines ≈ this; the gap to `pre-render-loop` below is post-spawn wiring.
+    tracing::info!(
+        target: "restart_timing",
+        elapsed_ms = restore_start.elapsed().as_millis() as u64,
+        attached = attached_mode,
+        "restore-complete: session restore + fleet PTY spawns done"
+    );
 
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
     // Start true so restored split panes get correct sizes before first draw.
@@ -443,6 +460,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // tick threads). The per-frame `#2057-size` probe below only ever sees this
     // post-shrink value (confirmed by the operator A/B), so the cause is here.
     trace_tty_size(size_debug, "pre-render-loop");
+
+    // restart-freeze RCA (t-…55279): entering the render loop — the first
+    // `terminal.draw` is imminent. Elapsed from `restore_start` is the full
+    // boot critical path the operator perceives as the restart freeze
+    // (restore + per-agent spawns + post-spawn wiring). Pure tracing.
+    tracing::info!(
+        target: "restart_timing",
+        elapsed_ms = restore_start.elapsed().as_millis() as u64,
+        attached = attached_mode,
+        "pre-render-loop: entering render loop (first draw imminent)"
+    );
 
     loop {
         if crate::bootstrap::signals::term_requested() {

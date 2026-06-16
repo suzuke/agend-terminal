@@ -225,7 +225,12 @@ pub(super) fn restore_with_reconciliation(
         match sp.fleet_instance_name.as_deref() {
             Some(name) => {
                 let resolved = fleet.as_ref().and_then(|f| f.resolve_instance(name))?;
-                super::pane_factory::create_pane_from_resolved(
+                // restart-freeze RCA (t-…55279): time the per-agent local-PTY
+                // spawn. The owned-restore path runs these synchronously in
+                // apply_session_layout order, so the sum is the boot critical
+                // path the operator sees freeze. Pure tracing, zero behavior.
+                let spawn_start = std::time::Instant::now();
+                let pane = super::pane_factory::create_pane_from_resolved(
                     name,
                     &resolved,
                     layout,
@@ -237,7 +242,15 @@ pub(super) fn restore_with_reconciliation(
                     name_counter,
                     crate::backend::SpawnMode::Resume,
                 )
-                .ok()
+                .ok();
+                tracing::info!(
+                    target: "restart_timing",
+                    agent = %name,
+                    elapsed_ms = spawn_start.elapsed().as_millis() as u64,
+                    ok = pane.is_some(),
+                    "restore-spawn: per-agent local-PTY spawn (synchronous)"
+                );
+                pane
             }
             None => {
                 let shell =
