@@ -420,6 +420,11 @@ pub fn teardown_workspace_worktree(home: &Path, agent: &str, working_dir: &Path)
     // owning repo so the registration is cleared (not just the dir).
     let wt_str = working_dir.display().to_string();
     let result = if source_repo.as_os_str().is_empty() {
+        // git-raw-allowed: defensive fallback when the owning repo can't be
+        // resolved (effectively unreachable — a real gitlink always yields a
+        // common-dir). Mirrors `remove_worktree`'s empty-source_repo arm: git
+        // must resolve the repo from the absolute `<wt>` itself, so this runs
+        // with NO `current_dir` — `git_bypass`/`git_cmd` both REQUIRE a cwd.
         std::process::Command::new("git")
             .args(["worktree", "remove", "--force", &wt_str])
             .env("AGEND_GIT_BYPASS", "1")
