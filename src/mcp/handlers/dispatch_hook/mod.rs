@@ -468,9 +468,14 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let (auto_created_branch, fetch_attempted) =
         ensure_branch_exists(home, &source_repo, branch, "origin/main", target)?;
 
-    // Attempt lease (creates worktree + tags as daemon-managed).
-    // Lease errors REJECT the dispatch (Q2 + §3.3).
-    let lease = crate::worktree_pool::lease(home, &source_repo, target, branch).map_err(|msg| {
+    // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
+    // (cwd == worktree) — switch it to `branch` IN PLACE instead of leasing a
+    // fresh per-branch worktree. Default OFF → legacy lease → byte-identical. The
+    // guards above (BindGuard, per-(source_repo,branch) lease lock,
+    // scan_existing_branch_binding) key on binding.json, NOT the worktree path,
+    // so this swap leaves concurrency serialized exactly as before.
+    let workspace_b = crate::worktree_pool::workspace_as_worktree_enabled(target);
+    let map_lease_err = |msg: String| {
         let code = if msg.contains("E4.5") {
             ErrorCode::ProtectedBranch
         } else {
@@ -483,48 +488,56 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             fetch_attempted,
             raw: Some(msg),
         }
-    })?;
-
-    // Clean empty "init" commits left by kiro-cli session checkpoints.
-    // Best-effort: failure here is non-fatal (worktree is still usable).
-    // #789: existing call site preserves pre-#789 silent semantic via
-    // `.ok()` so dispatch path has zero observable behavior change.
-    // The Result is consumed by `bind_self` / `task action=done` /
-    // `release_worktree` / `repo action=cleanup_init_commits` callers.
-    let _ = clean_empty_init_commits(&lease.path).ok();
+    };
+    let wt_path = if workspace_b {
+        // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
+        // backed up before --force) → in-place checkout. Encapsulated helper.
+        crate::worktree_pool::prepare_workspace_worktree(home, target, &source_repo, branch)
+            .map_err(map_lease_err)?
+    } else {
+        // Legacy: lease a fresh per-branch worktree. Lease errors REJECT (Q2 §3.3).
+        let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)
+            .map_err(map_lease_err)?;
+        // Clean empty "init" commits left by kiro-cli session checkpoints.
+        // Best-effort: failure is non-fatal. #789 silent `.ok()` semantic.
+        let _ = clean_empty_init_commits(&lease.path).ok();
+        lease.path
+    };
 
     // Bind with worktree + source-repo paths. Bind file write error stays graceful (Q1).
-    // source_repo persistence (P0-X r1): release_full uses it to run
-    // `git worktree remove` from the owning repo's cwd.
-    // #779 P2: bind_full now returns Result; this non-target caller preserves
-    // pre-#779-P2 silent semantic via `.ok()` — zero behavior change.
-    match crate::binding::bind_full(home, target, task_id, branch, &lease.path, &source_repo) {
+    // #779 P2: bind_full returns Result; preserves pre-#779-P2 silent semantic.
+    match crate::binding::bind_full(home, target, task_id, branch, &wt_path, &source_repo) {
         Ok(()) => tracing::info!(
-            %target, %branch, path = %lease.path.display(),
-            "dispatch auto-bind + lease OK"
+            %target, %branch, path = %wt_path.display(),
+            "dispatch auto-bind OK"
         ),
         Err(e) => {
-            // #1310: rollback worktree on binding failure to prevent orphans
             tracing::warn!(
-                %target, %branch, path = %lease.path.display(),
-                error = %e,
-                "dispatch auto-bind bind_full failed — rolling back worktree"
+                %target, %branch, path = %wt_path.display(), error = %e,
+                "dispatch auto-bind bind_full failed — rolling back"
             );
-            // #1899: bounded via git_bypass (LOCAL 60s) — best-effort rollback.
-            let _ = crate::git_helpers::git_bypass(
-                &source_repo,
-                &[
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &lease.path.display().to_string(),
-                ],
-            );
+            if workspace_b {
+                // (B): the workspace worktree is PERMANENT (the agent's cwd) — never
+                // delete it; roll the just-applied checkout back to HOLDING. Safe:
+                // no work exists on `branch` yet (bind_full ran synchronously right
+                // after checkout, before the agent saw dispatch success).
+                let _ = crate::worktree_pool::detach_workspace_to_holding(&wt_path);
+            } else {
+                // Legacy: remove the freshly-leased (disposable) worktree. #1899
+                // bounded via git_bypass (LOCAL 60s) — best-effort.
+                let _ = crate::git_helpers::git_bypass(
+                    &source_repo,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        &wt_path.display().to_string(),
+                    ],
+                );
+            }
             // #1324: surface rollback as dispatch error instead of silent success
             return Err(DispatchError {
-                message: format!(
-                    "bind_full failed for {target}@{branch}, worktree rolled back: {e}"
-                ),
+                message: format!("bind_full failed for {target}@{branch}, rolled back: {e}"),
                 code: ErrorCode::BindFailed,
                 stage: Stage::Bind,
                 fetch_attempted,

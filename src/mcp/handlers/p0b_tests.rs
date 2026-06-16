@@ -739,3 +739,85 @@ fn ci_watch_no_origin_remote_returns_non_github_error() {
     assert_eq!(result["code"], "non_github_remote_no_override");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2234 cure-(B) Phase 1c: dispatch in-place checkout integration ──────────
+
+/// End-to-end: with the (B) flag ON, `dispatch_auto_bind_lease` binds the agent
+/// to its WORKSPACE dir (cwd == worktree, in-place checked out to the task
+/// branch) instead of leasing a fresh `worktrees/<agent>/<branch>`. All the
+/// existing dispatch tests run with the flag OFF → legacy lease (byte-identical).
+#[test]
+#[serial_test::serial(ws_as_worktree_env)]
+fn dispatch_workspace_as_worktree_binds_workspace_path_2234() {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    };
+    let home = tmp_home("2234-b-disp");
+    // A SEPARATE canonical repo (NOT the workspace dir) with origin/main
+    // populated so strict ensure_branch_exists resolves without network.
+    let canonical = home.join("canonical");
+    std::fs::create_dir_all(&canonical).unwrap();
+    git(&canonical, &["init", "-b", "main"]);
+    git(
+        &canonical,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let sha = String::from_utf8_lossy(&git(&canonical, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    git(
+        &canonical,
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    let ws = crate::paths::workspace_dir(&home).join("agent");
+    // fleet source_repo = canonical (tier 2); working_directory = workspace default.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  agent:\n    backend: claude\n    working_directory: {}\n    source_repo: {}\n",
+            ws.display(),
+            canonical.display()
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("AGEND_WORKSPACE_AS_WORKTREE", "1");
+    let r = super::dispatch_hook::dispatch_auto_bind_lease(
+        &home,
+        "agent",
+        "T-1",
+        "feat/b-disp",
+        Some("o/r"),
+    );
+    std::env::remove_var("AGEND_WORKSPACE_AS_WORKTREE");
+
+    assert!(r.is_ok(), "(B) dispatch must succeed: {r:?}");
+    let binding = crate::binding::read(&home, "agent").expect("binding written");
+    let wt = binding["worktree"].as_str().unwrap_or_default();
+    assert_eq!(
+        std::path::Path::new(wt),
+        ws,
+        "(B): bound to the WORKSPACE path, not worktrees/<agent>/<branch>"
+    );
+    assert!(ws.join(".git").is_file(), "workspace is a gitlink worktree");
+    let cur = crate::git_helpers::git_cmd(&ws, &["branch", "--show-current"]).unwrap_or_default();
+    assert_eq!(
+        cur, "feat/b-disp",
+        "in-place checked out to the task branch"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
