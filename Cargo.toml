@@ -55,9 +55,15 @@ default = []
 tray = ["dep:tray-icon", "dep:tao", "dep:toml"]
 discord = ["dep:twilight-gateway", "dep:twilight-http", "dep:twilight-model"]
 
+# #2247 (build-profile only — NO feature code): ThinLTO + parallel codegen units
+# cut release link time substantially (operator-measured ~40m→17m) at a
+# negligible runtime cost. `lto = "thin"` parallelizes the cross-crate optimize
+# that fat LTO serializes; `codegen-units = 16` (made explicit) lets the
+# pre-LTO codegen run in parallel. `strip` retained.
 [profile.release]
 strip = true
-lto = true
+lto = "thin"
+codegen-units = 16
 
 [dependencies]
 # PTY
