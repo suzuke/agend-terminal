@@ -46,6 +46,18 @@ pub struct RuntimeConfig {
     /// the other gates here.
     #[serde(default = "default_true")]
     pub show_pane_state: bool,
+    /// #2090: origin-aware long-task progress reporting mode. `0` = off
+    /// (DEFAULT — zero behaviour change), `2` = report: the agent self-reports
+    /// progress on the channel a request came from, and the daemon's
+    /// progress-backstop watchdog nudges it if a long external-channel turn goes
+    /// quiet. In report mode the daemon NEVER authors or relays content itself —
+    /// it only prods the agent — so no raw transcript is ever exfiltrated. `1`
+    /// (mirror — daemon auto-relays the agent's raw output stream) is RESERVED
+    /// and not yet active in this build; `set` rejects it. `#[serde(default)]`
+    /// fills 0 for older configs (additive — no schema bump). Hot-reloadable via
+    /// the `config` MCP tool.
+    #[serde(default)]
+    pub progress_mode: i64,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
     /// written before this field reads back as 0 (≤ CURRENT, loads normally);
     /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
@@ -87,6 +99,7 @@ impl Default for RuntimeConfig {
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
             show_pane_state: true,
+            progress_mode: 0,
             schema_version: RuntimeConfig::CURRENT,
         }
     }
@@ -223,6 +236,20 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "progress_mode" => {
+            let m: i64 = value
+                .parse()
+                .map_err(|_| format!("invalid integer: {value}"))?;
+            // 0 = off (default), 2 = report. 1 (mirror) is reserved — not yet
+            // active in this build (gated separately) — so reject it explicitly
+            // rather than letting an operator set a silently-inert mode.
+            if !matches!(m, 0 | 2) {
+                return Err(format!(
+                    "invalid progress_mode: {m} (0 = off, 2 = report; 1/mirror not yet available)"
+                ));
+            }
+            config.progress_mode = m;
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -262,6 +289,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
         "show_pane_state" => Ok(config.show_pane_state.to_string()),
+        "progress_mode" => Ok(config.progress_mode.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -330,6 +358,32 @@ mod tests {
     fn hang_auto_recovery_enabled_default_false() {
         let c = RuntimeConfig::default();
         assert!(!c.hang_auto_recovery_enabled);
+    }
+
+    #[test]
+    fn progress_mode_default_off() {
+        // #2090: default is 0 (OFF) — a default fleet sees zero behaviour change.
+        assert_eq!(RuntimeConfig::default().progress_mode, 0);
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn progress_mode_accepts_report_rejects_mirror_and_garbage() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-progress");
+        std::fs::create_dir_all(&dir).ok();
+        // 2 (report) is accepted and round-trips.
+        set(&dir, "progress_mode", "2").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("progress_mode").unwrap(), "2");
+        // 0 (off) is accepted.
+        set(&dir, "progress_mode", "0").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("progress_mode").unwrap(), "0");
+        // 1 (mirror) is reserved / not yet active → rejected, not a silent no-op.
+        assert!(set(&dir, "progress_mode", "1").is_err());
+        // Non-integer → rejected.
+        assert!(set(&dir, "progress_mode", "report").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

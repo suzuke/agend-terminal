@@ -677,6 +677,12 @@ pub(crate) fn build_default_handlers(
         // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
         // + 30min re-alert windows, so the faster scan doesn't escalate sooner.
         Box::new(per_tick::HandoffTimeoutHandler::new(12)),
+        // #2090 (report mode): progress-backstop watchdog — ~30s cadence, boot-
+        // grace suppressed. Only fires when `progress_mode == 2`; nudges an agent
+        // to self-report if an external-channel turn runs long with no reply. It
+        // never authors/relays content itself (zero exfil). Default progress_mode
+        // is 0 (off) → this is a cheap early-return no-op for a default fleet.
+        Box::new(per_tick::ProgressBackstopHandler::new()),
         // Daemon-side deferred-notification flush — every tick (~10s). The
         // #1513 busy-gate defers notifications into the queue whose only other
         // flusher is the TUI loop; headless `run_core` (`start --foreground`)

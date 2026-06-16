@@ -490,6 +490,21 @@ pub fn nudge_text(channel: &str, msg_id: Option<&str>, gap_d: bool) -> String {
     }
 }
 
+/// #2090 M3 (report mode) progress-backstop nudge text — prods the AGENT to
+/// self-report a brief progress update on its in-flight `channel` request after
+/// a long quiet stretch. One short line; the daemon prepends the
+/// `[AGEND-AUTO kind=progress-backstop]` marker via `inject_with_target_gated`.
+/// NOT sent to the channel directly — it asks the agent to post its own (clean,
+/// agent-authored) update, so the daemon never relays raw output.
+pub fn backstop_nudge_text(channel: &str, armed_at_ms: i64, now_ms: i64) -> String {
+    let secs = now_ms.saturating_sub(armed_at_ms).max(0) / 1000;
+    format!(
+        "[progress] You've been working on the user's {channel} request for ~{secs}s \
+         with no update yet — send a brief progress reply now (what you're doing / \
+         how far along), then continue."
+    )
+}
+
 /// #2042 stage-3 delivery: send the human-phrased operator notice through the
 /// originating channel (NEVER hardcoded to telegram); the event-log line is the
 /// local persistent fallback when the channel is unavailable. Never blocks.
@@ -958,6 +973,27 @@ mod tests {
         );
         let lead = lead_text("dev-1", "telegram", Some("m-77"), 0);
         assert!(lead.contains("dev-1") && lead.contains("m-77"));
+    }
+
+    // ── #2090 M3 progress-backstop nudge text ───────────────────────────
+    #[test]
+    fn backstop_nudge_text_formats_elapsed_and_mentions_progress() {
+        // 45s elapsed (45_000ms) on the telegram channel.
+        let text = backstop_nudge_text("telegram", 0, 45_000);
+        assert!(
+            text.to_lowercase().contains("progress"),
+            "must mention progress: {text}"
+        );
+        assert!(text.contains("telegram"), "names the channel: {text}");
+        assert!(
+            text.contains("~45s"),
+            "formats elapsed seconds (45_000ms → ~45s): {text}"
+        );
+        // One short line — no embedded newlines (single channel reply).
+        assert!(!text.contains('\n'), "single line: {text}");
+        // Clamps a negative/clock-skew elapsed to 0 rather than underflowing.
+        let skewed = backstop_nudge_text("telegram", 99_000, 1_000);
+        assert!(skewed.contains("~0s"), "clamps negative elapsed: {skewed}");
     }
 
     // ── operator notify plumbing: same-channel routing + log fallback ───
