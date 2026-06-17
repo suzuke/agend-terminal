@@ -328,13 +328,22 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::None => {}
         Action::CopySelection => {
-            if let Some(tab) = ctx.layout.active_tab() {
-                if let Some(pane) = tab.root().find_pane(tab.focus_id) {
+            if let Some(tab) = ctx.layout.active_tab_mut() {
+                let focus_id = tab.focus_id;
+                if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
+                    let mut copied = false;
                     if let Some(ref sel) = pane.selection {
                         let text = pane.vterm.extract_text(sel.start, sel.end);
                         if !text.is_empty() {
                             super::mouse::copy_to_clipboard(&text);
+                            copied = true;
                         }
+                    }
+                    // Clear the highlight after a completed Cmd+C copy (mirrors the
+                    // mouse-release behavior); a no-selection / empty-text case is
+                    // left untouched.
+                    if copied {
+                        pane.selection = None;
                     }
                 }
             }
@@ -461,5 +470,82 @@ mod tests {
         assert!(result.needs_resize);
         assert_eq!(ctx.layout.active, 2);
         assert_eq!(*ctx.last_tab, 0);
+    }
+
+    // #84662: a completed copy (Cmd+C over a non-empty selection) clears the
+    // highlight; a selection with nothing to copy is left untouched.
+    #[test]
+    fn copy_selection_clears_highlight_after_copy() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let mut pane = test_pane(1, "a");
+        pane.vterm.process(b"hello\r\n");
+        pane.selection = Some(crate::layout::Selection {
+            start: (0, 0),
+            end: (0, 4),
+        });
+        layout.add_tab(Tab::new("a".to_string(), pane));
+        layout.active = 0;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        dispatch(Action::CopySelection, &mut ctx);
+        let pane = ctx
+            .layout
+            .active_tab()
+            .expect("active tab")
+            .root()
+            .find_pane(1)
+            .expect("focused pane");
+        assert!(
+            pane.selection.is_none(),
+            "#84662: highlight must auto-clear after a completed copy"
+        );
+    }
+
+    #[test]
+    fn copy_selection_keeps_highlight_when_nothing_to_copy() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let mut pane = test_pane(1, "a"); // empty vterm — selection extracts no text
+        pane.selection = Some(crate::layout::Selection {
+            start: (0, 0),
+            end: (0, 5),
+        });
+        layout.add_tab(Tab::new("a".to_string(), pane));
+        layout.active = 0;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        dispatch(Action::CopySelection, &mut ctx);
+        let pane = ctx
+            .layout
+            .active_tab()
+            .expect("active tab")
+            .root()
+            .find_pane(1)
+            .expect("focused pane");
+        assert!(
+            pane.selection.is_some(),
+            "#84662: nothing-to-copy is not a completed copy → highlight unchanged"
+        );
     }
 }

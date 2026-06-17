@@ -468,6 +468,7 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                 false
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                let mut copied = false;
                 if let Some(ref sel) = pane.selection {
                     if sel.start == sel.end {
                         pane.selection = None;
@@ -475,8 +476,16 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                         let text = pane.vterm.extract_text(sel.start, sel.end);
                         if !text.is_empty() {
                             copy_to_clipboard(&text);
+                            copied = true;
                         }
                     }
+                }
+                // Clear the highlight once a copy has completed — a finished copy
+                // ends the selection gesture. Other paths are unchanged: a
+                // zero-width click already cleared above, and an empty-text
+                // (nothing to copy) release keeps its selection as before.
+                if copied {
+                    pane.selection = None;
                 }
                 true
             }
