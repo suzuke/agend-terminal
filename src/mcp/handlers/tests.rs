@@ -541,6 +541,48 @@ fn post_decision_anonymous_does_not_emit_fleet_event() {
 }
 
 #[test]
+fn answer_decision_records_and_notifies_author_2305() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("fleet_decision_answer");
+    std::env::remove_var("AGEND_INSTANCE_NAME");
+
+    // Lead posts a pending question.
+    let posted = handle_tool(
+        "decision",
+        &json!({
+            "action": "post", "title": "Deploy?", "content": "ship v2?",
+            "needs_answer": true, "options": [{"label": "yes", "recommended": true}, "no"]
+        }),
+        "lead",
+    );
+    let id = posted["id"].as_str().expect("question id").to_string();
+
+    // Operator answers via the answer action.
+    let answered = handle_tool(
+        "decision",
+        &json!({"action": "answer", "id": id, "answer": "yes"}),
+        "operator",
+    );
+    assert_eq!(
+        answered["status"], "answered",
+        "answer recorded: {answered}"
+    );
+    assert_eq!(answered["author"], "lead");
+
+    // The author (lead) must have been notified in their inbox so they unblock.
+    let msgs = crate::inbox::drain(&home, "lead");
+    assert!(
+        msgs.iter().any(|m| m.text.contains("[decision-answered]")
+            && m.text.contains(&id)
+            && m.correlation_id.as_deref() == Some(id.as_str())),
+        "author must receive a decision-answered notify: {msgs:?}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn broadcast_emits_with_resolved_recipients() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_broadcast");

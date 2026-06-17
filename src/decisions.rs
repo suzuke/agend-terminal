@@ -13,6 +13,27 @@ use std::path::Path;
 /// serde defaults) do NOT need a bump.
 const SCHEMA_VERSION: u32 = 1;
 
+/// #2305: lifecycle of a decision that requires an operator answer. A plain
+/// scope-record decision has `status: None`; a posted *question* is `Pending`
+/// until answered (or expired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionStatus {
+    Pending,
+    Answered,
+    Expired,
+}
+
+/// #2305: one selectable answer option for a pending decision. `recommended`
+/// marks the suggested choice (poster convention: list the recommended option
+/// first, like AskUserQuestion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionOption {
+    pub label: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub id: String,
@@ -31,6 +52,34 @@ pub struct Decision {
     /// (no field) reads back as 0 (≤ current, loads normally).
     #[serde(default)]
     pub schema_version: u32,
+
+    // ── #2305 async decision-board fields ──
+    // All additive with serde defaults: a plain scope record leaves these at
+    // their defaults and behaves EXACTLY as before. Per the `SCHEMA_VERSION`
+    // doc, additive defaulted fields do NOT bump the version (and bumping would
+    // make every new record invisible to a not-yet-upgraded reader, since
+    // `load_all` skips `schema_version > SCHEMA_VERSION`).
+    /// This decision is a question awaiting an operator answer.
+    #[serde(default)]
+    pub needs_answer: bool,
+    /// `None` for a plain decision; `Pending`/`Answered`/`Expired` for a question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<DecisionStatus>,
+    /// Suggested answer options (recommended-first by convention).
+    #[serde(default)]
+    pub options: Vec<DecisionOption>,
+    /// Whether a free-text answer (not matching any option) is accepted.
+    #[serde(default)]
+    pub allow_free_text: bool,
+    /// The chosen option label or free-text, once answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// Who answered (the operator, or the agent that recorded it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    /// RFC3339 time the answer was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
 }
 
 pub(crate) fn decisions_dir(home: &Path) -> std::path::PathBuf {
@@ -148,6 +197,13 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let ttl_days = args["ttl_days"].as_u64();
     let supersedes = args["supersedes"].as_str().map(String::from);
 
+    // #2305: optional pending-question fields. A normal `post` (no
+    // `needs_answer`) leaves these defaulted → a plain scope record.
+    let needs_answer = args["needs_answer"].as_bool().unwrap_or(false);
+    let options = parse_options(&args["options"]);
+    let allow_free_text = args["allow_free_text"].as_bool().unwrap_or(false);
+    let status = needs_answer.then_some(DecisionStatus::Pending);
+
     let clock = chrono::Utc::now();
     let now = clock.to_rfc3339();
     // The historical id format was seconds-precision only — two posts in the
@@ -210,12 +266,49 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         supersedes,
         working_directory: working_dir,
         schema_version: SCHEMA_VERSION,
+        needs_answer,
+        status,
+        options,
+        allow_free_text,
+        answer: None,
+        answered_by: None,
+        answered_at: None,
     };
 
     match save(home, &decision) {
         Ok(()) => serde_json::json!({"id": id, "status": "posted"}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
+}
+
+/// #2305: parse the `options` arg — accepts either `[{label, recommended}]`
+/// objects or bare `["label", …]` strings (recommended=false). Unparseable
+/// entries are dropped.
+fn parse_options(v: &Value) -> Vec<DecisionOption> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| {
+                    if let Some(s) = o.as_str() {
+                        Some(DecisionOption {
+                            label: s.to_string(),
+                            recommended: false,
+                        })
+                    } else {
+                        o.get("label")
+                            .and_then(|l| l.as_str())
+                            .map(|label| DecisionOption {
+                                label: label.to_string(),
+                                recommended: o
+                                    .get("recommended")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                            })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Return active decisions as typed structs (no JSON round-trip).
@@ -313,6 +406,99 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
         // Inline write — save() would try to re-acquire this same lock.
         match crate::store::save_atomic(&path, &decision) {
             Ok(()) => serde_json::json!({"id": id, "status": "updated"}),
+            Err(e) => serde_json::json!({"error": format!("{e}")}),
+        }
+    });
+
+    match locked {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"error": format!("lock acquisition failed: {e}")}),
+    }
+}
+
+/// #2305: record an operator's answer to a pending decision.
+///
+/// Unlike [`update`], this is intentionally NOT gated by [`can_mutate_decision`]:
+/// the *author* posts the question, but the *operator* (a different identity)
+/// answers it — an author-only gate would reject the very caller we expect. The
+/// answerer is recorded in `answered_by` (the TUI passes `"operator"`; an agent
+/// recording on the operator's behalf is attributed by its own name, visible to
+/// the author). Read→validate→write happens under the same per-decision flock as
+/// `update`, so a concurrent second answer sees `Answered` (not `Pending`) and is
+/// refused — exactly one answer wins.
+pub fn answer(home: &Path, caller: &str, args: &Value) -> Value {
+    let id = match args["id"].as_str() {
+        Some(i) => i.to_string(),
+        None => return serde_json::json!({"error": "missing 'id'"}),
+    };
+    let ans = match args["answer"].as_str() {
+        Some(a) => a.to_string(),
+        None => return serde_json::json!({"error": "missing 'answer'"}),
+    };
+
+    let locked = with_decision_lock(home, &id, || -> Value {
+        let path = decision_path(home, &id);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return serde_json::json!({"error": format!("decision '{id}' not found")}),
+        };
+        let mut decision: Decision = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(e) => {
+                return serde_json::json!({"error": format!("decision '{id}' corrupted: {e}")})
+            }
+        };
+        // #1990: refuse to touch a record a newer daemon wrote.
+        if decision.schema_version > SCHEMA_VERSION {
+            return serde_json::json!({
+                "error": format!(
+                    "decision '{id}' was written by a newer schema version ({} > {SCHEMA_VERSION})",
+                    decision.schema_version
+                )
+            });
+        }
+        if !decision.needs_answer {
+            return serde_json::json!({
+                "error": format!("decision '{id}' is not a pending question (needs_answer=false)")
+            });
+        }
+        if decision.status != Some(DecisionStatus::Pending) {
+            return serde_json::json!({
+                "error": format!(
+                    "decision '{id}' is not Pending (already answered or expired); cannot answer"
+                )
+            });
+        }
+        // When the poster constrained the answer to options (no free text), the
+        // answer must match one of the option labels exactly.
+        if !decision.allow_free_text
+            && !decision.options.is_empty()
+            && !decision.options.iter().any(|o| o.label == ans)
+        {
+            return serde_json::json!({
+                "error": format!(
+                    "answer for '{id}' must be one of the offered options (free text not allowed)"
+                )
+            });
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        decision.answer = Some(ans.clone());
+        decision.answered_by = Some(caller.to_string());
+        decision.answered_at = Some(now.clone());
+        decision.status = Some(DecisionStatus::Answered);
+        decision.updated_at = now;
+        decision.schema_version = SCHEMA_VERSION;
+
+        // Inline write — save() would re-acquire this same (non-reentrant) flock.
+        match crate::store::save_atomic(&path, &decision) {
+            Ok(()) => serde_json::json!({
+                "id": id,
+                "status": "answered",
+                "author": decision.author,
+                "title": decision.title,
+                "answer": ans,
+            }),
             Err(e) => serde_json::json!({"error": format!("{e}")}),
         }
     });
@@ -521,6 +707,13 @@ mod tests {
             supersedes: None,
             working_directory: None,
             schema_version: SCHEMA_VERSION,
+            needs_answer: false,
+            status: None,
+            options: vec![],
+            allow_free_text: false,
+            answer: None,
+            answered_by: None,
+            answered_at: None,
         }
     }
 
@@ -667,6 +860,227 @@ mod tests {
         assert!(
             resp.get("error").is_some(),
             "updating a future-schema decision must be refused: {resp}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─── #2305 async decision board: pending questions + answer ───
+
+    fn post_question(home: &Path, args: serde_json::Value) -> String {
+        let r = post(home, "lead", &args);
+        r["id"].as_str().expect("question id").to_string()
+    }
+
+    /// Active pending questions (the PR2 overlay's prod helper lands next PR; here
+    /// we filter inline so PR1 carries no unused prod code).
+    fn pending_questions(home: &Path) -> Vec<Decision> {
+        list_all(home)
+            .into_iter()
+            .filter(|d| d.needs_answer && d.status == Some(DecisionStatus::Pending))
+            .collect()
+    }
+
+    #[test]
+    fn pre_2305_decision_loads_as_plain_non_question() {
+        // A pre-#2305 record (none of the new fields) must load with needs_answer
+        // false / status None — i.e. behave exactly as a plain scope decision.
+        let home = tmp_home("dec_pre2305");
+        let dir = decisions_dir(&home);
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("d-plain.json"),
+            r#"{"id":"d-plain","title":"T","content":"c","scope":"fleet","author":"a","tags":[],"ttl_days":null,"created_at":"2026-04-27T00:00:00Z","updated_at":"2026-04-27T00:00:00Z","archived":false,"supersedes":null,"working_directory":null,"schema_version":1}"#,
+        )
+        .expect("write pre-2305 fixture");
+        let all = list_all(&home);
+        let d = all.iter().find(|d| d.id == "d-plain").expect("loads");
+        assert!(!d.needs_answer, "pre-2305 record is not a question");
+        assert_eq!(d.status, None);
+        assert!(d.options.is_empty() && d.answer.is_none());
+        assert!(
+            pending_questions(&home).is_empty(),
+            "a plain decision must not appear as pending"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn post_question_appears_pending_then_answered() {
+        let home = tmp_home("dec_q_lifecycle");
+        let id = post_question(
+            &home,
+            serde_json::json!({
+                "title": "Deploy now?", "content": "ship v2?",
+                "needs_answer": true,
+                "options": [{"label": "yes", "recommended": true}, "no"],
+            }),
+        );
+        // Pending until answered.
+        let pending = pending_questions(&home);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].status, Some(DecisionStatus::Pending));
+        assert!(
+            pending[0].options[0].recommended,
+            "recommended-first preserved"
+        );
+        assert!(
+            !pending[0].options[1].recommended,
+            "bare-string option = not recommended"
+        );
+
+        // Answer with a valid option.
+        let r = answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": id, "answer": "yes"}),
+        );
+        assert_eq!(r["status"], "answered");
+        assert_eq!(r["author"], "lead", "answer surfaces author for notify");
+
+        // No longer pending; fields recorded.
+        assert!(pending_questions(&home).is_empty());
+        let all = list_all(&home);
+        let d = all.iter().find(|d| d.id == id).expect("present");
+        assert_eq!(d.status, Some(DecisionStatus::Answered));
+        assert_eq!(d.answer.as_deref(), Some("yes"));
+        assert_eq!(d.answered_by.as_deref(), Some("operator"));
+        assert!(d.answered_at.is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn answer_rejects_non_option_when_free_text_disallowed() {
+        let home = tmp_home("dec_q_optonly");
+        let id = post_question(
+            &home,
+            serde_json::json!({
+                "title": "Q", "content": "?", "needs_answer": true,
+                "options": ["a", "b"], "allow_free_text": false,
+            }),
+        );
+        let bad = answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": id, "answer": "zzz"}),
+        );
+        assert!(
+            bad.get("error").is_some(),
+            "off-option answer must be refused: {bad}"
+        );
+        // Still pending (not consumed by the rejected attempt).
+        assert_eq!(pending_questions(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn answer_allows_free_text_when_enabled() {
+        let home = tmp_home("dec_q_freetext");
+        let id = post_question(
+            &home,
+            serde_json::json!({
+                "title": "Q", "content": "?", "needs_answer": true,
+                "options": ["a"], "allow_free_text": true,
+            }),
+        );
+        let r = answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": id, "answer": "something custom"}),
+        );
+        assert_eq!(r["status"], "answered");
+        let d = list_all(&home)
+            .into_iter()
+            .find(|d| d.id == id)
+            .expect("present");
+        assert_eq!(d.answer.as_deref(), Some("something custom"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn answer_refuses_non_question_and_already_answered() {
+        let home = tmp_home("dec_q_guards");
+        // Plain decision (not a question) → refused.
+        let plain = post(
+            &home,
+            "lead",
+            &serde_json::json!({"title": "T", "content": "c"}),
+        );
+        let pid = plain["id"].as_str().expect("id");
+        assert!(answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": pid, "answer": "x"})
+        )
+        .get("error")
+        .is_some());
+
+        // Question → answer once OK, second answer refused (not Pending).
+        let id = post_question(
+            &home,
+            serde_json::json!({"title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true}),
+        );
+        assert_eq!(
+            answer(
+                &home,
+                "operator",
+                &serde_json::json!({"id": id, "answer": "first"})
+            )["status"],
+            "answered"
+        );
+        let second = answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": id, "answer": "second"}),
+        );
+        assert!(
+            second.get("error").is_some(),
+            "re-answer must be refused: {second}"
+        );
+        // The first answer stands.
+        let d = list_all(&home)
+            .into_iter()
+            .find(|d| d.id == id)
+            .expect("present");
+        assert_eq!(d.answer.as_deref(), Some("first"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn concurrent_answers_exactly_one_wins() {
+        // Two threads answer the same pending question; the per-decision flock
+        // serializes read→validate→write, so the second sees Answered (not
+        // Pending) and is refused. Exactly one answer is recorded.
+        let home = tmp_home("dec_q_concurrent");
+        let id = post_question(
+            &home,
+            serde_json::json!({"title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true}),
+        );
+        let home_arc = std::sync::Arc::new(home.clone());
+        let id_arc = std::sync::Arc::new(id.clone());
+        let mk = |ans: &'static str| {
+            let h = home_arc.clone();
+            let i = id_arc.clone();
+            std::thread::spawn(move || {
+                answer(
+                    &h,
+                    "operator",
+                    &serde_json::json!({"id": (*i).clone(), "answer": ans}),
+                )
+            })
+        };
+        // Spawn BOTH, then join — they contend on the same per-decision flock.
+        let (t1, t2) = (mk("A"), mk("B"));
+        let r1 = t1.join().expect("t1");
+        let r2 = t2.join().expect("t2");
+        let successes = [&r1, &r2]
+            .iter()
+            .filter(|r| r["status"] == "answered")
+            .count();
+        assert_eq!(successes, 1, "exactly one answer must win: {r1} | {r2}");
+        assert!(
+            pending_questions(&home).is_empty(),
+            "question is answered, not pending"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -175,15 +175,19 @@ pub(crate) fn def_tui_screenshot() -> Value {
 }
 
 pub(crate) fn def_decision() -> Value {
-    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, update.",
+    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, update, answer. #2305: `post` with `needs_answer:true` (+ `options`, `allow_free_text`) creates an async pending QUESTION the operator answers later; `answer` (id + answer) records the operator's choice and notifies the decision author.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["post", "list", "update"]},
-            "title": {"type": "string"}, "content": {"type": "string", "description": "Decision body (alias: text — #2037)."}, "text": {"type": "string", "description": "Alias of `content` (#2037)."},
+            "action": {"type": "string", "enum": ["post", "list", "update", "answer"]},
+            "title": {"type": "string"}, "content": {"type": "string", "description": "Decision body (alias: text — #2037). For a question, the prompt text."}, "text": {"type": "string", "description": "Alias of `content` (#2037)."},
             "scope": {"type": "string", "enum": ["project", "fleet"]},
             "tags": {"type": "array", "items": {"type": "string"}},
             "ttl_days": {"type": "number"}, "supersedes": {"type": "string"},
             "id": {"type": "string"}, "archive": {"type": "boolean"},
-            "include_archived": {"type": "boolean"}
+            "include_archived": {"type": "boolean"},
+            "needs_answer": {"type": "boolean", "description": "#2305 post: mark this decision a pending question awaiting an operator answer."},
+            "options": {"type": "array", "description": "#2305 post: suggested answer options (recommended-first). Each is `{label, recommended}` or a bare string.", "items": {"type": ["object", "string"]}},
+            "allow_free_text": {"type": "boolean", "description": "#2305 post: accept a free-text answer not matching any option."},
+            "answer": {"type": "string", "description": "#2305 answer action: the chosen option label or free-text answer for decision `id`."}
         }, "required": ["action"]}})
 }
 
@@ -865,9 +869,13 @@ mod tests {
             ("decision", "tags", "decisions.rs post/list-filter/update"),
             ("decision", "ttl_days", "decisions.rs post/update"),
             ("decision", "supersedes", "decisions.rs post archives prior"),
-            ("decision", "id", "decisions.rs update target"),
+            ("decision", "id", "decisions.rs update/answer target"),
             ("decision", "archive", "decisions.rs update flag"),
             ("decision", "include_archived", "decisions.rs list"),
+            ("decision", "needs_answer", "decisions.rs post → pending question (#2305)"),
+            ("decision", "options", "decisions.rs post question options (#2305)"),
+            ("decision", "allow_free_text", "decisions.rs post question free-text gate (#2305)"),
+            ("decision", "answer", "decisions.rs answer action (#2305)"),
             // ── team ──
             ("team", "action", "teams.rs routing"),
             ("team", "name", "teams.rs create/delete/update target"),

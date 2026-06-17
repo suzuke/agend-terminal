@@ -290,6 +290,7 @@ action_adapter!(dispatch_decision, "decision", [
     "post"   => task::handle_post_decision,   hais;
     "list"   => task::handle_list_decisions,   ha;
     "update" => task::handle_update_decision,  hai;
+    "answer" => task::handle_answer_decision,  hais;
 ]);
 
 action_adapter!(dispatch_deployment, "deployment", [
