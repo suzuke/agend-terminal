@@ -66,6 +66,20 @@ impl PaneNode {
         ids
     }
 
+    /// #92758-3: clear the text-selection highlight on every pane in the subtree.
+    /// Used by the mouse handler so a fresh left-click dismisses a stale selection
+    /// anywhere in the active tab. Touches only `selection` — no focus / scroll
+    /// state.
+    pub fn clear_selections(&mut self) {
+        match self {
+            PaneNode::Leaf(p) => p.selection = None,
+            PaneNode::Split { first, second, .. } => {
+                first.clear_selections();
+                second.clear_selections();
+            }
+        }
+    }
+
     pub fn find_pane(&self, id: usize) -> Option<&Pane> {
         match self {
             PaneNode::Leaf(p) if p.id == id => Some(p),

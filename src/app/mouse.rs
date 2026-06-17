@@ -66,6 +66,21 @@ pub(super) fn handle(
         }
     }
 
+    // #92758-3: a fresh left-button press dismisses any stale selection highlight,
+    // fleet-wide in the active tab — so a mis-select can be cleared by clicking
+    // ANYWHERE (a different pane, a border, the tab bar), not only by clicking
+    // inside the same pane's text or via the keyboard copy key. Placed BEFORE the
+    // mouse-forward gate below so it also fires when the click lands on a
+    // mouse-forwarding pane (the click still forwards as usual). The normal
+    // selection flow re-starts a fresh zero-width selection only on a real
+    // pane-body click, so drag-to-copy and #2294 clear-on-copy are unchanged.
+    // Selection state ONLY — focus is handled by the #901 pre-focus above.
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some(tab) = layout.active_tab_mut() {
+            tab.root_mut().clear_selections();
+        }
+    }
+
     // #700 + #783: If a pane's terminal wants mouse events AND shift is not
     // held, forward the event as SGR mouse report to the PTY instead of local
     // handling. The routing decision lives in `pane_for_mouse_forward` so it
@@ -1111,6 +1126,122 @@ mod tests {
             Some(2),
             "handle_selection MUST cache selecting_pane on Down so drag \
              continues against the same pane"
+        );
+    }
+
+    // ----- #92758-3: a left-click dismisses a stale selection anywhere -----
+
+    fn wide_selection() -> crate::layout::Selection {
+        // A non-zero-width (visible) selection — the mis-select the operator
+        // wants to clear by clicking.
+        crate::layout::Selection {
+            start: (0, 0),
+            end: (0, 5),
+        }
+    }
+
+    /// G1: clicking a DIFFERENT pane clears the stale highlight in the pane that
+    /// held the selection (pre-fix the Down only touched the clicked pane).
+    #[test]
+    #[serial]
+    fn left_click_clears_selection_in_other_pane_2158() {
+        let _home = ScopedHome::new("clear-g1");
+        let mut layout = two_pane_layout("right");
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0]
+            .root_mut()
+            .find_pane_mut(1)
+            .unwrap()
+            .selection = Some(wide_selection());
+
+        // Click inside pane 2's body (cols 10..20) — the OTHER pane.
+        let mut state = MouseState::default();
+        super::handle(
+            down_left_at(15, 5),
+            &mut layout,
+            &mut state,
+            std::path::Path::new("/nonexistent/fleet.yaml"),
+            &empty_registry(),
+        );
+
+        assert!(
+            layout.tabs[0]
+                .root_mut()
+                .find_pane_mut(1)
+                .unwrap()
+                .selection
+                .is_none(),
+            "clicking pane 2 must clear pane 1's stale selection (G1)"
+        );
+    }
+
+    /// G3: a click that lands OUTSIDE any pane body (the tab bar at row 0) still
+    /// clears a stale selection — the clear runs before the tab/border branching.
+    #[test]
+    #[serial]
+    fn left_click_on_tab_bar_clears_selection_2158() {
+        let _home = ScopedHome::new("clear-g3");
+        let mut layout = two_pane_layout("right");
+        layout.tabs[0]
+            .root_mut()
+            .find_pane_mut(2)
+            .unwrap()
+            .selection = Some(wide_selection());
+
+        // Row 0 is the tab bar — not a pane body.
+        let mut state = MouseState::default();
+        super::handle(
+            down_left_at(3, 0),
+            &mut layout,
+            &mut state,
+            std::path::Path::new("/nonexistent/fleet.yaml"),
+            &empty_registry(),
+        );
+
+        assert!(
+            layout.tabs[0]
+                .root_mut()
+                .find_pane_mut(2)
+                .unwrap()
+                .selection
+                .is_none(),
+            "clicking the tab bar must still clear a stale selection (G3)"
+        );
+    }
+
+    /// Drag-to-copy regression (#2294): a pane-body click clears the stale
+    /// selection AND anchors a fresh zero-width one, so a drag can still begin
+    /// (and #2294's copy-then-clear on Up is unaffected — it runs on the fresh
+    /// selection, untouched by this change).
+    #[test]
+    #[serial]
+    fn left_click_on_pane_body_anchors_fresh_zero_width_selection_2158() {
+        let _home = ScopedHome::new("clear-restart");
+        let mut layout = two_pane_layout("right");
+        layout.tabs[0]
+            .root_mut()
+            .find_pane_mut(2)
+            .unwrap()
+            .selection = Some(wide_selection());
+
+        // Click inside pane 2's INNER text area (rect 10,1,10,10 → inner 11..19).
+        let mut state = MouseState::default();
+        super::handle(
+            down_left_at(13, 4),
+            &mut layout,
+            &mut state,
+            std::path::Path::new("/nonexistent/fleet.yaml"),
+            &empty_registry(),
+        );
+
+        let pane = layout.tabs[0].root_mut().find_pane_mut(2).unwrap();
+        let sel = pane
+            .selection
+            .as_ref()
+            .expect("a pane-body click anchors a fresh selection for drag");
+        assert_eq!(
+            sel.start, sel.end,
+            "the stale wide selection is replaced by a fresh zero-width one (drag-to-copy intact)"
         );
     }
 }
