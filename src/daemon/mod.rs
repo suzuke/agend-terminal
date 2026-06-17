@@ -1467,6 +1467,112 @@ fn grace_disposition(still_alive: bool) -> GraceDisposition {
     }
 }
 
+/// A registry agent's child-process handle (`AgentHandle.child`).
+pub(crate) type ChildHandle = std::sync::Arc<Mutex<Box<dyn portable_pty::Child + Send>>>;
+
+/// Parallel agent-teardown core, shared by `run_core`'s [`shutdown_sequence`]
+/// and app-mode `app_teardown` so the two paths cannot drift (restart-freeze
+/// 真嫌#1, t-…55279: app teardown previously killed agents in a *sequential*
+/// per-agent wait loop, ~0.5 s × N ≈ ~6 s of the operator-visible restart
+/// freeze; routing it through this proven run_core core makes the wall time
+/// ≈ one grace window regardless of N).
+///
+/// Stages (Sprint 57 Wave 3 PR-2):
+/// 1. **Parallel SIGTERM** — on Unix, signal every agent's process group
+///    concurrently; on Windows there is no signal model, so the grace wait
+///    below just lets agents that exit on PTY EOF be reported as clean.
+/// 2. **Single grace window** — one [`SHUTDOWN_GRACE`] sleep for ALL agents
+///    (NOT per-agent), so they exit concurrently.
+/// 3. **SIGKILL + reap** — holdouts still alive after grace are escalated to a
+///    process-group SIGKILL then reaped; clean exits are reaped only
+///    (#bughunt-r1: no `kill_process_tree` on an exited PID — it may be reused).
+///
+/// Returns the number of agents that had to be SIGKILLed after the grace window.
+/// Callers MUST drain/snapshot the registry BEFORE calling so PTY-close handlers
+/// observe the agent as gone (or shutting down) and return silently instead of
+/// emitting crash/respawn events.
+pub(crate) fn terminate_agents_parallel(agents: Vec<(String, ChildHandle)>) -> usize {
+    // Stage 1: parallel SIGTERM.
+    let mut pids: Vec<(String, ChildHandle, Option<u32>)> = Vec::with_capacity(agents.len());
+    for (name, child) in agents {
+        let pid = {
+            let c = child.lock();
+            c.process_id()
+        };
+        #[cfg(unix)]
+        if let Some(p) = pid {
+            unsafe {
+                let pgid = libc::getpgid(p as i32);
+                let kill_pgid = if pgid > 0 { -pgid } else { -(p as i32) };
+                libc::kill(kill_pgid, libc::SIGTERM);
+            }
+        }
+        pids.push((name, child, pid));
+    }
+
+    // Stage 2: single grace window for all agents.
+    std::thread::sleep(SHUTDOWN_GRACE);
+
+    // Stage 3: reap clean exits; SIGKILL + reap genuine holdouts.
+    //
+    // Detect exit with a non-blocking `try_wait` rather than a raw-PID
+    // `is_pid_alive` probe. A child that exited during the grace window but has
+    // not been reaped yet is a ZOMBIE, which `kill(pid, 0)` (is_pid_alive)
+    // reports as STILL ALIVE — so an is_pid_alive gate pushes every grace-exiter
+    // down the HardKill arm and pays `kill_process_tree`'s 500 ms
+    // SIGTERM→SIGKILL sleep per agent, serialized. That N×~0.5 s is exactly the
+    // cost this parallel teardown exists to remove (restart-freeze 真嫌#1), and
+    // it bit app teardown hardest because the shutdown flag makes PTY-close
+    // handlers fast-return WITHOUT reaping, leaving every child a zombie here.
+    // `try_wait` reaps the zombie in place; it is also safer than is_pid_alive
+    // (#bughunt-r1: acts on the owned child handle, so no reaped-then-reused-PID
+    // window). Only a child still genuinely running after grace (`try_wait` →
+    // `None`) escalates to the process-group SIGKILL.
+    let mut killed_after_grace = 0usize;
+    for (name, child, pid) in pids {
+        // #t-41673 gap-instrument: per-agent reap clock — a slow `child.wait()`
+        // (kill→reap or grace-window reap) is a prime suspect for the shutdown
+        // half of the restart freeze; emit `reap_ms` on the existing per-agent
+        // logs. Now in the shared helper, so it covers app-mode teardown too.
+        let reap_started = std::time::Instant::now();
+        // r6 latent-defense: ONLY a child that `try_wait` positively confirms is
+        // still running (`Ok(None)`) escalates to `kill_process_tree`. A reaped
+        // exit (`Ok(Some)`) AND a status-read error (`Err` — e.g. already reaped
+        // elsewhere / ECHILD) both map to ReapOnly: we never SIGKILL a process
+        // group whose PID we cannot PROVE is still ours (reused-PID hazard,
+        // #bughunt-r1), even if a future reaper/flag change races us here.
+        let still_running = matches!(child.lock().try_wait(), Ok(None));
+        match grace_disposition(still_running) {
+            GraceDisposition::HardKill => {
+                // Holdout still running after grace — escalate to a SIGKILL of
+                // the whole process group, then reap the child handle.
+                if let Some(p) = pid {
+                    crate::process::kill_process_tree(p);
+                }
+                let _ = child.lock().kill();
+                let _ = child.lock().wait();
+                killed_after_grace += 1;
+                tracing::info!(
+                    agent = %name,
+                    reap_ms = reap_started.elapsed().as_millis() as u64,
+                    "killed (after grace window)"
+                );
+            }
+            GraceDisposition::ReapOnly => {
+                // Clean exit during the grace window — already reaped by the
+                // `try_wait` above (no `kill_process_tree`: #bughunt-r1, a reused
+                // PID's group must never be SIGKILLed).
+                tracing::info!(
+                    agent = %name,
+                    reap_ms = reap_started.elapsed().as_millis() as u64,
+                    "exited cleanly during grace window"
+                );
+            }
+        }
+    }
+    killed_after_grace
+}
+
 pub(crate) fn shutdown_sequence(
     home: &Path,
     registry: &AgentRegistry,
@@ -1491,80 +1597,10 @@ pub(crate) fn shutdown_sequence(
     };
     let agents_total = agents_to_kill.len();
 
-    // Sprint 57 Wave 3 PR-2: parallel SIGTERM stage. On Unix, send
-    // SIGTERM to each agent's process group concurrently; on Windows,
-    // fall back to per-agent kill_process_tree (no signal model).
-    type ChildHandle = std::sync::Arc<Mutex<Box<dyn portable_pty::Child + Send>>>;
-    let mut pids: Vec<(String, ChildHandle, Option<u32>)> =
-        Vec::with_capacity(agents_to_kill.len());
-    for (name, child) in agents_to_kill {
-        let pid = {
-            let c = child.lock();
-            c.process_id()
-        };
-        #[cfg(unix)]
-        if let Some(p) = pid {
-            unsafe {
-                let pgid = libc::getpgid(p as i32);
-                let kill_pgid = if pgid > 0 { -pgid } else { -(p as i32) };
-                libc::kill(kill_pgid, libc::SIGTERM);
-            }
-        }
-        pids.push((name, child, pid));
-    }
-
-    // Wait the grace window. On Unix, agents that received SIGTERM
-    // above can exit cleanly during this window (the parallel SIGTERM
-    // signaled all process groups simultaneously). On Windows, no
-    // SIGTERM was sent — but a brief wait still lets agents that
-    // happened to exit on their own (e.g. PTY EOF on parent close)
-    // be reported as clean rather than killed-after-grace, keeping
-    // the metric semantically consistent across platforms.
-    std::thread::sleep(SHUTDOWN_GRACE);
-
-    // Sprint 57 Wave 3 PR-2: SIGKILL stage. Anything still alive
-    // after the grace window is escalated. On Windows this is the
-    // primary kill stage (no SIGTERM was sent); on Unix it catches
-    // SIGTERM holdouts.
-    let mut agents_killed_after_grace = 0usize;
-    for (name, child, pid) in pids {
-        // #t-41673 gap-instrument: per-agent reap clock — a slow `child.wait()`
-        // (kill→reap or grace-window reap) is a prime suspect for the shutdown
-        // half of the freeze; emit `reap_ms` on the existing per-agent logs.
-        let reap_started = std::time::Instant::now();
-        let still_alive = match pid {
-            Some(p) => crate::process::is_pid_alive(p),
-            None => false,
-        };
-        match grace_disposition(still_alive) {
-            GraceDisposition::HardKill => {
-                // Holdout after the grace window — escalate to a SIGKILL of the
-                // whole process group, then reap the child handle.
-                if let Some(p) = pid {
-                    crate::process::kill_process_tree(p);
-                }
-                let _ = child.lock().kill();
-                let _ = child.lock().wait();
-                agents_killed_after_grace += 1;
-                tracing::info!(
-                    agent = %name,
-                    reap_ms = reap_started.elapsed().as_millis() as u64,
-                    "killed (after grace window)"
-                );
-            }
-            GraceDisposition::ReapOnly => {
-                // #bughunt-r1: clean exit during the grace window. Do NOT
-                // `kill_process_tree` — the PID may have been reused, so the
-                // group SIGKILL would hit an unrelated process. Just reap.
-                let _ = child.lock().wait();
-                tracing::info!(
-                    agent = %name,
-                    reap_ms = reap_started.elapsed().as_millis() as u64,
-                    "exited cleanly during grace window"
-                );
-            }
-        }
-    }
+    // Parallel SIGTERM → single grace → SIGKILL/reap holdouts (shared core).
+    // The per-agent `reap_ms` gap-instrument (#t-41673) lives inside the helper
+    // so it covers app-mode teardown too.
+    let agents_killed_after_grace = terminate_agents_parallel(agents_to_kill);
 
     let uptime_secs = started_at.elapsed().as_secs();
     let metrics = ShutdownMetrics {
@@ -2116,16 +2152,18 @@ mod tests {
         assert_eq!(grace_disposition(true), GraceDisposition::HardKill);
     }
 
-    /// Source-scan invariant: in `shutdown_sequence`, `kill_process_tree` must
-    /// only be reachable via the `GraceDisposition::HardKill` arm — never an
-    /// unconditional call (the bug). Guards against a regression that bypasses
-    /// `grace_disposition` and SIGKILLs every child's (possibly-reused) PID.
+    /// Source-scan invariant: in `terminate_agents_parallel` (the shared
+    /// parallel-teardown core, extracted from `shutdown_sequence` for
+    /// restart-freeze 真嫌#1), `kill_process_tree` must only be reachable via the
+    /// `GraceDisposition::HardKill` arm — never an unconditional call (the bug).
+    /// Guards against a regression that bypasses `grace_disposition` and SIGKILLs
+    /// every child's (possibly-reused) PID.
     #[test]
     fn shutdown_kill_process_tree_only_in_hard_kill_arm_bughunt_r1() {
         let src = include_str!("mod.rs");
         let start = src
-            .find("pub(crate) fn shutdown_sequence(")
-            .expect("shutdown_sequence present");
+            .find("pub(crate) fn terminate_agents_parallel(")
+            .expect("terminate_agents_parallel present");
         let after = &src[start..];
         // Scope to the fn body up to the start of the #[cfg(test)] module.
         let cfg_test = ["#[cfg(", "test)]"].concat();
@@ -2832,6 +2870,73 @@ mod tests {
         );
 
         kill_registered_child(&registry, "probe-1");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// restart-freeze 真嫌#1 (t-…55279): the shared parallel-teardown core must
+    /// kill and reap N agents in about one grace window, not N times a per-agent
+    /// sequential wait (the ~6 s app-restart freeze). Spawn several real
+    /// SIGTERM-responsive shells, drain to `(name, child)` exactly as
+    /// `shutdown_sequence` and `app_teardown` do, then assert bounded wall time
+    /// (a per-agent wait would scale with N), zero post-grace SIGKILLs (shells
+    /// honour SIGTERM), and every child reaped (no zombies).
+    #[cfg(unix)]
+    #[test]
+    fn terminate_agents_parallel_bounded_and_reaps_all() {
+        let home = tmp_home("terminate_parallel");
+        let _run_dir = setup_run_dir_with_cookie(&home);
+        let names = ["t1", "t2", "t3", "t4", "t5", "t6"];
+        seed_fleet_ids(&home, &names);
+        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
+        for n in &names {
+            spawn_and_register_agent(
+                &home,
+                &make_shell_agent_def(n),
+                &registry,
+                &configs,
+                &crash_tx,
+                &shutdown,
+            )
+            .expect("spawn ok");
+        }
+
+        // Drain to (name, child) — identical to shutdown_sequence / app_teardown.
+        let agents: Vec<(String, ChildHandle)> = {
+            let mut reg = registry.lock();
+            reg.drain()
+                .map(|(_id, h)| (h.name.to_string(), h.child))
+                .collect()
+        };
+        assert_eq!(agents.len(), names.len());
+        let children: Vec<ChildHandle> = agents.iter().map(|(_, c)| Arc::clone(c)).collect();
+
+        let start = std::time::Instant::now();
+        let killed = terminate_agents_parallel(agents);
+        let elapsed = start.elapsed();
+
+        // Bound: one grace window + CI margin. Grace-exiters are reaped in place
+        // by `try_wait`, so the reap loop is ~instant; a regression to the
+        // is_pid_alive gate (zombie reads alive → kill_process_tree's 500 ms per
+        // agent, serialized) would add ~N×0.5 s ≈ 3 s for these 6 agents and
+        // blow this bound.
+        assert!(
+            elapsed < SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            "parallel teardown of {} agents took {elapsed:?}; expected ≈ one grace window \
+             (regression: per-agent kill_process_tree 500ms scaling with N)",
+            names.len()
+        );
+        // `sleep 60` honours SIGTERM (default-terminate) → all exit within grace.
+        assert_eq!(
+            killed, 0,
+            "SIGTERM-responsive shells should exit during grace"
+        );
+        for c in &children {
+            assert!(
+                matches!(c.lock().try_wait(), Ok(Some(_))),
+                "every child must be reaped after terminate_agents_parallel"
+            );
+        }
+
         std::fs::remove_dir_all(&home).ok();
     }
 

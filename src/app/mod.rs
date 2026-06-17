@@ -1070,6 +1070,22 @@ fn app_maintenance_tick(
 /// presentation-layer state the app owns even when Attached, so the next attach
 /// can restore the custom layout. `sync_fleet_yaml` + agent-kill STAY gated to
 /// Owned mode — in Attached mode the daemon owns fleet.yaml and the agent PTYs.
+/// Process-global app-mode shutdown flag, cloned into every Owned-mode agent's
+/// `SpawnConfig.shutdown` (see `pane_factory::attach_agent_to_pane`). app mode
+/// is a singleton process, so one flag covers the whole fleet — this avoids
+/// threading an `Arc<AtomicBool>` through the entire restore/pane-factory call
+/// chain. `app_teardown` flips it true before killing agents so each agent's
+/// PTY-close handler (`agent::handle_pty_close`) takes the fast `is_shutdown`
+/// early-return (no per-thread 2 s exit-poll, no crash / shell-fallback events
+/// during teardown). It is the app-mode equivalent of run_core's
+/// "drain registry first" race guard. Sticky-true — process exits after.
+static APP_SHUTDOWN: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn app_shutdown_flag() -> &'static Arc<std::sync::atomic::AtomicBool> {
+    APP_SHUTDOWN.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
 fn app_teardown(home: &Path, layout: &Layout, registry: &AgentRegistry, attached_mode: bool) {
     session::save_session(home, layout);
     if !attached_mode {
@@ -1078,11 +1094,50 @@ fn app_teardown(home: &Path, layout: &Layout, registry: &AgentRegistry, attached
         session::sync_fleet_yaml(home, layout);
 
         // Cleanup: kill all agents (Owned-only — daemon owns PTYs in Attached).
-        for tab in &layout.tabs {
-            for name in tab.root().agent_names() {
-                kill_agent(home, registry, &name);
+        //
+        // restart-freeze 真嫌#1 (t-…55279): this was a SEQUENTIAL per-agent
+        // `kill_agent` loop, each blocking on `wait_for_child_exit` (≤5 s),
+        // ~0.5 s × N ≈ ~6 s of the operator-visible restart freeze. Now:
+        //  1. flip the shutdown flag so PTY-close handlers fast-return (no
+        //     crash/shell-fallback events, no redundant per-thread exit poll) —
+        //     the app-mode equivalent of run_core's drain-first race guard;
+        //  2. drain the registry and kill ALL agents in parallel via the shared
+        //     run_core core (`terminate_agents_parallel`: parallel SIGTERM →
+        //     single grace → SIGKILL/reap holdouts), wall time ≈ one grace
+        //     window regardless of N;
+        //  3. run the per-agent cleanup tail (drop active-channel binding +
+        //     remove IPC port + event log) — mirrors `delete_transaction`'s
+        //     steps 5/7/8 (the registry remove is already done by the drain;
+        //     app mode tracks no AgentConfig map, matching its `configs: None`).
+        app_shutdown_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+        // #t-41673 gap-instrument: clock the parallel teardown so the next
+        // operator restart EMPIRICALLY confirms the ~6s sequential freeze is
+        // gone (expect `teardown_elapsed_ms` ≈ one grace window). Mirrors
+        // shutdown_sequence's `shutdown_elapsed_ms` for the app-mode path, plus
+        // per-agent `reap_ms` inside `terminate_agents_parallel`.
+        let teardown_started = std::time::Instant::now();
+        let agents: Vec<(String, crate::daemon::ChildHandle)> = {
+            let mut reg = registry.lock();
+            reg.drain()
+                .map(|(_id, handle)| (handle.name.to_string(), handle.child))
+                .collect()
+        };
+        let agents_total = agents.len();
+        let names: Vec<String> = agents.iter().map(|(n, _)| n.clone()).collect();
+        crate::daemon::terminate_agents_parallel(agents);
+        let run_dir = crate::daemon::run_dir(home);
+        for name in &names {
+            if let Some(ch) = crate::channel::active_channel() {
+                let _ = ch.take_binding(name);
             }
+            crate::ipc::remove_port(&run_dir, name);
+            crate::event_log::log(home, "delete", name, "delete: app teardown (parallel)");
         }
+        tracing::info!(
+            agents_total,
+            teardown_elapsed_ms = teardown_started.elapsed().as_millis() as u64,
+            "app-mode parallel teardown complete"
+        );
     }
 }
 
@@ -1558,6 +1613,37 @@ mod tests {
     use super::*;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    /// restart-freeze 真嫌#1 (t-…55279) source-scan invariant: `app_teardown`'s
+    /// Owned-mode cleanup must (1) flip the shutdown flag so PTY-close handlers
+    /// fast-return, then (2) tear agents down through the shared parallel core
+    /// `terminate_agents_parallel` — NOT the old SEQUENTIAL per-tab `kill_agent`
+    /// loop (each blocking ≤5 s on `wait_for_child_exit`, ~6 s of the restart
+    /// freeze). Regression-proof: revert app_teardown to a `kill_agent` loop and
+    /// this fails.
+    #[test]
+    fn app_teardown_uses_parallel_core_not_sequential_kill_loop() {
+        let src = include_str!("mod.rs");
+        let start = src.find("fn app_teardown(").expect("app_teardown present");
+        let after = &src[start..];
+        let end = after.find("fn build_menu_items(").unwrap_or(after.len());
+        let body = &after[..end];
+
+        assert!(
+            body.contains("app_shutdown_flag().store(true"),
+            "app_teardown must flip the shutdown flag before killing agents \
+             (fast PTY-close early-return, no crash events during teardown)"
+        );
+        assert!(
+            body.contains("terminate_agents_parallel("),
+            "app_teardown must route the kill through the shared parallel core"
+        );
+        assert!(
+            !body.contains("kill_agent("),
+            "#真嫌1: app_teardown must NOT use the sequential per-agent kill_agent \
+             loop (that is the ~6s restart-freeze regression)"
+        );
+    }
 
     /// #1457 regression guard: submit detection must fire for ALL backends, not
     /// just claude. If this regresses to claude-only, non-claude panes never

@@ -246,7 +246,12 @@ fn attach_agent_to_pane(
             submit_key,
             home: Some(home),
             crash_tx: None,
-            shutdown: None,
+            // restart-freeze 真嫌#1 (t-…55279): hand every Owned-mode agent the
+            // process-global app shutdown flag so `app_teardown` can flip it and
+            // each PTY-close handler takes the fast `is_shutdown` early-return
+            // during a parallel teardown (was `None` → slow per-thread exit poll
+            // + crash/shell-fallback events on every restart kill).
+            shutdown: Some(Arc::clone(super::app_shutdown_flag())),
         },
         registry,
     )?;
