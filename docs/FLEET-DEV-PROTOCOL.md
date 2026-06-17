@@ -798,6 +798,12 @@ A PR that resolves a tracked issue MUST carry a closing keyword (`Closes #N` / `
 
 `↳ 緣由 A-§12.7`
 
+### 12.8 Keep the Interactive Loop Free — Delegate Blocking Work
+An agent servicing a live operator or peer conversation MUST NOT run a long blocking operation inline in its main context. This covers **all** blocking long tasks — compile/build, bulk analysis, audits, periodic/scheduled prompts, large file sweeps — not just scheduled prompts. Dispatch the work to a subagent and keep the main loop free to respond.
+
+- **Exception**: a subagent already executing a delegated task does **not** re-delegate — it runs its task to completion. (This guard prevents infinite subagent fan-out.)
+- This is enforced structurally: the daemon injects this rule unconditionally into every managed agent's instructions (see `build_instructions_body`, "Interactive responsiveness"), so it does not rely on agent self-discipline.
+
 ## §13. `AGEND_GIT_BYPASS=1` Usage
 
 **TL;DR:** emergency override only. Default is bare `git`. Bypass when shim explicitly denies AND the operation is on the required-bypass list below.
