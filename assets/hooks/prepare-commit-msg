@@ -1,50 +1,92 @@
 #!/bin/sh
-# agend-terminal prepare-commit-msg hook — injects fleet trailers.
-# Reads binding.json for the current agent and appends metadata trailers.
-# Always exits 0 (hook failure must not block commits).
+# agend-terminal prepare-commit-msg hook — injects fleet trailers and, for repos
+# that opt into DCO, a `Signed-off-by` trailer. Always exits 0 (hook failure must
+# not block commits).
 
 COMMIT_MSG_FILE="$1"
 COMMIT_SOURCE="$2"
 
-# Skip merge/squash/template commits.
+# Skip merge/squash/template commits. DCO also exempts merge commits (no original
+# authorship to certify), so this keeps the two in lockstep.
 case "$COMMIT_SOURCE" in
     merge|squash|template) exit 0 ;;
 esac
 
-# Determine agent name from env.
-AGENT="${AGEND_INSTANCE_NAME:-}"
-if [ -z "$AGENT" ]; then
-    exit 0
-fi
+# --- Fleet trailers (Agend-*) — only for a bound agent commit. ---
+inject_agend_trailers() {
+    msg_file="$1"
 
-# Determine AGEND_HOME.
-HOME_DIR="${AGEND_HOME:-}"
-if [ -z "$HOME_DIR" ]; then
-    exit 0
-fi
+    AGENT="${AGEND_INSTANCE_NAME:-}"
+    [ -n "$AGENT" ] || return 0
 
-BINDING="$HOME_DIR/runtime/$AGENT/binding.json"
-if [ ! -f "$BINDING" ]; then
-    exit 0
-fi
+    HOME_DIR="${AGEND_HOME:-}"
+    [ -n "$HOME_DIR" ] || return 0
 
-# Idempotent: skip if trailer already present.
+    BINDING="$HOME_DIR/runtime/$AGENT/binding.json"
+    [ -f "$BINDING" ] || return 0
+
+    # Idempotent: skip if trailer already present.
+    grep -q "^Agend-Agent:" "$msg_file" 2>/dev/null && return 0
+
+    # Parse binding.json (minimal jq-free parsing via grep/sed).
+    TASK=$(grep -o '"task_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"task_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
+    BRANCH=$(grep -o '"branch"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
+    ISSUED=$(grep -o '"issued_at"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"issued_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
+
+    # Only inject if we have at least agent name.
+    {
+        echo ""
+        echo "Agend-Agent: $AGENT"
+        [ -n "$TASK" ] && echo "Agend-Task: $TASK"
+        [ -n "$BRANCH" ] && echo "Agend-Branch: $BRANCH"
+        [ -n "$ISSUED" ] && echo "Agend-Issued-At: $ISSUED"
+    } >> "$msg_file"
+}
+
+# --- Project-scoped DCO sign-off (#t-92758-7). ---
+# Add a `Signed-off-by` ONLY when the repo being committed itself opts into DCO
+# (it ships `.github/workflows/dco.yml`). This is the core safety property: the
+# trailer NEVER overflows to other repos an operator happens to run Agend on — a
+# project without that workflow gets nothing.
+#
+# Repo resolution uses `git rev-parse --show-toplevel`, which is the repo git is
+# actually committing into (for a fleet agent the shim ChdirPass-redirects reads
+# to the bound worktree, i.e. the same repo this commit lands in — #2234), so the
+# dco.yml probe is checked against the correct project root, not a stale cwd.
+add_dco_signoff() {
+    msg_file="$1"
+    agend_trailers_present="$2"
+
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    [ -n "$repo_root" ] || return 0
+
+    # Project-scope gate: no DCO workflow → no sign-off.
+    [ -f "$repo_root/.github/workflows/dco.yml" ] || return 0
+
+    # Identity = the real author (git config). DCO certifies the author, and
+    # dco.yml requires `Name <email>`; if either is empty, SKIP rather than write
+    # a malformed trailer that would FAIL the check.
+    name=$(git config user.name 2>/dev/null)
+    email=$(git config user.email 2>/dev/null)
+    [ -n "$name" ] && [ -n "$email" ] || return 0
+
+    # Idempotent: this author already signed off (any Signed-off-by with this
+    # email — e.g. the agent used `git commit -s` or amended).
+    grep -qi "^[[:space:]]*Signed-off-by:.*<${email}>" "$msg_file" 2>/dev/null && return 0
+
+    # Keep the sign-off in the trailer block: contiguous with the Agend-* trailers
+    # when present, otherwise separated from the body by one blank line.
+    [ "$agend_trailers_present" = "1" ] || echo "" >> "$msg_file"
+    printf 'Signed-off-by: %s <%s>\n' "$name" "$email" >> "$msg_file"
+}
+
+inject_agend_trailers "$COMMIT_MSG_FILE"
+
 if grep -q "^Agend-Agent:" "$COMMIT_MSG_FILE" 2>/dev/null; then
-    exit 0
+    AGEND_PRESENT=1
+else
+    AGEND_PRESENT=0
 fi
-
-# Parse binding.json (minimal jq-free parsing via grep/sed).
-TASK=$(grep -o '"task_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"task_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
-BRANCH=$(grep -o '"branch"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
-ISSUED=$(grep -o '"issued_at"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"issued_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
-
-# Only inject if we have at least agent name.
-{
-    echo ""
-    echo "Agend-Agent: $AGENT"
-    [ -n "$TASK" ] && echo "Agend-Task: $TASK"
-    [ -n "$BRANCH" ] && echo "Agend-Branch: $BRANCH"
-    [ -n "$ISSUED" ] && echo "Agend-Issued-At: $ISSUED"
-} >> "$COMMIT_MSG_FILE"
+add_dco_signoff "$COMMIT_MSG_FILE" "$AGEND_PRESENT"
 
 exit 0

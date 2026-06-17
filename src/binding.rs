@@ -1349,6 +1349,142 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
+
+    // ── #t-92758-7: project-scoped DCO Signed-off-by in prepare-commit-msg ──
+    /// Run the EMBEDDED prepare-commit-msg hook in a hermetic harness: a stub `git`
+    /// on PATH answers `rev-parse --show-toplevel` + `config user.{name,email}`, so
+    /// the project-scope gate is exercised without a real repo. `dco_present`
+    /// toggles `<root>/.github/workflows/dco.yml`. No `AGEND_INSTANCE_NAME` → the
+    /// Agend-trailer block is skipped, isolating the DCO sign-off path. Returns the
+    /// resulting commit message.
+    #[cfg(unix)]
+    fn run_prepare_commit_msg(
+        tag: &str,
+        dco_present: bool,
+        name: &str,
+        email: &str,
+        initial: &str,
+    ) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let home = tmp_home(tag);
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let repo_root = home.join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let git_stub = bin.join("git");
+        std::fs::write(
+            &git_stub,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *'rev-parse --show-toplevel'*) echo '{root}' ;;\n\
+                   *'config user.name'*) printf '%s' '{name}' ;;\n\
+                   *'config user.email'*) printf '%s' '{email}' ;;\n\
+                   *) : ;;\n\
+                 esac\n\
+                 exit 0\n",
+                root = repo_root.display(),
+                name = name,
+                email = email,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if dco_present {
+            let wf = repo_root.join(".github").join("workflows");
+            std::fs::create_dir_all(&wf).unwrap();
+            std::fs::write(wf.join("dco.yml"), "name: DCO\n").unwrap();
+        }
+
+        let hook = home.join("prepare-commit-msg");
+        std::fs::write(&hook, include_str!("../assets/hooks/prepare-commit-msg")).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let msg = home.join("COMMIT_EDITMSG");
+        std::fs::write(&msg, initial).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let status = Command::new("sh")
+            .arg(&hook)
+            .arg(&msg)
+            .arg("message")
+            .env("PATH", &path)
+            .env_remove("AGEND_INSTANCE_NAME")
+            .status()
+            .unwrap();
+        assert!(status.success(), "hook must always exit 0");
+        let out = std::fs::read_to_string(&msg).unwrap();
+        std::fs::remove_dir_all(&home).ok();
+        out
+    }
+
+    /// (a) A DCO repo (ships dco.yml) gets a sign-off in dco.yml's required
+    /// `Name <email>` shape.
+    #[cfg(unix)]
+    #[test]
+    fn dco_repo_gets_signoff_passing_regex_92758() {
+        let out =
+            run_prepare_commit_msg("dco-a", true, "Test User", "test@example.com", "subject\n");
+        assert!(
+            out.contains("Signed-off-by: Test User <test@example.com>"),
+            "a DCO repo must get a sign-off: {out}"
+        );
+        // Mirrors dco.yml's gate: `^\s*Signed-off-by:\s+.+ <[^>]+@[^>]+>\s*$`.
+        let matches_dco = out.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("Signed-off-by:")
+                && l.contains(" <")
+                && l.contains('@')
+                && l.ends_with('>')
+        });
+        assert!(matches_dco, "sign-off must satisfy dco.yml's format: {out}");
+    }
+
+    /// (b) THE core safety property — a repo WITHOUT dco.yml is NEVER signed, so the
+    /// trailer cannot overflow to other projects an operator runs Agend on.
+    #[cfg(unix)]
+    #[test]
+    fn non_dco_repo_gets_no_signoff_92758() {
+        let out =
+            run_prepare_commit_msg("dco-b", false, "Test User", "test@example.com", "subject\n");
+        assert!(
+            !out.contains("Signed-off-by"),
+            "a repo without .github/workflows/dco.yml must NEVER be signed: {out}"
+        );
+    }
+
+    /// (c) Idempotent — an already-signed message is not double-signed.
+    #[cfg(unix)]
+    #[test]
+    fn already_signed_message_not_duplicated_92758() {
+        let initial = "subject\n\nSigned-off-by: Test User <test@example.com>\n";
+        let out = run_prepare_commit_msg("dco-c", true, "Test User", "test@example.com", initial);
+        assert_eq!(
+            out.matches("Signed-off-by:").count(),
+            1,
+            "must not duplicate an existing sign-off: {out}"
+        );
+    }
+
+    /// (d) Identity gap (empty email) → SKIP rather than emit a malformed trailer
+    /// that would fail the DCO regex.
+    #[cfg(unix)]
+    #[test]
+    fn missing_identity_skips_signoff_92758() {
+        let out = run_prepare_commit_msg("dco-d", true, "Test User", "", "subject\n");
+        assert!(
+            !out.contains("Signed-off-by"),
+            "empty email must skip the sign-off (no malformed trailer): {out}"
+        );
+    }
 }
 
 #[cfg(test)]
