@@ -1123,7 +1123,13 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     let core = Arc::new(CoreMutex::new(AgentCore {
         vterm: VTerm::with_pty_writer(*cols, *rows, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
-        state: StateTracker::new(detected_backend.as_ref()),
+        // #1523: name the tracker at construction. Per-agent telemetry (incl. the
+        // turn-completion sentinel, whose token is derived from this name) needs
+        // it; `for_agent` enforces it so a future edit can't leave it empty as the
+        // bare `StateTracker::new` did (r6 #2297). `name` here is the same fleet
+        // instance name the instruction injection uses for `ctx.name`, so the
+        // detector recomputes the SAME token the agent is told to emit.
+        state: StateTracker::for_agent(detected_backend.as_ref(), name),
         health: HealthTracker::new(),
     }));
 

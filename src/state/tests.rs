@@ -5445,13 +5445,22 @@ fn turn_sentinel_nonce_is_deterministic_and_eight_hex() {
 }
 
 #[test]
-fn turn_sentinel_token_shape_matches_directive_literal() {
-    // The detector's token and the instructions.rs directive literal
-    // (`<<<AGEND-DONE:{nonce}>>>`) MUST stay byte-identical or detection drifts.
+fn turn_sentinel_token_shape_is_single_source_and_safe() {
+    // The instructions.rs directive embeds `turn_sentinel_token(name)` verbatim,
+    // so this single source of truth pins the shape. #2243 DuDuClaw: use `=====`
+    // delimiters, NOT angle brackets an agent's renderer might mangle.
     let token = turn_sentinel_token("fixup-dev");
-    assert_eq!(
-        token,
-        format!("<<<AGEND-DONE:{}>>>", turn_sentinel_nonce("fixup-dev"))
+    assert!(
+        token.starts_with("=====AGEND-DONE:") && token.ends_with("====="),
+        "token uses ===== delimiters: {token}"
+    );
+    assert!(
+        !token.contains('<') && !token.contains('>'),
+        "token must avoid mangle-prone <…> delimiters: {token}"
+    );
+    assert!(
+        token.contains(&turn_sentinel_nonce("fixup-dev")),
+        "token carries this agent's nonce: {token}"
     );
     assert!(
         token.len() < 35,
@@ -5486,7 +5495,7 @@ fn observe_turn_sentinel_distinguishes_emit_echo_leak() {
     assert!(leak.leak_signal, "embedded non-directive token flags leak");
 
     // Another agent's token is not attributed to us.
-    let other = observe_turn_sentinel("<<<AGEND-DONE:deadbeef>>>\n", &token);
+    let other = observe_turn_sentinel("=====AGEND-DONE:deadbeef=====\n", &token);
     assert!(!other.token_seen, "only OUR exact token counts");
 
     // Hard-wrapped token (split across rows) still matches via de-wrap.
@@ -5516,12 +5525,18 @@ fn turn_sentinel_capture_never_touches_state() {
     );
 }
 
+/// Shared lock for the sentinel env-flag tests below — they all flip the same
+/// process-global `AGEND_HOME` / `AGEND_TURN_SENTINEL_SHADOW`, so they must
+/// serialize against EACH OTHER (a per-fn mutex would not), even under an
+/// in-process test runner. (CI uses nextest's process-per-test, but this keeps
+/// `cargo test` honest too.)
+static SENTINEL_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn turn_sentinel_shadow_logs_record_when_on_without_changing_state() {
     // Serialize the process-global env flips; restore on the way out so a panic
     // can't leak them to other tests (mirrors the MED-5 convention).
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 
     let home = std::env::temp_dir().join(format!("agend-sentinel-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mk temp home");
@@ -5573,5 +5588,56 @@ fn turn_sentinel_shadow_logs_record_when_on_without_changing_state() {
         with_state,
         AgentState::Thinking,
         "capture must not change classification even when shadow is on"
+    );
+}
+
+#[test]
+fn turn_sentinel_fires_for_prod_constructed_tracker_2297() {
+    // r6 #2297 regression: the live daemon builds the tracker via
+    // `StateTracker::for_agent` (the agent/mod.rs spawn site). If that path stops
+    // naming the tracker, `instance_name` is empty → the detector derives the
+    // WRONG token → the shadow log NEVER fires in prod (Phase-0 measurement is
+    // dead-on-arrival). The sibling tests all call `set_instance_name` manually
+    // and so MASK this. This one builds the tracker the PRODUCTION way — via
+    // `for_agent`, with NO manual setter — so a wiring regression re-surfaces.
+    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = std::env::temp_dir().join(format!("agend-sentinel-prod-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mk temp home");
+    let prev_home = std::env::var("AGEND_HOME").ok();
+    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
+
+    // The token the agent is instructed to emit (derived from its name).
+    let token = turn_sentinel_token("prod-agent");
+    // Build the tracker the PROD way — named at construction, no manual setter.
+    let mut t = StateTracker::for_agent(Some(&Backend::OpenCode), "prod-agent");
+    t.feed(&format!("finished\n{token}"));
+
+    let log = home.join("turn_sentinel_shadow.jsonl");
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+
+    match prev_home {
+        Some(v) => std::env::set_var("AGEND_HOME", v),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+    match prev_flag {
+        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
+        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
+    }
+    std::fs::remove_dir_all(&home).ok();
+
+    let line = contents.lines().last().expect(
+        "prod-constructed tracker must fire the shadow log — an empty instance_name would kill it",
+    );
+    let rec: serde_json::Value = serde_json::from_str(line).expect("valid json record");
+    assert_eq!(
+        rec["agent"], "prod-agent",
+        "record attributed to the named agent"
+    );
+    assert_eq!(
+        rec["token_seen"], true,
+        "the agent's name-derived token was detected via the prod path"
     );
 }

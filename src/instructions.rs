@@ -134,10 +134,12 @@ pub(crate) fn build_instructions_body(
     // — the daemon-role sentence differs per mode; the delegation half adapts to
     // whether this backend has a subagent tool.
     progress_directive: Option<(i64, bool)>,
-    // #1523 Phase 0 (shadow): `Some(nonce)` injects the in-band turn-completion
-    // sentinel directive (the agent prints `<<<AGEND-DONE:{nonce}>>>` as its last
-    // line when a turn is fully done). `None` = absent → ZERO behaviour change.
-    // Gated by the caller to hook-less backends + `AGEND_TURN_SENTINEL_SHADOW=1`.
+    // #1523 Phase 0 (shadow): `Some(token)` injects the in-band turn-completion
+    // sentinel directive (the agent prints this exact `token` as its last line
+    // when a turn is fully done). The token is built by
+    // `crate::state::turn_sentinel_token` so this directive and the detector
+    // share ONE source of truth. `None` = absent → ZERO behaviour change. Gated
+    // by the caller to hook-less backends + `AGEND_TURN_SENTINEL_SHADOW=1`.
     turn_sentinel: Option<&str>,
 ) -> String {
     let mut content = String::new();
@@ -414,14 +416,14 @@ pub(crate) fn build_instructions_body(
     // only when `AGEND_TURN_SENTINEL_SHADOW=1`. The daemon side-logs whether the
     // token appears (telemetry only — it takes NO action on the signal in Phase 0),
     // so this directive is the sole behavioural change and a default fleet (flag
-    // off → `None`) sees none. The nonce is per-agent so the daemon can attribute
+    // off → `None`) sees none. The token is per-agent so the daemon can attribute
     // the marker; per-turn freshness comes from the daemon's dedup, not the token.
-    if let Some(nonce) = turn_sentinel {
+    if let Some(token) = turn_sentinel {
         content.push_str("\n## Turn-completion signal (AgEnD)\n\n");
         content.push_str(&format!(
             "When you have FULLY finished responding to the current request and are about to wait \
              for new input, print this exact marker on its own line as the very last line of your \
-             reply:\n\n    <<<AGEND-DONE:{nonce}>>>\n\n"
+             reply:\n\n    {token}\n\n"
         ));
         content
             .push_str("- Emit it once per completed turn, only in your normal terminal reply.\n");
@@ -526,18 +528,18 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
     // #1523 Phase 0 (shadow): inject the turn-completion sentinel only for
     // hook-less backends (Claude is EXCLUDED — it has lifecycle hooks that emit
     // authoritative state) and only when `AGEND_TURN_SENTINEL_SHADOW=1`. The
-    // per-agent nonce is derived from the agent name so the daemon detector can
-    // recompute it without any persisted/plumbed state. Default-off → `None` →
-    // ZERO behaviour change (fail-open invariant).
-    let turn_nonce = ctx
+    // per-agent token is derived from the agent name so the daemon detector can
+    // recompute the SAME token without any persisted/plumbed state. Default-off →
+    // `None` → ZERO behaviour change (fail-open invariant).
+    let turn_token = ctx
         .map(|c| c.name)
         .filter(|_| !backend.has_state_hooks() && crate::state::turn_sentinel_shadow_enabled())
-        .map(crate::state::turn_sentinel_nonce);
+        .map(crate::state::turn_sentinel_token);
     let body = build_instructions_body(
         ctx,
         Some(&proto_str),
         progress_directive,
-        turn_nonce.as_deref(),
+        turn_token.as_deref(),
     );
 
     // Include fleet.yaml `instructions:` inside the managed block so
@@ -1155,24 +1157,31 @@ mod tests {
     }
 
     #[test]
-    fn turn_sentinel_directive_present_only_when_nonce_given_1523() {
-        // #1523 Phase 0: with no nonce the sentinel section is absent (fail-open:
+    fn turn_sentinel_directive_present_only_when_token_given_1523() {
+        // #1523 Phase 0: with no token the sentinel section is absent (fail-open:
         // a default fleet / hook-ful backend / flag-off sees ZERO behaviour change).
         let off = build_instructions_body(None, None, None, None);
         assert!(
             !off.contains("Turn-completion signal"),
-            "sentinel section must be absent when nonce is None: {off}"
+            "sentinel section must be absent when token is None: {off}"
         );
         assert!(
-            !off.contains("<<<AGEND-DONE:"),
-            "token must not leak into instructions when nonce is None: {off}"
+            !off.contains("AGEND-DONE:"),
+            "token must not leak into instructions when token is None: {off}"
         );
-        // With a nonce, the directive + the exact per-agent token are present.
-        let on = build_instructions_body(None, None, None, Some("ab12cd34"));
+        // With a token, the directive embeds that EXACT string. Build it the way
+        // prod does so a delimiter change can't silently desync directive↔detector.
+        let token = crate::state::turn_sentinel_token("dir-agent");
+        let on = build_instructions_body(None, None, None, Some(&token));
         assert!(on.contains("## Turn-completion signal (AgEnD)"));
         assert!(
-            on.contains("<<<AGEND-DONE:ab12cd34>>>"),
+            on.contains(&token),
             "directive must embed the exact per-agent token: {on}"
+        );
+        // #2243 DuDuClaw: the marker must NOT use angle-bracket delimiters.
+        assert!(
+            !token.contains('<') && !token.contains('>'),
+            "token must avoid mangle-prone <…> delimiters: {token}"
         );
         assert!(
             on.contains("never persisted content"),

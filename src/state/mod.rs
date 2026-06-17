@@ -544,17 +544,29 @@ pub(crate) fn turn_sentinel_shadow_enabled() -> bool {
 pub(crate) fn turn_sentinel_nonce(name: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut hasher);
-    // Low 32 bits as fixed-width hex → an 8-char nonce → 25-char token
-    // (`<<<AGEND-DONE:xxxxxxxx>>>`), comfortably under the #2090 ~35-char
+    // Low 32 bits as fixed-width hex → an 8-char nonce → 29-char token
+    // (`=====AGEND-DONE:xxxxxxxx=====`), comfortably under the #2090 ~35-char
     // hard-wrap threshold so the marker stays on one line.
     format!("{:08x}", hasher.finish() & 0xffff_ffff)
 }
 
+/// #1523 Phase 0: turn-completion token delimiters. `=====` (not `<…>`): the
+/// #2243 DuDuClaw lesson is that angle-bracket markers can be mangled by an
+/// agent's own markdown/HTML rendering, which would conflate "agent did not
+/// emit" with "delimiter was rewritten" and poison the Phase-0 emit/compliance
+/// data (r2 #2297). The prefix is shared by the detector fast-path so it can't
+/// drift from the token.
+const TURN_SENTINEL_PREFIX: &str = "=====AGEND-DONE:";
+const TURN_SENTINEL_SUFFIX: &str = "=====";
+
 /// #1523 Phase 0: the exact in-band token for an agent's turn-completion
-/// sentinel. Shared by the instruction directive and the shadow detector so the
-/// two never drift.
+/// sentinel. The single source of truth — the instruction directive embeds this
+/// exact string and the shadow detector scans for it, so the two never drift.
 pub(crate) fn turn_sentinel_token(name: &str) -> String {
-    format!("<<<AGEND-DONE:{}>>>", turn_sentinel_nonce(name))
+    format!(
+        "{TURN_SENTINEL_PREFIX}{}{TURN_SENTINEL_SUFFIX}",
+        turn_sentinel_nonce(name)
+    )
 }
 
 /// #1523 Phase 0: pure classification of a screen `tail` against an agent's
@@ -1242,8 +1254,22 @@ impl StateTracker {
         }
     }
 
-    /// Set instance name for behavioral telemetry logging.
-    #[allow(dead_code)] // Called by daemon supervisor when wiring up agents
+    /// Construct a tracker for a NAMED agent — the production path. The name is
+    /// required for per-agent telemetry: in particular the #1523 turn-completion
+    /// sentinel derives this agent's token from its name (see
+    /// [`turn_sentinel_token`]), so an unnamed tracker would compute the wrong
+    /// token and the shadow log would never fire. Prefer this over `new` +
+    /// `set_instance_name` at every real spawn site so the name can't be
+    /// forgotten (r6 #2297: the inline `StateTracker::new` left it empty in prod).
+    pub fn for_agent(backend: Option<&Backend>, name: &str) -> Self {
+        let mut t = Self::new(backend);
+        t.set_instance_name(name);
+        t
+    }
+
+    /// Set instance name for per-agent telemetry logging. Prefer [`for_agent`]
+    /// at construction; this stays public for the supervisor/tests that need to
+    /// (re)name an already-built tracker.
     pub fn set_instance_name(&mut self, name: &str) {
         self.instance_name = name.to_string();
     }
@@ -2368,7 +2394,7 @@ impl StateTracker {
         }
         // Cheap fast-path: the marker prefix is fixed; bail before building the
         // per-agent token or allocating a tail if it is nowhere on screen.
-        if !screen_text.contains("<<<AGEND-DONE:") {
+        if !screen_text.contains(TURN_SENTINEL_PREFIX) {
             self.last_turn_sentinel_sig = None;
             return;
         }
