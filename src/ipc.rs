@@ -38,11 +38,15 @@ pub(crate) fn port_path(run_dir: &Path, name: &str) -> std::path::PathBuf {
 }
 
 /// Write `port` to `{run_dir}/{name}.port` atomically (tmp + rename).
+///
+/// A2: uses `store::atomic_write`, whose tmp file is uniquely named
+/// (`.{pid}.{seq}.tmp`) rather than a SHARED `.{name}.port.tmp`. The shared tmp
+/// raced when the same agent's port was (re)written concurrently — two writers
+/// truncated/wrote the one tmp inode and could publish interleaved bytes — and
+/// left an orphan tmp on crash. A per-call tmp inode removes both.
 pub fn write_port(run_dir: &Path, name: &str, port: u16) -> io::Result<()> {
     let final_path = port_path(run_dir, name);
-    let tmp = run_dir.join(format!(".{name}.port.tmp"));
-    std::fs::write(&tmp, port.to_string())?;
-    std::fs::rename(&tmp, &final_path)
+    crate::store::atomic_write(&final_path, port.to_string().as_bytes()).map_err(io::Error::other)
 }
 
 /// Read a port from `{run_dir}/{name}.port`. Returns None if missing/malformed.
@@ -182,6 +186,23 @@ mod tests {
         let dir = tmp_dir("roundtrip");
         write_port(&dir, "api", 12345).expect("write");
         assert_eq!(read_port(&dir, "api"), Some(12345));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A2: `write_port` must NOT publish via the old SHARED tmp
+    /// `.{name}.port.tmp` (which raced on concurrent same-name writes and left
+    /// crash orphans). `store::atomic_write` uses a per-call unique tmp instead.
+    /// DISCRIMINATING: pre-create a directory at the old shared-tmp path — the
+    /// pre-fix `std::fs::write(&shared_tmp, ..)` would fail (the path is a dir),
+    /// while the unique-tmp write succeeds.
+    #[test]
+    fn write_port_does_not_use_shared_tmp_a2() {
+        let dir = tmp_dir("a2-shared-tmp");
+        // Block the pre-fix shared tmp name `.{name}.port.tmp`.
+        std::fs::create_dir(dir.join(".agent.port.tmp")).expect("block shared tmp");
+        write_port(&dir, "agent", 4321)
+            .expect("write_port must use a per-call unique tmp, not the shared one");
+        assert_eq!(read_port(&dir, "agent"), Some(4321));
         std::fs::remove_dir_all(&dir).ok();
     }
 

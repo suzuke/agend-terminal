@@ -1878,6 +1878,13 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
         let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
         crate::store::atomic_write(&archive_path, archived.as_bytes())?;
         crate::store::atomic_write(log_path, kept.as_bytes())?;
+        // S1: compaction just rewrote (shrank) the hot log. Invalidate the
+        // replay cache so the next reader replays the compacted file instead of
+        // a stale entry — mirrors every append path (:1124/:1211/:1297). Today
+        // this is correct-by-ACCIDENT (the shorter file changes the
+        // `(len, mtime)` cache key → key miss); the explicit bump makes it
+        // correct-by-CONTRACT and survives any future cache-key change.
+        invalidate_replay_cache();
         // We've already rewritten the hot file — return no extra lines
         // to append. (H10: no SEQ_CACHE to invalidate — `max_seq_for_instance`
         // always re-scans the on-disk file, so the atomic replace is observed.)
@@ -2299,6 +2306,60 @@ mod tests {
         let arc = archive_dir(&home);
         let entries: Vec<_> = fs::read_dir(&arc).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1, "exactly one archive file expected");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// S1: `compact_at` rewrites the hot log and MUST invalidate the replay
+    /// cache (bump `REPLAY_GENERATION`), exactly like the append paths. Pre-fix
+    /// it was correct-by-accident (the shorter file changed the `(len, mtime)`
+    /// cache key); this asserts the explicit contract — the generation bump —
+    /// which a future cache-key change can't silently break. DISCRIMINATING:
+    /// without the added `invalidate_replay_cache()`, the generation is
+    /// unchanged across `compact_at` and this fails.
+    #[test]
+    #[serial]
+    fn compact_at_invalidates_replay_cache_s1() {
+        let home = tmp_home("compact-invalidate");
+        let inst = InstanceName::from("u");
+        // Direct-write > COMPACTION_KEEP lines so compact_at actually rewrites
+        // (mirrors compact_archives_older_than_keep_threshold).
+        let log = home.join("task_events.jsonl");
+        let mut lines = String::new();
+        for i in 1..=(COMPACTION_KEEP + 5) {
+            let env = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: i as u64,
+                timestamp: format!("2026-04-27T{:02}:00:00Z", i % 24),
+                instance: inst.clone(),
+                emitter_id: None,
+                event: TaskEvent::Unblocked {
+                    task_id: format!("t-{i}").as_str().into(),
+                },
+            };
+            lines.push_str(&serde_json::to_string(&env).unwrap());
+            lines.push('\n');
+        }
+        fs::write(&log, lines).unwrap();
+        // Warm the replay cache for this board.
+        let _ = replay(&home).unwrap();
+        let gen_before = REPLAY_GENERATION.load(Ordering::Acquire);
+        compact(&home).unwrap();
+        let gen_after = REPLAY_GENERATION.load(Ordering::Acquire);
+        assert!(
+            gen_after > gen_before,
+            "compact_at must invalidate the replay cache (generation \
+             {gen_before} → {gen_after}); without the explicit bump the stale \
+             cache could outlive the compacted file"
+        );
+        // Sanity: compaction actually rewrote the hot log (kept exactly
+        // COMPACTION_KEEP lines — so the generation bump above came from a real
+        // rewrite, not a no-op) and a post-compact replay still succeeds.
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            COMPACTION_KEEP,
+            "compaction must shrink the hot log to COMPACTION_KEEP lines"
+        );
+        replay(&home).expect("post-compact replay must succeed");
         fs::remove_dir_all(&home).ok();
     }
 

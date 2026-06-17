@@ -441,7 +441,14 @@ pub(crate) fn write_daemon_id(run_dir: &Path) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let token = crate::process::process_start_token(pid).unwrap_or(0);
-    let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}:{token}"));
+    // A1: atomic write — a plain `fs::write` can be read mid-write (torn) by a
+    // concurrent `read_daemon_pid`/liveness probe, which then parse-fails on a
+    // truncated `pid:now:token` record. `store::atomic_write` publishes via a
+    // unique tmp + rename so readers only ever see a complete record.
+    let _ = crate::store::atomic_write(
+        &run_dir.join(".daemon"),
+        format!("{pid}:{now}:{token}").as_bytes(),
+    );
 }
 
 /// Read the PID recorded in `{run_dir}/.daemon`. Returns `None` if the file is
@@ -2196,6 +2203,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// A1: `write_daemon_id` publishes the `.daemon` identity via
+    /// `store::atomic_write`, so a concurrent `read_daemon_pid` liveness probe
+    /// never sees a torn `pid:now:token` record. DISCRIMINATING via a side
+    /// effect unique to `atomic_write`: it `create_dir_all`s the parent, so a
+    /// write into a not-yet-created run_dir succeeds and round-trips — the
+    /// pre-fix plain `std::fs::write` (no parent creation, error swallowed by
+    /// `let _ =`) would leave no file at all.
+    #[test]
+    fn write_daemon_id_atomic_write_roundtrip_a1() {
+        let home = tmp_home("a1-daemon-id");
+        let run_dir = home.join("run-not-yet-created");
+        assert!(!run_dir.exists());
+        write_daemon_id(&run_dir);
+        assert_eq!(
+            read_daemon_pid(&run_dir),
+            Some(std::process::id()),
+            "atomic_write must create run_dir + publish a complete .daemon record"
+        );
+        let raw = std::fs::read_to_string(run_dir.join(".daemon")).expect(".daemon present");
+        assert_eq!(
+            raw.split(':').count(),
+            3,
+            "complete pid:now:token record expected, got {raw:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #1814 Stage-2 (#t-27) source-scan invariant: the three shared-state
