@@ -80,6 +80,22 @@ git rebase --signoff origin/main           # every commit on the branch
 # then: git push --force-with-lease
 ```
 
+### Maintainer / fleet identity
+
+The author, committer, and `Signed-off-by` of a commit all come from this clone's
+`git config user.name` / `user.email`. Set them as **local** config in your clone of
+this repo (not `--global`, so other projects are unaffected). The maintainer/fleet
+identity is:
+
+```bash
+git config user.name  "Huang ChiaCheng (黃家政)"
+git config user.email "1557604+suzuke@users.noreply.github.com"
+```
+
+This is local to `.git/config` and is **not** version-controlled, so re-run it after a
+fresh `git clone`. Fleet agents commit in linked worktrees of this clone and inherit
+the same identity automatically.
+
 ## Review Process
 
 Here's what to expect once you open an issue or PR — the aim is fast, concrete feedback, not ceremony.

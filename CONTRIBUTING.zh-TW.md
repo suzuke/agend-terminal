@@ -80,6 +80,20 @@ git rebase --signoff origin/main           # 分支上的每個 commit
 # 然後:git push --force-with-lease
 ```
 
+### Maintainer / fleet 身份
+
+commit 的 author、committer 與 `Signed-off-by`都來自這個 clone 的 `git config
+user.name` / `user.email`。請把它們設成這個 repo clone 的 **local** config（不要
+`--global`,以免影響其他專案）。maintainer/fleet 身份為:
+
+```bash
+git config user.name  "Huang ChiaCheng (黃家政)"
+git config user.email "1557604+suzuke@users.noreply.github.com"
+```
+
+這是 `.git/config` 的 local 設定、**不進版控**,所以全新 `git clone` 後要重設一次。
+Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一個身份。
+
 ## Review 流程
 
 以下是你開 issue 或 PR 之後可以預期的狀況——目標是快速、具體的回饋，而不是繁文縟節。
