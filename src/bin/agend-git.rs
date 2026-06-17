@@ -77,6 +77,14 @@ fn main() {
                     log_bypass_mutating_op(&home, &agent, &args);
                 }
             }
+            // #2234 fix B: DENY (not just log) an AGENT's bypass-provisioning op
+            // in a canonical-rooted repo. The daemon already auto-binds a worktree
+            // at dispatch; a stray bypass `worktree add` / `checkout|switch <ref>`
+            // here detaches the operator's canonical HEAD (or strays a worktree).
+            // Daemon internals never reach this shim (daemon PATH is shim-free) and
+            // carry no AGEND_INSTANCE_NAME, so this only bites true agents. Exits
+            // non-zero before the passthrough exec when the deny fires.
+            enforce_agent_canonical_bypass_deny(&args);
         }
         exec_real_git(&args, None);
     }
@@ -1295,6 +1303,58 @@ fn is_positional_branch_checkout(args: &[String]) -> bool {
     ) && args
         .get(1)
         .is_some_and(|t| !t.is_empty() && !t.starts_with('-'))
+}
+
+/// #2234 fix B (pure decision — unit-testable without env/cwd/git). Should an
+/// agent's `AGEND_GIT_BYPASS` op be DENIED for canonical-repo safety?
+///
+/// Deny iff ALL hold:
+/// - `agent_present` — `AGEND_INSTANCE_NAME` set (a real fleet agent; daemon
+///   internals never reach this shim and carry no instance name);
+/// - NOT `escape` — the one-shot `AGEND_GIT_ALLOW_CANONICAL_MUTATE` override is
+///   absent (deliberately a SEPARATE env from `AGEND_GIT_BYPASS`, which is what
+///   put us on the bypass path in the first place);
+/// - `canonical` — cwd is canonical-rooted (the source repo OR a worktree of it,
+///   per `cwd_is_canonical_rooted`);
+/// - the op is **provisioning / HEAD-detaching**: `worktree` (any subcommand) or
+///   a positional `checkout|switch <ref>` (NOT `checkout -- <pathspec>` / flag
+///   forms — those are excluded by `is_positional_branch_checkout`).
+///
+/// `reset` is intentionally NOT denied (an agent self-help tool that moves a
+/// branch ref without detaching; `worktree add`'s internal reset is already
+/// covered by denying `worktree`). `push`/`commit`/`add`/`clean`/`branch` are
+/// excluded — agents legitimately bypass those in their own worktree.
+fn deny_agent_canonical_bypass(
+    agent_present: bool,
+    escape: bool,
+    canonical: bool,
+    args: &[String],
+) -> bool {
+    if !agent_present || escape || !canonical {
+        return false;
+    }
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    sub == "worktree" || is_positional_branch_checkout(args)
+}
+
+/// #2234 fix B: read the live env + cwd, and if [`deny_agent_canonical_bypass`]
+/// fires, print an actionable message and exit non-zero (refusing the bypass
+/// passthrough). No-op otherwise. Cross-platform — only env/args/cwd inspection
+/// (`cwd_is_canonical_rooted` already has macOS/Linux/Windows impls).
+fn enforce_agent_canonical_bypass_deny(args: &[String]) {
+    let agent = env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+    let escape = env::var("AGEND_GIT_ALLOW_CANONICAL_MUTATE").as_deref() == Ok("1");
+    if !deny_agent_canonical_bypass(!agent.is_empty(), escape, cwd_is_canonical_rooted(), args) {
+        return;
+    }
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    eprintln!(
+        "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo.\n\
+         The daemon already auto-bound your worktree at dispatch; cd into it and use normal git \
+         (no AGEND_GIT_BYPASS). A stray provision here detaches the operator's canonical HEAD (#2234).\n\
+         If you genuinely must: ask lead, or set AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot."
+    );
+    std::process::exit(1);
 }
 
 /// #2234 defect#2: record a NON-agent (no `AGEND_INSTANCE_NAME`) canonical-cwd
@@ -2925,6 +2985,106 @@ mod tests {
         ])));
         assert!(!is_positional_branch_checkout(&s(&["status"])));
         assert!(!is_positional_branch_checkout(&s(&["commit", "main"])));
+    }
+
+    /// #2234 fix B: the pure deny decision. Deny only when agent + !escape +
+    /// canonical + provisioning op (worktree / positional checkout|switch <ref>).
+    #[test]
+    fn deny_agent_canonical_bypass_decision_matrix_2234() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // DENY: agent, not escaped, canonical, provisioning ops.
+        assert!(deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["worktree", "add", "x", "origin/main"])
+        ));
+        assert!(deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["worktree", "remove", "x"])
+        ));
+        assert!(deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["checkout", "origin/main"])
+        ));
+        assert!(deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["switch", "main"])
+        ));
+
+        // ALLOW — carve-outs / non-provisioning:
+        // non-agent caller (daemon-correlated / operator shell).
+        assert!(!deny_agent_canonical_bypass(
+            false,
+            false,
+            true,
+            &s(&["worktree", "add", "x"])
+        ));
+        // explicit escape env set.
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            true,
+            true,
+            &s(&["worktree", "add", "x"])
+        ));
+        // cwd not canonical-rooted (e.g. /tmp nextest fixture).
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            false,
+            &s(&["checkout", "origin/main"])
+        ));
+        // non-provisioning ops agents legitimately bypass in their own worktree.
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["push", "origin", "feat/x"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["commit", "-m", "wip"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["add", "-A"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["reset", "--hard", "HEAD"])
+        ));
+        // checkout flag/pathspec forms are NOT positional-branch → not denied.
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["checkout", "-b", "tmp"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["checkout", "--", "file.rs"])
+        ));
+        // read-only.
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["status"])
+        ));
     }
 
     /// #852 residual core: canonical source repo (`.git` directory +
