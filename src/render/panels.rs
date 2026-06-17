@@ -82,56 +82,136 @@ fn format_active_status(mut names: Vec<&str>) -> String {
     }
 }
 
-pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision], scroll: usize) {
+/// #2305: the pending-decision answer board (Ctrl+B D). Browse lists questions
+/// awaiting an operator answer; Answer shows the selected question's options
+/// (⭐ = recommended) and an optional free-text input.
+pub fn render_decisions(
+    frame: &mut Frame,
+    items: &[crate::decisions::Decision],
+    selected: usize,
+    mode: &crate::app::DecisionMode,
+) {
+    use crate::app::DecisionMode;
     let count = items.len();
-    let title = format!(" Decisions ({count}) | j/k scroll | q close ");
+    let title = match mode {
+        DecisionMode::Browse => {
+            format!(" Pending decisions ({count}) | j/k select · Enter answer · q close ")
+        }
+        DecisionMode::Answer {
+            free_text: Some(_), ..
+        } => " Answer · type · Enter submit · Esc back ".to_string(),
+        DecisionMode::Answer { .. } => {
+            " Answer · j/k option · Enter submit · f free-text · Esc back ".to_string()
+        }
+    };
     let inner = render_overlay_frame(frame, Color::Yellow, &title);
 
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("  No decisions yet.").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("  No pending decisions — nothing to answer.")
+                .style(Style::default().fg(Color::DarkGray)),
             inner,
         );
         return;
     }
 
     let mut lines: Vec<Line> = Vec::new();
-    for (i, d) in items.iter().enumerate() {
-        let marker = if i == scroll { "> " } else { "  " };
-        let style = if i == scroll {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{marker}[{}] {}", d.scope, d.title),
-            style,
-        )));
-        if i == scroll {
+    match mode {
+        DecisionMode::Browse => {
+            for (i, d) in items.iter().enumerate() {
+                let is_sel = i == selected;
+                let marker = if is_sel { "> " } else { "  " };
+                let style = if is_sel {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker}[{}] {}", d.scope, d.title),
+                    style,
+                )));
+                if is_sel {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "    by {} | {}",
+                            d.author,
+                            crate::display_time::format_local_short(&d.created_at, None)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    for line in d.content.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {line}"),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                    for o in &d.options {
+                        let star = if o.recommended { "⭐ " } else { "   " };
+                        lines.push(Line::from(Span::styled(
+                            format!("    {star}{}", o.label),
+                            Style::default().fg(Color::Cyan),
+                        )));
+                    }
+                    if d.allow_free_text {
+                        lines.push(Line::from(Span::styled(
+                            "    (free-text allowed)",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                }
+            }
+        }
+        DecisionMode::Answer { option, free_text } => {
+            let Some(d) = items.get(selected) else {
+                return;
+            };
             lines.push(Line::from(Span::styled(
-                format!(
-                    "    by {} | {}",
-                    d.author,
-                    crate::display_time::format_local_short(&d.created_at, None)
-                ),
-                Style::default().fg(Color::DarkGray),
+                format!("[{}] {}", d.scope, d.title),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )));
             for line in d.content.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("    {line}"),
+                    format!("  {line}"),
                     Style::default().fg(Color::Gray),
                 )));
             }
-            if !d.tags.is_empty() {
+            lines.push(Line::from(""));
+            for (oi, o) in d.options.iter().enumerate() {
+                let sel = free_text.is_none() && oi == *option;
+                let marker = if sel { "> " } else { "  " };
+                let star = if o.recommended { "⭐ " } else { "" };
+                let style = if sel {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
                 lines.push(Line::from(Span::styled(
-                    format!("    tags: {}", d.tags.join(", ")),
-                    Style::default().fg(Color::Cyan),
+                    format!("{marker}{star}{}", o.label),
+                    style,
                 )));
             }
-            lines.push(Line::from(""));
+            if let Some(buf) = free_text {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("free text > {buf}▏"),
+                    Style::default().fg(Color::Green),
+                )));
+            } else if d.allow_free_text {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "press f to type a free-text answer",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);

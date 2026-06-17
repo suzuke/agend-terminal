@@ -14,7 +14,7 @@ mod telegram_hooks;
 mod tui_events;
 mod tui_spawn;
 
-pub use overlay::{BoardView, MenuItem, MenuItemKind, TaskBoardMode};
+pub use overlay::{BoardView, DecisionMode, MenuItem, MenuItemKind, TaskBoardMode};
 pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
 
 use crate::agent::{self, AgentRegistry};
@@ -623,8 +623,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 Overlay::Command { ref input } => {
                     render::render_command_palette(frame, input);
                 }
-                Overlay::Decisions { ref items, scroll } => {
-                    render::render_decisions(frame, items, *scroll);
+                Overlay::Decisions {
+                    ref items,
+                    selected,
+                    ref mode,
+                } => {
+                    render::render_decisions(frame, items, *selected, mode);
                 }
                 Overlay::Tasks {
                     ref items,
@@ -801,8 +805,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     Overlay::Command { ref input } => {
                                         crate::render::render_command_palette(frame, input);
                                     }
-                                    Overlay::Decisions { ref items, scroll } => {
-                                        crate::render::render_decisions(frame, items, *scroll);
+                                    Overlay::Decisions {
+                                        ref items,
+                                        selected,
+                                        ref mode,
+                                    } => {
+                                        crate::render::render_decisions(frame, items, *selected, mode);
                                     }
                                     Overlay::Tasks { ref items, col, row, ref mode, ref view } => {
                                         crate::render::render_tasks(frame, items, *col, *row, mode, *view, &home);

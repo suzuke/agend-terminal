@@ -28,6 +28,20 @@ pub(super) enum CloseTarget {
     Tab,
 }
 
+/// #2305: sub-mode of the pending-decision answer overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionMode {
+    /// Navigating the pending-question list (j/k select, Enter answers, q/Esc close).
+    Browse,
+    /// Answering the selected question. `option` is the highlighted option index;
+    /// `free_text` is `Some(buffer)` while typing a free-text answer (only when the
+    /// question's `allow_free_text` is set), else `None` (choosing among options).
+    Answer {
+        option: usize,
+        free_text: Option<String>,
+    },
+}
+
 pub enum TaskBoardMode {
     Board,
     Detail,
@@ -101,10 +115,15 @@ pub(super) enum Overlay {
     Command {
         input: String,
     },
-    /// Decisions overlay panel (read-only, scrollable).
+    /// #2305: pending-decision answer board (Ctrl+B D). Lists questions awaiting
+    /// an operator answer; Browse to pick one, then Answer (select an option or
+    /// type free-text). Mirrors the interactive `Tasks` overlay.
     Decisions {
         items: Vec<crate::decisions::Decision>,
-        scroll: usize,
+        /// Selected pending question (Browse mode).
+        selected: usize,
+        /// Sub-mode: Browse the list, or Answer the selected question.
+        mode: DecisionMode,
     },
     /// Task board overlay — 4-column kanban view with CRUD.
     Tasks {
@@ -125,30 +144,23 @@ pub(super) enum Overlay {
     },
 }
 
-/// Handle j/k/PgUp/PgDn scroll for list overlays. Returns true if handled, false to close.
-pub(super) fn handle_list_scroll(key: KeyCode, scroll: &mut usize, len: usize) -> bool {
-    match key {
-        KeyCode::Up | KeyCode::Char('k') => {
-            *scroll = scroll.saturating_sub(1);
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if *scroll + 1 < len {
-                *scroll += 1;
-            }
-            true
-        }
-        KeyCode::PageUp => {
-            *scroll = scroll.saturating_sub(10);
-            true
-        }
-        KeyCode::PageDown => {
-            *scroll = (*scroll + 10).min(len.saturating_sub(1));
-            true
-        }
-        KeyCode::Esc | KeyCode::Char('q') => false,
-        _ => true,
-    }
+/// #2305: record the operator's answer to a pending decision and reload the
+/// pending list so the answered item drops out. `answered_by` is fixed
+/// `"operator"` — the TUI is the trusted local operator. Best-effort: on a
+/// backend error the list simply doesn't change (the item stays pending), so the
+/// operator can retry; the overlay never surfaces a hard failure mid-key.
+fn submit_decision_answer(
+    home: &Path,
+    id: &str,
+    answer: String,
+    items: &mut Vec<crate::decisions::Decision>,
+) {
+    let _ = crate::decisions::answer(
+        home,
+        "operator",
+        &serde_json::json!({"id": id, "answer": answer}),
+    );
+    *items = crate::decisions::list_pending(home);
 }
 
 /// Bundle of mutable references passed to `handle_key` so overlay handlers can
@@ -570,11 +582,105 @@ pub(super) fn handle_key(
             _ => {}
         },
         Overlay::Decisions {
-            items,
-            ref mut scroll,
+            ref mut items,
+            ref mut selected,
+            ref mut mode,
         } => {
-            if !handle_list_scroll(key.code, scroll, items.len()) {
-                *overlay = Overlay::None;
+            match mode {
+                DecisionMode::Browse => match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
+                        *selected += 1;
+                    }
+                    // Enter answers the selected question. Open free-text directly
+                    // when there are no options to choose (and free text is allowed).
+                    KeyCode::Enter => {
+                        if let Some(d) = items.get(*selected) {
+                            let free_text = if d.options.is_empty() && d.allow_free_text {
+                                Some(String::new())
+                            } else {
+                                None
+                            };
+                            // Only enter Answer mode if there's actually a way to
+                            // answer (some options, or free text allowed).
+                            if !d.options.is_empty() || d.allow_free_text {
+                                *mode = DecisionMode::Answer {
+                                    option: 0,
+                                    free_text,
+                                };
+                            }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        *overlay = Overlay::None;
+                    }
+                    _ => {}
+                },
+                DecisionMode::Answer {
+                    ref mut option,
+                    ref mut free_text,
+                } => {
+                    // Snapshot the bits we need as OWNED values so the submit path
+                    // can take `&mut items` without an outstanding borrow. If the
+                    // selected decision vanished (race), bail back to Browse.
+                    let Some((id, opt_labels, allow_free)) = items.get(*selected).map(|d| {
+                        (
+                            d.id.clone(),
+                            d.options
+                                .iter()
+                                .map(|o| o.label.clone())
+                                .collect::<Vec<_>>(),
+                            d.allow_free_text,
+                        )
+                    }) else {
+                        *mode = DecisionMode::Browse;
+                        return outcome;
+                    };
+                    if let Some(buf) = free_text {
+                        // Free-text input sub-mode.
+                        match key.code {
+                            KeyCode::Enter if !buf.is_empty() => {
+                                submit_decision_answer(ctx.home, &id, buf.clone(), items);
+                                *selected = (*selected).min(items.len().saturating_sub(1));
+                                *mode = DecisionMode::Browse;
+                            }
+                            KeyCode::Char(c) => buf.push(c),
+                            KeyCode::Backspace => {
+                                buf.pop();
+                            }
+                            // Esc backs out of free-text to option select.
+                            KeyCode::Esc => *free_text = None,
+                            _ => {}
+                        }
+                    } else {
+                        // Option-select sub-mode.
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                *option = option.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if *option + 1 < opt_labels.len() =>
+                            {
+                                *option += 1;
+                            }
+                            KeyCode::Enter => {
+                                if let Some(label) = opt_labels.get(*option) {
+                                    submit_decision_answer(ctx.home, &id, label.clone(), items);
+                                    *selected = (*selected).min(items.len().saturating_sub(1));
+                                    *mode = DecisionMode::Browse;
+                                }
+                            }
+                            // 'f' / 'e' switch to free-text entry when allowed.
+                            KeyCode::Char('f') | KeyCode::Char('e') if allow_free => {
+                                *free_text = Some(String::new());
+                            }
+                            KeyCode::Esc => *mode = DecisionMode::Browse,
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         Overlay::Tasks {
@@ -913,6 +1019,37 @@ mod tests {
         match overlay {
             Overlay::Tasks { mode, .. } => mode,
             _ => panic!("expected Tasks overlay"),
+        }
+    }
+
+    /// #2305: a per-test temp home (process+tag unique — no env, no cross-test
+    /// collision; decisions are posted with an explicit `home`).
+    fn dec_home(tag: &str) -> std::path::PathBuf {
+        let h = std::env::temp_dir().join(format!("overlay_dec_{}_{}", std::process::id(), tag));
+        std::fs::create_dir_all(&h).ok();
+        h
+    }
+
+    /// #2305: drive a sequence of keys through `handle_key` against a fresh ctx
+    /// bound to `home` (so the Decisions overlay's `decisions::answer` writes land
+    /// in this temp home).
+    fn run_keys(home: &Path, overlay: &mut Overlay, keys: &[KeyCode]) {
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home,
+            fleet_path: home,
+            wakeup_tx: &tx,
+            name_counter: &mut name_counter,
+            telegram_state: &tg,
+        };
+        for k in keys {
+            handle_key(overlay, press(*k), &mut ctx);
         }
     }
 
@@ -1280,50 +1417,190 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // --- Sprint 41 T-4: handle_list_scroll logic coverage ---
+    // #2305: the read-only `handle_list_scroll` helper was removed when the
+    // Decisions overlay became interactive (it was its only prod caller); its
+    // navigation is now covered by the Decisions answer-overlay tests below.
 
-    #[test]
-    fn list_scroll_up_decrements() {
-        let mut scroll = 5;
-        let consumed = handle_list_scroll(KeyCode::Up, &mut scroll, 10);
-        assert!(consumed);
-        assert_eq!(scroll, 4);
+    // ─── #2305 interactive decision answer overlay ───
+
+    fn open_decisions(home: &Path) -> Overlay {
+        Overlay::Decisions {
+            items: crate::decisions::list_pending(home),
+            selected: 0,
+            mode: DecisionMode::Browse,
+        }
     }
 
     #[test]
-    fn list_scroll_up_at_zero_stays_zero() {
-        let mut scroll = 0;
-        handle_list_scroll(KeyCode::Up, &mut scroll, 10);
-        assert_eq!(scroll, 0);
+    fn decisions_option_answer_submits_and_reloads() {
+        let home = dec_home("opt");
+        let _ = crate::decisions::post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "Deploy?", "content": "ship v2?", "needs_answer": true,
+                "options": [{"label": "yes", "recommended": true}, "no"],
+            }),
+        );
+        let mut overlay = open_decisions(&home);
+        // Enter opens Answer (option-select, since options exist).
+        run_keys(&home, &mut overlay, &[KeyCode::Enter]);
+        assert!(matches!(
+            &overlay,
+            Overlay::Decisions {
+                mode: DecisionMode::Answer {
+                    option: 0,
+                    free_text: None
+                },
+                ..
+            }
+        ));
+        // Down→'no', Up→'yes', Enter submits 'yes'.
+        run_keys(
+            &home,
+            &mut overlay,
+            &[KeyCode::Down, KeyCode::Up, KeyCode::Enter],
+        );
+        match &overlay {
+            Overlay::Decisions { items, mode, .. } => {
+                assert!(
+                    matches!(mode, DecisionMode::Browse),
+                    "back to Browse after submit"
+                );
+                assert!(
+                    items.is_empty(),
+                    "answered question dropped from pending list"
+                );
+            }
+            _ => panic!("expected Decisions overlay after submit"),
+        }
+        let d = crate::decisions::list_all(&home)
+            .into_iter()
+            .next()
+            .expect("decision present");
+        assert_eq!(d.answer.as_deref(), Some("yes"));
+        assert_eq!(d.answered_by.as_deref(), Some("operator"));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn list_scroll_down_increments() {
-        let mut scroll = 3;
-        let consumed = handle_list_scroll(KeyCode::Down, &mut scroll, 10);
-        assert!(consumed);
-        assert_eq!(scroll, 4);
+    fn decisions_free_text_answer_submits() {
+        let home = dec_home("free");
+        let _ = crate::decisions::post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "Why?", "content": "explain", "needs_answer": true, "allow_free_text": true,
+            }),
+        );
+        let mut overlay = open_decisions(&home);
+        // No options + free text allowed → Enter goes straight to free-text entry.
+        run_keys(&home, &mut overlay, &[KeyCode::Enter]);
+        assert!(matches!(
+            &overlay,
+            Overlay::Decisions {
+                mode: DecisionMode::Answer {
+                    free_text: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        run_keys(
+            &home,
+            &mut overlay,
+            &[KeyCode::Char('h'), KeyCode::Char('i'), KeyCode::Enter],
+        );
+        let d = crate::decisions::list_all(&home)
+            .into_iter()
+            .next()
+            .expect("decision present");
+        assert_eq!(d.answer.as_deref(), Some("hi"));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn list_scroll_down_at_end_stays() {
-        let mut scroll = 9;
-        handle_list_scroll(KeyCode::Down, &mut scroll, 10);
-        assert_eq!(scroll, 9);
+    fn decisions_esc_backs_out_then_closes() {
+        let home = dec_home("esc");
+        let _ = crate::decisions::post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "Q", "content": "?", "needs_answer": true,
+                "options": ["a"], "allow_free_text": true,
+            }),
+        );
+        let mut overlay = open_decisions(&home);
+        // Enter→Answer(option), f→free-text.
+        run_keys(&home, &mut overlay, &[KeyCode::Enter, KeyCode::Char('f')]);
+        assert!(matches!(
+            &overlay,
+            Overlay::Decisions {
+                mode: DecisionMode::Answer {
+                    free_text: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+        // Esc backs free-text → option-select.
+        run_keys(&home, &mut overlay, &[KeyCode::Esc]);
+        assert!(matches!(
+            &overlay,
+            Overlay::Decisions {
+                mode: DecisionMode::Answer {
+                    free_text: None,
+                    ..
+                },
+                ..
+            }
+        ));
+        // Esc backs option-select → Browse.
+        run_keys(&home, &mut overlay, &[KeyCode::Esc]);
+        assert!(matches!(
+            &overlay,
+            Overlay::Decisions {
+                mode: DecisionMode::Browse,
+                ..
+            }
+        ));
+        // Esc in Browse closes the overlay.
+        run_keys(&home, &mut overlay, &[KeyCode::Esc]);
+        assert!(matches!(&overlay, Overlay::None));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn list_scroll_esc_returns_false() {
-        let mut scroll = 5;
-        let consumed = handle_list_scroll(KeyCode::Esc, &mut scroll, 10);
-        assert!(!consumed, "Esc must return false (close overlay)");
-    }
-
-    #[test]
-    fn list_scroll_page_down_jumps_10() {
-        let mut scroll = 0;
-        handle_list_scroll(KeyCode::PageDown, &mut scroll, 50);
-        assert_eq!(scroll, 10);
+    fn decisions_browse_jk_navigates() {
+        let home = dec_home("nav");
+        for t in ["q1", "q2", "q3"] {
+            let _ = crate::decisions::post(
+                &home,
+                "lead",
+                &serde_json::json!({"title": t, "content": "?", "needs_answer": true, "allow_free_text": true}),
+            );
+        }
+        let mut overlay = open_decisions(&home);
+        run_keys(
+            &home,
+            &mut overlay,
+            &[KeyCode::Char('j'), KeyCode::Char('j')],
+        );
+        match &overlay {
+            Overlay::Decisions {
+                selected, items, ..
+            } => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(*selected, 2, "j×2 moves to last");
+            }
+            _ => panic!("expected Decisions overlay"),
+        }
+        run_keys(&home, &mut overlay, &[KeyCode::Char('k')]);
+        match &overlay {
+            Overlay::Decisions { selected, .. } => assert_eq!(*selected, 1, "k moves up"),
+            _ => panic!("expected Decisions overlay"),
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 

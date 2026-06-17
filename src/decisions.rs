@@ -316,6 +316,15 @@ pub fn list_all(home: &Path) -> Vec<Decision> {
     load_all(home).into_iter().filter(|d| !d.archived).collect()
 }
 
+/// #2305: active questions awaiting an operator answer (`needs_answer` &&
+/// `status == Pending`), newest-first. Backs the interactive answer overlay.
+pub fn list_pending(home: &Path) -> Vec<Decision> {
+    load_all(home)
+        .into_iter()
+        .filter(|d| !d.archived && d.needs_answer && d.status == Some(DecisionStatus::Pending))
+        .collect()
+}
+
 pub fn list(home: &Path, args: &Value) -> Value {
     let include_archived = args["include_archived"].as_bool().unwrap_or(false);
     let filter_tags: Vec<String> = args["tags"]
@@ -460,6 +469,17 @@ pub fn answer(home: &Path, caller: &str, args: &Value) -> Value {
         if !decision.needs_answer {
             return serde_json::json!({
                 "error": format!("decision '{id}' is not a pending question (needs_answer=false)")
+            });
+        }
+        // #2305 (r2): a question is for the OPERATOR to answer — its own author
+        // must not self-answer (an agent answering its own question would bypass
+        // the operator entirely). The TUI overlay answers as "operator" (never the
+        // author), so this only blocks the MCP self-answer path.
+        if decision.author == caller {
+            return serde_json::json!({
+                "error": format!(
+                    "decision '{id}' author '{caller}' cannot answer its own question (operator answers)"
+                )
             });
         }
         if decision.status != Some(DecisionStatus::Pending) {
@@ -871,13 +891,10 @@ mod tests {
         r["id"].as_str().expect("question id").to_string()
     }
 
-    /// Active pending questions (the PR2 overlay's prod helper lands next PR; here
-    /// we filter inline so PR1 carries no unused prod code).
+    /// Active pending questions — delegates to the prod `list_pending` (added in
+    /// PR2 now that the answer overlay calls it).
     fn pending_questions(home: &Path) -> Vec<Decision> {
-        list_all(home)
-            .into_iter()
-            .filter(|d| d.needs_answer && d.status == Some(DecisionStatus::Pending))
-            .collect()
+        list_pending(home)
     }
 
     #[test]
@@ -994,6 +1011,39 @@ mod tests {
             .find(|d| d.id == id)
             .expect("present");
         assert_eq!(d.answer.as_deref(), Some("something custom"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn answer_refuses_author_self_answer_2305() {
+        // r2 hardening: the question's own author must not self-answer (would
+        // bypass the operator). A different caller (the operator) still can.
+        let home = tmp_home("dec_q_self_answer");
+        let id = post_question(
+            &home,
+            serde_json::json!({"title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true}),
+        );
+        // post_question authors as "lead" — lead answering its own question is refused.
+        let r = answer(&home, "lead", &serde_json::json!({"id": id, "answer": "x"}));
+        assert!(
+            r.get("error")
+                .is_some_and(|e| e.as_str().unwrap_or("").contains("cannot answer its own")),
+            "author self-answer must be refused: {r}"
+        );
+        assert_eq!(
+            pending_questions(&home).len(),
+            1,
+            "still pending after refused self-answer"
+        );
+        // The operator (different identity) answers fine.
+        assert_eq!(
+            answer(
+                &home,
+                "operator",
+                &serde_json::json!({"id": id, "answer": "x"})
+            )["status"],
+            "answered"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

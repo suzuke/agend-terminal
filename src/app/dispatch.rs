@@ -193,8 +193,14 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             });
         }
         Action::ShowDecisions => {
-            let items = crate::decisions::list_all(ctx.home);
-            out.new_overlay = Some(Overlay::Decisions { items, scroll: 0 });
+            // #2305: Ctrl+B D is now the pending-question answer board — list only
+            // decisions awaiting an operator answer.
+            let items = crate::decisions::list_pending(ctx.home);
+            out.new_overlay = Some(Overlay::Decisions {
+                items,
+                selected: 0,
+                mode: super::overlay::DecisionMode::Browse,
+            });
         }
         Action::ShowTasks => {
             let items = crate::tasks::list_all(ctx.home);
