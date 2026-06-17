@@ -1893,35 +1893,56 @@ fn persist_watch_state(
             match state.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
                 Some(next) => {
                     let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
-                    let pr_number = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch)
-                        .map(|s| s.pr_number);
-                    let task_id = state.task_id.as_deref();
-                    let msg = make_ci_ready_for_action_msg(
-                        ctx.repo,
-                        ctx.branch,
-                        &repo_branch_key,
-                        Some(&pr.current_sha),
-                        pr_number,
-                        task_id,
-                    );
-                    persist_or_log!(
-                        crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg),
-                        "ci_watch_chain",
-                        next
-                    );
-                    // #1888 phase-2: track the handoff until RESOLUTION (report /
-                    // PR terminal / target claims the branch), decoupled from the
-                    // inbox read-state the watchdog used to scan (any drain marked
-                    // it read within seconds and blinded the re-nudge).
-                    crate::daemon::ci_handoff_track::record(
-                        ctx.home,
-                        next,
-                        &repo_branch_key,
-                        &chrono::Utc::now().to_rfc3339(),
-                        // #2008: anchor the track to the head it was recorded for so
-                        // a later head move can invalidate it (head-aware resolve).
-                        Some(&pr.current_sha),
-                    );
+                    let pr_state = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch);
+                    // #t-92758 P1(b): don't emit ci-ready for a merge-BLOCKED PR
+                    // (REJECTED verdict / Draft) — the chain target can't act on it,
+                    // so emitting only spawns a re-nudge loop. This handles the
+                    // reject-before-CI ordering; the evict in `pr_state::scanner`
+                    // handles the CI-green-then-reject ordering (#2297). The
+                    // predicate NEVER suppresses VERIFIED/green/None — the normal
+                    // "your turn" handoff stays live (is_ci_ready_merge_blocked iron
+                    // rule).
+                    if pr_state
+                        .as_ref()
+                        .is_some_and(crate::daemon::pr_state::is_ci_ready_merge_blocked)
+                    {
+                        tracing::info!(
+                            target: "ci_watch",
+                            repo = ctx.repo,
+                            branch = ctx.branch,
+                            "ci-ready suppressed — PR merge-blocked (REJECTED/Draft); no chain handoff, no track"
+                        );
+                    } else {
+                        let pr_number = pr_state.as_ref().map(|s| s.pr_number);
+                        let task_id = state.task_id.as_deref();
+                        let msg = make_ci_ready_for_action_msg(
+                            ctx.repo,
+                            ctx.branch,
+                            &repo_branch_key,
+                            Some(&pr.current_sha),
+                            pr_number,
+                            task_id,
+                        );
+                        persist_or_log!(
+                            crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg),
+                            "ci_watch_chain",
+                            next
+                        );
+                        // #1888 phase-2: track the handoff until RESOLUTION (report /
+                        // PR terminal / target claims the branch), decoupled from the
+                        // inbox read-state the watchdog used to scan (any drain marked
+                        // it read within seconds and blinded the re-nudge).
+                        crate::daemon::ci_handoff_track::record(
+                            ctx.home,
+                            next,
+                            &repo_branch_key,
+                            &chrono::Utc::now().to_rfc3339(),
+                            // #2008: anchor the track to the head it was recorded for
+                            // so a later head move can invalidate it (head-aware
+                            // resolve).
+                            Some(&pr.current_sha),
+                        );
+                    }
                 }
                 None if state.subscriber_names().is_empty() => {
                     tracing::warn!(

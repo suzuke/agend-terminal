@@ -309,6 +309,39 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
     resolved
 }
 
+/// #t-92758 P2: resolve the track whose TARGET is `agent` AND whose correlation
+/// is exactly `correlation` (`owner/repo@branch`) — the dismiss path for
+/// `ci unwatch`. Unlike [`resolve_by_correlation`] (which clears every target's
+/// track for the branch) and [`resolve_claimed`] (which matches by `@branch`
+/// suffix across repos), this is the precise "the caller explicitly dropped THIS
+/// handoff" eviction: only the unwatching agent's own ci-ready obligation for
+/// this exact repo@branch is cleared, leaving any co-subscriber's track intact.
+pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlation: &str) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == agent
+            && track.correlation == correlation
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#1888-track-resolved",
+                agent = %track.target,
+                correlation = %track.correlation,
+                reason = "unwatch_dismiss",
+                "ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
 /// #2008: resolve every track for `correlation` whose recorded `head_sha` no
 /// longer matches the branch's CURRENT head — the ci-ready obligation was for a
 /// head that has since been superseded (a new push / force-push), so without this
@@ -497,6 +530,27 @@ mod tests {
         let left = list(&home);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].1.correlation, "o/r@other");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_for_target_correlation_scopes_to_exact_target_and_correlation() {
+        // #t-92758 P2: unwatch dismiss clears ONLY the caller's own track for the
+        // exact repo@branch — a co-subscriber's track (same correlation, different
+        // target) and the caller's other-branch track both survive.
+        let home = tmp_home("resolve-tc");
+        record(&home, "lead", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(&home, "lead", "o/r@other", "2026-06-10T00:00:00Z", None);
+        assert_eq!(resolve_for_target_correlation(&home, "lead", "o/r@b"), 1);
+        let left = list(&home);
+        assert_eq!(left.len(), 2, "only lead's o/r@b cleared");
+        assert!(left
+            .iter()
+            .any(|(_, t)| t.target == "reviewer" && t.correlation == "o/r@b"));
+        assert!(left
+            .iter()
+            .any(|(_, t)| t.target == "lead" && t.correlation == "o/r@other"));
         std::fs::remove_dir_all(&home).ok();
     }
 

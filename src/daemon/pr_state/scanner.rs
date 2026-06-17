@@ -368,6 +368,21 @@ pub fn scan_and_emit_with(
                 "pr_terminal",
             );
         }
+        // #t-92758 P1(a): a merge-BLOCKED-but-still-open PR (REJECTED verdict or
+        // Draft) also resolves any pending ci-handoff track — the chain target
+        // can't merge/act on it, so the ~2-min re-nudge is pure noise (#2297:
+        // REJECTED is not a terminal PR state and the head doesn't move, so none
+        // of the other resolvers fire). Symmetric with the terminal resolve above;
+        // idempotent (no-op if already gone or no track). VERIFIED/green/None are
+        // untouched — the normal "your turn / should-merge" ci-ready + re-nudge is
+        // preserved (is_ci_ready_merge_blocked iron rule).
+        if super::is_ci_ready_merge_blocked(&snapshot) {
+            let _ = crate::daemon::ci_handoff_track::resolve_by_correlation(
+                home,
+                &format!("{repo}@{branch}"),
+                "pr_merge_blocked",
+            );
+        }
         let _ = registry; // reserved for future gh-poll author lookup hook
     }
 }
@@ -695,6 +710,110 @@ fn build_event_message(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::super::gh_poll::tests::MockGhPoller;
+    use super::super::gh_poll::{GhPrMetadata, GhPrState};
+    use super::super::{new_for_branch, save, ReviewClass, VerdictState};
+    use super::scan_and_emit_with;
+
+    fn empty_registry() -> crate::agent::AgentRegistry {
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn open_pr_meta(number: u64, branch: &str) -> GhPrMetadata {
+        // A live, open, non-draft PR matching the tracked branch — keeps the
+        // snapshot OPEN through `apply_gh_poll` (an EMPTY poll would drive it
+        // terminal and resolve the track via the wrong path). gh metadata never
+        // carries the review verdict, so verdict_state is untouched.
+        GhPrMetadata {
+            number,
+            author_login: "dev".into(),
+            head_ref: branch.into(),
+            is_cross_repository: false,
+            is_draft: false,
+            state: GhPrState::Open,
+            merged_at: None,
+        }
+    }
+
+    /// #t-92758 P1(a): a REJECTED-but-open PR resolves its pending ci-handoff
+    /// track on the next scan — the #2297 noise root cause (REJECTED is not a
+    /// terminal PR state, so none of the prior resolvers fired and the watchdog
+    /// re-nudged every ~2 min).
+    #[test]
+    fn scan_evicts_ci_handoff_track_for_rejected_pr() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-92758-scan-evict-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mut s = new_for_branch("o/r", "b", "abcdef0", ReviewClass::Single);
+        s.pr_number = 42;
+        s.verdict_state = VerdictState::Rejected {
+            reviewer: "r".into(),
+            reviewed_head: "abcdef0".into(),
+            reason: None,
+        };
+        save(&home, &s).unwrap();
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "lead",
+            "o/r@b",
+            &chrono::Utc::now().to_rfc3339(),
+            Some("abcdef0"),
+        );
+
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(42, "b")])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        assert!(
+            crate::daemon::ci_handoff_track::list(&home).is_empty(),
+            "REJECTED PR must evict the ci-handoff track (#2297 noise fix)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-92758 IRON RULE (end-to-end): a VERIFIED PR must KEEP its ci-handoff
+    /// track — the normal "your turn / should-merge" handoff + re-nudge survives
+    /// the new eviction path.
+    #[test]
+    fn scan_keeps_ci_handoff_track_for_verified_pr() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-92758-scan-keep-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mut s = new_for_branch("o/r", "b", "abcdef1", ReviewClass::Single);
+        s.pr_number = 43;
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("r".into(), "abcdef1".into())],
+        };
+        save(&home, &s).unwrap();
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "lead",
+            "o/r@b",
+            &chrono::Utc::now().to_rfc3339(),
+            Some("abcdef1"),
+        );
+
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(43, "b")])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        assert!(
+            crate::daemon::ci_handoff_track::list(&home)
+                .iter()
+                .any(|(_, t)| t.correlation == "o/r@b"),
+            "IRON RULE: VERIFIED PR must KEEP its ci-handoff track"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #bughunt3 invariant (#1617 lock-while-blocking class): the worktree
     /// auto-release does a `git` subprocess + acquires a second (binding) flock,
     /// so it must NEVER run inside the `with_pr_state` closure — that closure

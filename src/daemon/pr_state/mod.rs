@@ -446,6 +446,24 @@ pub fn is_merge_ready(state: &PrState) -> bool {
         .all(|(_, reviewed)| sha_prefix_match(&state.head_sha, reviewed))
 }
 
+/// #t-92758: a PR whose `[ci-ready-for-action]` chain handoff is pointless right
+/// now because the PR cannot be merged/acted-on — a REJECTED verdict (a reviewer
+/// bounced it; it's being reworked) or a Draft PR (`gh pr merge` refuses drafts).
+/// Used to (a) SUPPRESS a new ci-ready emission and (b) EVICT an existing
+/// ci-handoff track so the re-nudge watchdog stops pinging the chain target for a
+/// PR they can't move.
+///
+/// IRON RULE (regression-pinned): this is DELIBERATELY narrow — it returns
+/// `false` for `Verified` / `Unverified` / `Pending` / `None` verdicts. A
+/// VERIFIED+green PR is exactly the "your turn to merge" case the chain exists
+/// for and MUST keep emitting + re-nudging; this predicate must never suppress
+/// it. (Unverified/Pending/None are not merge-blocked verdicts — the reviewer
+/// hasn't bounced the PR — so the chain handoff stays live.)
+pub fn is_ci_ready_merge_blocked(state: &PrState) -> bool {
+    matches!(state.verdict_state, VerdictState::Rejected { .. })
+        || matches!(state.draft_state, DraftState::Draft)
+}
+
 // ─── storage ───────────────────────────────────────────────────────────
 
 /// Canonical path to the PR-state directory.
@@ -1251,6 +1269,52 @@ mod tests {
             created_at: now(),
             updated_at: now(),
         }
+    }
+
+    /// #t-92758 IRON RULE: `is_ci_ready_merge_blocked` blocks ONLY a REJECTED
+    /// verdict or a Draft PR — never VERIFIED / Unverified / Pending / None. A
+    /// VERIFIED+green PR is the "your turn to merge" case the ci-ready chain
+    /// exists for and MUST keep emitting + re-nudging; a regression that made the
+    /// predicate true for VERIFIED would silently kill legitimate merge handoffs.
+    #[test]
+    fn is_ci_ready_merge_blocked_only_rejected_or_draft() {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+
+        // Non-blocking verdicts (Ready draft state):
+        s.verdict_state = VerdictState::None;
+        assert!(!is_ci_ready_merge_blocked(&s), "None must not block");
+        s.verdict_state = VerdictState::Pending;
+        assert!(!is_ci_ready_merge_blocked(&s), "Pending must not block");
+        s.verdict_state = VerdictState::Unverified {
+            reviewer: "r".into(),
+            reviewed_head: "sha-A".into(),
+        };
+        assert!(!is_ci_ready_merge_blocked(&s), "Unverified must not block");
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("r".into(), "sha-A".into())],
+        };
+        assert!(
+            !is_ci_ready_merge_blocked(&s),
+            "IRON RULE: VERIFIED must NEVER be suppressed/evicted"
+        );
+
+        // Blocking: REJECTED verdict.
+        s.verdict_state = VerdictState::Rejected {
+            reviewer: "r".into(),
+            reviewed_head: "sha-A".into(),
+            reason: None,
+        };
+        assert!(is_ci_ready_merge_blocked(&s), "REJECTED must block");
+
+        // Blocking: Draft — even with an otherwise-mergeable VERIFIED verdict.
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("r".into(), "sha-A".into())],
+        };
+        s.draft_state = DraftState::Draft;
+        assert!(
+            is_ci_ready_merge_blocked(&s),
+            "Draft must block even with a VERIFIED verdict"
+        );
     }
 
     /// T1: CI green at head_sha + Verified at same head_sha → MergeReady.

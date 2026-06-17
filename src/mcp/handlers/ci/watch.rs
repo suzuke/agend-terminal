@@ -248,6 +248,21 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
         .map(String::from)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| instance_name.to_string());
+    // #t-92758 P2: unwatch is also the lead's dismiss path for a stuck ci-ready —
+    // clear the caller's own ci-handoff track for this repo@branch so the re-nudge
+    // watchdog stops (previously unwatch removed the watch subscription but NOT the
+    // decoupled ci-ready obligation, so re-nudges continued). Done unconditionally
+    // (even if the watch file is already absent below) since the intent is to drop
+    // the obligation. Precise (caller + exact correlation) so a co-subscriber's
+    // track is left intact.
+    if !caller.is_empty() {
+        let correlation = format!("{repo}@{branch}");
+        crate::daemon::ci_handoff_track::resolve_for_target_correlation(
+            home,
+            &caller,
+            &correlation,
+        );
+    }
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let path = crate::daemon::ci_watch::ci_watches_dir(home).join(&filename);
     // H5: flock the per-watch read→atomic_write RMW (see handle_watch_ci).
@@ -466,4 +481,52 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
             .map(|p| Box::new(p) as Box<dyn CiProvider>),
     };
     provider
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// #t-92758 P2: `ci unwatch` is the lead's dismiss path for a stuck ci-ready —
+    /// it must clear the caller's own ci-handoff track so the re-nudge watchdog
+    /// stops. Runs even when no watch file exists (the dismiss intent stands).
+    #[test]
+    fn unwatch_resolves_callers_ci_handoff_track() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-92758-unwatch-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A ci-ready obligation pointing at the caller, plus a co-subscriber's
+        // track on the same branch that must survive (precise dismiss).
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "lead",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+        );
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+        );
+
+        let args = json!({"repository": "o/r", "branch": "b", "instance": "lead"});
+        let _ = handle_unwatch_ci(&home, &args, "lead");
+
+        let left = crate::daemon::ci_handoff_track::list(&home);
+        assert_eq!(left.len(), 1, "only the caller's track is cleared");
+        assert_eq!(
+            left[0].1.target, "reviewer",
+            "co-subscriber's track must survive unwatch dismiss"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
