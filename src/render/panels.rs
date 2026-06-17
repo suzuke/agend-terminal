@@ -247,7 +247,7 @@ pub fn render_tasks(
     ])
     .split(inner);
 
-    let col_titles = ["Backlog", "Ready", "Working", "Review", "Done"];
+    let col_titles = ["Todo", "Working", "Review", "Blocked", "Done"];
     let done_total = columns.get(4).map(|c| c.len()).unwrap_or(0);
     let done_visible = done_total.min(DONE_VISIBLE_MAX);
     let done_older = done_total.saturating_sub(DONE_VISIBLE_MAX);
@@ -262,12 +262,13 @@ pub fn render_tasks(
             }
         })
         .collect();
+    // #2306 column order: Todo, Working, Review, Blocked, Done.
     let col_colors = [
-        Color::Gray,
-        Color::Green,
-        Color::Yellow,
-        Color::Cyan,
-        Color::DarkGray,
+        Color::Gray,     // Todo
+        Color::Yellow,   // Working
+        Color::Cyan,     // Review
+        Color::Red,      // Blocked
+        Color::DarkGray, // Done
     ];
 
     for (ci, (tasks, area)) in columns.iter().zip(col_areas.iter()).enumerate() {
@@ -307,17 +308,23 @@ pub fn render_tasks(
                 crate::task_events::TaskPriority::Normal => "🔵",
                 crate::task_events::TaskPriority::Low => "⚪",
             };
-            let blocked = if t.status == crate::task_events::TaskStatus::Blocked {
-                " 🔴"
-            } else {
-                ""
+            // #2306: keep the original fine-grained status visible so the
+            // merged buckets don't lose information — Todo shows backlog/claimed
+            // (open is the unmarked default), Review marks verified with ✓, and a
+            // blocked task keeps its 🔴.
+            let sub = match t.status {
+                crate::task_events::TaskStatus::Backlog => " ·backlog",
+                crate::task_events::TaskStatus::Claimed => " ·claimed",
+                crate::task_events::TaskStatus::Verified => " ✓",
+                crate::task_events::TaskStatus::Blocked => " 🔴",
+                _ => "",
             };
             let assignee = t
                 .assignee
                 .as_deref()
                 .map(|a| format!(" @{a}"))
                 .unwrap_or_default();
-            let text = format!("{pri_badge} {}{blocked}{assignee}", t.title);
+            let text = format!("{pri_badge} {}{sub}{assignee}", t.title);
             let style = if is_selected {
                 Style::default()
                     .fg(Color::Black)
@@ -346,8 +353,9 @@ pub fn render_tasks(
         // daemon is offline; the filter degrades to the pre-#827
         // identity behavior in that case.
         let live = fetch_live_agents(home);
+        // #2306: Working is now column index 1 (was 2 under the old layout).
         let active_agents = filter_live_assignees(
-            columns[2].iter().filter_map(|t| t.assignee.as_deref()),
+            columns[1].iter().filter_map(|t| t.assignee.as_deref()),
             live.as_ref(),
         );
         let status_text = format_active_status(active_agents.into_iter().collect());
@@ -495,10 +503,12 @@ const DONE_VISIBLE_MAX: usize = 20;
 /// Extra rows beyond viewport to keep sorted (absorbs off-by-one / border).
 const PARTIAL_SORT_BUFFER: usize = 5;
 
-/// Group tasks into 4 kanban columns: Backlog, Open, In Progress, Done.
-/// Sorted by priority desc then created_at asc within each column.
+/// #2306: group tasks into the 5 readable kanban columns, in display order:
+/// `[Todo, Working, Review, Blocked, Done]` (Todo = backlog+open+claimed,
+/// Working = in_progress, Review = in_review+verified, Blocked = blocked,
+/// Done = done). Sorted by priority then created_at within each column.
 /// Done column is sorted by updated_at desc (most recent first).
-/// Cancelled tasks are excluded.
+/// Cancelled tasks are excluded. Display-only: the status enum is unchanged.
 ///
 /// Fully sorts every column. Use [`task_board_columns_viewport`] in
 /// per-frame render paths where only the first `viewport_rows` items
@@ -515,23 +525,26 @@ pub fn task_board_columns_viewport(
     items: &[crate::tasks::Task],
     viewport_rows: usize,
 ) -> [Vec<&crate::tasks::Task>; 5] {
-    let mut backlog: Vec<&crate::tasks::Task> = Vec::new();
-    let mut ready: Vec<&crate::tasks::Task> = Vec::new();
+    let mut todo: Vec<&crate::tasks::Task> = Vec::new();
     let mut working: Vec<&crate::tasks::Task> = Vec::new();
     let mut review: Vec<&crate::tasks::Task> = Vec::new();
+    let mut blocked: Vec<&crate::tasks::Task> = Vec::new();
     let mut done: Vec<&crate::tasks::Task> = Vec::new();
 
     for t in items {
-        use crate::task_events::{TaskPriority, TaskStatus};
+        use crate::task_events::TaskStatus;
+        // #2306: status → display bucket (readability). Pure status grouping —
+        // the prior low-priority→backlog cross-bucket sink is dropped (priority
+        // still sorts WITHIN a column). Blocked is its OWN column (split out of
+        // the old open+blocked "Ready" mix — the key readability win). Cancelled
+        // is hidden. The status enum / transitions / automation are UNTOUCHED;
+        // this only changes how the overlay groups + labels them.
         match t.status {
             TaskStatus::Cancelled => {}
-            TaskStatus::Backlog => backlog.push(t),
-            TaskStatus::Open | TaskStatus::Blocked if t.priority == TaskPriority::Low => {
-                backlog.push(t)
-            }
-            TaskStatus::Open | TaskStatus::Blocked => ready.push(t),
-            TaskStatus::Claimed | TaskStatus::InProgress => working.push(t),
+            TaskStatus::Backlog | TaskStatus::Open | TaskStatus::Claimed => todo.push(t),
+            TaskStatus::InProgress => working.push(t),
             TaskStatus::InReview | TaskStatus::Verified => review.push(t),
+            TaskStatus::Blocked => blocked.push(t),
             TaskStatus::Done => done.push(t),
         }
     }
@@ -561,8 +574,7 @@ pub fn task_board_columns_viewport(
         }
     }
 
-    partial_sort_by(&mut backlog, cap, pri_cmp);
-    partial_sort_by(&mut ready, cap, pri_cmp);
+    partial_sort_by(&mut todo, cap, pri_cmp);
     partial_sort_by(&mut working, cap, pri_cmp);
     working.sort_by(|a, b| {
         a.assignee
@@ -571,13 +583,29 @@ pub fn task_board_columns_viewport(
             .cmp(b.assignee.as_deref().unwrap_or(""))
     });
     partial_sort_by(&mut review, cap, pri_cmp);
+    partial_sort_by(&mut blocked, cap, pri_cmp);
     let done_cap = cap.min(DONE_VISIBLE_MAX);
     fn done_cmp(a: &&crate::tasks::Task, b: &&crate::tasks::Task) -> std::cmp::Ordering {
         b.updated_at.cmp(&a.updated_at)
     }
     partial_sort_by(&mut done, done_cap, done_cmp);
 
-    [backlog, ready, working, review, done]
+    [todo, working, review, blocked, done]
+}
+
+/// #2306: the display column index a task lands in given its status string —
+/// the single source of truth that [`task_board_columns`] grouping and the
+/// H/L drag's cursor-follow share, so the two can't drift. Order matches
+/// `[Todo, Working, Review, Blocked, Done]`. Unknown / Todo-class
+/// (backlog/open/claimed/cancelled) → 0 (Todo).
+pub fn board_column_for_status(status: &str) -> usize {
+    match status {
+        "in_progress" => 1,
+        "in_review" | "verified" => 2,
+        "blocked" => 3,
+        "done" => 4,
+        _ => 0,
+    }
 }
 
 /// Number of selectable (visible) tasks in a column.
@@ -685,9 +713,9 @@ mod tests {
             .collect();
         let columns = task_board_columns(&tasks);
         assert_eq!(
-            selectable_len(&columns, 1),
+            selectable_len(&columns, 0),
             30,
-            "open column should not be capped"
+            "Todo column (open lives here now) should not be capped"
         );
     }
 
@@ -767,21 +795,60 @@ mod tests {
         assert_eq!(result, "all idle");
     }
 
+    /// #2306: all 9 statuses land in the right one of the 5 display buckets
+    /// [Todo, Working, Review, Blocked, Done]; Cancelled is hidden.
     #[test]
-    fn task_board_groups_by_status() {
+    fn task_board_groups_9_statuses_into_5_buckets() {
         let tasks = vec![
-            make_task("backlog-item", "open", "low", "2026-01-01"),
-            make_task("open-item", "open", "high", "2026-01-02"),
-            make_task("wip", "claimed", "normal", "2026-01-03"),
-            make_task("finished", "done", "normal", "2026-01-04"),
-            make_task("cancelled-item", "cancelled", "normal", "2026-01-05"),
-            make_task("blocked-low", "blocked", "low", "2026-01-06"),
+            make_task("bk", "backlog", "normal", "2026-01-01"),
+            make_task("op", "open", "normal", "2026-01-02"),
+            make_task("cl", "claimed", "normal", "2026-01-03"),
+            make_task("ip", "in_progress", "normal", "2026-01-04"),
+            make_task("ir", "in_review", "normal", "2026-01-05"),
+            make_task("vf", "verified", "normal", "2026-01-06"),
+            make_task("bl", "blocked", "normal", "2026-01-07"),
+            make_task("dn", "done", "normal", "2026-01-08"),
+            make_task("cx", "cancelled", "normal", "2026-01-09"),
         ];
-        let [backlog, ready, working, _review, done] = task_board_columns(&tasks);
-        assert_eq!(backlog.len(), 2, "open+low and blocked+low → backlog");
-        assert_eq!(ready.len(), 1, "open+high → open");
-        assert_eq!(working.len(), 1, "claimed → in progress");
-        assert_eq!(done.len(), 1, "done → done");
+        let [todo, working, review, blocked, done] = task_board_columns(&tasks);
+        assert_eq!(todo.len(), 3, "backlog+open+claimed → Todo");
+        assert_eq!(working.len(), 1, "in_progress → Working");
+        assert_eq!(review.len(), 2, "in_review+verified → Review");
+        assert_eq!(blocked.len(), 1, "blocked → its own Blocked column");
+        assert_eq!(done.len(), 1, "done → Done");
+        assert_eq!(
+            todo.len() + working.len() + review.len() + blocked.len() + done.len(),
+            8,
+            "cancelled is hidden (9 → 8 placed)"
+        );
+    }
+
+    /// #2306: the drag cursor-follow index helper must agree with where the
+    /// grouping fn actually places each status (single source of truth — they
+    /// must not drift).
+    #[test]
+    fn board_column_for_status_matches_grouping_order() {
+        for (status, col) in [
+            ("backlog", 0),
+            ("open", 0),
+            ("claimed", 0),
+            ("in_progress", 1),
+            ("in_review", 2),
+            ("verified", 2),
+            ("blocked", 3),
+            ("done", 4),
+        ] {
+            assert_eq!(
+                board_column_for_status(status),
+                col,
+                "{status} should map to column {col}"
+            );
+            // Cross-check against the real grouping: a single task of this status
+            // must appear in exactly the column the helper names.
+            let tasks = vec![make_task("t", status, "normal", "2026-01-01")];
+            let cols = task_board_columns(&tasks);
+            assert_eq!(cols[col].len(), 1, "{status} grouped into column {col}");
+        }
     }
 
     #[test]
@@ -792,11 +859,11 @@ mod tests {
             make_task("normal-new", "open", "normal", "2026-01-02"),
             make_task("high-old", "open", "high", "2026-01-01"),
         ];
-        let [_, ready, _, _, _] = task_board_columns(&tasks);
-        assert_eq!(ready[0].title, "urgent-new", "urgent first");
-        assert_eq!(ready[1].title, "high-old", "high second");
-        assert_eq!(ready[2].title, "normal-old", "normal oldest third");
-        assert_eq!(ready[3].title, "normal-new", "normal newest last");
+        let [todo, _, _, _, _] = task_board_columns(&tasks);
+        assert_eq!(todo[0].title, "urgent-new", "urgent first");
+        assert_eq!(todo[1].title, "high-old", "high second");
+        assert_eq!(todo[2].title, "normal-old", "normal oldest third");
+        assert_eq!(todo[3].title, "normal-new", "normal newest last");
     }
 
     #[test]

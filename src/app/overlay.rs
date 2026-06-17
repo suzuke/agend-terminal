@@ -106,10 +106,10 @@ pub(super) enum Overlay {
         items: Vec<crate::decisions::Decision>,
         scroll: usize,
     },
-    /// Task board overlay — 4-column kanban view with CRUD.
+    /// Task board overlay — 5-column kanban view with CRUD.
     Tasks {
         items: Vec<crate::tasks::Task>,
-        /// Currently focused column (0=Backlog, 1=Ready, 2=Working, 3=Review, 4=Done).
+        /// Currently focused column (#2306: 0=Todo, 1=Working, 2=Review, 3=Blocked, 4=Done).
         col: usize,
         /// Currently focused row within the column.
         row: usize,
@@ -791,20 +791,28 @@ pub(super) fn handle_key(
                             if !columns[*col].is_empty() && *col > 0 =>
                         {
                             if let Some(task) = columns[*col].get(*row) {
-                                let update = match *col {
-                                    1 => Some(("priority", "low")),   // Open → Backlog
-                                    2 => Some(("status", "open")),    // InProgress → Open
-                                    3 => Some(("status", "claimed")), // Done → InProgress
+                                // #2306: regress along the progress flow
+                                // Todo←Working←Review←Done; a Blocked task
+                                // un-blocks back to Working (in_progress). Pure
+                                // canonical-status updates — no enum/automation change.
+                                let new_status = match *col {
+                                    1 => Some("open"),        // Working → Todo
+                                    2 => Some("in_progress"), // Review → Working
+                                    3 => Some("in_progress"), // Blocked → Working (unblock)
+                                    4 => Some("in_review"),   // Done → Review
                                     _ => None,
                                 };
-                                if let Some((field, val)) = update {
+                                if let Some(val) = new_status {
                                     crate::tasks::handle(
                                         ctx.home,
                                         "user",
-                                        &serde_json::json!({"action": "update", "id": task.id, field: val}),
+                                        &serde_json::json!({"action": "update", "id": task.id, "status": val}),
                                     );
                                     *items = crate::tasks::list_all(ctx.home);
-                                    *col -= 1;
+                                    // Follow the task to whichever column its NEW
+                                    // status lands in (column order != status order,
+                                    // so a fixed ±1 would mis-track — e.g. Blocked).
+                                    *col = crate::render::board_column_for_status(val);
                                     let new_cols = crate::render::task_board_columns(items);
                                     *row = (*row).min(
                                         crate::render::selectable_len(&new_cols, *col)
@@ -818,20 +826,24 @@ pub(super) fn handle_key(
                             if !columns[*col].is_empty() && *col < 4 =>
                         {
                             if let Some(task) = columns[*col].get(*row) {
-                                let update = match *col {
-                                    0 => Some(("priority", "normal")), // Backlog → Open
-                                    1 => Some(("status", "claimed")),  // Open → InProgress
-                                    2 => Some(("status", "done")),     // InProgress → Done
+                                // #2306: advance along the progress flow
+                                // Todo→Working→Review→Done; a Blocked task
+                                // un-blocks back to Working (in_progress).
+                                let new_status = match *col {
+                                    0 => Some("in_progress"), // Todo → Working
+                                    1 => Some("in_review"),   // Working → Review
+                                    2 => Some("done"),        // Review → Done
+                                    3 => Some("in_progress"), // Blocked → Working (unblock)
                                     _ => None,
                                 };
-                                if let Some((field, val)) = update {
+                                if let Some(val) = new_status {
                                     crate::tasks::handle(
                                         ctx.home,
                                         "user",
-                                        &serde_json::json!({"action": "update", "id": task.id, field: val}),
+                                        &serde_json::json!({"action": "update", "id": task.id, "status": val}),
                                     );
                                     *items = crate::tasks::list_all(ctx.home);
-                                    *col += 1;
+                                    *col = crate::render::board_column_for_status(val);
                                     let new_cols = crate::render::task_board_columns(items);
                                     *row = (*row).min(
                                         crate::render::selectable_len(&new_cols, *col)
@@ -1049,7 +1061,7 @@ mod tests {
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
 
-        // Create a task in Open column (priority=normal, status=open)
+        // Create a task (status=open) — #2306: open lives in the Todo column (0).
         crate::tasks::handle(
             &home,
             "user",
@@ -1060,7 +1072,7 @@ mod tests {
 
         let mut overlay = Overlay::Tasks {
             items,
-            col: 1,
+            col: 0,
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
@@ -1070,12 +1082,12 @@ mod tests {
         let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        // Reload from disk — must be persisted
+        // Reload from disk — must be persisted. #2306: Todo →L→ Working (in_progress).
         let reloaded = crate::tasks::list_all(&home);
         let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
         assert_eq!(
             task.status,
-            crate::task_events::TaskStatus::Claimed,
+            crate::task_events::TaskStatus::InProgress,
             "L must persist status change"
         );
 
@@ -1105,9 +1117,11 @@ mod tests {
             let items = crate::tasks::list_all(&home);
             let task_id = items[0].id.clone();
 
+            // #2306: the open task lives in the Todo column (0). Shift+D marks
+            // done from ANY column regardless.
             let mut overlay = Overlay::Tasks {
                 items,
-                col: 1,
+                col: 0,
                 row: 0,
                 mode: TaskBoardMode::Board,
                 view: BoardView::Tasks,
@@ -1157,16 +1171,17 @@ mod tests {
         let items = crate::tasks::list_all(&home);
         assert_eq!(items.len(), 2);
 
-        // After sort: high-pri is row 0, low-pri is row 1
+        // After sort: high-pri is row 0, low-pri is row 1. #2306: open tasks live
+        // in the Todo column (0).
         let cols = crate::render::task_board_columns(&items);
-        assert_eq!(cols[1][0].title, "high-pri");
-        assert_eq!(cols[1][1].title, "low-pri");
-        let high_id = cols[1][0].id.clone();
+        assert_eq!(cols[0][0].title, "high-pri");
+        assert_eq!(cols[0][1].title, "low-pri");
+        let high_id = cols[0][0].id.clone();
 
         // Move cursor to row 0 (high-pri), press Shift+L
         let mut overlay = Overlay::Tasks {
             items,
-            col: 1,
+            col: 0,
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
@@ -1180,8 +1195,8 @@ mod tests {
         let high = reloaded.iter().find(|t| t.id == high_id).expect("high-pri");
         assert_eq!(
             high.status,
-            crate::task_events::TaskStatus::Claimed,
-            "cursor row 0 must move high-pri task"
+            crate::task_events::TaskStatus::InProgress,
+            "cursor row 0 must move high-pri task (Todo →L→ Working)"
         );
         let low = reloaded
             .iter()
