@@ -376,6 +376,11 @@ pub struct StateTracker {
     /// SRL incident on the same line after recovery re-logs once; the `#1809`
     /// cross-cycle→Idle behavioral fix stays OUTSIDE this dedup.
     last_srl_phantom_warn_sig: Option<(u64, bool)>,
+    /// #1523 Phase 0 (shadow): fire-once latch for the turn-completion sentinel
+    /// telemetry — `hash` of the last side-logged sentinel observation, so a
+    /// static frame holding the token isn't re-logged every feed (mirrors the
+    /// retired `last_hardwrap_miss_sig`). Telemetry-only; never gates behavior.
+    last_turn_sentinel_sig: Option<u64>,
 }
 
 /// #1527: one recorded `current` transition, captured at the mutation site so
@@ -517,6 +522,91 @@ fn hash_screen(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// #1523 Phase 0: is the turn-completion sentinel shadow enabled? Default-OFF
+/// (matches the codebase env-flag idiom, e.g. `AGEND_PRODUCTIVE_GATE`). When
+/// off, neither the instruction directive nor the telemetry is active, so a
+/// default fleet sees ZERO behaviour change (the fail-open invariant).
+pub(crate) fn turn_sentinel_shadow_enabled() -> bool {
+    std::env::var("AGEND_TURN_SENTINEL_SHADOW")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// #1523 Phase 0: the per-agent sentinel nonce, derived deterministically from
+/// the agent name. Deriving (rather than persisting a random value) lets the
+/// instruction writer and the daemon detector compute the SAME token
+/// independently — no plumbed/persisted state, so it survives restart with no
+/// staleness surface (cf. the in-mem-reset-on-restart bug class). It is an
+/// attribution tag, not a secret; per-turn freshness comes from the detector's
+/// dedup latch, not from the nonce.
+pub(crate) fn turn_sentinel_nonce(name: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    // Low 32 bits as fixed-width hex → an 8-char nonce → 25-char token
+    // (`<<<AGEND-DONE:xxxxxxxx>>>`), comfortably under the #2090 ~35-char
+    // hard-wrap threshold so the marker stays on one line.
+    format!("{:08x}", hasher.finish() & 0xffff_ffff)
+}
+
+/// #1523 Phase 0: the exact in-band token for an agent's turn-completion
+/// sentinel. Shared by the instruction directive and the shadow detector so the
+/// two never drift.
+pub(crate) fn turn_sentinel_token(name: &str) -> String {
+    format!("<<<AGEND-DONE:{}>>>", turn_sentinel_nonce(name))
+}
+
+/// #1523 Phase 0: pure classification of a screen `tail` against an agent's
+/// turn-completion `token`. Separated from the I/O method so the echo /
+/// source-view FP heuristics (the sharpest risk — the instruction file itself
+/// carries the token) are unit-testable without env or home redirection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnSentinelObs {
+    /// The agent's token is present anywhere in the tail (raw or de-wrapped).
+    token_seen: bool,
+    /// The token sits on the final non-empty line — the shape of a genuine
+    /// turn-end emission (vs. embedded in earlier output).
+    on_last_line: bool,
+    /// Looks like an instruction-echo / source-view rather than a real emit:
+    /// directive prose co-occurs, or the token is not the last line.
+    suspected_echo: bool,
+    /// Coarse leak proxy: token embedded as content (not a clean final-line
+    /// emit) and not obviously a directive echo — e.g. a file being viewed.
+    leak_signal: bool,
+}
+
+fn observe_turn_sentinel(tail: &str, token: &str) -> TurnSentinelObs {
+    // Also scan a de-wrapped (newline-stripped) copy so a hard-wrapped token
+    // (split mid-string across rows) still matches.
+    let dewrapped: String = tail.chars().filter(|c| *c != '\n').collect();
+    let token_seen = tail.contains(token) || dewrapped.contains(token);
+    if !token_seen {
+        return TurnSentinelObs {
+            token_seen: false,
+            on_last_line: false,
+            suspected_echo: false,
+            leak_signal: false,
+        };
+    }
+    let on_last_line = tail
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.contains(token));
+    // The directive that injects the token uses these exact phrases; their
+    // presence means the instruction file / system prompt is on screen.
+    let directive_echo = tail.contains("Turn-completion signal")
+        || tail.contains("never persisted content")
+        || tail.contains("print this exact marker");
+    let suspected_echo = directive_echo || !on_last_line;
+    let leak_signal = !on_last_line && !directive_echo;
+    TurnSentinelObs {
+        token_seen,
+        on_last_line,
+        suspected_echo,
+        leak_signal,
+    }
 }
 
 /// #1955: the (bottom-most) screen line containing `matched` — the UsageLimit
@@ -1148,6 +1238,7 @@ impl StateTracker {
             last_unclassified_throttle_sig: None,
             last_srl_keep_latched_sig: None,
             last_srl_phantom_warn_sig: None,
+            last_turn_sentinel_sig: None,
         }
     }
 
@@ -1469,6 +1560,11 @@ impl StateTracker {
         // miss can be diagnosed. Zero behavior change (runs AFTER classify,
         // never touches `self.current`/retry).
         self.capture_unclassified_throttle(screen_text, fg);
+
+        // #1523 Phase 0: in-band turn-completion sentinel shadow telemetry.
+        // Default-OFF (flag-gated); when on, side-logs this agent's token sighting
+        // for measurement. Runs AFTER classify, never touches `self.current`.
+        self.capture_turn_sentinel_shadow(screen_text);
 
         // Instrumentation 2 — Sprint 27 shadow-mode behavioral telemetry.
         self.record_shadow_telemetry(silence_since_last_feed);
@@ -2243,6 +2339,82 @@ impl StateTracker {
                 agent = %self.instance_name,
                 error = %e,
                 "#1562: failed to append unclassified-throttle diagnostic"
+            );
+        }
+    }
+
+    /// #1523 Phase 0: turn-completion sentinel shadow telemetry.
+    ///
+    /// When `AGEND_TURN_SENTINEL_SHADOW=1`, hook-less agents are instructed to
+    /// print `<<<AGEND-DONE:{nonce}>>>` as the final line when a turn finishes
+    /// (see [`turn_sentinel_token`]). This side-logs whether THIS agent's token
+    /// is on screen alongside the heuristic classification, so emit-rate /
+    /// false-emit (instruction-echo / source-view) / leak can be measured before
+    /// any production reliance in Phase 1. The daemon takes NO action on the
+    /// signal in Phase 0 — this only ever ADDS corroboration, never subtracts.
+    ///
+    /// Invariants (mirror the retired `capture_hardwrap_miss_shadow`):
+    /// - **Zero behaviour change** — runs after classify, never touches
+    ///   `self.current`, retry, or any timer; failures are swallowed. Gated OFF
+    ///   by default (flag absent → early return → byte-identical classification).
+    /// - **Cheap** — fast-rejects on a `str::contains` for the fixed prefix
+    ///   before building the per-agent token or allocating a tail.
+    /// - **Fire-once** — a static token-bearing frame logs once via the
+    ///   `last_turn_sentinel_sig` latch (the feed-level hash-dedup already drops
+    ///   unchanged frames; this guards token frames whose hash churns).
+    fn capture_turn_sentinel_shadow(&mut self, screen_text: &str) {
+        if !turn_sentinel_shadow_enabled() || self.instance_name.is_empty() {
+            return;
+        }
+        // Cheap fast-path: the marker prefix is fixed; bail before building the
+        // per-agent token or allocating a tail if it is nowhere on screen.
+        if !screen_text.contains("<<<AGEND-DONE:") {
+            self.last_turn_sentinel_sig = None;
+            return;
+        }
+        let token = turn_sentinel_token(&self.instance_name);
+        let tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
+        let obs = observe_turn_sentinel(&tail, &token);
+        if !obs.token_seen {
+            // Some OTHER agent's token (or a malformed marker) is on screen — not
+            // ours. Drop the latch and skip (never attribute another agent's emit).
+            self.last_turn_sentinel_sig = None;
+            return;
+        }
+        // Consistency: a real emission means the agent just finished → the
+        // heuristic should independently read Idle. Disagreement is the
+        // corroboration value we want to measure.
+        let consistent = matches!(self.current, AgentState::Idle);
+        // Fire-once latch keyed on the token-bearing tail + derived flags so a
+        // static pane logs once, not every churned-hash frame.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tail.hash(&mut h);
+        obs.on_last_line.hash(&mut h);
+        obs.suspected_echo.hash(&mut h);
+        let sig = h.finish();
+        if self.last_turn_sentinel_sig == Some(sig) {
+            return;
+        }
+        self.last_turn_sentinel_sig = Some(sig);
+        let record = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "backend": self.backend_name,
+            "agent": self.instance_name,
+            "token_seen": obs.token_seen,
+            "on_last_line": obs.on_last_line,
+            "existing_state": self.current.display_name(),
+            "consistent": consistent,
+            "suspected_echo": obs.suspected_echo,
+            "leak_signal": obs.leak_signal,
+        });
+        let path = crate::home_dir().join("turn_sentinel_shadow.jsonl");
+        if let Err(e) = append_jsonl(&path, &record) {
+            // Diagnostic must never affect behavior — log and move on.
+            tracing::debug!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                error = %e,
+                "#1523 Phase 0 shadow: failed to append turn-sentinel diagnostic"
             );
         }
     }
