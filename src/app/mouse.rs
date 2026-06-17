@@ -483,24 +483,16 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                 false
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let mut copied = false;
+                // Releasing a real drag KEEPS the selection (no auto-copy, no
+                // clear) — copying is an explicit act via the copy key
+                // (CopySelection → Cmd+C / Ctrl+Shift+C), which copies + clears.
+                // A pure click leaves a zero-width selection; clear that so a click
+                // still dismisses the highlight (#2296). `copy_to_clipboard` stays —
+                // the CopySelection path (dispatch) is its remaining caller.
                 if let Some(ref sel) = pane.selection {
                     if sel.start == sel.end {
                         pane.selection = None;
-                    } else {
-                        let text = pane.vterm.extract_text(sel.start, sel.end);
-                        if !text.is_empty() {
-                            copy_to_clipboard(&text);
-                            copied = true;
-                        }
                     }
-                }
-                // Clear the highlight once a copy has completed — a finished copy
-                // ends the selection gesture. Other paths are unchanged: a
-                // zero-width click already cleared above, and an empty-text
-                // (nothing to copy) release keeps its selection as before.
-                if copied {
-                    pane.selection = None;
                 }
                 true
             }
@@ -1026,6 +1018,24 @@ mod tests {
         }
     }
 
+    fn drag_left_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn up_left_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
     /// Build a two-pane vertical split with left at id=1, right at id=2.
     /// Pane 1 occupies columns 0..10, pane 2 occupies columns 10..20.
     /// Both panes are 10 rows tall starting at row 1 (row 0 is the tab bar).
@@ -1209,10 +1219,8 @@ mod tests {
         );
     }
 
-    /// Drag-to-copy regression (#2294): a pane-body click clears the stale
-    /// selection AND anchors a fresh zero-width one, so a drag can still begin
-    /// (and #2294's copy-then-clear on Up is unaffected — it runs on the fresh
-    /// selection, untouched by this change).
+    /// Drag-start regression (#2296): a pane-body click clears the stale selection
+    /// AND anchors a fresh zero-width one, so a drag can still begin.
     #[test]
     #[serial]
     fn left_click_on_pane_body_anchors_fresh_zero_width_selection_2158() {
@@ -1242,6 +1250,51 @@ mod tests {
         assert_eq!(
             sel.start, sel.end,
             "the stale wide selection is replaced by a fresh zero-width one (drag-to-copy intact)"
+        );
+    }
+
+    // ----- #43783: releasing a drag keeps the selection (copy is the copy key) -----
+
+    /// Operator semantics: releasing a REAL drag KEEPS the selection — no auto-copy
+    /// and no auto-clear. Copying is an explicit act via the copy key
+    /// (CopySelection → Cmd+C / Ctrl+Shift+C). Replaces #2294's release-auto-copy.
+    #[test]
+    fn drag_release_keeps_selection_no_autocopy_43783() {
+        let mut layout = two_pane_layout("right");
+        // Down anchors a zero-width selection inside pane 1's inner area...
+        handle_selection(&mut layout, &down_left_at(3, 3));
+        // ...drag extends it to a real (non-zero) span...
+        handle_selection(&mut layout, &drag_left_at(6, 3));
+        // ...and releasing must KEEP it (not copy, not clear).
+        handle_selection(&mut layout, &up_left_at(6, 3));
+
+        let pane = layout.tabs[0].root_mut().find_pane_mut(1).unwrap();
+        let sel = pane
+            .selection
+            .as_ref()
+            .expect("a released drag must keep its selection");
+        assert_ne!(
+            sel.start, sel.end,
+            "the released selection must remain a real (non-zero) span"
+        );
+    }
+
+    /// A pure click (Down then Up at the same spot, zero-width) still dismisses the
+    /// highlight on release — the click-to-clear path is preserved.
+    #[test]
+    fn pure_click_release_clears_zero_width_selection_43783() {
+        let mut layout = two_pane_layout("right");
+        handle_selection(&mut layout, &down_left_at(3, 3));
+        handle_selection(&mut layout, &up_left_at(3, 3));
+
+        assert!(
+            layout.tabs[0]
+                .root_mut()
+                .find_pane_mut(1)
+                .unwrap()
+                .selection
+                .is_none(),
+            "a pure click must not leave a zero-width selection"
         );
     }
 }
