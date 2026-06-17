@@ -163,6 +163,36 @@ pub fn setup_rolling_tracing(
     Ok(guard)
 }
 
+/// #t-41673/C1: stash for the daemon's rolling-log [`WorkerGuard`] so it can be
+/// dropped (= flush + join the non-blocking writer) from a
+/// `std::process::exit()` path. The restart exits in `run_core` call
+/// `process::exit()` directly, which SKIPS the guard's Drop and would lose the
+/// buffered `predecessor_exit` timing anchor (and the pre-existing "exiting"
+/// log) — exactly the records the gap-instrument needs. The daemon stores its
+/// guard here and the normal-return / error / panic-unwind paths still flush it
+/// via an RAII holder in `main`.
+static DAEMON_LOG_GUARD: std::sync::Mutex<Option<WorkerGuard>> = std::sync::Mutex::new(None);
+
+/// Hand the daemon's rolling-log guard to the global flush slot. Called once at
+/// daemon startup, right after [`setup_rolling_tracing`]. The guard then lives
+/// for the process lifetime (keeping the writer thread alive) until
+/// [`flush_daemon_log`] drops it.
+pub fn store_daemon_flush_guard(guard: WorkerGuard) {
+    *DAEMON_LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+}
+
+/// Flush + close the daemon rolling-log writer by dropping the stashed guard.
+/// Idempotent: a no-op if nothing is stashed or it was already flushed. Call
+/// IMMEDIATELY before `std::process::exit()` on the daemon restart paths so the
+/// last records (the `predecessor_exit` anchor) are guaranteed on disk.
+pub fn flush_daemon_log() {
+    let guard = DAEMON_LOG_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    drop(guard);
+}
+
 /// Install a `panic::set_hook` that forwards panics to `tracing::error!`
 /// so the rolling-file appender captures them. Chains the previous
 /// (default) hook after so panic messages still reach stderr-if-attached
@@ -705,5 +735,20 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-41673/C1: the daemon flush slot must accept a guard and drop it on
+    /// `flush_daemon_log` (= flush + join the non-blocking writer), and a SECOND
+    /// flush must be a safe no-op — the restart-exit sites call it
+    /// unconditionally right before `std::process::exit()`, so a double-call (or
+    /// a call with nothing stashed) must never panic. Uses a throwaway
+    /// `io::sink` appender so no files are touched; the global slot is exercised
+    /// only by this test.
+    #[test]
+    fn daemon_flush_guard_store_then_flush_is_idempotent() {
+        let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
+        store_daemon_flush_guard(guard);
+        flush_daemon_log(); // drops + joins the worker thread
+        flush_daemon_log(); // idempotent: slot already empty, must not panic
     }
 }

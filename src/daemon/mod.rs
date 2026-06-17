@@ -1090,6 +1090,9 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 teardown_elapsed_ms = teardown_started.elapsed().as_millis() as u64,
                 "#1814 self-respawn: successor healthy through teardown — exiting 0"
             );
+            // #t-41673/C1: process::exit skips main's guard Drop → flush the
+            // non-blocking log writer so the predecessor_exit anchor above lands.
+            crate::logging::flush_daemon_log();
             std::process::exit(0);
         }
 
@@ -1129,10 +1132,17 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             teardown_elapsed_ms = post_serve_teardown.elapsed().as_millis() as u64,
             "operator-initiated restart: exiting with code 42"
         );
+        // #t-41673/C1: process::exit skips main's guard Drop → flush the
+        // non-blocking log writer so the predecessor_exit anchor above lands.
+        crate::logging::flush_daemon_log();
         std::process::exit(42);
     }
 
+    // #t-41673/C2: normal stop returns to `main`, whose RAII guard-flush runs on
+    // return — no explicit flush needed here. `target: "handoff"` keeps the
+    // predecessor_exit family filterable alongside the exit0/exit42 markers.
     tracing::info!(
+        target: "handoff",
         event = "predecessor_exit",
         reason = "normal_stop",
         teardown_elapsed_ms = post_serve_teardown.elapsed().as_millis() as u64,
