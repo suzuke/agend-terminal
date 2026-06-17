@@ -314,6 +314,46 @@ pub fn arm(
     });
 }
 
+/// Arm BOTH the reply-to-channel routing AND the delivery-closure obligation for
+/// an inbound channel message, in one call — independent of delivery path.
+///
+/// #2293 progress-mirror fix: the mirror's active-turn gate reads `reply_to_channel`
+/// + `pending_user_turn`. The inbox-drain path (`inbox::storage`) sets both when a
+/// channel-tagged message is drained, but a SHORT operator message takes the
+/// PTY-inject path (`channel::telegram::inbound`) and never drains — so without
+/// arming there too, the gate's two fields stay `None`/absent and the mirror never
+/// fires for short operator turns. This helper lets the inject path arm
+/// symmetrically with the drain path (set the same `reply_to_channel`/mirror
+/// bookkeeping fields, then `arm` the obligation).
+#[allow(clippy::too_many_arguments)]
+pub fn arm_channel_turn(
+    name: &str,
+    channel: ChannelKind,
+    inbound_msg_id: Option<String>,
+    chat_id: Option<String>,
+    inbound_kind: Option<String>,
+    from: Option<&str>,
+    text: Option<&str>,
+) {
+    let channel_name = channel_kind_str(channel);
+    crate::daemon::heartbeat_pair::update_with(name, |p| {
+        p.reply_to_channel = Some(channel_name.to_string());
+        p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
+        p.reply_to_set_at_ms = crate::daemon::heartbeat_pair::now_ms() as i64;
+        p.mirror_dispatched_for_turn = false;
+        p.mirror_skip_until_next_turn = false;
+    });
+    arm(
+        name,
+        channel,
+        inbound_msg_id,
+        chat_id,
+        inbound_kind,
+        from,
+        text,
+    );
+}
+
 /// Record the agent's `reply` outcome (Gap D). Called from `handle_reply` on
 /// every exit. `Ok` → the turn is settled: the WHOLE group closes (#2042 —
 /// replying to any member settles every delivery id) and the group key is
@@ -943,6 +983,41 @@ mod tests {
             "② a reply settles EVERY delivery id in the group — no escalation"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2293 progress-mirror: short PTY-inject path must arm the mirror gate ──
+    #[test]
+    fn arm_channel_turn_sets_reply_to_and_obligation_2293() {
+        let n = "rl2293-armchannel";
+        // The short-message PTY-inject path calls this instead of going through
+        // the inbox-drain arming. After it, BOTH mirror-gate inputs must be set:
+        arm_channel_turn(
+            n,
+            ChannelKind::Telegram,
+            Some("m-short-1".into()),
+            None,
+            None,
+            Some("user:op"),
+            Some("a short operator message"),
+        );
+        let pair = crate::daemon::heartbeat_pair::snapshot_for(n);
+        assert_eq!(
+            pair.reply_to_channel.as_deref(),
+            Some("telegram"),
+            "arm_channel_turn must set reply_to_channel (mirror gate destination)"
+        );
+        let t = pair
+            .pending_user_turn
+            .expect("arm_channel_turn must arm a pending_user_turn (mirror active-turn gate)");
+        assert_eq!(
+            t.reply_outcome,
+            ReplyOutcome::Pending,
+            "freshly armed turn must be Pending so the mirror gate opens"
+        );
+        assert!(
+            !pair.mirror_skip_until_next_turn,
+            "arm must clear the per-turn mirror opt-out"
+        );
     }
 
     // ── #2042 §3.9 ③ redelivery does not open a new obligation ──────────

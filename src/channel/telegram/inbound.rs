@@ -602,6 +602,21 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let pointer_only = inbox::notify::pointer_only_inject();
 
     if is_short && !pointer_only {
+        // #2293 progress-mirror fix: the inbox-drain path arms reply_to_channel +
+        // the delivery obligation for channel messages, but this SHORT-message
+        // PTY-inject path never drains — so without arming here the mirror's
+        // active-turn gate (reply_to_channel + pending_user_turn) never fires for
+        // short operator turns. Arm symmetrically with the drain path, BEFORE the
+        // inject (username/text are borrowed here, then moved into the notify call).
+        crate::reply_ledger::arm_channel_turn(
+            &instance_name,
+            crate::channel::ChannelKind::Telegram,
+            None,
+            None,
+            None,
+            Some(username),
+            Some(text.as_str()),
+        );
         inbox::notify_agent_with_attachments(
             &home,
             &instance_name,
