@@ -1940,7 +1940,15 @@ fn handle_pty_close(
     }
 
     tracing::info!(agent = name, "PTY closed, waiting for process exit");
+    // #t-41673 gap-instrument: time the per-agent exit wait so a slow child reap
+    // is attributable in the restart-freeze breakdown. Pure tracing.
+    let exit_wait_started = std::time::Instant::now();
     let exit_code = wait_for_process_exit(name, id, registry);
+    tracing::info!(
+        agent = name,
+        exit_wait_ms = exit_wait_started.elapsed().as_millis() as u64,
+        "process exit wait complete"
+    );
     sweep_child_tree(id, registry);
 
     if deleted.load(std::sync::atomic::Ordering::SeqCst) {

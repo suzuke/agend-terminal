@@ -1021,6 +1021,10 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
         log_residual_worktrees(home);
 
         let metrics = shutdown_sequence(home, &ctx.registry, started_at);
+        // #t-41673 gap-instrument: clock from shutdown-complete to the
+        // predecessor's final exit log — the "old-exit 收尾" portion of the
+        // ~4s no-log gap (file removals + self-respawn settle, then exit(0)).
+        let teardown_started = std::time::Instant::now();
         crate::event_log::log(
             home,
             "daemon_stop",
@@ -1079,13 +1083,24 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             }
             let _ = std::fs::remove_file(home.join("restart-requested"));
             let _ = std::fs::remove_dir_all(run_dir(home));
-            tracing::info!("#1814 self-respawn: successor healthy through teardown — exiting 0");
+            tracing::info!(
+                target: "handoff",
+                event = "predecessor_exit",
+                reason = "self_respawn_exit0",
+                teardown_elapsed_ms = teardown_started.elapsed().as_millis() as u64,
+                "#1814 self-respawn: successor healthy through teardown — exiting 0"
+            );
             std::process::exit(0);
         }
 
         break 'serve;
     }
 
+    // #t-41673 gap-instrument: post-'serve teardown clock for the legacy
+    // exit-42 / normal-stop paths (self-respawn-disabled). Mirrors the in-loop
+    // teardown clock used by the self-respawn exit(0); note the fixed 1s sleep
+    // below is part of this window.
+    let post_serve_teardown = std::time::Instant::now();
     let _ = std::fs::remove_dir_all(run_dir(home));
     std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -1107,11 +1122,22 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             "#1814: post-'serve RESTART_PENDING under self-respawn flag-on — the \
              flag-on exit must occur inside 'serve, never here"
         );
-        tracing::info!("operator-initiated restart: exiting with code 42");
+        tracing::info!(
+            target: "handoff",
+            event = "predecessor_exit",
+            reason = "operator_restart_exit42",
+            teardown_elapsed_ms = post_serve_teardown.elapsed().as_millis() as u64,
+            "operator-initiated restart: exiting with code 42"
+        );
         std::process::exit(42);
     }
 
-    tracing::info!("exiting");
+    tracing::info!(
+        event = "predecessor_exit",
+        reason = "normal_stop",
+        teardown_elapsed_ms = post_serve_teardown.elapsed().as_millis() as u64,
+        "exiting"
+    );
     Ok(())
 }
 
@@ -1437,6 +1463,11 @@ pub(crate) fn shutdown_sequence(
     started_at: std::time::Instant,
 ) -> ShutdownMetrics {
     let reason = ShutdownReason::from_u8(SHUTDOWN_REASON.load(Ordering::Relaxed));
+    // #t-41673 gap-instrument: time the whole shutdown sequence so the ~6s
+    // shutdown half of the restart freeze is attributable separately from the
+    // old-exit→new-launch gap. Pure tracing; mirrors the #2271 restart_timing
+    // (`target: "handoff"`, `elapsed_ms`) style.
+    let shutdown_started = std::time::Instant::now();
     tracing::info!(reason = reason.as_str(), "cleaning up...");
 
     // Drain registry FIRST, then kill. PTY close handlers check the
@@ -1487,6 +1518,10 @@ pub(crate) fn shutdown_sequence(
     // SIGTERM holdouts.
     let mut agents_killed_after_grace = 0usize;
     for (name, child, pid) in pids {
+        // #t-41673 gap-instrument: per-agent reap clock — a slow `child.wait()`
+        // (kill→reap or grace-window reap) is a prime suspect for the shutdown
+        // half of the freeze; emit `reap_ms` on the existing per-agent logs.
+        let reap_started = std::time::Instant::now();
         let still_alive = match pid {
             Some(p) => crate::process::is_pid_alive(p),
             None => false,
@@ -1501,14 +1536,22 @@ pub(crate) fn shutdown_sequence(
                 let _ = child.lock().kill();
                 let _ = child.lock().wait();
                 agents_killed_after_grace += 1;
-                tracing::info!(agent = %name, "killed (after grace window)");
+                tracing::info!(
+                    agent = %name,
+                    reap_ms = reap_started.elapsed().as_millis() as u64,
+                    "killed (after grace window)"
+                );
             }
             GraceDisposition::ReapOnly => {
                 // #bughunt-r1: clean exit during the grace window. Do NOT
                 // `kill_process_tree` — the PID may have been reused, so the
                 // group SIGKILL would hit an unrelated process. Just reap.
                 let _ = child.lock().wait();
-                tracing::info!(agent = %name, "exited cleanly during grace window");
+                tracing::info!(
+                    agent = %name,
+                    reap_ms = reap_started.elapsed().as_millis() as u64,
+                    "exited cleanly during grace window"
+                );
             }
         }
     }
@@ -1525,6 +1568,7 @@ pub(crate) fn shutdown_sequence(
         agents_total = metrics.agents_total,
         agents_killed_after_grace = metrics.agents_killed_after_grace,
         uptime_secs = metrics.uptime_secs,
+        shutdown_elapsed_ms = shutdown_started.elapsed().as_millis() as u64,
         "daemon shutdown sequence complete"
     );
     let _ = home; // home is currently logged via tracing only; reserved for future telemetry
@@ -2653,6 +2697,33 @@ mod tests {
             SHUTDOWN_GRACE,
             std::time::Duration::from_secs(2),
             "Wave 3 PR-2 contract: grace = 2s exactly"
+        );
+    }
+
+    /// #t-41673 gap-instrument: the shutdown-complete log MUST carry the new
+    /// `shutdown_elapsed_ms` field so the shutdown half of the restart freeze is
+    /// attributable separately from the old-exit→new-launch gap. Pure-tracing
+    /// instrument — this asserts the field is actually emitted (drop the field →
+    /// RED). `shutdown_sequence` treats `home` as reserved telemetry (`let _ =
+    /// home`), so a throwaway path suffices; the empty registry means no agents
+    /// are spawned/killed (still pays the 2s grace window).
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn shutdown_sequence_emits_shutdown_elapsed_ms() {
+        let (registry, _configs, _tx, _rx, _shutdown) = make_test_registry();
+        let _ = shutdown_sequence(
+            std::path::Path::new("/tmp"),
+            &registry,
+            std::time::Instant::now(),
+        );
+        assert!(
+            logs_contain("daemon shutdown sequence complete"),
+            "gap-instrument: shutdown-complete log should still fire"
+        );
+        assert!(
+            logs_contain("shutdown_elapsed_ms"),
+            "gap-instrument: shutdown-complete log must carry shutdown_elapsed_ms"
         );
     }
 

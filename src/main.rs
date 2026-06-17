@@ -557,6 +557,13 @@ enum ServiceAction {
 }
 
 fn main() -> anyhow::Result<()> {
+    // #t-41673 gap-instrument: capture process entry as early as possible. The
+    // daemon bootstrap log (emitted right after tracing init below) reports
+    // `elapsed_ms` since this point — the pre-tracing-init startup cost. Binary
+    // load happens BEFORE main(), so the remainder of the restart "new-launch"
+    // gap (OS spawn + dynamic load) shows up as the wall-clock delta between the
+    // predecessor's `predecessor_exit` log and this process's bootstrap log.
+    let process_entry = std::time::Instant::now();
     load_dotenv();
 
     let cli = Cli::parse();
@@ -590,12 +597,24 @@ fn main() -> anyhow::Result<()> {
     let _log_guard = if is_app {
         None
     } else if is_daemon_child {
-        Some(crate::logging::setup_rolling_tracing(
+        let guard = crate::logging::setup_rolling_tracing(
             &home,
             "daemon",
             "agend_terminal=info",
             crate::logging::MigrationPolicy::Migrate,
-        )?)
+        )?;
+        // #t-41673 gap-instrument: earliest in-process daemon log once tracing is
+        // live. Its wall-clock timestamp marks the END of the old-exit→new-launch
+        // gap; `elapsed_ms` is the main-entry→tracing-ready startup cost. Mirrors
+        // the #2271 restart_timing (`target: "handoff"`, `elapsed_ms`) style.
+        tracing::info!(
+            target: "handoff",
+            event = "process_bootstrap",
+            pid = std::process::id(),
+            elapsed_ms = process_entry.elapsed().as_millis() as u64,
+            "daemon process bootstrap: tracing live (#t-41673 gap-instrument)"
+        );
+        Some(guard)
     } else {
         crate::logging::setup_cli_tracing();
         None
