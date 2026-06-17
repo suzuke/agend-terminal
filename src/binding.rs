@@ -1485,6 +1485,155 @@ mod tests {
             "empty email must skip the sign-off (no malformed trailer): {out}"
         );
     }
+
+    /// (e, r2) A MALFORMED email (no `@`) must skip the sign-off — dco.yml requires
+    /// `<...@...>`, so emitting it would fail the very check.
+    #[cfg(unix)]
+    #[test]
+    fn malformed_email_no_at_skips_signoff_92758() {
+        let out =
+            run_prepare_commit_msg("dco-noat", true, "Test User", "not-an-email", "subject\n");
+        assert!(
+            !out.contains("Signed-off-by"),
+            "an email without '@' must skip the sign-off: {out}"
+        );
+    }
+
+    // ── #t-92758-7: REAL-git resolution e2e (r6) — locks the no-overflow property
+    //    against actual `git rev-parse --show-toplevel`, not a stub. ──
+    #[cfg(unix)]
+    fn run_git(args: &[&str], dir: &std::path::Path) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env_remove("AGEND_INSTANCE_NAME")
+            .output()
+            .expect("git")
+    }
+
+    #[cfg(unix)]
+    fn init_repo_with_identity(repo: &std::path::Path) {
+        assert!(run_git(&["init", "-b", "main"], repo).status.success());
+        run_git(&["config", "user.name", "Test User"], repo);
+        run_git(&["config", "user.email", "test@example.com"], repo);
+    }
+
+    #[cfg(unix)]
+    fn write_dco_yml(root: &std::path::Path) {
+        let wf = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("dco.yml"), "name: DCO\n").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn head_message(dir: &std::path::Path) -> String {
+        let log = run_git(&["log", "-1", "--format=%B"], dir);
+        String::from_utf8_lossy(&log.stdout).to_string()
+    }
+
+    /// (f) Real git: a commit from a SUBDIR of a DCO repo is signed (the gate
+    /// resolves the repo root via `git rev-parse --show-toplevel`).
+    #[cfg(unix)]
+    #[test]
+    fn real_git_dco_repo_subdir_commit_signs_92758() {
+        let home = tmp_home("dco-e2e-subdir");
+        let repo = tmp_home("dco-e2e-subdir-repo");
+        init_repo_with_identity(&repo);
+        write_dco_yml(&repo);
+        let sub = repo.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        install_hooks(&home, &repo);
+        assert!(
+            run_git(&["commit", "--allow-empty", "-m", "subj"], &sub)
+                .status
+                .success(),
+            "commit from subdir must succeed"
+        );
+        let msg = head_message(&repo);
+        assert!(
+            msg.contains("Signed-off-by: Test User <test@example.com>"),
+            "subdir commit in a DCO repo must be signed: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (g) #2234 core, real git: a commit in a LINKED WORKTREE of a DCO repo is
+    /// signed (the gate resolves the worktree root, where the tracked dco.yml is
+    /// checked out — the cwd/worktree dual-truth case).
+    #[cfg(unix)]
+    #[test]
+    fn real_git_dco_repo_linked_worktree_commit_signs_92758() {
+        let home = tmp_home("dco-e2e-wt");
+        let repo = tmp_home("dco-e2e-wt-repo");
+        init_repo_with_identity(&repo);
+        write_dco_yml(&repo);
+        run_git(&["add", "."], &repo);
+        assert!(
+            run_git(&["commit", "-m", "init dco.yml"], &repo)
+                .status
+                .success(),
+            "seed commit must succeed"
+        );
+        let wt = home.join("wt");
+        assert!(
+            run_git(
+                &["worktree", "add", "-b", "feat/x", &wt.display().to_string()],
+                &repo
+            )
+            .status
+            .success(),
+            "worktree add must succeed"
+        );
+        install_hooks(&home, &wt);
+        assert!(
+            run_git(&["commit", "--allow-empty", "-m", "subj"], &wt)
+                .status
+                .success(),
+            "worktree commit must succeed"
+        );
+        let msg = head_message(&wt);
+        assert!(
+            msg.contains("Signed-off-by: Test User <test@example.com>"),
+            "commit in a linked worktree of a DCO repo must be signed (#2234): {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (h) THE no-overflow regression (operator-core, real git): a NON-DCO repo is
+    /// NEVER signed, even when a SIBLING directory ships a dco.yml — the gate must
+    /// key on the committed repo's OWN root, not a neighbour.
+    #[cfg(unix)]
+    #[test]
+    fn real_git_non_dco_repo_with_dco_sibling_not_signed_92758() {
+        let home = tmp_home("dco-e2e-nondco");
+        let base = tmp_home("dco-e2e-nondco-base");
+        // Sibling that DOES opt into DCO — must not leak into the repo below.
+        write_dco_yml(&base.join("sibling-dco"));
+        let repo = base.join("plain-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo_with_identity(&repo);
+        install_hooks(&home, &repo);
+        assert!(
+            run_git(&["commit", "--allow-empty", "-m", "subj"], &repo)
+                .status
+                .success(),
+            "commit must succeed"
+        );
+        let msg = head_message(&repo);
+        assert!(
+            !msg.contains("Signed-off-by"),
+            "a non-DCO repo must NEVER be signed even with a DCO sibling (no overflow): {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 #[cfg(test)]

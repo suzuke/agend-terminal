@@ -69,10 +69,17 @@ add_dco_signoff() {
     name=$(git config user.name 2>/dev/null)
     email=$(git config user.email 2>/dev/null)
     [ -n "$name" ] && [ -n "$email" ] || return 0
+    # dco.yml requires `<...@...>`; a malformed (no-`@`) email would FAIL the
+    # check, so skip rather than write a bad trailer.
+    case "$email" in *@*) ;; *) return 0 ;; esac
 
-    # Idempotent: this author already signed off (any Signed-off-by with this
-    # email — e.g. the agent used `git commit -s` or amended).
-    grep -qi "^[[:space:]]*Signed-off-by:.*<${email}>" "$msg_file" 2>/dev/null && return 0
+    # Idempotent: this author already signed off (any Signed-off-by carrying this
+    # email — e.g. the agent used `git commit -s` or amended). Match the literal
+    # `<email>` with `grep -F` so regex metacharacters in the address (`.`/`+`)
+    # cannot mis-match.
+    if grep -i "^[[:space:]]*Signed-off-by:" "$msg_file" 2>/dev/null | grep -qF "<${email}>"; then
+        return 0
+    fi
 
     # Keep the sign-off in the trailer block: contiguous with the Agend-* trailers
     # when present, otherwise separated from the body by one blank line.
