@@ -52,7 +52,7 @@ pub(crate) use notify::{
 #[cfg(test)]
 pub use notify::{
     format_header, format_notification_for_inject, pointer_only_inject, HEADER_PREFIX,
-    HEADER_SIZE_THRESHOLD, PENDING_HEADER_PREFIX,
+    PENDING_HEADER_PREFIX,
 };
 
 #[cfg(test)]

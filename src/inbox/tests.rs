@@ -1800,48 +1800,22 @@ fn test_format_header_escapes_control_chars() {
     );
 }
 
-// #t-3 audit: removed the vacuous `test_short_msg_below_threshold` — it
-// asserted `300 <= 300` (HEADER_SIZE_THRESHOLD against itself) and never
-// exercised any production decision. The real short/long delivery split is
-// `< 200` (NOT this 300 const) and is now driven by
+// #t-109: the misleading dead `HEADER_SIZE_THRESHOLD` (300) const has been
+// removed (operator decision d-20260617102838730641-2: keep the real `< 200`
+// gate; production never consulted the 300 const). The vacuous
+// `test_short_msg_below_threshold` (asserted `300 <= 300`) was removed earlier
+// (#t-3); the prior `test_long_msg_above_threshold` is redundant with
+// `test_header_format_all_fields_present` (500-char body → `size=500`, single
+// line). The real short/long split is locked by
 // `channel::telegram::inbound::tests::is_short_inject_routes_by_char_count_and_attachments`.
 
 #[test]
-fn test_long_msg_above_threshold() {
-    // Messages > HEADER_SIZE_THRESHOLD should use header-only injection
-    let long = "a".repeat(HEADER_SIZE_THRESHOLD + 1);
-    assert!(long.len() > HEADER_SIZE_THRESHOLD);
-    // format_header produces a compact single-line representation
-    let msg = msg()
-        .id("m-1")
-        .sender("from:x")
-        .text_owned(long)
-        .kind("task")
-        .timestamp("2026-01-01T00:00:00Z")
-        .build();
-    let header = format_header(&msg);
-    assert!(
-        header.len() < HEADER_SIZE_THRESHOLD,
-        "header must be compact"
-    );
-    assert!(header.contains(&format!("size={}", HEADER_SIZE_THRESHOLD + 1)));
-}
-
-#[test]
-fn test_threshold_uses_char_count_not_bytes() {
-    // 100 CJK chars = 100 chars but 300 bytes (3 bytes each in UTF-8).
-    // Must be treated as short (100 < 300 threshold), not long.
+fn format_header_size_reports_char_count_not_bytes() {
+    // 100 CJK chars = 100 chars but 300 bytes (3 bytes each in UTF-8). The
+    // header's `size=` must report the CHAR count, not the byte count (#1077).
     let cjk = "你".repeat(100);
     assert_eq!(cjk.chars().count(), 100);
     assert_eq!(cjk.len(), 300); // bytes
-                                // 100 chars < HEADER_SIZE_THRESHOLD (300) → should be short path
-    assert!(cjk.chars().count() <= HEADER_SIZE_THRESHOLD);
-
-    // 301 CJK chars = 301 chars → should be long path
-    let long_cjk = "你".repeat(HEADER_SIZE_THRESHOLD + 1);
-    assert!(long_cjk.chars().count() > HEADER_SIZE_THRESHOLD);
-
-    // format_header size= should report char count, not byte count
     let msg = msg()
         .sender("from:x")
         .text_owned(cjk)

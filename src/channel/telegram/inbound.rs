@@ -204,9 +204,10 @@ pub(super) fn resolve_text_after_image_download_failure(initial: &str) -> String
 /// short PTY-inject path only when it is under the char cap AND carries no
 /// attachments; otherwise it goes inbox + pointer hint. Extracted from
 /// `handle_message` (byte-identical: `chars().count() < 200 && empty`) so the
-/// routing decision is unit-testable. The `< 200` cap is the CURRENT production
-/// behavior — distinct from the test-only `HEADER_SIZE_THRESHOLD` (300) const;
-/// reconciling the two is an operator semantics call, intentionally untouched.
+/// routing decision is unit-testable. The `< 200` char cap is the production
+/// behavior, kept by operator decision (d-20260617102838730641-2); the unused
+/// `HEADER_SIZE_THRESHOLD` (300) const that production never consulted was
+/// removed (#t-109).
 pub(super) fn is_short_inject(
     text: &str,
     attachments: &[crate::channel::event::Attachment],
@@ -729,13 +730,11 @@ mod tests {
         }
     }
 
-    /// #t-3 audit: drives the REAL #1352 long/short delivery split. The prior
-    /// `inbox::tests::test_short_msg_below_threshold` asserted `300 <= 300`
-    /// against `HEADER_SIZE_THRESHOLD`, a const production never consults — the
-    /// actual gate is `is_short_inject`'s `< 200` (was inlined at the
-    /// handle_message call-site). Pins CURRENT behavior (char-count, 200 cap,
-    /// attachments force the long path); the 200-vs-300 reconciliation is an
-    /// operator semantics call and is intentionally NOT decided here.
+    /// #t-3 / #t-109: drives the REAL #1352 long/short delivery split — the gate
+    /// is `is_short_inject`'s `< 200` char cap (was inlined at the handle_message
+    /// call-site). Pins the production behavior (char-count, 200 cap, attachments
+    /// force the long path), kept by operator decision (d-20260617102838730641-2)
+    /// when the unused 300 `HEADER_SIZE_THRESHOLD` const was removed.
     #[test]
     fn is_short_inject_routes_by_char_count_and_attachments() {
         assert!(

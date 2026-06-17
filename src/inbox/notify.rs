@@ -3,11 +3,6 @@ use std::path::Path;
 use super::message::{BroadcastContext, InboxMessage, NotifySource};
 use super::storage;
 
-/// Size threshold for header-only PTY injection. Messages with body > this
-/// value inject only a structured header line; the full body stays in inbox.
-#[allow(dead_code)]
-pub const HEADER_SIZE_THRESHOLD: usize = 300;
-
 /// Returns true when the `AGEND_POINTER_ONLY_INJECT` feature flag is set to "1".
 /// When enabled, PTY injection uses header-only format for all messages,
 /// forcing agents to call `inbox` to read content (solves dispatch non-FIFO).
