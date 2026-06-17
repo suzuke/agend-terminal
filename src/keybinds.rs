@@ -96,6 +96,17 @@ impl KeyHandler {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
                     return Action::CopySelection;
                 }
+                // Ctrl+Shift+C (Windows/Linux) → copy selection to clipboard. The
+                // SHIFT requirement is deliberate: plain Ctrl+C carries no SHIFT, so
+                // it falls through to `Forward` and stays the PTY's SIGINT. Accept
+                // both the Kitty-protocol `Char('c')+SHIFT` and the legacy uppercase
+                // `Char('C')` forms (cf. the resize keys' dual-encoding handling).
+                if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                {
+                    return Action::CopySelection;
+                }
                 Action::Forward(key)
             }
             PrefixState::WaitingFirst => {
@@ -374,6 +385,31 @@ mod tests {
     fn plain_c_forwards() {
         let mut handler = KeyHandler::new();
         let action = handler.handle(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(action, Action::Forward(_)));
+    }
+
+    #[test]
+    fn ctrl_shift_c_returns_copy_selection() {
+        let mut handler = KeyHandler::new();
+        let action = handler.handle(key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(action, Action::CopySelection);
+        // Legacy uppercase form (SHIFT folded into the char) also copies.
+        let upper = handler.handle(key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(upper, Action::CopySelection);
+    }
+
+    #[test]
+    fn ctrl_c_still_forwards_for_sigint() {
+        // The Ctrl+Shift+C copy binding must NOT swallow plain Ctrl+C: it has no
+        // SHIFT, so it stays forwarded to the PTY (where it is the SIGINT byte).
+        let mut handler = KeyHandler::new();
+        let action = handler.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(action, Action::Forward(_)));
     }
 }
