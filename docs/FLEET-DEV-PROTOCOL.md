@@ -744,7 +744,7 @@ gh run list -b main --limit 1
 or wait for ci_watch [ci-pass] on main. Only declare task `done` after main CI is confirmed green. If main CI fails post-merge, immediately investigate and fix (revert if necessary).
 
 ### 12.4 Worktree Mandatory
-Impl/reviewer must use worktrees. `git worktree add -b <branch> <path> origin/main`. **Never** `git worktree add <path> main`.
+Impl/reviewer must work in a worktree, never the canonical working tree. For dispatched tasks the daemon **already auto-binds** one — find it via `binding_state(agent: <self>)`, `cd` in, and use **normal git** (no bypass; the shim routes it). Do NOT self-provision: the `agend-git` shim DENIES an agent's `AGEND_GIT_BYPASS git worktree add` in a canonical-rooted repo (#2234 — a stray provision detaches the operator's canonical HEAD). Only the `nextest` line needs `AGEND_GIT_BYPASS=1` (its internal git). Provision deliberately via `bind_self {repository_path, branch}`; **never** `git worktree add <path> main`. Full rule + escape hatch: §10.4.
 
 ### 12.5 Spawn Site Rationale
 Every spawn must have `// fire-and-forget: <reason>` OR store JoinHandle. Test-only exempt.
