@@ -81,35 +81,104 @@ fn is_test_only_file(path: &str) -> bool {
         || p.ends_with(PRIMITIVE_FILE)
 }
 
-/// Blank out `#[cfg(test)]` module bodies (brace-matched) so test fixtures that
-/// legitimately hand-write fake state files don't trip the scan. Line numbers
-/// are preserved (offending content is replaced by empty lines).
+/// Drop inline `"..."` string contents + trailing `// ...` comments so the
+/// brace/semicolon CLASSIFICATION below isn't fooled by a `{`/`;` inside a
+/// string or comment. Used ONLY for the structural `#[cfg(test)]` scan — NOT
+/// for fs::write/token detection, which must keep string contents (the
+/// `".daemon"` path literal lives in a string).
+fn code_only(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_str = false;
+    let mut esc = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Blank out a `#[cfg(test)]` item's lines so test fixtures that legitimately
+/// hand-write fake state files don't trip the scan — WITHOUT over-stripping
+/// production code. Each `#[cfg(test)]` attribute is bounded to its OWN item: a
+/// braced item (`mod` / `fn` / `impl` / `struct {}`) is brace-matched; a
+/// statement item (`use ...;`, `const ...;`) ends at its `;`. Line numbers are
+/// preserved (offending content → empty lines).
+///
+/// #2323-r6 fix: the prior version scanned forward to "the next brace block"
+/// from ANY `#[cfg(test)]` line — so a NON-module `#[cfg(test)] use ...;`
+/// blanked everything up to a far-off brace, hiding a production state-file
+/// write placed after it (a false negative that defeats the forcing function).
 fn strip_cfg_test_modules(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         if lines[i].trim_start().starts_with("#[cfg(test)]") {
-            // Find the module's opening brace, then brace-match to its close.
-            let mut j = i;
-            let mut depth = 0i32;
-            let mut opened = false;
-            while j < lines.len() {
-                for ch in lines[j].chars() {
+            // Classify the attributed item: which comes first, `{` or `;`?
+            let mut braced = false;
+            'scan: for line in lines.iter().skip(i) {
+                for ch in code_only(line).chars() {
                     if ch == '{' {
-                        depth += 1;
-                        opened = true;
-                    } else if ch == '}' {
-                        depth -= 1;
+                        braced = true;
+                        break 'scan;
+                    }
+                    if ch == ';' {
+                        braced = false;
+                        break 'scan;
                     }
                 }
-                out.push(String::new()); // preserve line count
-                j += 1;
-                if opened && depth <= 0 {
-                    break;
-                }
             }
-            i = j;
+            if braced {
+                // Brace-match the item body.
+                let mut depth = 0i32;
+                let mut opened = false;
+                let mut k = i;
+                while k < lines.len() {
+                    for ch in code_only(lines[k]).chars() {
+                        if ch == '{' {
+                            depth += 1;
+                            opened = true;
+                        } else if ch == '}' {
+                            depth -= 1;
+                        }
+                    }
+                    out.push(String::new());
+                    k += 1;
+                    if opened && depth <= 0 {
+                        break;
+                    }
+                }
+                i = k;
+            } else {
+                // Statement item: blank through the line carrying its `;` only.
+                let mut k = i;
+                loop {
+                    let has_semi = code_only(lines[k]).contains(';');
+                    out.push(String::new());
+                    k += 1;
+                    if has_semi || k >= lines.len() {
+                        break;
+                    }
+                }
+                i = k;
+            }
         } else {
             out.push(lines[i].to_string());
             i += 1;
@@ -185,7 +254,7 @@ fn targets_state_file(call_text: &str) -> bool {
 
 /// A violation: a production plain `fs::write` to a state file with no
 /// atomic-write-exempt marker. Returns (1-based line, snippet).
-fn scan(path: &str, content: &str) -> Vec<(usize, String)> {
+fn find_violations(path: &str, content: &str) -> Vec<(usize, String)> {
     if is_test_only_file(path) {
         return Vec::new();
     }
@@ -242,7 +311,7 @@ fn production_state_file_writes_use_atomic_write() {
         let Ok(content) = std::fs::read_to_string(f) else {
             continue;
         };
-        for (line, snippet) in scan(&path, &content) {
+        for (line, snippet) in find_violations(&path, &content) {
             offenders.push(format!("{path}:{line}: {snippet}"));
         }
     }
@@ -265,30 +334,51 @@ fn scanner_catches_state_writes_and_respects_scope() {
     // CAUGHT: production plain write to a state file.
     let bad = "fn publish(run: &Path) { std::fs::write(run.join(\".daemon\"), body); }";
     assert_eq!(
-        scan("src/daemon/mod.rs", bad).len(),
+        find_violations("src/daemon/mod.rs", bad).len(),
         1,
         "must flag a production plain fs::write to .daemon"
     );
 
     // NOT caught: atomic_write is the fix.
     let good = "fn publish(run: &Path) { crate::store::atomic_write(&run.join(\".daemon\"), b); }";
-    assert!(scan("src/daemon/mod.rs", good).is_empty());
+    assert!(find_violations("src/daemon/mod.rs", good).is_empty());
 
     // NOT caught: write to a state file inside a #[cfg(test)] module.
     let test_region = "fn p() {}\n#[cfg(test)]\nmod tests {\n  fn t() { fs::write(run.join(\".port\"), x); }\n}\n";
     assert!(
-        scan("src/daemon/mod.rs", test_region).is_empty(),
+        find_violations("src/daemon/mod.rs", test_region).is_empty(),
         "#[cfg(test)] fixtures are exempt"
     );
 
     // NOT caught: out-of-scope benign config (no state-file token).
     let benign = "fn gen() { std::fs::write(dir.join(\"AGENTS.md\"), content); }";
-    assert!(scan("src/instructions.rs", benign).is_empty());
+    assert!(find_violations("src/instructions.rs", benign).is_empty());
 
     // NOT caught: explicit exempt marker.
     let marked = "fn p() {\n  // atomic-write-exempt: empty truncate, no reader races\n  std::fs::write(run.join(\".ready\"), \"\");\n}";
-    assert!(scan("src/daemon/mod.rs", marked).is_empty());
+    assert!(find_violations("src/daemon/mod.rs", marked).is_empty());
 
     // NOT caught: test-only file path.
-    assert!(scan("src/runtime_tests.rs", bad).is_empty());
+    assert!(find_violations("src/runtime_tests.rs", bad).is_empty());
+
+    // CAUGHT (#2323-r6 regression): a NON-module `#[cfg(test)]` item (a `use`,
+    // `const`, …) must NOT cause the cfg(test) stripper to swallow a production
+    // state-file write placed after it. Pre-fix, the stripper blanked forward to
+    // the next brace block and hid this write.
+    let after_cfg_use = "#[cfg(test)]\nuse std::time::Duration;\n\n\
+         fn publish(run: &Path) { std::fs::write(run.join(\".daemon\"), body); }\n";
+    assert_eq!(
+        find_violations("src/notification_queue.rs", after_cfg_use).len(),
+        1,
+        "a production state write after a non-module #[cfg(test)] item must still be flagged"
+    );
+    // Also a `#[cfg(test)] const` (braces only inside its string value) must not
+    // misclassify as a braced item and over-strip the following write.
+    let after_cfg_const = "#[cfg(test)]\nconst SAMPLE: &str = \"a { b\";\n\
+         fn publish(run: &Path) { std::fs::write(run.join(\".port\"), p); }\n";
+    assert_eq!(
+        find_violations("src/x.rs", after_cfg_const).len(),
+        1,
+        "a brace inside a #[cfg(test)] const's string literal must not over-strip the following write"
+    );
 }
