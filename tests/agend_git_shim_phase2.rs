@@ -279,3 +279,141 @@ fn stress_shim_recursion_attempt() {
 
     std::fs::remove_dir_all(&fake_agend_bin).ok();
 }
+
+/// #2234 fix B (r6 #2316): end-to-end RUNTIME proof that the shim BINARY itself
+/// denies an agent's `AGEND_GIT_BYPASS` provisioning op in a canonical-rooted
+/// repo — exit 1 + a `DENIED` message — and passes carve-outs through. The pure
+/// `deny_agent_canonical_bypass` unit test covers the DECISION; this covers the
+/// WIRING (`enforce_agent_canonical_bypass_deny` reading the live env + cwd) and
+/// the runtime behavior §3.17 requires for shim changes, exercised on every CI
+/// platform incl. windows-runtime.
+///
+/// Fixtures are throwaway temp dirs — NEVER the real canonical. DENY cases exit
+/// BEFORE `exec_real_git` (no git spawned). ALLOW/carve-out cases pass through to
+/// real git, which fast-fails on the fake-`.git` fixture (no objects/HEAD, so no
+/// index.lock, no checkout, no hang); we assert only that `DENIED` is absent.
+/// Joins the `git-subprocess` serialize group (.config/nextest.toml) so the
+/// passthrough git calls can't race on windows.
+#[test]
+fn shim_denies_agent_bypass_canonical_provisioning_2234() {
+    use std::process::Command;
+
+    let root = std::env::temp_dir().join(format!("agend-2234-deny-{}", std::process::id()));
+    // Throwaway "canonical" fixture: a `.git` DIR whose config carries
+    // `[remote "origin"]` → `cwd_is_canonical_rooted()` == true. No real git used
+    // to build it.
+    let canonical = root.join("canonical");
+    std::fs::create_dir_all(canonical.join(".git")).expect("mk .git dir");
+    std::fs::write(
+        canonical.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = https://example.invalid/x.git\n",
+    )
+    .expect("write .git/config");
+    // Non-canonical control dir (plain dir, no `.git`).
+    let plain = root.join("plain");
+    std::fs::create_dir_all(&plain).expect("mk plain dir");
+
+    let shim = env!("CARGO_BIN_EXE_agend-git");
+    let run = |cwd: &std::path::Path, instance: Option<&str>, escape: bool, args: &[&str]| {
+        let mut c = Command::new(shim);
+        c.args(args)
+            .current_dir(cwd)
+            .env("AGEND_GIT_BYPASS", "1")
+            // Start at shim depth 0 (don't inherit an outer shim's depth).
+            .env_remove("AGEND_GIT_SHIM_DEPTH")
+            // No AGEND_HOME → the #2158 audit log is skipped (no fleet_events).
+            .env_remove("AGEND_HOME");
+        match instance {
+            Some(n) => {
+                c.env("AGEND_INSTANCE_NAME", n);
+            }
+            None => {
+                c.env_remove("AGEND_INSTANCE_NAME");
+            }
+        }
+        if escape {
+            c.env("AGEND_GIT_ALLOW_CANONICAL_MUTATE", "1");
+        } else {
+            c.env_remove("AGEND_GIT_ALLOW_CANONICAL_MUTATE");
+        }
+        c.output().expect("run agend-git shim")
+    };
+    let is_denied = |o: &std::process::Output| {
+        o.status.code() == Some(1) && String::from_utf8_lossy(&o.stderr).contains("DENIED")
+    };
+    let not_denied =
+        |o: &std::process::Output| !String::from_utf8_lossy(&o.stderr).contains("DENIED");
+
+    // ── DENY (exit 1 + DENIED; exits before exec → no git spawned) ──
+    assert!(
+        is_denied(&run(
+            &canonical,
+            Some("test-agent"),
+            false,
+            &["worktree", "add", "/tmp/agend-2234-wt-a", "origin/main"]
+        )),
+        "agent `worktree add` in canonical must be DENIED"
+    );
+    assert!(
+        is_denied(&run(
+            &canonical,
+            Some("test-agent"),
+            false,
+            &["checkout", "origin/main"]
+        )),
+        "agent positional `checkout <ref>` in canonical must be DENIED"
+    );
+    assert!(
+        is_denied(&run(
+            &canonical,
+            Some("test-agent"),
+            false,
+            &["switch", "main"]
+        )),
+        "agent positional `switch <ref>` in canonical must be DENIED"
+    );
+
+    // ── ALLOW / carve-outs (DENIED message absent) ──
+    // (a) no AGEND_INSTANCE_NAME (daemon-internal / operator shell) → pass.
+    assert!(
+        not_denied(&run(
+            &canonical,
+            None,
+            false,
+            &["worktree", "add", "/tmp/agend-2234-wt-b", "origin/main"]
+        )),
+        "non-agent caller must NOT be denied"
+    );
+    // (c) explicit one-shot escape env → pass.
+    assert!(
+        not_denied(&run(
+            &canonical,
+            Some("test-agent"),
+            true,
+            &["worktree", "add", "/tmp/agend-2234-wt-c", "origin/main"]
+        )),
+        "AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 must bypass the deny"
+    );
+    // non-`add` worktree subcommand (r4 over-block fix): `list` is read-only → pass.
+    assert!(
+        not_denied(&run(
+            &canonical,
+            Some("test-agent"),
+            false,
+            &["worktree", "list"]
+        )),
+        "`worktree list` (read-only) must NOT be denied"
+    );
+    // (b) non-canonical cwd → pass.
+    assert!(
+        not_denied(&run(
+            &plain,
+            Some("test-agent"),
+            false,
+            &["worktree", "add", "/tmp/agend-2234-wt-d", "origin/main"]
+        )),
+        "non-canonical cwd must NOT be denied"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
