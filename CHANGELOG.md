@@ -5,6 +5,36 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-06-19
+
+228 commits since 0.8.0. Highlights, organized by theme (not an exhaustive commit list).
+
+### Added
+
+- **Multi-project task boards (#2117 P1–P3)** — the task board is now project-aware. A `BoardRouter` + per-board task index route every `task` command to the right project board (#2122); dispatch auto-stamps the target project and sweeps per-board (#2125); mutation paths are guarded by per-board ACL with a fail-closed fleet resolve, and cross-project `parent_id` is rejected at create (#2134, #2136); the branch lease is keyed on `(source_repo, branch)` so same-named branches across repos don't collide (#2137). `depends_on` resolves across boards (#2230) and `task health` aggregates every board (#2229). Single→multi-project conversion does not retroactively re-bucket legacy tasks — documented as accepted semantics (#2322).
+- **Async decision board (#2305)** — agents/operator post a pending question with suggested options and collect an answer asynchronously: backend (#2308) + an interactive `Ctrl+B D` answer overlay in the TUI (#2309).
+- **Copy-on-select + cross-platform copy (TUI)** — copy-on-select with dual modes and a dual control surface (#2325, #2328); `Ctrl+Shift+C` copies the selection for Win/Linux parity (#2295); selection-highlight lifecycle polished — cleared after a completed copy (#2294), dismissed on a left-click (#2296), preserved on drag-release so copy happens only via the copy key (#2302).
+- **Custom per-instance skills (#2321)** — `skills_path` in `fleet.yaml` configures per-instance skill directories; the `agy` backend is added to the skills symlink table (#2326).
+- **Origin-aware progress reporting (#2247 — default OFF, exfil-gated)** — an agent-curated report mode (#2283) and a raw transcript-tail mirror mode (#2293), with an actionable `[AGEND-PROGRESS]` marker for the daemon nudge (#2284).
+- **Project-scoped DCO sign-off (#2298)** — the `prepare-commit-msg` hook auto-adds `Signed-off-by` when the repo carries a DCO workflow.
+- **Readable task-board columns (#2306, #2307)** — the nine task statuses are regrouped into five readable columns in the TUI overlay.
+- **Reclaim work from stuck agents (#2127)** — board tasks are reclaimed from non-recoverable usage-limit agents (#2133) and their pending inbox dispatches are re-routed back to the dispatchers (#2142).
+
+### Changed
+
+- **Self-respawn restart on by default (#1814 Stage 4, #2094)** — `AGEND_RESTART_HANDOFF` flips OFF→ON: the daemon spawns and health-gates its own successor before exiting, with the launchd KeepAlive contract narrowed to restart-on-failure (#2093).
+- **Faster, smoother restarts** — app-mode shutdown teardown is parallelized (~6 s → the grace window, #2311); the old-exit→new-launch gap and restart timing are instrumented (#2310, #2275); release builds use ThinLTO + more codegen units (#2265).
+- **Canonical worktree reconcile (#2234 — flag-gated, default OFF)** — reconcile `workspace/<agent>` into canonical git worktrees (#2262), with layout-aware GC + agent attribution (#2263, #2266, #2269), in-place dispatch checkout (#2264), reconcile-backups retention GC (#2272), and a reverse-reconcile rollback primitive (#2267). The `agend-git` shim warns on cwd↔worktree drift (#2254, #2278) and now DENIES an agent's `AGEND_GIT_BYPASS` provisioning op in a canonical-rooted repo (#2316).
+- **Governance gates mechanized** — repeatedly hand-checked review rules became invariant tests: state files must use `store::atomic_write` (D2, #2323) and instrument/audit paths must never affect control-flow or exit code (D3, #2324); three protocol rules + a context-full self-restart procedure were formalized (#2329, #2157).
+- **Dependency bumps** — crossterm 0.29, sysinfo 0.39, regex, serde_json, insta (#2285–#2289).
+
+### Fixed
+
+- **Rate-limit / server-overload recovery** — a second `529` right after an agent self-cleared a rate-limit block no longer wedges it silently: the self-clear latch resets on a fresh `ApiError` hook so the retry re-arms (#2318), and stacked `AGEND-AUTO` retry nudges coalesce keep-latest (#2319). Also: ratelimit-retry over-inject is gated by an agent self-clear ground-truth signal (#2239); a fresh-restart injects a recovery first turn so a context-lost respawn doesn't sit idle (#2255); narrow-pane / hard-wrapped rate-limit lines are detected (#2089, #2091, #2087, #2261); and OpenCode/agy usage-limit phrasings are recognized (#2276, #2258, #2236).
+- **Telegram robustness** — polling backs off instead of panic-looping on a network failure (#2200, #2224); a fresh install fails fast on an empty allowlist and the quickstart auto-fills the sender id (#2207, #2225); the sender display name resolves from the allowlist (#2045); and a bot-token leak via a `reqwest` error URL is closed (#2178).
+- **CR-2026-06-14 reliability & security hardening** — a broad sweep: a case-insensitive `branch="Main"` protected-ref bypass (#2172), Telegram notify driven synchronously rather than onto an undriven runtime (#2152), char-aware pane parsing (no panic on non-ASCII) (#2149), lock-ordering / dedup / keepalive fixes (#2197), worktree data-loss guards (#2193, #2194), a bounded `gh` CLI subprocess (#2191), and further inbox / state-capture / worktree findings (#2181, #2187, #2190, #2201, #2203, #2205, #2212, #2221, #2223).
+- **Control-plane & TUI reliability** — `restart_daemon` fails closed in app/owned mode instead of bricking the control plane (#2103); a reused worktree is force-synced to HEAD on lease re-acquire (#2226); daemon git-spawn stdio no longer garbles the TUI frame (#2073).
+
 ## [0.8.0] — 2026-06-12
 
 ### Changed
