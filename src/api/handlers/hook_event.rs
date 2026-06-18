@@ -26,14 +26,39 @@ pub(crate) fn handle_hook_event(params: &Value, ctx: &HandlerCtx) -> Value {
     let derived =
         crate::daemon::hook_shadow::record_event(name, hook_event_name, notification_type);
 
+    // #t-3558: a fresh failure hook (StopFailure → ApiError) signals a NEW error
+    // episode. If the agent earlier self-cleared a rate-limit block, drop the
+    // #2232 `rate_limit_self_cleared` liveness latch so the supervisor's
+    // ServerRateLimit retry path re-arms. Without this the latch stays set until
+    // the SCREEN exits ServerRateLimit (supervisor.rs:1955), but the stale
+    // "Server is temporarily limiting" line keeps the screen pinned to SRL
+    // forever (#1769 positional defeat) → the retry track is cleared every tick
+    // and never re-injected: a permanent silent wedge (RCA t-…2345-2,
+    // live-reproduced on fixup-dev-2). Re-arm is still gated on
+    // screen==ServerRateLimit in the supervisor (:1994), so a non-SRL ApiError
+    // (e.g. an auth error) only drops the latch and cannot trigger a spurious
+    // inject. Only ApiError-derived hooks reset — a clean Stop / PreToolUse /
+    // UserPromptSubmit during normal post-self-clear work never does.
+    let is_apierror_hook = derived == Some(crate::state::AgentState::ApiError);
+
     // Shadow comparison: the screen-heuristic state at event receipt. This is
-    // the PoC's primary output — production promotion is gated on this
-    // agreement data.
+    // the PoC's primary output — production promotion is gated on this agreement
+    // data. Doubles as the #t-3558 latch-reset site (same single core lock).
     let (screen_state, backend) = {
         let reg = agent::lock_registry(ctx.registry);
         match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| {
-            reg.get(&id)
-                .map(|h| (h.core.lock().state.get_state(), h.backend_command.clone()))
+            reg.get(&id).map(|h| {
+                let mut core = h.core.lock();
+                if is_apierror_hook && core.health.rate_limit_self_cleared {
+                    core.health.rate_limit_self_cleared = false;
+                    tracing::info!(
+                        agent = %name,
+                        "#t-3558 rate-limit self-clear latch reset — fresh ApiError hook (new \
+                         error episode); supervisor ServerRateLimit retry re-arms"
+                    );
+                }
+                (core.state.get_state(), h.backend_command.clone())
+            })
         }) {
             Some((s, b)) => (Some(s), Some(b)),
             None => (None, None),
@@ -69,6 +94,7 @@ pub(crate) fn handle_hook_event(params: &Value, ctx: &HandlerCtx) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
@@ -115,6 +141,101 @@ mod tests {
         // Missing event name → honest error, nothing recorded for that call.
         let bad = handle_hook_event(&json!({"name": "hooked"}), &ctx);
         assert_eq!(bad["ok"], false);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // #t-3558: seed a registered agent (fleet.yaml id ↔ registry handle) whose
+    // `rate_limit_self_cleared` latch is set, then drive hook events through the
+    // handler. Mirrors the external.rs handler-test seeding pattern.
+    const T3558_ID: &str = "0d0d0d0d-0000-4000-8000-0000035580a1";
+
+    fn seed_latched_agent(ctx: &HandlerCtx<'_>, name: &str) {
+        let id = crate::types::InstanceId::parse(T3558_ID).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(ctx.home),
+            format!("instances:\n  {name}:\n    id: {T3558_ID}\n"),
+        )
+        .unwrap();
+        let handle = agent::mk_test_handle(name, id);
+        handle.core.lock().health.rate_limit_self_cleared = true;
+        agent::lock_registry(ctx.registry).insert(id, handle);
+    }
+
+    fn latch_of(ctx: &HandlerCtx<'_>) -> bool {
+        let id = crate::types::InstanceId::parse(T3558_ID).unwrap();
+        agent::lock_registry(ctx.registry)
+            .get(&id)
+            .map(|h| h.core.lock().health.rate_limit_self_cleared)
+            .expect("agent present")
+    }
+
+    fn set_latch(ctx: &HandlerCtx<'_>, val: bool) {
+        let id = crate::types::InstanceId::parse(T3558_ID).unwrap();
+        agent::lock_registry(ctx.registry)
+            .get(&id)
+            .expect("agent present")
+            .core
+            .lock()
+            .health
+            .rate_limit_self_cleared = val;
+    }
+
+    fn t3558_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-t3558-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).ok();
+        home
+    }
+
+    /// #t-3558 POSITIVE: a fresh `StopFailure` hook (→ ApiError) resets the
+    /// `rate_limit_self_cleared` latch so the supervisor SRL retry re-arms.
+    /// RED before the fix (the latch was only reset on a screen-state exit).
+    #[test]
+    fn apierror_hook_resets_rate_limit_self_clear_latch() {
+        let home = t3558_home("reset");
+        let ctx = test_ctx(&home);
+        let name = "wedged";
+        seed_latched_agent(&ctx, name);
+        assert!(latch_of(&ctx), "precondition: latch set");
+
+        let resp = handle_hook_event(
+            &json!({"name": name, "hook_event_name": "StopFailure"}),
+            &ctx,
+        );
+        assert_eq!(resp["ok"], true, "{resp}");
+        assert!(
+            !latch_of(&ctx),
+            "StopFailure (→ApiError) must reset rate_limit_self_cleared so SRL retry re-arms"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-3558 NEGATIVE (mandatory — pins "normal completion never re-arms"):
+    /// clean lifecycle hooks during normal post-self-clear work must NOT reset
+    /// the latch — only a genuine failure hook does.
+    #[test]
+    fn normal_hooks_do_not_reset_rate_limit_self_clear_latch() {
+        let home = t3558_home("noreset");
+        let ctx = test_ctx(&home);
+        let name = "working";
+        seed_latched_agent(&ctx, name);
+
+        for ev in ["Stop", "PreToolUse", "PostToolUse", "UserPromptSubmit"] {
+            set_latch(&ctx, true);
+            let resp = handle_hook_event(&json!({"name": name, "hook_event_name": ev}), &ctx);
+            assert_eq!(resp["ok"], true, "{resp}");
+            assert!(
+                latch_of(&ctx),
+                "normal hook {ev:?} must NOT reset the latch (no spurious re-arm on healthy work)"
+            );
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 }
