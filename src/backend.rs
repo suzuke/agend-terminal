@@ -768,14 +768,15 @@ impl Backend {
     }
 
     /// Skill directory key matching `BACKEND_SKILL_DIRS`. Returns `None`
-    /// for backends without a skill directory (Shell, Raw, Agy).
+    /// for backends without a skill directory (Shell, Raw).
     pub fn skill_dir_name(&self) -> Option<&'static str> {
         match self {
             Backend::ClaudeCode => Some("claude"),
             Backend::Codex => Some("codex"),
             Backend::OpenCode => Some("opencode"),
             Backend::KiroCli => Some("kiro"),
-            Backend::Agy | Backend::Shell | Backend::Raw(_) => None,
+            Backend::Agy => Some("agy"),
+            Backend::Shell | Backend::Raw(_) => None,
         }
     }
 

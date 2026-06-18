@@ -1,7 +1,7 @@
-//! Sprint 60 W2 PR-1 (#P1-1 Skills System Plan IMPL) — 4-backend
+//! Sprint 60 W2 PR-1 (#P1-1 Skills System Plan IMPL) — 5-backend
 //! community skill discovery via unified source + symlink (Windows
-//! copy fallback). (Originally 5 backends; #1580 retired gemini-cli —
-//! see `BACKEND_SKILL_DIRS`.)
+//! copy fallback). (Originally 5 with gemini-cli; #1580 retired it,
+//! then agy restored the count to 5 — see `BACKEND_SKILL_DIRS`.)
 //!
 //! ## Architecture
 //!
@@ -15,10 +15,11 @@
 //!   ├── .claude/skills/  → symlink → ~/.agend-terminal/skills/
 //!   ├── .codex/skills/   → symlink → ~/.agend-terminal/skills/
 //!   ├── .opencode/skills/→ symlink → ~/.agend-terminal/skills/
-//!   └── .kiro/skills/    → symlink → ~/.agend-terminal/skills/
+//!   ├── .kiro/skills/    → symlink → ~/.agend-terminal/skills/
+//!   └── .agents/skills/  → symlink → ~/.agend-terminal/skills/
 //! ```
 //!
-//! Unified source means: one skill file, all 4 backends discover.
+//! Unified source means: one skill file, all 5 backends discover.
 //! No file copies on Unix (symlink = zero maintenance). Windows
 //! falls back to copy with hash-compare staleness detection on
 //! subsequent installs (file-watch infra is out of scope per
@@ -40,12 +41,14 @@ use std::path::{Path, PathBuf};
 /// Per-backend conventional skills directories inside the agent's working
 /// tree; the daemon installs a symlink (or copy on Windows) pointing at the
 /// unified source. (Originally 5 backends per dispatch
-/// m-20260509214553949181-385; #1580 retired gemini-cli's `.gemini/skills`.)
+/// m-20260509214553949181-385; #1580 retired gemini-cli's `.gemini/skills`;
+/// agy restores the count to 5 via `.agents/skills`.)
 pub const BACKEND_SKILL_DIRS: &[(&str, &str)] = &[
     ("claude", ".claude/skills"),
     ("codex", ".codex/skills"),
     ("opencode", ".opencode/skills"),
     ("kiro", ".kiro/skills"),
+    ("agy", ".agents/skills"),
 ];
 
 /// Unified skill source root: `<home>/skills/`.
