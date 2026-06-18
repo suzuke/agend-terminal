@@ -5,6 +5,36 @@
 本文件記錄本專案所有重要變更。
 格式基於 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)；專案遵循 [SemVer](https://semver.org/spec/v2.0.0.html)。
 
+## [0.9.0] — 2026-06-19
+
+自 0.8.0 起 228 個 commit。以下依主題整理重點(非完整 commit 清單)。
+
+### Added
+
+- **多專案任務板(#2117 P1–P3)** — 任務板現在具備專案意識。`BoardRouter` + per-board 索引把每個 `task` 指令路由到正確的專案板(#2122);dispatch 自動標記目標專案並 per-board sweep(#2125);變更路徑由 per-board ACL 把關、fleet 解析 fail-closed,且 create 時拒絕跨專案 `parent_id`(#2134、#2136);branch lease 改以 `(source_repo, branch)` 為鍵,跨 repo 同名 branch 不再衝突(#2137)。`depends_on` 可跨板解析(#2230),`task health` 聚合所有板(#2229)。單→多專案轉換不回溯重歸舊任務 —— 已記為接受的語意(#2322)。
+- **非同步決策板(#2305)** — agent/operator 可貼出帶建議選項的待答問題並非同步收集答案:後端(#2308)+ TUI 內 `Ctrl+B D` 互動作答 overlay(#2309)。
+- **選取即複製 + 跨平台複製(TUI)** — 選取即複製,雙模式 + 雙控制面(#2325、#2328);`Ctrl+Shift+C` 複製選取,Win/Linux 對等(#2295);選取高亮生命週期打磨 —— 複製完成後清除(#2294)、左鍵點擊取消(#2296)、拖放放開時保留(僅由複製鍵觸發複製)(#2302)。
+- **每實例自訂 skills(#2321)** — `fleet.yaml` 的 `skills_path` 可設定 per-instance skill 目錄;skills symlink 表補上 `agy` 後端(#2326)。
+- **origin-aware 進度回報(#2247 —— 預設 OFF、exfil-gated)** — agent 自我策展的 report 模式(#2283)與 raw transcript-tail mirror 模式(#2293),搭配可行動的 `[AGEND-PROGRESS]` daemon nudge marker(#2284)。
+- **專案範圍的 DCO sign-off(#2298)** — 當 repo 帶有 DCO workflow 時,`prepare-commit-msg` hook 自動加上 `Signed-off-by`。
+- **可讀的任務板欄位(#2306、#2307)** — 九種任務狀態在 TUI overlay 重整為五個可讀欄位。
+- **從卡住的 agent 回收工作(#2127)** — 從不可恢復的 usage-limit agent 回收任務板任務(#2133),並把其待處理的 inbox dispatch 重新路由回 dispatcher(#2142)。
+
+### Changed
+
+- **自我 respawn restart 預設開啟(#1814 Stage 4、#2094)** — `AGEND_RESTART_HANDOFF` 由 OFF→ON:daemon 在退出前生成並健康把關自己的後繼者,launchd KeepAlive 契約收斂為 restart-on-failure(#2093)。
+- **更快更順的 restart** — app-mode shutdown teardown 平行化(~6 秒 → grace 窗,#2311);old-exit→new-launch 的 gap 與 restart timing 加上 instrument(#2310、#2275);release build 採 ThinLTO + 更多 codegen units(#2265)。
+- **canonical worktree reconcile(#2234 —— flag-gated、預設 OFF)** — 把 `workspace/<agent>` reconcile 成 canonical git worktree(#2262),含 layout-aware GC + agent 歸屬(#2263、#2266、#2269)、in-place dispatch checkout(#2264)、reconcile-backups 保留 GC(#2272)、reverse-reconcile 回滾原語(#2267)。`agend-git` shim 對 cwd↔worktree 漂移發 WARN(#2254、#2278),並在 canonical-rooted repo 中 DENY agent 的 `AGEND_GIT_BYPASS` provisioning op(#2316)。
+- **治理閘機械化** — 反覆手追的 review 規則變成 invariant 測:狀態檔必須走 `store::atomic_write`(D2,#2323),instrument/audit 路徑永不影響 control-flow 或 exit code(D3,#2324);三條 protocol 規則 + context-full 自我 restart 流程已形式化(#2329、#2157)。
+- **依賴升級** — crossterm 0.29、sysinfo 0.39、regex、serde_json、insta(#2285–#2289)。
+
+### Fixed
+
+- **rate-limit / server-overload 恢復** — agent 自清 rate-limit block 後緊接的第二個 `529` 不再靜默卡死:self-clear latch 在新的 `ApiError` hook 上重置以重新 arm retry(#2318),且堆疊的 `AGEND-AUTO` retry nudge 合併保留最新(#2319)。另外:ratelimit-retry over-inject 由 agent self-clear 的 ground-truth 訊號把關(#2239);fresh-restart 注入一個恢復首回合,讓失憶的 respawn 不會空等(#2255);窄 pane / hard-wrap 的 rate-limit 行可被偵測(#2089、#2091、#2087、#2261);並辨識 OpenCode/agy 的 usage-limit 措辭(#2276、#2258、#2236)。
+- **Telegram 健壯性** — 網路失敗時 polling 退避而非 panic-loop(#2200、#2224);全新安裝在空 allowlist 時 fail-fast,quickstart 自動填入 sender id(#2207、#2225);sender 顯示名稱從 allowlist 解析(#2045);關閉經由 `reqwest` error URL 的 bot-token 洩漏(#2178)。
+- **CR-2026-06-14 可靠性與安全硬化** — 一輪廣泛清掃:case-insensitive `branch="Main"` protected-ref 繞過(#2172)、Telegram notify 改同步驅動而非丟到未驅動的 runtime(#2152)、char-aware pane 解析(非 ASCII 不 panic)(#2149)、lock-ordering / dedup / keepalive 修正(#2197)、worktree 資料遺失防護(#2193、#2194)、有界的 `gh` CLI subprocess(#2191),以及更多 inbox / state-capture / worktree 發現(#2181、#2187、#2190、#2201、#2203、#2205、#2212、#2221、#2223)。
+- **control-plane 與 TUI 可靠性** — `restart_daemon` 在 app/owned 模式 fail-closed,而非把 control plane 弄 brick(#2103);reused worktree 在 lease 重取時 force-sync 到 HEAD(#2226);daemon git-spawn 的 stdio 不再弄亂 TUI 畫面(#2073)。
+
 ## [0.8.0] — 2026-06-12
 
 ### Changed
