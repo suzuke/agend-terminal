@@ -1090,6 +1090,8 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             }
             let _ = std::fs::remove_file(home.join("restart-requested"));
             let _ = std::fs::remove_dir_all(run_dir(home));
+            // instrument-only: D3 #2310 — gap-instrument anchor, control-flow-
+            // inert; the real op is the `exit(0)` below.
             tracing::info!(
                 target: "handoff",
                 event = "predecessor_exit",
