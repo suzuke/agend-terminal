@@ -1316,14 +1316,16 @@ fn is_positional_branch_checkout(args: &[String]) -> bool {
 ///   put us on the bypass path in the first place);
 /// - `canonical` — cwd is canonical-rooted (the source repo OR a worktree of it,
 ///   per `cwd_is_canonical_rooted`);
-/// - the op is **provisioning / HEAD-detaching**: `worktree` (any subcommand) or
-///   a positional `checkout|switch <ref>` (NOT `checkout -- <pathspec>` / flag
-///   forms — those are excluded by `is_positional_branch_checkout`).
+/// - the op is **provisioning / HEAD-detaching**: `worktree add` (the stray /
+///   detach vector) or a positional `checkout|switch <ref>` (NOT
+///   `checkout -- <pathspec>` / flag forms — excluded by
+///   `is_positional_branch_checkout`).
 ///
-/// `reset` is intentionally NOT denied (an agent self-help tool that moves a
-/// branch ref without detaching; `worktree add`'s internal reset is already
-/// covered by denying `worktree`). `push`/`commit`/`add`/`clean`/`branch` are
-/// excluded — agents legitimately bypass those in their own worktree.
+/// Deliberately NOT denied: other `worktree` subcommands (`list` is read-only;
+/// `remove`/`prune`/`repair`/`move` don't detach or stray); `reset` (agent
+/// self-help, moves a branch ref without detaching; `worktree add`'s internal
+/// reset is moot once add itself is denied); `push`/`commit`/`add`/`clean`/
+/// `branch` (agents legitimately bypass those in their own worktree).
 fn deny_agent_canonical_bypass(
     agent_present: bool,
     escape: bool,
@@ -1334,7 +1336,13 @@ fn deny_agent_canonical_bypass(
         return false;
     }
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
-    sub == "worktree" || is_positional_branch_checkout(args)
+    // Only `worktree ADD` is the stray/detach vector. Other worktree subcommands
+    // (list/remove/prune/repair/move) neither detach the canonical HEAD nor
+    // create a stray worktree, so they pass — `worktree list` in particular is
+    // read-only (r4 #2316: blocking all of `worktree` over-blocked beyond the
+    // documented threat).
+    let is_worktree_add = sub == "worktree" && args.get(1).map(String::as_str) == Some("add");
+    is_worktree_add || is_positional_branch_checkout(args)
 }
 
 /// #2234 fix B: read the live env + cwd, and if [`deny_agent_canonical_bypass`]
@@ -3003,12 +3011,6 @@ mod tests {
             true,
             false,
             true,
-            &s(&["worktree", "remove", "x"])
-        ));
-        assert!(deny_agent_canonical_bypass(
-            true,
-            false,
-            true,
             &s(&["checkout", "origin/main"])
         ));
         assert!(deny_agent_canonical_bypass(
@@ -3016,6 +3018,34 @@ mod tests {
             false,
             true,
             &s(&["switch", "main"])
+        ));
+
+        // ALLOW — non-`add` worktree subcommands are NOT stray/detach vectors
+        // (r4 #2316 over-block fix): `list` is read-only; remove/prune/move
+        // don't detach or stray. Bare `worktree` (no subcommand) → not add.
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["worktree", "list"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["worktree", "remove", "x"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["worktree", "prune"])
+        ));
+        assert!(!deny_agent_canonical_bypass(
+            true,
+            false,
+            true,
+            &s(&["worktree"])
         ));
 
         // ALLOW — carve-outs / non-provisioning:
