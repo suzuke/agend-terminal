@@ -354,6 +354,22 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 }
             }
         }
+        Action::ToggleCopyOnSelect => {
+            // #2325: flip Mode B (copy-on-select) ↔ Mode A (explicit-copy) and
+            // persist. `set` updates the in-process global immediately (so the
+            // next selection-release sees the new mode) and writes the choice to
+            // runtime-config.json for cross-restart persistence. Feedback is via
+            // tracing, mirroring the sibling `:config set` palette command.
+            let next = if crate::runtime_config::get().copy_on_select {
+                "off"
+            } else {
+                "on"
+            };
+            match crate::runtime_config::set(ctx.home, "copy_on_select", next) {
+                Ok(_) => tracing::info!(copy_on_select = next, "toggled copy-on-select mode"),
+                Err(e) => tracing::warn!(error = %e, "toggle copy-on-select failed"),
+            }
+        }
     }
     out
 }

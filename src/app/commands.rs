@@ -1,5 +1,5 @@
 //! Command-palette command execution (`:spawn`, `:kill`, `:restart`, `:layout`,
-//! `:send`, `:broadcast`, `:status`, `:config`).
+//! `:send`, `:broadcast`, `:status`, `:config`, `:set`).
 //!
 //! Input is a whitespace-split command line. Returns `true` iff the command
 //! mutated the layout in a way that requires a resize pass.
@@ -315,6 +315,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
             }
         }
         "config" => handle_config_command(&parts, ctx.home),
+        "set" => handle_set_command(&parts, ctx.home),
         _ => {
             tracing::warn!(cmd = cmd, "unknown command");
         }
@@ -350,6 +351,20 @@ fn handle_config_command(parts: &[&str], home: &Path) {
             None => tracing::warn!("config set requires <key> <value>"),
         },
         _ => tracing::warn!("config: use `get <key>` | `set <key> <value>` | list"),
+    }
+}
+
+/// #2325: `:set <key> <value>` — shorthand for `:config set`, routing to the same
+/// persisted runtime-config store (e.g. `set copy_on_select on`). Split out of
+/// `execute` so it is unit-testable without a full `CommandCtx`. `parts` is the
+/// `splitn(3, ' ')` split, so key is `parts[1]` and value is `parts[2]`.
+fn handle_set_command(parts: &[&str], home: &Path) {
+    match (parts.get(1), parts.get(2)) {
+        (Some(key), Some(value)) => match crate::runtime_config::set(home, key, value.trim()) {
+            Ok(result) => tracing::info!(result = %result, "set"),
+            Err(e) => tracing::warn!(error = %e, "set failed"),
+        },
+        _ => tracing::warn!("set requires <key> <value>"),
     }
 }
 
@@ -473,6 +488,25 @@ mod tests {
             v["show_pane_state"],
             serde_json::json!(false),
             "palette :config set must persist to runtime-config.json"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2325: the `:set <key> <value>` shorthand (parts already split into
+    /// key=parts[1], value=parts[2]) must reach `runtime_config::set` and persist,
+    /// accepting the `on`/`off` vocabulary for `copy_on_select`.
+    #[test]
+    #[serial(runtime_config)]
+    fn set_command_persists_copy_on_select() {
+        let dir = std::env::temp_dir().join(format!("agend-test-cmd-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        handle_set_command(&["set", "copy_on_select", "off"], &dir);
+        let raw = std::fs::read_to_string(dir.join("runtime-config.json")).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        assert_eq!(
+            v["copy_on_select"],
+            serde_json::json!(false),
+            "palette :set copy_on_select off must persist to runtime-config.json"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

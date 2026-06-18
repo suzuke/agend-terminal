@@ -46,6 +46,16 @@ pub struct RuntimeConfig {
     /// the other gates here.
     #[serde(default = "default_true")]
     pub show_pane_state: bool,
+    /// #2325: text-selection copy mode. `true` (DEFAULT — Mode B "copy-on-select")
+    /// auto-copies the selection to the clipboard when a drag is released, so a
+    /// dedicated copy key is unnecessary (works in Terminal.app and other
+    /// non-Kitty terminals out of the box). `false` (Mode A "explicit copy",
+    /// #2302) keeps the highlight on release and copies only via the copy key
+    /// (Cmd+C / Ctrl+Shift+C). Read by the TUI mouse handler at selection
+    /// release; toggle via `Ctrl+B e` or `:set copy_on_select on|off`.
+    /// `default_true` also fills the field for configs written before it existed.
+    #[serde(default = "default_true")]
+    pub copy_on_select: bool,
     /// #2090: origin-aware long-task progress reporting mode. `0` = off
     /// (DEFAULT — zero behaviour change).
     ///
@@ -106,6 +116,7 @@ impl Default for RuntimeConfig {
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
             show_pane_state: true,
+            copy_on_select: true,
             progress_mode: 0,
             schema_version: RuntimeConfig::CURRENT,
         }
@@ -243,6 +254,15 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use true/false)")),
             };
         }
+        "copy_on_select" => {
+            // #2325: also accept on/off (the operator-facing `:set copy_on_select
+            // on|off` vocabulary) alongside the usual true/false/1/0.
+            config.copy_on_select = match value {
+                "true" | "1" | "on" => true,
+                "false" | "0" | "off" => false,
+                _ => return Err(format!("invalid boolean: {value} (use on/off)")),
+            };
+        }
         "progress_mode" => {
             let m: i64 = value
                 .parse()
@@ -295,6 +315,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "usage_limit_propagation_enabled" => Ok(config.usage_limit_propagation_enabled.to_string()),
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
         "show_pane_state" => Ok(config.show_pane_state.to_string()),
+        "copy_on_select" => Ok(config.copy_on_select.to_string()),
         "progress_mode" => Ok(config.progress_mode.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
@@ -423,6 +444,29 @@ mod tests {
         set(&dir, "show_pane_state", "false").unwrap();
         reload(&dir);
         assert_eq!(get_key("show_pane_state").unwrap(), "false");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2325: copy-on-select (Mode B) is the DEFAULT, and the flag round-trips
+    /// through set/reload/get_key — including the operator-facing `on`/`off`
+    /// vocabulary, not just `true`/`false`.
+    #[test]
+    #[serial(runtime_config)]
+    fn copy_on_select_default_on_and_toggleable_via_on_off() {
+        assert!(
+            RuntimeConfig::default().copy_on_select,
+            "copy_on_select must default ON (Mode B = copy-on-select)"
+        );
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-copysel");
+        std::fs::create_dir_all(&dir).ok();
+        set(&dir, "copy_on_select", "off").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("copy_on_select").unwrap(), "false");
+        set(&dir, "copy_on_select", "on").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("copy_on_select").unwrap(), "true");
+        // Garbage value rejected (not silently coerced).
+        assert!(set(&dir, "copy_on_select", "maybe").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

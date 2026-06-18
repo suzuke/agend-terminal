@@ -197,6 +197,13 @@ fn trace_tty_size(enabled: bool, phase: &str) {
 
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
     let home = crate::home_dir();
+    // #2325: the app process (unlike the daemon's `run_core`, the only other
+    // `runtime_config::reload` caller) never tick-reloads runtime config, so load
+    // the persisted values once at startup. Otherwise a persisted `copy_on_select`
+    // (the TUI mouse copy-on-select mode) would reset to the compile-time default
+    // on every restart. In-session changes update the in-process global directly
+    // via `runtime_config::set` (the `Ctrl+B e` toggle and `:set`/`:config set`).
+    crate::runtime_config::reload(&home);
     let fleet_path = fleet_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));

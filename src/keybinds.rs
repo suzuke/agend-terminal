@@ -53,6 +53,9 @@ pub enum Action {
     ScratchShell,
     /// Copy the focused pane's selection to clipboard (Cmd+C).
     CopySelection,
+    /// #2325: toggle the text-selection copy mode (Mode B copy-on-select ↔
+    /// Mode A explicit-copy), persisting the choice. Bound to `Ctrl+B e`.
+    ToggleCopyOnSelect,
     None,
 }
 
@@ -205,6 +208,8 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         // Modes
         KeyCode::Char('[') => Action::ScrollMode,
         KeyCode::Char('@') => Action::FlipSplit,
+        // #2325: toggle copy-on-select (Mode B) ↔ explicit-copy (Mode A).
+        KeyCode::Char('e') => Action::ToggleCopyOnSelect,
         KeyCode::Char(':') => Action::CommandPalette,
         KeyCode::Char('D') => Action::ShowDecisions,
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ShowDecisions,
@@ -306,6 +311,16 @@ mod tests {
         assert_eq!(
             prefix_action(KeyCode::Char('d'), KeyModifiers::empty()),
             Action::Detach
+        );
+    }
+
+    // --- e: ToggleCopyOnSelect (#2325) ---
+
+    #[test]
+    fn keybind_ctrl_b_e_toggles_copy_on_select() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('e'), KeyModifiers::empty()),
+            Action::ToggleCopyOnSelect
         );
     }
 

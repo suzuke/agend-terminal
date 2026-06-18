@@ -483,16 +483,27 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                 false
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Releasing a real drag KEEPS the selection (no auto-copy, no
-                // clear) — copying is an explicit act via the copy key
-                // (CopySelection → Cmd+C / Ctrl+Shift+C), which copies + clears.
-                // A pure click leaves a zero-width selection; clear that so a click
-                // still dismisses the highlight (#2296). `copy_to_clipboard` stays —
-                // the CopySelection path (dispatch) is its remaining caller.
-                if let Some(ref sel) = pane.selection {
-                    if sel.start == sel.end {
+                // #2325: behavior on drag release depends on the persisted
+                // `copy_on_select` mode (read live; `Ctrl+B e` / `:set` update it).
+                // - Mode B "copy-on-select" (DEFAULT): auto-copy the selection +
+                //   clear the highlight — no copy key needed (works in Terminal.app
+                //   and other non-Kitty terminals out of the box).
+                // - Mode A "explicit-copy" (#2302, opt-in): KEEP the highlight;
+                //   copying is an explicit act via the copy key (CopySelection →
+                //   Cmd+C / Ctrl+Shift+C), which copies + clears.
+                // A pure click leaves a zero-width selection; clear that in BOTH
+                // modes so a click still dismisses the highlight (#2296).
+                if let Some((start, end)) = pane.selection.as_ref().map(|s| (s.start, s.end)) {
+                    if start == end {
+                        pane.selection = None;
+                    } else if crate::runtime_config::get().copy_on_select {
+                        let text = pane.vterm.extract_text(start, end);
+                        if !text.is_empty() {
+                            copy_to_clipboard(&text);
+                        }
                         pane.selection = None;
                     }
+                    // else Mode A: keep the highlight for an explicit copy.
                 }
                 true
             }
@@ -1253,30 +1264,67 @@ mod tests {
         );
     }
 
-    // ----- #43783: releasing a drag keeps the selection (copy is the copy key) -----
+    // ----- #2325/#43783: drag-release behavior depends on the copy_on_select mode -----
 
-    /// Operator semantics: releasing a REAL drag KEEPS the selection — no auto-copy
-    /// and no auto-clear. Copying is an explicit act via the copy key
-    /// (CopySelection → Cmd+C / Ctrl+Shift+C). Replaces #2294's release-auto-copy.
+    /// Mode A "explicit-copy" (#2302/#43783, `copy_on_select=false`): releasing a
+    /// REAL drag KEEPS the selection — no auto-copy, no auto-clear. Copying is an
+    /// explicit act via the copy key (CopySelection → Cmd+C / Ctrl+Shift+C).
     #[test]
-    fn drag_release_keeps_selection_no_autocopy_43783() {
+    #[serial(runtime_config)]
+    fn drag_release_mode_a_keeps_selection_no_autocopy_2325() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-test-mouse-modea-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::runtime_config::set(&dir, "copy_on_select", "off").expect("set copy_on_select off");
+
         let mut layout = two_pane_layout("right");
         // Down anchors a zero-width selection inside pane 1's inner area...
         handle_selection(&mut layout, &down_left_at(3, 3));
         // ...drag extends it to a real (non-zero) span...
         handle_selection(&mut layout, &drag_left_at(6, 3));
-        // ...and releasing must KEEP it (not copy, not clear).
+        // ...and in Mode A releasing must KEEP it (not copy, not clear).
         handle_selection(&mut layout, &up_left_at(6, 3));
 
         let pane = layout.tabs[0].root_mut().find_pane_mut(1).unwrap();
         let sel = pane
             .selection
             .as_ref()
-            .expect("a released drag must keep its selection");
+            .expect("Mode A: a released drag must keep its selection");
         assert_ne!(
             sel.start, sel.end,
-            "the released selection must remain a real (non-zero) span"
+            "Mode A: the released selection must remain a real (non-zero) span"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mode B "copy-on-select" (DEFAULT, `copy_on_select=true`): releasing a REAL
+    /// drag auto-copies the selection AND clears the highlight — no copy key needed
+    /// (so it works in Terminal.app and other non-Kitty terminals). The clipboard
+    /// write itself is best-effort (`copy_to_clipboard` swallows errors), so this
+    /// pins the observable state change: the highlight is gone after release.
+    #[test]
+    #[serial(runtime_config)]
+    fn drag_release_mode_b_copies_and_clears_2325() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-test-mouse-modeb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::runtime_config::set(&dir, "copy_on_select", "on").expect("set copy_on_select on");
+
+        let mut layout = two_pane_layout("right");
+        handle_selection(&mut layout, &down_left_at(3, 3));
+        handle_selection(&mut layout, &drag_left_at(6, 3));
+        handle_selection(&mut layout, &up_left_at(6, 3));
+
+        assert!(
+            layout.tabs[0]
+                .root_mut()
+                .find_pane_mut(1)
+                .unwrap()
+                .selection
+                .is_none(),
+            "Mode B: releasing a real drag must auto-copy and clear the highlight"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A pure click (Down then Up at the same spot, zero-width) still dismisses the
