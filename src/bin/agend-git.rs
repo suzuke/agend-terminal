@@ -74,6 +74,8 @@ fn main() {
                 let home = env::var("AGEND_HOME").unwrap_or_default();
                 if !home.is_empty() {
                     let agent = env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+                    // instrument-only: D3 #2158 — bypass audit emit, control-flow-
+                    // inert; the `exec_real_git` below is unchanged.
                     log_bypass_mutating_op(&home, &agent, &args);
                 }
             }
@@ -102,6 +104,8 @@ fn main() {
         // daemon-correlated culprit inherits AGEND_HOME but dropped
         // AGEND_INSTANCE_NAME). Instrument-only: the passthrough exec is unchanged.
         if !home.is_empty() {
+            // instrument-only: D3 #2234 — non-agent canonical-checkout audit,
+            // control-flow-inert; the `exec_real_git` below is unchanged.
             log_nonagent_canonical_checkout(&home, &agent, &args);
         }
         exec_real_git(&args, None);
