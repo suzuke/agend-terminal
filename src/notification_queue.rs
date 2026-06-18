@@ -326,6 +326,81 @@ fn append_queued(home: &Path, agent_name: &str, msg: &QueuedNotification) -> any
     Ok(())
 }
 
+/// #t-3558 P2: the `[AGEND-AUTO kind=X]` coalesce key for `text`, or `None` when
+/// `text` is not an auto-inject nudge. Two nudges coalesce iff they share this
+/// EXACT prefix — so a different `kind=` (e.g. `progress-backstop` vs
+/// `ratelimit-retry`) and any ordinary notification never match.
+fn agend_auto_kind_prefix(text: &str) -> Option<String> {
+    if !text.starts_with(crate::agent::DAEMON_AUTO_INJECT_MARKER) {
+        return None;
+    }
+    let close = text.find(']')?;
+    Some(text[..=close].to_string())
+}
+
+/// #t-3558 P2: enqueue an `[AGEND-AUTO]` auto-inject nudge, COALESCING it with any
+/// already-queued nudge of the SAME `[AGEND-AUTO kind=X]` kind (keep-latest). A
+/// non-draining agent otherwise accumulates a stack of identical retry nudges and
+/// replays the whole pile on its next wake (the operator-visible noise this
+/// fixes). ONLY same-kind AGEND-AUTO lines are dropped — a different `kind=` and
+/// EVERY ordinary notification are preserved verbatim (byte-for-byte, including a
+/// line that fails to parse).
+///
+/// No message loss: the read-modify-write is serialized against the drainer by
+/// the SAME per-agent `drain.lock`, and snapshots the queue via the drainer's
+/// atomic rename-claim — a lock-free [`append_queued`] racing in AFTER the claim
+/// lands in a fresh queue file and is preserved by the re-append, never clobbered.
+/// If the drain lock is held (a drainer is mid-delivery) the coalesce is SKIPPED
+/// and we fall back to a plain append: skipping a round cannot lose a message (at
+/// worst a transient duplicate the drainer is already consuming). On any IO error
+/// after the claim, the claim file is LEFT for stale-recovery rather than removed
+/// (re-delivered, never dropped).
+pub fn enqueue_coalesced_auto(home: &Path, agent_name: &str, text: &str) -> anyhow::Result<()> {
+    let new_msg = QueuedNotification {
+        text: text.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        actionable: false,
+        deferred_since_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let Some(kind_key) = agend_auto_kind_prefix(text) else {
+        // Not an AGEND-AUTO nudge (defensive — the caller only routes those
+        // here): nothing to coalesce on, append unchanged.
+        return append_queued(home, agent_name, &new_msg);
+    };
+    // Serialize vs the drainer; lock held → plain append (no coalesce, no loss).
+    let Ok(Some(_lock)) = crate::store::try_acquire_file_lock(&drain_lock_path(home, agent_name))
+    else {
+        return append_queued(home, agent_name, &new_msg);
+    };
+    let path = queue_path(home, agent_name);
+    if path.exists() {
+        let claim = draining_claim_path(home, agent_name);
+        if std::fs::rename(&path, &claim).is_ok() {
+            // Re-append every claimed RAW line EXCEPT same-kind AGEND-AUTO nudges.
+            // Raw lines (not re-serialized structs) so a non-matching OR
+            // unparseable line survives byte-for-byte. Remove the claim only
+            // after a successful re-append; on IO error leave it for the
+            // drainer's stale-claim recovery (re-delivered, never lost).
+            if let Ok(content) = std::fs::read_to_string(&claim) {
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+                    for line in content.lines() {
+                        let drop_it = serde_json::from_str::<QueuedNotification>(line)
+                            .map(|m| m.text.starts_with(&kind_key))
+                            .unwrap_or(false);
+                        if !drop_it {
+                            let _ = writeln!(f, "{line}");
+                        }
+                    }
+                    let _ = std::fs::remove_file(&claim);
+                }
+            }
+        }
+        // rename failed (queue vanished mid-claim) → nothing to coalesce.
+    }
+    append_queued(home, agent_name, &new_msg)
+    // `_lock` drops here → drain lock released.
+}
+
 pub fn pending_count(home: &Path, agent_name: &str) -> usize {
     let mut count = 0;
     let mut paths = list_draining_files(home, agent_name);
@@ -529,6 +604,7 @@ fn read_drain_file(path: &Path) -> Vec<QueuedNotification> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -571,6 +647,111 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         acc
+    }
+
+    // #t-3558 P2 — coalesce keep-latest. Pins (lead's hard conditions): the
+    // rewrite drops ONLY same-kind AGEND-AUTO lines, never a normal message nor a
+    // different AGEND-AUTO kind.
+    #[test]
+    fn coalesce_keeps_latest_same_kind_and_preserves_others() {
+        let home = tmp_home("coalesce-keep");
+        let a = "agent";
+        let rl = "[AGEND-AUTO kind=ratelimit-retry] continue";
+        let pb = "[AGEND-AUTO kind=progress-backstop] continue";
+        enqueue(&home, a, "hello world").expect("normal");
+        enqueue_coalesced_auto(&home, a, rl).expect("rl#1");
+        enqueue_coalesced_auto(&home, a, pb).expect("different kind");
+        enqueue_coalesced_auto(&home, a, rl).expect("rl#2 coalesces rl#1");
+
+        let drained = drain_settled(&home, a, 3);
+        let texts: Vec<&str> = drained.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            drained.len(),
+            3,
+            "hello + 1 ratelimit + 1 progress-backstop; got {texts:?}"
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("kind=ratelimit-retry"))
+                .count(),
+            1,
+            "only the LATEST ratelimit nudge kept; got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"hello world"),
+            "normal message preserved; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("kind=progress-backstop")),
+            "a DIFFERENT AGEND-AUTO kind is never coalesced away; got {texts:?}"
+        );
+    }
+
+    // #t-3558 P2 — coalesce operates on RAW lines, so a non-JSON/unparseable
+    // queue line is preserved byte-for-byte (never dropped by the filter rewrite).
+    #[test]
+    fn coalesce_preserves_unparseable_lines() {
+        let home = tmp_home("coalesce-raw");
+        let a = "agent";
+        let rl = "[AGEND-AUTO kind=ratelimit-retry] continue";
+        let qp = queue_path(&home, a);
+        std::fs::create_dir_all(qp.parent().unwrap()).unwrap();
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&qp)
+                .unwrap();
+            writeln!(f, "GARBAGE not json").unwrap();
+        }
+        enqueue_coalesced_auto(&home, a, rl).expect("rl#1");
+        enqueue_coalesced_auto(&home, a, rl).expect("rl#2 coalesces");
+
+        let raw = std::fs::read_to_string(&qp).unwrap();
+        assert!(
+            raw.lines().any(|l| l == "GARBAGE not json"),
+            "unparseable line preserved; got:\n{raw}"
+        );
+        assert_eq!(
+            raw.lines()
+                .filter(|l| l.contains("kind=ratelimit-retry"))
+                .count(),
+            1,
+            "ratelimit coalesced to the latest; got:\n{raw}"
+        );
+    }
+
+    // #t-3558 P2 — drain-lock contention: when a drainer holds the lock, coalesce
+    // SKIPS (no read-modify-write) and falls back to a plain append → no message
+    // loss while contended; coalesce resumes once the lock frees.
+    #[test]
+    fn coalesce_falls_back_to_append_when_drain_lock_held_no_loss() {
+        let home = tmp_home("coalesce-fallback");
+        let a = "agent";
+        let rl = "[AGEND-AUTO kind=ratelimit-retry] continue";
+        enqueue_coalesced_auto(&home, a, rl).expect("rl#1");
+        {
+            // Simulate a drainer mid-claim by holding the per-agent drain lock.
+            let _held = crate::store::try_acquire_file_lock(&drain_lock_path(&home, a))
+                .expect("lock op")
+                .expect("lock acquired");
+            enqueue_coalesced_auto(&home, a, rl).expect("rl#2 under held lock → fallback append");
+            let raw = std::fs::read_to_string(queue_path(&home, a)).unwrap();
+            assert_eq!(
+                raw.lines().count(),
+                2,
+                "lock held → fallback append keeps BOTH nudges (no loss); got:\n{raw}"
+            );
+        }
+        // Lock freed → a fresh coalesce now collapses to keep-latest.
+        enqueue_coalesced_auto(&home, a, rl).expect("rl#3 coalesces once free");
+        let drained = drain_settled(&home, a, 1);
+        assert_eq!(
+            drained.len(),
+            1,
+            "after the lock frees, coalesce keeps exactly the latest"
+        );
     }
 
     #[test]

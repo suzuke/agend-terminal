@@ -2246,13 +2246,19 @@ pub(crate) fn inject_with_target_gated(
                 // failed"), so propagate rather than swallow. anyhow→AgendError
                 // has no generic variant, so map through ApiError (message
                 // preserved via Display).
-                return crate::notification_queue::enqueue_classified(
-                    home,
-                    name,
-                    &String::from_utf8_lossy(text),
-                    false,
-                )
-                .map_err(|e| crate::error::AgendError::ApiError(format!("deferred enqueue: {e}")));
+                // #t-3558 P2: an AGEND-AUTO nudge (auto_kind set) routes through
+                // the coalescing enqueue so a non-draining agent can't stack
+                // identical same-kind retry nudges (keep-latest). Everything else
+                // keeps the plain ambient enqueue.
+                let text_str = String::from_utf8_lossy(text);
+                let enq = if auto_kind.is_some() {
+                    crate::notification_queue::enqueue_coalesced_auto(home, name, &text_str)
+                } else {
+                    crate::notification_queue::enqueue_classified(home, name, &text_str, false)
+                };
+                return enq.map_err(|e| {
+                    crate::error::AgendError::ApiError(format!("deferred enqueue: {e}"))
+                });
             }
         }
     }
