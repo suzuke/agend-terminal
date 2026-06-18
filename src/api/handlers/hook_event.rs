@@ -147,8 +147,14 @@ mod tests {
     // #t-3558: seed a registered agent (fleet.yaml id ↔ registry handle) whose
     // `rate_limit_self_cleared` latch is set, then drive hook events through the
     // handler. Mirrors the external.rs handler-test seeding pattern.
+    // `unix`-gated: `mk_test_handle` (the `true`-backed PTY handle) is
+    // `#[cfg(all(test, unix))]`, so the helpers + tests that use it — and the
+    // const only they reference — must be unix-only to keep the Windows build
+    // warning-clean.
+    #[cfg(unix)]
     const T3558_ID: &str = "0d0d0d0d-0000-4000-8000-0000035580a1";
 
+    #[cfg(unix)]
     fn seed_latched_agent(ctx: &HandlerCtx<'_>, name: &str) {
         let id = crate::types::InstanceId::parse(T3558_ID).unwrap();
         std::fs::write(
@@ -161,6 +167,7 @@ mod tests {
         agent::lock_registry(ctx.registry).insert(id, handle);
     }
 
+    #[cfg(unix)]
     fn latch_of(ctx: &HandlerCtx<'_>) -> bool {
         let id = crate::types::InstanceId::parse(T3558_ID).unwrap();
         agent::lock_registry(ctx.registry)
@@ -169,6 +176,7 @@ mod tests {
             .expect("agent present")
     }
 
+    #[cfg(unix)]
     fn set_latch(ctx: &HandlerCtx<'_>, val: bool) {
         let id = crate::types::InstanceId::parse(T3558_ID).unwrap();
         agent::lock_registry(ctx.registry)
@@ -180,6 +188,7 @@ mod tests {
             .rate_limit_self_cleared = val;
     }
 
+    #[cfg(unix)]
     fn t3558_home(tag: &str) -> std::path::PathBuf {
         let home = std::env::temp_dir().join(format!(
             "agend-t3558-{}-{}-{}",
@@ -197,6 +206,7 @@ mod tests {
     /// #t-3558 POSITIVE: a fresh `StopFailure` hook (→ ApiError) resets the
     /// `rate_limit_self_cleared` latch so the supervisor SRL retry re-arms.
     /// RED before the fix (the latch was only reset on a screen-state exit).
+    #[cfg(unix)]
     #[test]
     fn apierror_hook_resets_rate_limit_self_clear_latch() {
         let home = t3558_home("reset");
@@ -220,6 +230,7 @@ mod tests {
     /// #t-3558 NEGATIVE (mandatory — pins "normal completion never re-arms"):
     /// clean lifecycle hooks during normal post-self-clear work must NOT reset
     /// the latch — only a genuine failure hook does.
+    #[cfg(unix)]
     #[test]
     fn normal_hooks_do_not_reset_rate_limit_self_clear_latch() {
         let home = t3558_home("noreset");
