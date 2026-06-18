@@ -77,6 +77,16 @@ gh pr checks <PR#>
 - If any check is `pending`, wait and re-check
 - If any check is `fail`, block merge and report to implementer
 
+**Flake declarations require CI-log evidence.** Calling a CI failure a "flake" (to rerun instead of fix) MUST cite the real failing test name from the FAILING run's log:
+
+```
+gh run view <run-id> --log-failed
+```
+
+- The cited test must be a known-flake signature (timing/IO/ordering), not a deterministic failure wearing a flake label.
+- NEVER extrapolate flakiness from a local or worktree `cargo`/`nextest` run. Local green ≠ CI green (platform, timing, parallelism, env differ); a local pass does NOT prove the CI failure was non-deterministic.
+- No log evidence → treat the failure as REAL and fix it (a blanket "rerun + label flake" hides deterministic bugs).
+
 `↳ 緣由 A-§3.3.1`
 
 ### 3.4 Re-review (r2) Dispatch
@@ -327,6 +337,16 @@ Match fleet ceremony to where a task's risk actually lives. Decided by **lead ju
 - **Asymmetric bias — when unsure on ANY axis, escalate.** False-positive ceremony costs minutes; false-negative ships an authority bypass / silent deadlock. Default: when in doubt, more ceremony.
 
 `↳ 緣由: 2026-06-02 4-agent dialectic (dev/dev-2/codex/reviewer-2), /tmp/ceremony-spike-*.md. Resolves #1659 + #1660 as policy (no code).`
+
+### 3.22 Spike-First Planning Gate
+
+When §3.21-B selects a spike (premise-risk) **OR** the work carries an operator-decision fork (a choice only the operator/lead may settle), the spike and the impl MUST be **separate dispatches** — never one combined task.
+
+- **Spike is ANALYSIS-only** (no production code). It delivers a **decision-manifest**: each premise check stated as confirmed-or-refuted with code evidence, and each operator-decision fork teed up with concrete options + a recommendation.
+- **Impl is dispatched only AFTER the forks are resolved**, and `depends_on` the spike (and the decision that settled each fork). Impl scope is derived from the manifest, not assumed up front.
+- **No batch approval.** Do NOT pre-approve spike + impl as one unit: the impl's real scope is unknown until the spike resolves the premise and the forks, so approving impl in advance approves an unknown.
+
+`↳ 緣由 A-§3.22`
 
 ## §4. Daemon Enforcement Gates
 
@@ -735,6 +755,16 @@ When multiple PRs ship in the same wave (same dispatch/task_id):
 
 Daemon enforcement: `send(sequencing: "sequential-merge-only")` signals this constraint to downstream agents. Recipients MUST merge one at a time and verify CI between each merge.
 
+### 12.7 Linked-Issue Close Convention
+
+A PR that resolves a tracked issue MUST carry a closing keyword (`Closes #N` / `Fixes #N` / `Resolves #N`) in its **PR body**, so the platform auto-closes the issue on merge-to-default-branch.
+
+- A bare `#N` reference does NOT auto-close, and is ambiguous — a mention/cross-reference is not a fix (e.g. a cluster-sibling issue still open). Use the keyword only when the PR actually resolves the issue.
+- **No daemon auto-close.** A daemon-side `Closes #N` parser would be redundant with native platform behavior, inert until this convention is adopted, and `gh issue close` is GitHub-only (conflicts with the multi-platform `ScmProvider` direction).
+- **Reinforcement-only.** This is a convention, not a gate; lead manually closes any straggler at merge time.
+
+`↳ 緣由 A-§12.7`
+
 ## §13. `AGEND_GIT_BYPASS=1` Usage
 
 **TL;DR:** emergency override only. Default is bare `git`. Bypass when shim explicitly denies AND the operation is on the required-bypass list below.
@@ -810,6 +840,8 @@ The *why* and *when* behind normative rules. Incident narratives, activation his
 ### A-§3.3.1 — CI Verification Gate
 Sprint 61 incident — ci_watch emitted false [ci-pass] on partial completion, leading to merge of failing code.
 
+**Flake-evidence rule:** a blanket "rerun + label flake" reflex repeatedly masked deterministic failures — a CI Coverage run went red on mostly REAL failures mislabeled as flakes, churning reruns instead of fixing. The recurring trap is extrapolating "it's flaky" from a local/worktree pass: local green ≠ CI green (platform / timing / parallelism / env), so a local pass is not evidence the CI failure was non-deterministic. Requiring the `gh run view <id> --log-failed` failing-test name forces the claim to name a real, known-flake signature before a rerun is justified; absent that, the default is "real failure, fix it."
+
 ### A-§3.12.1 — `gh pr merge --auto` adoption
 **Activation status**: ACTIVE as of 2026-05-20 after #986 gh-poll integration shipped (PR #990, merge commit 4242c24). Prior to this date the canonical form was the legacy synchronous `gh pr merge <N> --squash --delete-branch` because `--auto`'s async-return discarded the synchronous merge confirmation. With #972 PR-state aggregator + #986 gh-poll integration both live, the `[pr-merged]` event now fires from real GitHub observation post-merge, restoring async-flow visibility and unlocking this default switch.
 
@@ -833,6 +865,9 @@ Why SOP 2 is post-merge, not a gate: a pre-merge smoke gate creates a chicken-an
 
 The bar for SOP 3 — fixup-reviewer's #882 verdict, verbatim: "Checked out pre-fix revert base 470c251 in this worktree. Verified target helper/tests are absent there by source grep."
 
+### A-§3.22 — Spike-First Planning Gate
+Distilled from the 2026-06-18 governance batch (operator D1–D5). Recurring failure mode: a combined spike+impl dispatch pre-commits to an impl scope the spike then refutes — e.g. #2325's "copy key is broken" framing and D1's "parse `Closes #N`" approach both inverted once the spike actually read the code / checked native platform behavior, so any impl approved up front would have built the wrong thing. Separating the dispatches and gating impl on a decision-manifest makes the premise-check load-bearing rather than decorative, and stops batch-approval from blessing an unknown scope.
+
 ### A-§7.1 — CI Tool Identity & Cache Hygiene
 Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` exit check missed pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
 
@@ -841,6 +876,9 @@ PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job
 
 ### A-§10.9 — GitHub CLI Authorship Signature
 #2109 proposed an `agend-gh` shim (analog to `agend-git`) to auto-inject instance+model into gh bodies. Operator ruled against the shim (2026-06-14): the `agend-git` shim is a behavioral-correctness necessity (worktree redirect, #821/#1463) without which the daemon breaks, whereas gh authorship is observability cosmetics — a second PATH-hijack shim binary for it is over-engineering. Downgraded to the §10.9 soft convention; #2109 closed as a note.
+
+### A-§12.7 — Linked-Issue Close Convention
+Operator decision 2026-06-18 (governance D1). The D1 spike found: (1) recent fleet PRs used bare `#N` (0/12), which never auto-closes and is ambiguous (a reference ≠ a fix — e.g. #2158 was referenced bare by merged PRs yet legitimately stayed open); (2) a daemon-side `Closes #N` parser would be redundant with GitHub/GitLab native auto-close AND inert until PRs adopt the keyword; (3) `gh issue close` is GitHub-only, conflicting with the multi-platform `ScmProvider` direction. So the fix is the convention (use the keyword → native close), not daemon code. First real use: #2325 / PR #2328 auto-closed #2325 via its `Closes` keyword; straggler fallback is lead closing manually at merge (e.g. #2327).
 
 ### A-§13.5 — Bug-Blocks-Its-Own-Fix Exception
 Reference: PR #779 (Sprint 61) Option 1 + Option 3 daemon binding fix shipped under this exception. PR #781 + #800 followed standard ZERO BYPASS workflow.
