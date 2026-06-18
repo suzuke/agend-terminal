@@ -346,6 +346,8 @@ When §3.21-B selects a spike (premise-risk) **OR** the work carries an operator
 - **Impl is dispatched only AFTER the forks are resolved**, and `depends_on` the spike (and the decision that settled each fork). Impl scope is derived from the manifest, not assumed up front.
 - **No batch approval.** Do NOT pre-approve spike + impl as one unit: the impl's real scope is unknown until the spike resolves the premise and the forks, so approving impl in advance approves an unknown.
 
+**Reinforcement-only** (lead judgment, like §3.21) — enforced at dispatch, NOT a daemon hard-gate. The mechanizable candidate is chokepoint=dispatch / signal="does this impl have a resolved decision-manifest?", but per KISS this stays a convention until a real gate is justified (restrict footguns, not capable ops).
+
 `↳ 緣由 A-§3.22`
 
 ## §4. Daemon Enforcement Gates
