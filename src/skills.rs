@@ -345,7 +345,21 @@ pub fn install_for_agent_backend(
     filter: Option<&[String]>,
     backend: Option<&str>,
 ) -> Result<Vec<InstallOutcome>> {
-    let source = ensure_skills_root(home)?;
+    install_for_agent_backend_with_source(home, working_dir, filter, backend, None)
+}
+
+/// Backend-scoped variant with customizable source directory.
+pub fn install_for_agent_backend_with_source(
+    home: &Path,
+    working_dir: &Path,
+    filter: Option<&[String]>,
+    backend: Option<&str>,
+    custom_source: Option<&Path>,
+) -> Result<Vec<InstallOutcome>> {
+    let source = match custom_source {
+        Some(path) => path.to_path_buf(),
+        None => ensure_skills_root(home)?,
+    };
     let staged_source = match filter {
         None => source,
         Some(allowlist) => stage_filtered_source(home, &source, allowlist)?,
@@ -1374,6 +1388,29 @@ mod tests {
                 "blocked-skill must NOT be visible at {:?}",
                 blocked
             );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_for_agent_backend_with_source_links_from_custom_path() {
+        let home = tmp_home("custom-src-home");
+        let working = home.join("working");
+        let custom_src = home.join("custom_skills");
+        seed_skill_source(&custom_src, "custom-skill");
+
+        let outcomes =
+            install_for_agent_backend_with_source(&home, &working, None, None, Some(&custom_src))
+                .unwrap();
+
+        assert!(!outcomes.is_empty());
+        for outcome in outcomes {
+            assert_eq!(outcome.mode, InstallMode::Symlink);
+            assert!(outcome
+                .target
+                .join("custom-skill")
+                .join("SKILL.md")
+                .exists());
         }
         std::fs::remove_dir_all(&home).ok();
     }
