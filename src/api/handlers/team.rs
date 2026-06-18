@@ -146,20 +146,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                     crate::fleet::InstanceYamlEntry {
                         backend: Some(be.clone()),
                         working_directory: Some(wd.display().to_string()),
-                        role: None,
-                        instructions: None,
-                        // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
-                        source_repo: None,
-                        // Sprint 55 P0-B EC4: see instance.rs (gradient).
-                        repo: None,
-                        github_login: None,
-                        args: None,
-                        model: None,
-                        env: None,
-                        ready_pattern: None,
-                        command: None,
-                        worktree: None,
-                        topic_binding_mode: None,
+                        ..Default::default()
                     },
                 )
             })

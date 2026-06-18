@@ -170,19 +170,7 @@ mod tests {
     fn make_entry() -> crate::fleet::InstanceYamlEntry {
         crate::fleet::InstanceYamlEntry {
             backend: Some("claude".to_string()),
-            working_directory: None,
-            role: None,
-            instructions: None,
-            source_repo: None,
-            repo: None,
-            github_login: None,
-            args: None,
-            model: None,
-            env: None,
-            ready_pattern: None,
-            command: None,
-            worktree: None,
-            topic_binding_mode: None,
+            ..Default::default()
         }
     }
 
@@ -269,19 +257,7 @@ mod tests {
         // resolve later — see src/app/mod.rs Backend handler arm).
         let entry = crate::fleet::InstanceYamlEntry {
             backend: Some("claude".to_string()),
-            working_directory: None,
-            role: None,
-            instructions: None,
-            source_repo: None,
-            repo: None,
-            github_login: None,
-            args: None,
-            model: None,
-            env: None,
-            ready_pattern: None,
-            command: None,
-            worktree: None,
-            topic_binding_mode: None,
+            ..Default::default()
         };
         let outcome = add_instance_with_topic(&home, "ctrlb-c-agent", &entry).expect("Ok");
 
@@ -315,19 +291,7 @@ mod tests {
         // resolver).
         let entry = crate::fleet::InstanceYamlEntry {
             backend: Some("codex".to_string()),
-            working_directory: None,
-            role: None,
-            instructions: None,
-            source_repo: None,
-            repo: None,
-            github_login: None,
-            args: None,
-            model: None,
-            env: None,
-            ready_pattern: None,
-            command: None,
-            worktree: None,
-            topic_binding_mode: None,
+            ..Default::default()
         };
         let outcome = add_instance_with_topic(&home, "palette-agent", &entry).expect("Ok");
 

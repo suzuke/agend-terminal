@@ -158,6 +158,7 @@ pub(super) fn build_instance_mapping(config: &InstanceYamlEntry) -> serde_yaml_n
         ("model", &config.model),
         ("ready_pattern", &config.ready_pattern),
         ("command", &config.command),
+        ("skills_path", &config.skills_path),
     ] {
         if let Some(ref v) = val {
             inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));

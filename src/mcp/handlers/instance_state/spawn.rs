@@ -173,29 +173,15 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
             .or_else(|| Some(command.to_string())),
         working_directory: Some(work_dir.clone()),
         role: role.clone(),
-        instructions: None,
-        // Sprint 54 P1-B Bug 2 fix: gradient deployment per
-        // general's constraint — daemon auto-write leaves
-        // source_repo None; operator hand-edits fleet.yaml to
-        // opt agents in. Backward-compat preserved via
-        // dispatch_auto_bind_lease's working_directory fallback.
-        source_repo: None,
-        // Sprint 55 P0-B EC4: same gradient — daemon leaves
-        // `repo` override None; operator opts in for non-GitHub
-        // remote OR fork-vs-upstream disambiguation.
-        repo: None,
-        github_login: None,
         args: entry_args,
         model: entry_model,
         env: env_for_entry,
-        ready_pattern: None,
-        command: None,
-        worktree: None,
         topic_binding_mode: args
             .get("topic_binding")
             .and_then(|v| v.as_str())
             .filter(|s| matches!(*s, "skip" | "deferred"))
             .map(String::from),
+        ..Default::default()
     };
     if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
         return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});

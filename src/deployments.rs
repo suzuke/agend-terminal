@@ -215,6 +215,7 @@ fn create_instance_entries(
                 role,
                 instructions: yaml_str(inst_val, "instructions"),
                 source_repo,
+                skills_path: yaml_str(inst_val, "skills_path"),
                 // #2104 (cheerc): both operator-controlled override fields were
                 // hardcoded None here → templates that set them were silently
                 // dropped. `repo` = explicit owner/name override (else daemon

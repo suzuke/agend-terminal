@@ -1,6 +1,6 @@
 pub(crate) mod merge;
 pub(crate) mod persist;
-mod resolve;
+pub(crate) mod resolve;
 pub(crate) mod watchdog;
 
 #[allow(unused_imports)]
@@ -418,6 +418,10 @@ pub struct InstanceConfig {
     /// all skills (no per-backend dirs are populated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<String>>,
+    /// Custom skills path override. When present, the daemon pulls skills
+    /// from this path instead of `<home>/skills`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_path: Option<String>,
     /// #991: topic binding mode — controls whether a Telegram topic is
     /// created at spawn time. `None` or `Some("auto")` = current behavior.
     /// `Some("skip")` = no topic ever. `Some("deferred")` = no topic at
@@ -779,6 +783,8 @@ pub struct InstanceYamlEntry {
     pub worktree: Option<bool>,
     /// #991: topic binding mode. See [`InstanceConfig::topic_binding_mode`].
     pub topic_binding_mode: Option<String>,
+    /// Custom skills path override.
+    pub skills_path: Option<String>,
 }
 
 // Persistence, merge, and team mutation functions live in fleet::persist and fleet::merge.
@@ -1319,19 +1325,8 @@ instances:
 
         let entry = InstanceYamlEntry {
             backend: Some("claude".to_string()),
-            working_directory: None,
             role: Some("tester".to_string()),
-            instructions: None,
-            source_repo: None,
-            repo: None,
-            github_login: None,
-            args: None,
-            model: None,
-            env: None,
-            ready_pattern: None,
-            command: None,
-            worktree: None,
-            topic_binding_mode: None,
+            ..Default::default()
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
@@ -2040,17 +2035,8 @@ instances:
             backend: Some("claude".to_string()),
             working_directory: Some("/tmp/rt-state".to_string()),
             role: Some("opted-in test agent".to_string()),
-            instructions: None,
             source_repo: Some("/tmp/rt-source".to_string()),
-            repo: None,
-            github_login: None,
-            args: None,
-            model: None,
-            env: None,
-            ready_pattern: None,
-            command: None,
-            worktree: None,
-            topic_binding_mode: None,
+            ..Default::default()
         };
         add_instance_to_yaml(&dir, "rt-agent", &entry).expect("add");
         let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
@@ -2067,6 +2053,27 @@ instances:
                 .map(|p| p.to_str().unwrap_or("")),
             Some("/tmp/rt-source"),
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_instance_to_yaml_round_trips_skills_path() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-sp-rt-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let entry = InstanceYamlEntry {
+            backend: Some("claude".to_string()),
+            skills_path: Some("/tmp/custom-skills".to_string()),
+            ..Default::default()
+        };
+        add_instance_to_yaml(&dir, "sp-agent", &entry).expect("add");
+        let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
+        assert!(
+            content.contains("skills_path: /tmp/custom-skills"),
+            "skills_path must round-trip: {content}"
+        );
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let resolved = config.instances.get("sp-agent").expect("get");
+        assert_eq!(resolved.skills_path.as_deref(), Some("/tmp/custom-skills"));
         fs::remove_dir_all(&dir).ok();
     }
 

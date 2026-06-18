@@ -56,19 +56,7 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
             .map(|b| b.name().to_string()),
         working_directory: None,
         role: Some("Fleet coordinator — routes tasks between agents".to_string()),
-        instructions: None,
-        // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
-        source_repo: None,
-        // Sprint 55 P0-B EC4: see instance.rs (gradient).
-        repo: None,
-        github_login: None,
-        args: None,
-        model: None,
-        env: None,
-        ready_pattern: None,
-        command: None,
-        worktree: None,
-        topic_binding_mode: None,
+        ..Default::default()
     };
     if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
         tracing::warn!(error = %e, "failed to persist general instance");
