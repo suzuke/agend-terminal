@@ -1837,13 +1837,19 @@ fn spawn_and_register_agent(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
+        let custom_skills_source: Option<std::path::PathBuf> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
+                .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill =
             crate::backend::Backend::from_command(command).and_then(|b| b.skill_dir_name());
-        match crate::skills::install_for_agent_backend(
+        match crate::skills::install_for_agent_backend_with_source(
             home,
             wd,
             skills_filter.as_deref(),
             backend_skill,
+            custom_skills_source.as_deref(),
         ) {
             Ok(outcomes) => {
                 let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
@@ -2051,13 +2057,19 @@ fn handle_stage2_restart(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
+        let custom_skills_source: Option<std::path::PathBuf> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
+                .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
             .and_then(|b| b.skill_dir_name());
-        if let Err(e) = crate::skills::install_for_agent_backend(
+        if let Err(e) = crate::skills::install_for_agent_backend_with_source(
             home,
             wd,
             skills_filter.as_deref(),
             backend_skill,
+            custom_skills_source.as_deref(),
         ) {
             tracing::warn!(
                 target: "recovery_shadow",

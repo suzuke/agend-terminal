@@ -283,13 +283,23 @@ fn respawn_agent_worker(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(&config.name).and_then(|i| i.skills.clone()));
+        let custom_skills_source: Option<std::path::PathBuf> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| {
+                    c.instances
+                        .get(&config.name)
+                        .and_then(|i| i.skills_path.clone())
+                })
+                .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
             .and_then(|b| b.skill_dir_name());
-        if let Err(e) = crate::skills::install_for_agent_backend(
+        if let Err(e) = crate::skills::install_for_agent_backend_with_source(
             home,
             wd,
             skills_filter.as_deref(),
             backend_skill,
+            custom_skills_source.as_deref(),
         ) {
             tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
         }

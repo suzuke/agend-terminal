@@ -209,12 +209,18 @@ fn attach_agent_to_pane(
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(&name).and_then(|i| i.skills.clone()));
+        let custom_skills_source: Option<std::path::PathBuf> =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(&name).and_then(|i| i.skills_path.clone()))
+                .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill = Backend::from_command(command).and_then(|b| b.skill_dir_name());
-        match crate::skills::install_for_agent_backend(
+        match crate::skills::install_for_agent_backend_with_source(
             home,
             &work_dir,
             skills_filter.as_deref(),
             backend_skill,
+            custom_skills_source.as_deref(),
         ) {
             Ok(outcomes) => {
                 let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
