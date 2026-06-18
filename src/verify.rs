@@ -127,9 +127,11 @@ pub fn run(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let _ = std::fs::write(
-            rdir.join(".daemon"),
-            format!("{}:{now}", std::process::id()),
+        // D2: atomic write — clients discover us by reading `.daemon`; a torn
+        // plain write is parse-fail-readable mid-write (same class as #2315 A1).
+        let _ = crate::store::atomic_write(
+            &rdir.join(".daemon"),
+            format!("{}:{now}", std::process::id()).as_bytes(),
         );
         // P1-10: issue the API auth cookie before spawning the TUI / API
         // threads so their `read_cookie` calls succeed.
