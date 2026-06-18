@@ -1117,7 +1117,12 @@ fn usagelimit_banner_adjacent(flat: &str, matched: &str) -> bool {
 /// creating parent dirs / the file as needed. Returns `Err` for the caller to
 /// log; never panics. The single small `write_all` relies on `O_APPEND`
 /// atomicity so concurrent appenders don't interleave within a record.
-fn append_jsonl(path: &std::path::Path, record: &serde_json::Value) -> std::io::Result<()> {
+/// `pub(crate)` so the shadow-telemetry family (e.g. `daemon::recovery_shadow`)
+/// shares the one append helper.
+pub(crate) fn append_jsonl(
+    path: &std::path::Path,
+    record: &serde_json::Value,
+) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

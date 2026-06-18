@@ -2025,6 +2025,32 @@ pub(crate) fn process_error_recovery(
                     srl_to_inject.push(name.to_string());
                 }
             } else if clears_server_rate_limit_retry(state) {
+                // #t-81376 Phase-0 shadow: this Idle is the "gap arm" — a fast
+                // 529→Idle the daemon treats as recovery and clears / never builds
+                // a retry track. Record the failed-turn discriminator components +
+                // hook-vs-raw layers so FP/FN can be measured. No-op unless
+                // AGEND_RECOVERY_SHADOW=1; takes NO action on the clear below.
+                // instrument-only: zero-behaviour shadow emit (D3 #2324) — no ?/return/exit/break/continue.
+                {
+                    let (had_retry_track, rc) = retry_tracks
+                        .get(name)
+                        .map(|t| (true, t.retry_count))
+                        .unwrap_or((false, 0));
+                    crate::daemon::recovery_shadow::record_recovery_shadow(
+                        home,
+                        &crate::daemon::recovery_shadow::GapObservation {
+                            agent: name,
+                            backend: handle.backend_command.as_str(),
+                            recovered,
+                            self_cleared,
+                            has_throttle_hint,
+                            had_retry_track,
+                            retry_count: rc,
+                            agent_state: state.display_name(),
+                            productive_silent_secs: productive_silence.as_secs(),
+                        },
+                    );
+                }
                 // #1713: Idle = genuine terminal recovery → cross-episode reset…
                 // EXCEPT the #1946 abort shape below.
                 match retry_tracks.get_mut(name) {
@@ -2152,6 +2178,9 @@ pub(crate) fn process_error_recovery(
     apierror_episodes.retain(|name| active_names.contains(name));
     apierror_nudge_counts.retain(|name, _| active_names.contains(name));
     last_continue_inject.retain(|name, _| active_names.contains(name));
+    // #t-81376 Phase-0 shadow: prune expectation/latch maps for churned agents
+    // (no-op unless AGEND_RECOVERY_SHADOW=1). `()` → control-flow-inert.
+    crate::daemon::recovery_shadow::retain_live(&|n| active_names.contains(n));
 
     // Phase 2: EXECUTE the ServerRateLimit injects decided in Phase 1 with fresh
     // state — inject "continue\n" lock-free, advance the tiered backoff, escalate on

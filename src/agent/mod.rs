@@ -1460,6 +1460,11 @@ pub(crate) fn spawn_self_kick_bootstrap(
                     // undelivered) so a swallowed first turn can't silently strand
                     // the restart. arm is a no-op for non-hook backends.
                     crate::daemon::inject_delivery::arm(&name, &prompt);
+                    // #t-81376 Phase-0 shadow: this RESUME self-kick IS a daemon
+                    // recovery turn — shadow-arm the expectation so the supervisor
+                    // gap arm can later tell a failed recovery turn from a normal
+                    // Idle. No-op unless AGEND_RECOVERY_SHADOW=1; `()` → inert (D3).
+                    crate::daemon::recovery_shadow::arm_expectation(&name);
                     tracing::info!(agent = %name, "fresh-restart self-kick injected");
                 }
                 Err(e) => {

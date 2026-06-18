@@ -55,6 +55,8 @@ const INSTRUMENT_EMIT_FNS: &[&str] = &[
     "log_bypass_mutating_op",          // #2158/#2234 bypass audit emit
     "record_shadow_telemetry",         // state-detection shadow telemetry
     "capture_turn_sentinel_shadow",    // state-detection sentinel shadow capture
+    "record_recovery_shadow",          // #t-81376 529-recovery failed-turn shadow emit
+    "arm_expectation",                 // #t-81376 recovery-turn expectation shadow-arm
 ];
 
 const INLINE_MARKER: &str = "// instrument-only:";
