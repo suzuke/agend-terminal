@@ -262,6 +262,7 @@
 - migration 會把 legacy tasks 轉成事件。
 - migration 成功後會把舊檔改名成 `.legacy_pre_v2`。
 - 這樣 operator 還能考古。
+- **不做單→多 project 回溯(#2117 P3 Gap1)。** 遷移過來的 legacy task 沒有 `project_id`,會落在 default board 並留在那裡。日後改用 per-project boards(#2125)不會回溯重歸這些舊任務——只有新建任務才會 per-project stamp。這個不對稱是接受的語意、不是缺口:舊任務沒有 auto-bucket 的訊號,而跨 board 查詢靠 full-board-scan fallback 仍正確。要把舊任務改 board,由 operator 顯式搬移。
 - board 的讀面已不依賴舊檔。
 - board 的寫面也不應回去改舊檔。
 

@@ -156,6 +156,7 @@ foundation for sweep, health, and dependency evaluation.
 - Append acquires a lock before writing; `append_batch` fsyncs multiple events atomically.
 - Replay folds the archive first, then the hot log. It is a strict reader — unknown variants or higher-version schemas cause an abort (fail-closed).
 - Legacy `tasks.json` is consumed only during migration, which converts old tasks into events and renames the file to `.legacy_pre_v2`.
+- **No single→multi-project backfill (#2117 P3 Gap1).** Migrated legacy tasks have no `project_id`, so they land on the default board and stay there. Adopting per-project boards (#2125) later does not retroactively re-bucket them — only newly created tasks are per-project-stamped. This asymmetry is the accepted semantics, not a gap: legacy tasks carry no signal to auto-bucket, and cross-board lookups stay correct via the full-board-scan fallback. To re-home a legacy task, an operator moves it explicitly.
 
 ## 13. ACL and Permissions
 

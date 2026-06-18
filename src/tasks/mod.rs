@@ -432,6 +432,17 @@ pub struct MigrationReport {
 /// the one-shot that ensures replay() at PR3 cutover sees every legacy
 /// task. Re-running after PR3 cutover (when `tasks.json` is gone) is a
 /// no-op via the empty-store branch.
+///
+/// **#2117 P3 Gap1 — no single→multi-project backfill (operator decision (a),
+/// 2026-06-18)**: legacy tasks migrated here carry no `project_id`, so they land
+/// on the DEFAULT board (`board_root(home, DEFAULT)`) and STAY there. When a
+/// single-repo deployment later adopts per-project boards (P2 #2125), existing
+/// default-board tasks are NOT retroactively re-bucketed — only tasks created
+/// after #2125 are per-project-stamped. This asymmetry is the ACCEPTED semantics,
+/// not a gap to close: legacy tasks predate `project_id` and carry no signal to
+/// auto-bucket, and `board_router::resolve_task_project`'s full-board-scan
+/// fallback keeps cross-board lookups correct regardless. An operator who wants a
+/// legacy task on a specific project board moves it explicitly. See #2117 P3.
 pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<MigrationReport> {
     let store = load(home);
     if store.tasks.is_empty() {
