@@ -10,6 +10,19 @@ pub fn tool_definitions() -> Value {
     json!({"tools": tools})
 }
 
+/// #2300 P0: tool definitions VISIBLE to `role` (per
+/// [`crate::mcp::registry::tool_subset_for_role`]). Default-all-open — `None` /
+/// dev / lead / unknown role → the full set, byte-identical to
+/// [`tool_definitions`]. Used by the daemon `tools/list` handler to subset the
+/// surface a read/report role advertises.
+pub fn tool_definitions_for_role(role: Option<&str>) -> Value {
+    let tools: Vec<Value> = crate::mcp::registry::tool_subset_for_role(role)
+        .iter()
+        .map(|entry| (entry.definition)())
+        .collect();
+    json!({"tools": tools})
+}
+
 pub(crate) fn def_reply() -> Value {
     json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
         "inputSchema": {"type": "object", "properties": {

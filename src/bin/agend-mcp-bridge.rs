@@ -117,7 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             "notifications/initialized" | "notifications/cancelled" => continue,
 
-            "tools/list" => match proxy_tools_list_with_retry(&home, &mut conn) {
+            "tools/list" => match proxy_tools_list_with_retry(&home, &instance, &mut conn) {
                 Ok(r) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": r}).to_string(),
                 Err(e) => {
                     // #879v4 C2 — Bug 2 fix: a `tools/list` failure surfaces
@@ -273,6 +273,7 @@ fn proxy_tool_call(
 /// waiting the full 30 s). Operators never set it.
 fn proxy_tools_list_with_retry(
     home: &Path,
+    instance: &str,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // test-only seam (see fn doc): prod always falls through to the 30_000 default.
@@ -282,7 +283,11 @@ fn proxy_tools_list_with_retry(
         .unwrap_or(30_000);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let interval = std::time::Duration::from_millis(100);
-    let envelope = serde_json::json!({"method": "mcp_tools_list", "params": {}});
+    // #2300 P0: pass the caller's instance so the daemon can subset the tool
+    // list by role (mirrors the tool-call path). Empty → daemon serves the full
+    // surface (default-all-open).
+    let envelope =
+        serde_json::json!({"method": "mcp_tools_list", "params": {"instance": instance}});
     loop {
         match proxy_request(home, conn, &envelope) {
             Ok(resp) => {

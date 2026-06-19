@@ -17,6 +17,110 @@ pub(crate) fn all() -> &'static [ToolEntry] {
     &ALL_TOOLS
 }
 
+/// #2300 P0: declarative per-role MCP tool subsets (capability registry).
+///
+/// Maps a free-form fleet.yaml `role` label → the tool names that role may SEE.
+/// **Default-all-open**: a role NOT listed here — including dev / lead /
+/// orchestrator / unlabeled — gets the full `all()` surface, byte-identical to
+/// pre-#2300. Only the listed read/report roles are trimmed, hiding footgun
+/// lifecycle/bind/orchestration tools they never legitimately use (cuts #2055
+/// surface + mis-trigger). P0 is VISIBILITY-ONLY: a trimmed tool is hidden from
+/// the role's `tools/list` but still dispatches if hard-called (behavior-
+/// preserving); the structural DENY is P1 (#2158). Conservative — when unsure a
+/// tool is KEPT (default-all-open backs any gap). Subsets vetted by lead/operator.
+const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
+    // reviewer: reads code + runs/checks CI + checks out the PR (`repo`) +
+    // reports verdicts (`send`/`decision`) + tracks its own review `task`. Drops
+    // instance & worktree lifecycle (the #2158 vector) + fleet orchestration.
+    (
+        "reviewer",
+        &[
+            "reply",
+            "send",
+            "inbox",
+            "download_attachment",
+            "list_instances",
+            "binding_state",
+            "pane_snapshot",
+            "tui_screenshot",
+            "task",
+            "decision",
+            "ci",
+            "repo",
+            "config",
+            "set_waiting_on",
+            "tokens",
+            "health",
+            "mode",
+        ],
+    ),
+    // planner: reads code/CI to plan + reports. Same read/report surface as
+    // reviewer (no lifecycle/bind/orchestration).
+    (
+        "planner",
+        &[
+            "reply",
+            "send",
+            "inbox",
+            "download_attachment",
+            "list_instances",
+            "binding_state",
+            "pane_snapshot",
+            "tui_screenshot",
+            "task",
+            "decision",
+            "ci",
+            "repo",
+            "config",
+            "set_waiting_on",
+            "tokens",
+            "health",
+            "mode",
+        ],
+    ),
+    // explorer: read-only investigation + report. Strictest — also drops `repo`
+    // (checkout = provisioning) and `ci` (run/dispatch); keeps comms + read +
+    // observe + self-status.
+    (
+        "explorer",
+        &[
+            "reply",
+            "send",
+            "inbox",
+            "download_attachment",
+            "list_instances",
+            "binding_state",
+            "pane_snapshot",
+            "tui_screenshot",
+            "task",
+            "decision",
+            "config",
+            "set_waiting_on",
+            "tokens",
+            "health",
+            "mode",
+        ],
+    ),
+];
+
+/// #2300 P0: the MCP tool entries a given `role` may SEE. Default-all-open:
+/// `None`, an unlisted role (dev / lead / orchestrator / …), or an unknown label
+/// → the full `all()` surface (byte-identical, registry order). A listed role is
+/// narrowed to its subset; a subset name not in the registry is ignored (never
+/// widens). Order always follows the registry, not the subset list.
+pub(crate) fn tool_subset_for_role(role: Option<&str>) -> Vec<&'static ToolEntry> {
+    let subset = role.and_then(|r| {
+        ROLE_TOOL_SUBSETS
+            .iter()
+            .find(|(name, _)| *name == r)
+            .map(|(_, tools)| *tools)
+    });
+    match subset {
+        Some(names) => all().iter().filter(|e| names.contains(&e.name)).collect(),
+        None => all().iter().collect(),
+    }
+}
+
 static ALL_TOOLS: [ToolEntry; 36] = [
     // ── Channel ──
     ToolEntry {
@@ -215,3 +319,125 @@ static ALL_TOOLS: [ToolEntry; 36] = [
         handler: super::handlers::dispatch::dispatch_mode,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(role: Option<&str>) -> Vec<&'static str> {
+        tool_subset_for_role(role).iter().map(|e| e.name).collect()
+    }
+
+    /// #2300 P0 byte-identical invariant: full-capability roles (dev / lead),
+    /// `None`, and any UNKNOWN role surface the ENTIRE registry in registry order
+    /// — zero behavior change. If this breaks, default-all-open regressed.
+    #[test]
+    fn full_capability_roles_surface_all_36_byte_identical() {
+        let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
+        assert_eq!(all_names.len(), 36, "registry baseline is 36 tools");
+        for role in [
+            None,
+            Some("dev"),
+            Some("lead"),
+            Some("orchestrator"),
+            Some("totally-unknown-role"),
+        ] {
+            assert_eq!(
+                names(role),
+                all_names,
+                "role {role:?} must surface all 36 tools in registry order (default-all-open)"
+            );
+        }
+    }
+
+    /// A narrowed role drops the footgun lifecycle/bind tools and KEEPS the
+    /// tools its workflow needs. Pins the conservative subset contract.
+    #[test]
+    fn reviewer_drops_lifecycle_keeps_review_tools() {
+        let r = names(Some("reviewer"));
+        // Dropped: instance/worktree lifecycle (the #2158 vector) + orchestration.
+        for cut in [
+            "bind_self",
+            "release_worktree",
+            "force_release_worktree",
+            "create_instance",
+            "delete_instance",
+            "restart_instance",
+            "replace_instance",
+            "start_instance",
+            "restart_daemon",
+            "team",
+            "deployment",
+            "schedule",
+            "watchdog",
+        ] {
+            assert!(
+                !r.contains(&cut),
+                "reviewer must NOT see lifecycle/orchestration tool '{cut}'"
+            );
+        }
+        // Kept: a reviewer must still review (repo/ci), report (send/decision),
+        // and track its task — cutting these would break its workflow.
+        for keep in [
+            "reply",
+            "send",
+            "inbox",
+            "task",
+            "decision",
+            "ci",
+            "repo",
+            "set_waiting_on",
+        ] {
+            assert!(
+                r.contains(&keep),
+                "reviewer must still see review tool '{keep}'"
+            );
+        }
+        // Narrowed (strictly fewer than the full surface).
+        assert!(
+            r.len() < all().len(),
+            "reviewer subset must be narrower than full"
+        );
+    }
+
+    /// explorer is the strictest read-only role: also drops `repo` (provisioning)
+    /// and `ci` (run/dispatch) that reviewer/planner keep.
+    #[test]
+    fn explorer_is_strictest_read_only() {
+        let e = names(Some("explorer"));
+        for cut in ["repo", "ci", "bind_self", "create_instance"] {
+            assert!(
+                !e.contains(&cut),
+                "explorer (read-only) must NOT see '{cut}'"
+            );
+        }
+        for keep in [
+            "reply",
+            "send",
+            "inbox",
+            "task",
+            "list_instances",
+            "pane_snapshot",
+        ] {
+            assert!(
+                e.contains(&keep),
+                "explorer must still see read/report tool '{keep}'"
+            );
+        }
+    }
+
+    /// Every name in a subset list must be a REAL registered tool — a typo'd
+    /// subset entry is silently ignored by the filter, so this guards intent.
+    #[test]
+    fn subset_names_are_all_registered_tools() {
+        let registered: std::collections::HashSet<&str> = all().iter().map(|e| e.name).collect();
+        for (role, tools) in ROLE_TOOL_SUBSETS {
+            for t in *tools {
+                assert!(
+                    registered.contains(t),
+                    "role '{role}' subset names '{t}' which is not a registered tool (typo?)"
+                );
+            }
+        }
+    }
+}

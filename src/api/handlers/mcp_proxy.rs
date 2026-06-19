@@ -225,9 +225,32 @@ fn handle_mcp_tool_inner(
     }
 }
 
-/// Handle `mcp_tools_list` API method: return the tool definitions.
-pub(crate) fn handle_mcp_tools_list(_params: &Value, _ctx: &HandlerCtx) -> Value {
-    json!({"ok": true, "result": crate::mcp::tools::tool_definitions()})
+/// Handle `mcp_tools_list` API method: return the tool definitions VISIBLE to
+/// the calling agent's role (#2300 P0).
+///
+/// The bridge passes the caller's `instance` in params (mirroring the tool-call
+/// path); we resolve its fleet `role` and subset the surface via
+/// [`crate::mcp::tools::tool_definitions_for_role`]. Default-all-open:
+/// no instance (old bridge / non-agent caller), unknown instance, or a role not
+/// in the capability registry (dev / lead / orchestrator / …) → the full surface.
+pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
+    let role = params
+        .get("instance")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .and_then(|inst| {
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+                .ok()
+                .and_then(|fleet| fleet.instances.get(inst).and_then(|i| i.role.clone()))
+        });
+    // Default-all-open hot path: no instance / unlabeled instance → the canonical
+    // full surface (also keeps `tool_definitions` the single unfiltered builder
+    // the count-invariant pins). A role only narrows via the capability registry.
+    let result = match role.as_deref() {
+        None => crate::mcp::tools::tool_definitions(),
+        Some(r) => crate::mcp::tools::tool_definitions_for_role(Some(r)),
+    };
+    json!({ "ok": true, "result": result })
 }
 
 #[cfg(test)]
