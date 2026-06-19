@@ -195,6 +195,28 @@ fn trace_tty_size(enabled: bool, phase: &str) {
     );
 }
 
+/// #t-84833-10 redraw-storm frame cap: the render loop draws at most once per
+/// `FRAME_INTERVAL`. Under a boot-time PTY-output flood (11 agents spewing
+/// startup output → one `wakeup_tx` per chunk), the loop used to draw once per
+/// wakeup (observed 300–741 fps) and saturate the render thread, starving input.
+/// 33 ms ≈ 30 fps is plenty for a TUI and halves the render CPU vs 60 fps.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// Pure frame-cap decision (the test seam): may we draw now? `None` = never drawn
+/// (always draw the first frame); otherwise only once `FRAME_INTERVAL` has elapsed
+/// since the last draw. Independent of *what* changed — coalescing/dirtiness is
+/// the caller's job; this only rate-limits.
+fn should_draw(
+    last_draw: Option<std::time::Instant>,
+    now: std::time::Instant,
+    frame_interval: std::time::Duration,
+) -> bool {
+    match last_draw {
+        None => true,
+        Some(t) => now.duration_since(t) >= frame_interval,
+    }
+}
+
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
     let home = crate::home_dir();
     // #2325: the app process (unlike the daemon's `run_core`, the only other
@@ -538,6 +560,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         "pre-render-loop: entering render loop (first draw imminent)"
     );
 
+    // #t-84833-10 redraw-storm frame cap: `last_draw` rate-limits `terminal.draw`
+    // to ≤1/FRAME_INTERVAL; `dirty` tracks whether anything changed since the last
+    // draw (set by every select! arm) so an idle loop keeps the cheap ~50ms
+    // refresh cadence instead of busy-drawing at 30 fps.
+    let mut last_draw: Option<std::time::Instant> = None;
+    let mut dirty = true;
+
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
@@ -612,108 +641,133 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             );
         }
 
-        terminal.draw(|frame| {
-            // #1027: snapshot the shared daemon-binary-stale flag once
-            // per frame so the render path sees a consistent value.
-            // Relaxed is enough — single-bit flag, no fence vs other
-            // state needed; the supervisor's SeqCst store will always
-            // be visible to this load before the next paint tick.
-            let binary_stale = daemon_binary_stale.load(std::sync::atomic::Ordering::Relaxed);
-            // #2057: the area render actually fills — compare to crossterm above.
-            if size_debug {
-                let a = frame.area();
-                tracing::info!(
-                    tag = "#2057-area",
-                    x = a.x,
-                    y = a.y,
-                    w = a.width,
-                    h = a.height,
-                    "frame.area() in draw"
-                );
-            }
-            render::render(
-                frame,
-                &mut layout,
-                repeat_mode,
-                &registry,
-                telegram_status,
-                binary_stale,
-            );
-            // &mut because ScratchShell needs to drain output and maybe
-            // resize its pane's VTerm/PTY during render.
-            match &mut overlay {
-                Overlay::NewTabMenu { items, selected }
-                | Overlay::SplitMenu {
-                    items, selected, ..
-                } => {
-                    render::render_menu(frame, items, *selected);
-                }
-                Overlay::RenameTab { input } | Overlay::RenamePane { input } => {
-                    render::render_rename(frame, input);
-                }
-                Overlay::ConfirmClose { target } => {
-                    let msg = match target {
-                        CloseTarget::Pane => "Close pane? (y/n)",
-                        CloseTarget::Tab => "Close tab and kill all agents? (y/n)",
-                    };
-                    render::render_confirm(frame, msg);
-                }
-                Overlay::TabList { selected } => {
-                    render::render_tab_list(frame, &layout, *selected);
-                }
-                Overlay::MovePaneTarget {
-                    selected,
-                    source_tab_idx,
-                    split_dir,
-                    ..
-                } => {
-                    render::render_move_pane_target(
-                        frame,
-                        &layout,
-                        *selected,
-                        *source_tab_idx,
-                        *split_dir,
+        // #t-84833-10 redraw-storm frame cap: draw at most once per FRAME_INTERVAL
+        // and only when something changed (`dirty`). Input is NOT throttled — the
+        // `event_rx` arm below processes keystrokes immediately; only the (expensive)
+        // full-TUI redraw is rate-limited, which is what the boot flood saturated.
+        let frame_now = std::time::Instant::now();
+        if dirty && should_draw(last_draw, frame_now, FRAME_INTERVAL) {
+            last_draw = Some(frame_now);
+            dirty = false;
+            terminal.draw(|frame| {
+                // #1027: snapshot the shared daemon-binary-stale flag once
+                // per frame so the render path sees a consistent value.
+                // Relaxed is enough — single-bit flag, no fence vs other
+                // state needed; the supervisor's SeqCst store will always
+                // be visible to this load before the next paint tick.
+                let binary_stale = daemon_binary_stale.load(std::sync::atomic::Ordering::Relaxed);
+                // #2057: the area render actually fills — compare to crossterm above.
+                if size_debug {
+                    let a = frame.area();
+                    tracing::info!(
+                        tag = "#2057-area",
+                        x = a.x,
+                        y = a.y,
+                        w = a.width,
+                        h = a.height,
+                        "frame.area() in draw"
                     );
                 }
-                Overlay::Help => {
-                    render::render_help(frame);
+                render::render(
+                    frame,
+                    &mut layout,
+                    repeat_mode,
+                    &registry,
+                    telegram_status,
+                    binary_stale,
+                );
+                // &mut because ScratchShell needs to drain output and maybe
+                // resize its pane's VTerm/PTY during render.
+                match &mut overlay {
+                    Overlay::NewTabMenu { items, selected }
+                    | Overlay::SplitMenu {
+                        items, selected, ..
+                    } => {
+                        render::render_menu(frame, items, *selected);
+                    }
+                    Overlay::RenameTab { input } | Overlay::RenamePane { input } => {
+                        render::render_rename(frame, input);
+                    }
+                    Overlay::ConfirmClose { target } => {
+                        let msg = match target {
+                            CloseTarget::Pane => "Close pane? (y/n)",
+                            CloseTarget::Tab => "Close tab and kill all agents? (y/n)",
+                        };
+                        render::render_confirm(frame, msg);
+                    }
+                    Overlay::TabList { selected } => {
+                        render::render_tab_list(frame, &layout, *selected);
+                    }
+                    Overlay::MovePaneTarget {
+                        selected,
+                        source_tab_idx,
+                        split_dir,
+                        ..
+                    } => {
+                        render::render_move_pane_target(
+                            frame,
+                            &layout,
+                            *selected,
+                            *source_tab_idx,
+                            *split_dir,
+                        );
+                    }
+                    Overlay::Help => {
+                        render::render_help(frame);
+                    }
+                    Overlay::Scroll => {
+                        let so = layout
+                            .active_tab()
+                            .and_then(|t| t.focused_pane())
+                            .map(|p| p.scroll_offset)
+                            .unwrap_or(0);
+                        render::render_scroll_indicator(frame, so);
+                    }
+                    Overlay::Command { ref input } => {
+                        render::render_command_palette(frame, input);
+                    }
+                    Overlay::Decisions {
+                        ref items,
+                        selected,
+                        ref mode,
+                    } => {
+                        render::render_decisions(frame, items, *selected, mode);
+                    }
+                    Overlay::Tasks {
+                        ref items,
+                        col,
+                        row,
+                        ref mode,
+                        ref view,
+                    } => {
+                        render::render_tasks(frame, items, *col, *row, mode, *view, &home);
+                    }
+                    Overlay::ScratchShell { pane } => {
+                        render::render_scratch_shell(frame, pane, &registry);
+                    }
+                    Overlay::None => {}
                 }
-                Overlay::Scroll => {
-                    let so = layout
-                        .active_tab()
-                        .and_then(|t| t.focused_pane())
-                        .map(|p| p.scroll_offset)
-                        .unwrap_or(0);
-                    render::render_scroll_indicator(frame, so);
-                }
-                Overlay::Command { ref input } => {
-                    render::render_command_palette(frame, input);
-                }
-                Overlay::Decisions {
-                    ref items,
-                    selected,
-                    ref mode,
-                } => {
-                    render::render_decisions(frame, items, *selected, mode);
-                }
-                Overlay::Tasks {
-                    ref items,
-                    col,
-                    row,
-                    ref mode,
-                    ref view,
-                } => {
-                    render::render_tasks(frame, items, *col, *row, mode, *view, &home);
-                }
-                Overlay::ScratchShell { pane } => {
-                    render::render_scratch_shell(frame, pane, &registry);
-                }
-                Overlay::None => {}
+            })?;
+        }
+
+        // #t-84833-10: wake the loop at the next frame boundary when a change is
+        // pending but throttled (so it never stays stale beyond one frame), else
+        // keep the cheap ~50ms idle refresh cadence (catches non-wakeup state like
+        // status-bar / notification updates).
+        let select_timeout = if dirty {
+            match last_draw {
+                Some(t) => FRAME_INTERVAL
+                    .saturating_sub(t.elapsed())
+                    .max(std::time::Duration::from_millis(1)),
+                None => std::time::Duration::from_millis(1),
             }
-        })?;
+        } else {
+            std::time::Duration::from_millis(50)
+        };
 
         crossbeam_channel::select! {
             recv(event_rx) -> ev => {
+                dirty = true; // input may change the display → redraw next due frame
                 let ev = match ev {
                     Ok(e) => e,
                     Err(_) => break,
@@ -816,9 +870,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(wakeup_rx) -> _ => {
-                // Wakeup from PTY output — triggers redraw
+                // Wakeup from PTY output — drain the whole burst (11 booting agents
+                // flood this channel, one wakeup per output chunk) so N chunks
+                // coalesce into ONE redraw, not N iterations. The frame cap above
+                // then bounds the actual redraw rate.
+                while wakeup_rx.try_recv().is_ok() {}
+                dirty = true;
             }
             recv(attach_rx) -> outcome => {
+                dirty = true;
                 // #render-first phase-(b): a background worker finished a deferred
                 // attach. Apply it to its placeholder pane (instance id + dump +
                 // forwarder on Ready, or a visible "failed to start" banner on
@@ -841,6 +901,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(tui_event_rx) -> ev => {
+                dirty = true;
                 if let Ok(event) = ev {
                     // #1257: handle screenshot request directly (needs terminal access).
                     if let TuiEvent::ScreenshotRequest(tx) = event {
@@ -924,6 +985,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             recv(tick_rx_ref) -> _ => {
+                dirty = true;
                 // #1726: owned-mode periodic maintenance now runs the FULL daemon
                 // per-tick pipeline (build_default_handlers minus APP_TICK_ALLOWLIST)
                 // instead of a hand-picked subset. Gated to owned mode via tick_rx
@@ -942,7 +1004,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     &app_handlers,
                 );
             }
-            default(std::time::Duration::from_millis(50)) => {
+            default(select_timeout) => {
+                // #t-84833-10: periodic idle refresh — mark dirty so the cap above
+                // redraws (catches non-wakeup state changes; ~50ms cadence when idle).
+                dirty = true;
                 // #1479: throttled, change-gated session persistence (every
                 // 10s). Cheap when the layout is unchanged (no write); on a
                 // change it preserves the on-screen layout against a hard
@@ -1744,6 +1809,58 @@ mod tests {
     use super::*;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    /// #t-84833-10 redraw-storm frame cap — the `should_draw` rate-limit decision.
+    #[test]
+    fn should_draw_caps_at_frame_rate() {
+        use std::time::{Duration, Instant};
+        let fi = Duration::from_millis(33);
+        let t0 = Instant::now();
+        assert!(should_draw(None, t0, fi), "first frame always draws");
+        assert!(
+            !should_draw(Some(t0), t0, fi),
+            "no draw immediately after a draw"
+        );
+        assert!(
+            !should_draw(Some(t0), t0 + Duration::from_millis(10), fi),
+            "10ms < interval → throttled"
+        );
+        assert!(
+            should_draw(Some(t0), t0 + Duration::from_millis(33), fi),
+            "interval elapsed → draw"
+        );
+        assert!(
+            should_draw(Some(t0), t0 + Duration::from_millis(500), fi),
+            "well past interval → draw"
+        );
+    }
+
+    /// #t-84833-10: the redraw count under a wakeup flood is bounded by the FRAME
+    /// RATE, not by the number of wakeups (the storm fix). 1000 wakeups packed into
+    /// ~100ms must yield only ~3-4 draws (100ms / 33ms), not 1000.
+    #[test]
+    fn frame_cap_bounds_draws_under_wakeup_flood() {
+        use std::time::{Duration, Instant};
+        let fi = Duration::from_millis(33);
+        let t0 = Instant::now();
+        let mut last_draw: Option<Instant> = None;
+        let mut draws = 0u32;
+        for i in 0..1000u64 {
+            let now = t0 + Duration::from_micros(i * 100); // 1000 wakeups over ~100ms
+            if should_draw(last_draw, now, fi) {
+                draws += 1;
+                last_draw = Some(now);
+            }
+        }
+        assert!(
+            draws <= 5,
+            "draws must be bounded by frame-rate, got {draws} for 1000 wakeups in 100ms"
+        );
+        assert!(
+            draws >= 3,
+            "but should still draw a few times across 100ms, got {draws}"
+        );
+    }
 
     /// #render-first phase-(b) F2 (r4): `bounded_join_attach_workers` must DETACH a
     /// worker wedged past the deadline (so quit can't hang) while still joining the
