@@ -1362,8 +1362,8 @@ fn enforce_agent_canonical_bypass_deny(args: &[String]) {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     eprintln!(
         "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo.\n\
-         The daemon already auto-bound your worktree at dispatch; cd into it and use normal git \
-         (no AGEND_GIT_BYPASS). A stray provision here detaches the operator's canonical HEAD (#2234).\n\
+         If the daemon auto-bound a worktree for this task (check `binding_state`), cd into it and use normal git \
+         (no AGEND_GIT_BYPASS); otherwise use `bind_self` or ask lead. A stray provision here detaches the operator's canonical HEAD (#2234).\n\
          If you genuinely must: ask lead, or set AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot."
     );
     std::process::exit(1);
