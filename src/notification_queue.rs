@@ -713,12 +713,22 @@ mod tests {
             raw.lines().any(|l| l == "GARBAGE not json"),
             "unparseable line preserved; got:\n{raw}"
         );
-        assert_eq!(
-            raw.lines()
-                .filter(|l| l.contains("kind=ratelimit-retry"))
-                .count(),
-            1,
-            "ratelimit coalesced to the latest; got:\n{raw}"
+        // The ratelimit nudge is never LOST, whether this enqueue hit the coalesce
+        // path (drain lock acquired → 1 line, keep-latest) or the contention
+        // fallback (lock momentarily held → plain append → 2 lines). BOTH are
+        // no-loss. coverage (llvm-cov) instrumentation perturbs scheduling and can
+        // flip the lock race, so assert the no-loss invariant (latest present, no
+        // runaway duplication) — NOT a single path — to keep this test about its
+        // actual subject: the unparseable line surviving the rewrite. The
+        // coalesce-vs-fallback paths themselves are pinned deterministically by
+        // `coalesce_falls_back_to_append_when_drain_lock_held_no_loss`.
+        let rl_count = raw
+            .lines()
+            .filter(|l| l.contains("kind=ratelimit-retry"))
+            .count();
+        assert!(
+            (1..=2).contains(&rl_count),
+            "ratelimit nudge preserved (1=coalesced, 2=fallback append; both no-loss); got:\n{raw}"
         );
     }
 
