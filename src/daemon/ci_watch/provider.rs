@@ -114,6 +114,34 @@ impl CiHttpClient {
         req
     }
 
+    /// Build a POST request with auth + User-Agent + JSON body applied.
+    /// #t-29025-19: GraphQL (the only POST we make) can't carry its query in a
+    /// GET — the `isRequired` per-check flag is GraphQL-only. Mirrors `get`'s
+    /// auth/UA/Accept handling.
+    pub(crate) fn post(&self, path: &str, body: serde_json::Value) -> reqwest::RequestBuilder {
+        let url = if self.path_prefix.is_empty() {
+            format!("{}/{path}", self.base_url)
+        } else {
+            format!("{}/{}/{path}", self.base_url, self.path_prefix)
+        };
+        let mut req = self
+            .client
+            .post(&url)
+            .header("User-Agent", "agend-terminal")
+            .json(&body);
+        if let Some(ref accept) = self.default_accept {
+            req = req.header("Accept", accept.as_str());
+        }
+        if let Some(auth) = (self.auth_fn)() {
+            req = match auth {
+                CiAuth::Bearer(token) => req.bearer_auth(token),
+                CiAuth::Header(name, value) => req.header(name, value),
+                CiAuth::Basic(user, pass) => req.basic_auth(user, Some(pass)),
+            };
+        }
+        req
+    }
+
     /// Parse rate-limit reset timestamp from response headers.
     /// Checks both GitHub (`x-ratelimit-reset`) and GitLab (`ratelimit-reset`) header names.
     #[allow(dead_code)] // available for providers to use; wired per-provider as needed
@@ -323,6 +351,24 @@ pub trait CiProvider: Send + Sync {
     /// Default returns empty — only GitHub implements this currently.
     async fn fetch_run_jobs(&self, _repo: &str, _run_id: u64) -> Vec<CiJob> {
         Vec::new()
+    }
+
+    /// #t-29025-19: does the open PR for `branch` have a REQUIRED status check
+    /// that is currently FAILING? Gates `[ci-fail]` to real merge-blocking
+    /// failures — a non-required check (e.g. `Coverage`, a non-required job
+    /// inside the required `CI` workflow) failing must NOT fire `[ci-fail]` +
+    /// re-nudge (it doesn't block merge → pure noise).
+    ///
+    /// - `Some(true)`  — at least one required check has a failure-class conclusion.
+    /// - `Some(false)` — no required check is failing (only non-required, or all good).
+    /// - `None`        — undeterminable (no open PR / API error / no rollup / a
+    ///   failing check whose `isRequired` GitHub couldn't classify).
+    ///
+    /// Callers MUST fail-OPEN on `None`: keep the existing emit so a real
+    /// required failure is never hidden by a query miss. Default `None`
+    /// (fail-open) — non-GitHub providers and mocks don't gate.
+    async fn required_check_failed(&self, _repo: &str, _branch: &str) -> Option<bool> {
+        None
     }
 
     /// CI-fail-notify: fetch the tail of the failed-job logs (~`max_lines`) so
@@ -717,6 +763,83 @@ impl CiProvider for GitHubCiProvider {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    async fn required_check_failed(&self, repo: &str, branch: &str) -> Option<bool> {
+        let owner = repo.split('/').next().unwrap_or("");
+        let name = repo.split('/').nth(1).unwrap_or("");
+        // (1) Resolve the open PR number for this branch (same as check_pr_mergeable).
+        //     `isRequired(pullRequestNumber:)` needs the PR's number to evaluate
+        //     against the PR's base-branch protection. No open PR → None (fail-open).
+        let list: serde_json::Value = self
+            .http
+            .get(&format!(
+                "repos/{repo}/pulls?head={owner}:{}&state=open&per_page=1",
+                percent_encode_query(branch)
+            ))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let pr_number = list
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|pr| pr["number"].as_u64())?;
+        // (2) GraphQL statusCheckRollup with per-check `isRequired(pullRequestNumber:)`
+        //     — GitHub's authoritative "does this check block merge for THIS PR" flag.
+        //     A non-required job inside a required workflow (e.g. Coverage in CI) is
+        //     where the noise comes from; this is the only API that distinguishes it.
+        let query = "query($owner:String!,$name:String!,$pr:Int!){\
+            repository(owner:$owner,name:$name){pullRequest(number:$pr){\
+            commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{\
+            __typename ... on CheckRun{conclusion isRequired(pullRequestNumber:$pr)} \
+            ... on StatusContext{state isRequired(pullRequestNumber:$pr)}}}}}}}}}}";
+        let body = serde_json::json!({
+            "query": query,
+            "variables": { "owner": owner, "name": name, "pr": pr_number },
+        });
+        let resp: serde_json::Value = self
+            .http
+            .post("graphql", body)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let nodes = resp["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+            ["statusCheckRollup"]["contexts"]["nodes"]
+            .as_array()?;
+        // No rollup / empty contexts (or a GraphQL error → data is null) → None (fail-open).
+        if nodes.is_empty() {
+            return None;
+        }
+        let mut any_required_failed = false;
+        for n in nodes {
+            // CheckRun carries `conclusion`; StatusContext carries `state`.
+            let verdict = n["conclusion"].as_str().or_else(|| n["state"].as_str());
+            let failing = matches!(
+                verdict.map(|s| s.to_ascii_uppercase()).as_deref(),
+                Some("FAILURE")
+                    | Some("TIMED_OUT")
+                    | Some("STARTUP_FAILURE")
+                    | Some("ACTION_REQUIRED")
+                    | Some("ERROR")
+            );
+            if !failing {
+                continue;
+            }
+            match n["isRequired"].as_bool() {
+                Some(true) => any_required_failed = true,
+                Some(false) => {} // non-required failure → not merge-blocking → ignore
+                // A failing check we can't classify as required-or-not → fail-OPEN
+                // (never suppress a possibly-required failure on a missing flag).
+                None => return None,
+            }
+        }
+        Some(any_required_failed)
     }
 
     async fn fetch_failure_log_tail(
