@@ -239,6 +239,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     branch,
                     &worktree_dir,
                     &source_canonical,
+                    true, // #2158 GR1: agent self-claim (repo checkout bind:true) → notify operator
                 ) {
                     // #1310: rollback worktree on binding failure to prevent orphans
                     tracing::warn!(

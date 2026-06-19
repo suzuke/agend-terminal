@@ -61,7 +61,10 @@ pub fn lease(
     // source_repo persistence (P0-X r1): release_full reads this back to run
     // `git worktree remove --force` from the owning repo's cwd, which
     // prevents stale registry entries that would block re-lease.
-    if let Err(e) = crate::binding::bind_full(home, agent, "", branch, &info.path, source_repo) {
+    // #2158 GR1: internal lease bind — not an agent self-claim, no operator notify.
+    if let Err(e) =
+        crate::binding::bind_full(home, agent, "", branch, &info.path, source_repo, false)
+    {
         tracing::warn!(%agent, %branch, error = %e, "lease: bind_full failed — worktree created but binding missing");
     }
 
@@ -2738,7 +2741,7 @@ mod tests {
         reverse_reconcile(&home, "devd").expect("no-op on unconverted");
 
         let ws = converted_workspace_with_commit(&home, &repo, "devd", "feat/off");
-        crate::binding::bind_full(&home, "devd", "T-1", "feat/off", &ws, &repo).ok();
+        crate::binding::bind_full(&home, "devd", "T-1", "feat/off", &ws, &repo, false).ok();
         let wt_listed = |repo: &Path| {
             crate::git_helpers::git_cmd(repo, &["worktree", "list", "--porcelain"])
                 .unwrap_or_default()

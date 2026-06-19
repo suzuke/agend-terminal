@@ -1675,7 +1675,7 @@ mod tests {
         done: bool,
     ) -> std::path::PathBuf {
         let lease = crate::worktree_pool::lease(home, repo, agent, branch).expect("lease");
-        crate::binding::bind_full(home, agent, task_id, branch, &lease.path, repo)
+        crate::binding::bind_full(home, agent, task_id, branch, &lease.path, repo, false)
             .expect("bind_full");
         seed_task(home, task_id, agent, branch, done);
         lease.path
@@ -1835,7 +1835,8 @@ mod tests {
             "merge",
         );
         // Re-lease the SAME agent to a new task → snapshot is now stale.
-        crate::binding::bind_full(&home, "dev", "t-c2", "feat/c", &wt, &repo).expect("rebind");
+        crate::binding::bind_full(&home, "dev", "t-c2", "feat/c", &wt, &repo, false)
+            .expect("rebind");
         drain_queue(&home);
         assert!(
             bound(&home, "dev"),

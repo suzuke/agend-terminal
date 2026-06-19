@@ -520,7 +520,18 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
 
     // Bind with worktree + source-repo paths. Bind file write error stays graceful (Q1).
     // #779 P2: bind_full returns Result; preserves pre-#779-P2 silent semantic.
-    match crate::binding::bind_full(home, target, task_id, branch, &wt_path, &source_repo) {
+    // #2158 GR1: the only `arm_ci_watch=false` path through this sink is `bind_self`
+    // (an agent self-claim → operator notify); dispatch wrappers pass true. So
+    // self-claim ⟺ !arm_ci_watch — reuse the dispatch-intent, no task_id heuristic.
+    match crate::binding::bind_full(
+        home,
+        target,
+        task_id,
+        branch,
+        &wt_path,
+        &source_repo,
+        !arm_ci_watch,
+    ) {
         Ok(()) => tracing::info!(
             %target, %branch, path = %wt_path.display(),
             "dispatch auto-bind OK"

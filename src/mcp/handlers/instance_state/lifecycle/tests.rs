@@ -564,6 +564,7 @@ fn full_delete_clears_binding_and_succeeds_1879() {
         "feat/x",
         std::path::Path::new("/tmp/wt-agent-b"),
         std::path::Path::new("/tmp/repo-agent-b"),
+        false,
     )
     .expect("bind_full");
     assert!(

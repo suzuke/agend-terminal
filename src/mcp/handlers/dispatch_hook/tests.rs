@@ -1614,9 +1614,16 @@ fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
             branch,
         ))
     };
+    // #2158 GR1: the SAME dispatch-intent signal gates the operator NOTIFY (inverted):
+    // self-claim notifies, dispatch does not — regardless of task_id.
+    let notified = |home: &std::path::Path| {
+        std::fs::read_to_string(home.join("event-log.jsonl"))
+            .unwrap_or_default()
+            .contains("binding_out_of_dispatch")
+    };
 
     // (a) bind_self self-claim (`_with_source`) → NO arm, even WITH a task_id
-    //     (self-provision must never silently arm).
+    //     (self-provision must never silently arm) — and DOES notify the operator.
     let parent_a = mk_parent("bindself");
     let (home_a, _c) =
         p781_canonical_with_team_source_repo(&parent_a, "feat/gr1-bs", true, "val", &["val-dev"]);
@@ -1632,6 +1639,10 @@ fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
     assert!(
         !watch_for(&home_a, "feat/gr1-bs").exists(),
         "#2158 GR1: bind_self self-claim must NOT auto-arm ci_watch"
+    );
+    assert!(
+        notified(&home_a),
+        "#2158 GR1: bind_self self-claim MUST notify the operator"
     );
     std::fs::remove_dir_all(&parent_a).ok();
 
@@ -1652,6 +1663,10 @@ fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
     assert!(
         watch_for(&home_b, "feat/gr1-tid").exists(),
         "a dispatch with a task_id must arm ci_watch"
+    );
+    assert!(
+        !notified(&home_b),
+        "a dispatch (task_id set) must NOT notify the operator"
     );
     std::fs::remove_dir_all(&parent_b).ok();
 
@@ -1683,6 +1698,10 @@ fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
     assert!(
         watch_for(&home_c, "feat/gr1-notid").exists(),
         "#2158 GR1: a dispatch with an EMPTY task_id (single-target auto-create) must STILL arm"
+    );
+    assert!(
+        !notified(&home_c),
+        "#2158 GR1 (r2's catch): an EMPTY-task_id dispatch must NOT false-notify the operator"
     );
     std::fs::remove_dir_all(&parent_c).ok();
 }

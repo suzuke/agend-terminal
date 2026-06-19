@@ -125,6 +125,7 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
         branch,
         std::path::Path::new(""),
         std::path::Path::new(""),
+        false, // #2158 GR1: internal convenience bind — not a self-claim, no notify
     ) {
         tracing::warn!(%agent, task_id, branch, error = %e, "bind failed (fail-closed)");
     }
@@ -153,6 +154,11 @@ pub fn bind_full(
     branch: &str,
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
+    // #2158 GR1: true ⟺ an AGENT SELF-CLAIM (`bind_self` / `repo checkout bind:true`),
+    // which surfaces to the operator. Dispatch / internal binds pass false. Keyed on
+    // the caller's EXPLICIT intent, NOT on task_id — a single-target auto-create
+    // `send kind=task` legitimately binds with task_id="" and must NOT false-notify.
+    is_self_claim: bool,
 ) -> Result<(), String> {
     // #1888 phase-2: the agent claiming a branch is acting on any pending
     // ci-handoff for it — resolve the track (re-nudge stops). Scoped to this
@@ -273,21 +279,16 @@ pub fn bind_full(
                 crate::event_log::caller_process_context()
             ),
         );
-        // #2158 GR1: a binding CREATE/CHANGE with NO task_id is OUT-OF-DISPATCH (a
-        // self-claim `repo checkout bind:true` or a `bind_self` without a task) —
-        // exactly the first-bind-hijack / accidental-sub-agent vector guard-b cannot
-        // prevent (identity-indistinguishable). Surface it to the operator, ONCE per
-        // (agent, branch), so an unexpected rebind is NOTICED. The daemon dispatch
-        // path always carries a task_id, so normal delegation is unaffected.
-        if task_id.is_empty() {
-            notify_operator_out_of_dispatch_bind(
-                home,
-                agent,
-                branch,
-                &wt_str,
-                prev_branch.as_deref(),
-            );
-        }
+    }
+    // #2158 GR1: notify the operator on an AGENT SELF-CLAIM (`bind_self` /
+    // `repo checkout bind:true`) — the first-bind-hijack / accidental-sub-agent vector
+    // guard-b cannot prevent (identity-indistinguishable). NOT gated on `changed`: the
+    // dispatch flow double-binds (lease then re-bind), so a self-claim's intent-bind is
+    // frequently a no-op (changed=false); the per-(agent,branch) sidecar in the helper
+    // gives fire-once. Keyed on the caller's explicit `is_self_claim`, NOT task_id — a
+    // single-target auto-create dispatch legitimately binds with task_id="".
+    if is_self_claim {
+        notify_operator_out_of_dispatch_bind(home, agent, branch, &wt_str, prev_branch.as_deref());
     }
     Ok(())
 }
@@ -1186,6 +1187,7 @@ mod tests {
             "branch",
             std::path::Path::new(""),
             std::path::Path::new(""),
+            false,
         );
         assert!(
             result.is_err(),
@@ -1293,9 +1295,9 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap(); // LIVE worktree on disk
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src).expect("first bind ok");
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
 
-        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src)
+        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
             .expect_err("cross-branch rebind of a live binding must be rejected");
         assert!(
             err.contains("#2158") && err.contains("release_worktree first"),
@@ -1320,8 +1322,8 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("first-bind allowed");
-        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("same-branch reuse allowed");
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, false).expect("first-bind allowed");
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, false).expect("same-branch reuse allowed");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1333,8 +1335,8 @@ mod tests {
         let dead = home.join("wt-gone"); // NOT created → not live
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "ag", "", "feat/x", &dead, &src).expect("first bind ok");
-        bind_full(&home, "ag", "", "feat/y", &dead, &src)
+        bind_full(&home, "ag", "", "feat/x", &dead, &src, false).expect("first bind ok");
+        bind_full(&home, "ag", "", "feat/y", &dead, &src, false)
             .expect("rebind allowed when the prior worktree is dead (stale binding)");
         assert_eq!(
             read(&home, "ag")
@@ -1354,7 +1356,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("bind ok");
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, false).expect("bind ok");
         unbind(&home, "ag");
         let log = read_event_log(&home);
         assert!(
@@ -1372,14 +1374,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // ── #2158 GR1: out-of-dispatch bind → operator-visible, fire-once ────────
+    // ── #2158 GR1: agent self-claim bind → operator-visible, fire-once ──────
 
-    /// An OUT-OF-DISPATCH bind (no task_id) surfaces a distinct
+    /// An AGENT SELF-CLAIM bind (`is_self_claim=true`) surfaces a distinct
     /// `binding_out_of_dispatch` marker and DEDUPS per (agent, branch): a repeated
     /// CHANGE on the SAME branch (here a new worktree path) must NOT re-surface
     /// (fire-once, no flood).
     #[test]
-    fn out_of_dispatch_bind_surfaces_once_per_branch_2158_gr1() {
+    fn self_claim_bind_surfaces_once_per_branch_2158_gr1() {
         let home = tmp_home("gr1-once");
         let wt = home.join("wt");
         std::fs::create_dir_all(&wt).unwrap();
@@ -1388,31 +1390,34 @@ mod tests {
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
 
-        // first out-of-dispatch bind (no task_id) → surfaced.
-        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("first out-of-dispatch bind");
+        // first self-claim bind → surfaced.
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, true).expect("first self-claim bind");
         // SAME branch, different worktree → changed=true again, but dedup suppresses.
-        bind_full(&home, "ag", "", "feat/x", &wt2, &src).expect("same-branch rebind allowed");
+        bind_full(&home, "ag", "", "feat/x", &wt2, &src, true).expect("same-branch rebind allowed");
 
         let log = read_event_log(&home);
         assert_eq!(
             log.matches("binding_out_of_dispatch").count(),
             1,
-            "out-of-dispatch bind must surface exactly once per (agent, branch): {log}"
+            "self-claim bind must surface exactly once per (agent, branch): {log}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// A DISPATCH bind (task_id present — the normal delegation path) must NOT
-    /// surface the out-of-dispatch operator notify; only the always-on
-    /// `binding_changed` audit fires.
+    /// #2158 GR1 (r2's catch): a DISPATCH bind must NOT surface even when its task_id
+    /// is EMPTY — a single-target `send kind=task` is auto-create-exempt and binds with
+    /// task_id="" (#1050 assigns the id AFTER the bind). Keying notify on
+    /// `is_self_claim=false` (the dispatch intent), NOT task_id, avoids the false
+    /// operator alert the old task_id heuristic + non-empty-task_id test masked.
     #[test]
-    fn dispatch_bind_does_not_surface_out_of_dispatch_2158_gr1() {
+    fn empty_task_id_dispatch_does_not_surface_2158_gr1() {
         let home = tmp_home("gr1-dispatch");
         let wt = home.join("wt");
         std::fs::create_dir_all(&wt).unwrap();
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "ag", "T-1", "feat/x", &wt, &src).expect("dispatch bind ok");
+        // EMPTY task_id but a real dispatch (is_self_claim=false) — the masked case.
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, false).expect("dispatch bind ok");
         let log = read_event_log(&home);
         assert!(
             log.contains("binding_changed"),
@@ -1420,7 +1425,7 @@ mod tests {
         );
         assert!(
             !log.contains("binding_out_of_dispatch"),
-            "a dispatch bind (task_id set) must NOT surface as out-of-dispatch: {log}"
+            "#2158 GR1: an EMPTY-task_id dispatch (is_self_claim=false) must NOT false-notify: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

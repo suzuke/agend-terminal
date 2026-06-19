@@ -795,6 +795,14 @@ fn checkout_bind_true_writes_binding_marker_and_no_longer_arms_watch_2158_gr1() 
         Some(false),
         "self-claim checkout must report ci_watch_armed:false: {resp}"
     );
+    // #2158 GR1: a self-claim `repo checkout bind:true` MUST notify the operator
+    // (it passes is_self_claim=true to bind_full).
+    assert!(
+        std::fs::read_to_string(home.join("event-log.jsonl"))
+            .unwrap_or_default()
+            .contains("binding_out_of_dispatch"),
+        "#2158 GR1: self-claim checkout bind:true must notify the operator"
+    );
 
     // HEAD must be on the named branch (NOT detached). Verifies the
     // `--detach` omission for bind:true so subsequent commits land
