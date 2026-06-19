@@ -160,30 +160,54 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
 
 /// #t-84833-14 (R3 perf): the minimal projection of an [`InboxMessage`] that
 /// decides post-#2299 *actionable-unread* membership. Deserializing a JSONL line
-/// into this — rather than the full `InboxMessage` — skips allocating the large
-/// `text`/`from`/… String fields (the dominant per-row deserialize cost on the
-/// hot `send` path: ~7–13× the file read), while serde's tokenizer still
-/// validates the JSON and `#[serde(default)]` preserves the EXACT filter for any
-/// field a row omits. `timestamp` is carried (small) so the same probe serves
-/// [`unread_count`]'s `oldest` derivation.
+/// into this — rather than the full `InboxMessage` — skips the dominant per-row
+/// deserialize cost (allocating the large `text` String + the ~25 other fields),
+/// on the hot `send` path (~7–13× the file read), while serde still validates the
+/// JSON.
 ///
-/// Equivalence with the prior full-`InboxMessage` count is exhaustively pinned by
-/// the `perf_r3_equiv` tests (proptest over serde-produced rows + state-coverage
-/// driven through the real mutators). It holds for every line a producer can emit
-/// (a complete `InboxMessage`) and for torn/half-written lines (invalid JSON →
-/// `Err` → skipped by both). The only inputs where it could differ are
-/// syntactically-valid JSON objects that are NOT inbox messages (e.g. `{}`),
-/// which no code path ever writes to an inbox file.
+/// ## Validity boundary MUST match `InboxMessage` (r6 #2350)
+/// The count must be byte-identical to the prior `from_str::<InboxMessage>` loop
+/// for EVERY line that can appear in the JSONL — and that includes forward-schema
+/// rows, which `drain`/`ack`/`clear`/`reclaim` PRESERVE verbatim as raw lines
+/// (storage.rs preserved_forward). A forward-schema row (or a stray `{}`) that
+/// LACKS a field `InboxMessage` requires is a syntactically-valid JSON object that
+/// the old loop REJECTS (`from_str::<InboxMessage>` → `Err` → skipped). So this
+/// probe mirrors `InboxMessage`'s required-PRESENCE set — `from`, `text`, `kind`,
+/// `timestamp` carry no `#[serde(default)]` there, so a row missing any of them
+/// fails to deserialize here too, exactly as before. An earlier all-`Option`
+/// probe accepted such rows and miscounted them as unread (the re-page gate) —
+/// the bug r6 caught.
+///
+/// `text` (the big allocation we exist to avoid) uses [`serde::de::IgnoredAny`]:
+/// its PRESENCE is still required, but its value is consumed without building a
+/// `String`. `from`/`kind`/`timestamp` mirror `InboxMessage`'s declarations
+/// exactly (tiny allocations). The one residual, intentional, r6-endorsed
+/// deviation: `text` present as a NON-string value (`"text":1`) is accepted here
+/// but rejected by `InboxMessage` — type-enforcing it would re-introduce the very
+/// `String` allocation this optimization removes, and no producer (current or
+/// forward-schema) ever emits a non-string `text`.
+///
+/// Equivalence is exhaustively pinned by `perf_r3_equiv` (proptest over BOTH
+/// well-formed and adversarial valid-JSON-non-`InboxMessage` rows + state-coverage
+/// via the real mutators + named boundary fixtures).
 #[derive(serde::Deserialize)]
+#[allow(dead_code)] // `from`/`text`/`kind` are required-presence validity markers
+                    // (consumed by serde, never read); only the filter fields +
+                    // `timestamp` are read.
 struct UnreadProbe {
+    // Required-presence markers mirroring `InboxMessage` (no `#[serde(default)]`),
+    // so this probe rejects exactly the rows the full struct rejects.
+    from: String,
+    text: serde::de::IgnoredAny,
+    kind: Option<String>,
+    timestamp: String,
+    // Filter fields — optional exactly as in `InboxMessage` (`#[serde(default)]`).
     #[serde(default)]
     read_at: Option<String>,
     #[serde(default)]
     delivering_at: Option<String>,
     #[serde(default)]
     superseded_by: Option<String>,
-    #[serde(default)]
-    timestamp: Option<String>,
 }
 
 impl UnreadProbe {
@@ -918,13 +942,10 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
             if probe.is_unread() {
                 count += 1;
                 // `oldest` over the unread rows — identical to the prior
-                // `msg.timestamp` parse (a real unread row always carries it; an
-                // unparseable/absent timestamp leaves `oldest` untouched, as before).
-                if let Some(ts) = probe
-                    .timestamp
-                    .as_deref()
-                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                {
+                // `msg.timestamp` parse (`timestamp` is a required field, so a
+                // parsed row always has it; an unparseable value leaves `oldest`
+                // untouched, as before).
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&probe.timestamp) {
                     let ts_utc = ts.with_timezone(&chrono::Utc);
                     if oldest.is_none_or(|t| t > ts_utc) {
                         oldest = Some(ts_utc);

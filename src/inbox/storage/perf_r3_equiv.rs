@@ -3,26 +3,30 @@
 //!
 //! The hot-path counter (`enqueue_returning_unread_count`) and `unread_count`
 //! now count unread rows by deserializing each JSONL line into the minimal
-//! `UnreadProbe` (3 filter fields + timestamp) instead of the full
-//! `InboxMessage`, to skip the large `text`/`from`/… String allocations. Because
-//! `unread_count` gates the inbox-stuck watchdog's re-page decision (#2299
-//! excluded `delivering` rows from actionable-unread precisely to not re-page a
-//! healthy agent), the new count MUST be byte-identical to the old full-struct
-//! count. This module proves it:
+//! `UnreadProbe` (mirrors `InboxMessage`'s required-presence boundary; `text` via
+//! `IgnoredAny` to skip the big allocation) instead of the full `InboxMessage`.
+//! Because `unread_count` gates the inbox-stuck watchdog's re-page decision
+//! (#2299 excluded `delivering` rows from actionable-unread precisely to not
+//! re-page a healthy agent), the new count MUST be byte-identical to the old
+//! full-struct count for EVERY line that can appear in the JSONL. This module
+//! proves it:
 //!
 //!   1. `probe_count_equals_full_struct_count` — proptest over randomized
-//!      `InboxMessage`s (every read_at/delivering_at/superseded_by combo, forward
-//!      schema_version, adversarial text incl. JSON-special chars), each
-//!      serialized via the REAL producer (`serde_json::to_string`, #1493). The
-//!      probe count must equal both the prior full-struct count AND the
-//!      hand-computed filter.
-//!   2. `state_coverage_equiv_serde_fixture` — one row of EVERY state, asserts
-//!      all three counters (`count_unread_in_content`, the full-struct reference,
-//!      `unread_count`, `enqueue_returning_unread_count`) agree.
-//!   3. `cross_mutator_consistency` — drive the inbox through the REAL mutators
-//!      (enqueue → drain → ack → mark_ci_watch_superseded) and after each step
-//!      assert the two production counters agree with a hand-tracked expected.
-//!   4. edge cases — empty lines, torn/invalid-JSON line, forward-schema row.
+//!      WELL-FORMED `InboxMessage`s (every read_at/delivering_at/superseded_by
+//!      combo, forward schema_version, JSON-special-char text), each serialized
+//!      via the REAL producer (#1493): probe == full == explicit filter.
+//!   2. `probe_count_equals_full_over_mixed_wellformed_and_adversarial` — r6 #2350
+//!      gap-closer: MIXES well-formed rows with valid-JSON-but-not-`InboxMessage`
+//!      rows (the class the original proptest never emitted): probe == full.
+//!   3. `validity_boundary_matches_full_inbox_message` — named fixtures: rows
+//!      missing a REQUIRED field (`{}`, no-from/text/timestamp, forward-schema
+//!      dropping a required field) are REJECTED by both (count 0); rows missing
+//!      only OPTIONAL fields (no-`kind`) / forward-valid are ACCEPTED by both.
+//!   4. `state_coverage_equiv_serde_fixture` — one row of EVERY state; all
+//!      production counters agree.
+//!   5. `cross_mutator_consistency` — drive the inbox through the REAL mutators
+//!      (enqueue → drain → ack → mark_ci_watch_superseded); counters agree.
+//!   6. `edge_cases_empty_torn_forward_schema` — empty / torn-JSON / forward rows.
 
 use super::{
     count_unread_in_content, drain, enqueue, enqueue_returning_unread_count, inbox_path,
@@ -259,4 +263,134 @@ fn edge_cases_empty_torn_forward_schema() {
     let fwd = row(false, false, false, true, "future unread");
     assert_eq!(count_unread_in_content(&fwd), 1);
     assert_eq!(count_full_struct_reference(&fwd), 1);
+}
+
+/// Valid-JSON rows `InboxMessage` REJECTS because a REQUIRED field — one with no
+/// `#[serde(default)]` AND not an `Option` (serde defaults a missing `Option` to
+/// `None`): `from`/`text`/`timestamp` — is absent. This is the class r6 #2350
+/// caught the original all-`Option` probe miscounting: `drain`/`ack`/`clear`/
+/// `reclaim` preserve forward-schema rows verbatim as raw lines, so a
+/// forward-schema row dropping a now-required field really can appear in the
+/// JSONL, and the full-struct loop skips it. Returns (raw_line, label).
+fn rows_inbox_message_rejects() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (r#"{}"#, "empty object (missing from/text/timestamp)"),
+        (
+            r#"{"text":"x","kind":null,"timestamp":"2026-06-19T00:00:00Z"}"#,
+            "missing required `from`",
+        ),
+        (
+            r#"{"from":"x","kind":null,"timestamp":"2026-06-19T00:00:00Z"}"#,
+            "missing required `text`",
+        ),
+        (
+            r#"{"from":"x","text":"y","kind":null}"#,
+            "missing required `timestamp`",
+        ),
+        (
+            r#"{"schema_version":999,"text":"y","timestamp":"2026-06-19T00:00:00Z","fut":42}"#,
+            "forward-schema dropping required `from`",
+        ),
+    ]
+}
+
+/// Valid-JSON rows `InboxMessage` ACCEPTS as unread — including the subtle case
+/// that proves WHY the probe must MIRROR `InboxMessage`'s declarations rather
+/// than hand-pick a "required" set: `kind: Option<String>` has no
+/// `#[serde(default)]`, but serde defaults a missing `Option` field to `None`, so
+/// a row omitting `kind` is a VALID unread message. The probe's `kind:
+/// Option<String>` mirrors this exactly → both count it. Returns (raw_line, label).
+fn rows_inbox_message_accepts_as_unread() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            r#"{"from":"x","text":"y","timestamp":"2026-06-19T00:00:00Z"}"#,
+            "missing OPTIONAL `kind` (serde defaults None) — still a valid unread",
+        ),
+        (
+            r#"{"schema_version":999,"from":"x","text":"y","kind":null,"timestamp":"2026-06-19T00:00:00Z","fut":42}"#,
+            "forward-schema with every required field present",
+        ),
+    ]
+}
+
+/// Every adversarial raw line (rejected ∪ accepted) — fed into the mixed proptest
+/// so it exercises the valid-JSON-but-not-a-complete-`InboxMessage` class.
+fn all_adversarial_lines() -> Vec<&'static str> {
+    rows_inbox_message_rejects()
+        .into_iter()
+        .chain(rows_inbox_message_accepts_as_unread())
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// r6 #2350 regression: the probe's deserialize-validity boundary MUST equal
+/// `InboxMessage`'s. A valid-JSON row missing a REQUIRED field is REJECTED
+/// (skipped) by BOTH — never miscounted as actionable-unread (which gates
+/// re-page); a row missing only OPTIONAL fields is ACCEPTED by both.
+#[test]
+fn validity_boundary_matches_full_inbox_message() {
+    // Rows full-struct REJECTS (missing a required field) → both skip (count 0).
+    for (line, label) in rows_inbox_message_rejects() {
+        let full = count_full_struct_reference(line);
+        let probe = count_unread_in_content(line);
+        assert_eq!(
+            full, 0,
+            "oracle: full-struct must reject {label} (got {full})"
+        );
+        assert_eq!(
+            probe, full,
+            "probe diverged from full on rejected row: {label}"
+        );
+    }
+    // Rows full-struct ACCEPTS as unread → both count 1 (proves the probe rejects
+    // ONLY the genuinely-invalid rows — not all forward-schema rows, and not
+    // Option-defaulted ones).
+    for (line, label) in rows_inbox_message_accepts_as_unread() {
+        let full = count_full_struct_reference(line);
+        let probe = count_unread_in_content(line);
+        assert_eq!(
+            full, 1,
+            "oracle: full-struct must accept {label} as unread (got {full})"
+        );
+        assert_eq!(
+            probe, full,
+            "probe diverged from full on accepted row: {label}"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    /// r6 #2350 gap-closer: the original proptest only emitted complete
+    /// `InboxMessage`s, so it never exercised the valid-JSON-but-rejected class.
+    /// This generator MIXES well-formed rows with adversarial raw lines and
+    /// asserts probe count == full-struct count (the byte-equivalence contract)
+    /// over the whole inbox.
+    #[test]
+    fn probe_count_equals_full_over_mixed_wellformed_and_adversarial(
+        rows in prop::collection::vec(
+            prop_oneof![
+                // 4:1 well-formed : adversarial — well-formed dominates a real inbox.
+                4 => (
+                    any::<bool>(),
+                    any::<bool>(),
+                    any::<bool>(),
+                    any::<bool>(),
+                    r#"[a-zA-Z0-9 "\\:{}\[\]]{0,32}"#,
+                ).prop_map(|(r, d, s, f, t)| row(r, d, s, f, &t)),
+                1 => (0usize..all_adversarial_lines().len())
+                    .prop_map(|i| all_adversarial_lines()[i].to_string()),
+            ],
+            0..40usize,
+        )
+    ) {
+        let content = rows.join("\n") + "\n";
+        let probe = count_unread_in_content(&content);
+        let full = count_full_struct_reference(&content);
+        prop_assert_eq!(
+            probe, full,
+            "probe count must equal full-struct count over mixed well-formed + adversarial rows"
+        );
+    }
 }
