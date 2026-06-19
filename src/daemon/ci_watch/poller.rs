@@ -1180,6 +1180,23 @@ async fn check_early_job_failures(
         return false;
     }
 
+    // #t-29025-19: required-only gate (mirror of the terminal path). The early-fail
+    // detector fires on ANY failed job; if the failing job(s) are NON-required checks
+    // (e.g. Coverage) and no required check is failing, suppress — it doesn't block
+    // merge, so the early [ci-fail] is pure noise. Return WITHOUT persisting dedup
+    // state, so each poll re-evaluates and a later required job failure on this sha is
+    // never hidden (lead's hard rule). fail-OPEN: only a definitive Some(false)
+    // suppresses; None (no open PR / API error / no rollup) proceeds to the emit.
+    if provider.required_check_failed(ctx.repo, ctx.branch).await == Some(false) {
+        tracing::debug!(
+            repo = ctx.repo,
+            branch = ctx.branch,
+            sha = %pr.current_sha,
+            "#t-29025-19: suppressing early [ci-fail] — only non-required job(s) failed (merge not blocked)"
+        );
+        return false;
+    }
+
     let sha_short = &pr.current_sha[..pr.current_sha.len().min(7)];
     let headline = format!(
         "[ci-fail] {}@{} ({}): failure",
@@ -1681,6 +1698,27 @@ async fn fan_out_notifications(
             new_notified_run_attempt = Some(run.run_attempt);
             new_notified_run_conclusion = run.conclusion.clone();
             new_stale_emitted_sha = Some(sha.to_string());
+            continue;
+        }
+
+        // #t-29025-19: required-only [ci-fail] gate (see provider::required_check_failed).
+        // Here *sha == current_sha and the aggregate is terminal. When the aggregate is
+        // "failure" but GitHub says NO required check is failing (only a non-required
+        // check like Coverage — a non-required job inside the required CI workflow),
+        // suppress: it doesn't block merge, so [ci-fail]+re-nudge is pure noise. We
+        // `continue` WITHOUT advancing the dedup/tracking state below, so each poll
+        // re-evaluates — a LATER required failure on this same sha is never hidden
+        // (the lead's hard rule). fail-OPEN: only a definitive Some(false) suppresses;
+        // None (no open PR / API error / no rollup) falls through to the normal emit.
+        if conclusion == Some("failure")
+            && provider.required_check_failed(ctx.repo, ctx.branch).await == Some(false)
+        {
+            tracing::debug!(
+                repo = ctx.repo,
+                branch = ctx.branch,
+                sha = %sha,
+                "#t-29025-19: suppressing [ci-fail] — only non-required check(s) failed (merge not blocked)"
+            );
             continue;
         }
 

@@ -986,6 +986,11 @@ struct MockCiProvider {
     mergeable: Mutex<MergeableState>,
     /// #1326: per-run_id job lists for early-fail testing.
     jobs: Mutex<std::collections::HashMap<u64, Vec<super::CiJob>>>,
+    /// #t-29025-19: pre-seeded `required_check_failed` answer. Defaults to
+    /// `None` (fail-open) so existing tests are unaffected — a failure still
+    /// emits `[ci-fail]`. Tests targeting the required-only gate set this via
+    /// `with_required_failed`.
+    required_failed: Mutex<Option<bool>>,
 }
 
 impl MockCiProvider {
@@ -1000,6 +1005,7 @@ impl MockCiProvider {
             failure_summary: Mutex::new("Build / Test".to_string()),
             mergeable: Mutex::new(MergeableState::Unknown),
             jobs: Mutex::new(std::collections::HashMap::new()),
+            required_failed: Mutex::new(None),
         }
     }
 
@@ -1018,6 +1024,7 @@ impl MockCiProvider {
             failure_summary: Mutex::new("Build / Test".to_string()),
             mergeable: Mutex::new(MergeableState::Unknown),
             jobs: Mutex::new(std::collections::HashMap::new()),
+            required_failed: Mutex::new(None),
         }
     }
 
@@ -1032,6 +1039,7 @@ impl MockCiProvider {
             failure_summary: Mutex::new("Build / Test".to_string()),
             mergeable: Mutex::new(MergeableState::Unknown),
             jobs: Mutex::new(std::collections::HashMap::new()),
+            required_failed: Mutex::new(None),
         }
     }
 
@@ -1067,6 +1075,15 @@ impl MockCiProvider {
         self.jobs.lock().insert(run_id, jobs);
         self
     }
+
+    /// #t-29025-19: seed the `required_check_failed` answer for the
+    /// required-only `[ci-fail]` gate. `Some(false)` = no required check
+    /// failing (suppress), `Some(true)` = a required check failed (emit),
+    /// `None` = undeterminable (fail-open → emit).
+    fn with_required_failed(self, answer: Option<bool>) -> Self {
+        *self.required_failed.lock() = answer;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -1086,6 +1103,9 @@ impl CiProvider for MockCiProvider {
     }
     async fn fetch_run_jobs(&self, _repo: &str, run_id: u64) -> Vec<super::CiJob> {
         self.jobs.lock().get(&run_id).cloned().unwrap_or_default()
+    }
+    async fn required_check_failed(&self, _repo: &str, _branch: &str) -> Option<bool> {
+        *self.required_failed.lock()
     }
     fn token_warning(&self) -> Option<&'static str> {
         None
@@ -1485,6 +1505,7 @@ fn mock_rate_limit_writes_backoff_and_propagates_error() {
         failure_summary: Mutex::new(String::new()),
         mergeable: Mutex::new(MergeableState::Unknown),
         jobs: Mutex::new(std::collections::HashMap::new()),
+        required_failed: Mutex::new(None),
     };
     let result = run_ci_check(&dir, &base_watch(), &provider);
     assert!(result.is_err(), "rate-limit must propagate as error");
@@ -5576,6 +5597,153 @@ fn empty_run_poll_does_not_refresh_expires_at_1750() {
     assert_eq!(
         new_expires, old_expires,
         "empty-run poll must NOT refresh expires_at (#1750 A2) — leave the watch to age out"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- #t-29025-19 required-only [ci-fail] gate ---
+// The aggregate can read "failure" purely from a NON-required check (e.g.
+// Coverage — a non-required job inside the required CI workflow). That doesn't
+// block merge, so [ci-fail]+re-nudge is pure noise. The gate asks GitHub which
+// checks are required (provider::required_check_failed) and suppresses only on a
+// definitive "no required check failed". fail-OPEN on None (query miss).
+
+/// One terminal failing run (the aggregate → "failure", so the terminal Site-1
+/// path would emit `[ci-fail]` unless the required-gate suppresses it).
+fn req_gate_failure_runs() -> Vec<CiRun> {
+    vec![CiRun {
+        run_attempt: 1,
+        id: 800,
+        conclusion: Some("failure".into()),
+        head_sha: "ff00aa".into(),
+        url: "https://example.com/800".into(),
+        name: "CI".into(),
+    }]
+}
+
+#[test]
+fn required_gate_nonrequired_only_failure_suppresses_ci_fail() {
+    // ① only a non-required check (Coverage) failed → NO [ci-fail].
+    let dir = tmp_dir("reqgate-suppress");
+    let provider =
+        MockCiProvider::with_runs(req_gate_failure_runs()).with_required_failed(Some(false));
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    let content =
+        std::fs::read_to_string(dir.join("inbox").join("agent1.jsonl")).unwrap_or_default();
+    assert!(
+        !content.contains("[ci-fail]"),
+        "#t-29025-19: only-non-required failure must NOT emit [ci-fail]; inbox:\n{content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn required_gate_required_failure_still_emits_ci_fail() {
+    // ② a required check failed → [ci-fail] as before.
+    let dir = tmp_dir("reqgate-required");
+    let provider =
+        MockCiProvider::with_runs(req_gate_failure_runs()).with_required_failed(Some(true));
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    let content =
+        std::fs::read_to_string(dir.join("inbox").join("agent1.jsonl")).unwrap_or_default();
+    assert!(
+        content.contains("[ci-fail]"),
+        "#t-29025-19: a required-check failure MUST still emit [ci-fail]; inbox:\n{content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn required_gate_unknown_fails_open_emits_ci_fail() {
+    // ③ undeterminable (no open PR / API error / no rollup) → fail-OPEN: emit.
+    let dir = tmp_dir("reqgate-failopen");
+    let provider = MockCiProvider::with_runs(req_gate_failure_runs()).with_required_failed(None);
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    let content =
+        std::fs::read_to_string(dir.join("inbox").join("agent1.jsonl")).unwrap_or_default();
+    assert!(
+        content.contains("[ci-fail]"),
+        "#t-29025-19: undeterminable required-status must FAIL-OPEN and emit [ci-fail]; inbox:\n{content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// In-progress run with a failed NON-required job → exercises the early-fail
+/// (Site-2) path of the same gate.
+fn req_gate_early_provider() -> MockCiProvider {
+    use super::CiJob;
+    MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: 900,
+        conclusion: None,
+        head_sha: "ee11bb".into(),
+        url: "https://example.com/900".into(),
+        name: "CI".into(),
+    }])
+    .with_jobs(
+        900,
+        vec![
+            CiJob {
+                name: "Coverage".into(),
+                conclusion: Some("failure".into()),
+            },
+            CiJob {
+                name: "Check (ubuntu)".into(),
+                conclusion: None,
+            },
+        ],
+    )
+}
+
+#[test]
+fn required_gate_early_nonrequired_only_suppresses() {
+    // ① early-fail on a non-required job + no required failing → NO [ci-fail],
+    // and dedup state is NOT persisted (so a later required failure re-evaluates).
+    let dir = tmp_dir("reqgate-early-suppress");
+    let provider = req_gate_early_provider().with_required_failed(Some(false));
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    let content =
+        std::fs::read_to_string(dir.join("inbox").join("agent1.jsonl")).unwrap_or_default();
+    assert!(
+        !content.contains("[ci-fail]"),
+        "#t-29025-19: early-fail on only-non-required job must NOT emit [ci-fail]; inbox:\n{content}"
+    );
+    let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert!(
+        updated["early_fail_notified_sha"].is_null(),
+        "#t-29025-19: suppression must NOT persist early_fail_notified_sha (re-evaluate next poll so a later required failure is never hidden)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn required_gate_early_required_failure_emits() {
+    // ② early-fail with a required check failing → [ci-fail].
+    let dir = tmp_dir("reqgate-early-required");
+    let provider = req_gate_early_provider().with_required_failed(Some(true));
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    let content =
+        std::fs::read_to_string(dir.join("inbox").join("agent1.jsonl")).unwrap_or_default();
+    assert!(
+        content.contains("[ci-fail]"),
+        "#t-29025-19: early-fail with a required-check failure MUST emit [ci-fail]; inbox:\n{content}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn required_gate_early_unknown_fails_open() {
+    // ③ undeterminable on the early path → fail-OPEN: emit.
+    let dir = tmp_dir("reqgate-early-failopen");
+    let provider = req_gate_early_provider().with_required_failed(None);
+    run_ci_check(&dir, &base_watch(), &provider).unwrap();
+    let content =
+        std::fs::read_to_string(dir.join("inbox").join("agent1.jsonl")).unwrap_or_default();
+    assert!(
+        content.contains("[ci-fail]"),
+        "#t-29025-19: undeterminable required-status must FAIL-OPEN on the early path; inbox:\n{content}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
