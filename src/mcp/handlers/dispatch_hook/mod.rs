@@ -562,7 +562,15 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 .and_then(|s| canonicalize_repo_slug(&s))
         })
         .or_else(|| derive_repo_from_remote(&source_repo));
-    if let Some(r) = resolved_repo {
+    // #2158 GR1: ONLY a real DISPATCH auto-arms ci_watch. A dispatch always carries a
+    // task_id (send kind=task rejects an empty one — comms_gates/anti_stall.rs), so
+    // gating the arm on a non-empty task_id arms every legit dispatch while skipping
+    // OUT-OF-DISPATCH self-claims that reach here with task_id="" — namely `bind_self`
+    // without a task. This is the SECOND silent-arm path (the first, checkout.rs's
+    // inline arm, was removed); both were the #2158 silent-arm blast. Same task_id
+    // gate as the out-of-dispatch operator-notify in `bind_full`. The bind/lease above
+    // is unaffected — only the convenience auto-watch is gated.
+    if let Some(r) = resolved_repo.filter(|_| !task_id.is_empty()) {
         // #931 Fix 2 (H5a): when the dispatcher declared a workflow chain
         // via `next_after_ci` (e.g. lead → dev with reviewer as the next
         // step), propagate it into the auto-armed watch so the daemon's

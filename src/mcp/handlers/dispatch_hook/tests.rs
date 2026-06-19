@@ -1590,6 +1590,81 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #2158 GR1: the auto-watch arm is gated on a non-empty task_id. An OUT-OF-DISPATCH
+/// self-claim — `bind_self` reaches `dispatch_auto_bind_lease_with_source` with
+/// task_id="" — must NOT arm a ci_watch (the second silent-arm path r4 caught; the
+/// first, checkout.rs's inline arm, was already removed). A REAL dispatch always
+/// carries a task_id (send kind=task rejects an empty one) → STILL arms — proving the
+/// gate doesn't kill legit dispatch arming (companion to the existing #931/#1877 arm
+/// tests).
+#[test]
+#[cfg(unix)]
+fn out_of_dispatch_bind_self_does_not_arm_watch_but_dispatch_does_2158_gr1() {
+    let mk_parent = |tag: &str| {
+        std::env::temp_dir().join(format!(
+            "agend-2158-gr1-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    };
+
+    // (a) OUT-OF-DISPATCH: bind_self path with task_id="" → bind succeeds, NO arm.
+    let parent_a = mk_parent("noarm");
+    let (home_a, _c) = p781_canonical_with_team_source_repo(
+        &parent_a,
+        "feat/gr1-noarm",
+        true,
+        "val",
+        &["val-dev"],
+    );
+    let r = super::dispatch_auto_bind_lease_with_source(
+        &home_a,
+        "val-dev",
+        "", // out-of-dispatch
+        "feat/gr1-noarm",
+        None,
+        None,
+    );
+    assert!(
+        r.is_ok(),
+        "out-of-dispatch bind must still succeed (bind/lease unaffected): {:?}",
+        r.err()
+    );
+    let watch_a = crate::daemon::ci_watch::ci_watches_dir(&home_a).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/gr1-noarm"),
+    );
+    assert!(
+        !watch_a.exists(),
+        "#2158 GR1: out-of-dispatch self-claim (task_id=\"\") must NOT arm ci_watch"
+    );
+    std::fs::remove_dir_all(&parent_a).ok();
+
+    // (b) REAL DISPATCH: same path, non-empty task_id → STILL arms.
+    let parent_b = mk_parent("arm");
+    let (home_b, _c) =
+        p781_canonical_with_team_source_repo(&parent_b, "feat/gr1-arm", true, "val", &["val-dev"]);
+    let r2 = super::dispatch_auto_bind_lease_with_source(
+        &home_b,
+        "val-dev",
+        "T-gr1-arm", // real dispatch
+        "feat/gr1-arm",
+        None,
+        None,
+    );
+    assert!(r2.is_ok(), "dispatch bind must succeed: {:?}", r2.err());
+    let watch_b = crate::daemon::ci_watch::ci_watches_dir(&home_b).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/gr1-arm"),
+    );
+    assert!(
+        watch_b.exists(),
+        "a real dispatch (task_id set) must STILL arm ci_watch (gate must not kill legit arming)"
+    );
+    std::fs::remove_dir_all(&parent_b).ok();
+}
+
 /// #1877 §3.9 + regression guard: EVERY MCP-accepted dispatch directive must
 /// reach the auto-armed watch together. This re-marshal-drop class has recurred
 /// 4× — #931 (next_after_ci), #1031 (task_id), #1877 (review_class from a

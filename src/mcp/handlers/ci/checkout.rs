@@ -258,13 +258,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     });
                 }
                 // #2158 GR1 (operator-approved): a self-claimed `repo action=checkout
-                // bind=true` no longer SILENTLY arms a ci_watch. The silent auto-arm
-                // was part of the #2158 incident blast — a transient sub-agent (sharing
-                // the primary's identity) self-claiming a worktree also armed a watch
-                // the operator never asked for. The daemon's DISPATCH path
-                // (`dispatch_hook`) is a SEPARATE code path and STILL arms ci_watch for
-                // normal task delegation — it is untouched. A self-claiming agent that
-                // wants CI notifications must now arm it explicitly via `ci action=watch`.
+                // bind=true` no longer SILENTLY arms a ci_watch — neither here (this
+                // inline arm is removed) NOR via the shared dispatch_hook path (the
+                // companion `bind_self` self-claim reached `handle_watch_ci` there with
+                // task_id="" — now gated on a non-empty task_id). The silent auto-arm was
+                // part of the #2158 incident blast: a transient sub-agent (sharing the
+                // primary's identity) self-claiming a worktree also armed a watch the
+                // operator never asked for. The daemon DISPATCH path (which always carries
+                // a task_id) STILL arms for normal task delegation. A self-claiming agent
+                // that wants CI notifications must arm explicitly via `ci action=watch`.
                 resp["bound"] = json!(true);
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
