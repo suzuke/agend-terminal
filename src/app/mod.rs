@@ -217,6 +217,29 @@ fn should_draw(
     }
 }
 
+/// #84833-15 R2 perf: `sync_notification_state` scans the notification-queue dir
+/// (`read_dir` + `read_to_string` per pane) on EVERY render wakeup just to refresh
+/// the tab/title `[N]` badge — a disk-I/O storm under the same wakeup flood the
+/// frame cap addresses. The badge tolerates ≥1s staleness, so throttle the scan to
+/// once per second (the sibling idle-flush is already ≥1s-gated). This is independent
+/// of #2346's draw cap: the scan runs at the loop-body TOP, before `should_draw`.
+const NOTIF_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Pure throttle decision (the test seam), mirroring `should_draw`: may we re-scan
+/// the notification queues now? `None` = never scanned (scan the first frame so the
+/// badge is correct at startup); otherwise only once `NOTIF_SYNC_INTERVAL` has
+/// elapsed since the last scan.
+fn should_sync_notifications(
+    last_sync: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last_sync {
+        None => true,
+        Some(t) => now.duration_since(t) >= interval,
+    }
+}
+
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
     let home = crate::home_dir();
     // #2325: the app process (unlike the daemon's `run_core`, the only other
@@ -566,6 +589,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // refresh cadence instead of busy-drawing at 30 fps.
     let mut last_draw: Option<std::time::Instant> = None;
     let mut dirty = true;
+    // #84833-15 R2 perf: stamps the last notification-queue disk scan so it runs at
+    // most once per `NOTIF_SYNC_INTERVAL` instead of once per wakeup (see
+    // `should_sync_notifications`). Mirrors `last_draw`'s frame-cap state.
+    let mut last_notif_sync: Option<std::time::Instant> = None;
 
     loop {
         if crate::bootstrap::signals::term_requested() {
@@ -593,7 +620,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             let _ = terminal.clear();
             needs_resize = false;
         }
-        sync_notification_state(&home, &mut layout);
+        // #84833-15 R2 perf: throttle the per-wakeup notification-queue disk scan to
+        // ≥1s (the badge it feeds tolerates staleness); see `should_sync_notifications`.
+        let notif_now = std::time::Instant::now();
+        if should_sync_notifications(last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
+            last_notif_sync = Some(notif_now);
+            sync_notification_state(&home, &mut layout);
+        }
         // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm).
         // std::sync::Mutex is fine here: only the main thread touches this,
         // the critical section is sub-microsecond, and the TUI render loop is
@@ -1859,6 +1892,52 @@ mod tests {
         assert!(
             draws >= 3,
             "but should still draw a few times across 100ms, got {draws}"
+        );
+    }
+
+    /// #84833-15 R2 perf: the notification-queue disk-scan count under a wakeup flood
+    /// is bounded by `NOTIF_SYNC_INTERVAL` (≥1s), not by the number of wakeups. A burst
+    /// of M wakeups inside one <1s window must yield exactly ONE scan (pre-fix = M);
+    /// crossing the ≥1s boundary admits exactly one more. Deterministic via constructed
+    /// `Instant`s (no wall-clock timing), threading `last_sync` like the render loop.
+    #[test]
+    fn notif_sync_throttle_bounds_disk_scans_per_window() {
+        use std::time::{Duration, Instant};
+        let interval = Duration::from_secs(1);
+        let t0 = Instant::now();
+
+        // First-frame semantics: never-scanned ⇒ scan now (badge correct at startup).
+        assert!(
+            should_sync_notifications(None, t0, interval),
+            "first frame always scans so the startup badge is correct"
+        );
+
+        // 200 wakeups packed into ~900ms (one <1s window) → exactly ONE scan.
+        let mut last_sync: Option<Instant> = None;
+        let mut scans = 0u32;
+        for i in 0..200u64 {
+            let now = t0 + Duration::from_micros(i * 4500); // ~900ms total, all < 1s
+            if should_sync_notifications(last_sync, now, interval) {
+                scans += 1;
+                last_sync = Some(now);
+            }
+        }
+        assert_eq!(
+            scans, 1,
+            "a wakeup burst within one <1s window must scan exactly once, got {scans}"
+        );
+
+        // Crossing the ≥1s boundary admits exactly one more scan...
+        let after = t0 + Duration::from_millis(1000);
+        assert!(
+            should_sync_notifications(last_sync, after, interval),
+            "≥1s since last scan → scan again"
+        );
+        last_sync = Some(after);
+        // ...and the next sub-1s wakeup is throttled again.
+        assert!(
+            !should_sync_notifications(last_sync, after + Duration::from_millis(500), interval),
+            "0.5s after the last scan → throttled"
         );
     }
 
