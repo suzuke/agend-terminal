@@ -136,7 +136,9 @@ tracing-appender = "0.2"
 arboard = "3.6.1"
 unicode-width = "0.2"
 which = "8"
-sysinfo = "0.39"
+# #2288 re-bumped sysinfo 0.38→0.39.3, which requires rustc 1.95 and broke the
+# v0.9.0 release MSRV (1.88) gate. Re-pinned to 0.38 (MSRV 1.88) — see [0.9.0].
+sysinfo = "0.38"
 # Crypto-grade random for API-connection cookie (P1-10)
 getrandom = "0.4"
 iana-time-zone = "0.1.65"

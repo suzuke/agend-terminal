@@ -26,7 +26,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **Faster, smoother restarts** — app-mode shutdown teardown is parallelized (~6 s → the grace window, #2311); the old-exit→new-launch gap and restart timing are instrumented (#2310, #2275); release builds use ThinLTO + more codegen units (#2265).
 - **Canonical worktree reconcile (#2234 — flag-gated, default OFF)** — reconcile `workspace/<agent>` into canonical git worktrees (#2262), with layout-aware GC + agent attribution (#2263, #2266, #2269), in-place dispatch checkout (#2264), reconcile-backups retention GC (#2272), and a reverse-reconcile rollback primitive (#2267). The `agend-git` shim warns on cwd↔worktree drift (#2254, #2278) and now DENIES an agent's `AGEND_GIT_BYPASS` provisioning op in a canonical-rooted repo (#2316) — the deny now sees through a leading `-C` to resolve the real subcommand and effective cwd, so `git -C <canonical> worktree add` is denied from any cwd (#2336), and its message reads as a conditional for no-branch dispatches that have no auto-bound worktree (#2334).
 - **Governance gates mechanized** — repeatedly hand-checked review rules became invariant tests: state files must use `store::atomic_write` (D2, #2323) and instrument/audit paths must never affect control-flow or exit code (D3, #2324); three protocol rules + a context-full self-restart procedure were formalized (#2329, #2157).
-- **Dependency bumps** — crossterm 0.29, sysinfo 0.39, regex, serde_json, insta (#2285–#2289).
+- **Dependency bumps** — crossterm 0.29, regex, serde_json, insta (#2285–#2289).
 
 ### Fixed
 
