@@ -218,6 +218,31 @@ jobs:
           path: target/release/agend-terminal.exe
           retention-days: 14
 
+  # #2288/#2339: MSRV gate in REGULAR CI (root-fix for the Dependabot-raises-MSRV
+  # class). release.yml's Pre-release gate runs this too, but only at TAG time —
+  # so a dep bump that silently raises the floor (sysinfo 0.39.3 → needs rustc
+  # 1.95) passed every PR's CI and only blew up at `git tag v0.9.0`. Running it on
+  # each PR fails the offending bump at PR time instead. Mirrors the release-gate
+  # step exactly (dtolnay 1.88 + `cargo +1.88 check --locked`); default features
+  # only (matches the release gate — `tray` needs GTK and is covered by the
+  # `check` matrix). NO path-filter: a required check that path-skips stays
+  # permanently `pending` and blocks merge. release.yml's MSRV step is unchanged —
+  # the two gates are independent and the release gate stays the final backstop.
+  msrv:
+    name: MSRV check (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-msrv-1.88
+      - name: MSRV check (1.88)
+        run: cargo +1.88 check --locked
+
   audit:
     runs-on: ubuntu-latest
     # rustsec/audit-check@v2 POSTs results to /repos/.../check-runs to surface
