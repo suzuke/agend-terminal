@@ -273,8 +273,89 @@ pub fn bind_full(
                 crate::event_log::caller_process_context()
             ),
         );
+        // #2158 GR1: a binding CREATE/CHANGE with NO task_id is OUT-OF-DISPATCH (a
+        // self-claim `repo checkout bind:true` or a `bind_self` without a task) —
+        // exactly the first-bind-hijack / accidental-sub-agent vector guard-b cannot
+        // prevent (identity-indistinguishable). Surface it to the operator, ONCE per
+        // (agent, branch), so an unexpected rebind is NOTICED. The daemon dispatch
+        // path always carries a task_id, so normal delegation is unaffected.
+        if task_id.is_empty() {
+            notify_operator_out_of_dispatch_bind(
+                home,
+                agent,
+                branch,
+                &wt_str,
+                prev_branch.as_deref(),
+            );
+        }
     }
     Ok(())
+}
+
+/// #2158 GR1: surface an OUT-OF-DISPATCH binding CREATE/CHANGE (no task_id) to the
+/// operator — the realistic accidental-sub-agent / first-bind-hijack vector that
+/// guard-b can't prevent. Dedup is per `(agent, branch)` via a runtime-dir sidecar
+/// so a stable or re-applied binding never re-notifies (fire-once). Honest about
+/// attribution: the daemon CANNOT name the caller — a transient Claude Code Task
+/// sub-agent shares the primary's `instance_name` AND its process, so neither
+/// `instance_name` nor a pid separates them (the binding audit's
+/// `caller_process_context` is daemon-side regardless). Best-effort + file-based
+/// (the same `inbox::notify_agent` primitive as `canonical_auto_stash`); never
+/// blocks and runs under the caller's binding lock, so no network/no spawn.
+fn notify_operator_out_of_dispatch_bind(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    wt_str: &str,
+    prev_branch: Option<&str>,
+) {
+    let sidecar = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join(".out_of_dispatch_notified");
+    // Dedup: skip if this (agent, branch) was already surfaced.
+    if let Ok(seen) = std::fs::read_to_string(&sidecar) {
+        if seen.lines().any(|l| l == branch) {
+            return;
+        }
+    }
+    // Mark BEFORE notifying so a delivery hiccup can't drive a re-notify loop.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sidecar)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{branch}");
+    }
+    // Distinct, greppable marker (also the regression-test hook) — separate from the
+    // always-on `binding_changed` audit above.
+    crate::event_log::log(
+        home,
+        "binding_out_of_dispatch",
+        agent,
+        &format!(
+            "branch={branch} worktree={wt_str} prev_branch={}",
+            prev_branch.unwrap_or("<none>")
+        ),
+    );
+    // Operator-visible delivery (best-effort, file-based inbox to the operator-mapped
+    // `general` agent — mirrors `canonical_auto_stash`).
+    let was = prev_branch
+        .map(|p| format!(", was `{p}`"))
+        .unwrap_or_default();
+    let text = format!(
+        "[system:binding_out_of_dispatch] instance `{agent}` bound to branch `{branch}`{was} \
+         OUTSIDE a task dispatch (no task_id). If unexpected, a transient sub-agent or a \
+         self-claim may have moved this instance's worktree. The daemon CANNOT name the exact \
+         caller — a Task sub-agent shares the primary's identity and process. Inspect with \
+         `binding_state instance={agent}`; undo with `release_worktree`. (#2158 GR1)"
+    );
+    crate::inbox::notify_agent(
+        home,
+        "general",
+        &crate::inbox::NotifySource::System("binding_out_of_dispatch"),
+        &text,
+    );
 }
 
 /// #1651: the HMAC sidecar path for a binding dir. The agend-git shim hard-codes
@@ -1287,6 +1368,59 @@ mod tests {
         assert!(
             log.contains("pid="),
             "audit lines must carry caller process context: {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2158 GR1: out-of-dispatch bind → operator-visible, fire-once ────────
+
+    /// An OUT-OF-DISPATCH bind (no task_id) surfaces a distinct
+    /// `binding_out_of_dispatch` marker and DEDUPS per (agent, branch): a repeated
+    /// CHANGE on the SAME branch (here a new worktree path) must NOT re-surface
+    /// (fire-once, no flood).
+    #[test]
+    fn out_of_dispatch_bind_surfaces_once_per_branch_2158_gr1() {
+        let home = tmp_home("gr1-once");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt2 = home.join("wt2");
+        std::fs::create_dir_all(&wt2).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // first out-of-dispatch bind (no task_id) → surfaced.
+        bind_full(&home, "ag", "", "feat/x", &wt, &src).expect("first out-of-dispatch bind");
+        // SAME branch, different worktree → changed=true again, but dedup suppresses.
+        bind_full(&home, "ag", "", "feat/x", &wt2, &src).expect("same-branch rebind allowed");
+
+        let log = read_event_log(&home);
+        assert_eq!(
+            log.matches("binding_out_of_dispatch").count(),
+            1,
+            "out-of-dispatch bind must surface exactly once per (agent, branch): {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A DISPATCH bind (task_id present — the normal delegation path) must NOT
+    /// surface the out-of-dispatch operator notify; only the always-on
+    /// `binding_changed` audit fires.
+    #[test]
+    fn dispatch_bind_does_not_surface_out_of_dispatch_2158_gr1() {
+        let home = tmp_home("gr1-dispatch");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "ag", "T-1", "feat/x", &wt, &src).expect("dispatch bind ok");
+        let log = read_event_log(&home);
+        assert!(
+            log.contains("binding_changed"),
+            "a dispatch bind is still audited: {log}"
+        );
+        assert!(
+            !log.contains("binding_out_of_dispatch"),
+            "a dispatch bind (task_id set) must NOT surface as out-of-dispatch: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

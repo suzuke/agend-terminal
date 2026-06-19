@@ -727,72 +727,18 @@ fn p778_setup_source_repo(parent: &Path, branch: &str) -> std::path::PathBuf {
     repo
 }
 
-#[test]
-#[cfg(unix)]
-fn checkout_bind_true_no_longer_auto_derives_next_after_ci_pr2() {
-    // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1040/#1037
-    // `<team>-reviewer` auto-derive was REMOVED from the dev-self-claim checkout
-    // path too (consistent decouple with the dispatch side). A self-claimed
-    // `repo action=checkout bind=true` now arms the watch with `next_after_ci`
-    // UNSET → on CI pass the dev (a subscriber) gets the informational `[ci-pass]`;
-    // the actionable `[ci-ready-for-action]` review handoff is now EXPLICIT
-    // (lead dispatches the reviewer, or an explicit `next_after_ci`), not a silent
-    // naming-convention auto-handoff.
-    let home = p778_tmp_home("1040-derive");
-    let parent = p778_tmp_home("1040-derive-src");
-    let source = p778_setup_source_repo(&parent, "feat/1040-derive");
-    let agent = "val-dev";
-
-    // Seed fleet.yaml with team `val` containing `val-dev` + `val-reviewer`.
-    // The auto-derive scans the target's team for a `*-reviewer` member.
-    let yaml = format!(
-        "instances: {{}}\nteams:\n  val:\n    members:\n      - val-dev\n      - val-reviewer\n    source_repo: {}\n",
-        source.display()
-    );
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
-
-    let resp = super::handle_checkout_repo(
-        &home,
-        &serde_json::json!({
-            "repository_path": source.display().to_string(),
-            "branch": "feat/1040-derive",
-            "bind": true,
-        }),
-        agent,
-    );
-    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
-
-    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
-        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/1040-derive"),
-    );
-    assert!(watch_path.exists(), "ci-watch sidecar must be armed");
-
-    let watch: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
-            .expect("parse watch");
-    assert!(
-        watch["next_after_ci"].as_str().is_none(),
-        "PR-2: checkout-bound watch must NOT auto-derive next_after_ci from the \
-         `<team>-reviewer` convention (explicit-only now). Got: {watch}"
-    );
-    // The dev (armer) stays a subscriber → it receives [ci-pass] on CI pass.
-    let subscriber_names: Vec<&str> = watch["subscribers"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|s| s["instance"].as_str()).collect())
-        .unwrap_or_default();
-    assert!(
-        subscriber_names.contains(&"val-dev"),
-        "dev (armer) must remain a subscriber (for [ci-pass]). Got: {watch}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&parent).ok();
-}
+// #2158 GR1: `checkout_bind_true_no_longer_auto_derives_next_after_ci_pr2` was
+// DELETED here — it asserted a self-claim `repo checkout bind:true` armed a watch
+// (without next_after_ci). GR1 removes that silent self-claim auto-arm entirely, so
+// the test's whole premise (a self-claim watch sidecar) no longer exists; the new
+// "no longer arms" behavior is pinned by the test just below.
 
 #[test]
 #[cfg(unix)]
-fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
-    // Empirical regression-proof anchor for #778 Option 1.
+fn checkout_bind_true_writes_binding_marker_and_no_longer_arms_watch_2158_gr1() {
+    // Empirical regression-proof anchor for #778 Option 1 (bind / marker / HEAD),
+    // now ALSO pinning #2158 GR1: the dev-self-claim path NO LONGER auto-arms a
+    // ci_watch. The daemon DISPATCH path still arms (dispatch_hook tests).
     let home = p778_tmp_home("ok");
     let parent = p778_tmp_home("ok-src-parent");
     let source = p778_setup_source_repo(&parent, "feat/p778");
@@ -835,13 +781,19 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
         "atomic bind must record empty task_id (no sentinel)"
     );
 
-    // Auto-watch_ci must have been armed via derive_repo_from_remote_pub.
+    // #2158 GR1: the dev-self-claim `repo checkout bind:true` must NO LONGER
+    // auto-arm ci_watch — no sidecar for the derived repo+branch.
     let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
         crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p778"),
     );
     assert!(
-        watch_path.exists(),
-        "watch_ci must be armed for derived repo on bind:true"
+        !watch_path.exists(),
+        "#2158 GR1: self-claim checkout bind:true must NOT auto-arm ci_watch"
+    );
+    assert_eq!(
+        resp["ci_watch_armed"].as_bool(),
+        Some(false),
+        "self-claim checkout must report ci_watch_armed:false: {resp}"
     );
 
     // HEAD must be on the named branch (NOT detached). Verifies the
@@ -1628,15 +1580,14 @@ fn checkout_bind_true_auto_create_path_preserves_779_tail_ops() {
     assert_eq!(v["branch"].as_str(), Some("feat/p780-tail"));
     assert_eq!(v["task_id"].as_str(), Some(""));
 
-    // ci_watch arming uses derive_repo_from_remote_pub on origin URL —
-    // the fixture's `https://github.com/owner/repo.git` resolves to
-    // `owner/repo`.
+    // #2158 GR1: the self-claim path (including the auto-create branch case) no
+    // longer auto-arms ci_watch — no sidecar for the derived repo+branch.
     let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
         crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p780-tail"),
     );
     assert!(
-        watch_path.exists(),
-        "watch_ci must be armed on auto-create path"
+        !watch_path.exists(),
+        "#2158 GR1: self-claim auto-create path must NOT auto-arm ci_watch"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -1798,56 +1749,11 @@ fn handle_watch_ci_atomic_write_failure_returns_error_field() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-#[test]
-#[cfg(unix)]
-fn checkout_bind_true_watch_ci_failure_surfaces_warning() {
-    // Test 2 (depends on Piece 3 hardening landed in C3): pre-create
-    // ci-watches as a regular file. handle_watch_ci's site-A hardening
-    // returns `{error, code: ci_watches_dir_create_failed}`. handle_
-    // checkout_repo captures it into `warnings: ["watch_ci: ... (code=ci_watches_dir_create_failed)"]`.
-    // `bound: true` MUST still hold (lease succeeded).
-    let home = p778_tmp_home("779p2-watch-warn");
-    let parent = p778_tmp_home("779p2-watch-warn-src");
-    let source = p778_setup_source_repo(&parent, "feat/p779p2-watch");
-    let agent = "p779p2-agent-watch-warn";
-
-    // Block ci-watches dir create by pre-creating the path as a file.
-    let ci_watches = crate::daemon::ci_watch::ci_watches_dir(&home);
-    if let Some(p) = ci_watches.parent() {
-        std::fs::create_dir_all(p).ok();
-    }
-    std::fs::write(&ci_watches, "blocking file (not a dir)").unwrap();
-
-    let resp = super::handle_checkout_repo(
-        &home,
-        &serde_json::json!({
-            "repository_path": source.display().to_string(),
-            "branch": "feat/p779p2-watch",
-            "bind": true,
-        }),
-        agent,
-    );
-
-    assert_eq!(
-        resp["bound"].as_bool(),
-        Some(true),
-        "lease success → bound=true must hold despite watch_ci failure: {resp}"
-    );
-    let warnings = resp["warnings"]
-        .as_array()
-        .expect("warnings array must be present when watch_ci failed");
-    let watch_warning = warnings
-        .iter()
-        .find_map(|w| w.as_str().filter(|s| s.starts_with("watch_ci:")))
-        .expect("warnings must contain a `watch_ci:` prefix entry");
-    assert!(
-        watch_warning.contains("code=ci_watches_dir_create_failed"),
-        "watch_ci warning must surface the canonical code: {watch_warning}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&parent).ok();
-}
+// #2158 GR1: `checkout_bind_true_watch_ci_failure_surfaces_warning` was DELETED
+// here — it injected a ci-watches-dir failure and asserted the self-claim checkout
+// surfaced a `watch_ci:` warning. GR1 removes the self-claim watch auto-arm entirely,
+// so there is no watch_ci call to fail and no such warning. (The dispatch path's
+// watch-arm error handling is covered by dispatch_hook's `auto_watch_arm_error` test.)
 
 #[test]
 #[cfg(unix)]

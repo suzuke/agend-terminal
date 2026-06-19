@@ -45,11 +45,15 @@ fn rotate(base: &Path) {
     let _ = std::fs::rename(base, &first);
 }
 
-/// #2158 PR2: best-effort caller PROCESS context for binding / bypass audit lines
-/// — `pid`, parent `ppid`, and `cwd`. A transient sub-agent shares the primary's
-/// `instance_name` (so it can't be ATTRIBUTED to "sub-agent vs primary"), but it
-/// has its own pid/ppid/cwd — enough to trace an unexpected binding change to a
-/// process tree post-facto. ppid is unix-only (`libc::getppid`); `-1` elsewhere.
+/// #2158 PR2: best-effort PROCESS context for binding / bypass audit lines —
+/// `pid`, parent `ppid`, and `cwd`. ppid is unix-only (`libc::getppid`); `-1` else.
+///
+/// #2158 GR1 CAVEAT (verified): this captures the context of WHOEVER CALLS it. All
+/// current call sites (`bind_full`, `git_helpers`) run DAEMON-side (MCP handler →
+/// `execute_tool`), so the captured pid/ppid/cwd is the DAEMON's, NOT the calling
+/// agent's — it does NOT attribute a binding change to a caller. Even agent-side
+/// context wouldn't separate a transient Task sub-agent from the primary (they
+/// share one process). Treat these audit fields as daemon-side, not caller identity.
 pub(crate) fn caller_process_context() -> String {
     let pid = std::process::id();
     let cwd = std::env::current_dir()
