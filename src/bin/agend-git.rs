@@ -377,11 +377,20 @@ fn is_protected_ref(branch: &str) -> bool {
 /// — the previous name's "worktree" suffix was misleading after
 /// broadening since the canonical source repo isn't a worktree.
 fn cwd_is_canonical_rooted() -> bool {
-    let cwd = match env::current_dir() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let dot_git = cwd.join(".git");
+    match env::current_dir() {
+        Ok(cwd) => path_is_canonical_rooted(&cwd),
+        Err(_) => false,
+    }
+}
+
+/// #2234 Patch A: the canonical-rooted test for an ARBITRARY directory, so a
+/// `git -C <path>` op can be judged against the dir git WOULD operate in rather
+/// than the shim's process cwd. Extracted verbatim from `cwd_is_canonical_rooted`
+/// (which now delegates with the process cwd — its behavior is byte-identical).
+/// `<dir>/.git` is a DIR (canonical source repo) or a FILE (linked worktree)
+/// whose origin config carries `[remote "origin"]`.
+fn path_is_canonical_rooted(dir: &Path) -> bool {
+    let dot_git = dir.join(".git");
     let meta = match std::fs::metadata(&dot_git) {
         Ok(m) => m,
         Err(_) => return false,
@@ -812,6 +821,44 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
         }
     }
     None
+}
+
+/// #2234 Patch A: the directory git WOULD operate in after applying the leading
+/// global `-C <path>` option(s). git chdir's for each `-C`, and multiple are
+/// cumulative — a non-absolute `-C` is relative to the path accumulated so far.
+/// Only the global region `[0, sub_idx)` is walked (a post-subcommand `-C`, e.g.
+/// `git commit -C <commit>` = reuse-message, is an unrelated option). Other
+/// value-taking globals are skipped WITH their value (mirrors `subcommand_index`)
+/// so their argument is never mistaken for a `-C` target. Starts from the process
+/// cwd; returns it unchanged when there is no leading `-C`. Residual:
+/// `--git-dir`/`--work-tree` are deliberately NOT resolved (they don't move cwd;
+/// a `--git-dir` pointing at canonical is a separate, narrower vector left to a
+/// follow-up). Pure modulo the one `current_dir()` read, so the `-C` math is
+/// unit-testable from a known cwd.
+fn effective_cwd_through_globals(args: &[String], sub_idx: usize) -> PathBuf {
+    let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut i = 0;
+    while i < sub_idx {
+        match args[i].as_str() {
+            "-C" => {
+                if let Some(p) = args.get(i + 1) {
+                    let p = PathBuf::from(p);
+                    cwd = if p.is_absolute() { p } else { cwd.join(p) };
+                }
+                i += 2;
+            }
+            // Other value-taking globals consume their value (same set as
+            // `subcommand_index`); no-value globals advance one token.
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+            | "--config-env" | "--exec-path" => {
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    cwd
 }
 
 /// #1463 (B): on a ChdirPass for a MUTATING-local command, strip the caller's
@@ -1330,6 +1377,10 @@ fn is_positional_branch_checkout(args: &[String]) -> bool {
 /// self-help, moves a branch ref without detaching; `worktree add`'s internal
 /// reset is moot once add itself is denied); `push`/`commit`/`add`/`clean`/
 /// `branch` (agents legitimately bypass those in their own worktree).
+///
+/// `args` is the SUBCOMMAND-ROOTED slice — the caller strips leading git globals
+/// via `subcommand_index`, so `args.first()` is the real subcommand even for
+/// `git -C <path> worktree add` (#2234 Patch A r4).
 fn deny_agent_canonical_bypass(
     agent_present: bool,
     escape: bool,
@@ -1356,10 +1407,20 @@ fn deny_agent_canonical_bypass(
 fn enforce_agent_canonical_bypass_deny(args: &[String]) {
     let agent = env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
     let escape = env::var("AGEND_GIT_ALLOW_CANONICAL_MUTATE").as_deref() == Ok("1");
-    if !deny_agent_canonical_bypass(!agent.is_empty(), escape, cwd_is_canonical_rooted(), args) {
+    // #2234 Patch A (r4): resolve the REAL subcommand through leading git globals
+    // (`-C`, `-c`, `--git-dir`, …) so `git -C <canonical> worktree add` is judged
+    // as `worktree add` — not the `-C` token (the `args.first()` blind spot) — AND
+    // against the dir `-C` points at, not the shim's process cwd. No subcommand
+    // (globals only) → nothing to deny.
+    let Some(sub_idx) = subcommand_index(args) else {
+        return;
+    };
+    let sub_args = &args[sub_idx..];
+    let canonical = path_is_canonical_rooted(&effective_cwd_through_globals(args, sub_idx));
+    if !deny_agent_canonical_bypass(!agent.is_empty(), escape, canonical, sub_args) {
         return;
     }
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    let sub = sub_args.first().map(|s| s.as_str()).unwrap_or("");
     eprintln!(
         "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo.\n\
          The daemon already auto-bound your worktree at dispatch; cd into it and use normal git \
@@ -2997,6 +3058,45 @@ mod tests {
         ])));
         assert!(!is_positional_branch_checkout(&s(&["status"])));
         assert!(!is_positional_branch_checkout(&s(&["commit", "main"])));
+    }
+
+    /// #2234 Patch A: leading `-C` resolution for the deny's effective cwd —
+    /// absolute target wins, repeated/relative `-C` accumulate, a value-taking
+    /// global before `-C` is skipped WITH its value, and no `-C` leaves the
+    /// process cwd untouched.
+    #[test]
+    fn effective_cwd_through_globals_resolves_leading_dash_c() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Absolute `-C <path>` → that path, independent of the process cwd.
+        let args = s(&["-C", "/abs/canonical", "worktree", "add", "x"]);
+        let idx = subcommand_index(&args).expect("has subcommand");
+        assert_eq!(idx, 2, "subcommand starts after `-C <path>`");
+        assert_eq!(
+            effective_cwd_through_globals(&args, idx),
+            std::path::PathBuf::from("/abs/canonical")
+        );
+        // Repeated `-C`: a later RELATIVE `-C` joins onto the accumulated path.
+        let args = s(&["-C", "/abs/canonical", "-C", "sub", "checkout", "main"]);
+        let idx = subcommand_index(&args).expect("has subcommand");
+        assert_eq!(
+            effective_cwd_through_globals(&args, idx),
+            std::path::PathBuf::from("/abs/canonical/sub")
+        );
+        // A value-taking global (`-c k=v`) before `-C` is skipped WITH its value,
+        // so `k=v` is never mistaken for the `-C` target.
+        let args = s(&["-c", "k=v", "-C", "/abs/x", "status"]);
+        let idx = subcommand_index(&args).expect("has subcommand");
+        assert_eq!(
+            effective_cwd_through_globals(&args, idx),
+            std::path::PathBuf::from("/abs/x")
+        );
+        // No leading `-C` → process cwd unchanged.
+        let args = s(&["worktree", "add", "x"]);
+        let idx = subcommand_index(&args).expect("has subcommand");
+        assert_eq!(
+            effective_cwd_through_globals(&args, idx),
+            std::env::current_dir().unwrap()
+        );
     }
 
     /// #2234 fix B: the pure deny decision. Deny only when agent + !escape +

@@ -415,5 +415,58 @@ fn shim_denies_agent_bypass_canonical_provisioning_2234() {
         "non-canonical cwd must NOT be denied"
     );
 
+    // ── #2234 Patch A (r4): a leading `-C` must NOT slip the deny ──
+    let canonical_str = canonical.to_str().expect("utf8 canonical path");
+    let plain_str = plain.to_str().expect("utf8 plain path");
+    // `git -C <canonical> worktree add` from a NON-canonical cwd → DENIED. Proves
+    // BOTH fixes at once: the real subcommand is found past `-C` (not `args.first()`
+    // == "-C"), AND the effective cwd is the `-C` TARGET (canonical), not the
+    // process cwd (plain).
+    assert!(
+        is_denied(&run(
+            &plain,
+            Some("test-agent"),
+            false,
+            &[
+                "-C",
+                canonical_str,
+                "worktree",
+                "add",
+                "/tmp/agend-2234-wt-e",
+                "origin/main"
+            ]
+        )),
+        "`git -C <canonical> worktree add` from non-canonical cwd must be DENIED"
+    );
+    // Same for a positional `checkout <ref>` behind `-C`.
+    assert!(
+        is_denied(&run(
+            &plain,
+            Some("test-agent"),
+            false,
+            &["-C", canonical_str, "checkout", "origin/main"]
+        )),
+        "`git -C <canonical> checkout <ref>` from non-canonical cwd must be DENIED"
+    );
+    // Inverse (no over-block): `-C` pointing AWAY from canonical → effective cwd is
+    // the non-canonical `-C` target even though the PROCESS cwd is canonical, so the
+    // deny must NOT fire (the fix narrows by the dir git actually operates in).
+    assert!(
+        not_denied(&run(
+            &canonical,
+            Some("test-agent"),
+            false,
+            &[
+                "-C",
+                plain_str,
+                "worktree",
+                "add",
+                "/tmp/agend-2234-wt-f",
+                "origin/main"
+            ]
+        )),
+        "`git -C <non-canonical>` from canonical cwd must NOT be denied (judged by the -C target)"
+    );
+
     std::fs::remove_dir_all(&root).ok();
 }
