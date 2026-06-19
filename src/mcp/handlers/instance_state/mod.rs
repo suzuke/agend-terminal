@@ -298,6 +298,7 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
                 schema_version: 0,
                 id: None,
                 read_at: None,
+                delivering_at: None,
                 thread_id: None,
                 parent_id: None,
                 task_id: None,

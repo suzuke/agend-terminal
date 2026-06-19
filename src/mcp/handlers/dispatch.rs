@@ -326,12 +326,19 @@ action_adapter!(dispatch_team, "team", [
     "update" => task::handle_update_team,  ha;
 ]);
 
-// `inbox` — three-way branch on arg presence (NOT `args["action"]`):
+// `inbox` — branch on `args["action"]` then arg presence:
+//   - `action=ack`  → confirm processed (#2299; delivering → processed)
+//   - `action=clear` → quiet compact-clear
 //   - `message_id` present → describe single message
 //   - else `thread_id` present → describe thread
 //   - else → drain pending
 pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
-    if ctx.args.get("action").and_then(|v| v.as_str()) == Some("clear") {
+    let action = ctx.args.get("action").and_then(|v| v.as_str());
+    if action == Some("ack") {
+        // #2299 explicit ack (C): confirm the agent HANDLED what it drained →
+        // delivering → processed, so the reclaim-TTL won't re-deliver it.
+        comms::handle_inbox_ack(ctx.home, ctx.args, ctx.instance_name)
+    } else if action == Some("clear") {
         // #inbox-gc part a: quiet compact-clear (explicit action — never the
         // no-arg drain). Obligations stay unread; returns bounded summaries.
         comms::handle_inbox_clear(ctx.home, ctx.instance_name)

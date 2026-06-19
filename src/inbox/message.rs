@@ -58,6 +58,17 @@ pub struct InboxMessage {
     pub channel: Option<crate::channel::ChannelKind>,
     #[serde(default)]
     pub read_at: Option<String>,
+    /// #2299 three-state delivery: timestamp the message was DELIVERED to the agent
+    /// (drained / injected) but not yet confirmed processed. The state machine is:
+    ///   unread     = read_at.is_none() && delivering_at.is_none()
+    ///   delivering = read_at.is_none() && delivering_at.is_some()  (in-flight)
+    ///   processed  = read_at.is_some()                             (terminal)
+    /// A `delivering` message is NOT re-delivered (drain skips it / unread_count
+    /// excludes it); a reclaim-TTL sweep resets it to unread if it stays unconfirmed
+    /// past the TTL (the agent's turn died before processing). Absent on legacy rows
+    /// (`#[serde(default)]`) → reads as unread/processed exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivering_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +212,14 @@ pub enum MessageStatus {
     /// (within the 30d retention window). The previous code returned
     /// `NotFound` for this — breaking delivery audit of an un-drained message.
     Unread {
+        delivery_mode: Option<String>,
+        correlation_id: Option<String>,
+    },
+    /// #2299: message has been DELIVERED to the agent (`delivering_at` set) but
+    /// not yet confirmed processed (`read_at` None). Distinct from `Unread` so a
+    /// delivery audit (`inbox message_id=…`) does not mistake an in-flight
+    /// message for undelivered and re-send it.
+    Delivering {
         delivery_mode: Option<String>,
         correlation_id: Option<String>,
     },

@@ -691,7 +691,9 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
 // #1286: inbox describe handlers extracted to stay under file_size_invariant.
 #[path = "comms_inbox.rs"]
 mod comms_inbox;
-pub(super) use comms_inbox::{handle_describe_message, handle_describe_thread, handle_inbox_clear};
+pub(super) use comms_inbox::{
+    handle_describe_message, handle_describe_thread, handle_inbox_ack, handle_inbox_clear,
+};
 
 /// Sprint 55 P0-C — true when the caller passed `bind: false`, signaling
 /// a read-only RCA/audit/design dispatch that should NOT trigger

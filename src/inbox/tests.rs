@@ -81,6 +81,12 @@ impl TestMsgBuilder {
         self.0.superseded_by = Some(v.into());
         self
     }
+    /// #2299: preset the `delivering_at` timestamp (for reclaim-TTL tests that
+    /// need a stale in-flight row without waiting wall-clock).
+    fn delivering_at(mut self, v: &str) -> Self {
+        self.0.delivering_at = Some(v.into());
+        self
+    }
     fn in_reply_to_msg_id(mut self, v: &str) -> Self {
         self.0.in_reply_to_msg_id = Some(v.into());
         self
@@ -770,33 +776,467 @@ fn test_recover_noop_on_empty_file() {
 }
 
 #[test]
-fn test_drain_marks_read_at_but_keeps_message() {
+fn test_drain_marks_delivering_then_implicit_ack_keeps_message() {
     let home = tmp_home("drain-read-at");
     enqueue(&home, "agent1", make_msg("alice", "hello")).ok();
     enqueue(&home, "agent1", make_msg("bob", "world")).ok();
 
-    // First drain returns both messages with read_at set
+    // #2299: first drain returns both, now in the DELIVERING state — handed to
+    // the agent (delivering_at set) but NOT yet processed (read_at still None).
     let msgs = drain(&home, "agent1");
     assert_eq!(msgs.len(), 2);
-    assert!(msgs[0].read_at.is_some(), "drain must stamp read_at");
-    assert!(msgs[1].read_at.is_some());
-
-    // Second drain returns empty (already read)
-    let msgs2 = drain(&home, "agent1");
     assert!(
-        msgs2.is_empty(),
-        "already-read messages must not be returned"
+        msgs[0].delivering_at.is_some(),
+        "drain must stamp delivering_at"
     );
+    assert!(
+        msgs[0].read_at.is_none(),
+        "drain must NOT stamp read_at (delivering, not processed)"
+    );
+    assert!(msgs[1].delivering_at.is_some());
+    assert!(msgs[1].read_at.is_none());
 
-    // But the file still exists with the messages
+    // delivering_at is persisted, read_at is not.
     let path = inbox_path(&home, "agent1");
     let content = fs::read_to_string(&path).expect("file must still exist");
     let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 2, "messages must be kept in file");
-    // Verify read_at is persisted
     let m: InboxMessage = serde_json::from_str(lines[0]).expect("parse");
-    assert!(m.read_at.is_some(), "read_at must be persisted to disk");
+    assert!(
+        m.delivering_at.is_some(),
+        "delivering_at must be persisted to disk"
+    );
+    assert!(
+        m.read_at.is_none(),
+        "read_at must NOT be set after a single drain"
+    );
 
+    // Second drain returns empty (delivering rows are skipped, never re-delivered)
+    // and IMPLICITLY ACKS the prior batch → read_at now set (processed).
+    let msgs2 = drain(&home, "agent1");
+    assert!(
+        msgs2.is_empty(),
+        "in-flight (delivering) messages must not be returned again"
+    );
+    let content2 = fs::read_to_string(&path).expect("file must still exist");
+    for line in content2.lines().filter(|l| !l.is_empty()) {
+        let m: InboxMessage = serde_json::from_str(line).expect("parse");
+        assert!(
+            m.read_at.is_some(),
+            "re-drain must implicitly ack the prior delivering batch → processed"
+        );
+    }
+
+    fs::remove_dir_all(&home).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #2299 three-state delivery: unread → delivering → processed + reclaim-TTL.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// RFC3339 timestamp `secs` seconds in the past (for aging delivering rows).
+fn secs_ago(secs: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339()
+}
+
+/// turn-死重投: a message delivered to an agent whose turn then DIED (never
+/// acked, never re-drained) is reverted to unread by the reclaim-TTL sweep and
+/// RE-DELIVERED — the core anti-silent-loss guarantee of #2299.
+#[test]
+fn reclaim_redelivers_after_turn_death() {
+    let home = tmp_home("2299-turn-death");
+    // Seed a stale in-flight row directly (delivered ~11 min ago, never acked).
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("lead")
+            .text("do the thing")
+            .id("m-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    // Reclaim reverts it to unread (delivering_at cleared, still unprocessed).
+    reclaim_stale_delivering(&home);
+
+    // A drain now RE-DELIVERS it (back to delivering, returned to the agent).
+    let redelivered = drain(&home, "a");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "stale delivering row must be re-delivered"
+    );
+    assert_eq!(redelivered[0].id.as_deref(), Some("m-stale"));
+    assert!(redelivered[0].delivering_at.is_some());
+    assert!(redelivered[0].read_at.is_none());
+    fs::remove_dir_all(&home).ok();
+}
+
+/// healthy 不重投 / 在途不雙投: a FRESH in-flight (delivering) row is left
+/// untouched by reclaim and is never returned a second time — no double-deliver
+/// while the agent is mid-turn.
+#[test]
+fn reclaim_leaves_fresh_delivering_untouched_no_double_deliver() {
+    let home = tmp_home("2299-fresh-delivering");
+    enqueue(&home, "a", make_msg("lead", "hi")).unwrap();
+
+    let first = drain(&home, "a");
+    assert_eq!(first.len(), 1, "first drain delivers once");
+    assert!(first[0].delivering_at.is_some() && first[0].read_at.is_none());
+
+    // Reclaim runs but the row is fresh (< TTL) → not reverted.
+    reclaim_stale_delivering(&home);
+
+    // Re-drain returns NOTHING (in-flight, not re-delivered) — and implicitly
+    // acks the prior batch (read_at now set).
+    let second = drain(&home, "a");
+    assert!(
+        second.is_empty(),
+        "fresh in-flight message must not be re-delivered"
+    );
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    let m: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        m.read_at.is_some(),
+        "re-drain implicitly acked the delivering row"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// 顯式 ack→不 reclaim: an explicitly-acked (processed) message is never
+/// reverted by reclaim — even if it has aged well past the TTL — so an
+/// acked message is never re-delivered.
+#[test]
+fn explicit_ack_prevents_reclaim() {
+    let home = tmp_home("2299-explicit-ack");
+    enqueue(
+        &home,
+        "a",
+        msg().sender("lead").text("hi").id("m-ack").build(),
+    )
+    .unwrap();
+
+    let drained = drain(&home, "a");
+    assert_eq!(drained.len(), 1);
+    // Agent processes, then explicitly acks the message it drained.
+    let acked = ack(&home, "a", Some("m-ack"));
+    assert_eq!(acked, 1, "ack transitions delivering → processed");
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    let m: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(m.read_at.is_some(), "ack stamps read_at (processed)");
+
+    // Reclaim is a no-op on a processed row (read_at set); no re-delivery.
+    reclaim_stale_delivering(&home);
+    assert!(
+        drain(&home, "a").is_empty(),
+        "acked message must never be re-delivered"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// TTL 邊界: reclaim reverts only rows older than RECLAIM_TTL_SECS (600s);
+/// a row just under the boundary is left in-flight.
+#[test]
+fn reclaim_ttl_boundary() {
+    let home = tmp_home("2299-ttl-boundary");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("l")
+            .text("under")
+            .id("m-under")
+            .delivering_at(&secs_ago(590))
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("l")
+            .text("over")
+            .id("m-over")
+            .delivering_at(&secs_ago(610))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    // The just-over row reverted to unread → drain re-delivers ONLY it.
+    let redelivered = drain(&home, "a");
+    let ids: Vec<&str> = redelivered.iter().filter_map(|m| m.id.as_deref()).collect();
+    assert_eq!(
+        ids,
+        vec!["m-over"],
+        "only the past-TTL row is reclaimed+re-delivered"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// 並發 sweep+drain+ack 不雙 reclaim: under concurrent drain + reclaim + ack on
+/// the same inbox (all serialized by `with_inbox_lock`), every message is
+/// returned AT MOST ONCE across all drains — no double-deliver, no double-reclaim.
+#[test]
+fn concurrent_drain_reclaim_ack_no_double_deliver() {
+    use std::sync::Arc;
+    let home = tmp_home("2299-concurrent");
+    for i in 0..20 {
+        enqueue(
+            &home,
+            "a",
+            msg().sender("l").text("m").id(&format!("m-{i}")).build(),
+        )
+        .unwrap();
+    }
+    let home = Arc::new(home);
+    let returned = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut handles = Vec::new();
+    for t in 0..6 {
+        let home = Arc::clone(&home);
+        let returned = Arc::clone(&returned);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..5 {
+                if t % 3 == 0 {
+                    for m in drain(&home, "a") {
+                        if let Some(id) = m.id {
+                            returned.lock().push(id);
+                        }
+                    }
+                } else if t % 3 == 1 {
+                    reclaim_stale_delivering(&home);
+                } else {
+                    ack(&home, "a", None);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    // No message id may be RETURNED to an agent more than once (exactly-once
+    // delivery holds even with reclaim+ack racing the drains).
+    let mut ids = returned.lock().clone();
+    ids.sort();
+    let mut deduped = ids.clone();
+    deduped.dedup();
+    assert_eq!(
+        ids, deduped,
+        "a message was delivered more than once: {ids:?}"
+    );
+    fs::remove_dir_all(&*home).ok();
+}
+
+/// legacy back-compat: a row written before #2299 (no `delivering_at` field)
+/// drains exactly as an unread message did, and a legacy READ row stays read.
+#[test]
+fn legacy_rows_without_delivering_at_field() {
+    let home = tmp_home("2299-legacy");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).unwrap();
+    let legacy_unread = r#"{"schema_version":1,"id":"m-leg-unread","from":"l","text":"u","kind":null,"timestamp":"2025-01-01T00:00:00Z"}"#;
+    let legacy_read = r#"{"schema_version":1,"id":"m-leg-read","from":"l","text":"r","kind":null,"timestamp":"2025-01-01T00:00:00Z","read_at":"2025-01-01T00:00:01Z"}"#;
+    fs::write(
+        inbox_path(&home, "a"),
+        format!("{legacy_unread}\n{legacy_read}\n"),
+    )
+    .unwrap();
+
+    // Legacy unread drains (→ delivering); legacy read is skipped.
+    let drained = drain(&home, "a");
+    assert_eq!(drained.len(), 1, "only the legacy unread row drains");
+    assert_eq!(drained[0].id.as_deref(), Some("m-leg-unread"));
+    assert!(
+        drained[0].delivering_at.is_some(),
+        "legacy unread → delivering on drain"
+    );
+
+    // Reclaim ignores a legacy row that never had delivering_at (it's read or
+    // freshly delivering) — no spurious revert of the legacy read row.
+    reclaim_stale_delivering(&home);
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    for line in content.lines() {
+        let m: InboxMessage = serde_json::from_str(line).unwrap();
+        if m.id.as_deref() == Some("m-leg-read") {
+            assert!(m.read_at.is_some(), "legacy read row must stay processed");
+        }
+    }
+    fs::remove_dir_all(&home).ok();
+}
+
+/// unread_count must EXCLUDE delivering rows (else a healthy mid-turn agent is
+/// re-paged); reclaim restores the count when it reverts a stale row.
+#[test]
+fn unread_count_excludes_delivering() {
+    let home = tmp_home("2299-unread-count");
+    enqueue(&home, "a", make_msg("l", "one")).unwrap();
+    enqueue(&home, "a", make_msg("l", "two")).unwrap();
+    assert_eq!(
+        unread_count(&home, "a").0,
+        2,
+        "two genuinely-unread messages"
+    );
+
+    drain(&home, "a"); // → both delivering
+    assert_eq!(
+        unread_count(&home, "a").0,
+        0,
+        "delivering (in-flight) rows must not count as unread"
+    );
+
+    // Age them past the TTL + reclaim → back to unread → counted again.
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    let aged: String = content
+        .lines()
+        .map(|l| {
+            let mut m: InboxMessage = serde_json::from_str(l).unwrap();
+            m.delivering_at = Some(secs_ago(660));
+            serde_json::to_string(&m).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(inbox_path(&home, "a"), format!("{aged}\n")).unwrap();
+    reclaim_stale_delivering(&home);
+    assert_eq!(
+        unread_count(&home, "a").0,
+        2,
+        "reclaimed rows count as unread again"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// A delivering (in-flight) row counts as "already drained" for the #911
+/// re-inject dedup — so the daemon never re-pushes an in-flight message.
+#[test]
+fn msg_already_drained_treats_delivering_as_drained() {
+    let home = tmp_home("2299-already-drained");
+    enqueue(
+        &home,
+        "a",
+        msg().sender("l").text("x").id("m-inflight").build(),
+    )
+    .unwrap();
+    drain(&home, "a"); // → delivering, read_at still None
+    assert!(
+        storage::msg_already_drained_in_jsonl(&home, "a", "m-inflight"),
+        "a delivering row must read as already-drained (suppress daemon re-inject)"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// `ack` with no message_id confirms the WHOLE drained batch (delivering →
+/// processed), and is an idempotent no-op on a second call.
+#[test]
+fn ack_all_delivering_when_no_msg_id() {
+    let home = tmp_home("2299-ack-all");
+    enqueue(&home, "a", make_msg("l", "one")).unwrap();
+    enqueue(&home, "a", make_msg("l", "two")).unwrap();
+    drain(&home, "a"); // → both delivering
+
+    assert_eq!(
+        ack(&home, "a", None),
+        2,
+        "ack(None) confirms the whole batch"
+    );
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    for line in content.lines() {
+        let m: InboxMessage = serde_json::from_str(line).unwrap();
+        assert!(m.read_at.is_some(), "every drained row is now processed");
+    }
+    assert_eq!(
+        ack(&home, "a", None),
+        0,
+        "second ack is an idempotent no-op"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// F1 (#2299): a `delivering` blocking dispatch (query/task) counts as
+/// "delivered" for `has_drained_blocker_for_correlation` — sibling-consistent
+/// with `msg_already_drained_in_jsonl` — so a codex report/update reply on that
+/// correlation overrides ack-absorption (reaches the agent), just as a fully
+/// drained dispatch does. A never-delivered (plain unread) dispatch does not.
+#[test]
+fn has_drained_blocker_counts_delivering_dispatch() {
+    let home = tmp_home("2299-blocker-delivering");
+    // A task dispatch handed to the agent: delivering (delivering_at set, read_at None).
+    let mut delivering = msg()
+        .sender("lead")
+        .text("review this")
+        .id("m-blk-deliv")
+        .kind("task")
+        .delivering_at(&secs_ago(5))
+        .build();
+    delivering.correlation_id = Some("c-delivering".to_string());
+    enqueue(&home, "a", delivering).unwrap();
+    // A second task that is still plain unread (never delivered).
+    let mut unread = msg()
+        .sender("lead")
+        .text("later")
+        .id("m-blk-unread")
+        .kind("task")
+        .build();
+    unread.correlation_id = Some("c-unread".to_string());
+    enqueue(&home, "a", unread).unwrap();
+
+    assert!(
+        has_drained_blocker_for_correlation(&home, "a", "c-delivering"),
+        "a delivering blocking dispatch must count (override ack-absorption)"
+    );
+    assert!(
+        !has_drained_blocker_for_correlation(&home, "a", "c-unread"),
+        "a never-delivered (plain unread) dispatch must NOT count yet"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// F2 (#2299): `describe_message` reports a `delivering` row as `Delivering`
+/// (not `Unread`) so a delivery audit (`inbox message_id=…`) does not mistake an
+/// in-flight message for undelivered and re-send it. Full lifecycle:
+/// unread → Unread, drained → Delivering, acked → ReadAt.
+#[test]
+fn describe_message_reports_delivering_state() {
+    let home = tmp_home("2299-describe-delivering");
+    // Fresh timestamp so the pre-drain row is live `Unread`, not `UnreadExpired`
+    // (the msg() builder default timestamp is >30d old).
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("lead")
+            .text("hi")
+            .id("m-desc")
+            .timestamp(&secs_ago(1))
+            .build(),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            describe_message(&home, "m-desc", "a"),
+            MessageStatus::Unread { .. }
+        ),
+        "before drain: Unread"
+    );
+    drain(&home, "a");
+    assert!(
+        matches!(
+            describe_message(&home, "m-desc", "a"),
+            MessageStatus::Delivering { .. }
+        ),
+        "after drain: Delivering (delivered, not yet processed)"
+    );
+    ack(&home, "a", Some("m-desc"));
+    assert!(
+        matches!(
+            describe_message(&home, "m-desc", "a"),
+            MessageStatus::ReadAt(..)
+        ),
+        "after ack: ReadAt (processed)"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
@@ -2929,7 +3369,10 @@ fn m4_drain_returns_correct_unread_no_duplicates() {
     assert_eq!(drained[0].text, "msg1");
     assert_eq!(drained[1].text, "msg2");
     assert_eq!(drained[2].text, "msg3");
-    assert!(drained.iter().all(|m| m.read_at.is_some()));
+    // #2299: first drain transitions unread → delivering (not processed).
+    assert!(drained
+        .iter()
+        .all(|m| m.delivering_at.is_some() && m.read_at.is_none()));
 
     // All messages remain in the JSONL file after drain
     let path = super::storage::inbox_path(&home, "a");
@@ -2940,11 +3383,11 @@ fn m4_drain_returns_correct_unread_no_duplicates() {
         .collect();
     assert_eq!(persisted.len(), 3, "all messages persisted");
     assert!(
-        persisted.iter().all(|m| m.read_at.is_some()),
-        "all have read_at on disk"
+        persisted.iter().all(|m| m.delivering_at.is_some()),
+        "all have delivering_at on disk after first drain"
     );
 
-    // Second drain returns empty
+    // Second drain returns empty (delivering skipped, not re-delivered)
     assert!(drain(&home, "a").is_empty());
     fs::remove_dir_all(&home).ok();
 }
@@ -2991,10 +3434,14 @@ fn m1_supersede_skips_already_read() {
     ci.kind = Some("ci-watch".to_string());
     enqueue(&home, agent, ci).unwrap();
 
-    // Drain to mark as read
+    // Drain then ack → reach the PROCESSED (read_at set) terminal state.
+    // (#2299: a drain alone leaves the row `delivering`/read_at=None, which a
+    // newer ci-watch may legitimately supersede — newest CI state wins. This
+    // test pins the surviving invariant: a PROCESSED row is immune to supersede.)
     drain(&home, agent);
+    ack(&home, agent, None);
 
-    // Supersede should not affect already-read messages
+    // Supersede should not affect already-processed messages
     super::storage::mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-id");
 
     let path = super::storage::inbox_path(&home, agent);
@@ -3002,7 +3449,7 @@ fn m1_supersede_skips_already_read() {
     let msg: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
     assert!(
         msg.superseded_by.is_none(),
-        "already-read should not be superseded"
+        "already-processed (read_at set) should not be superseded"
     );
     fs::remove_dir_all(&home).ok();
 }
@@ -3078,7 +3525,7 @@ fn m2_hint_uses_merged_enqueue_count() {
 }
 
 #[test]
-fn drain_marks_read_and_preserves_order_after_lock_shrink() {
+fn drain_marks_delivering_and_preserves_order_after_lock_shrink() {
     let home = tmp_home("drain-lock-shrink");
     enqueue(&home, "agent-ls", make_msg("a", "first")).unwrap();
     enqueue(&home, "agent-ls", make_msg("b", "second")).unwrap();
@@ -3090,7 +3537,7 @@ fn drain_marks_read_and_preserves_order_after_lock_shrink() {
     assert_eq!(msgs[1].from, "b");
     assert_eq!(msgs[2].from, "c");
 
-    // Verify read_at was set (persisted to file under lock)
+    // #2299: verify delivering_at was set (persisted to file under lock).
     let content = fs::read_to_string(storage::inbox_path_resolved(&home, "agent-ls")).unwrap();
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -3098,8 +3545,8 @@ fn drain_marks_read_and_preserves_order_after_lock_shrink() {
         }
         let m: InboxMessage = serde_json::from_str(line).unwrap();
         assert!(
-            m.read_at.is_some(),
-            "all messages must have read_at set after drain: {:?}",
+            m.delivering_at.is_some() && m.read_at.is_none(),
+            "all messages must be delivering (not processed) after first drain: {:?}",
             m.from
         );
     }

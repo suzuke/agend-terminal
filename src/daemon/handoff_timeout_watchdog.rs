@@ -364,8 +364,10 @@ mod tests {
     }
 
     /// §3.9 #1888 (instrument-only): a `ci-ready-for-action` handoff transitioning
-    /// to read on a drain is OBSERVABLE (the `#1888-ciready-read` trace fires)
-    /// while the drain behavior is byte-identical (the message is returned + read).
+    /// on a drain is OBSERVABLE (the `#1888-ciready-read` trace fires) while the
+    /// drain behavior is preserved (the message is returned). #2299: the first
+    /// drain now marks it `delivering` (in-flight), not `read` — the trace tag is
+    /// unchanged, so the instrumentation still fires.
     #[test]
     #[tracing_test::traced_test]
     fn ciready_read_on_drain_is_instrumented_1888() {
@@ -375,12 +377,13 @@ mod tests {
         assert!(
             drained
                 .iter()
-                .any(|m| m.kind.as_deref() == Some("ci-ready-for-action") && m.read_at.is_some()),
-            "behavior unchanged: drain returns the handoff, now marked read"
+                .any(|m| m.kind.as_deref() == Some("ci-ready-for-action")
+                    && m.delivering_at.is_some()),
+            "#2299: drain returns the handoff, now marked delivering (not yet processed)"
         );
         assert!(
             logs_contain("#1888-ciready-read"),
-            "the ci-ready read-on-drain must be traced"
+            "the ci-ready transition-on-drain must be traced"
         );
     }
 

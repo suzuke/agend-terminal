@@ -36,6 +36,10 @@ impl PerTickHandler for InboxMaintenanceHandler {
         // (hotspot.rs + daemon::hotspot_scan wrapper) is deleted in
         // the same commit.
         crate::inbox::sweep_expired(ctx.home);
+        // #2299: revert stale `delivering` rows (recipient turn died after the
+        // drain, never confirmed) back to `unread` for re-delivery — the net
+        // under explicit ack (C) + implicit next-drain ack (A).
+        crate::inbox::reclaim_stale_delivering(ctx.home);
         crate::inbox::check_disk_space(ctx.home);
         crate::daemon::run_task_maintenance(ctx.home);
         worktree_auto_cleanup(ctx.home, ctx.configs);

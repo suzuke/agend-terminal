@@ -28,8 +28,9 @@ pub use disk::{check_disk_space, recover_half_writes};
 
 // Storage CRUD (pub)
 pub use storage::{
-    clear_compact, describe_message, drain, enqueue, find_message, get_thread,
-    has_drained_blocker_for_correlation, mark_ci_watch_superseded, sweep_expired, unread_count,
+    ack, clear_compact, describe_message, drain, enqueue, find_message, get_thread,
+    has_drained_blocker_for_correlation, mark_ci_watch_superseded, reclaim_stale_delivering,
+    sweep_expired, unread_count,
 };
 // Storage CRUD (pub(crate))
 pub(crate) use storage::inbox_path_resolved;

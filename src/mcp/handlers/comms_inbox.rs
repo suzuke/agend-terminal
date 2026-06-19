@@ -65,6 +65,21 @@ pub fn handle_describe_message(home: &Path, args: &Value, instance_name: &str) -
             }
             resp
         }
+        crate::inbox::MessageStatus::Delivering {
+            delivery_mode,
+            correlation_id,
+        } => {
+            // #2299: delivered to the agent, not yet confirmed processed. Report
+            // `delivering` (not `unread`) so a delivery audit does not re-send.
+            let mut resp = json!({"status": "delivering"});
+            if let Some(mode) = delivery_mode {
+                resp["delivery_mode"] = json!(mode);
+            }
+            if let Some(cid) = correlation_id {
+                resp["correlation_id"] = json!(cid);
+            }
+            resp
+        }
         crate::inbox::MessageStatus::UnreadExpired => {
             json!({"status": "unread_expired"})
         }
@@ -82,6 +97,17 @@ pub fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     let instance = args["instance"].as_str();
     let msgs = crate::inbox::get_thread(home, thread_id, instance);
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
+}
+
+/// #2299 explicit ack (C): confirm `delivering` messages as `processed`.
+/// `message_id` present → ack that one message; omitted → ack the caller's
+/// whole in-flight batch. The agent calls this after HANDLING what it drained,
+/// so the reclaim-TTL sweep never re-delivers an already-processed message.
+/// Returns `{"acked": N}` (rows newly transitioned to processed).
+pub fn handle_inbox_ack(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let msg_id = args["message_id"].as_str();
+    let acked = crate::inbox::ack(home, instance_name, msg_id);
+    json!({"acked": acked})
 }
 
 /// #inbox-gc part a: quiet compact-clear. Marks non-obligation messages read

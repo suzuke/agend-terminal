@@ -236,6 +236,7 @@ fn build_message(
         schema_version: 0,
         id: None,
         read_at: None,
+        delivering_at: None,
         thread_id,
         parent_id,
         task_id: params["task_id"]
@@ -2243,6 +2244,7 @@ mod tests {
             schema_version: 0,
             id: Some(format!("m-blocker-{corr}")),
             read_at: Some(chrono::Utc::now().to_rfc3339()),
+            delivering_at: None,
             thread_id: None,
             parent_id: None,
             task_id: None,
@@ -2339,6 +2341,7 @@ mod tests {
             schema_version: 0,
             id: Some("m-undrained".to_string()),
             read_at: None, // ← key: not drained
+            delivering_at: None,
             thread_id: None,
             parent_id: None,
             task_id: None,

@@ -106,6 +106,19 @@ impl Ledger {
         now.duration_since(entry.injected_at) < Duration::from_secs(IDEMPOTENCY_WINDOW_SECS)
     }
 
+    /// #2299: drop the `(agent, msg_id)` entry outright. Called by the
+    /// inbox reclaim-TTL sweep when it reverts a stale `delivering` row back
+    /// to `unread`: the entry was flagged `consumed` at the original delivering
+    /// drain, so without this the daemon's re-inject would stay suppressed for
+    /// the rest of the 10-min window and the reclaimed message couldn't be
+    /// re-delivered. Forgetting it lets the next `record_inject` start clean.
+    /// No-op when the entry is absent.
+    pub fn forget(&self, agent: &str, msg_id: &str) {
+        if let Ok(mut s) = self.state.lock() {
+            s.remove(&(agent.to_string(), msg_id.to_string()));
+        }
+    }
+
     /// Drop expired entries. Called periodically from the supervisor
     /// tick (10s cadence) so memory pressure stays bounded.
     pub fn sweep_expired(&self) {
@@ -229,6 +242,29 @@ mod tests {
             !l.should_suppress_reinject("alice836", "m-2"),
             "partial-consume must NOT suppress the still-pending msg"
         );
+    }
+
+    /// #2299 unit: `forget` removes the entry outright, so a subsequently
+    /// reclaimed (delivering → unread) message is no longer suppressed and the
+    /// daemon can re-inject it. The TTL alone would leave a `consumed` entry
+    /// suppressing re-inject for the rest of the 10-min window.
+    #[test]
+    fn forget_removes_consumed_entry_so_reinject_is_not_suppressed() {
+        let l = Ledger::default();
+        l.record_inject("agent-2299", "m-reclaim");
+        l.mark_consumed("agent-2299", "m-reclaim");
+        assert!(
+            l.should_suppress_reinject("agent-2299", "m-reclaim"),
+            "precondition: a consumed entry suppresses re-inject"
+        );
+        l.forget("agent-2299", "m-reclaim");
+        assert!(
+            !l.should_suppress_reinject("agent-2299", "m-reclaim"),
+            "after forget, the reclaimed message's re-inject must NOT be suppressed"
+        );
+        assert_eq!(l.len(), 0, "forget drops the entry");
+        // Idempotent: forgetting an absent entry is a no-op.
+        l.forget("agent-2299", "m-nope");
     }
 
     /// #836 unit: header parser extracts the `id=` field. Locks the

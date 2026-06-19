@@ -65,7 +65,8 @@ fn msg_already_drained_reads_resolved_uuid_path_inbox_notify() {
     msg.id = Some("m-already-drained-1".to_string());
     enqueue(&home, name, msg).expect("enqueue id-native");
 
-    // drain sets `read_at` in the UUID file.
+    // drain marks the row delivering (#2299) in the UUID file — already
+    // delivered, so `msg_already_drained_in_jsonl` must see it.
     let drained = drain(&home, name);
     assert_eq!(drained.len(), 1, "the message must drain once");
 
