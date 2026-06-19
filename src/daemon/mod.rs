@@ -709,6 +709,10 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
         Box::new(per_tick::GcTickHandler::new(360)),
+        // #2158 item 2: hourly stray-managed-worktree sweep (edge-triggered
+        // event-log + fleet health count). Same 360-tick GC cadence; runs in app
+        // mode too (not allowlisted out) since the live daemon is app-mode.
+        Box::new(per_tick::WorkspaceBoundarySweepHandler::new(360)),
         // #1747: slow-cadence backstop GC for stale /tmp review worktrees (mtime
         // > 2d). Same 360-tick cadence as the other GC siblings; runs in app mode
         // (not allowlisted out) since the live daemon is app-mode.

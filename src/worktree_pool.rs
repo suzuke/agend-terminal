@@ -1287,7 +1287,7 @@ pub(crate) fn collect_managed_worktrees(root: &Path, max_depth: usize, out: &mut
 /// `None` when the path is under neither managed root — the caller treats that
 /// as unresolvable and SKIPS the worktree (fail-toward-alive), never guessing
 /// from the parent dir.
-fn agent_from_layout(home: &Path, wt_path: &Path) -> Option<String> {
+pub(crate) fn agent_from_layout(home: &Path, wt_path: &Path) -> Option<String> {
     for root in [
         daemon_managed_worktree_root(home),
         crate::paths::workspace_dir(home),

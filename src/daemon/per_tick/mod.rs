@@ -59,6 +59,7 @@ pub(crate) mod supervisor_trackers;
 pub(crate) mod thread_dump;
 pub(crate) mod tmp_review_gc;
 pub(crate) mod watchdog;
+pub(crate) mod workspace_boundary_sweep;
 
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
@@ -90,6 +91,7 @@ pub(crate) use supervisor_trackers::{
 pub(crate) use thread_dump::ThreadDumpHandler;
 pub(crate) use tmp_review_gc::TmpReviewGcHandler;
 pub(crate) use watchdog::WatchdogHandler;
+pub(crate) use workspace_boundary_sweep::WorkspaceBoundarySweepHandler;
 
 /// Shared per-tick context. Field types match what the daemon main loop
 /// holds verbatim — the trait is pure relocation, not abstraction. New

@@ -93,6 +93,26 @@ pub fn build_summary(home: &Path) -> String {
         }
     }
 
+    // #2158 item 3: fleet-level surface for workspace-boundary violations
+    // (NOT a per-agent reason). Re-derived via the shared detector so the count
+    // matches what the hourly sweep edge-triggers on.
+    let violations = crate::workspace_boundary::detect_violations(home);
+    if !violations.is_empty() {
+        lines.push(format!("▸ Workspace violations: {}", violations.len()));
+        for v in violations.iter().take(5) {
+            let who = v.agent.as_deref().unwrap_or("?");
+            lines.push(format!(
+                "  ⚠ {} {} [{}]",
+                v.kind.as_str(),
+                who,
+                v.path.display()
+            ));
+        }
+        if violations.len() > 5 {
+            lines.push(format!("  ... +{} more", violations.len() - 5));
+        }
+    }
+
     lines.join("\n")
 }
 

@@ -84,6 +84,7 @@ mod tui;
 pub mod types;
 mod verify;
 mod vterm;
+mod workspace_boundary;
 mod worktree;
 mod worktree_cleanup;
 #[allow(dead_code)]
