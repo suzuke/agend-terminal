@@ -642,7 +642,18 @@ impl VTerm {
     /// Used by AwaitingOperator to snapshot "what the CLI printed before
     /// it started waiting for stdin" for forwarding to Telegram.
     pub fn tail_lines(&self, n: usize) -> String {
-        self.tail_lines_impl(n, false).0
+        self.tail_lines_impl(n, false, false).0
+    }
+
+    /// #perf-R1: the de-wrapped detection text WITHOUT the per-cell foreground
+    /// classification. Byte-identical to [`tail_lines_with_fg`]'s `String` (same
+    /// `WRAPLINE` de-wrap), but skips the O(rows*cols) `classify_fg` pass and the
+    /// per-row colour/dim allocations. The PTY hot path hashes this for the
+    /// unchanged-frame dedup gate and builds the colour mask lazily only on a
+    /// dedup MISS (see [`crate::state::StateTracker::feed_with_lazy_fg`]), so a
+    /// redraw flood of identical frames never pays the colour cost.
+    pub fn tail_lines_dewrapped(&self, n: usize) -> String {
+        self.tail_lines_impl(n, false, true).0
     }
 
     /// #1948(b): the last `n` rows + a per-character DIM-attribute mask aligned
@@ -651,7 +662,7 @@ impl VTerm {
     /// the operator's normal-intensity input — colour-only [`CellFg`] can't,
     /// because the ghost is dim on the DEFAULT foreground colour.
     pub fn tail_lines_with_dim(&self, n: usize) -> (String, Vec<bool>) {
-        let (text, _fg, dim) = self.tail_lines_impl(n, true);
+        let (text, _fg, dim) = self.tail_lines_impl(n, true, true);
         (text, dim)
     }
 
@@ -663,20 +674,33 @@ impl VTerm {
     /// the phrase is rendered red. Building both in one pass guarantees the
     /// mask and the text can never drift out of alignment.
     pub fn tail_lines_with_fg(&self, n: usize) -> (String, Vec<CellFg>) {
-        let (text, fg, _dim) = self.tail_lines_impl(n, true);
+        let (text, fg, _dim) = self.tail_lines_impl(n, true, true);
         (text, fg)
     }
 
-    /// Shared core for [`tail_lines`] / [`tail_lines_with_fg`]. When
-    /// `collect_fg` is false the returned `Vec<CellFg>` is empty (no per-cell
-    /// classification cost) AND physical rows are joined verbatim with `\n`
-    /// (byte-identical to the legacy output — text-only display/dialog callers
-    /// unaffected). When `collect_fg` is true (the state-detection feed) a
-    /// `WRAPLINE`-soft-wrapped row is DE-WRAPPED — joined to its continuation
-    /// WITHOUT a `\n` — so a single logical line the terminal wrapped across
-    /// rows stays one line for the single-line detection regexes (#1808). The
-    /// fg mask stays aligned 1:1 with the de-wrapped text.
-    fn tail_lines_impl(&self, n: usize, collect_fg: bool) -> (String, Vec<CellFg>, Vec<bool>) {
+    /// Shared core for [`tail_lines`] / [`tail_lines_with_fg`] /
+    /// [`tail_lines_dewrapped`]. Two orthogonal knobs (decoupled #perf-R1):
+    ///
+    /// * `collect_fg` — when false the returned `Vec<CellFg>` (and dim vec) are
+    ///   empty, skipping the per-cell `classify_fg` classification cost.
+    /// * `dewrap` — when false physical rows are joined verbatim with `\n`
+    ///   (byte-identical to the legacy text-only output — display/dialog callers
+    ///   unaffected). When true a `WRAPLINE`-soft-wrapped row is DE-WRAPPED —
+    ///   joined to its continuation WITHOUT a `\n` — so a single logical line the
+    ///   terminal wrapped across rows stays one line for the single-line
+    ///   detection regexes (#1808).
+    ///
+    /// The state-detection feed uses `(collect_fg=true, dewrap=true)`; the cheap
+    /// pre-hash gate uses `(collect_fg=false, dewrap=true)` — same de-wrapped
+    /// text, no colour cost. The fg mask (when collected) stays aligned 1:1 with
+    /// the returned text. (Previously `dewrap` was implicitly `collect_fg`; they
+    /// are now independent so a text-only caller can still de-wrap.)
+    fn tail_lines_impl(
+        &self,
+        n: usize,
+        collect_fg: bool,
+        dewrap: bool,
+    ) -> (String, Vec<CellFg>, Vec<bool>) {
         let grid = self.term.grid();
         let cols = self.cols as usize;
         let rows = self.rows as usize;
@@ -718,7 +742,7 @@ impl VTerm {
                 }
                 col += 1;
             }
-            let row_wrapped = collect_fg
+            let row_wrapped = dewrap
                 && cols > 0
                 && safe_cell(grid, Line(row as i32), cols - 1)
                     .flags
@@ -2274,6 +2298,96 @@ mod tests {
         assert_ne!(
             ptr2, ptr0,
             "each pane's VTerm must own a distinct scratch buffer (no shared state)"
+        );
+    }
+
+    /// #perf-R1: `tail_lines_dewrapped` must return text BYTE-IDENTICAL to
+    /// `tail_lines_with_fg().0` (the de-wrapped detection text) while skipping the
+    /// colour mask. Under a soft-wrap it must DIFFER from the verbatim
+    /// `tail_lines` — proving the pre-hash dedup gate keys on the SAME text
+    /// detection consumes, NOT the verbatim tail (whose `\n`/trailing-space
+    /// divergence at the wrap column would desync the dedup decision).
+    #[test]
+    fn tail_lines_dewrapped_matches_detection_text_and_dewraps() {
+        // 20-col terminal; a 30-char line auto-wraps (soft WRAPLINE) across 2 rows.
+        let mut vt = VTerm::new(20, 6);
+        vt.process(b"abcdefghijklmnopqrstuvwxyz0123\r\n");
+        let n = vt.rows() as usize;
+
+        let dewrapped = vt.tail_lines_dewrapped(n);
+        let (with_fg_text, _fg) = vt.tail_lines_with_fg(n);
+        assert_eq!(
+            dewrapped, with_fg_text,
+            "#perf-R1: the cheap pre-hash text must equal the de-wrapped detection text"
+        );
+
+        let verbatim = vt.tail_lines(n);
+        assert_ne!(
+            dewrapped, verbatim,
+            "under a soft-wrap the de-wrapped text must DIFFER from the verbatim tail \
+             (the gate keys on detection text, not `tail_lines`)"
+        );
+        assert!(
+            dewrapped.contains("abcdefghijklmnopqrstuvwxyz0123"),
+            "de-wrap rejoins the soft-wrapped logical line WITHOUT a newline"
+        );
+        assert!(
+            verbatim.contains('\n'),
+            "verbatim text keeps the soft-wrap as a newline split"
+        );
+    }
+
+    /// #perf-R1 spike measurement (NOT a regression gate — `#[ignore]`, run in
+    /// release: `cargo test --release --ignored perf_r1_tail_extract_cost --
+    /// --nocapture`). Isolates the wasted work on an UNCHANGED frame: the PTY hot
+    /// path used to build the full fg mask (`tail_lines_with_fg`, O(rows*cols) +
+    /// per-cell `classify_fg` + 2 Vecs/row) on EVERY chunk, then discard it inside
+    /// the text-only dedup gate when the frame was identical. The shipped fix
+    /// hashes the cheap `tail_lines_dewrapped` (de-wrapped text-only, the REAL
+    /// pre-hash path — same text, no colour cost) and builds the mask lazily only
+    /// on a dedup MISS. This prints both costs + the per-identical-frame saving.
+    #[test]
+    #[ignore = "perf measurement, run explicitly in release"]
+    fn perf_r1_tail_extract_cost() {
+        use std::time::Instant;
+        // ~200 cols × 50 visible rows, filled with mixed colored content so
+        // classify_fg has realistic work (red anchors + 256/rgb + default).
+        let mut vt = VTerm::new(200, 50);
+        for r in 0..50 {
+            let line = format!(
+                "\x1b[31mERROR\x1b[0m row {r} \x1b[38;5;208midx\x1b[0m \
+                 \x1b[38;2;10;200;30mrgb\x1b[0m normal padding text to widen the row {r}\r\n"
+            );
+            vt.process(line.as_bytes());
+        }
+        let n = 100_000u32;
+        let rows = vt.rows() as usize;
+
+        // black-box the results so the optimizer can't elide the work.
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..n {
+            let (text, fg) = vt.tail_lines_with_fg(rows);
+            acc = acc.wrapping_add(text.len()).wrapping_add(fg.len());
+        }
+        let with_fg = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..n {
+            let text = vt.tail_lines_dewrapped(rows);
+            acc = acc.wrapping_add(text.len());
+        }
+        let dewrapped = t1.elapsed();
+
+        let wf = with_fg.as_nanos() as f64 / n as f64;
+        let dw = dewrapped.as_nanos() as f64 / n as f64;
+        println!("#perf-R1 (200x50, n={n}, acc={acc}):");
+        println!("  tail_lines_with_fg (old: built per identical frame): {wf:.0} ns/call");
+        println!("  tail_lines_dewrapped (new pre-hash gate path)       : {dw:.0} ns/call");
+        println!(
+            "  saving per unchanged frame                          : {:.0} ns ({:.1}x)",
+            wf - dw,
+            wf / dw
         );
     }
 }

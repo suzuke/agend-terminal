@@ -1452,17 +1452,46 @@ impl StateTracker {
     /// `anchor_on_red == false` (Shell/Raw) OR `fg` is empty (text-only
     /// callers / cold paths) — matching pre-#919 unconditional behavior.
     pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) {
-        // Gate sequence (order-critical — read top-to-bottom):
-        //   1. hash-dedup gate        — skip unchanged frames (throttle-hint override)
-        //   2. classify + transition  — anchor/position suppression → landing
-        //                               pipeline → heartbeat gate → transition
-        //   3. post-classify instrumentation (zero behavior): unclassified-throttle
-        //      capture, shadow telemetry, F9 productive-output detection
+        // Gate 1 — hash-dedup (skip unchanged frames; throttle-hint override).
+        // On a MISS the post-dedup pipeline runs (see `feed_after_dedup`).
         let hash = hash_screen(screen_text);
         if self.apply_hash_dedup_gate(screen_text, hash) {
             return;
         }
+        self.feed_after_dedup(screen_text, fg);
+    }
 
+    /// #perf-R1: hot-path entry. Runs the cheap text-only hash-dedup gate FIRST
+    /// and builds the fg colour mask (via `build_fg`) ONLY on a dedup MISS, so an
+    /// unchanged redraw (Ink/spinner re-emitting an identical frame) skips the
+    /// O(rows*cols) `classify_fg` pass + per-row allocations entirely — all while
+    /// holding the contended per-agent core lock.
+    ///
+    /// Behaviourally identical to `feed_with_fg(screen_text, &build_fg())`: the
+    /// gate's dedup decision is byte-identical because `screen_text` MUST be the
+    /// SAME de-wrapped text `feed_with_fg` would hash — callers pass
+    /// [`crate::vterm::VTerm::tail_lines_dewrapped`], whose text equals
+    /// `tail_lines_with_fg().0`. `build_fg` then yields the colour mask aligned
+    /// 1:1 with that text (same grid, same de-wrap ⇒ `tail_lines_with_fg().1`).
+    pub fn feed_with_lazy_fg(&mut self, screen_text: &str, build_fg: impl FnOnce() -> Vec<CellFg>) {
+        let hash = hash_screen(screen_text);
+        if self.apply_hash_dedup_gate(screen_text, hash) {
+            return;
+        }
+        let fg = build_fg();
+        self.feed_after_dedup(screen_text, &fg);
+    }
+
+    /// Shared post-dedup body of [`feed_with_fg`] / [`feed_with_lazy_fg`] —
+    /// order-critical, read top-to-bottom:
+    ///   2. classify + transition  — anchor/position suppression → landing
+    ///                               pipeline → heartbeat gate → transition
+    ///   3. post-classify instrumentation (zero behavior): unclassified-throttle
+    ///      capture, shadow telemetry, F9 productive-output detection
+    ///
+    /// The caller MUST have already passed the hash-dedup gate (gate 1) for this
+    /// `screen_text`; entering here re-runs detection unconditionally.
+    fn feed_after_dedup(&mut self, screen_text: &str, fg: &[CellFg]) {
         // Sprint 27 shadow-mode: capture silence duration BEFORE updating
         // last_output, so we measure time since previous feed (not current).
         let silence_since_last_feed = self.last_output.elapsed();

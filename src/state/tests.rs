@@ -5641,3 +5641,171 @@ fn turn_sentinel_fires_for_prod_constructed_tracker_2297() {
         "the agent's name-derived token was detected via the prod path"
     );
 }
+
+// ── #perf-R1: lazy-fg gate — unchanged frames skip the fg colour-mask build ──
+//
+// The PTY hot path (agent/mod.rs `pty_read_loop`) used to build the full
+// O(rows*cols) fg colour mask on EVERY chunk, then discard it inside
+// `feed_with_fg`'s hash-dedup early-return whenever the frame was unchanged (an
+// Ink/spinner redraw flood). `feed_with_lazy_fg` defers the mask build behind
+// the dedup gate. These pins are DETERMINISTIC (a call counter, never a timing
+// assertion — machine-independent, never flaky).
+
+/// Drive the NEW hot-path ingress (`tail_lines_dewrapped` → `feed_with_lazy_fg`),
+/// mirroring agent/mod.rs `pty_read_loop`, so a test can prove it transitions
+/// identically to the eager [`drive`] (`tail_lines_with_fg` → `feed_with_fg`).
+fn drive_lazy(vterm: &mut VTerm, state: &mut StateTracker, bytes: &[u8]) {
+    vterm.process(bytes);
+    let rows = vterm.rows() as usize;
+    let screen = vterm.tail_lines_dewrapped(rows);
+    state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+}
+
+/// An unchanged (dedup-HIT) frame must NOT invoke the fg-mask builder.
+#[test]
+fn lazy_fg_skips_build_on_unchanged_frame() {
+    use std::cell::Cell;
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    let frame = "some benign idle output\n❯";
+    let n = frame.chars().count();
+    let builds = Cell::new(0u32);
+
+    // First feed: a NEW frame ⇒ dedup MISS ⇒ fg built exactly once.
+    t.feed_with_lazy_fg(frame, || {
+        builds.set(builds.get() + 1);
+        vec![CellFg::Default; n]
+    });
+    assert_eq!(
+        builds.get(),
+        1,
+        "a new frame must build the fg mask exactly once"
+    );
+
+    // Second feed: IDENTICAL frame ⇒ dedup HIT ⇒ fg builder NOT invoked.
+    t.feed_with_lazy_fg(frame, || {
+        builds.set(builds.get() + 1);
+        vec![CellFg::Default; n]
+    });
+    assert_eq!(
+        builds.get(),
+        1,
+        "an unchanged frame must skip the fg-mask build (dedup HIT via the lazy gate)"
+    );
+}
+
+/// A CHANGED frame (dedup MISS) must build the fg mask AND run detection — a
+/// red-rendered SRL error still latches through the lazy path (fg is consumed).
+#[test]
+fn lazy_fg_builds_on_changed_frame_and_red_anchor_fires() {
+    use std::cell::Cell;
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    let screen = "Error: socket hang up";
+    let n = screen.chars().count();
+    let builds = Cell::new(0u32);
+
+    t.feed_with_lazy_fg(screen, || {
+        builds.set(builds.get() + 1);
+        vec![CellFg::Red; n]
+    });
+    assert_eq!(builds.get(), 1, "a changed frame builds the fg mask");
+    assert_eq!(
+        t.get_state(),
+        AgentState::ServerRateLimit,
+        "#perf-R1: a red SRL error still latches through the lazy-fg path (fg consumed on MISS)"
+    );
+}
+
+/// The lazy hot path must produce the SAME state transitions as the eager path
+/// across a realistic sequence (idle → SRL latch → recovery), driven through the
+/// REAL vterm render. `saw_srl` guards against a vacuously-all-Idle equality.
+#[test]
+fn lazy_fg_path_matches_eager_path() {
+    let seq: &[&[u8]] = &[
+        b"\x1b[2J\x1b[Hidle output here\r\n\xe2\x9d\xaf ",
+        "\x1b[2J\x1b[HAPI Error: Server is\r\ntemporarily limiting\r\nrequests (not your\r\nusage limit)\r\n"
+            .as_bytes(),
+        b"\x1b[2J\x1b[Hrecovered, idle again\r\n\xe2\x9d\xaf ",
+    ];
+    let mut vt_e = VTerm::new(120, 24);
+    let mut st_e = StateTracker::new(Some(&Backend::ClaudeCode));
+    let mut vt_l = VTerm::new(120, 24);
+    let mut st_l = StateTracker::new(Some(&Backend::ClaudeCode));
+
+    let mut saw_srl = false;
+    for (i, f) in seq.iter().enumerate() {
+        drive(&mut vt_e, &mut st_e, f);
+        drive_lazy(&mut vt_l, &mut st_l, f);
+        assert_eq!(
+            st_l.get_state(),
+            st_e.get_state(),
+            "frame {i}: the lazy hot path must transition identically to the eager path"
+        );
+        saw_srl |= st_e.get_state() == AgentState::ServerRateLimit;
+    }
+    assert!(
+        saw_srl,
+        "the sequence must exercise a real SRL transition (else the equality is vacuous)"
+    );
+}
+
+/// #SRL-phase2 throttle-hint override through the lazy path. While a pane is
+/// already latched an identical frame is a plain dedup HIT (no fg rebuild); but a
+/// SETTLED pane that was spuriously cleared must RE-DETECT on the next identical
+/// frame, and the fg mask IS rebuilt on that re-detect (the override deliberately
+/// falls through the dedup gate — correctness over the perf skip). Mirrors
+/// `static_srl_pane_redetected_after_dedup_blindspot_phase2`.
+#[test]
+fn lazy_fg_rebuilds_and_redetects_static_throttle_pane() {
+    use std::cell::Cell;
+    let mut vt = VTerm::new(120, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    let hw =
+        "API Error: Server is\r\ntemporarily limiting\r\nrequests (not your\r\nusage limit)\r\n";
+    vt.process(hw.as_bytes());
+    let rows = vt.rows() as usize;
+    let screen = vt.tail_lines_dewrapped(rows);
+    let builds = Cell::new(0u32);
+
+    // First feed (NEW frame ⇒ MISS): builds the mask, latches.
+    st.feed_with_lazy_fg(&screen, || {
+        builds.set(builds.get() + 1);
+        vt.tail_lines_with_fg(rows).1
+    });
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "first feed latches"
+    );
+    assert_eq!(builds.get(), 1, "the first (MISS) feed builds the fg mask");
+
+    // Identical frame while STILL latched: `already_throttle` ⇒ plain dedup HIT.
+    st.feed_with_lazy_fg(&screen, || {
+        builds.set(builds.get() + 1);
+        vt.tail_lines_with_fg(rows).1
+    });
+    assert_eq!(st.get_state(), AgentState::ServerRateLimit, "stays latched");
+    assert_eq!(
+        builds.get(),
+        1,
+        "an identical frame while already throttle-latched is a plain dedup HIT (no fg rebuild)"
+    );
+
+    // Spurious clear; the pane stays STATIC (same de-wrapped text ⇒ same hash).
+    st.current = AgentState::Idle;
+    // Identical frame, now NOT latched: throttle-hint override falls through the
+    // dedup gate ⇒ re-detect ⇒ the fg mask IS rebuilt ⇒ re-latches.
+    st.feed_with_lazy_fg(&screen, || {
+        builds.set(builds.get() + 1);
+        vt.tail_lines_with_fg(rows).1
+    });
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#SRL-phase2: a static throttle pane must re-detect through the lazy gate"
+    );
+    assert_eq!(
+        builds.get(),
+        2,
+        "#perf-R1: the throttle-hint re-detect override still rebuilds the fg mask"
+    );
+}

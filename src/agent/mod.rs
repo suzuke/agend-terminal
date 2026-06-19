@@ -1609,17 +1609,32 @@ fn pty_read_loop(
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
                 let screen = {
                     let mut c = core.lock();
-                    c.vterm.process(data);
-                    let rows = c.vterm.rows() as usize;
-                    // #1450: pull the screen text together with the per-char
-                    // foreground color mask. The HIGH_FP color anchor reads
-                    // the mask off the resolved grid cells (alacritty has
-                    // already normalized 16/256/truecolor SGR), replacing the
-                    // #919 raw-byte SGR ring that missed truecolor and broke
-                    // on Ink redraw fragmentation.
-                    let (screen, fg) = c.vterm.tail_lines_with_fg(rows);
-                    c.state.feed_with_fg(&screen, &fg);
-                    broadcast_pty_output(&mut c.subscribers, data, &mut dropped_chunks, name);
+                    // Disjoint field borrows so the lazy-fg closure may read
+                    // `vterm` while `state` is borrowed mutably (both fields of
+                    // the same guarded `AgentCore`).
+                    let AgentCore {
+                        vterm,
+                        state,
+                        subscribers,
+                        ..
+                    } = &mut *c;
+                    vterm.process(data);
+                    let rows = vterm.rows() as usize;
+                    // #perf-R1: hash the CHEAP de-wrapped text-only tail for the
+                    // unchanged-frame dedup gate and build the per-char fg colour
+                    // mask LAZILY — only on a dedup MISS. A redraw flood (Ink /
+                    // spinner re-emitting an identical frame) thus skips the
+                    // O(rows*cols) `classify_fg` rebuild + per-row allocations
+                    // while holding the contended core lock. `tail_lines_dewrapped`
+                    // is byte-identical to `tail_lines_with_fg().0`, so the dedup
+                    // decision and the post-render dismiss scan below are unchanged.
+                    //
+                    // #1450: on a MISS the HIGH_FP colour anchor still reads the
+                    // mask off the resolved grid cells (alacritty has normalized
+                    // 16/256/truecolor SGR) via `tail_lines_with_fg().1`.
+                    let screen = vterm.tail_lines_dewrapped(rows);
+                    state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+                    broadcast_pty_output(subscribers, data, &mut dropped_chunks, name);
                     screen
                 };
 
