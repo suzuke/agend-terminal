@@ -3067,29 +3067,26 @@ mod tests {
     #[test]
     fn effective_cwd_through_globals_resolves_leading_dash_c() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // A REAL absolute base (drive-qualified on Windows, `/`-rooted on Unix) so
+        // `is_absolute()` agrees with the assertion on every platform. A hardcoded
+        // `/abs/...` is NOT absolute on Windows — it would resolve drive-relative
+        // (`D:/abs/...`) and only this test (not the production logic) would diverge.
+        let abs = std::env::current_dir().expect("cwd").join("canon-fixture");
+        let abs_s = abs.to_str().expect("utf8 path");
         // Absolute `-C <path>` → that path, independent of the process cwd.
-        let args = s(&["-C", "/abs/canonical", "worktree", "add", "x"]);
+        let args = s(&["-C", abs_s, "worktree", "add", "x"]);
         let idx = subcommand_index(&args).expect("has subcommand");
         assert_eq!(idx, 2, "subcommand starts after `-C <path>`");
-        assert_eq!(
-            effective_cwd_through_globals(&args, idx),
-            std::path::PathBuf::from("/abs/canonical")
-        );
+        assert_eq!(effective_cwd_through_globals(&args, idx), abs);
         // Repeated `-C`: a later RELATIVE `-C` joins onto the accumulated path.
-        let args = s(&["-C", "/abs/canonical", "-C", "sub", "checkout", "main"]);
+        let args = s(&["-C", abs_s, "-C", "sub", "checkout", "main"]);
         let idx = subcommand_index(&args).expect("has subcommand");
-        assert_eq!(
-            effective_cwd_through_globals(&args, idx),
-            std::path::PathBuf::from("/abs/canonical/sub")
-        );
+        assert_eq!(effective_cwd_through_globals(&args, idx), abs.join("sub"));
         // A value-taking global (`-c k=v`) before `-C` is skipped WITH its value,
         // so `k=v` is never mistaken for the `-C` target.
-        let args = s(&["-c", "k=v", "-C", "/abs/x", "status"]);
+        let args = s(&["-c", "k=v", "-C", abs_s, "status"]);
         let idx = subcommand_index(&args).expect("has subcommand");
-        assert_eq!(
-            effective_cwd_through_globals(&args, idx),
-            std::path::PathBuf::from("/abs/x")
-        );
+        assert_eq!(effective_cwd_through_globals(&args, idx), abs);
         // No leading `-C` → process cwd unchanged.
         let args = s(&["worktree", "add", "x"]);
         let idx = subcommand_index(&args).expect("has subcommand");
