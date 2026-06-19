@@ -2178,7 +2178,7 @@ mod tests {
     fn render_output_fully_determined_no_residual_leak() {
         use ratatui::layout::Rect;
         const SENTINEL: char = '\u{2588}'; // full block — never produced by render
-                                            // (bytes, cols, rows, render area)
+                                           // (bytes, cols, rows, render area)
         let cases: &[(&[u8], u16, u16, Rect)] = &[
             (b"hello world", 11, 1, Rect::new(0, 0, 11, 1)), // narrow, area == grid
             (b"hi", 10, 3, Rect::new(0, 0, 10, 3)),          // blank tail within grid
