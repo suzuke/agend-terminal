@@ -225,6 +225,14 @@ pub struct VTerm {
     processor: Processor,
     cols: u16,
     rows: u16,
+    /// R7 (#t-84833-16): per-pane reusable scratch for the per-frame visible-cell
+    /// snapshot in `render_to_buffer_inner`. Each render `clear()`s and refills it
+    /// instead of allocating a fresh `Vec<Cell>` (~grid-size, ~100KB @120×40) every
+    /// frame — in steady state (stable pane size) the buffer is reused with zero
+    /// reallocation. `RefCell` keeps the render path `&self` (read-shaped) while
+    /// caching across frames; VTerm is single-threaded (main render thread only),
+    /// so the interior mutability never races.
+    snapshot_scratch: std::cell::RefCell<Vec<Cell>>,
 }
 
 impl VTerm {
@@ -256,6 +264,7 @@ impl VTerm {
             processor: Processor::new(),
             cols,
             rows,
+            snapshot_scratch: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -311,18 +320,43 @@ impl VTerm {
         scroll_offset: usize,
         show_block_cursor: bool,
     ) {
-        // #1064 area-clamp pre-fill: ratatui Buffer is stateful across
-        // frames (codebase invariant from #819). The clamped-write loop
-        // below only touches `rows × cols = min(self.rows, area.height,
-        // grid_rows)` cells, so trailing rows/cols of `area` (when
-        // `area > grid`, e.g. resize race or initial spawn lag) would
-        // retain previous-frame content → operator-visible residual text.
-        // Blank the full area first with a default cell; the loop then
-        // overwrites with PTY content for the clamped region.
+        // Dimension clamp FIRST — the R7-folded pre-fill below needs the clamped
+        // render region (`rows`/`cols`). Sprint 21 Phase 4 Q7 sweep: this
+        // triple-`.min()` chain is the same saturating-arithmetic class as
+        // `render::clamp_overlay_dim` — intentionally caps render bounds by the
+        // smallest of {self-tracked, ratatui-passed, grid-actual} dimensions so a
+        // resize race where any pair disagrees cannot index past the alacritty
+        // grid (HOTFIX PR #194 closed the panic; root-cause race deferred to
+        // backlog `t-20260426150432078733-1`). Audit-confirmed clean: no other
+        // panic-prone subtraction sites in this file.
+        let grid = self.term.grid();
+        let grid_cols = grid.columns() as u16;
+        let grid_rows = grid.screen_lines() as u16;
+        let rows = self.rows.min(area.height).min(grid_rows);
+        let cols = self.cols.min(area.width).min(grid_cols);
+        // `scroll_offset` is usize; `as i32` wraps on 64-bit hosts when the
+        // caller somehow passes > i32::MAX. Clamp instead so an unreasonable
+        // offset degrades to "deepest scrollback" rather than flipping sign
+        // and pulling a positive-huge line index that panics alacritty on
+        // index.
+        let offset: i32 = scroll_offset.min(i32::MAX as usize) as i32;
+
+        // #1064 area-clamp pre-fill, R7-folded: ratatui Buffer is stateful across
+        // frames (codebase invariant from #819). The clamped-write loop below
+        // writes EVERY in-buffer cell of the core region `rows × cols` (each
+        // column is written, and wide chars also blank their spacer), so
+        // pre-filling the core is pure redundant work — the render loop overwrites
+        // it anyway. R7: blank ONLY the residual strips the loop never visits —
+        // the bottom strip (rows `rows..area.height`) and the right strip (cols
+        // `cols..area.width` within rows `0..rows`). Together they are exactly
+        // `area \ core`, non-empty only when `area > grid` (resize race / spawn
+        // lag); in the common `area == grid` case both strips run zero passes.
+        // Output is byte-identical to the old full-area pre-fill (#1064 T1–T7).
         let buf_right = buf.area().x.saturating_add(buf.area().width);
         let buf_bottom = buf.area().y.saturating_add(buf.area().height);
         let default_style = ratatui::style::Style::default();
-        for dy in 0..area.height {
+        // Bottom strip: full-width rows below the rendered grid region.
+        for dy in rows..area.height {
             let y = area.y.saturating_add(dy);
             if y >= buf_bottom {
                 break;
@@ -337,40 +371,43 @@ impl VTerm {
                 cell.set_style(default_style);
             }
         }
+        // Right strip: cols beyond the rendered grid, within the rendered rows.
+        for dy in 0..rows {
+            let y = area.y.saturating_add(dy);
+            if y >= buf_bottom {
+                break;
+            }
+            for dx in cols..area.width {
+                let x = area.x.saturating_add(dx);
+                if x >= buf_right {
+                    break;
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_char(' ');
+                cell.set_style(default_style);
+            }
+        }
 
-        let grid = self.term.grid();
-        let grid_cols = grid.columns() as u16;
-        let grid_rows = grid.screen_lines() as u16;
-        // Sprint 21 Phase 4 Q7 sweep: this triple-`.min()` chain is the same
-        // saturating-arithmetic class as `render::clamp_overlay_dim` —
-        // intentionally caps render bounds by the smallest of {self-tracked,
-        // ratatui-passed, grid-actual} dimensions so a resize race where any
-        // pair disagrees cannot index past the alacritty grid (HOTFIX PR #194
-        // closed the panic; root-cause race deferred to backlog
-        // `t-20260426150432078733-1`). Audit-confirmed clean: no other
-        // panic-prone subtraction sites in this file.
-        let rows = self.rows.min(area.height).min(grid_rows);
-        let cols = self.cols.min(area.width).min(grid_cols);
-        // `scroll_offset` is usize; `as i32` wraps on 64-bit hosts when the
-        // caller somehow passes > i32::MAX. Clamp instead so an unreasonable
-        // offset degrades to "deepest scrollback" rather than flipping sign
-        // and pulling a positive-huge line index that panics alacritty on
-        // index.
-        let offset: i32 = scroll_offset.min(i32::MAX as usize) as i32;
-
-        // L1 atomic snapshot: copy visible cells into a local buffer so
+        // L1 atomic snapshot: copy visible cells into a REUSED scratch buffer so
         // concurrent PTY resize cannot mutate the grid mid-render. This
         // eliminates the TOCTOU temporal gap entirely — the snapshot is
         // immutable for the duration of this frame. Cost: ~rows×cols Cell
-        // copies (typically 120×40 = 4800 cells, ~100KB). safe_cell (L0a)
-        // remains as defense-in-depth for the snapshot-build phase itself.
+        // copies (typically 120×40 = 4800 cells, ~100KB). R7: the per-pane
+        // scratch `Vec` is reused across frames (`clear` + `reserve` + refill),
+        // so a stable pane size reallocates zero times after the first frame
+        // (was a fresh `Vec::with_capacity` allocation every frame). safe_cell
+        // (L0a) remains as defense-in-depth for the snapshot-build phase itself.
         let snap_rows = rows as usize;
         let snap_cols = cols as usize;
-        let mut snapshot: Vec<Cell> = Vec::with_capacity(snap_rows * snap_cols);
-        for row in 0..rows {
-            let grid_line = Line((row as i32).saturating_sub(offset));
-            for c in 0..cols {
-                snapshot.push(safe_cell(grid, grid_line, c as usize).clone());
+        {
+            let mut scratch = self.snapshot_scratch.borrow_mut();
+            scratch.clear();
+            scratch.reserve(snap_rows * snap_cols);
+            for row in 0..rows {
+                let grid_line = Line((row as i32).saturating_sub(offset));
+                for c in 0..cols {
+                    scratch.push(safe_cell(grid, grid_line, c as usize).clone());
+                }
             }
         }
 
@@ -379,6 +416,7 @@ impl VTerm {
 
         // From here on, only the snapshot is used — the live grid reference
         // is no longer accessed, eliminating the TOCTOU window.
+        let snapshot = self.snapshot_scratch.borrow();
 
         for row in 0..rows {
             let mut col = 0u16;
@@ -452,6 +490,17 @@ impl VTerm {
                 buf_cell.set_style(style);
             }
         }
+    }
+
+    /// R7 (#t-84833-16) test seam: the snapshot scratch's (data-pointer, capacity).
+    /// A stable pair across repeated same-size renders proves the per-frame
+    /// snapshot buffer is REUSED with zero reallocation (the steady-state
+    /// "0 allocations" property), since a `Vec` only changes its pointer/capacity
+    /// when it reallocates.
+    #[cfg(test)]
+    fn snapshot_scratch_ptr_cap(&self) -> (usize, usize) {
+        let s = self.snapshot_scratch.borrow();
+        (s.as_ptr() as usize, s.capacity())
     }
 
     /// Returns true if the terminal application has enabled mouse reporting.
@@ -2108,6 +2157,123 @@ mod tests {
             buf[(0, 0)].symbol(),
             "K",
             "zero-size area must not affect buffer"
+        );
+    }
+
+    /// R7 (#t-84833-16) byte-identical / no-residual-leak characterization.
+    ///
+    /// The rendered Buffer must be FULLY determined by the render — every cell in
+    /// `area` either written by the content loop or blanked by the pre-fill —
+    /// independent of the buffer's prior contents (ratatui buffers are stateful
+    /// across frames, #819). Renders each case twice into byte-for-byte buffers
+    /// that differ only in prior contents (one clean, one pre-poisoned with a
+    /// sentinel in EVERY cell); the two `area` regions must be cell-identical and
+    /// no sentinel may survive anywhere inside `area`.
+    ///
+    /// This is the guard for the R7 pre-fill fold (blank only the residual strips
+    /// instead of the full area): if the fold leaves any in-`area` cell unwritten,
+    /// the poisoned buffer keeps its sentinel there and this fails. Green on the
+    /// pre-fold code (characterizes current behavior); must stay green after.
+    #[test]
+    fn render_output_fully_determined_no_residual_leak() {
+        use ratatui::layout::Rect;
+        const SENTINEL: char = '\u{2588}'; // full block — never produced by render
+                                           // (bytes, cols, rows, render area)
+        let cases: &[(&[u8], u16, u16, Rect)] = &[
+            (b"hello world", 11, 1, Rect::new(0, 0, 11, 1)), // narrow, area == grid
+            (b"hi", 10, 3, Rect::new(0, 0, 10, 3)),          // blank tail within grid
+            ("中文ab".as_bytes(), 10, 2, Rect::new(0, 0, 10, 2)), // wide CJK + spacers
+            (b"abcde", 5, 2, Rect::new(0, 0, 12, 6)),        // area >> grid: BOTH strips
+            (b"x", 5, 2, Rect::new(3, 4, 9, 7)),             // non-zero origin + overflow
+            (b"", 8, 3, Rect::new(0, 0, 8, 3)),              // empty content
+            (b"line1\r\nline2", 8, 4, Rect::new(0, 0, 8, 4)), // multi-line + blank rows
+        ];
+        for (i, (bytes, cols, rows, area)) in cases.iter().enumerate() {
+            let mut vt = VTerm::new(*cols, *rows);
+            vt.process(bytes);
+
+            // Buffer strictly larger than `area` so the outside-area no-touch
+            // contract is also exercised.
+            let buf_area = Rect::new(0, 0, area.x + area.width + 2, area.y + area.height + 2);
+            let mut clean = ratatui::buffer::Buffer::empty(buf_area);
+            let mut dirty = ratatui::buffer::Buffer::empty(buf_area);
+            for y in buf_area.y..buf_area.y + buf_area.height {
+                for x in buf_area.x..buf_area.x + buf_area.width {
+                    dirty[(x, y)].set_char(SENTINEL);
+                }
+            }
+
+            vt.render_to_buffer(&mut clean, *area, 0, false);
+            vt.render_to_buffer(&mut dirty, *area, 0, false);
+
+            for dy in 0..area.height {
+                for dx in 0..area.width {
+                    let (x, y) = (area.x + dx, area.y + dy);
+                    assert_eq!(
+                        clean[(x, y)],
+                        dirty[(x, y)],
+                        "case {i}: cell ({x},{y}) differs clean-vs-poisoned — render \
+                         left it undetermined (prior buffer state leaked through)"
+                    );
+                    assert_ne!(
+                        dirty[(x, y)].symbol(),
+                        SENTINEL.to_string(),
+                        "case {i}: cell ({x},{y}) kept the sentinel — render neither \
+                         wrote nor blanked it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// R7 (#t-84833-16) scratch-reuse / steady-state zero-allocation.
+    ///
+    /// The per-frame visible-cell snapshot must be backed by a REUSED `Vec<Cell>`,
+    /// not a fresh `Vec::with_capacity` every render. After the first render warms
+    /// the scratch to grid size, repeated same-size renders must leave its data
+    /// pointer AND capacity unchanged — a `Vec` only moves/grows its allocation on
+    /// reallocation, so a stable (ptr, cap) pair == zero steady-state allocations.
+    /// Also pins per-pane isolation: each VTerm owns a distinct scratch (no shared
+    /// or `static` buffer that would corrupt rendering across panes).
+    #[test]
+    fn snapshot_scratch_reused_zero_steadystate_alloc() {
+        use ratatui::layout::Rect;
+        let mut vt = VTerm::new(40, 12);
+        vt.process(b"content across the grid\r\nsecond line\r\nthird line here");
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+
+        // Warm-up: the first render allocates the scratch to grid size.
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        let (ptr0, cap0) = vt.snapshot_scratch_ptr_cap();
+        assert!(
+            cap0 >= 40 * 12,
+            "scratch must hold the full {}-cell grid snapshot, cap={cap0}",
+            40 * 12
+        );
+
+        // Steady state: many same-size renders must NOT reallocate, even as the
+        // PTY content changes each frame (clear + refill stays within capacity).
+        for frame in 0..50 {
+            vt.process(format!("frame {frame}\r").as_bytes()); // same grid size
+            vt.render_to_buffer(&mut buf, area, 0, false);
+            assert_eq!(
+                vt.snapshot_scratch_ptr_cap(),
+                (ptr0, cap0),
+                "frame {frame}: scratch reallocated (ptr/cap moved) — the per-frame \
+                 grid-size allocation was not eliminated"
+            );
+        }
+
+        // Per-pane isolation: a second live VTerm holds its OWN scratch allocation.
+        let mut vt2 = VTerm::new(40, 12);
+        vt2.process(b"a different pane");
+        let mut buf2 = ratatui::buffer::Buffer::empty(area);
+        vt2.render_to_buffer(&mut buf2, area, 0, false);
+        let (ptr2, _) = vt2.snapshot_scratch_ptr_cap();
+        assert_ne!(
+            ptr2, ptr0,
+            "each pane's VTerm must own a distinct scratch buffer (no shared state)"
         );
     }
 }
