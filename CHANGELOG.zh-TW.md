@@ -24,7 +24,7 @@
 
 - **自我 respawn restart 預設開啟(#1814 Stage 4、#2094)** — `AGEND_RESTART_HANDOFF` 由 OFF→ON:daemon 在退出前生成並健康把關自己的後繼者,launchd KeepAlive 契約收斂為 restart-on-failure(#2093)。
 - **更快更順的 restart** — app-mode shutdown teardown 平行化(~6 秒 → grace 窗,#2311);old-exit→new-launch 的 gap 與 restart timing 加上 instrument(#2310、#2275);release build 採 ThinLTO + 更多 codegen units(#2265)。
-- **canonical worktree reconcile(#2234 —— flag-gated、預設 OFF)** — 把 `workspace/<agent>` reconcile 成 canonical git worktree(#2262),含 layout-aware GC + agent 歸屬(#2263、#2266、#2269)、in-place dispatch checkout(#2264)、reconcile-backups 保留 GC(#2272)、reverse-reconcile 回滾原語(#2267)。`agend-git` shim 對 cwd↔worktree 漂移發 WARN(#2254、#2278),並在 canonical-rooted repo 中 DENY agent 的 `AGEND_GIT_BYPASS` provisioning op(#2316)。
+- **canonical worktree reconcile(#2234 —— flag-gated、預設 OFF)** — 把 `workspace/<agent>` reconcile 成 canonical git worktree(#2262),含 layout-aware GC + agent 歸屬(#2263、#2266、#2269)、in-place dispatch checkout(#2264)、reconcile-backups 保留 GC(#2272)、reverse-reconcile 回滾原語(#2267)。`agend-git` shim 對 cwd↔worktree 漂移發 WARN(#2254、#2278),並在 canonical-rooted repo 中 DENY agent 的 `AGEND_GIT_BYPASS` provisioning op(#2316)—— 此 deny 現在會穿透 leading `-C` 解析真正的 subcommand 與 effective cwd,使 `git -C <canonical> worktree add` 從任何 cwd 都正確 DENY(#2336),訊息也改為條件式措辭以涵蓋無 auto-bind worktree 的 no-branch dispatch(#2334)。
 - **治理閘機械化** — 反覆手追的 review 規則變成 invariant 測:狀態檔必須走 `store::atomic_write`(D2,#2323),instrument/audit 路徑永不影響 control-flow 或 exit code(D3,#2324);三條 protocol 規則 + context-full 自我 restart 流程已形式化(#2329、#2157)。
 - **依賴升級** — crossterm 0.29、sysinfo 0.39、regex、serde_json、insta(#2285–#2289)。
 
@@ -34,6 +34,8 @@
 - **Telegram 健壯性** — 網路失敗時 polling 退避而非 panic-loop(#2200、#2224);全新安裝在空 allowlist 時 fail-fast,quickstart 自動填入 sender id(#2207、#2225);sender 顯示名稱從 allowlist 解析(#2045);關閉經由 `reqwest` error URL 的 bot-token 洩漏(#2178)。
 - **CR-2026-06-14 可靠性與安全硬化** — 一輪廣泛清掃:case-insensitive `branch="Main"` protected-ref 繞過(#2172)、Telegram notify 改同步驅動而非丟到未驅動的 runtime(#2152)、char-aware pane 解析(非 ASCII 不 panic)(#2149)、lock-ordering / dedup / keepalive 修正(#2197)、worktree 資料遺失防護(#2193、#2194)、有界的 `gh` CLI subprocess(#2191),以及更多 inbox / state-capture / worktree 發現(#2181、#2187、#2190、#2201、#2203、#2205、#2212、#2221、#2223)。
 - **control-plane 與 TUI 可靠性** — `restart_daemon` 在 app/owned 模式 fail-closed,而非把 control plane 弄 brick(#2103);reused worktree 在 lease 重取時 force-sync 到 HEAD(#2226);daemon git-spawn 的 stdio 不再弄亂 TUI 畫面(#2073)。
+- **CI-watch 信號準確度(#2335)** — ci-watch 現在只在 required status check 上 gate `[ci-fail]`,非-required check(如 Coverage)失敗不再觸發假的 `[ci-fail]` + re-nudge。
+- **stray-worktree 衛生(#2158、#2337)** — 每小時一次、emit-once 的 sweep 把 GC 無法回收的 stray daemon-managed worktree 以 fleet health「Workspace violations」count 呈現。
 
 ## [0.8.0] — 2026-06-12
 
