@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+mod auto_watch;
 mod from_ref;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 
@@ -232,6 +233,7 @@ pub(crate) fn dispatch_auto_bind_lease(
 ) -> Result<DispatchOutcome, DispatchError> {
     dispatch_auto_bind_lease_with_source_and_chain(
         home, target, task_id, branch, repo, None, None, None,
+        true, // #2158 GR1: dispatch entry → arm ci-watch
     )
 }
 
@@ -275,6 +277,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
         None,
         next_after_ci,
         review_class,
+        true, // #2158 GR1: dispatch entry (delegate/comms) → arm ci-watch
     )
 }
 
@@ -288,6 +291,11 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
 /// Option 1 atomic fresh provision). Both share this dispatch path —
 /// caller chooses entry based on whether the caller already knows the
 /// source repo (bind:true) or relies on fleet.yaml resolution (bind_self).
+///
+/// #2158 GR1: passes `arm_ci_watch=false` — a `bind_self` self-provision NEVER
+/// silently arms a ci-watch (the agent arms `ci action=watch` explicitly if it
+/// wants CI notifications). The dispatch wrappers (`_with_chain` / the bare entry)
+/// pass `true`.
 ///
 /// #781 Piece 7: returns structured [`DispatchOutcome`] / [`DispatchError`].
 /// C2 commit performs the signature migration mechanically — `source_repo_tier`,
@@ -310,6 +318,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         source_repo_override,
         None,
         None,
+        false, // #2158 GR1: bind_self self-claim → do NOT silently arm ci-watch
     )
 }
 
@@ -349,6 +358,11 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // the MCP boundary (comms.rs) silently evaporates and CI gates single review.
     // 4th re-marshal-drop of an MCP-accepted dispatch directive.
     review_class: Option<&str>,
+    // #2158 GR1: explicit "this is a real dispatch, arm the ci-watch" intent — true
+    // for the delegate/dispatch wrappers, false for `bind_self` self-claims. NOT keyed
+    // on task_id, which a single-target auto-create `send kind=task` legitimately leaves
+    // empty (the arm must still fire for it).
+    arm_ci_watch: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let _guard = BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
         message: msg,
@@ -562,74 +576,21 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 .and_then(|s| canonicalize_repo_slug(&s))
         })
         .or_else(|| derive_repo_from_remote(&source_repo));
-    // #2158 GR1: ONLY a real DISPATCH auto-arms ci_watch. A dispatch always carries a
-    // task_id (send kind=task rejects an empty one — comms_gates/anti_stall.rs), so
-    // gating the arm on a non-empty task_id arms every legit dispatch while skipping
-    // OUT-OF-DISPATCH self-claims that reach here with task_id="" — namely `bind_self`
-    // without a task. This is the SECOND silent-arm path (the first, checkout.rs's
-    // inline arm, was removed); both were the #2158 silent-arm blast. Same task_id
-    // gate as the out-of-dispatch operator-notify in `bind_full`. The bind/lease above
-    // is unaffected — only the convenience auto-watch is gated.
-    if let Some(r) = resolved_repo.filter(|_| !task_id.is_empty()) {
-        // #931 Fix 2 (H5a): when the dispatcher declared a workflow chain
-        // via `next_after_ci` (e.g. lead → dev with reviewer as the next
-        // step), propagate it into the auto-armed watch so the daemon's
-        // poll loop fires `[ci-ready-for-action]` to the chain target on
-        // CI pass. Pre-#931 callers had to issue a follow-up
-        // `ci action=watch next_after_ci=…` manually — easily forgotten
-        // and one of the root causes of the 4-in-a-row PR stalls.
-        //
-        // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1037
-        // `<team>-reviewer` name-derived auto-default was REMOVED — it baked the
-        // `-reviewer` naming convention into the daemon and only worked for teams
-        // that follow it. `next_after_ci` is now explicit-only: unset → the watch
-        // arms with no chain target, and on CI pass the dev/subscribers receive
-        // the informational `[ci-pass]` (PR-1 #1796); routing the actionable
-        // `[ci-ready-for-action]` to a reviewer requires an EXPLICIT
-        // `next_after_ci` (lead dispatches the reviewer, or passes it). Role-based
-        // auto-handoff is a future follow-up (needs role infra).
-        let effective_next = next_after_ci.filter(|s| !s.is_empty()).map(String::from);
-        let mut watch_args = serde_json::json!({"repository": &r, "branch": branch});
-        if let Some(ref next) = effective_next {
-            watch_args["next_after_ci"] = serde_json::json!(next);
-        }
-        // #1031: persist the dispatch task_id alongside the watch so
-        // the ci_check_repo emit site can back-link the
-        // `[ci-ready-for-action]` event to the originating dispatch.
-        // Reviewer's verdict report can then echo this task_id in
-        // its correlation_id, closing the [[feedback-dispatch-task-id-mirror]]
-        // false-positive class on the verdict-reply side.
-        if !task_id.is_empty() {
-            watch_args["task_id"] = serde_json::json!(task_id);
-        }
-        // #1877: propagate the dual-review directive so a `second_reviewer=true`
-        // dispatch arms a `review_class=dual` watch (handle_watch_ci → ci/mod.rs
-        // stores it; the poller's `record_ci_result` then enforces dual review).
-        // Unset (normal dispatch) leaves the watch single — no over-upgrade.
-        if let Some(rc) = review_class.filter(|s| !s.is_empty()) {
-            watch_args["review_class"] = serde_json::json!(rc);
-        }
-        let watch_result = crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
-        // #1750 A1: `handle_watch_ci` returns `{"error":..,"code":..}` on a failed
-        // arm (watch_write_failed / ci_watches_dir_create_failed / binding-stale).
-        // Previously this Result was discarded and the success log fired
-        // unconditionally — a silently-failed arm left no trace, the surface
-        // behind "CI green but no watch armed, ci-ready never fires". Surface the
-        // failure as an error log instead of a false success (the dispatch itself
-        // still proceeds — auto-watch is best-effort convenience, not a gate).
-        if let Some((code, err)) = auto_watch_arm_error(&watch_result) {
-            tracing::error!(
-                %target, repo = %r, %branch, code, error = %err,
-                "dispatch auto-watch_ci FAILED — no CI watch armed (ci-ready will not fire)"
-            );
-        } else {
-            tracing::info!(
-                %target,
-                repo = %r,
-                %branch,
-                next_after_ci = ?effective_next,
-                explicit = next_after_ci.is_some(),
-                "dispatch auto-watch_ci"
+    // #2158 GR1: auto-arm the dispatch ci-watch ONLY on an explicit dispatch intent
+    // (`arm_ci_watch`), NOT on task_id presence — a single-target `send kind=task`
+    // (auto-create-exempt) reaches here with task_id="" and MUST still arm. bind_self
+    // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1). The
+    // arming body lives in `auto_watch.rs` (file-size split).
+    if arm_ci_watch {
+        if let Some(r) = resolved_repo {
+            auto_watch::arm(
+                home,
+                target,
+                &r,
+                branch,
+                next_after_ci,
+                review_class,
+                task_id,
             );
         }
     }
