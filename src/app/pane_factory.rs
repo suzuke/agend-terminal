@@ -193,10 +193,47 @@ fn attach_agent_to_pane(
         .working_dir
         .clone()
         .unwrap_or_else(|| crate::paths::workspace_dir(home).join(&name));
+    // #render-first phase-(b): the back-to-back composition of the worker-safe
+    // expensive half (`spawn_and_subscribe`) and the main-thread cheap half
+    // (`apply_attachment`) is byte-identical to the prior inline body — same side
+    // effects, same order. Splitting here is what lets the deferred path run
+    // `spawn_and_subscribe` on a background worker (touches only the shareable
+    // registry) while the render thread runs `apply_attachment` (pane mutation).
+    let (instance_id, rx, dump) = spawn_and_subscribe(
+        registry, home, &name, command, args, spawn_mode, env, submit_key, &work_dir, cols, rows,
+    )?;
+    apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+    Ok(())
+}
 
+/// Expensive, **worker-safe** half of an attach (#render-first phase-(b)): the
+/// part that touches only the shareable `registry: Arc<Mutex>` and the filesystem
+/// — generate MCP config, install skills, spawn the agent (the fork/exec), resolve
+/// its UUID, and subscribe to its output. Returns the authoritative UUID + the
+/// subscriber receiver + the initial screen dump for the main thread to finish
+/// wiring via [`apply_attachment`]. Mutates NO `Pane`/`Layout`, so it can run off
+/// the render thread on a background worker.
+#[allow(clippy::too_many_arguments)]
+fn spawn_and_subscribe(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
+    env: &HashMap<String, String>,
+    submit_key: &str,
+    work_dir: &Path,
+    cols: u16,
+    rows: u16,
+) -> Result<(
+    crate::types::InstanceId,
+    crossbeam_channel::Receiver<Vec<u8>>,
+    Vec<u8>,
+)> {
     // Generate MCP config for agent backends
     if Backend::from_command(command).is_some() {
-        crate::instructions::generate(&work_dir, command);
+        crate::instructions::generate(work_dir, command);
     }
 
     // #1083: install skills for TUI-spawned panes (app mode).
@@ -208,16 +245,16 @@ fn attach_agent_to_pane(
         let skills_filter: Option<Vec<String>> =
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
-                .and_then(|c| c.instances.get(&name).and_then(|i| i.skills.clone()));
+                .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
         let custom_skills_source: Option<std::path::PathBuf> =
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
-                .and_then(|c| c.instances.get(&name).and_then(|i| i.skills_path.clone()))
+                .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
                 .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill = Backend::from_command(command).and_then(|b| b.skill_dir_name());
         match crate::skills::install_for_agent_backend_with_source(
             home,
-            &work_dir,
+            work_dir,
             skills_filter.as_deref(),
             backend_skill,
             custom_skills_source.as_deref(),
@@ -238,17 +275,17 @@ fn attach_agent_to_pane(
     // Backend-specific flags (Claude's --append-system-prompt-file / --mcp-config /
     // --settings) are now injected centrally by agent::spawn_agent, so callers pass
     // raw args and spawn_agent enriches them from files under work_dir.
-    let spawn_mode = spawn_mode.downgraded_for(command, Some(&work_dir));
+    let spawn_mode = spawn_mode.downgraded_for(command, Some(work_dir));
     agent::spawn_agent(
         &agent::SpawnConfig {
-            name: &name,
+            name,
             backend_command: command,
             args,
             spawn_mode,
             cols,
             rows,
             env: Some(env),
-            working_dir: Some(&work_dir),
+            working_dir: Some(work_dir),
             submit_key,
             home: Some(home),
             crash_tx: None,
@@ -266,9 +303,8 @@ fn attach_agent_to_pane(
     // key spawn_agent just used) and route the pane's registry lookups by it.
     // spawn_agent succeeded above, so the fleet.yaml entry — and thus the
     // resolution — is guaranteed present.
-    let instance_id = crate::fleet::resolve_uuid(home, &name)
+    let instance_id = crate::fleet::resolve_uuid(home, name)
         .ok_or_else(|| anyhow::anyhow!("agent '{name}' has no fleet UUID after spawn"))?;
-    pane.instance_id = instance_id;
 
     // Subscribe to the agent's output
     let (rx, dump) = {
@@ -279,11 +315,31 @@ fn attach_agent_to_pane(
         agent::subscribe_with_dump(handle)
     };
 
-    // Feed the screen dump into the placeholder's (empty) local VTerm
+    Ok((instance_id, rx, dump))
+}
+
+/// Cheap, **main-thread** half of an attach (#render-first phase-(b)): apply the
+/// [`spawn_and_subscribe`] result to the placeholder pane and start the output
+/// forwarder. MUST run on the render thread — it mutates the `Pane` (which lives
+/// in the main-thread-owned `Layout`) and processes the dump BEFORE the forwarder
+/// is started, so the initial screen is seeded ahead of any post-subscribe stream
+/// (the render loop's `drain_output` only ever sees post-dump bytes → no
+/// out-of-order first frame).
+fn apply_attachment(
+    pane: &mut Pane,
+    instance_id: crate::types::InstanceId,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    dump: Vec<u8>,
+    fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
+) {
+    pane.instance_id = instance_id;
+    // Feed the screen dump into the placeholder's local VTerm
     pane.vterm.process(&dump);
 
     // Forward subscriber output to wakeup channel via the placeholder's fwd_tx
     let pane_id = pane.id;
+    let name = pane.agent_name.to_string();
     let tx = wakeup_tx.clone();
     // fire-and-forget: forwarder exits when fwd_tx.send() fails (pane
     // dropped → fwd_rx dropped → send returns Err) or rx.recv() fails
@@ -300,8 +356,442 @@ fn attach_agent_to_pane(
             }
         })
         .ok();
+}
 
-    Ok(())
+// ── #render-first phase-(b): deferred (background) attach ──────────────────
+//
+// OWNED restore builds all placeholders synchronously (µs) then schedules the
+// expensive per-agent spawn on a bounded background pool, so the TUI's first
+// draw no longer waits on N sequential fork/exec + skills-install. Layout +
+// name_counter stay main-thread-exclusive; workers only touch the shareable
+// `registry: Arc<Mutex>` and hand results back over a channel.
+
+/// The worker-side recipe for a deferred attach. Holds NO `Pane`/`Layout`
+/// reference (those are the render thread's exclusive `&mut`), only owned data
+/// safe to move to a background worker.
+// One per restored agent/shell, moved once into a worker — the `Agent`
+// (carries a `ResolvedInstance`) vs `Direct` size gap doesn't matter.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum AttachSpec {
+    /// A fleet agent — the worker re-runs the per-agent prep (peers/team/worktree/
+    /// model/args + fleet-aware instructions) then spawns, mirroring the
+    /// synchronous `create_pane_from_resolved` ordering off the render thread.
+    Agent {
+        fleet_name: String,
+        deduped_name: String,
+        resolved: crate::fleet::ResolvedInstance,
+        spawn_mode: crate::backend::SpawnMode,
+        cols: u16,
+        rows: u16,
+    },
+    /// A shell (or any direct command) — final spawn params already resolved.
+    Direct {
+        name: String,
+        command: String,
+        args: Vec<String>,
+        spawn_mode: crate::backend::SpawnMode,
+        env: HashMap<String, String>,
+        submit_key: String,
+        work_dir: std::path::PathBuf,
+        cols: u16,
+        rows: u16,
+    },
+}
+
+impl AttachSpec {
+    fn name(&self) -> &str {
+        match self {
+            AttachSpec::Agent { deduped_name, .. } => deduped_name,
+            AttachSpec::Direct { name, .. } => name,
+        }
+    }
+}
+
+/// A placeholder pane awaiting background attach: its id + the forwarder sender
+/// the attach result wires up + the worker recipe.
+pub(super) struct AttachJob {
+    pub pane_id: usize,
+    pub fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
+    pub spec: AttachSpec,
+}
+
+/// Result a worker hands back to the render thread over `attach_rx`.
+// A handful of these are sent per restart (one per restored agent), so the
+// `Ready`/`Failed` size gap is irrelevant — boxing would only add an alloc on
+// the hot success path.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum AttachOutcome {
+    Ready {
+        pane_id: usize,
+        instance_id: crate::types::InstanceId,
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+        dump: Vec<u8>,
+        /// The real spawn cwd (worktree-resolved for agents) → update the pane.
+        work_dir: std::path::PathBuf,
+        /// The agent's (deduped) name — used to kill the orphan if its pane was
+        /// closed while the attach was in flight (F1).
+        name: String,
+    },
+    Failed {
+        pane_id: usize,
+        name: String,
+        err: String,
+    },
+}
+
+impl AttachOutcome {
+    /// The placeholder pane this outcome targets (used to look it up in the Layout).
+    pub(super) fn pane_id(&self) -> usize {
+        match self {
+            AttachOutcome::Ready { pane_id, .. } | AttachOutcome::Failed { pane_id, .. } => {
+                *pane_id
+            }
+        }
+    }
+}
+
+/// Pre-feed the placeholder VTerm with a "Starting" banner so the operator sees a
+/// labelled shell immediately, before the background attach completes. This is the
+/// one behavioral change vs the empty-VTerm phase-(a) placeholder.
+fn prefeed_starting(vterm: &mut VTerm, name: &str) {
+    vterm.process(format!("\u{23f3} Starting {name}\u{2026}\r\n").as_bytes());
+}
+
+/// Main-thread: build the cheap placeholder pane for a fleet AGENT (name dedup +
+/// pane id + "Starting" banner) plus the [`AttachJob`] a worker will run. The
+/// expensive spawn (skills + fork/exec + subscribe + fleet instructions) is
+/// deferred to [`run_attach`]; nothing here forks a process.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_deferred_agent_pane(
+    fleet_name: &str,
+    resolved: &crate::fleet::ResolvedInstance,
+    layout: &mut Layout,
+    home: &Path,
+    cols: u16,
+    rows: u16,
+    name_counter: &mut HashMap<String, usize>,
+    spawn_mode: crate::backend::SpawnMode,
+) -> (Pane, AttachJob) {
+    let (mut pane, fwd_tx) = build_pane_placeholder(
+        layout,
+        home,
+        fleet_name,
+        &resolved.backend_command,
+        resolved.working_directory.as_deref(),
+        cols,
+        rows,
+        name_counter,
+    );
+    let deduped_name = pane.agent_name.to_string();
+    pane.fleet_instance_name = Some(fleet_name.to_string());
+    prefeed_starting(&mut pane.vterm, &deduped_name);
+    let job = AttachJob {
+        pane_id: pane.id,
+        fwd_tx,
+        spec: AttachSpec::Agent {
+            fleet_name: fleet_name.to_string(),
+            deduped_name,
+            resolved: resolved.clone(),
+            spawn_mode,
+            cols,
+            rows,
+        },
+    };
+    (pane, job)
+}
+
+/// Main-thread: build the cheap placeholder pane for a SHELL / direct command
+/// plus its [`AttachJob`] (final spawn params already resolved).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_deferred_direct_pane(
+    layout: &mut Layout,
+    home: &Path,
+    base_name: &str,
+    command: &str,
+    args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
+    working_dir: Option<&Path>,
+    env: &HashMap<String, String>,
+    submit_key: &str,
+    cols: u16,
+    rows: u16,
+    name_counter: &mut HashMap<String, usize>,
+) -> (Pane, AttachJob) {
+    let (mut pane, fwd_tx) = build_pane_placeholder(
+        layout,
+        home,
+        base_name,
+        command,
+        working_dir,
+        cols,
+        rows,
+        name_counter,
+    );
+    let deduped_name = pane.agent_name.to_string();
+    let work_dir = pane
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(&deduped_name));
+    prefeed_starting(&mut pane.vterm, &deduped_name);
+    let job = AttachJob {
+        pane_id: pane.id,
+        fwd_tx,
+        spec: AttachSpec::Direct {
+            name: deduped_name,
+            command: command.to_string(),
+            args: args.to_vec(),
+            spawn_mode,
+            env: env.clone(),
+            submit_key: submit_key.to_string(),
+            work_dir,
+            cols,
+            rows,
+        },
+    };
+    (pane, job)
+}
+
+/// #render-first phase-(b) F2 (r6): if app teardown began while a worker was
+/// spawning, reap the just-registered child so no live orphan survives quit.
+/// Remove + terminate happen UNDER the registry lock, serialized against the
+/// teardown's one-shot drain. The teardown sets the shutdown flag BEFORE the
+/// drain, so every interleaving is covered: a child registered before the drain
+/// is reaped by the drain itself (this call then finds None), and a child
+/// registered after the drain is observed here (the late finisher always sees the
+/// flag) and reaped. No registered-but-unterminated child can outlive teardown.
+/// Returns true if a child was reaped (i.e. we are shutting down).
+fn reap_late_registration_if_shutdown(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    shutting_down: bool,
+) -> bool {
+    if !shutting_down {
+        return false;
+    }
+    let drained: Vec<(String, crate::daemon::ChildHandle)> = {
+        let mut reg = agent::lock_registry(registry);
+        reg.remove(&instance_id)
+            .map(|h| (h.name.to_string(), h.child))
+            .into_iter()
+            .collect()
+    };
+    crate::daemon::terminate_agents_parallel(drained);
+    true
+}
+
+/// Commit a successful deferred spawn as a `Ready` outcome — UNLESS app teardown
+/// began while we were spawning (the worker passed `run_attach`'s entry shutdown
+/// check, then `spawn_agent` registered a child). In that case reap our own child
+/// (`reap_late_registration_if_shutdown`) and report `Failed` instead of leaking a
+/// live agent the one-shot teardown drain may have missed (the F2 race r6 found).
+#[allow(clippy::too_many_arguments)]
+fn finish_attach(
+    registry: &AgentRegistry,
+    pane_id: usize,
+    instance_id: crate::types::InstanceId,
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    dump: Vec<u8>,
+    work_dir: std::path::PathBuf,
+    name: String,
+) -> AttachOutcome {
+    let shutting_down = super::app_shutdown_flag().load(std::sync::atomic::Ordering::SeqCst);
+    if reap_late_registration_if_shutdown(registry, instance_id, shutting_down) {
+        return AttachOutcome::Failed {
+            pane_id,
+            name,
+            err: "app shutting down during spawn".to_string(),
+        };
+    }
+    AttachOutcome::Ready {
+        pane_id,
+        instance_id,
+        rx,
+        dump,
+        work_dir,
+        name,
+    }
+}
+
+/// Worker entry: run ONE deferred [`AttachJob`]'s spec off the render thread,
+/// returning an [`AttachOutcome`] for the main thread to apply. Honors the app
+/// shutdown flag at TWO points: at entry (early-abort: never fork a NEW child once
+/// teardown began) and, via [`finish_attach`], right after a successful spawn
+/// (reap a child registered after the one-shot teardown drain — the F2 race).
+pub(super) fn run_attach(
+    spec: AttachSpec,
+    pane_id: usize,
+    registry: &AgentRegistry,
+    home: &Path,
+) -> AttachOutcome {
+    if super::app_shutdown_flag().load(std::sync::atomic::Ordering::SeqCst) {
+        return AttachOutcome::Failed {
+            pane_id,
+            name: spec.name().to_string(),
+            err: "app shutting down".to_string(),
+        };
+    }
+    match spec {
+        AttachSpec::Agent {
+            fleet_name,
+            deduped_name,
+            resolved,
+            spawn_mode,
+            cols,
+            rows,
+        } => {
+            // Mirror create_pane_from_resolved's per-agent prep, off-thread.
+            let fleet_path = crate::fleet::fleet_yaml_path(home);
+            let peers: Vec<(String, Option<String>)> = crate::fleet::FleetConfig::load(&fleet_path)
+                .map(|f| {
+                    f.instances
+                        .iter()
+                        .map(|(n, c)| (n.clone(), c.role.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let team_record = crate::teams::find_team_for(home, &fleet_name);
+            let extra_instructions = crate::instructions::resolve_extra_for(
+                &resolved,
+                fleet_path.parent().unwrap_or(home),
+            );
+            // #render-first phase-(b) F3 (accepted residual, lead-tracked follow-up):
+            // W=3 workers may now resolve auto-worktrees CONCURRENTLY, so the FIRST
+            // concurrent same-repo `git worktree add` can race on `.git/index.lock`
+            // and the loser falls back (losing isolation that once). Bounded: git
+            // serializes the op, only the #2234 reconcile-flag-ON create() path forks
+            // a worktree here (default OFF), and RESTART is idempotent — so not fixed
+            // in this PR.
+            let mut working_dir = resolved.working_directory.clone();
+            if let Some(wt) = crate::worktree::resolve_auto_worktree(home, &fleet_name, &resolved) {
+                working_dir = Some(wt);
+            }
+            let mut args = resolved.args.clone();
+            if let Some(ref model) = resolved.model {
+                let model_val = Backend::from_command(&resolved.backend_command)
+                    .map(|b| b.format_model_arg(model))
+                    .unwrap_or_else(|| model.clone());
+                args.push("--model".to_string());
+                args.push(model_val);
+            }
+            let command = resolved.backend_command.clone();
+            let work_dir = working_dir
+                .clone()
+                .unwrap_or_else(|| crate::paths::workspace_dir(home).join(&deduped_name));
+            match spawn_and_subscribe(
+                registry,
+                home,
+                &deduped_name,
+                &command,
+                &args,
+                spawn_mode,
+                &resolved.env,
+                &resolved.submit_key,
+                &work_dir,
+                cols,
+                rows,
+            ) {
+                Ok((instance_id, rx, dump)) => {
+                    // Overwrite basic instructions with the fleet-aware version
+                    // (same ordering as the synchronous create_pane_from_resolved).
+                    let team_ctx = team_record
+                        .as_ref()
+                        .map(|t| crate::instructions::TeamContext {
+                            name: t.name.as_str(),
+                            orchestrator: t.orchestrator.as_deref(),
+                            members: t.members.as_slice(),
+                        });
+                    let ctx = crate::instructions::AgentContext {
+                        name: &fleet_name,
+                        role: resolved.role.as_deref(),
+                        fleet_peers: &peers,
+                        team: team_ctx.as_ref(),
+                        extra_instructions: extra_instructions.as_deref(),
+                    };
+                    crate::instructions::generate_with_context(&work_dir, &command, Some(&ctx));
+                    finish_attach(
+                        registry,
+                        pane_id,
+                        instance_id,
+                        rx,
+                        dump,
+                        work_dir,
+                        deduped_name,
+                    )
+                }
+                Err(e) => AttachOutcome::Failed {
+                    pane_id,
+                    name: deduped_name,
+                    err: e.to_string(),
+                },
+            }
+        }
+        AttachSpec::Direct {
+            name,
+            command,
+            args,
+            spawn_mode,
+            env,
+            submit_key,
+            work_dir,
+            cols,
+            rows,
+        } => match spawn_and_subscribe(
+            registry,
+            home,
+            &name,
+            &command,
+            &args,
+            spawn_mode,
+            &env,
+            &submit_key,
+            &work_dir,
+            cols,
+            rows,
+        ) {
+            Ok((instance_id, rx, dump)) => {
+                finish_attach(registry, pane_id, instance_id, rx, dump, work_dir, name)
+            }
+            Err(e) => AttachOutcome::Failed {
+                pane_id,
+                name,
+                err: e.to_string(),
+            },
+        },
+    }
+}
+
+/// Main-thread: apply a worker's [`AttachOutcome`] to its placeholder pane. On
+/// `Ready` wires the agent in (instance id, dump, real cwd, forwarder); on
+/// `Failed` flips the placeholder VTerm to a visible "failed to start" banner
+/// (the pane stays a normal, closable Layout pane — no zombie). `fwd_tx` is the
+/// placeholder's forwarder sender, retained by the caller keyed on `pane_id`.
+pub(super) fn apply_attach_outcome(
+    pane: &mut Pane,
+    outcome: AttachOutcome,
+    fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
+) {
+    match outcome {
+        AttachOutcome::Ready {
+            instance_id,
+            rx,
+            dump,
+            work_dir,
+            ..
+        } => {
+            pane.working_dir = Some(work_dir);
+            apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+        }
+        AttachOutcome::Failed { name, err, .. } => {
+            // Dropping fwd_tx disconnects the placeholder's output channel
+            // (no forwarder ever starts); the pane shows the failure and is
+            // closable via the normal close path.
+            drop(fwd_tx);
+            tracing::error!(agent = %name, error = %err, "render-first: deferred attach failed");
+            pane.vterm
+                .process(format!("\u{26a0} failed to start {name}: {err}\r\n").as_bytes());
+        }
+    }
 }
 
 /// Attach a pane to an already-running agent (no spawn — subscribe only).
@@ -629,6 +1119,224 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("create tmp home");
         p
+    }
+
+    // ── #render-first phase-(b) ──────────────────────────────────────────────
+
+    fn screen_of(pane: &Pane) -> String {
+        String::from_utf8_lossy(&pane.vterm.dump_screen()).to_string()
+    }
+
+    /// #render-first phase-(b) — must-resolve #4 (new behavior) + deferral proof:
+    /// the placeholder is built WITHOUT spawning (no registry needed) and shows a
+    /// "Starting" banner; the spawn recipe rides along in the AttachJob.
+    #[test]
+    fn deferred_placeholder_shows_starting_and_defers_spawn() {
+        let home = tmp_home("rf_starting");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (pane, job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        let screen = screen_of(&pane);
+        assert!(
+            screen.contains("Starting") && screen.contains("shell"),
+            "placeholder must show a 'Starting <name>' banner; got:\n{screen}"
+        );
+        assert_eq!(job.pane_id, pane.id, "job targets its placeholder");
+        assert!(matches!(job.spec, AttachSpec::Direct { .. }));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// must-resolve: a worker `Ready` outcome seeds the dump into the pane and
+    /// starts the forwarder (subscriber bytes reach the pane's output channel).
+    #[test]
+    fn apply_ready_outcome_seeds_dump_and_starts_forwarder() {
+        let home = tmp_home("rf_ready");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (mut pane, _job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        let pid = pane.id;
+        let (sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded::<usize>();
+        apply_attach_outcome(
+            &mut pane,
+            AttachOutcome::Ready {
+                pane_id: pid,
+                instance_id: crate::types::InstanceId::default(),
+                rx: sub_rx,
+                dump: b"DUMP-XYZ".to_vec(),
+                work_dir: home.clone(),
+                name: "shell".into(),
+            },
+            fwd_tx,
+            &wakeup_tx,
+        );
+        assert!(
+            screen_of(&pane).contains("DUMP-XYZ"),
+            "the worker's dump must be seeded into the pane vterm"
+        );
+        // Forwarder is live: a subscriber byte reaches the (passed) fwd channel.
+        sub_tx
+            .send(b"hello".to_vec())
+            .expect("send on an open channel");
+        let got = fwd_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("forwarded byte");
+        assert_eq!(got, b"hello");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// must-resolve #3: a `Failed` outcome flips the placeholder to a visible
+    /// "failed to start" banner and leaves it a never-routed (closable) pane.
+    #[test]
+    fn apply_failed_outcome_shows_banner_and_stays_closable() {
+        let home = tmp_home("rf_failed");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (mut pane, _job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        let pid = pane.id;
+        // The placeholder's instance_id is the never-routed id assigned at build;
+        // a Failed attach must NOT wire it to any agent (stays closable, no zombie).
+        let orig_iid = pane.instance_id;
+        let (fwd_tx, _fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wakeup_tx, _w) = crossbeam_channel::unbounded::<usize>();
+        apply_attach_outcome(
+            &mut pane,
+            AttachOutcome::Failed {
+                pane_id: pid,
+                name: "shell".into(),
+                err: "boom".into(),
+            },
+            fwd_tx,
+            &wakeup_tx,
+        );
+        let screen = screen_of(&pane);
+        assert!(
+            screen.contains("failed to start") && screen.contains("boom"),
+            "failed attach must show a visible banner; got:\n{screen}"
+        );
+        assert_eq!(
+            pane.instance_id, orig_iid,
+            "Failed must leave the pane's routing id unchanged (never-routed placeholder)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// must-resolve #1 [BLOCKER]: with the main-thread keepalive `attach_tx`
+    /// alive, the channel is NOT disconnected after every worker sender drops, so
+    /// `recv` BLOCKS (Empty) rather than busy-spinning (Disconnected).
+    #[test]
+    fn attach_rx_keepalive_blocks_not_disconnects() {
+        let (attach_tx, attach_rx) = crossbeam_channel::unbounded::<AttachOutcome>();
+        let worker_senders: Vec<_> = (0..3).map(|_| attach_tx.clone()).collect();
+        drop(worker_senders); // all workers exited
+        assert!(
+            matches!(
+                attach_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "keepalive must keep the channel connected (block, not spin)"
+        );
+        drop(attach_tx); // drop the keepalive too → now it disconnects
+        assert!(
+            matches!(
+                attach_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ),
+            "without the keepalive the channel disconnects (the busy-spin we avoid)"
+        );
+    }
+
+    /// The render-loop handback locates a placeholder by id across ALL tabs.
+    #[test]
+    fn layout_find_pane_mut_locates_placeholder_across_tabs() {
+        let home = tmp_home("rf_find");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (pane, _job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        let pid = pane.id;
+        layout.add_tab(Tab::new("t".to_string(), pane));
+        assert!(
+            layout.find_pane_mut(pid).is_some(),
+            "handback must find the pane"
+        );
+        assert!(layout.find_pane_mut(987654).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #render-first phase-(b) F2 (r6) — the child-leak RACE regression. A worker
+    /// that finishes its spawn (registers a child) AFTER teardown's one-shot drain
+    /// must still have that child reaped, not orphaned. We model the post-drain
+    /// state by inserting a real PTY-backed agent, then running the worker's reap
+    /// path with `shutting_down=true` (the flag is set before the drain, so a late
+    /// finisher always observes it) — the agent must be terminated + removed.
+    #[cfg(unix)]
+    #[test]
+    fn reap_late_registration_kills_child_registered_after_drain() {
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let id = crate::types::InstanceId::default();
+        agent::lock_registry(&registry).insert(id, agent::mk_test_handle("rf-late", id));
+        assert!(agent::lock_registry(&registry).contains_key(&id));
+        // Detached worker finishing AFTER the drain → shutting_down=true → reap.
+        assert!(reap_late_registration_if_shutdown(&registry, id, true));
+        assert!(
+            !agent::lock_registry(&registry).contains_key(&id),
+            "a child registered after the drain must be terminated + removed, not orphaned"
+        );
+        // Control: not shutting down → never reaps (short-circuits before the registry).
+        assert!(!reap_late_registration_if_shutdown(&registry, id, false));
     }
 
     #[test]

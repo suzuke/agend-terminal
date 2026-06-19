@@ -99,12 +99,11 @@ pub(super) fn noop_guard() -> ApiGuard {
 pub(super) fn auto_start_fleet(
     fleet_path: &Path,
     layout: &mut Layout,
-    registry: &AgentRegistry,
     home: &Path,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
+    attach_jobs: &mut Vec<super::pane_factory::AttachJob>,
 ) -> bool {
     let fleet = match crate::fleet::FleetConfig::load(fleet_path) {
         Ok(f) => f,
@@ -116,28 +115,24 @@ pub(super) fn auto_start_fleet(
     }
     names.sort();
 
+    // #render-first phase-(b): like the session-restore path, build cheap
+    // placeholders + collect deferred AttachJobs (no synchronous fork/exec here).
     let mut pane_builder =
         |sp: &super::session::SessionPane, layout: &mut Layout| -> Option<crate::layout::Pane> {
             let name = sp.fleet_instance_name.as_deref()?;
             let resolved = fleet.resolve_instance(name)?;
-            match super::pane_factory::create_pane_from_resolved(
+            let (pane, job) = super::pane_factory::build_deferred_agent_pane(
                 name,
                 &resolved,
                 layout,
-                registry,
                 home,
                 cols,
                 rows,
-                wakeup_tx,
                 name_counter,
                 crate::backend::SpawnMode::Resume,
-            ) {
-                Ok(pane) => Some(pane),
-                Err(e) => {
-                    tracing::error!(instance = name, error = %e, "fleet auto-start failed");
-                    None
-                }
-            }
+            );
+            attach_jobs.push(job);
+            Some(pane)
         };
 
     super::session::place_agents_team_grouped(home, &names, &mut pane_builder, layout)

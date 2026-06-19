@@ -296,6 +296,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Pure tracing, zero behavior.
     let restore_start = std::time::Instant::now();
 
+    // #render-first phase-(b): OWNED restore collects deferred attach jobs here;
+    // the synchronous per-agent fork/exec + skills-install is replaced by
+    // background workers spawned AFTER the render loop is live (below). Attached
+    // mode leaves this empty — its remote panes attach via the bridge, a separate
+    // cheap path not subject to the restore freeze.
+    let mut attach_jobs: Vec<pane_factory::AttachJob> = Vec::new();
+
     if let Some(ref run_dir) = attached_run_dir {
         // Attached (#895 fix): tabs derive from the union of
         //   (a) daemon's `*.port` files (live agent registry — source of truth
@@ -339,9 +346,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             &home,
             &fleet_path,
             &mut layout,
-            &registry,
-            &wakeup_tx,
             &mut name_counter,
+            &mut attach_jobs,
             pane_cols,
             pane_rows,
         );
@@ -381,6 +387,59 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         attached = attached_mode,
         "restore-complete: session restore + fleet PTY spawns done"
     );
+
+    // #render-first phase-(b): all placeholders are now in the Layout. Spawn a
+    // bounded (W=3) pool of background workers to run the deferred attaches
+    // (skills + fork/exec + subscribe) and hand results back over `attach_rx`;
+    // the render loop's select! arm applies each to its pane. The render loop is
+    // entered immediately below — the operator sees the TUI shell while attaches
+    // run in the background, instead of freezing on N synchronous spawns.
+    //
+    // attach_tx is held by the main thread for the ENTIRE render-loop scope
+    // (mirrors `wakeup_tx`): a live sender keeps `attach_rx` connected, so
+    // `recv(attach_rx)` BLOCKS instead of busy-spinning once every worker exits
+    // and drops its sender clone (the #BLOCKER must-resolve).
+    let (attach_tx, attach_rx) = crossbeam_channel::unbounded::<pane_factory::AttachOutcome>();
+    // Placeholder forwarder senders, keyed by pane id, retained until the matching
+    // AttachOutcome is applied (or the pane is closed before it arrives).
+    let mut pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>> = HashMap::new();
+    // Stored JoinHandles — joined at teardown BEFORE the registry drain so every
+    // worker-spawned child is reaped (not fire-and-forget).
+    let mut attach_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    if !attach_jobs.is_empty() {
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<(usize, pane_factory::AttachSpec)>();
+        const ATTACH_WORKERS: usize = 3;
+        for w in 0..ATTACH_WORKERS {
+            let job_rx = job_rx.clone();
+            let attach_tx = attach_tx.clone();
+            let registry = Arc::clone(&registry);
+            let home = home.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("attach_worker_{w}"))
+                .spawn(move || {
+                    while let Ok((pane_id, spec)) = job_rx.recv() {
+                        let outcome = pane_factory::run_attach(spec, pane_id, &registry, &home);
+                        if attach_tx.send(outcome).is_err() {
+                            break; // render loop gone
+                        }
+                    }
+                })
+                .expect("spawn attach worker");
+            attach_workers.push(handle);
+        }
+        for job in attach_jobs.drain(..) {
+            let pane_factory::AttachJob {
+                pane_id,
+                fwd_tx,
+                spec,
+            } = job;
+            pending_fwd.insert(pane_id, fwd_tx);
+            let _ = job_tx.send((pane_id, spec));
+        }
+        // Drop job_tx → workers exit once the queue drains (after each spawn or an
+        // early-abort on the shutdown flag inside run_attach).
+        drop(job_tx);
+    }
 
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
     // Start true so restored split panes get correct sizes before first draw.
@@ -759,6 +818,28 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             recv(wakeup_rx) -> _ => {
                 // Wakeup from PTY output — triggers redraw
             }
+            recv(attach_rx) -> outcome => {
+                // #render-first phase-(b): a background worker finished a deferred
+                // attach. Apply it to its placeholder pane (instance id + dump +
+                // forwarder on Ready, or a visible "failed to start" banner on
+                // Failed). If the pane was closed before the attach completed, drop
+                // the outcome. The keepalive `attach_tx` keeps this arm from
+                // busy-spinning after all workers exit.
+                if let Ok(outcome) = outcome {
+                    let pane_id = outcome.pane_id();
+                    if let Some(fwd_tx) = pending_fwd.remove(&pane_id) {
+                        if let Some(pane) = layout.find_pane_mut(pane_id) {
+                            pane_factory::apply_attach_outcome(pane, outcome, fwd_tx, &wakeup_tx);
+                        } else if let pane_factory::AttachOutcome::Ready { name, .. } = &outcome {
+                            // F1 (r4): the pane was closed while the attach was in
+                            // flight → the agent is already spawned + registered with
+                            // no host pane. Kill it so it doesn't run orphaned until
+                            // quit (fwd_tx already removed above → forwarder/rx drop).
+                            kill_agent(&home, &registry, name);
+                        }
+                    }
+                }
+            }
             recv(tui_event_rx) -> ev => {
                 if let Ok(event) = ev {
                     // #1257: handle screenshot request directly (needs terminal access).
@@ -979,7 +1060,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // same reconciliation path Owned mode uses (parameterized over agent
     // source: fleet.yaml for Owned, `runtime::list_agents_with_fallback`
     // for Attached — see #910 for the registry-truth migration).
-    app_teardown(&home, &layout, &registry, attached_mode);
+    app_teardown(&home, &layout, &registry, attached_mode, attach_workers);
 
     Ok(())
 }
@@ -1093,7 +1174,37 @@ pub(crate) fn app_shutdown_flag() -> &'static Arc<std::sync::atomic::AtomicBool>
     APP_SHUTDOWN.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
 }
 
-fn app_teardown(home: &Path, layout: &Layout, registry: &AgentRegistry, attached_mode: bool) {
+/// #render-first phase-(b) F2: join attach workers, but DETACH any that haven't
+/// finished by the shared `deadline` — a worker wedged mid-spawn (fork/exec /
+/// skills / subscribe) must not hang quit (that would move the restore freeze to
+/// quit). A detached worker's child, if it registered one, is reaped by the
+/// registry drain + the OS (same stance as #2311's grace→SIGKILL). Returns the
+/// number detached (wedged past the deadline).
+fn bounded_join_attach_workers(
+    handles: Vec<std::thread::JoinHandle<()>>,
+    deadline: std::time::Instant,
+) -> usize {
+    let mut detached = 0usize;
+    for h in handles {
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        } else {
+            detached += 1; // past the shared deadline → detach (drop the handle)
+        }
+    }
+    detached
+}
+
+fn app_teardown(
+    home: &Path,
+    layout: &Layout,
+    registry: &AgentRegistry,
+    attached_mode: bool,
+    attach_workers: Vec<std::thread::JoinHandle<()>>,
+) {
     session::save_session(home, layout);
     if !attached_mode {
         // Sync fleet.yaml to match current state (Owned-only — daemon owns
@@ -1117,6 +1228,33 @@ fn app_teardown(home: &Path, layout: &Layout, registry: &AgentRegistry, attached
         //     steps 5/7/8 (the registry remove is already done by the drain;
         //     app mode tracks no AgentConfig map, matching its `configs: None`).
         app_shutdown_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+        // #render-first phase-(b): join the background attach workers BEFORE
+        // draining the registry. The shutdown flag (just set) makes each worker
+        // early-abort un-started attaches (run_attach checks it on entry), so a
+        // holdout is at most ONE in-flight spawn per worker. Joining first means
+        // every child a worker DID register is in the registry → the parallel
+        // terminate below reaps it.
+        //
+        // F2 (r4/r6): the join is BOUNDED — a worker wedged mid-spawn (fork/exec /
+        // skills / subscribe) must not move the restore freeze to quit. Poll up to
+        // a shared grace deadline (slightly longer than #2311's 2s SHUTDOWN_GRACE);
+        // past it, DETACH the holdout (drop its handle). `is_finished` (Rust 1.61+,
+        // MSRV 1.88) avoids a blocking `join()` on a wedged thread.
+        //
+        // Detaching is SAFE w.r.t. the one-shot drain below because we set the
+        // shutdown flag FIRST (above): a detached worker that finishes its spawn
+        // AFTER the drain sees the flag set and reaps its own child in
+        // `pane_factory::finish_attach` — so a late registration never outlives
+        // teardown (the r6 child-leak race). Children registered before the drain
+        // are reaped by the drain itself.
+        let attach_join_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let detached = bounded_join_attach_workers(attach_workers, attach_join_deadline);
+        if detached > 0 {
+            tracing::warn!(
+                detached,
+                "render-first: detached attach worker(s) still wedged past the join grace at quit"
+            );
+        }
         // #t-41673 gap-instrument: clock the parallel teardown so the next
         // operator restart EMPIRICALLY confirms the ~6s sequential freeze is
         // gone (expect `teardown_elapsed_ms` ≈ one grace window). Mirrors
@@ -1606,6 +1744,34 @@ mod tests {
     use super::*;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    /// #render-first phase-(b) F2 (r4): `bounded_join_attach_workers` must DETACH a
+    /// worker wedged past the deadline (so quit can't hang) while still joining the
+    /// finished ones. Deterministic via a parked thread held by a channel.
+    #[test]
+    fn bounded_join_detaches_wedged_worker_without_hanging() {
+        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+        // Wedged: blocks until keep_tx drops (held past the join below).
+        let wedged = std::thread::spawn(move || {
+            let _ = keep_rx.recv();
+        });
+        let quick = std::thread::spawn(|| {}); // finishes immediately
+        let start = std::time::Instant::now();
+        let detached = bounded_join_attach_workers(
+            vec![quick, wedged],
+            start + std::time::Duration::from_millis(150),
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "bounded join must not hang on a wedged worker (took {:?})",
+            start.elapsed()
+        );
+        assert_eq!(
+            detached, 1,
+            "the wedged worker is detached; the quick one is joined"
+        );
+        drop(keep_tx); // release the parked thread (cleanup)
+    }
 
     /// restart-freeze 真嫌#1 (t-…55279) source-scan invariant: `app_teardown`'s
     /// Owned-mode cleanup must (1) flip the shutdown flag so PTY-close handlers

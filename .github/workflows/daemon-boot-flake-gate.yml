@@ -21,6 +21,14 @@ on:
       - 'src/agent/**'
       - 'src/daemon/**'
       - 'src/bootstrap/**'
+      # #t-84833-6: app-mode (owned daemon) boot/restore lives here — render-first
+      # builds the restore layout + spawns the per-agent attach pool in run_app.
+      # An app-boot change used to escape this gate (the MSRV-in-CI gap class).
+      # NOTE: the current gated tests boot via `start --foreground` (run_core), so
+      # they do NOT yet exercise app-mode run_app restore — this expansion closes
+      # the TRIGGER gap, but a real app-restart flake test is still owed (lead).
+      - 'src/app/**'
+      - 'src/layout/**'
       - 'tests/common/harness.rs'
       - 'tests/daemon_boot_gate_filter.txt'
       - 'tests/teardown_completeness_regression.rs'

@@ -17,7 +17,6 @@
 //!   mode the daemon's registry naturally drifts as agents are added/removed
 //!   between attaches; warning every transient mismatch would be noise.
 
-use crate::agent::AgentRegistry;
 use crate::fleet;
 use crate::layout::{Layout, Pane, PaneNode, SplitDir, Tab};
 
@@ -192,9 +191,8 @@ pub(super) fn restore_with_reconciliation(
     home: &Path,
     fleet_path: &Path,
     layout: &mut Layout,
-    registry: &AgentRegistry,
-    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
+    attach_jobs: &mut Vec<super::pane_factory::AttachJob>,
     cols: u16,
     rows: u16,
 ) -> bool {
@@ -218,46 +216,35 @@ pub(super) fn restore_with_reconciliation(
         .map(|f| f.instance_names().into_iter().collect())
         .unwrap_or_default();
 
-    // Owned pane builder: agent → spawn local PTY (Resume mode); shell →
-    // spawn local shell (Fresh mode). Single closure to avoid dual-mutable-
-    // borrow on `name_counter` + `registry`.
+    // #render-first phase-(b): Owned pane builder now builds the CHEAP
+    // placeholder (name dedup + pane id + "Starting" banner, µs) and collects an
+    // `AttachJob` for the deferred background spawn — the per-agent fork/exec +
+    // skills-install no longer runs synchronously here (that was the ~1s restore
+    // freeze). `run_app` schedules the jobs on a bounded pool AFTER the render
+    // loop is live. Single closure to keep `name_counter` + `attach_jobs` as the
+    // only mutable captures (Layout is passed in).
     let mut pane_builder = |sp: &SessionPane, layout: &mut Layout| -> Option<Pane> {
         match sp.fleet_instance_name.as_deref() {
             Some(name) => {
                 let resolved = fleet.as_ref().and_then(|f| f.resolve_instance(name))?;
-                // restart-freeze RCA (t-…55279): time the per-agent local-PTY
-                // spawn. The owned-restore path runs these synchronously in
-                // apply_session_layout order, so the sum is the boot critical
-                // path the operator sees freeze. Pure tracing, zero behavior.
-                let spawn_start = std::time::Instant::now();
-                let pane = super::pane_factory::create_pane_from_resolved(
+                let (pane, job) = super::pane_factory::build_deferred_agent_pane(
                     name,
                     &resolved,
                     layout,
-                    registry,
                     home,
                     cols,
                     rows,
-                    wakeup_tx,
                     name_counter,
                     crate::backend::SpawnMode::Resume,
-                )
-                .ok();
-                tracing::info!(
-                    phase = "restore-spawn",
-                    agent = %name,
-                    elapsed_ms = spawn_start.elapsed().as_millis() as u64,
-                    ok = pane.is_some(),
-                    "restore-spawn: per-agent local-PTY spawn (synchronous)"
                 );
-                pane
+                attach_jobs.push(job);
+                Some(pane)
             }
             None => {
                 let shell =
                     std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
-                super::pane_factory::create_pane(
+                let (pane, job) = super::pane_factory::build_deferred_direct_pane(
                     layout,
-                    registry,
                     home,
                     "shell",
                     &shell,
@@ -268,10 +255,10 @@ pub(super) fn restore_with_reconciliation(
                     "\r",
                     cols,
                     rows,
-                    wakeup_tx,
                     name_counter,
-                )
-                .ok()
+                );
+                attach_jobs.push(job);
+                Some(pane)
             }
         }
     };
@@ -287,12 +274,11 @@ pub(super) fn restore_with_reconciliation(
         return super::api_server::auto_start_fleet(
             fleet_path,
             layout,
-            registry,
             home,
             cols,
             rows,
-            wakeup_tx,
             name_counter,
+            attach_jobs,
         );
     }
 

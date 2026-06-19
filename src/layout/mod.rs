@@ -85,6 +85,15 @@ impl Layout {
         }
     }
 
+    /// #render-first phase-(b): find a pane by id across ALL tabs (a deferred
+    /// attach handback may target any tab, not just the active one). Returns the
+    /// first match (pane ids are unique).
+    pub fn find_pane_mut(&mut self, id: usize) -> Option<&mut Pane> {
+        self.tabs
+            .iter_mut()
+            .find_map(|t| t.root_mut().find_pane_mut(id))
+    }
+
     /// #1431/#1939: record where `agent`'s pane currently sits (tab + parent
     /// split geometry) so a later `SameTab` spawn can restore it. Call BEFORE
     /// removing the pane; no-op if the agent has no pane.
