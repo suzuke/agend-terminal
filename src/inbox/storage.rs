@@ -158,6 +158,60 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
     })?
 }
 
+/// #t-84833-14 (R3 perf): the minimal projection of an [`InboxMessage`] that
+/// decides post-#2299 *actionable-unread* membership. Deserializing a JSONL line
+/// into this — rather than the full `InboxMessage` — skips allocating the large
+/// `text`/`from`/… String fields (the dominant per-row deserialize cost on the
+/// hot `send` path: ~7–13× the file read), while serde's tokenizer still
+/// validates the JSON and `#[serde(default)]` preserves the EXACT filter for any
+/// field a row omits. `timestamp` is carried (small) so the same probe serves
+/// [`unread_count`]'s `oldest` derivation.
+///
+/// Equivalence with the prior full-`InboxMessage` count is exhaustively pinned by
+/// the `perf_r3_equiv` tests (proptest over serde-produced rows + state-coverage
+/// driven through the real mutators). It holds for every line a producer can emit
+/// (a complete `InboxMessage`) and for torn/half-written lines (invalid JSON →
+/// `Err` → skipped by both). The only inputs where it could differ are
+/// syntactically-valid JSON objects that are NOT inbox messages (e.g. `{}`),
+/// which no code path ever writes to an inbox file.
+#[derive(serde::Deserialize)]
+struct UnreadProbe {
+    #[serde(default)]
+    read_at: Option<String>,
+    #[serde(default)]
+    delivering_at: Option<String>,
+    #[serde(default)]
+    superseded_by: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
+}
+
+impl UnreadProbe {
+    /// post-#2299 actionable-unread filter — identical to the `read_at.is_none()
+    /// && delivering_at.is_none() && superseded_by.is_none()` predicate the
+    /// full-struct loops used. `delivering` rows (in-flight) and `superseded`
+    /// rows (silently retired by `drain`) are excluded so a healthy agent is not
+    /// re-paged (see `unread_count` MED-3 / #2299 notes).
+    fn is_unread(&self) -> bool {
+        self.read_at.is_none() && self.delivering_at.is_none() && self.superseded_by.is_none()
+    }
+}
+
+/// Count actionable-unread rows in inbox file `content` via the cheap
+/// [`UnreadProbe`] deserialize. Shared spelling of the filter so the hot-path
+/// counter and `unread_count` cannot drift.
+fn count_unread_in_content(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| {
+            serde_json::from_str::<UnreadProbe>(l)
+                .map(|p| p.is_unread())
+                .unwrap_or(false)
+        })
+        .count()
+}
+
 /// Enqueue a message and return the post-enqueue unread count in one lock
 /// scope. Avoids the double-read of separate `enqueue` + `unread_count` calls.
 pub fn enqueue_returning_unread_count(
@@ -174,23 +228,12 @@ pub fn enqueue_returning_unread_count(
 
     with_inbox_lock(home, name, |path| {
         let existing = std::fs::read_to_string(path).unwrap_or_default();
-        let mut count = 0usize;
-        for l in existing.lines() {
-            if l.trim().is_empty() {
-                continue;
-            }
-            if let Ok(m) = serde_json::from_str::<InboxMessage>(l) {
-                // CR-2026-06-14: exclude superseded rows (mirror `unread_count`'s
-                // MED-3 fix) — `drain` silently retires them, so they are not
-                // actionable unread and must not inflate the pending hint.
-                // #2299: also exclude `delivering` rows (`delivering_at` set,
-                // `read_at` still None) — those are in-flight, already handed to
-                // the agent; counting them as unread would re-page a healthy agent.
-                if m.read_at.is_none() && m.delivering_at.is_none() && m.superseded_by.is_none() {
-                    count += 1;
-                }
-            }
-        }
+        // #t-84833-14 (R3 perf): count via the cheap `UnreadProbe` deserialize
+        // instead of full `InboxMessage` (skips the big `text`/`from`/… allocs on
+        // this hot `send` path). Same post-#2299 filter — superseded + delivering
+        // rows excluded so a healthy agent isn't re-paged. Byte-identical result
+        // to the prior full-struct count (pinned by `perf_r3_equiv`).
+        let count = count_unread_in_content(&existing);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -857,21 +900,31 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
     let mut count = 0usize;
     let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
     for line in content.lines() {
-        if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
-            // MED-3: a superseded-but-undrained row is NOT actionable unread —
-            // `drain` silently consumes it (stamps `read_at`, never surfaces it).
-            // Counting it here inflated the unread count, so a busy branch whose
-            // CI SHA churns (each `mark_ci_watch_superseded` leaves the prior row
-            // superseded + unread until the next drain) tripped
-            // `inbox_stuck_watchdog` into false-paging a healthy agent. Match
-            // drain's actionable-unread definition.
-            // #2299: a `delivering` row (`delivering_at` set, `read_at` None) is
-            // in-flight — already delivered to the agent, not actionable-unread.
-            // Counting it would re-page a healthy agent mid-turn (and the
-            // reclaim-TTL sweep, not the watchdog, owns re-delivery if it stalls).
-            if msg.read_at.is_none() && msg.delivering_at.is_none() && msg.superseded_by.is_none() {
+        // #t-84833-14 (R3 perf): same `UnreadProbe` cheap deserialize as the
+        // hot-path counter (skips big `text`/`from` allocs). The filter is
+        // unchanged:
+        // MED-3: a superseded-but-undrained row is NOT actionable unread —
+        // `drain` silently consumes it (stamps `read_at`, never surfaces it).
+        // Counting it here inflated the unread count, so a busy branch whose
+        // CI SHA churns (each `mark_ci_watch_superseded` leaves the prior row
+        // superseded + unread until the next drain) tripped
+        // `inbox_stuck_watchdog` into false-paging a healthy agent. Match
+        // drain's actionable-unread definition.
+        // #2299: a `delivering` row (`delivering_at` set, `read_at` None) is
+        // in-flight — already delivered to the agent, not actionable-unread.
+        // Counting it would re-page a healthy agent mid-turn (and the
+        // reclaim-TTL sweep, not the watchdog, owns re-delivery if it stalls).
+        if let Ok(probe) = serde_json::from_str::<UnreadProbe>(line) {
+            if probe.is_unread() {
                 count += 1;
-                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
+                // `oldest` over the unread rows — identical to the prior
+                // `msg.timestamp` parse (a real unread row always carries it; an
+                // unparseable/absent timestamp leaves `oldest` untouched, as before).
+                if let Some(ts) = probe
+                    .timestamp
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                {
                     let ts_utc = ts.with_timezone(&chrono::Utc);
                     if oldest.is_none_or(|t| t > ts_utc) {
                         oldest = Some(ts_utc);
@@ -1338,3 +1391,13 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;
+
+// #t-84833-14 (R3 perf): equivalence proof for the `UnreadProbe` count refactor.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod perf_r3_equiv;
+
+// #t-84833-14 (R3 perf): manual #[ignore]d bench (not CI — no criterion).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod perf_r3_bench;
