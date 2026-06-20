@@ -34,7 +34,31 @@ pub fn centered_overlay_rect(
     Rect::new(x, y, width, height)
 }
 
-/// Render a centered overlay frame with border and title. Returns the inner area.
+/// #2050 simplify PR-C (③): the shared body of the *titled* overlay popups —
+/// `Clear` the pre-computed `area`, draw a bordered block with a bold `title` in
+/// `color`, and return the inner content rect. Each caller computes its own `area`
+/// (the sizes differ) then fills the returned rect. Excludes `render_confirm`,
+/// which is title-less (structurally different).
+pub(super) fn render_titled_popup<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    color: Color,
+    title: impl Into<std::borrow::Cow<'a, str>>,
+) -> Rect {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            title.into(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+/// Render a centered (80%) overlay frame with border and title. Returns the inner area.
 pub(super) fn render_overlay_frame(frame: &mut Frame, color: Color, title: &str) -> Rect {
     let area = frame.area();
     let h = (area.height * 80 / 100).max(10);
@@ -42,35 +66,19 @@ pub(super) fn render_overlay_frame(frame: &mut Frame, color: Color, title: &str)
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let oa = Rect::new(x, y, w, h);
-    frame.render_widget(Clear, oa);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
-        .title(Span::styled(
-            title,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(oa);
-    frame.render_widget(block, oa);
-    inner
+    render_titled_popup(frame, oa, color, title)
 }
 
 pub fn render_menu(frame: &mut Frame, items: &[MenuItem], selected: usize) {
     let area = frame.area();
     let item_count = u16::try_from(items.len()).unwrap_or(u16::MAX);
     let menu_area = centered_overlay_rect(area, item_count.saturating_add(4), 50, 2, 4);
-    frame.render_widget(Clear, menu_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " New Tab (Enter to select, Esc to cancel) ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(menu_area);
-    frame.render_widget(block, menu_area);
+    let inner = render_titled_popup(
+        frame,
+        menu_area,
+        Color::Cyan,
+        " New Tab (Enter to select, Esc to cancel) ",
+    );
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
@@ -96,18 +104,7 @@ pub fn render_rename(frame: &mut Frame, input: &str) {
     let x = center_overlay(area.width, w);
     let y = (area.height / 2).saturating_sub(1);
     let ra = Rect::new(x, y, w, 3);
-    frame.render_widget(Clear, ra);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(
-            " Rename (Enter, Esc) ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(ra);
-    frame.render_widget(block, ra);
+    let inner = render_titled_popup(frame, ra, Color::Yellow, " Rename (Enter, Esc) ");
     frame.render_widget(
         Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
         inner,
@@ -122,18 +119,7 @@ pub fn render_tab_list(frame: &mut Frame, layout: &Layout, selected: usize) {
     let area = frame.area();
     let content_h = (layout.tabs.len() as u16).saturating_add(4);
     let la = centered_overlay_rect(area, content_h, 50, 2, 4);
-    frame.render_widget(Clear, la);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " Windows (Enter, Esc) ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(la);
-    frame.render_widget(block, la);
+    let inner = render_titled_popup(frame, la, Color::Cyan, " Windows (Enter, Esc) ");
     let lines: Vec<Line> = layout
         .tabs
         .iter()
@@ -174,18 +160,12 @@ pub fn render_move_pane_target(
     let list_len = (layout.tabs.len() as u16).saturating_add(1);
     let content_h = list_len.saturating_add(4);
     let la = centered_overlay_rect(area, content_h, 54, 2, 4);
-    frame.render_widget(Clear, la);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(Span::styled(
-            format!(" Move pane to... (Split: {:?}) (Tab to toggle) ", split_dir),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(la);
-    frame.render_widget(block, la);
+    let inner = render_titled_popup(
+        frame,
+        la,
+        Color::Magenta,
+        format!(" Move pane to... (Split: {:?}) (Tab to toggle) ", split_dir),
+    );
 
     let mut lines: Vec<Line> = Vec::with_capacity(list_len.into());
     for (i, tab) in layout.tabs.iter().enumerate() {
@@ -322,18 +302,7 @@ pub fn render_help(frame: &mut Frame) {
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let ha = Rect::new(x, y, w, h);
-    frame.render_widget(Clear, ha);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(
-            " Keybindings ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(ha);
-    frame.render_widget(block, ha);
+    let inner = render_titled_popup(frame, ha, Color::Yellow, " Keybindings ");
     let lines: Vec<Line> = help
         .iter()
         .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::White))))
@@ -364,18 +333,7 @@ pub fn render_command_palette(frame: &mut Frame, input: &str) {
     let x = (area.width.saturating_sub(w)) / 2;
     let y = area.height / 3;
     let ra = Rect::new(x, y, w, 3);
-    frame.render_widget(Clear, ra);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " : Command (Enter, Esc) ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(ra);
-    frame.render_widget(block, ra);
+    let inner = render_titled_popup(frame, ra, Color::Cyan, " : Command (Enter, Esc) ");
     frame.render_widget(
         Paragraph::new(format!(":{input}")).style(Style::default().fg(Color::White)),
         inner,
