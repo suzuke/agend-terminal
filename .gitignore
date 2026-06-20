@@ -27,3 +27,12 @@ statusline.sh
 mcp-config.json
 *.json.lock
 .agend-managed
+
+# Agent-ephemeral scratch (per-agent, not for version control)
+SESSION-HANDOFF.md
+PRODUCTION-READINESS.md
+CR-*.md
+arch-survey/
+.codex/
+.gemini/
+.opencode/
