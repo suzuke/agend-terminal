@@ -64,6 +64,7 @@ instances:
 
   reviewer:
     role: "Code reviewer"
+    role_kind: reviewer   # typed role → trims the MCP tool surface (opt-in; see below)
     backend: kiro-cli
     working_directory: ~/Projects/my-app
     source_repo: ~/Projects/my-app
@@ -100,7 +101,8 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `role` | string | Agent role description (alias: `description`) |
+| `role` | string | Agent role description, free text (alias: `description`) |
+| `role_kind` | enum | **Optional, opt-in.** Typed role selector that trims the MCP tool surface this agent advertises (defense-in-depth, #2300). One of `reviewer` / `planner` / `explorer` (read/report — drops instance/worktree lifecycle + orchestration tools) or `orchestrator` / `implementer` / `utility` / `proxy` (full surface). **Absent → all tools** (no existing fleet changes). Distinct from the free-text `role` above; an unknown value fails fleet load. |
 | `backend` | string | Override defaults backend |
 | `command` | string | Override defaults command |
 | `args` | [string] | Additional CLI arguments (merged with defaults) |

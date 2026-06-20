@@ -10,13 +10,13 @@ pub fn tool_definitions() -> Value {
     json!({"tools": tools})
 }
 
-/// #2300 P0: tool definitions VISIBLE to `role` (per
-/// [`crate::mcp::registry::tool_subset_for_role`]). Default-all-open — `None` /
-/// dev / lead / unknown role → the full set, byte-identical to
-/// [`tool_definitions`]. Used by the daemon `tools/list` handler to subset the
-/// surface a read/report role advertises.
-pub fn tool_definitions_for_role(role: Option<&str>) -> Value {
-    let tools: Vec<Value> = crate::mcp::registry::tool_subset_for_role(role)
+/// #2300 P0 / #2344: tool definitions VISIBLE to a typed [`crate::fleet::RoleKind`]
+/// (per [`crate::mcp::registry::tool_subset_for_role`]). Default-all-open — `None`
+/// (no `role_kind` declared) or a full-capability role → the full set,
+/// byte-identical to [`tool_definitions`]. Used by the daemon `tools/list` handler
+/// to subset the surface a read/report role advertises.
+pub fn tool_definitions_for_role(role_kind: Option<crate::fleet::RoleKind>) -> Value {
+    let tools: Vec<Value> = crate::mcp::registry::tool_subset_for_role(role_kind)
         .iter()
         .map(|entry| (entry.definition)())
         .collect();

@@ -234,21 +234,27 @@ fn handle_mcp_tool_inner(
 /// no instance (old bridge / non-agent caller), unknown instance, or a role not
 /// in the capability registry (dev / lead / orchestrator / …) → the full surface.
 pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
-    let role = params
+    // #2344: subset off the typed `role_kind` (operator-declared), NOT the
+    // free-text `role` description — the old exact-match against the prose role
+    // never hit, so every agent saw all 36 tools. `.ok()` here is a per-request
+    // best-effort read; a malformed `role_kind` is caught loudly at the
+    // authoritative fleet load (#2344 D2 strict), so this path only ever sees a
+    // valid (or absent) value.
+    let role_kind = params
         .get("instance")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .and_then(|inst| {
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
                 .ok()
-                .and_then(|fleet| fleet.instances.get(inst).and_then(|i| i.role.clone()))
+                .and_then(|fleet| fleet.instances.get(inst).and_then(|i| i.role_kind))
         });
-    // Default-all-open hot path: no instance / unlabeled instance → the canonical
+    // Default-all-open hot path: no instance / undeclared role_kind → the canonical
     // full surface (also keeps `tool_definitions` the single unfiltered builder
     // the count-invariant pins). A role only narrows via the capability registry.
-    let result = match role.as_deref() {
+    let result = match role_kind {
         None => crate::mcp::tools::tool_definitions(),
-        Some(r) => crate::mcp::tools::tool_definitions_for_role(Some(r)),
+        Some(rk) => crate::mcp::tools::tool_definitions_for_role(Some(rk)),
     };
     json!({ "ok": true, "result": result })
 }
@@ -430,5 +436,58 @@ mod tests {
             resp.get("status").is_none(),
             "no accepted_in_progress on success: {resp}"
         );
+    }
+
+    /// #2344 e2e: `handle_mcp_tools_list` subsets the surface for a fleet instance
+    /// whose `role_kind` is a read/report role — the live path the MCP bridge hits.
+    /// A reviewer sees fewer than the full 36 tools; no instance → all-open.
+    #[test]
+    fn tools_list_subsets_for_role_kind_reviewer() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-mcp-toolslist-rk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("fleet.yaml"),
+            "instances:\n  rev:\n    role: \"Code reviewer\"\n    role_kind: reviewer\n    command: claude\n",
+        )
+        .expect("write fleet.yaml");
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+        };
+
+        let full = crate::mcp::tools::tool_definitions()["tools"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        // role_kind=reviewer → subsetted surface.
+        let resp = handle_mcp_tools_list(&json!({"instance": "rev"}), &ctx);
+        assert_eq!(resp["ok"], true);
+        let n = resp["result"]["tools"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert!(
+            n > 0 && n < full,
+            "tools_list for role_kind=reviewer must be subsetted ({n} < {full})"
+        );
+
+        // No instance → all-open (the default hot path).
+        let resp_full = handle_mcp_tools_list(&json!({}), &ctx);
+        let n_full = resp_full["result"]["tools"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(n_full, full, "no instance → all-open full surface");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -19,7 +19,9 @@ pub(crate) fn all() -> &'static [ToolEntry] {
 
 /// #2300 P0: declarative per-role MCP tool subsets (capability registry).
 ///
-/// Maps a free-form fleet.yaml `role` label → the tool names that role may SEE.
+/// Keyed by a typed [`crate::fleet::RoleKind`]'s canonical (snake_case) name →
+/// the tool names that role may SEE (#2344: was a free-text `role` label that
+/// never matched real prose, so the subsetting was inert).
 /// **Default-all-open**: a role NOT listed here — including dev / lead /
 /// orchestrator / unlabeled — gets the full `all()` surface, byte-identical to
 /// pre-#2300. Only the listed read/report roles are trimmed, hiding footgun
@@ -103,13 +105,33 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// #2300 P0: the MCP tool entries a given `role` may SEE. Default-all-open:
-/// `None`, an unlisted role (dev / lead / orchestrator / …), or an unknown label
-/// → the full `all()` surface (byte-identical, registry order). A listed role is
-/// narrowed to its subset; a subset name not in the registry is ignored (never
-/// widens). Order always follows the registry, not the subset list.
-pub(crate) fn tool_subset_for_role(role: Option<&str>) -> Vec<&'static ToolEntry> {
-    let subset = role.and_then(|r| {
+/// #2300 P0 / #2344: the MCP tool entries a given typed [`crate::fleet::RoleKind`]
+/// may SEE. Default-all-open: `None` (no `role_kind` declared — opt-in) or a
+/// full-capability role (`Orchestrator` / `Implementer` / `Utility` / `Proxy`) →
+/// the full `all()` surface (byte-identical, registry order). The three read/report
+/// roles narrow to their curated subset; a subset name not in the registry is
+/// ignored (never widens). Order always follows the registry, not the subset list.
+///
+/// #2344: the match on `RoleKind` is EXHAUSTIVE on purpose — adding a variant
+/// forces a deliberate subset-vs-all-open decision here at compile time. (Was a
+/// free-text `role` string exact-match that no real prose role ever hit → the
+/// per-role subsetting was silently inert.)
+pub(crate) fn tool_subset_for_role(
+    role_kind: Option<crate::fleet::RoleKind>,
+) -> Vec<&'static ToolEntry> {
+    use crate::fleet::RoleKind;
+    let subset_key: Option<&str> = match role_kind {
+        Some(RoleKind::Reviewer) => Some("reviewer"),
+        Some(RoleKind::Planner) => Some("planner"),
+        Some(RoleKind::Explorer) => Some("explorer"),
+        // Full-capability roles + undeclared (opt-in) → all-open.
+        Some(RoleKind::Orchestrator)
+        | Some(RoleKind::Implementer)
+        | Some(RoleKind::Utility)
+        | Some(RoleKind::Proxy)
+        | None => None,
+    };
+    let subset = subset_key.and_then(|r| {
         ROLE_TOOL_SUBSETS
             .iter()
             .find(|(name, _)| *name == r)
@@ -323,24 +345,26 @@ static ALL_TOOLS: [ToolEntry; 36] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::RoleKind;
 
-    fn names(role: Option<&str>) -> Vec<&'static str> {
+    fn names(role: Option<RoleKind>) -> Vec<&'static str> {
         tool_subset_for_role(role).iter().map(|e| e.name).collect()
     }
 
-    /// #2300 P0 byte-identical invariant: full-capability roles (dev / lead),
-    /// `None`, and any UNKNOWN role surface the ENTIRE registry in registry order
-    /// — zero behavior change. If this breaks, default-all-open regressed.
+    /// #2300 P0 byte-identical invariant: full-capability roles (orchestrator /
+    /// implementer / utility / proxy) and `None` (undeclared role_kind) surface the
+    /// ENTIRE registry in registry order — zero behavior change. If this breaks,
+    /// default-all-open regressed.
     #[test]
     fn full_capability_roles_surface_all_36_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(all_names.len(), 36, "registry baseline is 36 tools");
         for role in [
             None,
-            Some("dev"),
-            Some("lead"),
-            Some("orchestrator"),
-            Some("totally-unknown-role"),
+            Some(RoleKind::Orchestrator),
+            Some(RoleKind::Implementer),
+            Some(RoleKind::Utility),
+            Some(RoleKind::Proxy),
         ] {
             assert_eq!(
                 names(role),
@@ -354,7 +378,7 @@ mod tests {
     /// tools its workflow needs. Pins the conservative subset contract.
     #[test]
     fn reviewer_drops_lifecycle_keeps_review_tools() {
-        let r = names(Some("reviewer"));
+        let r = names(Some(RoleKind::Reviewer));
         // Dropped: instance/worktree lifecycle (the #2158 vector) + orchestration.
         for cut in [
             "bind_self",
@@ -404,7 +428,7 @@ mod tests {
     /// and `ci` (run/dispatch) that reviewer/planner keep.
     #[test]
     fn explorer_is_strictest_read_only() {
-        let e = names(Some("explorer"));
+        let e = names(Some(RoleKind::Explorer));
         for cut in ["repo", "ci", "bind_self", "create_instance"] {
             assert!(
                 !e.contains(&cut),

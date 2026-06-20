@@ -342,11 +342,45 @@ pub enum IdleExpectation {
     OnDemand,
 }
 
+/// #2344: typed agent-role selector. Drives the per-role MCP tool subset
+/// (`crate::mcp::registry::tool_subset_for_role`). Distinct from the free-text
+/// `role` description below: the operator DECLARES this typed value (no brittle
+/// prose-parsing — see archived plan PLAN-role-enum-default-by-role-2026-04).
+///
+/// `#[serde(rename_all = "snake_case")]` → fleet.yaml values: `reviewer`,
+/// `planner`, `explorer`, `orchestrator`, `implementer`, `utility`, `proxy`.
+/// STRICT (#2344 D2): a `role_kind:` present with any other value FAILS
+/// fleet.yaml load (serde unknown-variant error naming the offending instance +
+/// value); an ABSENT `role_kind` is legal and resolves to the all-open default
+/// (opt-in — no existing fleet breaks, no real agent loses tools).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleKind {
+    /// Restricted read/report subset — no instance/worktree lifecycle (#2158).
+    Reviewer,
+    /// Restricted read/report — same subset surface as `Reviewer`.
+    Planner,
+    /// Strictest read-only — also drops `repo` (checkout) + `ci` (run/dispatch).
+    Explorer,
+    /// Full capability — fleet orchestration/dispatch (lead).
+    Orchestrator,
+    /// Full capability — implements changes (dev).
+    Implementer,
+    /// Full capability — general/utility agent.
+    Utility,
+    /// Full capability — bridges an external/proxy backend.
+    Proxy,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceConfig {
     /// Role description. TS version uses "description", accepted as alias.
     #[serde(alias = "description")]
     pub role: Option<String>,
+    /// #2344: typed role selector driving the per-role MCP tool subset (opt-in;
+    /// absent → all-open). Distinct from the free-text `role` description above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_kind: Option<RoleKind>,
     /// Unique instance ID (UUIDv4). Auto-assigned on first load if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -993,6 +1027,115 @@ instances:
             resolved.args
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #2344: typed role_kind drives the per-role MCP tool subset ──
+
+    fn tool_count(defs: &serde_json::Value) -> usize {
+        defs.get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// #2344: a typed `role_kind: reviewer` parses to the enum AND drives the MCP
+    /// tool subset (narrower than full) — the per-role subsetting that was inert.
+    /// The prose `role` description coexists unchanged.
+    #[test]
+    fn role_kind_reviewer_parses_and_subsets_tools() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-rk-rev-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  rev:
+    role: "Senior code reviewer"
+    role_kind: reviewer
+    command: claude
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let inst = config.instances.get("rev").expect("instance");
+        assert_eq!(inst.role_kind, Some(RoleKind::Reviewer));
+        assert_eq!(
+            inst.role.as_deref(),
+            Some("Senior code reviewer"),
+            "prose role description coexists with the typed role_kind"
+        );
+
+        let full = tool_count(&crate::mcp::tools::tool_definitions());
+        let subset = tool_count(&crate::mcp::tools::tool_definitions_for_role(
+            inst.role_kind,
+        ));
+        assert!(
+            subset < full,
+            "role_kind=reviewer must narrow the tool surface ({subset} < {full})"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2344 REGRESSION PIN: a free-text `role` description with NO `role_kind`
+    /// stays ALL-OPEN (opt-in) — the original bug class. Prose like "Code reviewer"
+    /// never matched a subset key, so it must surface the full 36 tools; only an
+    /// operator-declared typed `role_kind` narrows.
+    #[test]
+    fn prose_role_without_role_kind_stays_all_open() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-rk-prose-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  rev:
+    role: "Code reviewer"
+    command: claude
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let inst = config.instances.get("rev").expect("instance");
+        assert_eq!(
+            inst.role_kind, None,
+            "no role_kind declared → None (opt-in)"
+        );
+
+        let full = tool_count(&crate::mcp::tools::tool_definitions());
+        let surface = tool_count(&crate::mcp::tools::tool_definitions_for_role(
+            inst.role_kind,
+        ));
+        assert_eq!(
+            surface, full,
+            "prose role without role_kind must stay all-open (the #2344 bug: prose never subsets)"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2344 D2 STRICT: a `role_kind:` present with a value outside the seven
+    /// variants FAILS fleet.yaml load (returns Err, does NOT panic), naming the bad
+    /// value + the valid options. A field-ABSENT role_kind is legal (covered
+    /// above), so existing fleets (no role_kind) are never wrongly blocked.
+    #[test]
+    fn unknown_role_kind_value_fails_load_strict() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-rk-bad-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  badagent:
+    role_kind: supervisor
+    command: claude
+"#,
+        );
+        let err =
+            FleetConfig::load(&path).expect_err("unknown role_kind must fail load (D2 strict)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("supervisor"),
+            "error must name the bad value, got: {msg}"
+        );
+        assert!(
+            msg.contains("reviewer"),
+            "error must list the valid role_kind options, got: {msg}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
