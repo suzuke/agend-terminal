@@ -219,6 +219,7 @@ fn cross_mutator_consistency() {
     // 5. enqueue a ci-watch E, then supersede it → E unread+superseded (excluded).
     let mut e = InboxMessage::new_system("system:ci", "ci-watch", "ci-watch owner/repo@main built");
     e.id = Some("E".to_string());
+    e.correlation_id = Some("owner/repo@main".to_string());
     enqueue(&home, name, e).expect("enqueue E");
     assert_eq!(unread_count(&home, name).0, 2, "D + E unread");
     mark_ci_watch_superseded(&home, name, "owner/repo@main", "m-newer");

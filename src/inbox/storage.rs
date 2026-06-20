@@ -348,11 +348,20 @@ pub fn mark_ci_watch_superseded(
                 continue;
             }
             if let Ok(mut msg) = serde_json::from_str::<InboxMessage>(line) {
+                // Authoritative match is `correlation_id` EQUALITY, not a
+                // `text.contains` substring. ci-watch enqueues set
+                // `correlation_id = "<repo>@<branch>"` (see `ci_watch::poller` /
+                // `ci_watch::sweep`). A substring match supersedes a
+                // prefix-colliding branch: a new `repo@feat/x` event would wrongly
+                // supersede an unread `repo@feat/x-2` notice (its key CONTAINS
+                // `repo@feat/x`), silently dropping feat/x-2's CI-ready signal. The
+                // `line.contains` pre-filter above stays as a cheap screen (it
+                // over-includes; this equality is the authoritative decision).
                 if msg.read_at.is_none()
                     && msg.superseded_by.is_none()
                     && msg.kind.as_deref() == Some("ci-watch")
                     && msg.from == "system:ci"
-                    && msg.text.contains(repo_branch_key)
+                    && msg.correlation_id.as_deref() == Some(repo_branch_key)
                 {
                     msg.superseded_by = Some(new_msg_id.to_string());
                     changed = true;

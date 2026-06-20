@@ -2440,7 +2440,7 @@ fn superseded_by_field_backward_compat() {
 fn mark_ci_watch_superseded_tags_prior_messages() {
     let home = tmp_home("supersede_tag");
     let agent = "test-agent";
-    let msg1 = msg()
+    let mut msg1 = msg()
         .schema_version(0)
         .id("old-1")
         .sender("system:ci")
@@ -2448,12 +2448,71 @@ fn mark_ci_watch_superseded_tags_prior_messages() {
         .kind("ci-watch")
         .timestamp("2026-01-01T00:00:00Z")
         .build();
+    // Real ci-watch enqueues set `correlation_id = "<repo>@<branch>"` (the key
+    // the supersede match keys on); mirror that in the fixture.
+    msg1.correlation_id = Some("owner/repo@main".to_string());
     enqueue(&home, agent, msg1).unwrap();
     mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-msg-id");
     let msgs = drain(&home, agent);
     assert!(
         msgs.is_empty(),
         "superseded message should be filtered: {msgs:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// bug-audit Rank3 regression: `mark_ci_watch_superseded` must match on
+/// `correlation_id` EQUALITY, not a `text.contains` substring. Two unread
+/// ci-watch notices — A=`owner/repo@feat/x` and B=`owner/repo@feat/x-2`, where
+/// B's key CONTAINS A's — superseding for A must mark ONLY A; the
+/// prefix-colliding B must survive (pre-fix the substring match wrongly
+/// superseded B, silently dropping feat/x-2's CI-ready signal).
+#[test]
+fn mark_ci_watch_superseded_does_not_supersede_prefix_colliding_branch() {
+    let home = tmp_home("supersede_prefix_collision");
+    let agent = "test-agent";
+
+    let mut a = msg()
+        .schema_version(0)
+        .id("A")
+        .sender("system:ci")
+        .text("[ci-pass] owner/repo@feat/x (abc1234): passed ✓")
+        .kind("ci-watch")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
+    a.correlation_id = Some("owner/repo@feat/x".to_string());
+    enqueue(&home, agent, a).unwrap();
+
+    let mut b = msg()
+        .schema_version(0)
+        .id("B")
+        .sender("system:ci")
+        .text("[ci-pass] owner/repo@feat/x-2 (def5678): passed ✓")
+        .kind("ci-watch")
+        .timestamp("2026-01-01T00:00:00Z")
+        .build();
+    b.correlation_id = Some("owner/repo@feat/x-2".to_string());
+    enqueue(&home, agent, b).unwrap();
+
+    mark_ci_watch_superseded(&home, agent, "owner/repo@feat/x", "new-x");
+
+    // Read back without draining so we can inspect `superseded_by` per id.
+    let path = home.join("inbox").join(format!("{agent}.jsonl"));
+    let content = std::fs::read_to_string(&path).unwrap();
+    let msgs: Vec<InboxMessage> = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let a = msgs.iter().find(|m| m.id.as_deref() == Some("A")).unwrap();
+    let b = msgs.iter().find(|m| m.id.as_deref() == Some("B")).unwrap();
+    assert!(
+        a.superseded_by.is_some(),
+        "A (exact key match) must be superseded"
+    );
+    assert!(
+        b.superseded_by.is_none(),
+        "B (owner/repo@feat/x-2) must NOT be superseded — prefix collision with \
+         owner/repo@feat/x"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3414,6 +3473,7 @@ fn m1_supersede_preserves_non_matching_messages() {
     enqueue(&home, agent, make_msg("from:lead", "task dispatch")).unwrap();
     let mut ci = make_msg("system:ci", "[ci-pass] owner/repo@main: passed");
     ci.kind = Some("ci-watch".to_string());
+    ci.correlation_id = Some("owner/repo@main".to_string());
     enqueue(&home, agent, ci).unwrap();
 
     super::storage::mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-id");
