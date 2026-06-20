@@ -321,7 +321,7 @@ fn respawn_agent_worker(
         },
         reg,
     ) {
-        Ok(()) => {
+        Ok(_) => {
             tracing::info!(agent = %config.name, "respawned");
             crate::event_log::log(home, "respawn", &config.name, "agent respawned");
             // #1441: registry is UUID-keyed; resolve the respawned name once.

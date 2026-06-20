@@ -1029,7 +1029,40 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     Ok((cmd, detected_backend))
 }
 
-pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Result<()> {
+/// Resolve the authoritative registry `InstanceId` for a spawn (#1441).
+///
+/// A *managed* spawn (`home = Some`: a fleet/inbox-backed agent) MUST resolve to
+/// its fleet.yaml UUID — a missing entry would force a random fallback that
+/// diverges from the agent's inbox identity and reintroduces the name/UUID
+/// dual-track bug, so refuse instead. An *unmanaged* spawn (`home = None`) has no
+/// second identity track to drift against: the standalone `capture` CLI (no
+/// fleet/inbox/daemon) AND TUI-local/scratch shells (never fleet members) both
+/// take this branch, so a throwaway minted id is safe. The TUI shell paths pass
+/// `home = None` here via `pane_factory::SpawnIdentity::UnmanagedLocalShell`.
+fn resolve_spawn_instance_id(
+    home: Option<&std::path::Path>,
+    name: &str,
+) -> anyhow::Result<crate::types::InstanceId> {
+    match home {
+        Some(h) => crate::fleet::resolve_uuid(h, name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "spawn '{name}': cannot resolve InstanceId from fleet.yaml — \
+                 managed instances must be registered in fleet.yaml before spawn; \
+                 refusing to register the agent registry with a non-authoritative \
+                 random UUID (#1441)"
+            )
+        }),
+        None => Ok(crate::types::InstanceId::new()),
+    }
+}
+
+/// Spawn an agent process and register it. Returns the authoritative
+/// `InstanceId` it resolved/minted (#1441) so the caller can route the pane
+/// without re-resolving (which fails for unmanaged local shells not in fleet.yaml).
+pub fn spawn_agent(
+    config: &SpawnConfig,
+    registry: &AgentRegistry,
+) -> anyhow::Result<crate::types::InstanceId> {
     let SpawnConfig {
         name,
         backend_command,
@@ -1156,31 +1189,11 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         health: HealthTracker::new(),
     }));
 
-    // #1441: resolve instance ID via the single authoritative resolver
-    // (same source as inbox). Resolved once here and reused for the registry
-    // key, the PTY-reaper context, and the router-subscriber lookup so all
-    // three share one authoritative identity.
-    //
-    // Fail-fast for *managed* spawns (`home` set): a missing fleet.yaml entry
-    // would force a random fallback UUID that diverges from inbox identity and
-    // reintroduces the name/UUID dual-track bug — refuse instead. When `home`
-    // is `None` (standalone `capture` CLI: no fleet, no inbox, no daemon), no
-    // second identity track exists to drift against, so a throwaway minted id
-    // is safe.
-    let instance_id = match config.home {
-        Some(h) => match crate::fleet::resolve_uuid(h, name) {
-            Some(id) => id,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "spawn '{name}': cannot resolve InstanceId from fleet.yaml — \
-                     managed instances must be registered in fleet.yaml before spawn; \
-                     refusing to register the agent registry with a non-authoritative \
-                     random UUID (#1441)"
-                ));
-            }
-        },
-        None => crate::types::InstanceId::new(),
-    };
+    // #1441: resolve the single authoritative instance ID (same source as inbox),
+    // reused for the registry key, the PTY-reaper context, and the router-subscriber
+    // lookup. Extracted to `resolve_spawn_instance_id` so the managed/unmanaged
+    // identity policy is unit-testable without a live PTY spawn.
+    let instance_id = resolve_spawn_instance_id(config.home, name)?;
 
     // Register in registry
     {
@@ -1337,7 +1350,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     rollback.commit();
 
     tracing::info!(agent = name, backend = backend_command, args = %config.args.join(" "), "spawned");
-    Ok(())
+    Ok(instance_id)
 }
 
 /// #CR-2026-06-14: lock the per-agent core (OFF the registry lock path) and
@@ -1924,7 +1937,7 @@ fn on_clean_exit_shell_fallback(
         registry,
     );
     match spawn_result {
-        Ok(()) => {
+        Ok(_) => {
             tracing::info!(agent = name, shell, "shell fallback spawned");
             if let Some(ref home) = home {
                 let rdir = crate::daemon::run_dir(home);

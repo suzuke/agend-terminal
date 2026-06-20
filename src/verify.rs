@@ -521,7 +521,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     );
 
     match spawn_result {
-        Ok(()) => {
+        Ok(_) => {
             let re = regex::RegexBuilder::new(preset.ready_pattern)
                 .size_limit(1 << 20)
                 .build()

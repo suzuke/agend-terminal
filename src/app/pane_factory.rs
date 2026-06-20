@@ -24,6 +24,20 @@ use std::sync::Arc;
 
 /// Spawn an agent/shell via spawn_agent and add as a new tab.
 #[allow(clippy::too_many_arguments)]
+/// Whether a spawned pane is a managed fleet agent or an unmanaged local shell.
+/// Drives the #1441 identity policy in `agent::spawn_agent`: a managed agent must
+/// resolve its authoritative UUID from fleet.yaml (a missing entry is refused),
+/// while a local/scratch shell — never a fleet member, no inbox identity — has no
+/// second identity track to drift against and so mints a throwaway id (the same
+/// path as the standalone `capture` CLI). Carried explicitly so the sensitive
+/// guard is never widened to wrongly admit a real managed agent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SpawnIdentity {
+    Managed,
+    UnmanagedLocalShell,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_pane_tab(
     layout: &mut Layout,
     registry: &AgentRegistry,
@@ -39,6 +53,7 @@ pub(super) fn spawn_pane_tab(
     rows: u16,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
+    identity: SpawnIdentity,
 ) -> Result<()> {
     let pane = create_pane(
         layout,
@@ -55,6 +70,7 @@ pub(super) fn spawn_pane_tab(
         rows,
         wakeup_tx,
         name_counter,
+        identity,
     )?;
     let tab_name = pane.agent_name.clone();
     layout.add_tab(Tab::new(tab_name.to_string(), pane));
@@ -88,6 +104,7 @@ pub(super) fn create_pane(
     rows: u16,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
+    identity: SpawnIdentity,
 ) -> Result<Pane> {
     let (mut pane, fwd_tx) = build_pane_placeholder(
         layout,
@@ -101,7 +118,7 @@ pub(super) fn create_pane(
     );
     attach_agent_to_pane(
         &mut pane, fwd_tx, registry, home, command, args, spawn_mode, env, submit_key, cols, rows,
-        wakeup_tx,
+        wakeup_tx, identity,
     )?;
     Ok(pane)
 }
@@ -187,6 +204,7 @@ fn attach_agent_to_pane(
     cols: u16,
     rows: u16,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
+    identity: SpawnIdentity,
 ) -> Result<()> {
     let name = pane.agent_name.to_string();
     let work_dir = pane
@@ -201,6 +219,7 @@ fn attach_agent_to_pane(
     // registry) while the render thread runs `apply_attachment` (pane mutation).
     let (instance_id, rx, dump) = spawn_and_subscribe(
         registry, home, &name, command, args, spawn_mode, env, submit_key, &work_dir, cols, rows,
+        identity,
     )?;
     apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
     Ok(())
@@ -226,6 +245,7 @@ fn spawn_and_subscribe(
     work_dir: &Path,
     cols: u16,
     rows: u16,
+    identity: SpawnIdentity,
 ) -> Result<(
     crate::types::InstanceId,
     crossbeam_channel::Receiver<Vec<u8>>,
@@ -276,7 +296,20 @@ fn spawn_and_subscribe(
     // --settings) are now injected centrally by agent::spawn_agent, so callers pass
     // raw args and spawn_agent enriches them from files under work_dir.
     let spawn_mode = spawn_mode.downgraded_for(command, Some(work_dir));
-    agent::spawn_agent(
+    // #1441 identity: a managed agent passes its real `home` so spawn_agent
+    // resolves the authoritative fleet.yaml UUID; a local/scratch shell passes
+    // `None` (it is not a fleet member) so spawn_agent mints a throwaway id —
+    // exactly like the standalone `capture` CLI. `home` is still used below for
+    // skills/cwd/work_dir; only the *identity* source is gated here.
+    let identity_home = match identity {
+        SpawnIdentity::Managed => Some(home),
+        SpawnIdentity::UnmanagedLocalShell => None,
+    };
+    // #1441: spawn_agent returns the authoritative InstanceId it used as the
+    // registry key — reuse it directly to route the pane's lookups. (Was a
+    // second `resolve_uuid(home, name)` here, which fails for a local shell with
+    // no fleet.yaml entry even after a successful spawn — the original bug.)
+    let instance_id = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
             backend_command: command,
@@ -287,7 +320,7 @@ fn spawn_and_subscribe(
             env: Some(env),
             working_dir: Some(work_dir),
             submit_key,
-            home: Some(home),
+            home: identity_home,
             crash_tx: None,
             // restart-freeze 真嫌#1 (t-…55279): hand every Owned-mode agent the
             // process-global app shutdown flag so `app_teardown` can flip it and
@@ -298,13 +331,6 @@ fn spawn_and_subscribe(
         },
         registry,
     )?;
-
-    // #1441: resolve the authoritative UUID once (same source as the registry
-    // key spawn_agent just used) and route the pane's registry lookups by it.
-    // spawn_agent succeeded above, so the fleet.yaml entry — and thus the
-    // resolution — is guaranteed present.
-    let instance_id = crate::fleet::resolve_uuid(home, name)
-        .ok_or_else(|| anyhow::anyhow!("agent '{name}' has no fleet UUID after spawn"))?;
 
     // Subscribe to the agent's output
     let (rx, dump) = {
@@ -689,6 +715,7 @@ pub(super) fn run_attach(
                 &work_dir,
                 cols,
                 rows,
+                SpawnIdentity::Managed,
             ) {
                 Ok((instance_id, rx, dump)) => {
                     // Overwrite basic instructions with the fleet-aware version
@@ -747,6 +774,9 @@ pub(super) fn run_attach(
             &work_dir,
             cols,
             rows,
+            // AttachSpec::Direct is the deferred SHELL / direct-command path
+            // (see `build_deferred_direct_pane`) — unmanaged, no fleet.yaml entry.
+            SpawnIdentity::UnmanagedLocalShell,
         ) {
             Ok((instance_id, rx, dump)) => {
                 finish_attach(registry, pane_id, instance_id, rx, dump, work_dir, name)
@@ -950,6 +980,7 @@ pub(super) fn create_pane_from_resolved(
         rows,
         wakeup_tx,
         name_counter,
+        SpawnIdentity::Managed,
     )?;
 
     // Overwrite basic instructions with fleet-aware version

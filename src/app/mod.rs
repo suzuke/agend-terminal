@@ -412,6 +412,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 pane_rows,
                 &wakeup_tx,
                 &mut name_counter,
+                pane_factory::SpawnIdentity::UnmanagedLocalShell,
             )?;
         }
     }
@@ -1467,6 +1468,7 @@ fn pane_from_menu_item(
                 rows,
                 wakeup_tx,
                 name_counter,
+                pane_factory::SpawnIdentity::UnmanagedLocalShell,
             )
         }
         MenuItemKind::Backend(backend) => {
@@ -1519,6 +1521,7 @@ fn pane_from_menu_item(
                     rows,
                     wakeup_tx,
                     name_counter,
+                    pane_factory::SpawnIdentity::Managed,
                 )
             }
         }

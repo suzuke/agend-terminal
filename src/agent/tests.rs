@@ -756,7 +756,7 @@ fn spawn_agent_refuses_mid_delete_1915() {
         shutdown: None,
     };
     let err = match spawn_agent(&cfg, &registry) {
-        Ok(()) => panic!("#1915: a mid-delete spawn must be refused, got Ok"),
+        Ok(_) => panic!("#1915: a mid-delete spawn must be refused, got Ok"),
         Err(e) => format!("{e}"),
     };
     assert!(
@@ -767,6 +767,75 @@ fn spawn_agent_refuses_mid_delete_1915() {
         registry.lock().is_empty(),
         "#1915: bailed before the insert — no handle, no resurrection"
     );
+}
+
+/// #t-98760-1: a local/scratch shell (unmanaged identity, `home = None`) resolves
+/// a throwaway InstanceId WITHOUT a fleet.yaml entry — the identity path that
+/// fixes the broken `Ctrl+B c → Shell` spawn. Pre-fix the shell passed
+/// `home = Some` and a name never in fleet.yaml, so it hit the #1441 guard.
+#[test]
+fn resolve_spawn_instance_id_unmanaged_mints_throwaway() {
+    let id1 = resolve_spawn_instance_id(None, "shell").expect("unmanaged shell must resolve");
+    let id2 = resolve_spawn_instance_id(None, "scratch").expect("unmanaged scratch must resolve");
+    // Each unmanaged spawn is its own ephemeral identity.
+    assert_ne!(id1, id2, "distinct throwaway ids per unmanaged spawn");
+}
+
+/// #t-98760-1 / #1441 GUARD INTACT: a *managed* spawn (`home = Some`) whose name
+/// is NOT in fleet.yaml is STILL refused. The fix must not widen the guard to
+/// admit a real managed agent with a non-authoritative random UUID (the dual-track
+/// bug #1441 closed).
+#[test]
+fn resolve_spawn_instance_id_managed_without_fleet_entry_refused() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let home = std::env::temp_dir().join(format!(
+        "agend-resolve-id-{}-{}",
+        std::process::id(),
+        C.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&home).ok();
+    // No fleet.yaml written → resolve_uuid returns None for any name.
+    let err = resolve_spawn_instance_id(Some(home.as_path()), "managed-agent")
+        .expect_err("managed spawn with no fleet.yaml entry must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("#1441") && msg.contains("fleet.yaml"),
+        "refusal must cite #1441 + fleet.yaml, got: {msg}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #t-98760-1: full-spawn integration — an unmanaged local shell (`home = None`)
+/// spawns successfully and registers under the returned authoritative id, WITHOUT
+/// a fleet.yaml "shell" entry (the operator-reported `Ctrl+B c → Shell` bug). The
+/// returned id is used directly (no post-spawn `resolve_uuid`, which used to fail
+/// here for the shell — the second bug layer). Mirrors the `home: None` style of
+/// `deleted_agent_reaper_no_shell_fallback`.
+#[test]
+fn unmanaged_local_shell_spawns_without_fleet_entry() {
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let cfg = SpawnConfig {
+        name: "shell",
+        backend_command: "true", // exits immediately; we only assert it registered
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None, // unmanaged identity — the local-shell path
+        crash_tx: None,
+        shutdown: None,
+    };
+    let id =
+        spawn_agent(&cfg, &registry).expect("unmanaged local shell must spawn without fleet.yaml");
+    let reg = registry.lock();
+    let handle = reg
+        .get(&id)
+        .expect("registry must hold the spawned shell under its returned id");
+    assert_eq!(handle.name.as_str(), "shell");
 }
 
 /// Deleted agent: reaper should not spawn shell fallback when deleted flag is set.

@@ -89,6 +89,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     pr,
                     ctx.wakeup_tx,
                     ctx.name_counter,
+                    super::pane_factory::SpawnIdentity::Managed,
                 )
             };
             match pane_result {
@@ -225,6 +226,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                                 pr,
                                 ctx.wakeup_tx,
                                 ctx.name_counter,
+                                super::pane_factory::SpawnIdentity::Managed,
                             )
                         }
                     } else {
@@ -245,6 +247,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                             pr,
                             ctx.wakeup_tx,
                             ctx.name_counter,
+                            super::pane_factory::SpawnIdentity::Managed,
                         )
                     };
                     if let Ok(new_pane) = pane_result {

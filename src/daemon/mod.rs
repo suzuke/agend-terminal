@@ -2117,7 +2117,7 @@ fn handle_stage2_restart(
     );
 
     match spawn_result {
-        Ok(()) => {
+        Ok(_) => {
             tracing::info!(
                 target: "recovery_shadow",
                 agent = %name,

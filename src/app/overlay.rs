@@ -211,7 +211,7 @@ pub(super) fn handle_key(
                     if let Some(item) = items.into_iter().nth(sel) {
                         let pc = c.saturating_sub(2);
                         let pr = r.saturating_sub(4);
-                        if let Ok(pane) = super::pane_from_menu_item(
+                        match super::pane_from_menu_item(
                             item,
                             ctx.fleet_path,
                             ctx.layout,
@@ -222,15 +222,24 @@ pub(super) fn handle_key(
                             ctx.wakeup_tx,
                             ctx.name_counter,
                         ) {
-                            super::telegram_hooks::maybe_create_telegram_topic(
-                                ctx.telegram_state,
-                                ctx.registry,
-                                ctx.home,
-                                &pane,
-                            );
-                            let tab_name = pane.agent_name.clone();
-                            ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
-                            outcome.needs_resize = true;
+                            Ok(pane) => {
+                                super::telegram_hooks::maybe_create_telegram_topic(
+                                    ctx.telegram_state,
+                                    ctx.registry,
+                                    ctx.home,
+                                    &pane,
+                                );
+                                let tab_name = pane.agent_name.clone();
+                                ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
+                                outcome.needs_resize = true;
+                            }
+                            // #t-98760-1: surface a failed new-tab spawn instead of
+                            // silently swallowing the Err (mirrors SplitMenu's error
+                            // log) — a swallowed Err looked to the operator like
+                            // Ctrl+B c "did nothing".
+                            Err(e) => {
+                                tracing::error!(error = %e, "new-tab spawn failed");
+                            }
                         }
                     }
                 }

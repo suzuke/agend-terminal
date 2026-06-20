@@ -323,6 +323,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 inner_h,
                 ctx.wakeup_tx,
                 ctx.name_counter,
+                super::pane_factory::SpawnIdentity::UnmanagedLocalShell,
             ) {
                 Ok(pane) => {
                     out.new_overlay = Some(Overlay::ScratchShell {
