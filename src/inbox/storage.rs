@@ -119,6 +119,39 @@ fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> an
     Ok(f(&path))
 }
 
+/// Parse an inbox JSONL body into successfully-deserialized [`InboxMessage`]s,
+/// skipping blank / unparseable / forward-schema rows. The READ-ONLY counterpart
+/// to the read-modify-write rewriters (`drain` / `sweep_expired` / `clear_compact`
+/// / `reclaim_stale_delivering` / `mark_ci_watch_superseded` / `enqueue`), which
+/// instead preserve every raw line VERBATIM — those must NOT route through this
+/// parse-and-skip helper or they would drop forward-schema rows (silent
+/// data-loss). Lazy (no intermediate `Vec`) so `.any` / `.find` callers keep
+/// their short-circuit and allocation profile. Takes already-read content (not a
+/// path) because a path-taking iterator can't borrow its local read buffer
+/// without an eager collect.
+fn parse_inbox_messages(content: &str) -> impl Iterator<Item = InboxMessage> + '_ {
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<InboxMessage>(line).ok())
+}
+
+/// Iterate `home/inbox`'s `*.jsonl` entry paths (the directory-walk +
+/// extension-filter shared by `sweep_expired` / `get_thread` / `find_message`).
+/// A `read_dir` error yields an empty iteration (callers historically
+/// early-`return`/skip on it). Yields only the raw path: each caller keeps its
+/// own per-file choice — the read-only scanners (`get_thread` / `find_message`)
+/// use the path directly, while `sweep_expired` re-derives the stem name and
+/// re-resolves through [`with_inbox_lock`] (preserving the UUID→canonical
+/// [`inbox_path_resolved`] redirect; operating on this raw path would drop it).
+fn inbox_files(home: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(home.join("inbox"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+}
+
 /// Enqueue a message — in-place flock'd append + fsync (O(1) JSONL append).
 ///
 /// NOT crash-atomic: enqueue appends in place — no tmp+rename (only the
@@ -971,23 +1004,15 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
 ///
 /// File line order is preserved for survivors.
 pub fn sweep_expired(home: &Path) {
-    let inbox_dir = home.join("inbox");
-    let entries = match std::fs::read_dir(&inbox_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
     let now = chrono::Utc::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+    for path in inbox_files(home) {
+        // Extract agent name from filename (e.g. "agent1.jsonl" → "agent1") and
+        // re-resolve through `with_inbox_lock` — NOT the raw yielded `path`,
+        // which would bypass the UUID→canonical `inbox_path_resolved` redirect.
+        let Some(agent_name) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
-        }
-        // Extract agent name from filename (e.g. "agent1.jsonl" → "agent1")
-        let agent_name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
         };
-        let _ = with_inbox_lock(home, &agent_name, |path| {
+        let _ = with_inbox_lock(home, agent_name, |path| {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(_) => return,
@@ -1226,19 +1251,11 @@ pub fn reclaim_stale_delivering(home: &Path) {
 /// If `instance` is provided, only that agent's inbox is searched.
 pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageStatus {
     let path = inbox_path_resolved(home, instance);
-    if !path.exists() {
-        return MessageStatus::NotFound;
-    }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return MessageStatus::NotFound,
-    };
+    // A missing/unreadable file → empty content → no match → `NotFound`
+    // fall-through (same result as the prior explicit exists/Err guards).
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
     let now = chrono::Utc::now();
-    for line in content.lines() {
-        let msg: InboxMessage = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+    for msg in parse_inbox_messages(&content) {
         if msg.id.as_deref() != Some(msg_id) {
             continue;
         }
@@ -1283,16 +1300,7 @@ pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<I
         let path = inbox_path_resolved(home, inst);
         collect_thread_messages(&path, thread_id, &mut msgs);
     } else {
-        let inbox_dir = home.join("inbox");
-        let entries = match std::fs::read_dir(&inbox_dir) {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
+        for path in inbox_files(home) {
             collect_thread_messages(&path, thread_id, &mut msgs);
         }
         // CR-2026-06-14: a migrated inbox is present under TWO directory entries —
@@ -1335,25 +1343,13 @@ fn collect_thread_messages(path: &Path, thread_id: &str, out: &mut Vec<InboxMess
 
 /// Look up a message by ID across all inbox files. Returns the message if found.
 pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
-    let inbox_dir = home.join("inbox");
-    let entries = std::fs::read_dir(&inbox_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        // CR-2026-06-14: skip-and-continue on an unreadable file. The prior
-        // `read_to_string(&path).ok()?` propagated `None` out of the WHOLE scan,
-        // so one bad file hid a message living in a LATER inbox. Mirror
-        // `get_thread`/`collect_thread_messages`.
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in content.lines() {
-            if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
-                if msg.id.as_deref() == Some(msg_id) {
-                    return Some(msg);
-                }
+    // CR-2026-06-14: an unreadable file is skipped (yields no messages) so one
+    // bad file can't hide a message living in a LATER inbox.
+    for path in inbox_files(home) {
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        for msg in parse_inbox_messages(&content) {
+            if msg.id.as_deref() == Some(msg_id) {
+                return Some(msg);
             }
         }
     }
@@ -1378,17 +1374,16 @@ pub fn has_drained_blocker_for_correlation(
     correlation_id: &str,
 ) -> bool {
     let path = inbox_path_resolved(home, agent_name);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    content.lines().any(|line| {
-        let Ok(msg) = serde_json::from_str::<InboxMessage>(line) else {
-            return false;
-        };
-        msg.correlation_id.as_deref() == Some(correlation_id)
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    for msg in parse_inbox_messages(&content) {
+        if msg.correlation_id.as_deref() == Some(correlation_id)
             && (msg.read_at.is_some() || msg.delivering_at.is_some())
             && matches!(msg.kind.as_deref(), Some("query") | Some("task"))
-    })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read the agent's inbox JSONL and return `true` iff a message with
@@ -1410,15 +1405,15 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
     // that let an already-drained message be re-injected after a daemon restart
     // (when the in-memory `OnceLock` ledger is gone).
     let path = inbox_path_resolved(home, agent_name);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    content.lines().any(|line| {
-        let Ok(msg) = serde_json::from_str::<InboxMessage>(line) else {
-            return false;
-        };
-        msg.id.as_deref() == Some(msg_id) && (msg.read_at.is_some() || msg.delivering_at.is_some())
-    })
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    for msg in parse_inbox_messages(&content) {
+        if msg.id.as_deref() == Some(msg_id)
+            && (msg.read_at.is_some() || msg.delivering_at.is_some())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
