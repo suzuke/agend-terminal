@@ -8,9 +8,10 @@
 //! a failure here can never affect a tool call (same discipline as the #1808
 //! instrument-only shadow probes).
 //!
-//! Storage is an append-only JSONL file at `<home>/mcp-usage-stats.jsonl` — its
-//! own file, NOT the rotating daemon log, so it survives restarts and is never
-//! rotated away. One compact line per call:
+//! Storage is a bounded JSONL file at `<home>/mcp-usage-stats.jsonl` — its own
+//! file, NOT the rotating daemon log. It rotates locally with a small retention
+//! window, so usage stats survive restarts without unbounded disk growth. One
+//! compact line per call:
 //!
 //! ```json
 //! {"ts":"2026-06-12T05:00:00Z","tool":"task","action":"create","opt_params":["branch","priority"]}
@@ -28,6 +29,24 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
+
+const MAX_STATS_BYTES: u64 = 1024 * 1024;
+const MAX_ROTATED_FILES: usize = 5;
+const MAX_ROTATED_AGE: Duration = Duration::from_secs(30 * 86400);
+
+#[derive(Clone, Copy)]
+struct RetentionPolicy {
+    max_live_bytes: u64,
+    max_rotated_files: usize,
+    max_rotated_age: Duration,
+}
+
+const DEFAULT_RETENTION: RetentionPolicy = RetentionPolicy {
+    max_live_bytes: MAX_STATS_BYTES,
+    max_rotated_files: MAX_ROTATED_FILES,
+    max_rotated_age: MAX_ROTATED_AGE,
+};
 
 /// The usage log path — a dedicated file under `<home>`, deliberately separate
 /// from `daemon.log*` so log rotation never discards it.
@@ -103,12 +122,116 @@ fn build_line(tool: &str, args: &Value, ts: String) -> Value {
 /// tolerable (the analyst's jq skips a malformed line), and a failed write is
 /// silently dropped — usage stats must never be load-bearing.
 fn append_line(path: &Path, line: &Value) -> std::io::Result<()> {
+    append_line_with_policy(path, line, DEFAULT_RETENTION, SystemTime::now())
+}
+
+fn append_line_with_policy(
+    path: &Path,
+    line: &Value,
+    policy: RetentionPolicy,
+    now: SystemTime,
+) -> std::io::Result<()> {
     use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path).map_err(std::io::Error::other)?;
+
+    rotate_if_needed(path, policy);
+    prune_rotated_stats(path, policy, now);
+
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(f, "{line}")
+    writeln!(f, "{line}")?;
+    drop(f);
+
+    rotate_if_needed(path, policy);
+    prune_rotated_stats(path, policy, now);
+    Ok(())
+}
+
+fn rotated_stats_path(base: &Path, gen: usize) -> PathBuf {
+    let mut name = base.file_name().map(|s| s.to_owned()).unwrap_or_default();
+    name.push(format!(".{gen}"));
+    base.with_file_name(name)
+}
+
+fn rotate_if_needed(path: &Path, policy: RetentionPolicy) {
+    if policy.max_rotated_files == 0 {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= policy.max_live_bytes {
+        return;
+    }
+
+    let _ = std::fs::remove_file(rotated_stats_path(path, policy.max_rotated_files));
+    for gen in (1..policy.max_rotated_files).rev() {
+        let src = rotated_stats_path(path, gen);
+        let dst = rotated_stats_path(path, gen + 1);
+        if src.exists() {
+            let _ = std::fs::rename(src, dst);
+        }
+    }
+    if std::fs::rename(path, rotated_stats_path(path, 1)).is_ok() {
+        let _ = std::fs::File::create(path);
+    }
+}
+
+fn prune_rotated_stats(path: &Path, policy: RetentionPolicy, now: SystemTime) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Some(base_name) = path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{base_name}.");
+
+    let mut rotated: Vec<(PathBuf, usize, SystemTime)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let gen = name.strip_prefix(&prefix)?.parse::<usize>().ok()?;
+            let mtime = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((path, gen, mtime))
+        })
+        .collect();
+
+    for (path, gen, mtime) in &rotated {
+        let too_old = now
+            .duration_since(*mtime)
+            .map(|age| age > policy.max_rotated_age)
+            .unwrap_or(false);
+        if *gen > policy.max_rotated_files || too_old {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    rotated.retain(|(path, gen, mtime)| {
+        path.exists()
+            && *gen <= policy.max_rotated_files
+            && now
+                .duration_since(*mtime)
+                .map(|age| age <= policy.max_rotated_age)
+                .unwrap_or(true)
+    });
+    rotated.sort_by_key(|(_, gen, _)| *gen);
+    for (idx, (path, _, _)) in rotated.iter().enumerate() {
+        if idx >= policy.max_rotated_files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +239,7 @@ fn append_line(path: &Path, line: &Value) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::{Duration, SystemTime};
 
     /// `optional_params` derives `properties − required` from the live registry:
     /// `task` (required `action`) keeps `branch`/`priority` as optional and drops
@@ -213,5 +337,84 @@ mod tests {
             .any(|v| v == "branch"));
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_line_rotates_when_live_stats_exceeds_budget_r9() {
+        let home = tmp_home("rotate-budget-r9");
+        let path = stats_path(&home);
+        let policy = RetentionPolicy {
+            max_live_bytes: 180,
+            max_rotated_files: 2,
+            max_rotated_age: Duration::from_secs(30 * 86400),
+        };
+
+        for i in 0..40 {
+            let line = json!({
+                "ts": "2026-06-20T00:00:00Z",
+                "tool": "task",
+                "action": "create",
+                "opt_params": ["branch", "priority", format!("p{i}")],
+            });
+            append_line_with_policy(&path, &line, policy, SystemTime::now()).unwrap();
+        }
+
+        let live_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            live_len <= policy.max_live_bytes,
+            "live stats file must stay under the rotation budget; got {live_len}"
+        );
+        assert!(
+            rotated_stats_path(&path, 1).exists(),
+            "rotation must keep history"
+        );
+        assert!(
+            !rotated_stats_path(&path, 3).exists(),
+            "count retention must prune generations beyond max_rotated_files"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_line_prunes_stale_rotated_stats_even_without_size_rotation_r9() {
+        let home = tmp_home("retention-age-r9");
+        let path = stats_path(&home);
+        let old = rotated_stats_path(&path, 1);
+        let fresh = rotated_stats_path(&path, 2);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&old, "old\n").unwrap();
+        std::fs::write(&fresh, "fresh\n").unwrap();
+
+        let stale_mtime = SystemTime::now() - Duration::from_secs(10);
+        let f = std::fs::File::options().write(true).open(&old).unwrap();
+        f.set_modified(stale_mtime).unwrap();
+
+        let policy = RetentionPolicy {
+            max_live_bytes: 1024 * 1024,
+            max_rotated_files: 5,
+            max_rotated_age: Duration::from_secs(1),
+        };
+        append_line_with_policy(
+            &path,
+            &json!({"ts":"now","tool":"task","action":"list","opt_params":[]}),
+            policy,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        assert!(!old.exists(), "stale rotated stats must be pruned on write");
+        assert!(fresh.exists(), "fresh rotated stats must be retained");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn tmp_home(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-usage-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
