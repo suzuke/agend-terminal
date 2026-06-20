@@ -9,16 +9,25 @@
 
 ### Added
 
-- **per-role MCP 工具子集現已生效(#2367)** — `fleet.yaml` 新增型別化、由 operator 宣告的 `role_kind`(七種變體)驅動每個實例的工具子集。先前用自由文字 `role:` 比對,永遠對不上真實的散文角色名,所以每個 agent 都看到全部工具;唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集,且 exhaustive match 強制每個新角色都要明確決定子集(#2300、#2344)。
+- **per-role MCP 工具子集(#2344、#2367)** — 新增 per-role MCP capability registry(#2344),加上 `fleet.yaml` 中型別化、由 operator 宣告的 `role_kind`(七種變體)驅動它(#2367),裁切 agent 對外公告的工具面。先前用自由文字 `role:` 比對,永遠對不上真實的散文角色名,所以每個 agent 都看到全部工具;唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集,且 exhaustive match 強制每個新角色都要明確決定。opt-in、預設全工具(#2300)。
 - **turn-completion sentinel shadow 擴及 Claude(#2366 —— measure-only、預設 OFF)** — 在 `AGEND_TURN_SENTINEL_SHADOW=1` 下,Claude 現在也會被注入 turn-completion sentinel 並做 shadow 量測,取得跨 backend 的 emission 基線。Claude 的權威狀態仍走其 lifecycle hooks;shadow 永不驅動 state(#1523 Phase 0)。
+- **三態 inbox 投遞(#2345)** — 訊息投遞改為 `unread → delivering → processed`,搭配顯式 `inbox ack` 與 reclaim-TTL:收件者 turn 在 drain 之後死掉的訊息會被重新投遞(at-least-once),不再靜默遺失(#2299)。
+
+### Changed
+
+- **per-tick / render 熱路徑效能稽核(#2348–#2356)** — 一批零行為改變的熱路徑加速:render redraw-scan 節流與 per-pane snapshot-scratch 重用(#2348、#2351、#2354)、PTY reader pre-hash gate 在未變更的 frame 跳過 colour-mask 建構(#2349)、inbox unread-count 改用 cheap probe(#2350)、`FleetConfig` mtime-cache Arc 共享(#2356)、monitor proc-table 重用(#2355)、dismiss scan 在啟動後才開(#2352)、以及 MCP usage-stats 輪替(#2353)。
 
 ### Fixed
 
-- **API 連線計數器 panic-safe(#2368)** — per-connection slot 與 in-flight session 計數器在 `handle_session` *之後* 才遞減,panic unwind 會跳過;洩漏的 slot 累積到上限(32)後拒絕所有新連線,鎖死控制面。RAII guard 現在在所有路徑(含 panic unwind)都釋放 slot(bug-audit Rank1)。
+- **redraw 風暴與重啟時的 UI 凍結(#2343、#2346)** — render loop 現在把 redraw 速率上限訂在 30fps 並合併 wakeup,wakeup 風暴不再凍結 UI(#2346);重啟時把 OWNED pane 的還原 spawn 延後到 render-first 背景池,讓畫面先繪出再做重活(#2343)。
+- **本地 / scratch shell 可再次啟動(#2359)** — #1441 的 unmanaged-spawn gate 連 operator 開的本地/scratch shell(`Ctrl+B c`)也擋住了;這些現在豁免。
+- **還原的分割 pane PTY 尺寸(#2360)** — 重啟時還原的分割 pane 會在 deferred attach 之後重新調整到其 content rect,不再卡在錯誤尺寸(#2343)。
+- **GR1 綁定劫持可觀測性(#2158 —— #2341、#2361、#2373)** — self-claim 綁定(無 task dispatch)現在會向 operator 顯示,且不再靜默 auto-arm ci-watch(#2341);該通知改寄到被綁 agent 的 team orchestrator 而非全域 operator inbox,top-level lead 的 self-notify 則跳過(#2361、#2347);per-branch fire-once latch 在 release 時清除,之後同分支的真正 re-claim 會重新顯示(#2373)。僅偵測 —— push 權限仍由 HMAC + guard-b 把關。
+- **API 連線計數器 panic-safe(#2368)** — per-connection slot 與 in-flight session 計數器在 `handle_session` *之後* 才遞減,panic unwind 會跳過;洩漏的 slot 累積到上限(32)後拒絕所有新連線,鎖死控制面。RAII guard 現在在所有路徑(含 panic unwind)都釋放(bug-audit Rank1)。
 - **Telegram 授權在 side-effect 之前執行(#2369)** — allowlist 檢查跑在 fleet-status 注入與 `加 task:` 板寫入 *之後*,非 allowlist 的傳送者可讀取 fleet 狀態或建立板任務。授權區塊已提前到所有內容 side-effect 之前(bug-audit Rank2)。
-- **ci-watch supersede 不再誤殺前綴碰撞的 branch(#2370)** — `mark_ci_watch_superseded` 以子字串比對 `repo@branch` 鍵,使得 `repo@feat/x` 事件誤把未讀的 `repo@feat/x-2` CI-ready 通知標為 superseded(訊號靜默遺失)。現改以 `correlation_id` 相等比對(bug-audit Rank3)。
-- **null 的必填 MCP 參數被乾淨拒絕(#2372)** — `validate_args` 把「存在但為 JSON null」的必填欄位當成存在,例如 `reply {"message": null}` 會轉發空字串、在下游不透明地失敗;現在對每個 handler 都把 null 視為缺漏拒絕,而合法的空字串仍通過。
-- **GR1 out-of-dispatch 通知在 release 後重新武裝(#2373)** — 劫持通知的 fire-once latch 在 `unbind` 時從未清除,使得 self-claim → notify → release 後,之後同分支的真正 re-claim 被靜默吞掉;`unbind` 現在清除 latch,且保留 intra-cycle dedup(bug-audit Rank6)。
+- **ci-watch supersede 不再誤殺前綴碰撞的 branch(#2370)** — `mark_ci_watch_superseded` 以子字串比對 `repo@branch` 鍵,使得 `repo@feat/x` 事件誤把未讀的 `repo@feat/x-2` CI-ready 通知標為 superseded。現改以 `correlation_id` 相等比對(bug-audit Rank3)。
+- **被回收的 inbox 訊息會重新 page(#2362)** — 把過期的 `delivering` 列還原回 `unread` 時,現在會重新武裝 poll-reminder,被回收的訊息會再次浮現而非靜默躺著(#2299)。
+- **null 的必填 MCP 參數被乾淨拒絕(#2372)** — `validate_args` 把「存在但為 JSON null」的必填欄位當成存在,例如 `reply {"message": null}` 會轉發空字串、在下游不透明地失敗;現在對每個 handler 都把 null 視為缺漏拒絕,而合法的空字串仍通過(bug-audit Rank8)。
 - **restart/replace 雙重 spawn 防護加上回歸鎖(#2371 —— 僅測試)** — `handle_pty_close` 裡 source 端的 `deleted` guard 是 restart/replace 路徑上防止同名 re-spawn 雙重 spawn 的唯一保護;兩個回歸測試現在把它釘住(deleted → 抑制 exit;not-deleted → crash 仍發出),無 production 變更(bug-audit Rank4)。
 
 ## [0.9.0] — 2026-06-19
