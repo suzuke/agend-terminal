@@ -54,6 +54,22 @@ fn err_needs_identity(tool: &str) -> Value {
     })
 }
 
+/// #2050 simplify PR-B (⑤): the uniform "require the `instance` arg" extraction
+/// shared by the Variant-A MCP handlers (those for which `args["instance"]` is
+/// mandatory). Returns the instance name, or the byte-identical
+/// `{"error": "missing 'instance'"}` Value for the caller to return. Name-format
+/// validation stays at each call site (`crate::validate_name_or_err!`), and the
+/// `unwrap_or("")`/empty-string-guard handlers are intentionally NOT migrated.
+///
+/// Call sites use `let x = match super::require_instance(args) { Ok(t) => t,
+/// Err(e) => return e };` (the `?` operator can't be used in a `-> Value` fn).
+fn require_instance(args: &Value) -> Result<&str, Value> {
+    match args["instance"].as_str() {
+        Some(t) => Ok(t),
+        None => Err(json!({"error": "missing 'instance'"})),
+    }
+}
+
 /// Build the INJECT API params for an interrupt ESC byte injection.
 /// Extracted for testability — unit tests verify the exact params
 /// without needing a running daemon.

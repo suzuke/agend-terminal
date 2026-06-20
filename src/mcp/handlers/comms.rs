@@ -53,9 +53,9 @@ pub(super) fn handle_send_to_instance(
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity(tool);
     };
-    let target = match args["instance"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'instance'"}),
+    let target = match super::require_instance(args) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     if *sender == target {
@@ -120,23 +120,32 @@ pub(super) fn handle_send_to_instance(
     };
     let mut result = result;
     if kind == Some("report") && parent_id.is_none() {
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert(
-                "warning".to_string(),
-                json!("parent_id recommended for report kind; will be required in future version"),
-            );
-        }
+        attach_report_parent_warning(&mut result);
     }
     result
+}
+
+/// #2050 simplify PR-B (⑫): attach the "parent_id recommended" warning to a
+/// result object (no-op when `result` isn't a JSON object). Only the shared
+/// insert is deduped — each CALLER keeps its own guard (the send path gates on
+/// `kind == Some("report") && parent_id.is_none()`, the report path on
+/// `args["parent_id"].as_str().is_none()`), so behavior is byte-identical.
+fn attach_report_parent_warning(result: &mut Value) {
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "warning".to_string(),
+            json!("parent_id recommended for report kind; will be required in future version"),
+        );
+    }
 }
 
 pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("delegate_task");
     };
-    let raw_target = match args["instance"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'instance'"}),
+    let raw_target = match super::require_instance(args) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(raw_target);
     // Sprint 46 P2: resolve target via InstanceId — replaces P1 name-lookup bandaid.
@@ -404,9 +413,9 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("report_result");
     };
-    let target = match args["instance"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'instance'"}),
+    let target = match super::require_instance(args) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     let summary = match args["summary"].as_str() {
@@ -508,12 +517,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     // Add warning for report kind without parent_id
     let mut result = result;
     if args["parent_id"].as_str().is_none() {
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert(
-                "warning".to_string(),
-                json!("parent_id recommended for report kind; will be required in future version"),
-            );
-        }
+        attach_report_parent_warning(&mut result);
     }
     if is_ok_result(&result) {
         // Mark dispatch as completed so timeout sweep doesn't false-warn.
@@ -552,9 +556,9 @@ pub(super) fn handle_request_information(
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("request_information");
     };
-    let target = match args["instance"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'instance'"}),
+    let target = match super::require_instance(args) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     let question = match args["question"].as_str() {

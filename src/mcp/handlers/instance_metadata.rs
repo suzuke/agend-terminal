@@ -5,43 +5,46 @@ use std::path::Path;
 
 use super::err_needs_identity;
 
-pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let display_name = args["name"].as_str().unwrap_or("");
-    // #1604: empty/missing `name` = explicit CLEAR (reset to the default = the
-    // agent name; see layout::pane::display_name's `unwrap_or(&agent_name)`),
-    // mirroring set_waiting_on. Pre-#1604 it saved `""` → the pane showed a
-    // blank name instead of falling back. Clear stores `null` so the reader's
-    // Option is None.
-    if display_name.is_empty() {
-        save_metadata(home, instance_name, "display_name", json!(null));
+/// #2050 simplify PR-B (⑩): shared body for the `set_display_name` /
+/// `set_description` metadata setters (byte-identical to the former inline code).
+///
+/// #1604 semantics: an empty `value` = explicit CLEAR — store `null` (so the
+/// reader's `Option` is `None`, falling back to the default) and return
+/// `{"cleared": true}`. Over `max_len` (BYTES — `str::len`, unchanged) →
+/// `{"error": "<attr> exceeds <max_len> character limit"}`. Otherwise persist and
+/// echo `{"<attr>": value}`. Exactly one `save_metadata` write executes per call.
+fn set_string_attr(
+    home: &Path,
+    instance_name: &str,
+    value: &str,
+    attr: &str,
+    max_len: usize,
+) -> Value {
+    if value.is_empty() {
+        save_metadata(home, instance_name, attr, json!(null));
         return json!({"cleared": true});
     }
-    if display_name.len() > 256 {
-        return json!({"error": "display_name exceeds 256 character limit"});
+    if value.len() > max_len {
+        return json!({"error": format!("{attr} exceeds {max_len} character limit")});
     }
-    save_metadata(home, instance_name, "display_name", json!(display_name));
-    json!({"display_name": display_name})
+    save_metadata(home, instance_name, attr, json!(value));
+    json!({ attr: value })
+}
+
+pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let display_name = args["name"].as_str().unwrap_or("");
+    set_string_attr(home, instance_name, display_name, "display_name", 256)
 }
 
 pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &str) -> Value {
     let desc = args["description"].as_str().unwrap_or("");
-    // #1604: empty/missing `description` = explicit CLEAR (store `null`),
-    // consistent with set_display_name + set_waiting_on.
-    if desc.is_empty() {
-        save_metadata(home, instance_name, "description", json!(null));
-        return json!({"cleared": true});
-    }
-    if desc.len() > 1024 {
-        return json!({"error": "description exceeds 1024 character limit"});
-    }
-    save_metadata(home, instance_name, "description", json!(desc));
-    json!({"description": desc})
+    set_string_attr(home, instance_name, desc, "description", 1024)
 }
 
 pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
-    let target = match args["instance"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'instance'"}),
+    let target = match super::require_instance(args) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     match crate::api::call(home, &super::interrupt_esc_params(target)) {
@@ -133,9 +136,9 @@ pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
-    let target = match args["instance"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'instance'"}),
+    let target = match super::require_instance(args) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     let lines_u64 = args["lines"].as_u64().unwrap_or(100);
@@ -198,9 +201,9 @@ pub(super) fn handle_report_health(
 }
 
 pub(super) fn handle_clear_blocked_reason(home: &Path, args: &Value) -> Value {
-    let instance = match args["instance"].as_str() {
-        Some(n) => n,
-        None => return json!({"error": "missing 'instance'"}),
+    let instance = match super::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     // CR-2026-06-14: validate the instance name at the MCP boundary before the
     // CLEAR_BLOCKED_REASON RPC, mirroring the sibling handlers in this file

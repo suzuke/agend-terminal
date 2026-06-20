@@ -154,9 +154,9 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
 }
 
 pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["instance"].as_str() {
-        Some(n) => n,
-        None => return json!({"error": "missing 'instance'"}),
+    let name = match super::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
@@ -182,9 +182,9 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["instance"].as_str() {
-        Some(n) => n,
-        None => return json!({"error": "missing 'instance'"}),
+    let name = match super::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
     // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
@@ -228,9 +228,9 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
 }
 
 pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["instance"].as_str() {
-        Some(n) => n,
-        None => return json!({"error": "missing 'instance'"}),
+    let name = match super::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
     // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
@@ -387,9 +387,9 @@ fn restart_spawn_params(
 }
 
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
-    let name = match args["instance"].as_str() {
-        Some(n) => n,
-        None => return json!({"error": "missing 'instance'"}),
+    let name = match super::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
     // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal

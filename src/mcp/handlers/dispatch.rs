@@ -132,34 +132,14 @@ pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
 //   custom body                   → shape: custom
 // ---------------------------------------------------------------------
 macro_rules! adapter {
-    ($name:ident, hai, $handler:expr) => {
+    // Generic fn-generating arm: emit `fn $name(ctx) -> Value` that delegates to
+    // the matching `@call` arm for `$shape`. Collapses the former six per-shape
+    // fn arms (hai/ha/hais/has/h/a) into one — byte-identical expansion. The
+    // `@call` arms below lead with `@` (not an `ident`), so an `adapter!(@call …)`
+    // invocation can never match this `$name:ident` arm.
+    ($name:ident, $shape:ident, $handler:expr) => {
         pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
-            $handler(ctx.home, ctx.args, ctx.instance_name)
-        }
-    };
-    ($name:ident, ha, $handler:expr) => {
-        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
-            $handler(ctx.home, ctx.args)
-        }
-    };
-    ($name:ident, hais, $handler:expr) => {
-        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
-            $handler(ctx.home, ctx.args, ctx.instance_name, ctx.sender)
-        }
-    };
-    ($name:ident, has, $handler:expr) => {
-        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
-            $handler(ctx.home, ctx.args, ctx.sender)
-        }
-    };
-    ($name:ident, h, $handler:expr) => {
-        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
-            $handler(ctx.home)
-        }
-    };
-    ($name:ident, a, $handler:expr) => {
-        pub(crate) fn $name(ctx: &HandlerCtx<'_>) -> Value {
-            $handler(ctx.args)
+            adapter!(@call ctx, $shape, $handler)
         }
     };
     (@call $ctx:ident, hai, $handler:expr) => {
