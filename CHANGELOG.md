@@ -5,6 +5,31 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-role MCP tool subsetting (#2344, #2367)** — a per-role MCP capability registry (#2344) plus a typed, operator-declared `role_kind` in `fleet.yaml` (seven variants) that drives it (#2367), trimming the tool surface an agent advertises. The previous free-text `role:` match never matched real prose roles, so every agent saw all tools; read-only roles (reviewer/planner/explorer) now get report/read subsets, while an exhaustive match forces a deliberate decision for each new role. Opt-in, default all tools (#2300).
+- **Turn-completion sentinel shadow extended to Claude (#2366 — measure-only, default OFF)** — under `AGEND_TURN_SENTINEL_SHADOW=1`, Claude is now also injected the turn-completion sentinel and shadow-measured, giving a cross-backend emission baseline. Claude's authoritative state still comes from its lifecycle hooks; the shadow never drives state (#1523 Phase 0).
+- **Three-state inbox delivery (#2345)** — message delivery moves through `unread → delivering → processed`, with an explicit `inbox ack` and a reclaim-TTL that re-delivers a message whose recipient turn died after the drain (at-least-once) instead of losing it silently (#2299).
+
+### Changed
+
+- **Per-tick / render hot-path performance audit (#2348–#2356)** — a batch of behaviour-preserving speedups on hot paths: render redraw-scan throttling and per-pane snapshot-scratch reuse (#2348, #2351, #2354), a PTY-reader pre-hash gate that skips the colour-mask build on unchanged frames (#2349), inbox unread-count via a cheap probe (#2350), `FleetConfig` mtime-cache Arc-sharing (#2356), monitor proc-table reuse (#2355), a post-startup gate on dismiss scans (#2352), and MCP usage-stats rotation (#2353).
+
+### Fixed
+
+- **UI freeze under redraw storms and restart (#2343, #2346)** — the render loop now caps its redraw rate (30 fps) and coalesces wakeups so a wakeup storm can't freeze the UI (#2346); and a restart defers OWNED-pane restore spawns to a render-first background pool, so the frame paints before the heavy restore work (#2343).
+- **Local / scratch shells spawn again (#2359)** — the #1441 unmanaged-spawn gate was also blocking operator-opened local/scratch shells (`Ctrl+B c`); those are now exempt.
+- **Restored split-pane PTY size (#2360)** — a split pane restored on restart is resized to its content rect after the deferred attach, so it no longer stays at the wrong size (#2343).
+- **GR1 binding-hijack observability (#2158 — #2341, #2361, #2373)** — a self-claim bind (no task dispatch) now surfaces to the operator and no longer silently auto-arms a ci-watch (#2341); the notice routes to the bound agent's team orchestrator instead of the global operator inbox, with a top-level lead's self-notify skipped (#2361, #2347); and the per-branch fire-once latch is cleared on release so a later real re-claim of the same branch re-surfaces (#2373). Detection-only — push authority stays HMAC- + guard-b-gated.
+- **API connection counter is panic-safe (#2368)** — the per-connection slot and in-flight session counters were decremented *after* `handle_session`, so a panic unwind skipped them; leaked slots accumulated to the cap (32) and rejected every new connection, locking up the control plane. RAII guards now release on every path, including a panic unwind (bug-audit Rank1).
+- **Telegram authorization runs before side-effects (#2369)** — the allowlist check ran *after* fleet-status injection and `加 task:` board writes, so a non-allowlisted sender could read fleet status or create a board task. The authz block is hoisted ahead of all content side-effects (bug-audit Rank2).
+- **ci-watch supersede no longer drops a prefix-colliding branch (#2370)** — `mark_ci_watch_superseded` matched the `repo@branch` key by substring, so a `repo@feat/x` event wrongly superseded an unread `repo@feat/x-2` CI-ready notice. It now matches on `correlation_id` equality (bug-audit Rank3).
+- **Reclaimed inbox messages re-page (#2362)** — reverting a stale `delivering` row back to `unread` now re-arms the poll-reminder, so a reclaimed message surfaces again instead of sitting silently (#2299).
+- **Null required MCP arguments are rejected cleanly (#2372)** — `validate_args` treated a present-but-JSON-null required field as present, so e.g. `reply {"message": null}` forwarded an empty string and failed opaquely downstream; it now rejects null-as-missing for every handler, while a legitimate empty string still passes (bug-audit Rank8).
+- **Restart/replace double-spawn guard regression-locked (#2371 — test-only)** — the source-side `deleted` guard in `handle_pty_close` is the only net preventing a same-name re-spawn double-spawn on the restart/replace path; two regression tests now pin it (deleted → exit suppressed; not-deleted → crash still emitted), with no production change (bug-audit Rank4).
+
 ## [0.9.0] — 2026-06-19
 
 228 commits since 0.8.0. Highlights, organized by theme (not an exhaustive commit list).
