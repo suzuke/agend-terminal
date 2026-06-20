@@ -509,7 +509,9 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
 /// backend via fleet.yaml so per-instance overrides are honoured. A backend
 /// with no submit key (Shell/Raw) is unsupported (can't detect submission).
 fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
-    let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
+    // #perf-R4: per-tick hot path → load_arc (Arc refcount bump, not deep clone).
+    let Ok(fleet) = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home))
+    else {
         return false;
     };
     let Some(resolved) = fleet.resolve_instance(agent) else {
@@ -524,7 +526,8 @@ fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
 /// Unknown agent / unreadable config → `Active` (default; preserves pre-#1563
 /// behavior so a misconfiguration never silently suppresses a real stall).
 fn idle_expectation_for(home: &std::path::Path, agent: &str) -> crate::fleet::IdleExpectation {
-    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+    // #perf-R4: per-tick hot path → load_arc (Arc refcount bump, not deep clone).
+    crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|cfg| cfg.instances.get(agent).map(|ic| ic.idle_expectation))
         .unwrap_or_default()

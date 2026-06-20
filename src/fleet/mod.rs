@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Mtime-based cache for `FleetConfig::load()`.
@@ -29,7 +30,10 @@ struct FleetCacheEntry {
     path: PathBuf,
     mtime: SystemTime,
     size: u64,
-    config: FleetConfig,
+    /// #perf-R4: store the parsed config behind an `Arc` so a cache HIT in
+    /// [`FleetConfig::load_arc`] is a refcount bump, not a deep clone of the
+    /// whole `instances`/`teams` map under the global `FLEET_CACHE` mutex.
+    config: Arc<FleetConfig>,
 }
 
 fn invalidate_cache() {
@@ -482,7 +486,15 @@ impl FleetConfig {
         keys
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
+    /// #perf-R4: cache-shared load returning `Arc<FleetConfig>`. On a cache HIT
+    /// this is an `Arc::clone` (refcount bump), NOT a deep clone of the whole
+    /// `FleetConfig` (its `instances`/`teams` HashMaps). The supervisor per-tick
+    /// hot callers (`idle_expectation_for`, `pane_input_backend_supported`,
+    /// `metadata_path_resolved`) use this so a 10s tick over N agents doesn't
+    /// deep-copy the fleet ~4×/agent while holding the global `FLEET_CACHE`
+    /// mutex (which render/etc. also contend). Cold/infrequent callers keep
+    /// [`FleetConfig::load`] (owned, deep-cloned) — behaviour-identical.
+    pub fn load_arc(path: &Path) -> Result<Arc<Self>> {
         let meta = std::fs::metadata(path).ok();
         let disk_mtime = meta.as_ref().and_then(|m| m.modified().ok());
         let disk_size = meta.as_ref().map(|m| m.len());
@@ -491,12 +503,12 @@ impl FleetConfig {
             let guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.as_ref() {
                 if entry.path == path && entry.mtime == mtime && entry.size == size {
-                    return Ok(entry.config.clone());
+                    return Ok(Arc::clone(&entry.config));
                 }
             }
         }
 
-        let config = Self::load_uncached(path)?;
+        let config = Arc::new(Self::load_uncached(path)?);
 
         if let (Some(mtime), Some(size)) = (disk_mtime, disk_size) {
             let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -504,11 +516,19 @@ impl FleetConfig {
                 path: path.to_path_buf(),
                 mtime,
                 size,
-                config: config.clone(),
+                config: Arc::clone(&config),
             });
         }
 
         Ok(config)
+    }
+
+    /// Owned load (deep-cloned `FleetConfig`). Byte-identical to the pre-#perf-R4
+    /// behaviour for the ~190 cold/infrequent call sites that want an owned
+    /// value. Per-tick hot callers use [`FleetConfig::load_arc`] to skip the
+    /// deep clone.
+    pub fn load(path: &Path) -> Result<Self> {
+        Ok((*Self::load_arc(path)?).clone())
     }
 
     /// #1989: resolved schema version — an omitted `schema_version:` means 1.
@@ -2375,6 +2395,129 @@ instances:
             second.instances.contains_key("longer-name-agent"),
             "different-size rewrite must not return stale cache"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #perf-R4: load_arc (Arc refcount bump on cache HIT) vs load (deep clone) ──
+
+    /// `load_arc` must return content behaviour-equivalent to `load` (the cold
+    /// path). Order-independent + eviction-robust (no cache-HIT dependency, so
+    /// it can't flake on the single-entry global `FLEET_CACHE`).
+    #[test]
+    fn load_arc_content_equals_load() {
+        let _g = env_guard();
+        invalidate_cache();
+        let dir = std::env::temp_dir().join(format!("agend-fleet-arc-eq-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            "instances:\n  a:\n    backend: claude\n  b:\n    backend: codex\n",
+        );
+        let arc = FleetConfig::load_arc(&path).expect("load_arc");
+        let owned = FleetConfig::load(&path).expect("load");
+        let arc_keys: std::collections::BTreeSet<_> = arc.instances.keys().cloned().collect();
+        let owned_keys: std::collections::BTreeSet<_> = owned.instances.keys().cloned().collect();
+        assert_eq!(
+            arc_keys, owned_keys,
+            "#perf-R4: load_arc and load must see the same instances"
+        );
+        let expect: std::collections::BTreeSet<_> =
+            ["a".to_string(), "b".to_string()].into_iter().collect();
+        assert_eq!(arc_keys, expect);
+        assert_eq!(
+            arc.resolve_instance("a").map(|r| r.backend_command),
+            owned.resolve_instance("a").map(|r| r.backend_command),
+            "#perf-R4: load_arc must resolve byte-identically to load"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression guard: the supervisor per-tick hot callers must use `load_arc`
+    /// (Arc bump), not `load` (deep clone). Source-scan because it's
+    /// eviction-immune — a cache-HIT/`Arc::ptr_eq` assertion would flake (the
+    /// single-entry `FLEET_CACHE` is evicted by parallel tests in other modules).
+    #[test]
+    fn hot_callers_use_load_arc_not_load() {
+        fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("fn not found: {sig}"));
+            let after = &src[start + sig.len()..];
+            let a = after.find("\nfn ");
+            let b = after.find("\npub fn ");
+            let end = match (a, b) {
+                (Some(x), Some(y)) => x.min(y),
+                (Some(x), None) => x,
+                (None, Some(y)) => y,
+                (None, None) => after.len(),
+            };
+            &src[start..start + sig.len() + end]
+        }
+        let supervisor = include_str!("../daemon/supervisor.rs");
+        let agent_ops = include_str!("../agent_ops.rs");
+        for (src, sig) in [
+            (supervisor, "fn pane_input_backend_supported"),
+            (supervisor, "fn idle_expectation_for"),
+            (agent_ops, "fn metadata_path_resolved"),
+        ] {
+            let body = fn_body(src, sig);
+            assert!(
+                body.contains("FleetConfig::load_arc("),
+                "#perf-R4: `{sig}` is a per-tick hot caller and MUST use FleetConfig::load_arc"
+            );
+            assert!(
+                !body.contains("FleetConfig::load("),
+                "#perf-R4: `{sig}` must NOT use FleetConfig::load (deep clone) on the per-tick hot path"
+            );
+        }
+    }
+
+    /// #perf-R4 manual bench (NOT a CI gate — `#[ignore]`, machine-dependent).
+    /// `cargo nextest run --release --run-ignored all -E 'test(perf_r4_fleet)' --no-capture`
+    /// Shows the per-call cost of `load` (deep-clones the whole N-instance fleet
+    /// on every cache HIT) vs `load_arc` (refcount bump), as N grows.
+    #[test]
+    #[ignore = "perf measurement, run explicitly in release"]
+    fn perf_r4_fleet_load_arc_vs_load() {
+        use std::time::Instant;
+        let _g = env_guard();
+        invalidate_cache();
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-arc-bench-{}", std::process::id()));
+        let n_instances = 200usize;
+        let mut yaml = String::from("instances:\n");
+        for i in 0..n_instances {
+            yaml.push_str(&format!(
+                "  agent-{i:04}:\n    backend: claude\n    role: worker number {i}\n"
+            ));
+        }
+        let path = write_fleet(&dir, &yaml);
+        let iters = 50_000u32;
+        let _ = FleetConfig::load_arc(&path).expect("populate cache");
+
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..iters {
+            acc = acc.wrapping_add(FleetConfig::load(&path).expect("load").instances.len());
+        }
+        let load_dur = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            acc = acc.wrapping_add(
+                FleetConfig::load_arc(&path)
+                    .expect("load_arc")
+                    .instances
+                    .len(),
+            );
+        }
+        let arc_dur = t1.elapsed();
+
+        let lo = load_dur.as_nanos() as f64 / iters as f64;
+        let ar = arc_dur.as_nanos() as f64 / iters as f64;
+        println!("#perf-R4 (N={n_instances} instances, iters={iters}, acc={acc}):");
+        println!("  load     (deep-clone on cache HIT): {lo:.0} ns/call");
+        println!("  load_arc (Arc refcount bump)      : {ar:.0} ns/call");
+        println!("  speedup                           : {:.1}x", lo / ar);
         std::fs::remove_dir_all(&dir).ok();
     }
 

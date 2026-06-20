@@ -129,7 +129,9 @@ pub fn metadata_path(home: &Path, name: &str) -> PathBuf {
 /// Sprint 46 P2: resolve metadata path by InstanceId when available.
 /// Migrates legacy name-based files to id-based on first access.
 pub fn metadata_path_resolved(home: &Path, name: &str) -> PathBuf {
-    let id = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+    // #perf-R4: per-tick hot path (supervisor reads metadata ~2×/agent/tick) →
+    // load_arc (Arc refcount bump, not a deep clone of the whole fleet).
+    let id = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|c| {
             c.instances
