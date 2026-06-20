@@ -440,7 +440,7 @@ const HARD_WRAP_TAIL_LINES: usize = 40;
 
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
     #[cfg(test)]
-    RECENT_SCREEN_TAIL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RECENT_SCREEN_TAIL_CALLS.with(|c| c.set(c.get() + 1));
     let lines: Vec<&str> = screen_text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
@@ -452,18 +452,27 @@ fn tail_recent_lines(tail: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+// Per-test-thread tail-scan counter. The libtest harness runs each `#[test]` on
+// its OWN thread, so a thread-local (vs the former process-global AtomicUsize)
+// isolates the count per test: a parallel `cargo test` run no longer leaks a
+// sibling test's `recent_screen_tail` calls into another test's assertion (the
+// `changed_frames_..._bound_tail_scans` flake — green single-threaded, red under
+// CI's parallel Check). The `reset()` each test runs at its start also keeps it
+// correct under `--test-threads=1` (one thread reused across tests). `#[cfg(test)]`
+// only — no prod footprint (the increment in `recent_screen_tail` is gated too).
 #[cfg(test)]
-static RECENT_SCREEN_TAIL_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static RECENT_SCREEN_TAIL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_recent_screen_tail_call_count() {
-    RECENT_SCREEN_TAIL_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    RECENT_SCREEN_TAIL_CALLS.with(|c| c.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn recent_screen_tail_call_count() -> usize {
-    RECENT_SCREEN_TAIL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    RECENT_SCREEN_TAIL_CALLS.with(|c| c.get())
 }
 
 /// Context% telemetry: rows scanned from the bottom of the screen for the
@@ -2463,7 +2472,7 @@ impl StateTracker {
             return;
         }
         let token = turn_sentinel_token(&self.instance_name);
-        let obs = observe_turn_sentinel(&tail, &token);
+        let obs = observe_turn_sentinel(tail, &token);
         if !obs.token_seen {
             // Some OTHER agent's token (or a malformed marker) is on screen — not
             // ours. Drop the latch and skip (never attribute another agent's emit).
