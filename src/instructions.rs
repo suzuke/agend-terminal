@@ -525,15 +525,19 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
         m @ (1 | 2) => Some((m, backend.supports_subagents())),
         _ => None,
     };
-    // #1523 Phase 0 (shadow): inject the turn-completion sentinel only for
-    // hook-less backends (Claude is EXCLUDED — it has lifecycle hooks that emit
-    // authoritative state) and only when `AGEND_TURN_SENTINEL_SHADOW=1`. The
-    // per-agent token is derived from the agent name so the daemon detector can
-    // recompute the SAME token without any persisted/plumbed state. Default-off →
+    // #1523 Phase 0 (shadow): inject the turn-completion sentinel directive
+    // whenever `AGEND_TURN_SENTINEL_SHADOW=1`. The earlier `!has_state_hooks()`
+    // exclusion (which skipped Claude) is dropped so Claude is ALSO injected and
+    // shadow-measured — the operator-approved extension that yields Claude's
+    // emission baseline for the cross-backend comparison. Measure-only: Claude's
+    // authoritative state still comes from its lifecycle hooks; the shadow
+    // detector (`capture_turn_sentinel_shadow`) is fail-open and never drives
+    // state. The per-agent token is derived from the agent name so the detector
+    // recomputes the SAME token with no persisted/plumbed state. Default-off →
     // `None` → ZERO behaviour change (fail-open invariant).
     let turn_token = ctx
         .map(|c| c.name)
-        .filter(|_| !backend.has_state_hooks() && crate::state::turn_sentinel_shadow_enabled())
+        .filter(|_| crate::state::turn_sentinel_shadow_enabled())
         .map(crate::state::turn_sentinel_token);
     let body = build_instructions_body(
         ctx,
@@ -1187,6 +1191,66 @@ mod tests {
             on.contains("never persisted content"),
             "directive must warn against writing the token to files (leak surface): {on}"
         );
+    }
+
+    /// Serialises the tests that toggle the process-global
+    /// `AGEND_TURN_SENTINEL_SHADOW` env var (nextest already isolates by process;
+    /// this guards the threaded `cargo test` path within this binary).
+    static SENTINEL_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #1523 Phase 0 claude extension: with the shadow flag ON, a CLAUDE backend
+    /// (which has lifecycle hooks and was previously EXCLUDED from injection) now
+    /// receives the turn-completion sentinel directive + its per-agent token, so
+    /// the shadow detector can measure Claude's emission for the cross-backend
+    /// baseline. With the flag OFF, Claude is byte-identical (no directive, no
+    /// token leak). Claude's authoritative (hook-based) detection is unaffected
+    /// either way — this governs only the measure-only injection.
+    #[test]
+    fn turn_sentinel_injected_for_claude_under_shadow_flag_1523() {
+        let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
+        let ctx = AgentContext {
+            name: "claude-888b09",
+            role: None,
+            fleet_peers: &[],
+            team: None,
+            extra_instructions: None,
+        };
+
+        // Flag ON → Claude IS injected (the dropped `!has_state_hooks()` exclusion).
+        std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
+        let on_dir = tmp_dir("sentinel_claude_on");
+        generate_with_context(&on_dir, "claude", Some(&ctx));
+        let on = std::fs::read_to_string(on_dir.join(".claude").join("agend.md")).unwrap();
+        assert!(
+            on.contains("## Turn-completion signal (AgEnD)"),
+            "Claude must receive the sentinel directive under shadow: {on}"
+        );
+        assert!(
+            on.contains(&crate::state::turn_sentinel_token("claude-888b09")),
+            "Claude must receive its per-agent token under shadow"
+        );
+        std::fs::remove_dir_all(&on_dir).ok();
+
+        // Flag OFF → Claude byte-identical (no directive, no token).
+        std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW");
+        let off_dir = tmp_dir("sentinel_claude_off");
+        generate_with_context(&off_dir, "claude", Some(&ctx));
+        let off = std::fs::read_to_string(off_dir.join(".claude").join("agend.md")).unwrap();
+        assert!(
+            !off.contains("Turn-completion signal"),
+            "Claude must NOT receive the directive when shadow is off: {off}"
+        );
+        assert!(
+            !off.contains("AGEND-DONE:"),
+            "no token may leak into Claude instructions when shadow is off"
+        );
+        std::fs::remove_dir_all(&off_dir).ok();
+
+        match prev {
+            Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
+            None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
+        }
     }
 
     #[test]
