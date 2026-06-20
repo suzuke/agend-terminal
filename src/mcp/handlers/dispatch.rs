@@ -78,7 +78,13 @@ fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
     let schema = &def["inputSchema"];
     if let Some(required) = schema["required"].as_array() {
         for req in required.iter().filter_map(Value::as_str) {
-            if args.get(req).is_none() {
+            // Rank8: treat a present-but-JSON-null value as missing. `args.get`
+            // returns `Some(Value::Null)` for `{"req": null}`, so a bare
+            // `is_none()` let null slip through — the handler then defaulted it
+            // (e.g. `as_str().unwrap_or("")` → an empty reply) and the failure
+            // surfaced opaquely downstream (Telegram 400) instead of here. A
+            // legit empty string is NOT null, so `""` still passes.
+            if args.get(req).is_none_or(Value::is_null) {
                 return Some(json!({
                     "error": format!("{tool}: missing required parameter '{req}'")
                 }));
@@ -891,6 +897,64 @@ mod tests {
             result["error"], "reply: missing required parameter 'message'",
             "dispatch must reject reply with no message: {result}"
         );
+    }
+
+    // ── Rank8 bug-audit: present-but-JSON-null required field ───────────────
+    // `{"message": null}` slipped through validation because `args.get(req)`
+    // returns `Some(Value::Null)` (not `None`), so `is_none()` saw it as
+    // "present". `handle_reply` then did `as_str().unwrap_or("")` → forwarded an
+    // EMPTY string → opaque downstream channel rejection (Telegram 400) instead
+    // of a clean early named error. The fix treats present-but-null as missing.
+
+    #[test]
+    fn validate_rejects_present_but_null_required_field() {
+        // The exact Rank8 bug: a null required value must reject like a missing
+        // one, with the SAME named error — caught early at the validator, never
+        // forwarded as an empty reply.
+        let def = crate::mcp::tools::def_reply();
+        let err = validate_args("reply", &def, &json!({"message": null}))
+            .expect("a null required field must reject like a missing one");
+        assert_eq!(
+            err["error"], "reply: missing required parameter 'message'",
+            "present-but-null must reject with the same named error as missing: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_empty_string_required_field() {
+        // Precision: ONLY JSON null counts as missing. A legit empty string is a
+        // real present value (null=absent, ""=present) and must still pass, so
+        // the fix never wrongly blocks a caller that means to send "".
+        let def = crate::mcp::tools::def_reply();
+        assert!(
+            validate_args("reply", &def, &json!({"message": ""})).is_none(),
+            "empty-string message is a present value, not null — must not be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_null_for_all_genuinely_required_fields() {
+        // The null-as-missing rule lives in validate_args, so it benefits EVERY
+        // handler — not just reply. Mirror the genuinely-required cases.
+        use crate::mcp::tools::*;
+        let cases = [
+            ("reply", def_reply(), "message"),
+            ("send", def_send(), "message"),
+            ("delete_instance", def_delete_instance(), "instance"),
+            ("task", def_task(), "action"),
+        ];
+        for case in &cases {
+            let (tool, def, field) = (case.0, &case.1, case.2);
+            let mut obj = serde_json::Map::new();
+            obj.insert(field.to_string(), serde_json::Value::Null);
+            let args = serde_json::Value::Object(obj);
+            let err = validate_args(tool, def, &args).expect("a null required field must reject");
+            assert_eq!(
+                err["error"],
+                format!("{tool}: missing required parameter '{field}'"),
+                "{tool}: null '{field}' must be rejected like missing"
+            );
+        }
     }
 }
 
