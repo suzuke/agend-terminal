@@ -323,13 +323,16 @@ pub fn serve(
             std::sync::atomic::Ordering::Relaxed,
         );
         let _ = stream.set_nodelay(true);
-        // #680: atomic reserve-then-check (no race between check and increment)
-        let prev = active_conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // #680: atomic reserve-then-check (no race between check and increment).
+        // The slot is a RAII `ConnSlot` whose `Drop` releases it on EVERY exit
+        // path (reject / spawn-fail / normal return / panic unwind) — bug-audit
+        // Rank1: the old manual `fetch_sub` placed after `handle_session` leaked
+        // the slot when that call panicked.
+        let (conn_slot, prev) = ConnSlot::reserve(&active_conns);
         if prev >= max_conns {
-            active_conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             tracing::warn!("API connection rejected — at capacity");
             drop(stream);
-            continue;
+            continue; // `conn_slot` drops here → reservation released
         }
         if prev >= max_conns * 3 / 4 {
             tracing::warn!(
@@ -350,13 +353,14 @@ pub fn serve(
         // Cookie is `[u8; 32]` (Copy), each session gets its own copy so the
         // spawned closure satisfies `'static`.
         let session_cookie = cookie;
-        let conn_counter = Arc::clone(&active_conns);
-        let spawn_counter = Arc::clone(&active_conns);
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
+                // Hold the reservation + session count for the whole session;
+                // their `Drop` releases on normal return OR panic unwind.
+                let _conn = conn_slot;
                 let _census = crate::thread_census::register("api_handler");
-                ACTIVE_API_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _session = SessionCount::enter(&ACTIVE_API_SESSIONS);
                 handle_session(
                     stream,
                     &reg,
@@ -367,12 +371,11 @@ pub fn serve(
                     ntf.as_deref(),
                     session_cookie,
                 );
-                ACTIVE_API_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             })
             .is_err()
         {
-            spawn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // Spawn failed: the closure (and the `conn_slot` it captured) is
+            // dropped, releasing the reservation — no manual decrement needed.
             tracing::warn!("failed to spawn API handler thread");
         }
         // Back to accept-blocking phase before the next iteration's
@@ -437,6 +440,59 @@ pub static LISTENER_PHASE: std::sync::atomic::AtomicU8 =
 /// in flight). Read by the periodic thread-dump handler.
 pub static ACTIVE_API_SESSIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII reservation of an `active_conns` slot. `reserve` performs the #680
+/// atomic `fetch_add` (reserve-then-check) and returns the prior count for the
+/// capacity gate; `Drop` performs the matching `fetch_sub`. The guard is held
+/// for the connection's whole lifetime (moved into the handler thread), so the
+/// slot is released on EVERY exit path — normal return, an over-capacity reject,
+/// a thread-spawn failure (the closure and its captured guard are dropped), and
+/// crucially a `handle_session` PANIC unwind. A previous bug released the slot
+/// with a manual `fetch_sub` placed AFTER `handle_session`, which the unwind
+/// skipped — leaked slots accumulated to `API_MAX_CONNS` and locked out the
+/// control plane (bug-audit Rank1).
+struct ConnSlot {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConnSlot {
+    /// Reserve a slot (atomic `fetch_add`); returns the guard + the prior count.
+    fn reserve(counter: &Arc<std::sync::atomic::AtomicUsize>) -> (Self, usize) {
+        let prev = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (
+            Self {
+                counter: Arc::clone(counter),
+            },
+            prev,
+        )
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// RAII counter for in-flight `handle_session` threads (the #941
+/// `ACTIVE_API_SESSIONS` observability surrogate): `enter` does `fetch_add`,
+/// `Drop` does `fetch_sub`, so a `handle_session` panic unwind decrements it
+/// instead of leaking the count.
+struct SessionCount(&'static std::sync::atomic::AtomicUsize);
+
+impl SessionCount {
+    fn enter(counter: &'static std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for SessionCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn handle_session(
@@ -2019,6 +2075,50 @@ mod tests {
             1,
             "api::call must resolve the active run dir exactly ONCE (port + cookie \
              from the same dir)"
+        );
+    }
+
+    /// bug-audit Rank1 regression: a `handle_session` PANIC must NOT leak the
+    /// `active_conns` reservation. Pre-fix the manual `fetch_sub` sat AFTER
+    /// `handle_session`, so an unwind skipped it and leaked the slot (leaks
+    /// accumulate to `API_MAX_CONNS` → control-plane lockup). The `ConnSlot`
+    /// `Drop` releases the slot on the unwind path, returning the count to
+    /// baseline.
+    #[test]
+    fn conn_slot_releases_reservation_on_panic_unwind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_slot, prev) = ConnSlot::reserve(&counter);
+            assert_eq!(prev, 0, "first reservation sees prev=0");
+            assert_eq!(counter.load(Ordering::SeqCst), 1, "slot reserved");
+            panic!("simulated handle_session panic");
+        }));
+        assert!(result.is_err(), "panic must propagate out of catch_unwind");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "ConnSlot::drop must release the slot on panic unwind (no leak)"
+        );
+    }
+
+    /// bug-audit Rank1 regression (sibling counter): a `handle_session` panic
+    /// must also decrement the in-flight session count via `SessionCount::drop`
+    /// instead of leaking it.
+    #[test]
+    fn session_count_decrements_on_panic_unwind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TEST_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _session = SessionCount::enter(&TEST_SESSIONS);
+            assert_eq!(TEST_SESSIONS.load(Ordering::Relaxed), 1, "session entered");
+            panic!("simulated handle_session panic");
+        }));
+        assert!(result.is_err(), "panic must propagate");
+        assert_eq!(
+            TEST_SESSIONS.load(Ordering::Relaxed),
+            0,
+            "SessionCount::drop must decrement on panic unwind"
         );
     }
 }
