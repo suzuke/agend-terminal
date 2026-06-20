@@ -4746,7 +4746,8 @@ the agent kept going after the throttle\n";
 fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
     // Throttle phrase present, classifier landed on Ready (the in-the-wild
     // miss — e.g. anchor suppressed it / wording drifted) → capture.
-    let captured = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[]);
+    let tail = recent_screen_tail(THROTTLE_SCREEN, HARD_WRAP_TAIL_LINES);
+    let captured = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[], &tail);
     let (tail, wrap_split) =
         captured.expect("throttle phrase + non-retryable state must be captured");
     assert!(
@@ -4768,7 +4769,8 @@ fn unclassified_throttle_captures_hard_wrapped_phrase_with_wrap_split_flag() {
     // Phrase split across rows by `\n` the way an app word-wrap emits it — NOT
     // contiguous, so the old `contains` check missed it entirely.
     let screen = "⏺ API Error:\ntemporarily limiting\nrequests (not your\nusage limit)\n";
-    let captured = unclassified_throttle_tail(AgentState::Idle, screen, &[]);
+    let tail = recent_screen_tail(screen, HARD_WRAP_TAIL_LINES);
+    let captured = unclassified_throttle_tail(AgentState::Idle, screen, &[], &tail);
     let (_tail, wrap_split) =
         captured.expect("a hard-`\\n`-wrapped throttle phrase must still be captured (#1808)");
     assert!(
@@ -4787,8 +4789,9 @@ fn unclassified_throttle_skipped_when_classified_serverratelimit() {
         AgentState::ApiError,
         AgentState::ContextFull,
     ] {
+        let tail = recent_screen_tail(THROTTLE_SCREEN, HARD_WRAP_TAIL_LINES);
         assert!(
-            unclassified_throttle_tail(state, THROTTLE_SCREEN, &[]).is_none(),
+            unclassified_throttle_tail(state, THROTTLE_SCREEN, &[], &tail).is_none(),
             "classified retryable state {state:?} must NOT be side-logged"
         );
     }
@@ -4798,8 +4801,9 @@ fn unclassified_throttle_skipped_when_classified_serverratelimit() {
 fn unclassified_throttle_skipped_without_phrase() {
     // No known throttle phrase on screen → never logged, regardless of state.
     let screen = "claude ready\n❯ awaiting input\n";
-    assert!(unclassified_throttle_tail(AgentState::Idle, screen, &[]).is_none());
-    assert!(unclassified_throttle_tail(AgentState::Thinking, screen, &[]).is_none());
+    let tail = recent_screen_tail(screen, HARD_WRAP_TAIL_LINES);
+    assert!(unclassified_throttle_tail(AgentState::Idle, screen, &[], &tail).is_none());
+    assert!(unclassified_throttle_tail(AgentState::Thinking, screen, &[], &tail).is_none());
 }
 
 #[test]
@@ -4811,8 +4815,9 @@ fn unclassified_throttle_skipped_when_phrase_only_in_scrollback() {
     for i in 0..(UNCLASSIFIED_TAIL_LINES + 5) {
         screen.push_str(&format!("post-recovery output line {i}\n"));
     }
+    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
     assert!(
-        unclassified_throttle_tail(AgentState::Idle, &screen, &[]).is_none(),
+        unclassified_throttle_tail(AgentState::Idle, &screen, &[], &tail).is_none(),
         "a throttle phrase only surviving in scrollback must NOT be logged"
     );
 }
@@ -5517,7 +5522,9 @@ fn turn_sentinel_capture_never_touches_state() {
     let mut t = StateTracker::new(Some(&Backend::OpenCode));
     t.set_instance_name("zb-agent");
     t.current = AgentState::Thinking;
-    t.capture_turn_sentinel_shadow(&format!("done\n{token}"));
+    let screen = format!("done\n{token}");
+    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
+    t.capture_turn_sentinel_shadow(&screen, &tail);
     assert_eq!(
         t.current,
         AgentState::Thinking,
@@ -5556,8 +5563,8 @@ fn changed_frames_with_sentinel_shadow_off_bound_tail_scans() {
     }
 
     assert_eq!(
-        tail_scans, 5,
-        "changed-frame post-classify probes should share one recent tail and skip sentinel tail work when shadow is off"
+        tail_scans, 10,
+        "changed-frame post-classify probes should share one recent tail; this fixture also pays one classifier tail per frame"
     );
 }
 
@@ -5585,7 +5592,9 @@ fn turn_sentinel_shadow_logs_record_when_on_without_changing_state() {
     // Zero-behaviour even with the flag ON: a direct re-capture must not move
     // the state (the heuristic owns `current`, the sentinel only side-logs).
     t.current = AgentState::Thinking;
-    t.capture_turn_sentinel_shadow(&format!("again\n{token}"));
+    let screen = format!("again\n{token}");
+    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
+    t.capture_turn_sentinel_shadow(&screen, &tail);
     let with_state = t.current;
 
     let log = home.join("turn_sentinel_shadow.jsonl");

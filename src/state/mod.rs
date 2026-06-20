@@ -446,6 +446,12 @@ fn recent_screen_tail(screen_text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+fn tail_recent_lines(tail: &str, n: usize) -> String {
+    let lines: Vec<&str> = tail.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 #[cfg(test)]
 static RECENT_SCREEN_TAIL_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -933,6 +939,7 @@ fn unclassified_throttle_tail(
     current: AgentState,
     screen_text: &str,
     fg: &[CellFg],
+    tail: &str,
 ) -> Option<(String, bool)> {
     // Fast reject (no allocation on the common path): no known throttle phrase
     // contiguously on screen. #1808 — the original `contains`-only check was
@@ -963,7 +970,7 @@ fn unclassified_throttle_tail(
     // Require the phrase in the LIVE bottom-N tail — a copy that only survives
     // in scrolled-up scrollback is stale, not a current miss. Check the
     // flattened tail too so a wrapped live error still qualifies.
-    let tail = recent_screen_tail(screen_text.trim_end(), UNCLASSIFIED_TAIL_LINES);
+    let tail = tail_recent_lines(tail, UNCLASSIFIED_TAIL_LINES);
     let tail_flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
     if !tail.contains(phrase) && !tail_flat.contains(phrase) {
         return None;
@@ -1641,18 +1648,19 @@ impl StateTracker {
         // on a retryable state, side-log the colored tail so the in-the-wild
         // miss can be diagnosed. Zero behavior change (runs AFTER classify,
         // never touches `self.current`/retry).
-        self.capture_unclassified_throttle(screen_text, fg);
+        let recent_tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
+        self.capture_unclassified_throttle(screen_text, fg, &recent_tail);
 
         // #1523 Phase 0: in-band turn-completion sentinel shadow telemetry.
         // Default-OFF (flag-gated); when on, side-logs this agent's token sighting
         // for measurement. Runs AFTER classify, never touches `self.current`.
-        self.capture_turn_sentinel_shadow(screen_text);
+        self.capture_turn_sentinel_shadow(screen_text, &recent_tail);
 
         // Instrumentation 2 — Sprint 27 shadow-mode behavioral telemetry.
         self.record_shadow_telemetry(silence_since_last_feed);
 
         // F9 (#685 sub-task 4): productive-output detection (zero behavior).
-        self.detect_productive_output(screen_text);
+        self.detect_productive_output(&recent_tail);
     }
 
     /// Gate 1 — hash-dedup. Returns `true` when this frame is a duplicate
@@ -1728,13 +1736,13 @@ impl StateTracker {
     /// `last_productive_output` re-fired despite no new productive evidence.
     /// Hashing the matched substring directly captures evidence identity, not
     /// surrounding-context noise.
-    fn detect_productive_output(&mut self, screen_text: &str) {
+    fn detect_productive_output(&mut self, recent_tail: &str) {
         if let Some(ref pconfig) = self.productivity_config {
             let heartbeat_age = self
                 .last_heartbeat
                 .map(|t| t.elapsed())
                 .unwrap_or_else(|| Duration::from_secs(u32::MAX as u64));
-            let recent_tail = recent_screen_tail(screen_text, MARKER_SCAN_TAIL_LINES);
+            let recent_tail = tail_recent_lines(recent_tail, MARKER_SCAN_TAIL_LINES);
             let (signal, matched_substr) = crate::behavioral::infer_productivity_with_match(
                 pconfig,
                 &recent_tail,
@@ -2360,9 +2368,9 @@ impl StateTracker {
     ///   no throttle phrase is present, which is the overwhelming common case.
     /// - **Low-noise** — fires only on phrase-present + classified-non-retryable
     ///   + phrase-in-live-tail (a scrolled-up scrollback echo is ignored).
-    fn capture_unclassified_throttle(&mut self, screen_text: &str, fg: &[CellFg]) {
+    fn capture_unclassified_throttle(&mut self, screen_text: &str, fg: &[CellFg], tail: &str) {
         let Some((raw_tail, wrap_split)) =
-            unclassified_throttle_tail(self.current, screen_text, fg)
+            unclassified_throttle_tail(self.current, screen_text, fg, tail)
         else {
             // Left the throttle-miss shape — drop the latch so a later recurrence
             // of the same screen logs once again (#2100/#2115).
@@ -2444,7 +2452,7 @@ impl StateTracker {
     /// - **Fire-once** — a static token-bearing frame logs once via the
     ///   `last_turn_sentinel_sig` latch (the feed-level hash-dedup already drops
     ///   unchanged frames; this guards token frames whose hash churns).
-    fn capture_turn_sentinel_shadow(&mut self, screen_text: &str) {
+    fn capture_turn_sentinel_shadow(&mut self, screen_text: &str, tail: &str) {
         if !turn_sentinel_shadow_enabled() || self.instance_name.is_empty() {
             return;
         }
@@ -2455,7 +2463,6 @@ impl StateTracker {
             return;
         }
         let token = turn_sentinel_token(&self.instance_name);
-        let tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
         let obs = observe_turn_sentinel(&tail, &token);
         if !obs.token_seen {
             // Some OTHER agent's token (or a malformed marker) is on screen — not
