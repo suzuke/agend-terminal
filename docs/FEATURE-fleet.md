@@ -102,7 +102,7 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 | Field | Type | Description |
 |-------|------|-------------|
 | `role` | string | Agent role description, free text (alias: `description`) |
-| `role_kind` | enum | **Optional, opt-in.** Typed role selector that trims the MCP tool surface this agent advertises (defense-in-depth, #2300). One of `reviewer` / `planner` / `explorer` (read/report — drops instance/worktree lifecycle + orchestration tools) or `orchestrator` / `implementer` / `utility` / `proxy` (full surface). **Absent → all tools** (no existing fleet changes). Distinct from the free-text `role` above; an unknown value fails fleet load. |
+| `role_kind` | enum | **Optional, opt-in.** Typed role selector that trims the MCP tool surface this agent advertises (defense-in-depth, #2300). One of `reviewer` / `planner` / `explorer` (read/report — drops instance/worktree lifecycle + orchestration tools) or `orchestrator` / `implementer` / `utility` / `proxy` (full surface). **Absent → all tools** (no existing fleet changes). Distinct from the free-text `role` above. Strict + fail-closed: an unknown value fails fleet load, and a malformed fleet never silently widens the advertised tool surface (#2367). |
 | `backend` | string | Override defaults backend |
 | `command` | string | Override defaults command |
 | `args` | [string] | Additional CLI arguments (merged with defaults) |

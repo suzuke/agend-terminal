@@ -68,6 +68,7 @@ instances:
 
   reviewer:
     role: "Code reviewer"
+    role_kind: reviewer   # 具型別的角色 → 裁切對外公告的 MCP 工具面（opt-in；詳見下方）
     backend: kiro-cli
     working_directory: ~/Projects/my-app
     source_repo: ~/Projects/my-app
@@ -104,7 +105,8 @@ teams:
 
 | 欄位 | 型別 | 說明 |
 |------|------|------|
-| `role` | string | Agent 的角色描述（別名：`description`） |
+| `role` | string | Agent 的角色描述，自由文字（別名：`description`） |
+| `role_kind` | enum | **選用、opt-in。** 具型別的角色選擇器，用來裁切此 agent 對外公告的 MCP 工具面（縱深防禦，#2300）。可為 `reviewer` / `planner` / `explorer`（讀取/回報類——移除 instance/worktree 生命週期與協調類工具）或 `orchestrator` / `implementer` / `utility` / `proxy`（完整工具面）。**未設定 → 全部工具**（不更動既有 fleet 行為）。與上方自由文字的 `role` 不同。strict 且 fail-closed：未知值會使 fleet 載入失敗，格式錯誤的 fleet 也絕不會悄悄放寬對外公告的工具面（#2367）。 |
 | `backend` | string | 覆蓋 defaults 的 backend |
 | `command` | string | 覆蓋 defaults 的命令 |
 | `args` | [string] | 附加的 CLI 參數（與 defaults 合併） |
