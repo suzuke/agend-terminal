@@ -40,6 +40,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("daemon.", "daemon.<date>.log — tracing legitimately names the deleted instance"),
     ("event-log.jsonl", "append-only audit trail — create/delete events name the instance by design"),
     ("task_events.jsonl", "append-only task-event log — owner/assignee history named by design"),
+    // #t-…34628-8 RCA: same append-only-audit class as event-log.jsonl. Written by
+    // the agend-git shim (src/bin/agend-git.rs — #2158 bypass-audit / #2234 cwd-drift)
+    // whenever a daemon git op runs through the shim (git_helpers.rs::git_cmd sets
+    // AGEND_GIT_BYPASS=1). Home-level forensic trail that names instances by design →
+    // teardown must NOT scrub it (would corrupt the audit chain). Only created when
+    // PATH `git` is the operator's shim (local dev machine); CI's real /usr/bin/git
+    // never writes it — which is why this entry was missing yet CI stayed green while
+    // two devs hit a local red. (The test inherits the operator git binary, i.e. is
+    // not fully hermetic w.r.t. `git`; forcing real git in the harness is an optional
+    // future hardening, intentionally NOT done here — A2/KISS.)
+    ("fleet_events.jsonl", "append-only agend-git shim forensic audit (#2158/#2234) — home-level, names instances by design; same class as event-log.jsonl, teardown must not scrub"),
     // ── intentional retention (audit-confirmed; see #1907 spike) ──
     ("schedules.json", "INTENTIONAL: orphan-disabled, never deleted — operator may re-target a cron"),
     ("tasks.json", "INTENTIONAL: owner cleared but the task row is kept for surviving agents"),
