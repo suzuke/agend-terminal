@@ -480,6 +480,7 @@ mod deleted_gate_tests_1913 {
             backend_command: "true".to_string(),
             pty_writer,
             pty_master,
+            published_state: crate::agent::published_state_of(&core),
             core,
             child: Arc::new(Mutex::new(child)),
             submit_key: "\r".to_string(),

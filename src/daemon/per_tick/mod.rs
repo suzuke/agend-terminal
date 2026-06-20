@@ -303,6 +303,7 @@ pub(crate) fn mock_live_agent_no_context(
         backend_command: "claude".to_string(),
         pty_writer,
         pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
+        published_state: crate::agent::published_state_of(&core),
         core,
         child: Arc::new(parking_lot::Mutex::new(child)),
         submit_key: "\r".to_string(),

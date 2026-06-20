@@ -41,6 +41,12 @@ pub struct AgentHandle {
     pub(crate) pty_writer: PtyWriter,
     pub(crate) pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub(crate) core: Arc<CoreMutex<AgentCore>>,
+    /// Lock-free clone of the core's published `AgentState` mirror
+    /// (`StateTracker::published_handle`). Lets `render::build_agent_state_snapshot`
+    /// read this agent's state WITHOUT `core.lock()`, so the per-frame TUI snapshot
+    /// stops contending with the PTY-feed producer that holds the core lock under
+    /// the boot output flood. Aliases the same `AtomicU8` `record_set` writes.
+    pub(crate) published_state: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     pub(crate) submit_key: String,
     pub(crate) inject_prefix: String,
@@ -49,6 +55,17 @@ pub struct AgentHandle {
     pub(crate) spawned_at_epoch_ms: u64,
     /// Set by DELETE handler to prevent reaper from spawning shell fallback.
     pub(crate) deleted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Clone an agent's lock-free published-`AgentState` handle from its core, so an
+/// `AgentHandle` and the core's `StateTracker` share ONE `AtomicU8` (the render
+/// snapshot reads it without `core.lock()`). A free fn — not an inline
+/// `core.lock()…` in the struct literal — so the transient `CoreGuard` is dropped
+/// on return, before the literal moves `core`.
+pub(crate) fn published_state_of(
+    core: &Arc<CoreMutex<AgentCore>>,
+) -> Arc<std::sync::atomic::AtomicU8> {
+    core.lock().state.published_handle()
 }
 
 // #1441: keyed by stable InstanceId (UUID), NOT name. Live-process identity
@@ -1206,6 +1223,7 @@ pub fn spawn_agent(
                 backend_command: backend_command.to_string(),
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
+                published_state: published_state_of(&core),
                 core: Arc::clone(&core),
                 child: Arc::clone(&child_arc),
                 submit_key: submit_key.to_string(),
@@ -2651,6 +2669,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         state: StateTracker::new(None),
         health: HealthTracker::new(),
     }));
+    let published_state = core.lock().state.published_handle();
     AgentHandle {
         id,
         name: name.to_string().into(),
@@ -2658,6 +2677,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         pty_writer,
         pty_master,
         core,
+        published_state,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),

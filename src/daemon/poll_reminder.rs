@@ -262,13 +262,19 @@ mod tests {
             state: st,
             health: crate::health::HealthTracker::new(),
         };
+        let core = Arc::new(crate::sync_audit::CoreMutex::new(core));
+        let published_state = core.lock().state.published_handle();
+        // `st.current` was set directly (bypasses record_set), so sync the
+        // lock-free mirror to match.
+        published_state.store(state as u8, std::sync::atomic::Ordering::Relaxed);
         let handle = AgentHandle {
             id: crate::types::InstanceId::default(),
             name: name.to_string().into(),
             backend_command: "test".to_string(),
             pty_writer: Arc::new(Mutex::new(writer)),
             pty_master: Arc::new(Mutex::new(pair.master)),
-            core: Arc::new(crate::sync_audit::CoreMutex::new(core)),
+            core,
+            published_state,
             child: Arc::new(Mutex::new(child)),
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),

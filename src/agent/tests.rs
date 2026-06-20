@@ -384,6 +384,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         backend_command: "sh".to_string(),
         pty_writer,
         pty_master,
+        published_state: crate::agent::published_state_of(&core),
         core,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),
@@ -977,18 +978,21 @@ fn write_to_agent_typed_uses_timeout() {
         let mut guard = write_in_progress_set().lock();
         guard.insert(key);
     }
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+    }));
+    let published_state = core.lock().state.published_handle();
     let handle = AgentHandle {
         id: crate::types::InstanceId::default(),
         name: "typed-test".into(),
         backend_command: "test".to_string(),
         pty_writer: writer,
         pty_master: Arc::new(Mutex::new(pair.master)),
-        core: Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
-            vterm: VTerm::new(80, 24),
-            subscribers: Vec::new(),
-            state: StateTracker::new(None),
-            health: HealthTracker::new(),
-        })),
+        core,
+        published_state,
         child: Arc::new(Mutex::new(
             pair.slave
                 .spawn_command(portable_pty::CommandBuilder::new("true"))
@@ -1725,6 +1729,7 @@ fn pty_read_error_triggers_cleanup() {
                     .unwrap()
                     .master,
             )),
+            published_state: crate::agent::published_state_of(&core),
             core: Arc::clone(&core),
             child: Arc::new(Mutex::new(
                 portable_pty::native_pty_system()
@@ -1853,6 +1858,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
                 .unwrap()
                 .master,
         )),
+        published_state: crate::agent::published_state_of(&core),
         core,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),
@@ -2189,6 +2195,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         backend_command: "true".to_string(),
         pty_writer,
         pty_master,
+        published_state: crate::agent::published_state_of(&core),
         core,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),

@@ -67,8 +67,19 @@ fn build_agent_state_snapshot(
                     snapshot
                         .entry(pane.agent_name.to_string())
                         .or_insert_with(|| {
+                            // Read the lock-free published mirror — NO core.lock().
+                            // Under the boot PTY flood the per-agent core lock is
+                            // held 2–6 ms by each `pty_read_loop` feed; taking it
+                            // here (once per pane, every frame) made the render
+                            // snapshot wait up to ~10 ms and starved input. The
+                            // AtomicU8 is written in lockstep by `record_set`.
                             reg.get(&pane.instance_id)
-                                .map(|h| h.core.lock().state.get_state())
+                                .map(|h| {
+                                    AgentState::from_u8(
+                                        h.published_state
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                    )
+                                })
                                 .unwrap_or(AgentState::Idle)
                         });
                 }
@@ -1164,5 +1175,74 @@ mod tests {
         // separate concern. This test documents the protocol for future
         // wiring; runs only with `cargo test -- --ignored` against a daemon
         // spun up with the env set.
+    }
+
+    /// Regression for the post-#2346 residual freeze: the per-frame render state
+    /// snapshot must read each agent's state via the lock-free published mirror,
+    /// NOT `core.lock()`. Under the boot PTY flood the core lock is held multi-ms
+    /// by each `pty_read_loop` feed; when the snapshot took it, the render loop
+    /// (and thus input) stalled up to ~10 ms/frame. Here we hold an agent's core
+    /// lock on a background thread and assert the snapshot still returns promptly
+    /// AND with the correct published state. If `build_agent_state_snapshot` ever
+    /// reverts to `core.lock().state.get_state()`, this blocks ~200 ms and fails.
+    #[test]
+    fn snapshot_reads_published_state_without_core_lock() {
+        let id = crate::types::InstanceId::default();
+        let handle = crate::agent::mk_test_handle("agent", id);
+        // Drive a real transition through record_set so the published mirror moves
+        // off its initial value.
+        handle.core.lock().state.set_restarting();
+        let core = std::sync::Arc::clone(&handle.core);
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+                (id, handle),
+            ])));
+
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: id,
+            vterm: VTerm::new(38, 11),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: Some(crate::backend::Backend::ClaudeCode),
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
+
+        // Hold the agent's core lock on a background thread; signal once held so
+        // the timing assertion is deterministic (no sleep-race).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _g = core.lock();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        rx.recv().unwrap(); // core lock is now held
+
+        let t0 = std::time::Instant::now();
+        let snap = build_agent_state_snapshot(&layout, &registry);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            snap.get("agent"),
+            Some(&AgentState::Restarting),
+            "snapshot must report the published state"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "snapshot blocked {elapsed:?} on a held core.lock — it must read the \
+             lock-free published mirror, not take core.lock()"
+        );
+        holder.join().unwrap();
     }
 }

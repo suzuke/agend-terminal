@@ -17,12 +17,22 @@
 use crate::backend::Backend;
 use serde::Serialize;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Agent runtime state, ordered by priority (highest last).
+///
+/// `#[repr(u8)]`: the discriminant (declaration order, `Starting = 0` …
+/// `Restarting = 17`) is mirrored into a lock-free `AtomicU8` so the TUI render
+/// snapshot can read agent state WITHOUT taking `core.lock()` (see
+/// [`StateTracker::published_handle`] + `render::build_agent_state_snapshot`).
+/// [`AgentState::from_u8`] is the inverse; a roundtrip unit test pins them so a
+/// future variant reorder/addition can't silently desync the mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
+#[repr(u8)]
 pub enum AgentState {
     Starting,
     Hang,
@@ -73,6 +83,35 @@ pub enum AgentState {
 }
 
 impl AgentState {
+    /// Inverse of the `#[repr(u8)]` discriminant: reconstruct the state from the
+    /// byte published into the lock-free `AtomicU8` mirror. Unknown bytes (never
+    /// produced in-process; the writer always stores a real discriminant) fall
+    /// back to `Idle` — a benign default for the render snapshot. Kept in lockstep
+    /// with the enum's declaration order by `agentstate_u8_roundtrip`.
+    pub fn from_u8(v: u8) -> AgentState {
+        match v {
+            0 => Self::Starting,
+            1 => Self::Hang,
+            2 => Self::AwaitingOperator,
+            3 => Self::Idle,
+            4 => Self::ToolUse,
+            5 => Self::Thinking,
+            6 => Self::InteractivePrompt,
+            7 => Self::PermissionPrompt,
+            8 => Self::GitConflict,
+            9 => Self::ContextFull,
+            10 => Self::RateLimit,
+            11 => Self::ServerRateLimit,
+            12 => Self::UsageLimit,
+            13 => Self::AuthError,
+            14 => Self::ApiError,
+            15 => Self::ModelUnsupported,
+            16 => Self::Crashed,
+            17 => Self::Restarting,
+            _ => Self::Idle,
+        }
+    }
+
     /// GO-NARROW 6 states that trigger orchestrator notify on transition.
     /// Per Sprint 43 §13 #1 operator decision.
     pub fn is_notify_error_class(self) -> bool {
@@ -185,6 +224,15 @@ pub struct RecoveryEpisode {
 
 pub struct StateTracker {
     pub current: AgentState,
+    /// Lock-free mirror of `current` for the TUI render snapshot. Written ONLY by
+    /// [`StateTracker::record_set`] — the single funnel for every `current`
+    /// mutation — so it can never drift from `current` on the production path.
+    /// Read lock-free (no `core.lock()`) via [`StateTracker::published_handle`] in
+    /// `render::build_agent_state_snapshot`, eliminating the producer/consumer
+    /// core-lock contention that froze input under the boot PTY flood. Relaxed
+    /// ordering is sufficient: it carries no other memory, and the render path
+    /// already tolerates ≤1-frame staleness (it re-snapshots every draw).
+    published: Arc<AtomicU8>,
     pub(crate) since: Instant,
     pub last_output: Instant,
     /// F9 (#685 sub-task 4): `Some(t)` only when `infer_productivity()` returned
@@ -1239,6 +1287,9 @@ impl StateTracker {
         };
         Self {
             current: initial_state,
+            // Seed the lock-free mirror with the same initial state (record_set
+            // keeps it in lockstep thereafter).
+            published: Arc::new(AtomicU8::new(initial_state as u8)),
             since: Instant::now(),
             last_output: Instant::now(),
             last_productive_output: None,
@@ -2596,6 +2647,15 @@ impl StateTracker {
         self.current
     }
 
+    /// Clone the lock-free published-state handle. Holders read the agent's
+    /// current [`AgentState`] via `from_u8(handle.load(Relaxed))` WITHOUT taking
+    /// `core.lock()`. Used by the TUI render snapshot to stop contending with the
+    /// PTY-feed producer on the core lock. The returned `Arc` aliases the same
+    /// atomic `record_set` writes, so reads always observe the latest transition.
+    pub fn published_handle(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.published)
+    }
+
     /// Time since the agent last produced PRODUCTIVE output, for the silence-based
     /// readers (`check_hang` `silent_productive`, the recovery dispatcher, the
     /// snapshot `silent_secs`). When the agent has not produced yet
@@ -2706,6 +2766,11 @@ impl StateTracker {
             self.blocked_notice_sent = false;
         }
         self.current = new_state;
+        // Mirror into the lock-free published handle in the SAME funnel, so the
+        // render snapshot (which reads it without core.lock) can never lag a
+        // committed transition. Relaxed: standalone value, no other memory to
+        // synchronize; the writer here always holds core.lock.
+        self.published.store(new_state as u8, Ordering::Relaxed);
         self.since = Instant::now();
     }
 

@@ -5847,3 +5847,68 @@ fn lazy_fg_rebuilds_and_redetects_static_throttle_pane() {
         "#perf-R1: the throttle-hint re-detect override still rebuilds the fg mask"
     );
 }
+
+// ── #freeze fix: lock-free published AgentState mirror ─────────────────────
+
+/// Pin the `#[repr(u8)]` discriminant ↔ `from_u8` mapping for EVERY variant so a
+/// future variant reorder/addition can't silently desync the lock-free render
+/// mirror (the render snapshot decodes the published byte via `from_u8`).
+#[test]
+fn agentstate_u8_roundtrip() {
+    let all = [
+        AgentState::Starting,
+        AgentState::Hang,
+        AgentState::AwaitingOperator,
+        AgentState::Idle,
+        AgentState::ToolUse,
+        AgentState::Thinking,
+        AgentState::InteractivePrompt,
+        AgentState::PermissionPrompt,
+        AgentState::GitConflict,
+        AgentState::ContextFull,
+        AgentState::RateLimit,
+        AgentState::ServerRateLimit,
+        AgentState::UsageLimit,
+        AgentState::AuthError,
+        AgentState::ApiError,
+        AgentState::ModelUnsupported,
+        AgentState::Crashed,
+        AgentState::Restarting,
+    ];
+    for (i, s) in all.iter().enumerate() {
+        assert_eq!(
+            *s as u8, i as u8,
+            "{s:?} discriminant drifted from declaration order — update from_u8 + this list"
+        );
+        assert_eq!(
+            AgentState::from_u8(*s as u8),
+            *s,
+            "from_u8 roundtrip failed for {s:?}"
+        );
+    }
+    // Unknown byte → benign Idle fallback (never produced by the in-process writer).
+    assert_eq!(AgentState::from_u8(200), AgentState::Idle);
+}
+
+/// The lock-free published mirror must equal `current` at construction and after
+/// every transition driven through `record_set` (the single funnel) — this is the
+/// invariant the render snapshot relies on to read state without `core.lock()`.
+#[test]
+fn published_mirror_tracks_current_through_record_set() {
+    use std::sync::atomic::Ordering;
+    let mut t = StateTracker::new(None); // initial Idle
+    let published = t.published_handle();
+    assert_eq!(
+        AgentState::from_u8(published.load(Ordering::Relaxed)),
+        t.get_state(),
+        "mirror must match current at construction"
+    );
+    // set_restarting routes through record_set → mirror updates in lockstep.
+    t.set_restarting();
+    assert_eq!(t.get_state(), AgentState::Restarting);
+    assert_eq!(
+        published.load(Ordering::Relaxed),
+        AgentState::Restarting as u8,
+        "record_set must store the new discriminant into the published mirror"
+    );
+}
