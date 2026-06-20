@@ -236,22 +236,52 @@ fn handle_mcp_tool_inner(
 pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
     // #2344: subset off the typed `role_kind` (operator-declared), NOT the
     // free-text `role` description — the old exact-match against the prose role
-    // never hit, so every agent saw all 36 tools. `.ok()` here is a per-request
-    // best-effort read; a malformed `role_kind` is caught loudly at the
-    // authoritative fleet load (#2344 D2 strict), so this path only ever sees a
-    // valid (or absent) value.
-    let role_kind = params
+    // never hit, so every agent saw all 36 tools.
+    let inst = params
         .get("instance")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .and_then(|inst| {
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-                .ok()
-                .and_then(|fleet| fleet.instances.get(inst).and_then(|i| i.role_kind))
-        });
-    // Default-all-open hot path: no instance / undeclared role_kind → the canonical
-    // full surface (also keeps `tool_definitions` the single unfiltered builder
-    // the count-invariant pins). A role only narrows via the capability registry.
+        .filter(|s| !s.is_empty());
+    let role_kind = match inst {
+        // No instance (old bridge / non-agent caller) → default-all-open.
+        None => None,
+        Some(inst) => {
+            // #2344 (r6 #2367 reject + lead nuance): distinguish a MISSING fleet.yaml
+            // from a present-but-malformed one. The old `FleetConfig::load(..).ok()`
+            // collapsed BOTH to `None` → the full 36-tool surface, which let a typo'd
+            // `role_kind: supervisor` FAIL strict parse yet still advertise every tool
+            // — the D2 strict-deny hole r6 found.
+            let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
+            if !fleet_path.exists() {
+                // (1) No fleet.yaml at all — a common setup (dev / fresh / local
+                // shell). Stay ALL-OPEN; a blanket fail-closed would regress every
+                // no-fleet daemon.
+                None
+            } else {
+                match crate::fleet::FleetConfig::load(&fleet_path) {
+                    // (2) Present but FAILS to load (parse error / malformed
+                    // role_kind) → FAIL CLOSED. Surface the error loudly (operator
+                    // fixes the config); never silently advertise the full surface.
+                    Err(e) => {
+                        return json!({
+                            "ok": false,
+                            "error": format!(
+                                "tools/list: fleet.yaml is present but failed to load \
+                                 (refusing to advertise the full tool surface — fix the \
+                                 config): {e:#}"
+                            ),
+                        });
+                    }
+                    // (3) Loaded OK → the instance's role_kind. An unknown instance OR
+                    // an absent role_kind → all-open (the unchanged opt-in contract).
+                    Ok(fleet) => fleet.instances.get(inst).and_then(|i| i.role_kind),
+                }
+            }
+        }
+    };
+    // Default-all-open hot path: no instance / no fleet.yaml / undeclared role_kind
+    // → the canonical full surface (also keeps `tool_definitions` the single
+    // unfiltered builder the count-invariant pins). A role only narrows via the
+    // capability registry.
     let result = match role_kind {
         None => crate::mcp::tools::tool_definitions(),
         Some(rk) => crate::mcp::tools::tool_definitions_for_role(Some(rk)),
@@ -487,6 +517,96 @@ mod tests {
             .map(|a| a.len())
             .unwrap_or(0);
         assert_eq!(n_full, full, "no instance → all-open full surface");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn toollist_ctx_home(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("agend-mcp-toollist-{tag}-{}", std::process::id()))
+    }
+
+    /// #2344 D2 STRICT on the live bridge path (r6 #2367 reject): a fleet.yaml that
+    /// is PRESENT but malformed (e.g. an unknown `role_kind`) must FAIL CLOSED in
+    /// `handle_mcp_tools_list` — NOT silently fall back to the full 36-tool surface
+    /// (the old `.ok()` swallowed the parse error). Returns `ok: false` + an
+    /// explanatory error, no `result.tools`, and does not panic.
+    #[test]
+    fn tools_list_fails_closed_on_malformed_role_kind() {
+        let dir = toollist_ctx_home("bad");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("fleet.yaml"),
+            "instances:\n  bad:\n    role_kind: supervisor\n    command: claude\n",
+        )
+        .expect("write fleet.yaml");
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+        };
+
+        let resp = handle_mcp_tools_list(&json!({"instance": "bad"}), &ctx);
+        assert_eq!(
+            resp["ok"], false,
+            "present-but-malformed fleet.yaml must fail closed, got: {resp}"
+        );
+        let err = resp["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("supervisor") || err.contains("role_kind") || err.contains("fleet"),
+            "error must explain the failure (bad value / role_kind / fleet), got: {err}"
+        );
+        assert!(
+            resp.get("result").and_then(|r| r.get("tools")).is_none(),
+            "fail-closed must NOT return a full tool list, got: {resp}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2344 (lead nuance): a MISSING fleet.yaml must stay ALL-OPEN — a no-fleet
+    /// daemon (dev / fresh / local-shell setups) must NOT be fail-closed just
+    /// because an instance name is passed. Only a PRESENT-but-malformed fleet.yaml
+    /// fails closed (above); absence is not an error.
+    #[test]
+    fn tools_list_all_open_when_no_fleet_yaml() {
+        let dir = toollist_ctx_home("nofleet");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Deliberately NO fleet.yaml written.
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+        };
+
+        let full = crate::mcp::tools::tool_definitions()["tools"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let resp = handle_mcp_tools_list(&json!({"instance": "anyone"}), &ctx);
+        assert_eq!(
+            resp["ok"], true,
+            "no fleet.yaml must NOT fail closed, got: {resp}"
+        );
+        let n = resp["result"]["tools"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            n, full,
+            "no fleet.yaml → all-open full surface (no-fleet setups not regressed)"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
