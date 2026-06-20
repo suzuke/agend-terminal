@@ -5533,6 +5533,35 @@ fn turn_sentinel_capture_never_touches_state() {
 static SENTINEL_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn changed_frames_with_sentinel_shadow_off_bound_tail_scans() {
+    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
+    std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW");
+
+    let mut t = StateTracker::new(Some(&Backend::OpenCode));
+    t.set_instance_name("scan-bound-agent");
+
+    reset_recent_screen_tail_call_count();
+    for n in 0..5 {
+        t.feed(&format!(
+            "  ┃\n  ┃  Build · DeepSeek V4 Pro OpenCode Go\n\nchanged {n}\ntemporarily limiting requests\nAsk anything"
+        ));
+    }
+    let tail_scans = recent_screen_tail_call_count();
+
+    match prev_flag {
+        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
+        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
+    }
+
+    assert_eq!(
+        tail_scans, 5,
+        "changed-frame post-classify probes should share one recent tail and skip sentinel tail work when shadow is off"
+    );
+}
+
+#[test]
 fn turn_sentinel_shadow_logs_record_when_on_without_changing_state() {
     // Serialize the process-global env flips; restore on the way out so a panic
     // can't leak them to other tests (mirrors the MED-5 convention).

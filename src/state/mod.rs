@@ -439,9 +439,25 @@ const ERROR_TAIL_SCAN_LINES: usize = 15;
 const HARD_WRAP_TAIL_LINES: usize = 40;
 
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
+    #[cfg(test)]
+    RECENT_SCREEN_TAIL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let lines: Vec<&str> = screen_text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+#[cfg(test)]
+static RECENT_SCREEN_TAIL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_recent_screen_tail_call_count() {
+    RECENT_SCREEN_TAIL_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn recent_screen_tail_call_count() -> usize {
+    RECENT_SCREEN_TAIL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Context% telemetry: rows scanned from the bottom of the screen for the
