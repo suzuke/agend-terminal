@@ -1207,6 +1207,18 @@ pub fn reclaim_stale_delivering(home: &Path) {
         for id in &reverted_ids {
             crate::daemon::notification_dedup::global().forget(&agent_name, id);
         }
+        // #t-98760-9 (#2299 regression): also reset this agent's poll-reminder
+        // count-dedup. The loop above clears the per-MESSAGE inject dedup, but the
+        // poll-reminder ledger keys on the unread COUNT and still holds the
+        // pre-drain N. Reverting back to N then reads as "no change" and the
+        // idle-agent nudge is withheld until the next count change or the 10-min
+        // reclaim TTL — defeating reclaim's "no silent message loss" promise.
+        // Recording 0 on a 0-count poll pass would not suffice (a pass may never
+        // observe the count==0 window between drain and reclaim); re-arming here
+        // is deterministic.
+        if !reverted_ids.is_empty() {
+            crate::daemon::poll_reminder::remove_agent(&agent_name);
+        }
     }
 }
 

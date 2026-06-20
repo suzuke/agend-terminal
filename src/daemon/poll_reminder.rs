@@ -213,6 +213,31 @@ mod tests {
         }
     }
 
+    /// Seed `count` STALE `delivering` rows (read_at None, delivering_at older
+    /// than `RECLAIM_TTL_SECS`) directly into the agent's name-based inbox file,
+    /// so `reclaim_stale_delivering` reverts them back to unread. Distinct from
+    /// `seed_unread` (which seeds plain unread rows reclaim would not touch).
+    fn seed_stale_delivering(home: &Path, agent: &str, count: usize) {
+        let inbox_dir = home.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).expect("mkdir inbox");
+        let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let mut content = String::new();
+        for i in 0..count {
+            let msg = crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some(format!("m-{agent}-{i}")),
+                from: "test".into(),
+                text: format!("msg {i}"),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                delivering_at: Some(stale.clone()), // delivered, unconfirmed, stale
+                ..Default::default()                // read_at = None
+            };
+            content.push_str(&serde_json::to_string(&msg).expect("serialize"));
+            content.push('\n');
+        }
+        std::fs::write(inbox_dir.join(format!("{agent}.jsonl")), content).expect("write inbox");
+    }
+
     fn mock_registry(name: &str, state: AgentState) -> AgentRegistry {
         use portable_pty::{CommandBuilder, PtySize};
         let pty_system = native_pty_system();
@@ -326,6 +351,55 @@ mod tests {
             v2[0].1
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-98760-9 (#2299 regression, production-path): a dead turn's stale
+    /// `delivering` rows reclaimed back to unread must RE-PAGE the idle agent —
+    /// even when the restored unread count equals the count the poll-reminder last
+    /// notified at. Bug: draining to `delivering` left `LAST_NOTIFIED` at N (the
+    /// `count==0` path never records 0), so reverting back to N read as "no change"
+    /// and the nudge was withheld until the 10-min reclaim TTL. NOTE: no poll pass
+    /// observes the `count==0` window here (drain→reclaim between passes — the real
+    /// scenario), so this is fixed only by `reclaim_stale_delivering` actively
+    /// clearing the agent's poll-reminder dedup, NOT by recording 0 on a 0-count pass.
+    #[test]
+    fn reclaim_rearms_poll_reminder_even_when_restored_count_equals_last_notified() {
+        let home = tmp_home("reclaim-rearm");
+        let agent = "reclaim-rearm-agent";
+        let registry = mock_registry(agent, AgentState::Idle);
+
+        // Prior state: the poll-reminder last notified this agent at count 3.
+        reset_dedup(agent);
+        assert!(
+            should_notify_and_record(agent, 3),
+            "seed: record last-notified count = 3"
+        );
+
+        // A dead turn's 3 messages are now stale `delivering` (drained, never
+        // acked). Unread count is 0; no poll pass runs in this window, so the
+        // ledger stays at 3 — the production bug scenario.
+        seed_stale_delivering(&home, agent, 3);
+
+        // Reclaim reverts the stale delivering rows back to unread (count → 3).
+        crate::inbox::storage::reclaim_stale_delivering(&home);
+
+        // Restored count (3) EQUALS the last-notified count (3). Pre-fix this was
+        // deduped to nothing; the fix re-arms the reminder on reclaim → re-page.
+        let v = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            v.len(),
+            1,
+            "reclaim must re-arm the poll-reminder even when restored count == last notified"
+        );
+        assert_eq!(v[0].0, agent);
+        assert!(
+            v[0].1.contains("unread=3"),
+            "reminder reflects the restored count, got: {}",
+            v[0].1
+        );
+
+        reset_dedup(agent);
         std::fs::remove_dir_all(&home).ok();
     }
 
