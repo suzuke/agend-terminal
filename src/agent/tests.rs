@@ -1,5 +1,7 @@
 use super::*;
 
+static R8_DISMISS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// #945 Phase 1: pending-registry slot publishes the agent registry
 /// to the background `telegram_init` thread. The slot is a
 /// `OnceLock` (set-once-per-process) so the test asserts that
@@ -1706,6 +1708,149 @@ fn pty_read_error_triggers_cleanup() {
         "#1144: read error path must call handle_pty_close which removes \
              agent from registry (shutdown=true path). Before fix, the Err \
              branch broke without cleanup, leaving a zombie entry."
+    );
+}
+
+struct ChunkReader {
+    chunks: Vec<&'static [u8]>,
+    next: usize,
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(chunk) = self.chunks.get(self.next) else {
+            return Ok(0);
+        };
+        self.next += 1;
+        let n = chunk.len().min(buf.len());
+        buf[..n].copy_from_slice(&chunk[..n]);
+        Ok(n)
+    }
+}
+
+#[derive(Clone)]
+struct RecordingWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for RecordingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn run_pty_read_loop_for_r8(
+    chunks: Vec<&'static [u8]>,
+    backend: Backend,
+    dismiss_patterns: Vec<(String, Vec<u8>)>,
+) -> Arc<Mutex<Vec<u8>>> {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&written),
+    })));
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(120, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(Some(&backend)),
+        health: HealthTracker::new(),
+    }));
+    let ctx = PtyReadContext {
+        name: "r8-dismiss-test".to_string(),
+        instance_id: crate::types::InstanceId::default(),
+        core,
+        pty_writer: writer,
+        registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        home: None,
+        crash_tx: None,
+        dismiss_patterns: dismiss::prepare_dismiss_patterns(&dismiss_patterns),
+        shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut reader = ChunkReader { chunks, next: 0 };
+    let capture = crate::capture::make_capture_writer(None, "r8-dismiss-test", backend.name());
+    pty_read_loop(&mut reader, &ctx, capture);
+    written
+}
+
+#[test]
+fn r8_dismiss_scan_skips_unchanged_frames() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dismiss::reset_dismiss_scan_count_for_test();
+
+    let patterns = vec![(r"(?m)^[^A-Za-z\n]*Do you trust".to_string(), b"\r".to_vec())];
+    run_pty_read_loop_for_r8(
+        vec![b"\x1b[2J\x1b[Hbooting", b"\x1b[2J\x1b[Hbooting"],
+        Backend::Codex,
+        patterns,
+    );
+
+    assert_eq!(
+        dismiss::dismiss_scan_count_for_test(),
+        1,
+        "R8: identical post-render screens must hit the state dedup gate and skip dismiss scanning"
+    );
+}
+
+#[test]
+fn r8_dismiss_scan_latches_off_after_idle() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dismiss::reset_dismiss_scan_count_for_test();
+
+    let patterns = vec![(r"(?m)^[^A-Za-z\n]*Do you trust".to_string(), b"\r".to_vec())];
+    run_pty_read_loop_for_r8(
+        vec![
+            b"\x1b[2J\x1b[HOpenAI Codex\n\xe2\x80\xba ",
+            b"\x1b[2J\x1b[HDo you trust this folder?\nYes, continue",
+        ],
+        Backend::Codex,
+        patterns,
+    );
+
+    assert_eq!(
+        dismiss::dismiss_scan_count_for_test(),
+        1,
+        "R8: once the agent reaches Idle, later changed frames must not keep scanning dismiss patterns"
+    );
+}
+
+#[test]
+fn r8_startup_dialog_still_dismisses_before_latch_off() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dismiss::reset_dismiss_scan_count_for_test();
+
+    let patterns: Vec<(String, Vec<u8>)> = Backend::Codex
+        .preset()
+        .dismiss_patterns
+        .iter()
+        .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+        .collect();
+    let written = run_pty_read_loop_for_r8(
+        vec![b"\x1b[2J\x1b[HDo you trust this folder?\nYes, continue"],
+        Backend::Codex,
+        patterns,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    assert_eq!(
+        dismiss::dismiss_scan_count_for_test(),
+        1,
+        "R8: startup modal frame must still run the dismiss scanner"
+    );
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "R8: startup trust dialog must still send the configured dismiss keystroke"
     );
 }
 

@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod dismiss;
+#[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
+use dismiss::{prepare_dismiss_patterns, try_prepared_dismiss_dialog, PreparedDismissPattern};
 
 pub mod deleting;
 
@@ -1208,6 +1210,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                 .collect()
         })
         .unwrap_or_default();
+    let dismiss = prepare_dismiss_patterns(&dismiss);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = registry.lock();
@@ -1490,7 +1493,7 @@ struct PtyReadContext {
     registry: AgentRegistry,
     home: Option<std::path::PathBuf>,
     crash_tx: Option<CrashChannel>,
-    dismiss_patterns: Vec<(String, Vec<u8>)>,
+    dismiss_patterns: Vec<PreparedDismissPattern>,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1558,6 +1561,7 @@ fn pty_read_loop(
     } = ctx;
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
+    let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -1607,7 +1611,7 @@ fn pty_read_loop(
                 // post-render means we match what the user actually sees —
                 // Ink-style TUIs that draw char-by-char with cursor positioning
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
-                let screen = {
+                let (screen, state_changed, dismiss_latch_off) = {
                     let mut c = core.lock();
                     // Disjoint field borrows so the lazy-fg closure may read
                     // `vterm` while `state` is borrowed mutably (both fields of
@@ -1633,17 +1637,28 @@ fn pty_read_loop(
                     // mask off the resolved grid cells (alacritty has normalized
                     // 16/256/truecolor SGR) via `tail_lines_with_fg().1`.
                     let screen = vterm.tail_lines_dewrapped(rows);
-                    state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+                    let state_changed =
+                        state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+                    let dismiss_latch_off = state_changed
+                        && (state.get_state() == crate::state::AgentState::Idle
+                            || state.has_productive_output());
                     broadcast_pty_output(subscribers, data, &mut dropped_chunks, name);
-                    screen
+                    (screen, state_changed, dismiss_latch_off)
                 };
 
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
-                if !in_cooldown && try_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns) {
+                if dismiss_scan_enabled
+                    && state_changed
+                    && !in_cooldown
+                    && try_prepared_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns)
+                {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                }
+                if dismiss_latch_off {
+                    dismiss_scan_enabled = false;
                 }
             }
             Err(e) => {

@@ -1451,14 +1451,15 @@ impl StateTracker {
     /// Fail-open conditions (HIGH_FP transition fires WITHOUT a red check):
     /// `anchor_on_red == false` (Shell/Raw) OR `fg` is empty (text-only
     /// callers / cold paths) — matching pre-#919 unconditional behavior.
-    pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) {
+    pub fn feed_with_fg(&mut self, screen_text: &str, fg: &[CellFg]) -> bool {
         // Gate 1 — hash-dedup (skip unchanged frames; throttle-hint override).
         // On a MISS the post-dedup pipeline runs (see `feed_after_dedup`).
         let hash = hash_screen(screen_text);
         if self.apply_hash_dedup_gate(screen_text, hash) {
-            return;
+            return false;
         }
         self.feed_after_dedup(screen_text, fg);
+        true
     }
 
     /// #perf-R1: hot-path entry. Runs the cheap text-only hash-dedup gate FIRST
@@ -1473,13 +1474,18 @@ impl StateTracker {
     /// [`crate::vterm::VTerm::tail_lines_dewrapped`], whose text equals
     /// `tail_lines_with_fg().0`. `build_fg` then yields the colour mask aligned
     /// 1:1 with that text (same grid, same de-wrap ⇒ `tail_lines_with_fg().1`).
-    pub fn feed_with_lazy_fg(&mut self, screen_text: &str, build_fg: impl FnOnce() -> Vec<CellFg>) {
+    pub fn feed_with_lazy_fg(
+        &mut self,
+        screen_text: &str,
+        build_fg: impl FnOnce() -> Vec<CellFg>,
+    ) -> bool {
         let hash = hash_screen(screen_text);
         if self.apply_hash_dedup_gate(screen_text, hash) {
-            return;
+            return false;
         }
         let fg = build_fg();
         self.feed_after_dedup(screen_text, &fg);
+        true
     }
 
     /// Shared post-dedup body of [`feed_with_fg`] / [`feed_with_lazy_fg`] —
@@ -2588,6 +2594,10 @@ impl StateTracker {
     pub fn recovered_within(&self, window: Duration) -> bool {
         self.last_productive_output
             .is_some_and(|t| t.elapsed() < window)
+    }
+
+    pub fn has_productive_output(&self) -> bool {
+        self.last_productive_output.is_some()
     }
 
     /// Periodic tick — expire stale latched states without requiring new PTY

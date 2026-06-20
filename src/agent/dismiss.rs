@@ -28,6 +28,27 @@ static DISMISS_IN_FLIGHT: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
+#[cfg(test)]
+static DISMISS_SCAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_dismiss_scan_count_for_test() {
+    DISMISS_SCAN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn dismiss_scan_count_for_test() -> usize {
+    DISMISS_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[derive(Clone)]
+pub struct PreparedDismissPattern {
+    pattern: String,
+    literal_hint: String,
+    regex: std::sync::Arc<regex::Regex>,
+    key_seq: Vec<u8>,
+}
+
 /// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
 /// drop — including on a panic or early-return of the dismiss thread. Previously
 /// the removal was a trailing statement, so a panic before it left a stale entry
@@ -88,33 +109,66 @@ fn dismiss_regex_cache_contains(pattern: &str) -> bool {
 /// and any future cursor variant introduced by a backend's TUI without
 /// requiring a new patch per backend.
 const DISMISS_REGEX_PREFIX: &str = r"(?m)^[^A-Za-z\n]{0,8}";
+const DISMISS_REGEX_WIDE_PREFIX: &str = r"(?m)^[^A-Za-z\n]*";
 
 fn dismiss_literal_hint(pattern: &str) -> &str {
     pattern
         .strip_prefix(DISMISS_REGEX_PREFIX)
+        .or_else(|| pattern.strip_prefix(DISMISS_REGEX_WIDE_PREFIX))
         .unwrap_or(pattern)
 }
 
+pub fn prepare_dismiss_patterns(
+    dismiss_patterns: &[(String, Vec<u8>)],
+) -> Vec<PreparedDismissPattern> {
+    dismiss_patterns
+        .iter()
+        .filter_map(|(pattern, key_seq)| {
+            let regex = compile_dismiss_regex(pattern)?;
+            Some(PreparedDismissPattern {
+                pattern: pattern.clone(),
+                literal_hint: dismiss_literal_hint(pattern).to_string(),
+                regex,
+                key_seq: key_seq.clone(),
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
 pub fn try_dismiss_dialog(
     name: &str,
     screen: &str,
     pty_writer: &PtyWriter,
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> bool {
+    let prepared = prepare_dismiss_patterns(dismiss_patterns);
+    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared)
+}
+
+pub fn try_prepared_dismiss_dialog(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+) -> bool {
+    #[cfg(test)]
+    DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     if dismiss_patterns.is_empty() {
         return false;
     }
 
-    for (pattern, key_seq) in dismiss_patterns {
+    for pattern in dismiss_patterns {
+        if !pattern.literal_hint.is_empty() && !screen.contains(&pattern.literal_hint) {
+            continue;
+        }
         // Issue #468: regex match anchored to line start + optional TUI prefix.
         // Substring match (the prior behavior) auto-injected `2\n` / `3\n`
         // whenever the phrase appeared anywhere on screen — including in agent
         // output and scrollback — sending input the user never authorized.
-        let Some(re) = compile_dismiss_regex(pattern) else {
-            continue;
-        };
-        if re.is_match(screen) {
-            tracing::info!(agent = name, pattern, "auto-dismissing dialog");
+        if pattern.regex.is_match(screen) {
+            tracing::info!(agent = name, pattern = %pattern.pattern, "auto-dismissing dialog");
             // Delayed write: TUI escape-sequence parsers need time to distinguish
             // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
@@ -128,7 +182,7 @@ pub fn try_dismiss_dialog(
                 inflight.insert(name.to_string());
             }
             let writer = Arc::clone(pty_writer);
-            let keys = key_seq.clone();
+            let keys = pattern.key_seq.clone();
             let agent = name.to_string();
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
             // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
@@ -179,12 +233,11 @@ pub fn try_dismiss_dialog(
         // would have triggered the old substring path but the new regex
         // anchor declined — surfaces realistic false positives (mid-paragraph
         // matches, scrollback echoes) without auto-injecting bytes.
-        let literal = dismiss_literal_hint(pattern);
-        if literal != pattern.as_str() && !literal.is_empty() && screen.contains(literal) {
+        if pattern.literal_hint != pattern.pattern && !pattern.literal_hint.is_empty() {
             tracing::debug!(
                 agent = name,
-                pattern,
-                literal,
+                pattern = %pattern.pattern,
+                literal = %pattern.literal_hint,
                 "dismiss substring seen but regex didn't match — likely false positive"
             );
         }
