@@ -36,6 +36,14 @@ Full nextest: 1 red `teardown_completeness_regression::teardown_leaves_zero_resi
 (residual `fleet_events.jsonl (content)`). **Fails identically on clean origin/main** (verified via git stash).
 Touches no teardown/fleet-events code here. Likely separate issue (#1907 teardown-completeness class).
 
+## Base conflict resolved (2026-06-21)
+- main merged #2378 (AuthError FP fix) after my push → ci-conflict. Both #2378 and I appended tests at
+  the END of state/tests.rs → conflict; state/mod.rs auto-merged (my repr(u8)/from_u8/published orthogonal
+  to their AuthError gate). Resolution = KEEP BOTH test sets. Merge commit `bce90d1c`, pushed.
+- Re-verified: no markers, clippy(--features tray) clean, 15 tests green (my 3 + their 4 auth + supervisor
+  auth gate + CoreMutex #1535). PR #2380 now **MERGEABLE** (BLOCKED = awaiting review/CI). 0 behind origin/main.
+
 ## Next
 Await DUAL review verdicts → address findings on this branch (additive commits, no force-push) → merge →
-operator rebuild+restart to go live.
+operator rebuild+restart to go live. If base conflicts again: `git fetch origin main && git merge origin/main`
+(NOT rebase/force-push — squash-merge collapses the merge commit).

@@ -1185,6 +1185,13 @@ mod tests {
     /// lock on a background thread and assert the snapshot still returns promptly
     /// AND with the correct published state. If `build_agent_state_snapshot` ever
     /// reverts to `core.lock().state.get_state()`, this blocks ~200 ms and fails.
+    ///
+    /// `#[cfg(unix)]`: the only registry-handle builder, `agent::mk_test_handle`,
+    /// is `#[cfg(all(test, unix))]` (real openpty + `true`), so this test is
+    /// unix-only. The lock-free property itself is platform-agnostic; the state
+    /// unit tests (`agentstate_u8_roundtrip`, `published_mirror_tracks_current_…`)
+    /// cover the mirror cross-platform.
+    #[cfg(unix)]
     #[test]
     fn snapshot_reads_published_state_without_core_lock() {
         let id = crate::types::InstanceId::default();
