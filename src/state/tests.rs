@@ -828,7 +828,9 @@ fn context_full_instant_transition() {
 #[test]
 fn auth_error_instant_transition() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-    t.feed("API key invalid");
+    // Real Claude auth banner (was the synthetic "API key invalid" — the bare
+    // `API key` token was removed as an FP source; assertion unchanged).
+    t.feed("Invalid API key");
     assert_eq!(t.get_state(), AgentState::AuthError);
 }
 
@@ -5845,5 +5847,95 @@ fn lazy_fg_rebuilds_and_redetects_static_throttle_pane() {
         builds.get(),
         2,
         "#perf-R1: the throttle-hint re-detect override still rebuilds the fg mask"
+    );
+}
+
+// ── auth_error false-positive fix (operator-reported, dev-3 spike t-…58335-0) ──
+// claude AuthError regex matched generic tokens `unauthorized` + `API key`, and
+// AuthError had NO anchor gate (not in is_high_fp_state / requires_red_anchor), so
+// a healthy agent merely REVIEWING/WRITING authz code (#2369 telegram-authz) or
+// the auth-detection code itself was misflagged AuthError. Fix = narrow the
+// pattern off the generic words AND red-anchor AuthError (the real banners carry
+// no error-line indicator, so only color distinguishes a banner from prose).
+
+/// FP repro (text-only path): reviewing #2369 authz content (`unauthorized` /
+/// `API key`) must NOT latch AuthError. Pre-fix RED (generic tokens matched);
+/// post-fix GREEN (narrowed pattern no longer matches the prose).
+#[test]
+fn authz_review_content_does_not_false_flag_auth_error() {
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    t.feed(
+        "reviewing #2369: hoist is_user_allowed so a non-allowlisted sender can't do an \
+         unauthorized write to the task board; also the ANTHROPIC API key check is fail-closed",
+    );
+    assert_ne!(
+        t.get_state(),
+        AgentState::AuthError,
+        "reviewing authz content (unauthorized / API key) must not be misflagged AuthError"
+    );
+}
+
+/// Precision: the real auth-failure banners must STILL classify (text-only feed
+/// fails the red anchor open, so this also pins the narrowed pattern's tokens).
+#[test]
+fn auth_error_precision_real_banners_still_detected() {
+    for banner in [
+        "Invalid API key",
+        "invalid x-api-key",
+        "authentication_error",
+        "authentication failed",
+        "Please run /login",
+        "API Error: 401",
+    ] {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(banner);
+        assert_eq!(
+            t.get_state(),
+            AgentState::AuthError,
+            "real auth banner {banner:?} must still detect (text-only fail-open)"
+        );
+    }
+}
+
+/// AuthError JOINS the red-anchor regime: a plain (reviewed/typed, non-red) auth
+/// phrase must NOT latch; the SAME phrase rendered red (a real banner) does. This
+/// catches the residual FP an agent reviewing the auth-detection code itself would
+/// hit (its pane contains the literal banner strings in default color).
+#[test]
+fn auth_error_requires_red_anchor() {
+    let line = "Invalid API key";
+    let (mut vt, mut st) = claude_tracker();
+    drive_plain_line(&mut vt, &mut st, line);
+    assert_ne!(
+        st.get_state(),
+        AgentState::AuthError,
+        "plain (non-red) auth phrase must stay suppressed — AuthError now keeps the red anchor"
+    );
+    let (mut vt2, mut st2) = claude_tracker();
+    drive_colored_line(&mut vt2, &mut st2, RED_16, line);
+    assert_eq!(
+        st2.get_state(),
+        AgentState::AuthError,
+        "a real RED auth banner must fire"
+    );
+}
+
+/// Sweep: codex's AuthError pattern dropped the generic `api.?key` token (same FP
+/// class) — a benign `api key` mention must not latch; a real codex auth error does.
+#[test]
+fn codex_auth_pattern_drops_generic_api_key_token() {
+    let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
+    t.feed("set the codex api key in the environment before running");
+    assert_ne!(
+        t.get_state(),
+        AgentState::AuthError,
+        "generic `api key` mention must not latch AuthError on codex"
+    );
+    let mut t2 = tracker_at(&Backend::Codex, AgentState::Idle, 0);
+    t2.feed("Incorrect API key provided");
+    assert_eq!(
+        t2.get_state(),
+        AgentState::AuthError,
+        "a real codex auth error must still detect"
     );
 }

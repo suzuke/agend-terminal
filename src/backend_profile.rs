@@ -280,7 +280,13 @@ fn opencode_profile() -> BackendProfile {
 fn codex_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
-            (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
+            // auth_error FP fix: drop the generic `api.?key` token (matched any
+            // "api key" prose) — keep the env-var anchor + the real OpenAI
+            // auth-error forms. AuthError is also red-anchored downstream.
+            (
+                AgentState::AuthError,
+                r"OPENAI_API_KEY|Incorrect API key|invalid_api_key",
+            ),
             (AgentState::UsageLimit, r"hit your usage limit|try again at"),
             (
                 AgentState::RateLimit,
@@ -336,8 +342,13 @@ fn claudecode_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
             (
+                // auth_error FP fix (operator-reported): the bare `API key` and
+                // `unauthorized` tokens are generic English that any pane
+                // reviewing/writing authz code (#2369) shows, so they misflagged
+                // healthy agents. Anchor on the REAL Claude/Anthropic
+                // auth-failure banners instead (+ the AuthError red-anchor below).
                 AgentState::AuthError,
-                r"API key|authentication failed|unauthorized|API Error: 40[13]\b",
+                r"Invalid API key|invalid x-api-key|authentication_error|authentication failed|OAuth token has expired|Please run /login|API Error: 40[13]\b",
             ),
             (
                 AgentState::ServerRateLimit,

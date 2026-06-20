@@ -505,9 +505,9 @@ fn oscillation_guard_window() -> Duration {
 /// / JSON dumps, so they get the extra FP defenses (the #1518 position gate + the
 /// #1769 working-marker override + an anchor gate). The ANCHOR gate splits by
 /// [`requires_red_anchor`] — RateLimit/ServerRateLimit now use a content anchor
-/// (`in_error_line_excluding_input`), only ContextFull/ModelUnsupported still require red. This
-/// predicate stays the full set because position + working-marker apply to all
-/// four regardless of which anchor regime they use.
+/// (`in_error_line_excluding_input`), while ContextFull/ModelUnsupported/AuthError
+/// require red. This predicate stays the full set because position +
+/// working-marker apply to all of them regardless of which anchor regime they use.
 /// Per #919 spike + dev-2 cross-audit:
 /// - ServerRateLimit / RateLimit: server-side throttle alternations
 ///   include `api_error|timeout_error|overloaded_error` etc which
@@ -527,6 +527,13 @@ fn is_high_fp_state(state: AgentState) -> bool {
             // hang-check, so a FP would silently disable a healthy agent — the
             // anchor is the FP boundary.
             | AgentState::ModelUnsupported
+            // auth_error FP fix (operator-reported): auth-failure phrases
+            // (`Invalid API key`, `Please run /login`, …) appear verbatim when an
+            // agent reviews/writes authz code (#2369) or this detection code, and
+            // an AuthError FP fires a false supervisor re-auth page + wastes a
+            // restart on a healthy agent — same cost profile as ModelUnsupported,
+            // so it joins the red-anchor regime below.
+            | AgentState::AuthError
     )
 }
 
@@ -534,10 +541,15 @@ fn is_high_fp_state(state: AgentState) -> bool {
 /// which HIGH_FP states still require the #1450 RED-SGR anchor vs the content
 /// anchor (`in_error_line_excluding_input`).
 ///
-/// - **`true`** — ContextFull, ModelUnsupported: keep RED. ContextFull has no
-///   fixture corpus to prove a content path; ModelUnsupported never auto-clears
-///   AND suppresses hang-check, so a verbatim-quote FP would silently disable a
-///   healthy agent (the anchor is the FP boundary, #1634).
+/// - **`true`** — ContextFull, ModelUnsupported, AuthError: keep RED. ContextFull
+///   has no fixture corpus to prove a content path; ModelUnsupported never
+///   auto-clears AND suppresses hang-check, so a verbatim-quote FP would silently
+///   disable a healthy agent (the anchor is the FP boundary, #1634). AuthError
+///   uses RED (not the content anchor) because the real banners — `Invalid API
+///   key`, `Please run /login`, `OAuth token has expired` — carry NO error-line
+///   indicator (`line_has_error_indicator`), so the content anchor would
+///   false-negative them; color is the only reliable signal that separates a real
+///   red banner from authz prose an agent is reviewing/writing.
 /// - **`false`** — RateLimit, ServerRateLimit: content anchor instead. The corpus
 ///   gate proved content+position+working-marker preserves detection (5/5 prose
 ///   suppressed, FN-covered incl. kiro via #1789), and the residual verbatim-quote
@@ -545,7 +557,7 @@ fn is_high_fp_state(state: AgentState) -> bool {
 fn requires_red_anchor(state: AgentState) -> bool {
     matches!(
         state,
-        AgentState::ContextFull | AgentState::ModelUnsupported
+        AgentState::ContextFull | AgentState::ModelUnsupported | AgentState::AuthError
     )
 }
 
@@ -1805,11 +1817,13 @@ impl StateTracker {
     /// (treated as no-match). Two regimes (t-coloranchor-remove-ratelimit,
     /// operator-approved after the corpus gate's go/no-go):
     ///
-    /// - **`requires_red_anchor`** {ContextFull, ModelUnsupported}: keep the
-    ///   #1450 RED anchor — a marker needs ≥1 red rendered cell, else it's prose
-    ///   not a state. ContextFull has no corpus to prove a content path;
+    /// - **`requires_red_anchor`** {ContextFull, ModelUnsupported, AuthError}: keep
+    ///   the #1450 RED anchor — a marker needs ≥1 red rendered cell, else it's
+    ///   prose not a state. ContextFull has no corpus to prove a content path;
     ///   ModelUnsupported never auto-clears AND suppresses hang-check, so a
     ///   verbatim-quote FP would silently disable a healthy agent (cost too high).
+    ///   AuthError's real banners carry no error-line indicator, so only color
+    ///   separates a banner from reviewed authz prose (operator-reported FP).
     /// - **content-anchor** {RateLimit, ServerRateLimit}: the marker must sit on
     ///   an error-line-shaped line (`in_error_line_excluding_input`) —
     ///   corpus-proven safe (5/5 prose suppressed via pattern-narrow + #1518
