@@ -303,6 +303,15 @@ pub fn bind_full(
 /// `caller_process_context` is daemon-side regardless). Best-effort + file-based
 /// (the same `inbox::notify_agent` primitive as `canonical_auto_stash`); never
 /// blocks and runs under the caller's binding lock, so no network/no spawn.
+/// #2347 GR1: per-agent sidecar listing the branches that have already surfaced
+/// an out-of-dispatch notify — fire-once-per-branch dedup WITHIN a bind cycle.
+/// Cleared by [`unbind`] so a release resets the latch (bug-audit Rank6): without
+/// the clear, a self-claim → notify → release left the branch latched forever, so
+/// a LATER real re-claim hijack of the same branch was silently swallowed as
+/// "already notified". The clear is scoped to release, so intra-cycle dedup
+/// (repeated binds to the same branch within one cycle) is preserved.
+const OUT_OF_DISPATCH_SIDECAR: &str = ".out_of_dispatch_notified";
+
 /// #2347: the live delivery is routed to the bound agent's TEAM ORCHESTRATOR
 /// (`out_of_dispatch_notify_recipient`, fallback `general`) rather than the
 /// global operator inbox, and SKIPPED when the orchestrator resolves to the
@@ -317,7 +326,7 @@ fn notify_operator_out_of_dispatch_bind(
 ) {
     let sidecar = crate::paths::runtime_dir(home)
         .join(agent)
-        .join(".out_of_dispatch_notified");
+        .join(OUT_OF_DISPATCH_SIDECAR);
     // Dedup: skip if this (agent, branch) was already surfaced.
     if let Ok(seen) = std::fs::read_to_string(&sidecar) {
         if seen.lines().any(|l| l == branch) {
@@ -421,6 +430,11 @@ pub fn unbind(home: &Path, agent: &str) {
     let _ = std::fs::remove_file(dir.join("binding.json"));
     // #1651: drop the HMAC sidecar too, so a stale signature can't linger.
     let _ = std::fs::remove_file(binding_sig_path(&dir));
+    // bug-audit Rank6: clear the out-of-dispatch notify latch so a release resets
+    // it — a later real re-claim of the same branch re-surfaces instead of being
+    // silently swallowed as "already notified". Scoped to release, so the
+    // per-(agent,branch) intra-cycle fire-once dedup is preserved.
+    let _ = std::fs::remove_file(dir.join(OUT_OF_DISPATCH_SIDECAR));
     if let Ok(mut map) = binding_index().write() {
         map.remove(&index_key(home, agent));
     }
@@ -1432,6 +1446,45 @@ mod tests {
             log.matches("binding_out_of_dispatch").count(),
             1,
             "self-claim bind must surface exactly once per (agent, branch): {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// bug-audit Rank6: the out-of-dispatch notify latch is per-bind-CYCLE, not
+    /// forever. `unbind` clears the `.out_of_dispatch_notified` sidecar, so after a
+    /// release a real re-claim of the SAME branch re-surfaces (pre-fix it was
+    /// swallowed as "already notified"). Intra-cycle dedup stays intact.
+    #[test]
+    fn unbind_resets_out_of_dispatch_latch_so_reclaim_resurfaces_rank6() {
+        let home = tmp_home("rank6-relatch");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Cycle 1: self-claim feat/x surfaces once; a same-branch rebind in the
+        // SAME cycle does NOT re-surface (intra-cycle dedup preserved).
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, true).expect("cycle1 bind");
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, true).expect("cycle1 same-branch rebind");
+        assert_eq!(
+            read_event_log(&home)
+                .matches("binding_out_of_dispatch")
+                .count(),
+            1,
+            "intra-cycle: a self-claim surfaces exactly once per (agent, branch)"
+        );
+
+        // Release clears the latch.
+        unbind(&home, "ag");
+
+        // Cycle 2: re-claim the SAME branch (the hijack scenario) MUST re-surface.
+        bind_full(&home, "ag", "", "feat/x", &wt, &src, true).expect("cycle2 reclaim bind");
+        assert_eq!(
+            read_event_log(&home)
+                .matches("binding_out_of_dispatch")
+                .count(),
+            2,
+            "post-release re-claim of the same branch must re-surface (latch reset on unbind)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
