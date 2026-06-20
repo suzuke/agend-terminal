@@ -649,9 +649,27 @@ mod tests {
         acc
     }
 
-    // #t-3558 P2 — coalesce keep-latest. Pins (lead's hard conditions): the
-    // rewrite drops ONLY same-kind AGEND-AUTO lines, never a normal message nor a
-    // different AGEND-AUTO kind.
+    // #t-3558 P2 — coalesce keep-latest, asserted as a NO-LOSS invariant.
+    //
+    // Pins (lead's hard conditions): the rewrite drops ONLY same-kind AGEND-AUTO
+    // lines, never a normal message nor a different AGEND-AUTO kind.
+    //
+    // The EXACT keep-latest collapse (rl#2 drops rl#1 → one ratelimit line) is NOT
+    // asserted here. `enqueue_coalesced_auto` legitimately falls back to a no-loss
+    // plain append whenever it can't grab the per-agent `drain.lock`
+    // (`enqueue_coalesced_auto`, the `try_acquire_file_lock` gate). Under the
+    // Coverage job's llvm-cov `cargo test` (heavy parallel, non-nextest) fd
+    // pressure makes that lock's `.open()` transiently EMFILE → `Err` → the
+    // fallback fires even with NO real contender, leaving rl#1 un-coalesced → 4
+    // lines instead of 3. That is correct by design — every nudge is preserved, no
+    // message is lost — so an exact-count assertion was a false flake. #2333
+    // relaxed the sibling `coalesce_preserves_unparseable_lines` for this IDENTICAL
+    // mechanism but missed this test (same family as #2028/#2072/#2074).
+    //
+    // The collapse itself stays deterministically covered by
+    // `coalesce_falls_back_to_append_when_drain_lock_held_no_loss` (forces the
+    // lock-free path → asserts exactly one line), so a refactor that breaks
+    // coalescing is still caught under the no-fd-pressure (nextest) gate.
     #[test]
     fn coalesce_keeps_latest_same_kind_and_preserves_others() {
         let home = tmp_home("coalesce-keep");
@@ -663,28 +681,37 @@ mod tests {
         enqueue_coalesced_auto(&home, a, pb).expect("different kind");
         enqueue_coalesced_auto(&home, a, rl).expect("rl#2 coalesces rl#1");
 
-        let drained = drain_settled(&home, a, 3);
-        let texts: Vec<&str> = drained.iter().map(|m| m.text.as_str()).collect();
-        assert_eq!(
-            drained.len(),
-            3,
-            "hello + 1 ratelimit + 1 progress-backstop; got {texts:?}"
+        // Read the queue file directly — like the sibling
+        // `coalesce_preserves_unparseable_lines` — instead of draining. The
+        // coalesce writes the queue, so a direct read asserts the coalesce outcome
+        // without dragging in the SEPARATE #2028/#2072 drain-transient surface
+        // (`drain`'s own lock `.open()` EMFILEs under the same fd pressure and can
+        // under-deliver, which would re-introduce a different flake here).
+        let raw = std::fs::read_to_string(queue_path(&home, a)).expect("queue file");
+        let lines: Vec<&str> = raw.lines().collect();
+        // No loss, bounded: 3 = coalesced (rl#1 dropped), 4 = fd-pressure fallback
+        // append (rl#1 kept). Both preserve every message; neither runs away.
+        assert!(
+            (3..=4).contains(&lines.len()),
+            "no-loss bounded total (3=coalesced, 4=fallback append); got:\n{raw}"
         );
-        assert_eq!(
-            texts
-                .iter()
-                .filter(|t| t.contains("kind=ratelimit-retry"))
-                .count(),
-            1,
-            "only the LATEST ratelimit nudge kept; got {texts:?}"
+        let rl_kept = lines
+            .iter()
+            .filter(|l| l.contains("kind=ratelimit-retry"))
+            .count();
+        // 1 = coalesced, 2 = fd-pressure fallback append — the LATEST ratelimit
+        // nudge is always present and never duplicated beyond the single fallback.
+        assert!(
+            (1..=2).contains(&rl_kept),
+            "latest ratelimit nudge preserved (1=coalesced, 2=fallback); got:\n{raw}"
         );
         assert!(
-            texts.contains(&"hello world"),
-            "normal message preserved; got {texts:?}"
+            lines.iter().any(|l| l.contains("hello world")),
+            "normal message preserved; got:\n{raw}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("kind=progress-backstop")),
-            "a DIFFERENT AGEND-AUTO kind is never coalesced away; got {texts:?}"
+            lines.iter().any(|l| l.contains("kind=progress-backstop")),
+            "a DIFFERENT AGEND-AUTO kind is never coalesced away; got:\n{raw}"
         );
     }
 
