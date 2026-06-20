@@ -237,6 +237,58 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         return;
     }
 
+    // Authz gate (bug-audit Rank2): hoisted ahead of ALL content side-effects
+    // below. The status-keyword summary injection and the `加 task:` board write
+    // both used to run BEFORE this check, letting a non-allowlisted sender read
+    // fleet status (info leak) or create a board task (unauthorized write). The
+    // `forum_topic_closed` handler above is left ungated on purpose: it reacts
+    // to a structural Telegram event (topic deletion → instance cleanup), needs
+    // group-admin rights to fire, and its service message may carry no `from` —
+    // gating it would break legitimate cleanup for no realistic security gain.
+    let sender_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
+    // Display name: prefer the public @username; if absent, fall back to the
+    // configured allowlist name (`{ id, name }` in fleet.yaml) so the operator
+    // shows as their name instead of `unknown`; else "unknown".
+    let allowlist_name: Option<String> = if msg
+        .from
+        .as_ref()
+        .and_then(|u| u.username.as_deref())
+        .is_none()
+    {
+        sender_id.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
+    } else {
+        None
+    };
+    let username = msg
+        .from
+        .as_ref()
+        .and_then(|u| u.username.as_deref())
+        .or(allowlist_name.as_deref())
+        .unwrap_or("unknown");
+
+    // Authz: drop messages from senders not on the allowlist (Sprint 21
+    // Phase 2 fail-closed cascade auth — combined with PR #216 outbound
+    // gate this closes the cascade attack chain inbound side).
+    //   - `Some([u1, u2])` → restricts to listed IDs (always was)
+    //   - `Some([])` → rejects all
+    //   - `None` → rejects all (Phase 2 inversion of legacy `accept-all`)
+    //   - sender_id `None` (anonymous) → fail-closed: rejected
+    {
+        let s = lock_state(state);
+        let allowed = match sender_id {
+            Some(id) => s.is_user_allowed(id),
+            None => false,
+        };
+        if !allowed {
+            tracing::warn!(
+                from = username,
+                user_id = ?sender_id,
+                "telegram message rejected by user_allowlist"
+            );
+            return;
+        }
+    }
+
     let mut text = match msg.text() {
         Some(t) => t.to_string(),
         None => msg.caption().unwrap_or("").to_string(),
@@ -413,50 +465,6 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // If no text and no attachment, nothing to process.
     if text.is_empty() && inbound_file.is_none() {
         return;
-    }
-
-    let sender_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
-    // Display name: prefer the public @username; if absent, fall back to the
-    // configured allowlist name (`{ id, name }` in fleet.yaml) so the operator
-    // shows as their name instead of `unknown`; else "unknown".
-    let allowlist_name: Option<String> = if msg
-        .from
-        .as_ref()
-        .and_then(|u| u.username.as_deref())
-        .is_none()
-    {
-        sender_id.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
-    } else {
-        None
-    };
-    let username = msg
-        .from
-        .as_ref()
-        .and_then(|u| u.username.as_deref())
-        .or(allowlist_name.as_deref())
-        .unwrap_or("unknown");
-
-    // Authz: drop messages from senders not on the allowlist (Sprint 21
-    // Phase 2 fail-closed cascade auth — combined with PR #216 outbound
-    // gate this closes the cascade attack chain inbound side).
-    //   - `Some([u1, u2])` → restricts to listed IDs (always was)
-    //   - `Some([])` → rejects all
-    //   - `None` → rejects all (Phase 2 inversion of legacy `accept-all`)
-    //   - sender_id `None` (anonymous) → fail-closed: rejected
-    {
-        let s = lock_state(state);
-        let allowed = match sender_id {
-            Some(id) => s.is_user_allowed(id),
-            None => false,
-        };
-        if !allowed {
-            tracing::warn!(
-                from = username,
-                user_id = ?sender_id,
-                "telegram message rejected by user_allowlist"
-            );
-            return;
-        }
     }
 
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
@@ -886,6 +894,125 @@ mod tests {
         assert!(
             preceding_256.contains("if is_image"),
             "resolver call must be gated behind `if is_image`; found context: {preceding_256}"
+        );
+    }
+
+    // ── bug-audit Rank2: telegram authz gate must precede content side-effects ──
+    //
+    // RCA: `is_status_keyword` (fleet-status summary injection) and
+    // `parse_task_entry` (`加 task:` board write) used to run BEFORE the
+    // `is_user_allowed` allowlist check in `handle_message`. A non-allowlisted
+    // sender could therefore read fleet status (info leak) or create a board
+    // task (unauthorized write). The fix hoists the authz gate ahead of both.
+    //
+    // These tests drive the REAL `handle_message` entry point (§3.9) via a
+    // teloxide `Message` fixture, asserting the OBSERVABLE side-effects (inbox
+    // enqueue / task board) rather than re-implementing the gate. Both
+    // `unauthorized_*` tests FAIL against the pre-fix order (RED) and pass
+    // after the hoist (GREEN); `authorized_status_keyword_still_enqueues`
+    // pins that the gate does NOT block legitimate users.
+
+    /// Build a text-only private-chat `Message` from `from_id`. Deserialized
+    /// from the Telegram wire JSON (teloxide 0.17 `Message: Deserialize`), so
+    /// it exercises the same shape `handle_message` sees in production. No
+    /// `message_thread_id` → `resolve_topic` falls back to "general".
+    fn telegram_text_message(from_id: i64, text: &str) -> Message {
+        let json = serde_json::json!({
+            "message_id": 1,
+            "date": 1700000000,
+            "chat": { "id": from_id, "type": "private", "first_name": "U" },
+            "from": { "id": from_id, "is_bot": false, "first_name": "U" },
+            "text": text,
+        });
+        serde_json::from_value(json).expect("construct telegram Message fixture")
+    }
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-telegram-authz-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// `TelegramState` with the given allowlist and an empty topic map (so
+    /// `resolve_topic` yields "general"). Uses `new_for_contract_test` to skip
+    /// `Bot::new` — the status/task paths under test never touch the bot.
+    fn state_with_allowlist(
+        home: &std::path::Path,
+        allowlist: Vec<i64>,
+    ) -> Arc<Mutex<TelegramState>> {
+        Arc::new(Mutex::new(TelegramState::new_for_contract_test(
+            -1,
+            std::collections::HashMap::new(),
+            home.to_path_buf(),
+            std::collections::HashMap::new(),
+            Some(allowlist),
+        )))
+    }
+
+    #[tokio::test]
+    async fn unauthorized_status_keyword_enqueues_no_summary() {
+        // RED before fix: the status-keyword path ran ahead of the allowlist
+        // gate, so a non-allowlisted sender's "status" injected the fleet
+        // summary into the resolved ("general") inbox.
+        let home = tmp_home("status-unauth");
+        let state = state_with_allowlist(&home, vec![1000]);
+        let msg = telegram_text_message(9999, "status");
+
+        handle_message(&state, &msg).await;
+
+        let msgs = crate::inbox::drain(&home, "general");
+        assert!(
+            msgs.iter().all(|m| m.from != "system:status"),
+            "non-allowlisted sender must NOT trigger a fleet-status summary (info leak); \
+             found: {:?}",
+            msgs.iter().map(|m| &m.from).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_task_entry_creates_no_task() {
+        // RED before fix: `parse_task_entry` ran ahead of the allowlist gate,
+        // so a non-allowlisted sender's "加 task: …" created a board task.
+        let home = tmp_home("task-unauth");
+        let state = state_with_allowlist(&home, vec![1000]);
+        let msg = telegram_text_message(9999, "加 task: PWNED");
+
+        handle_message(&state, &msg).await;
+
+        let tasks = crate::tasks::list_all(&home);
+        assert!(
+            tasks.iter().all(|t| t.title != "PWNED"),
+            "non-allowlisted sender must NOT create a board task (unauthorized write); \
+             titles: {:?}",
+            tasks.iter().map(|t| &t.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_status_keyword_still_enqueues_summary() {
+        // Guard: an ALLOWLISTED sender's status keyword still injects the
+        // summary — the hoisted gate must not block legitimate users
+        // (success criterion: authorized path behavior unchanged).
+        let home = tmp_home("status-auth");
+        let state = state_with_allowlist(&home, vec![1000]);
+        let msg = telegram_text_message(1000, "status");
+
+        handle_message(&state, &msg).await;
+
+        let msgs = crate::inbox::drain(&home, "general");
+        assert!(
+            msgs.iter().any(|m| m.from == "system:status"),
+            "allowlisted sender's status keyword must still enqueue the summary; \
+             found: {:?}",
+            msgs.iter().map(|m| &m.from).collect::<Vec<_>>()
         );
     }
 }
