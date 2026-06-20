@@ -922,7 +922,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     let pane_id = outcome.pane_id();
                     if let Some(fwd_tx) = pending_fwd.remove(&pane_id) {
                         if let Some(pane) = layout.find_pane_mut(pane_id) {
-                            pane_factory::apply_attach_outcome(pane, outcome, fwd_tx, &wakeup_tx);
+                            pane_factory::apply_attach_outcome(
+                                pane, &registry, outcome, fwd_tx, &wakeup_tx,
+                            );
                         } else if let pane_factory::AttachOutcome::Ready { name, .. } = &outcome {
                             // F1 (r4): the pane was closed while the attach was in
                             // flight → the agent is already spawned + registered with

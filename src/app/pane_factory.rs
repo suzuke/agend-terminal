@@ -767,6 +767,7 @@ pub(super) fn run_attach(
 /// placeholder's forwarder sender, retained by the caller keyed on `pane_id`.
 pub(super) fn apply_attach_outcome(
     pane: &mut Pane,
+    registry: &AgentRegistry,
     outcome: AttachOutcome,
     fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
@@ -781,6 +782,20 @@ pub(super) fn apply_attach_outcome(
         } => {
             pane.working_dir = Some(work_dir);
             apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+            // #t-98760-8 (#2343 deferred-attach regression): snap the just-
+            // registered PTY to the pane's CURRENT (already render-corrected) vterm
+            // size. On a restored SPLIT layout the render loop corrected this
+            // placeholder's VTERM to the split content rect BEFORE the deferred PTY
+            // existed (`resize_pty` was a no-op on the unregistered placeholder), so
+            // the render loop's vterm-vs-content gate now sees `vterm == content`
+            // and never resizes the freshly-registered PTY — leaving the backend
+            // forked at the single-pane spawn estimate (full-width wrap in a half
+            // pane). Resize EXPLICITLY here (NOT via `needs_resize`, which the same
+            // gate would no-op) now that `pane.instance_id` points at the live
+            // handle. Deliberately scoped to this DEFERRED path: the synchronous
+            // `attach_agent_to_pane` (which also calls `apply_attachment`) creates
+            // the vterm at the PTY's spawn size, so it has no estimate/content gap.
+            pane.resize_pty(registry, pane.vterm.cols(), pane.vterm.rows());
         }
         AttachOutcome::Failed { name, err, .. } => {
             // Dropping fwd_tx disconnects the placeholder's output channel
@@ -1184,8 +1199,10 @@ mod tests {
         let (sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded::<usize>();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         apply_attach_outcome(
             &mut pane,
+            &registry,
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
@@ -1239,8 +1256,10 @@ mod tests {
         let orig_iid = pane.instance_id;
         let (fwd_tx, _fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (wakeup_tx, _w) = crossbeam_channel::unbounded::<usize>();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         apply_attach_outcome(
             &mut pane,
+            &registry,
             AttachOutcome::Failed {
                 pane_id: pid,
                 name: "shell".into(),
@@ -1257,6 +1276,87 @@ mod tests {
         assert_eq!(
             pane.instance_id, orig_iid,
             "Failed must leave the pane's routing id unchanged (never-routed placeholder)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-98760-8 (#2343 deferred-attach regression): on a restored SPLIT layout
+    /// the render loop corrects the placeholder VTERM to the split content rect
+    /// BEFORE the deferred PTY exists, so the later vterm-vs-content resize gate
+    /// sees `vterm == content` and never resizes the freshly-registered PTY — the
+    /// backend stays forked at the single-pane spawn estimate (full-width wrap in
+    /// a half pane). `apply_attach_outcome` must explicitly snap the just-
+    /// registered PTY to the (corrected) vterm size. RED before that explicit
+    /// resize (PTY stuck at the 80×24 estimate); GREEN after.
+    #[test]
+    fn restored_split_pane_pty_snapped_to_content_rect() {
+        let home = tmp_home("rf_split_resize");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        // Placeholder built at the single-pane spawn estimate.
+        let (mut pane, _job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        // Simulate the render loop correcting the placeholder VTERM to the SPLIT
+        // content rect (smaller than the estimate) BEFORE the PTY registers — the
+        // exact #2343 ordering that defeats the vterm-vs-content gate.
+        let (content_cols, content_rows) = (39u16, 20u16);
+        pane.vterm.resize(content_cols, content_rows);
+
+        // The real backend PTY was forked at the single-pane estimate (80×24, the
+        // "full-screen" size `mk_test_handle` opens) and registered under instance_id.
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let instance_id = crate::types::InstanceId::default();
+        registry.lock().insert(
+            instance_id,
+            crate::agent::mk_test_handle("shell", instance_id),
+        );
+
+        let pane_id = pane.id;
+        let (_sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (fwd_tx, _fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wakeup_tx, _w) = crossbeam_channel::unbounded::<usize>();
+        apply_attach_outcome(
+            &mut pane,
+            &registry,
+            AttachOutcome::Ready {
+                pane_id,
+                instance_id,
+                rx: sub_rx,
+                dump: Vec::new(),
+                work_dir: home.clone(),
+                name: "shell".into(),
+            },
+            fwd_tx,
+            &wakeup_tx,
+        );
+
+        // The PTY must now be snapped to the split content rect — NOT left at the
+        // 80×24 single-pane spawn estimate (the #2343 bug). Clone the master Arc
+        // out of the registry guard so the lock is released before querying size.
+        let master = {
+            let reg = registry.lock();
+            Arc::clone(&reg.get(&instance_id).expect("handle present").pty_master)
+        };
+        let size = master.lock().get_size().expect("get_size");
+        assert_eq!(
+            (size.cols, size.rows),
+            (content_cols, content_rows),
+            "restored split-pane PTY must be resized to the split content rect, not the \
+             single-pane spawn estimate (got {}x{})",
+            size.cols,
+            size.rows
         );
         std::fs::remove_dir_all(&home).ok();
     }
