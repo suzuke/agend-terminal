@@ -1780,6 +1780,169 @@ fn pty_read_error_triggers_cleanup() {
     );
 }
 
+// ── Rank4 bug-audit spike follow-up: lock the `handle_pty_close` source-side
+// `deleted` guard — the ONLY net that stops `restart_instance` /
+// `replace_instance` from double-spawning.
+//
+// WHY THIS MATTERS — do NOT move or delete these without re-reading the Rank4
+// double-spawn spike conclusion:
+//
+//   `restart_instance` / `replace_instance` issue DELETE(no_wait) → SPAWN. The
+//   new instance is re-created under the SAME name (with a fresh
+//   `deleted=false` handle) BEFORE the OS reaps the old process and its death is
+//   classified. `AgentExitEvent::Crash` carries only the NAME (no PID /
+//   generation), so the #1913 crash-respawn SINK gates (config-by-name,
+//   deleted-by-name, registry-by-name in `daemon::crash_respawn`) all resolve to
+//   the NEW healthy handle — they would let the OLD process's death drive a
+//   respawn → a second, duplicate instance (double-spawn / zombie PTY).
+//
+//   The ONLY reliable protection is the SOURCE guard inside `handle_pty_close`:
+//   it checks the OLD handle's OWN `deleted` Arc — captured by Arc identity at
+//   spawn (`Arc::clone(&h.deleted)`), NOT a by-name registry lookup — BEFORE it
+//   classifies the exit, so the torn-down process emits NO exit event at all.
+//   `delete_transaction` Stores `deleted = true` (SeqCst) BEFORE the kill, and
+//   the kill is what triggers the PTY EOF the monitor observes, so the monitor's
+//   SeqCst load reliably sees `true`.
+//
+//   If anyone ever moves the `deleted` check after `classify_exit`, or lets a
+//   path emit an exit event before it, these two tests MUST go RED — the
+//   name-keyed sink gates will silently fail to catch that regression.
+
+/// Build an agent handle whose backend child exits with a CRASH-classified code
+/// (3 → `ExitKind::Crash`, distinct from 0/130 user-exit and 137/143
+/// signal-kill), with its `deleted` flag preset. Mirrors the live spawn handle
+/// shape (PTY master + slave-backed child) so `wait_for_process_exit` reads a
+/// real exit code.
+#[allow(clippy::unwrap_used)]
+fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::InstanceId) {
+    let id = crate::types::InstanceId::default();
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+    }));
+    let mut cmd = portable_pty::CommandBuilder::new("sh");
+    cmd.arg("-c");
+    cmd.arg("exit 3");
+    let child = portable_pty::native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap()
+        .slave
+        .spawn_command(cmd)
+        .unwrap();
+    let handle = AgentHandle {
+        id,
+        name: "rank4-guard".to_string().into(),
+        backend_command: "test".to_string(),
+        pty_writer,
+        pty_master: Arc::new(Mutex::new(
+            portable_pty::native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap()
+                .master,
+        )),
+        core,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(deleted)),
+    };
+    (handle, id)
+}
+
+/// Drive `pty_read_loop` → `handle_pty_close` for `handle` with an immediate-EOF
+/// reader and `shutdown=false` (so the close path is NOT short-circuited by the
+/// `is_shutdown` early return and actually reaches the `deleted` check /
+/// `classify_exit`). Returns the crash channel receiver so the caller can assert
+/// whether an `AgentExitEvent` was emitted.
+#[allow(clippy::unwrap_used)]
+fn run_pty_close_capturing_crash(
+    handle: AgentHandle,
+    id: crate::types::InstanceId,
+) -> crossbeam_channel::Receiver<crate::agent::AgentExitEvent> {
+    use std::collections::HashMap;
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let core = Arc::clone(&handle.core);
+    let pty_writer = Arc::clone(&handle.pty_writer);
+    let deleted = Arc::clone(&handle.deleted);
+    registry.lock().insert(id, handle);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let ctx = PtyReadContext {
+        name: "rank4-guard".to_string(),
+        instance_id: id,
+        core,
+        pty_writer,
+        registry: Arc::clone(&registry),
+        home: None,
+        crash_tx: Some(tx),
+        dismiss_patterns: Vec::new(),
+        shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        deleted,
+    };
+    struct EofReader;
+    impl std::io::Read for EofReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    let mut reader = EofReader;
+    let capture = crate::capture::make_capture_writer(None, "rank4-guard", "test");
+    pty_read_loop(&mut reader, &ctx, capture);
+    rx
+}
+
+/// Rank4 spike invariant — the decisive one. A `deleted = true` handle (the state
+/// `delete_transaction` Stores BEFORE the kill on the restart/replace no_wait
+/// path) whose child then exits with a CRASH code must emit NO exit event:
+/// `handle_pty_close`'s source-side `deleted` check suppresses it before
+/// classification, so the torn-down process never reaches crash-respawn and
+/// cannot double-spawn. This is restart/replace's ONLY protection — the
+/// name-keyed #1913 sink gates do not cover it (see module comment above).
+#[test]
+#[allow(clippy::unwrap_used)]
+fn deleted_guard_suppresses_exit_event_at_source_rank4() {
+    let (handle, id) = make_crash_exit_handle(true);
+    let rx = run_pty_close_capturing_crash(handle, id);
+    assert!(
+        rx.try_recv().is_err(),
+        "Rank4: a deleted handle's CRASH-classified exit must emit NO event — \
+         handle_pty_close must suppress at the SOURCE (the only net against \
+         restart/replace double-spawn; the name-keyed sink gates would miss it)"
+    );
+}
+
+/// Precision guard for the above: the source-side `deleted` check must suppress
+/// ONLY intentional teardowns, never a genuine crash. A `deleted = false` handle
+/// that crashes MUST still emit `AgentExitEvent::Crash` so real crash recovery is
+/// untouched (no blanket suppression).
+#[test]
+#[allow(clippy::unwrap_used)]
+fn deleted_guard_is_precise_real_crash_still_emits_rank4() {
+    let (handle, id) = make_crash_exit_handle(false);
+    let rx = run_pty_close_capturing_crash(handle, id);
+    let got = rx.try_recv();
+    assert!(
+        matches!(got, Ok(crate::agent::AgentExitEvent::Crash(_))),
+        "Rank4 precision: a live (deleted=false) handle's crash MUST still emit \
+         Crash — the deleted-guard must not blanket-suppress real crashes; got {got:?}"
+    );
+}
+
 struct ChunkReader {
     chunks: Vec<&'static [u8]>,
     next: usize,
