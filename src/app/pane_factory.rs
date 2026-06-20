@@ -1288,6 +1288,7 @@ mod tests {
     /// a half pane). `apply_attach_outcome` must explicitly snap the just-
     /// registered PTY to the (corrected) vterm size. RED before that explicit
     /// resize (PTY stuck at the 80×24 estimate); GREEN after.
+    #[cfg(unix)] // `mk_test_handle` is `#[cfg(all(test, unix))]` (spawns a `true` PTY)
     #[test]
     fn restored_split_pane_pty_snapped_to_content_rect() {
         let home = tmp_home("rf_split_resize");
