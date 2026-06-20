@@ -240,6 +240,150 @@ fn should_sync_notifications(
     }
 }
 
+/// #freeze-instrument (spike t-…2843, measure-only): `run_app` render-loop probes
+/// for the residual post-first-draw freeze ("panes appear, type a few chars, then
+/// stuck"). Active ONLY when `AGEND_FREEZE_INSTRUMENT` is set (see
+/// [`crate::sync_audit::freeze_instrument_threshold_us`]); otherwise every method
+/// early-returns so the loop is byte-identical. Emits a 1 s windowed summary
+/// (`#freeze-loop-summary`: draw rate / wakeup volume / loop iters / max draw +
+/// input handle) plus a per-event `#freeze-loop` line whenever one `terminal.draw`
+/// or input-handle stalls at/above the threshold — the span during which the
+/// single-threaded loop cannot service `event_rx`. Pairs with the
+/// `#freeze-corelock` lines from [`crate::sync_audit::CoreMutex`].
+struct FreezeInstrument {
+    threshold_us: Option<u64>,
+    window_start: std::time::Instant,
+    input_recv_at: Option<std::time::Instant>,
+    draws: u64,
+    wakeups: u64,
+    iters: u64,
+    inputs: u64,
+    max_draw_us: u64,
+    max_input_us: u64,
+    max_wakeup_burst: u64,
+}
+
+impl FreezeInstrument {
+    fn new() -> Self {
+        Self {
+            threshold_us: crate::sync_audit::freeze_instrument_threshold_us(),
+            window_start: std::time::Instant::now(),
+            input_recv_at: None,
+            draws: 0,
+            wakeups: 0,
+            iters: 0,
+            inputs: 0,
+            max_draw_us: 0,
+            max_input_us: 0,
+            max_wakeup_burst: 0,
+        }
+    }
+
+    #[inline]
+    fn enabled(&self) -> bool {
+        self.threshold_us.is_some()
+    }
+
+    /// Stamp `Instant::now()` for a draw/input span, or `None` when disabled (so
+    /// the caller skips the clock read entirely).
+    #[inline]
+    fn stamp(&self) -> Option<std::time::Instant> {
+        self.enabled().then(std::time::Instant::now)
+    }
+
+    /// Loop-top bookkeeping: count the iteration, close any pending input-handle
+    /// span (received → back at `select!`, covers all `continue` paths), and
+    /// flush the 1 s window.
+    fn on_loop_top(&mut self) {
+        if !self.enabled() {
+            return;
+        }
+        self.iters += 1;
+        if let Some(t) = self.input_recv_at.take() {
+            self.record_input(t.elapsed());
+        }
+        self.maybe_flush();
+    }
+
+    /// Mark an input event received by the `select!` arm; the handle span ends at
+    /// the next loop top.
+    fn mark_input_recv(&mut self) {
+        if self.enabled() {
+            self.input_recv_at = Some(std::time::Instant::now());
+        }
+    }
+
+    fn record_input(&mut self, dur: std::time::Duration) {
+        let Some(th) = self.threshold_us else { return };
+        self.inputs += 1;
+        let us = dur.as_micros() as u64;
+        self.max_input_us = self.max_input_us.max(us);
+        if us >= th {
+            tracing::info!(
+                tag = "#freeze-loop",
+                input_us = us,
+                "input-event handle exceeded threshold"
+            );
+        }
+    }
+
+    /// Record a `terminal.draw` span. `span` is the [`stamp`](Self::stamp) taken
+    /// just before the draw (`None` when disabled => no-op).
+    fn record_draw(&mut self, span: Option<std::time::Instant>) {
+        let (Some(th), Some(start)) = (self.threshold_us, span) else {
+            return;
+        };
+        self.draws += 1;
+        let us = start.elapsed().as_micros() as u64;
+        self.max_draw_us = self.max_draw_us.max(us);
+        if us >= th {
+            tracing::info!(
+                tag = "#freeze-loop",
+                draw_us = us,
+                "terminal.draw exceeded threshold (loop blocked, input unserviced)"
+            );
+        }
+    }
+
+    fn record_wakeup_burst(&mut self, drained: u64) {
+        if !self.enabled() {
+            return;
+        }
+        self.wakeups += drained;
+        self.max_wakeup_burst = self.max_wakeup_burst.max(drained);
+    }
+
+    /// Emit + reset the 1 s window summary once the window elapses (cheap no-op
+    /// before then). Called from [`on_loop_top`](Self::on_loop_top).
+    fn maybe_flush(&mut self) {
+        let elapsed = self.window_start.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        tracing::info!(
+            tag = "#freeze-loop-summary",
+            window_ms = elapsed.as_millis() as u64,
+            draws = self.draws,
+            fps = self.draws as f64 / elapsed.as_secs_f64(),
+            wakeups = self.wakeups,
+            max_wakeup_burst = self.max_wakeup_burst,
+            loop_iters = self.iters,
+            inputs = self.inputs,
+            max_draw_us = self.max_draw_us,
+            max_input_us = self.max_input_us,
+            "render-loop 1s window"
+        );
+        self.window_start = std::time::Instant::now();
+        self.draws = 0;
+        self.wakeups = 0;
+        self.iters = 0;
+        self.inputs = 0;
+        self.max_draw_us = 0;
+        self.max_input_us = 0;
+        self.max_wakeup_burst = 0;
+    }
+}
+
 /// #2050 simplify PR-C (②): render the active overlay on top of the main frame.
 /// Extracted verbatim from the two byte-identical blocks in `run_app` — the normal
 /// draw path and the screenshot (TestBackend) path — so they can't drift. Takes
@@ -670,12 +814,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // most once per `NOTIF_SYNC_INTERVAL` instead of once per wakeup (see
     // `should_sync_notifications`). Mirrors `last_draw`'s frame-cap state.
     let mut last_notif_sync: Option<std::time::Instant> = None;
+    // #freeze-instrument (spike t-…2843): env-gated render-loop diagnostics; a
+    // no-op unless AGEND_FREEZE_INSTRUMENT is set.
+    let mut freeze = FreezeInstrument::new();
 
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
             break;
         }
+        freeze.on_loop_top();
         // Auto-close the scratch shell overlay once its backing process
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
         // 50ms `default` arm of the main `select!` below guarantees this
@@ -759,6 +907,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         if dirty && should_draw(last_draw, frame_now, FRAME_INTERVAL) {
             last_draw = Some(frame_now);
             dirty = false;
+            let draw_span = freeze.stamp(); // #freeze-instrument: time the blocking draw
             terminal.draw(|frame| {
                 // #1027: snapshot the shared daemon-binary-stale flag once
                 // per frame so the render path sees a consistent value.
@@ -790,6 +939,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // resize its pane's VTerm/PTY during render.
                 render_active_overlay(frame, &mut overlay, &layout, &registry, &home);
             })?;
+            freeze.record_draw(draw_span); // #freeze-instrument
         }
 
         // #t-84833-10: wake the loop at the next frame boundary when a change is
@@ -810,6 +960,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         crossbeam_channel::select! {
             recv(event_rx) -> ev => {
                 dirty = true; // input may change the display → redraw next due frame
+                freeze.mark_input_recv(); // #freeze-instrument: span ends at next loop top
                 let ev = match ev {
                     Ok(e) => e,
                     Err(_) => break,
@@ -916,7 +1067,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // flood this channel, one wakeup per output chunk) so N chunks
                 // coalesce into ONE redraw, not N iterations. The frame cap above
                 // then bounds the actual redraw rate.
-                while wakeup_rx.try_recv().is_ok() {}
+                let mut drained = 1u64; // the wakeup that fired this arm
+                while wakeup_rx.try_recv().is_ok() {
+                    drained += 1;
+                }
+                freeze.record_wakeup_burst(drained); // #freeze-instrument
                 dirty = true;
             }
             recv(attach_rx) -> outcome => {

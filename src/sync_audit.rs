@@ -203,6 +203,50 @@ pub(crate) fn flock_depth() -> u32 {
     FLOCK_DEPTH.with(|c| c.get())
 }
 
+// ── #freeze-instrument (spike t-…2843): post-first-draw freeze diagnostics ──
+//
+// Measure-only, env-gated instrumentation for the residual TUI startup freeze
+// ("panes appear, type a few chars, then stuck"). Enabled SOLELY by
+// `AGEND_FREEZE_INSTRUMENT`; OFF by default => every probe is a cheap branch
+// with byte-identical behavior. Read once into a `OnceLock` (matches the
+// build+restart repro flow; cannot be live-toggled). It threads through the
+// single core-lock chokepoint below ([`CoreMutex`]) — so a slow `core.lock`
+// acquire-wait or hold is attributed to its `#[track_caller]` call site (e.g.
+// the PTY-feed hold in `agent::pty_read_loop` vs the per-agent state read in
+// `render::build_agent_state_snapshot`) — and through the `run_app` render loop
+// (draw rate / wakeup volume / input handle).
+//
+// Value = `None` disabled, or `Some(threshold_us)`: an acquire-wait or hold
+// at/above `threshold_us` emits one `#freeze-corelock` line (sub-threshold fast
+// locks stay silent to bound log volume + observer effect under the boot flood).
+
+static FREEZE_INSTRUMENT: OnceLock<Option<u64>> = OnceLock::new();
+
+/// Parse the `AGEND_FREEZE_INSTRUMENT` value into an optional per-event log
+/// threshold (microseconds). `"1"` => the 2 ms default; `"<N>"` with N>1 => a
+/// custom threshold; anything else (unset / empty / `"0"` / non-numeric) =>
+/// `None` (disabled). Pure (no env read) so the gating contract is unit-testable
+/// without a global-env race.
+fn parse_freeze_threshold(val: Option<&str>) -> Option<u64> {
+    match val {
+        Some("1") => Some(2_000),
+        Some(s) => match s.parse::<u64>() {
+            Ok(n) if n > 1 => Some(n),
+            _ => None,
+        },
+        None => None,
+    }
+}
+
+/// The freeze-diagnostic per-event threshold in microseconds, or `None` when the
+/// `AGEND_FREEZE_INSTRUMENT` env gate is off. Read once and cached. When `None`,
+/// callers take a byte-identical no-op path (zero behavior change).
+pub fn freeze_instrument_threshold_us() -> Option<u64> {
+    *FREEZE_INSTRUMENT.get_or_init(|| {
+        parse_freeze_threshold(std::env::var("AGEND_FREEZE_INSTRUMENT").ok().as_deref())
+    })
+}
+
 /// #1535: a `parking_lot::Mutex` wrapper for the per-agent `AgentCore` that
 /// tracks lock depth via [`CORE_LOCK_DEPTH`]. `.lock()` is API-compatible with
 /// `parking_lot::Mutex::lock` (the returned [`CoreGuard`] `Deref`s to `T`), so
@@ -225,16 +269,59 @@ impl<T> CoreMutex<T> {
     }
 
     /// Lock the core, bumping [`CORE_LOCK_DEPTH`] for the guard's lifetime.
+    ///
+    /// `#[track_caller]` so the `#freeze-instrument` probe (when enabled) can
+    /// attribute an acquire-wait / hold to the `.core.lock()` call site. The
+    /// implicit location arg is the only always-on cost; the clock reads + log
+    /// work are taken solely on the enabled path — the disabled path is
+    /// byte-identical to the original two-line lock.
+    #[track_caller]
     pub fn lock(&self) -> CoreGuard<'_, T> {
+        let Some(threshold_us) = freeze_instrument_threshold_us() else {
+            let guard = self.inner.lock();
+            core_lock_entered();
+            return CoreGuard { guard, probe: None };
+        };
+        let site = std::panic::Location::caller();
+        let wait_start = Instant::now();
         let guard = self.inner.lock();
         core_lock_entered();
-        CoreGuard { guard }
+        let waited_us = wait_start.elapsed().as_micros() as u64;
+        if waited_us >= threshold_us {
+            let cur = std::thread::current();
+            tracing::info!(
+                tag = "#freeze-corelock",
+                site = %site,
+                wait_us = waited_us,
+                thread = cur.name().unwrap_or("?"),
+                "core.lock acquire-wait exceeded threshold"
+            );
+        }
+        CoreGuard {
+            guard,
+            probe: Some(CoreLockProbe {
+                acquired: Instant::now(),
+                site,
+                threshold_us,
+            }),
+        }
     }
 }
 
 /// RAII guard from [`CoreMutex::lock`]; decrements [`CORE_LOCK_DEPTH`] on drop.
 pub struct CoreGuard<'a, T> {
     guard: parking_lot::MutexGuard<'a, T>,
+    /// `Some` only when `#freeze-instrument` is enabled; carries the acquire
+    /// stamp + call site so `drop` can attribute the hold duration. `None` (the
+    /// default path) makes `drop` a byte-identical no-op.
+    probe: Option<CoreLockProbe>,
+}
+
+/// #freeze-instrument hold-timing payload carried by an enabled [`CoreGuard`].
+struct CoreLockProbe {
+    acquired: Instant,
+    site: &'static std::panic::Location<'static>,
+    threshold_us: u64,
 }
 
 impl<T> std::ops::Deref for CoreGuard<'_, T> {
@@ -253,6 +340,19 @@ impl<T> std::ops::DerefMut for CoreGuard<'_, T> {
 impl<T> Drop for CoreGuard<'_, T> {
     fn drop(&mut self) {
         core_lock_exited();
+        if let Some(probe) = &self.probe {
+            let held_us = probe.acquired.elapsed().as_micros() as u64;
+            if held_us >= probe.threshold_us {
+                let cur = std::thread::current();
+                tracing::info!(
+                    tag = "#freeze-corelock",
+                    site = %probe.site,
+                    hold_us = held_us,
+                    thread = cur.name().unwrap_or("?"),
+                    "core.lock hold exceeded threshold"
+                );
+            }
+        }
     }
 }
 
@@ -476,5 +576,23 @@ mod tests {
         registry_lock_entered();
         registry_lock_exited();
         assert!(assert_no_registry_lock_for_self_ipc("api::call").is_ok());
+    }
+
+    // ── #freeze-instrument: env-gate parse contract (default OFF) ──
+    #[test]
+    fn freeze_threshold_disabled_by_default_and_for_falsey_values() {
+        // The critical invariant: absent / empty / "0" / non-numeric => disabled,
+        // so the CoreMutex + render-loop probes stay byte-identical no-ops.
+        assert_eq!(parse_freeze_threshold(None), None);
+        assert_eq!(parse_freeze_threshold(Some("")), None);
+        assert_eq!(parse_freeze_threshold(Some("0")), None);
+        assert_eq!(parse_freeze_threshold(Some("on")), None);
+    }
+
+    #[test]
+    fn freeze_threshold_enabled_forms() {
+        assert_eq!(parse_freeze_threshold(Some("1")), Some(2_000)); // default 2ms
+        assert_eq!(parse_freeze_threshold(Some("500")), Some(500)); // custom µs
+        assert_eq!(parse_freeze_threshold(Some("2")), Some(2)); // N>1 honored
     }
 }
