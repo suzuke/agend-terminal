@@ -28,7 +28,7 @@ pub(super) struct CommandCtx<'a> {
 /// (`matching_specs` + `render::overlay::render_command_palette`); `execute`
 /// below stays the source of truth for BEHAVIOR and is unchanged. ⚠ Adding or
 /// renaming a command in `execute` REQUIRES a matching entry here — the
-/// `command_specs_cover_execute_arms` test fails otherwise.
+/// `command_specs_match_execute_arms_bidirectional` test fails otherwise.
 pub(crate) struct CommandSpec {
     pub keyword: &'static str,
     pub usage: &'static str,
@@ -108,7 +108,8 @@ pub(crate) fn matching_specs(input: &str) -> Vec<&'static CommandSpec> {
 /// Execute a command palette command. Returns true if layout changed (needs resize).
 ///
 /// ⚠ Adding/renaming a command keyword here? Sync `COMMAND_SPECS` above (the
-/// completion list) — `command_specs_cover_execute_arms` enforces coverage.
+/// completion list) — `command_specs_match_execute_arms_bidirectional` asserts the
+/// two sets are exactly equal (both directions).
 pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
     let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
     if parts.is_empty() {
@@ -619,31 +620,47 @@ mod tests {
         assert!(matching_specs("zzz").is_empty());
     }
 
-    /// Structural sync guard: every `COMMAND_SPECS` keyword must appear as a
-    /// string literal inside `execute`, so a typo'd/stale spec can't ship a
-    /// completion the dispatcher doesn't handle. Source-scan (NOT live `execute`
-    /// calls — `spawn`/`restart` fork real PTY processes); pure + cross-platform.
-    /// Scan only the slice from `fn execute(` to the test module, so the
-    /// `COMMAND_SPECS` definition above and these tests below can't self-satisfy it.
+    /// Bidirectional sync guard: the `COMMAND_SPECS` keyword set must EXACTLY
+    /// equal the set of `execute` command arms — so a stale/typo'd spec can't
+    /// offer a completion the dispatcher won't handle (forward), AND a newly added
+    /// command can't be missing from the palette (reverse).
+    ///
+    /// Source-scan, NOT live `execute` calls (`spawn`/`restart` fork real PTY
+    /// processes); pure + cross-platform. Two precision measures vs a naive
+    /// substring scan:
+    /// 1. Bound to the `execute` fn body (`fn execute(` → next top-level `fn`), so
+    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms and the
+    ///    test module don't leak in.
+    /// 2. Match a quoted keyword ONLY when immediately followed by `|` (group arm)
+    ///    or `=>` (arm body). This excludes non-arm literals like
+    ///    `unwrap_or(&"agent")` and `Some("get")` (both followed by `)`), which a
+    ///    bare `contains("\"agent\"")` false-matched.
     #[test]
-    fn command_specs_cover_execute_arms() {
+    fn command_specs_match_execute_arms_bidirectional() {
+        use std::collections::BTreeSet;
         let src = include_str!("commands.rs");
         let from_execute = src
             .split_once("fn execute(cmd:")
             .map(|(_, rest)| rest)
             .expect("execute fn must exist");
         let exec_body = from_execute
-            .split_once("#[cfg(test)]")
+            .split_once("\nfn ")
             .map(|(body, _)| body)
             .unwrap_or(from_execute);
-        for spec in COMMAND_SPECS {
-            let arm = format!("\"{}\"", spec.keyword);
-            assert!(
-                exec_body.contains(&arm),
-                "COMMAND_SPECS keyword {:?} has no {} arm in execute — add the arm or remove the spec",
-                spec.keyword,
-                arm
-            );
-        }
+        let arm_re = regex::Regex::new(r#""([a-z_]+)"\s*(?:\||=>)"#).expect("valid regex");
+        let arm_keywords: BTreeSet<&str> = arm_re
+            .captures_iter(exec_body)
+            .map(|c| c.get(1).expect("group 1").as_str())
+            .collect();
+        let spec_keywords: BTreeSet<&str> = COMMAND_SPECS.iter().map(|s| s.keyword).collect();
+        assert_eq!(
+            spec_keywords,
+            arm_keywords,
+            "COMMAND_SPECS must EXACTLY match execute's command arms.\n  \
+             in specs only (offered but unhandled): {:?}\n  \
+             in execute only (handled but not in palette): {:?}",
+            spec_keywords.difference(&arm_keywords).collect::<Vec<_>>(),
+            arm_keywords.difference(&spec_keywords).collect::<Vec<_>>(),
+        );
     }
 }

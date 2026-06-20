@@ -607,9 +607,13 @@ pub(super) fn handle_key(
             // palette open (and a trailing space) so the operator types args next.
             // No-op when the prefix matches nothing.
             KeyCode::Tab => {
-                let keyword = super::commands::matching_specs(input)
-                    .get(*selected)
-                    .map(|s| s.keyword.to_string());
+                let matches = super::commands::matching_specs(input);
+                // Clamp `selected` at the use-site (same as render): it may be
+                // stale — e.g. a paste shrank the candidate list below it — and
+                // Tab must complete the candidate the operator actually sees
+                // highlighted, not silently no-op on an out-of-range index.
+                let idx = (*selected).min(matches.len().saturating_sub(1));
+                let keyword = matches.get(idx).map(|s| s.keyword.to_string());
                 if let Some(keyword) = keyword {
                     let rest: String = input
                         .split_whitespace()
@@ -1667,6 +1671,31 @@ mod tests {
         match &overlay {
             Overlay::Decisions { selected, .. } => assert_eq!(*selected, 1, "k moves up"),
             _ => panic!("expected Decisions overlay"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-5 BLOCKER 2 (r6): a paste can leave `selected` past the now-shorter
+    /// candidate list; Tab must still complete the highlighted keyword instead of
+    /// silently no-op'ing on an out-of-range index. Drive the exact stale state
+    /// (selected=5, input "co" → only `config` matches) through `handle_key`.
+    #[test]
+    fn tab_completes_keyword_when_selected_is_stale() {
+        let home = dec_home("cmd_tab_stale");
+        let mut overlay = Overlay::Command {
+            input: "co".to_string(),
+            selected: 5,
+        };
+        run_keys(&home, &mut overlay, &[KeyCode::Tab]);
+        match overlay {
+            Overlay::Command { input, selected } => {
+                assert_eq!(
+                    input, "config ",
+                    "Tab completes the matched keyword + trailing space"
+                );
+                assert_eq!(selected, 0, "Tab resets the highlight");
+            }
+            _ => panic!("palette must stay open after Tab"),
         }
         std::fs::remove_dir_all(&home).ok();
     }

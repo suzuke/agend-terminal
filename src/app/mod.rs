@@ -891,9 +891,19 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     Event::Paste(text) => {
                         match &mut overlay {
                             Overlay::RenameTab { ref mut input }
-                            | Overlay::RenamePane { ref mut input }
-                            | Overlay::Command { ref mut input, .. } => {
+                            | Overlay::RenamePane { ref mut input } => {
                                 input.push_str(&text);
+                            }
+                            // #t-5: paste grows `input` → the candidate set changes,
+                            // so reset the completion highlight (same as Char /
+                            // Backspace) — otherwise a stale `selected` past the new
+                            // (shorter) list left Tab silently no-op.
+                            Overlay::Command {
+                                ref mut input,
+                                ref mut selected,
+                            } => {
+                                input.push_str(&text);
+                                *selected = 0;
                             }
                             Overlay::ScratchShell { pane } => {
                                 pane.write_input(&registry, text.as_bytes());
