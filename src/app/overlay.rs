@@ -114,6 +114,11 @@ pub(super) enum Overlay {
     /// Command palette (:command input).
     Command {
         input: String,
+        /// #t-5 completion: highlighted index into the prefix-matched candidate
+        /// list (`commands::matching_specs(input)`). Recomputed on each edit; the
+        /// candidate list itself is derived from `input` (not stored) so the enum
+        /// holds no borrowed `&'static` specs.
+        selected: usize,
     },
     /// #2305: pending-decision answer board (Ctrl+B D). Lists questions awaiting
     /// an operator answer; Browse to pick one, then Answer (select an option or
@@ -563,7 +568,13 @@ pub(super) fn handle_key(
             }
             _ => {}
         },
-        Overlay::Command { ref mut input } => match key.code {
+        Overlay::Command {
+            ref mut input,
+            ref mut selected,
+        } => match key.code {
+            // Enter: execute the CURRENT input — semantics unchanged from before
+            // completion existed (completion is opt-in via Tab; Enter never picks a
+            // candidate, so muscle memory / scripts behave identically).
             KeyCode::Enter => {
                 let cmd = input.clone();
                 *overlay = Overlay::None;
@@ -582,11 +593,48 @@ pub(super) fn handle_key(
             KeyCode::Esc => {
                 *overlay = Overlay::None;
             }
+            // #t-5 completion nav: move the highlight within the candidate list.
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let n = super::commands::matching_specs(input).len();
+                if *selected + 1 < n {
+                    *selected += 1;
+                }
+            }
+            // Tab: complete the FIRST token to the highlighted keyword, keep the
+            // palette open (and a trailing space) so the operator types args next.
+            // No-op when the prefix matches nothing.
+            KeyCode::Tab => {
+                let matches = super::commands::matching_specs(input);
+                // Clamp `selected` at the use-site (same as render): it may be
+                // stale — e.g. a paste shrank the candidate list below it — and
+                // Tab must complete the candidate the operator actually sees
+                // highlighted, not silently no-op on an out-of-range index.
+                let idx = (*selected).min(matches.len().saturating_sub(1));
+                let keyword = matches.get(idx).map(|s| s.keyword.to_string());
+                if let Some(keyword) = keyword {
+                    let rest: String = input
+                        .split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    *input = if rest.is_empty() {
+                        format!("{keyword} ")
+                    } else {
+                        format!("{keyword} {rest}")
+                    };
+                    *selected = 0;
+                }
+            }
             KeyCode::Backspace => {
                 input.pop();
+                *selected = 0; // candidate set changed → reset highlight
             }
             KeyCode::Char(c) => {
                 input.push(c);
+                *selected = 0; // candidate set changed → reset highlight
             }
             _ => {}
         },
@@ -1623,6 +1671,31 @@ mod tests {
         match &overlay {
             Overlay::Decisions { selected, .. } => assert_eq!(*selected, 1, "k moves up"),
             _ => panic!("expected Decisions overlay"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-5 BLOCKER 2 (r6): a paste can leave `selected` past the now-shorter
+    /// candidate list; Tab must still complete the highlighted keyword instead of
+    /// silently no-op'ing on an out-of-range index. Drive the exact stale state
+    /// (selected=5, input "co" → only `config` matches) through `handle_key`.
+    #[test]
+    fn tab_completes_keyword_when_selected_is_stale() {
+        let home = dec_home("cmd_tab_stale");
+        let mut overlay = Overlay::Command {
+            input: "co".to_string(),
+            selected: 5,
+        };
+        run_keys(&home, &mut overlay, &[KeyCode::Tab]);
+        match overlay {
+            Overlay::Command { input, selected } => {
+                assert_eq!(
+                    input, "config ",
+                    "Tab completes the matched keyword + trailing space"
+                );
+                assert_eq!(selected, 0, "Tab resets the highlight");
+            }
+            _ => panic!("palette must stay open after Tab"),
         }
         std::fs::remove_dir_all(&home).ok();
     }

@@ -4,7 +4,10 @@
 //! same PTY lifecycle as the daemon: auto-dismiss, state tracking, broadcast.
 
 mod api_server;
-mod commands;
+// #t-5: `pub(crate)` so `render::overlay` can read the completion specs
+// (`CommandSpec` / `COMMAND_SPECS` / `matching_specs`). `execute` stays
+// `pub(super)` = app-only, so command EXECUTION is not widened.
+pub(crate) mod commands;
 mod dispatch;
 mod mouse;
 mod overlay;
@@ -290,8 +293,11 @@ fn render_active_overlay(
                 .unwrap_or(0);
             render::render_scroll_indicator(frame, so);
         }
-        Overlay::Command { ref input } => {
-            render::render_command_palette(frame, input);
+        Overlay::Command {
+            ref input,
+            selected,
+        } => {
+            render::render_command_palette(frame, input, *selected);
         }
         Overlay::Decisions {
             ref items,
@@ -885,9 +891,19 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     Event::Paste(text) => {
                         match &mut overlay {
                             Overlay::RenameTab { ref mut input }
-                            | Overlay::RenamePane { ref mut input }
-                            | Overlay::Command { ref mut input } => {
+                            | Overlay::RenamePane { ref mut input } => {
                                 input.push_str(&text);
+                            }
+                            // #t-5: paste grows `input` → the candidate set changes,
+                            // so reset the completion highlight (same as Char /
+                            // Backspace) — otherwise a stale `selected` past the new
+                            // (shorter) list left Tab silently no-op.
+                            Overlay::Command {
+                                ref mut input,
+                                ref mut selected,
+                            } => {
+                                input.push_str(&text);
+                                *selected = 0;
                             }
                             Overlay::ScratchShell { pane } => {
                                 pane.write_input(&registry, text.as_bytes());

@@ -327,17 +327,50 @@ pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {
     );
 }
 
-pub fn render_command_palette(frame: &mut Frame, input: &str) {
+/// #t-5: command palette with prefix-match completion. Renders the `:input` line
+/// plus a candidate list — `commands::matching_specs(input)`, derived live from the
+/// input (empty input lists all, the "what commands exist?" entry point) — with the
+/// `selected` candidate highlighted, modeled on [`render_menu`]. Keyword-only (P0).
+pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
     let area = frame.area();
-    let w = 60u16.min(area.width.saturating_sub(4));
+    let matches = crate::app::commands::matching_specs(input);
+    // Cap rows so the popup can't outgrow the screen; the full set (11) fits.
+    let shown = matches.len().min(12);
+    let sel = selected.min(shown.saturating_sub(1));
+
+    let w = 64u16.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = area.height / 3;
-    let ra = Rect::new(x, y, w, 3);
-    let inner = render_titled_popup(frame, ra, Color::Cyan, " : Command (Enter, Esc) ");
-    frame.render_widget(
-        Paragraph::new(format!(":{input}")).style(Style::default().fg(Color::White)),
-        inner,
-    );
+    // 1 input line + `shown` candidate rows + 2 border rows, clamped to the screen.
+    let height = u16::try_from(shown + 3)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let ra = Rect::new(x, y, w, height);
+    let inner = render_titled_popup(frame, ra, Color::Cyan, " : Command — Tab ↑↓ Enter Esc ");
+
+    let mut lines: Vec<Line> = Vec::with_capacity(shown + 1);
+    lines.push(Line::from(Span::styled(
+        format!(":{input}"),
+        Style::default().fg(Color::White),
+    )));
+    for (i, spec) in matches.iter().take(shown).enumerate() {
+        let style = if i == sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let prefix = if i == sel { "> " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{:<26} {}", spec.usage, spec.desc),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    // Cursor on the input line, just after `:input`.
     let cursor_x = inner.x + 1 + input.width() as u16;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, inner.y));
@@ -387,5 +420,40 @@ mod tests {
     fn centered_overlay_rect_centers_within_area() {
         let r = centered_overlay_rect(Rect::new(0, 0, 100, 40), 10, 50, 2, 4);
         assert_eq!((r.x, r.y, r.width, r.height), (25, 15, 50, 10));
+    }
+
+    /// #t-5 UX smoke: the palette lists ALL commands on empty input (the operator's
+    /// "what commands exist?" discovery), and prefix-filters to matching keywords.
+    #[test]
+    fn command_palette_lists_all_on_open_and_prefix_filters() {
+        fn palette_text(input: &str) -> String {
+            let backend = ratatui::backend::TestBackend::new(80, 20);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_command_palette(frame, input, 0))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+                }
+                out.push('\n');
+            }
+            out
+        }
+        // Empty input → list every command.
+        let all = palette_text("");
+        assert!(
+            all.contains("spawn") && all.contains("config") && all.contains("layout"),
+            "empty input must list all commands:\n{all}"
+        );
+        // Prefix narrows to matching keyword(s) only.
+        let co = palette_text("co");
+        assert!(co.contains("config"), "`co` must show config:\n{co}");
+        assert!(
+            !co.contains("spawn") && !co.contains("layout"),
+            "`co` must hide non-matching commands:\n{co}"
+        );
     }
 }
