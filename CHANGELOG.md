@@ -5,6 +5,22 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-role MCP tool subsetting, now active (#2367)** — a typed, operator-declared `role_kind` in `fleet.yaml` (seven variants) drives each instance's tool subset. The previous free-text `role:` match never matched real prose roles, so every agent saw all tools; read-only roles (reviewer/planner/explorer) now get report/read subsets, and an exhaustive match forces a deliberate subset decision for each new role (#2300, #2344).
+- **Turn-completion sentinel shadow extended to Claude (#2366 — measure-only, default OFF)** — under `AGEND_TURN_SENTINEL_SHADOW=1`, Claude is now also injected the turn-completion sentinel and shadow-measured, giving a cross-backend emission baseline. Claude's authoritative state still comes from its lifecycle hooks; the shadow never drives state (#1523 Phase 0).
+
+### Fixed
+
+- **API connection counter is panic-safe (#2368)** — the per-connection slot and in-flight session counters were decremented *after* `handle_session`, so a panic unwind skipped them; leaked slots accumulated to the cap (32) and rejected every new connection, locking up the control plane. RAII guards now release the slot on every path, including a panic unwind (bug-audit Rank1).
+- **Telegram authorization runs before side-effects (#2369)** — the allowlist check ran *after* fleet-status injection and `加 task:` board writes, so a non-allowlisted sender could read fleet status or create a board task. The authz block is hoisted ahead of all content side-effects (bug-audit Rank2).
+- **ci-watch supersede no longer drops a prefix-colliding branch (#2370)** — `mark_ci_watch_superseded` matched the `repo@branch` key by substring, so a `repo@feat/x` event wrongly superseded an unread `repo@feat/x-2` CI-ready notice (silent signal loss). It now matches on `correlation_id` equality (bug-audit Rank3).
+- **Null required MCP arguments are rejected cleanly (#2372)** — `validate_args` treated a present-but-JSON-null required field as present, so e.g. `reply {"message": null}` forwarded an empty string and failed opaquely downstream; it now rejects null-as-missing for every handler, while a legitimate empty string still passes.
+- **GR1 out-of-dispatch notify re-arms after a release (#2373)** — the hijack-notify fire-once latch was never cleared on `unbind`, so after a self-claim → notify → release, a later real re-claim of the same branch was silently swallowed; `unbind` now clears the latch, with intra-cycle dedup preserved (bug-audit Rank6).
+- **Restart/replace double-spawn guard regression-locked (#2371 — test-only)** — the source-side `deleted` guard in `handle_pty_close` is the only net preventing a same-name re-spawn double-spawn on the restart/replace path; two regression tests now pin it (deleted → exit suppressed; not-deleted → crash still emitted), with no production change (bug-audit Rank4).
+
 ## [0.9.0] — 2026-06-19
 
 228 commits since 0.8.0. Highlights, organized by theme (not an exhaustive commit list).

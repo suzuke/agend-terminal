@@ -5,6 +5,22 @@
 本文件記錄本專案所有重要變更。
 格式基於 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)；專案遵循 [SemVer](https://semver.org/spec/v2.0.0.html)。
 
+## [Unreleased]
+
+### Added
+
+- **per-role MCP 工具子集現已生效(#2367)** — `fleet.yaml` 新增型別化、由 operator 宣告的 `role_kind`(七種變體)驅動每個實例的工具子集。先前用自由文字 `role:` 比對,永遠對不上真實的散文角色名,所以每個 agent 都看到全部工具;唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集,且 exhaustive match 強制每個新角色都要明確決定子集(#2300、#2344)。
+- **turn-completion sentinel shadow 擴及 Claude(#2366 —— measure-only、預設 OFF)** — 在 `AGEND_TURN_SENTINEL_SHADOW=1` 下,Claude 現在也會被注入 turn-completion sentinel 並做 shadow 量測,取得跨 backend 的 emission 基線。Claude 的權威狀態仍走其 lifecycle hooks;shadow 永不驅動 state(#1523 Phase 0)。
+
+### Fixed
+
+- **API 連線計數器 panic-safe(#2368)** — per-connection slot 與 in-flight session 計數器在 `handle_session` *之後* 才遞減,panic unwind 會跳過;洩漏的 slot 累積到上限(32)後拒絕所有新連線,鎖死控制面。RAII guard 現在在所有路徑(含 panic unwind)都釋放 slot(bug-audit Rank1)。
+- **Telegram 授權在 side-effect 之前執行(#2369)** — allowlist 檢查跑在 fleet-status 注入與 `加 task:` 板寫入 *之後*,非 allowlist 的傳送者可讀取 fleet 狀態或建立板任務。授權區塊已提前到所有內容 side-effect 之前(bug-audit Rank2)。
+- **ci-watch supersede 不再誤殺前綴碰撞的 branch(#2370)** — `mark_ci_watch_superseded` 以子字串比對 `repo@branch` 鍵,使得 `repo@feat/x` 事件誤把未讀的 `repo@feat/x-2` CI-ready 通知標為 superseded(訊號靜默遺失)。現改以 `correlation_id` 相等比對(bug-audit Rank3)。
+- **null 的必填 MCP 參數被乾淨拒絕(#2372)** — `validate_args` 把「存在但為 JSON null」的必填欄位當成存在,例如 `reply {"message": null}` 會轉發空字串、在下游不透明地失敗;現在對每個 handler 都把 null 視為缺漏拒絕,而合法的空字串仍通過。
+- **GR1 out-of-dispatch 通知在 release 後重新武裝(#2373)** — 劫持通知的 fire-once latch 在 `unbind` 時從未清除,使得 self-claim → notify → release 後,之後同分支的真正 re-claim 被靜默吞掉;`unbind` 現在清除 latch,且保留 intra-cycle dedup(bug-audit Rank6)。
+- **restart/replace 雙重 spawn 防護加上回歸鎖(#2371 —— 僅測試)** — `handle_pty_close` 裡 source 端的 `deleted` guard 是 restart/replace 路徑上防止同名 re-spawn 雙重 spawn 的唯一保護;兩個回歸測試現在把它釘住(deleted → 抑制 exit;not-deleted → crash 仍發出),無 production 變更(bug-audit Rank4)。
+
 ## [0.9.0] — 2026-06-19
 
 自 0.8.0 起 228 個 commit。以下依主題整理重點(非完整 commit 清單)。
