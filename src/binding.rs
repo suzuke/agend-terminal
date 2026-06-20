@@ -303,6 +303,11 @@ pub fn bind_full(
 /// `caller_process_context` is daemon-side regardless). Best-effort + file-based
 /// (the same `inbox::notify_agent` primitive as `canonical_auto_stash`); never
 /// blocks and runs under the caller's binding lock, so no network/no spawn.
+/// #2347: the live delivery is routed to the bound agent's TEAM ORCHESTRATOR
+/// (`out_of_dispatch_notify_recipient`, fallback `general`) rather than the
+/// global operator inbox, and SKIPPED when the orchestrator resolves to the
+/// agent itself (a top-level lead) — a self-notify is pure noise. The event-log
+/// marker below stays unconditional, so this routing never weakens GR1 detection.
 fn notify_operator_out_of_dispatch_bind(
     home: &Path,
     agent: &str,
@@ -339,8 +344,16 @@ fn notify_operator_out_of_dispatch_bind(
             prev_branch.unwrap_or("<none>")
         ),
     );
-    // Operator-visible delivery (best-effort, file-based inbox to the operator-mapped
-    // `general` agent — mirrors `canonical_auto_stash`).
+    // #2347: route the operator-visible delivery to the bound agent's team
+    // orchestrator (fallback `general`), skipping a self-notify. `None` ⟹ the
+    // recipient would be the agent itself (a top-level lead) ⟹ pure noise ⟹
+    // skip; the event-log marker above already recorded it for GR1 forensics.
+    let recipient = match out_of_dispatch_notify_recipient(home, agent) {
+        Some(r) => r,
+        None => return,
+    };
+    // Best-effort, file-based inbox to the resolved recipient — mirrors
+    // `canonical_auto_stash`.
     let was = prev_branch
         .map(|p| format!(", was `{p}`"))
         .unwrap_or_default();
@@ -353,10 +366,29 @@ fn notify_operator_out_of_dispatch_bind(
     );
     crate::inbox::notify_agent(
         home,
-        "general",
+        &recipient,
         &crate::inbox::NotifySource::System("binding_out_of_dispatch"),
         &text,
     );
+}
+
+/// #2347: resolve WHO receives the out-of-dispatch live notice for `agent`.
+/// Routes to the agent's team orchestrator so an operator-directed team-lead
+/// bind doesn't spam the global `general` operator inbox; a teamless/orphan
+/// agent (no team lists it, or its team has no orchestrator) falls back to
+/// `general`. Returns `None` when the recipient would be the bound agent itself
+/// (a top-level lead's orchestrator resolves to itself) — a self-notify is pure
+/// noise and is skipped. Purely a routing decision: the #2158 GR1 event-log
+/// marker is emitted unconditionally by the caller regardless, so this never
+/// attempts the structurally-impossible legit-vs-stolen discrimination and
+/// never weakens GR1 detection.
+fn out_of_dispatch_notify_recipient(home: &Path, agent: &str) -> Option<String> {
+    let recipient =
+        crate::fleet::team_orchestrator_for(home, agent).unwrap_or_else(|| "general".to_string());
+    if recipient == agent {
+        return None;
+    }
+    Some(recipient)
 }
 
 /// #1651: the HMAC sidecar path for a binding dir. The agend-git shim hard-codes
@@ -1426,6 +1458,99 @@ mod tests {
         assert!(
             !log.contains("binding_out_of_dispatch"),
             "#2158 GR1: an EMPTY-task_id dispatch (is_self_claim=false) must NOT false-notify: {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2347: route the binding_out_of_dispatch DELIVERY to the team ────────
+    // orchestrator. `out_of_dispatch_notify_recipient` is the pure routing
+    // decision, unit-tested directly (the live delivery goes through
+    // `notify_agent`'s compose-aware inject, which is gated on pane/draft state
+    // and so is NOT observable via `inbox::drain` in a no-pane test). The
+    // event-log marker stays unconditional (see the #2158 GR1 tests above and
+    // the forensics-guard integration test below) so GR1 detection is
+    // unaffected. NOT a legit-vs-stolen discrimination (structurally impossible,
+    // GR1 premise) — only WHO receives the live notice changes.
+
+    /// #2347 ①: an operator-directed team-LEAD self-claim (lead == its own
+    /// team's orchestrator) resolves to NO recipient — a self-notify is pure
+    /// noise, so neither `general` nor the lead itself is live-notified.
+    #[test]
+    fn out_of_dispatch_notify_recipient_skips_self_for_team_lead_2347() {
+        let home = tmp_home("2347-lead-skip");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        assert_eq!(
+            out_of_dispatch_notify_recipient(&home, "lead"),
+            None,
+            "#2347: a self-claiming team-lead (orchestrator == self) must not be live-notified"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2347 ②: a NON-lead member's self-claim routes the live notice to its
+    /// team's orchestrator (a DIFFERENT instance), NOT to `general`.
+    #[test]
+    fn out_of_dispatch_notify_recipient_routes_to_orchestrator_2347() {
+        let home = tmp_home("2347-member-orch");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  ops:\n    members: [dev, lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        assert_eq!(
+            out_of_dispatch_notify_recipient(&home, "dev").as_deref(),
+            Some("lead"),
+            "#2347: a member's out-of-dispatch notice routes to its team orchestrator"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2347 ③: a TEAMLESS agent (no team lists it) falls back to the `general`
+    /// operator inbox — preserves operator visibility for an instance no lead owns.
+    #[test]
+    fn out_of_dispatch_notify_recipient_falls_back_to_general_when_teamless_2347() {
+        let home = tmp_home("2347-teamless");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  ops:\n    members: [someoneelse]\n    orchestrator: someoneelse\n",
+        )
+        .unwrap();
+        assert_eq!(
+            out_of_dispatch_notify_recipient(&home, "loner").as_deref(),
+            Some("general"),
+            "#2347: a teamless agent's notice falls back to `general`"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2347 ④ (forensics guard): even when the live notify is SKIPPED (a
+    /// self-claiming lead), the unconditional `binding_out_of_dispatch`
+    /// event-log marker MUST still fire exactly once — the skip must never gate
+    /// the #2158 GR1 detection signal.
+    #[test]
+    fn self_claiming_lead_still_logs_marker_despite_skipped_notify_2347() {
+        let home = tmp_home("2347-lead-marker");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  ops:\n    members: [lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        bind_full(&home, "lead", "", "feat/x", &wt, &src, true).expect("self-claim bind ok");
+
+        let log = read_event_log(&home);
+        assert_eq!(
+            log.matches("binding_out_of_dispatch").count(),
+            1,
+            "#2347: the GR1 event-log marker must fire once even when live notify is skipped: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

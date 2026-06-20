@@ -795,13 +795,20 @@ fn checkout_bind_true_writes_binding_marker_and_no_longer_arms_watch_2158_gr1() 
         Some(false),
         "self-claim checkout must report ci_watch_armed:false: {resp}"
     );
-    // #2158 GR1: a self-claim `repo checkout bind:true` MUST notify the operator
-    // (it passes is_self_claim=true to bind_full).
+    // #2158 GR1: a self-claim `repo checkout bind:true` surfaces the
+    // `binding_out_of_dispatch` MARKER (it passes is_self_claim=true to
+    // bind_full). #2347: the live DELIVERY now routes via the bound agent's team
+    // orchestrator (fallback `general` — this teamless test agent → general); the
+    // unconditional event-log marker is the GR1-forensics invariant asserted here
+    // (live delivery goes through the compose-aware inject, not a drainable inbox,
+    // so the recipient is verified by the `out_of_dispatch_notify_recipient` unit
+    // tests in `binding.rs`, not here).
     assert!(
         std::fs::read_to_string(home.join("event-log.jsonl"))
             .unwrap_or_default()
             .contains("binding_out_of_dispatch"),
-        "#2158 GR1: self-claim checkout bind:true must notify the operator"
+        "#2158 GR1 marker (unconditional; #2347 delivery routes via team orchestrator): \
+         self-claim checkout bind:true must surface binding_out_of_dispatch"
     );
 
     // HEAD must be on the named branch (NOT detached). Verifies the
