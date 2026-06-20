@@ -190,6 +190,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         Action::CommandPalette => {
             out.new_overlay = Some(Overlay::Command {
                 input: String::new(),
+                selected: 0,
             });
         }
         Action::ShowDecisions => {

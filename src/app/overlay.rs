@@ -114,6 +114,11 @@ pub(super) enum Overlay {
     /// Command palette (:command input).
     Command {
         input: String,
+        /// #t-5 completion: highlighted index into the prefix-matched candidate
+        /// list (`commands::matching_specs(input)`). Recomputed on each edit; the
+        /// candidate list itself is derived from `input` (not stored) so the enum
+        /// holds no borrowed `&'static` specs.
+        selected: usize,
     },
     /// #2305: pending-decision answer board (Ctrl+B D). Lists questions awaiting
     /// an operator answer; Browse to pick one, then Answer (select an option or
@@ -563,7 +568,13 @@ pub(super) fn handle_key(
             }
             _ => {}
         },
-        Overlay::Command { ref mut input } => match key.code {
+        Overlay::Command {
+            ref mut input,
+            ref mut selected,
+        } => match key.code {
+            // Enter: execute the CURRENT input — semantics unchanged from before
+            // completion existed (completion is opt-in via Tab; Enter never picks a
+            // candidate, so muscle memory / scripts behave identically).
             KeyCode::Enter => {
                 let cmd = input.clone();
                 *overlay = Overlay::None;
@@ -582,11 +593,44 @@ pub(super) fn handle_key(
             KeyCode::Esc => {
                 *overlay = Overlay::None;
             }
+            // #t-5 completion nav: move the highlight within the candidate list.
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let n = super::commands::matching_specs(input).len();
+                if *selected + 1 < n {
+                    *selected += 1;
+                }
+            }
+            // Tab: complete the FIRST token to the highlighted keyword, keep the
+            // palette open (and a trailing space) so the operator types args next.
+            // No-op when the prefix matches nothing.
+            KeyCode::Tab => {
+                let keyword = super::commands::matching_specs(input)
+                    .get(*selected)
+                    .map(|s| s.keyword.to_string());
+                if let Some(keyword) = keyword {
+                    let rest: String = input
+                        .split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    *input = if rest.is_empty() {
+                        format!("{keyword} ")
+                    } else {
+                        format!("{keyword} {rest}")
+                    };
+                    *selected = 0;
+                }
+            }
             KeyCode::Backspace => {
                 input.pop();
+                *selected = 0; // candidate set changed → reset highlight
             }
             KeyCode::Char(c) => {
                 input.push(c);
+                *selected = 0; // candidate set changed → reset highlight
             }
             _ => {}
         },

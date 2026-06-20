@@ -23,7 +23,92 @@ pub(super) struct CommandCtx<'a> {
     pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
 
+/// #t-5 command-palette completion: declarative metadata for the `:` commands —
+/// keyword + usage + one-line description. Consumed ONLY by the completion list
+/// (`matching_specs` + `render::overlay::render_command_palette`); `execute`
+/// below stays the source of truth for BEHAVIOR and is unchanged. ⚠ Adding or
+/// renaming a command in `execute` REQUIRES a matching entry here — the
+/// `command_specs_cover_execute_arms` test fails otherwise.
+pub(crate) struct CommandSpec {
+    pub keyword: &'static str,
+    pub usage: &'static str,
+    pub desc: &'static str,
+}
+
+pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        keyword: "spawn",
+        usage: "spawn [name] [backend]",
+        desc: "New agent in a new tab",
+    },
+    CommandSpec {
+        keyword: "vsplit",
+        usage: "vsplit [name] [backend]",
+        desc: "New agent; split focused pane vertically",
+    },
+    CommandSpec {
+        keyword: "hsplit",
+        usage: "hsplit [name] [backend]",
+        desc: "New agent; split focused pane horizontally",
+    },
+    CommandSpec {
+        keyword: "kill",
+        usage: "kill <agent>",
+        desc: "Close an agent's pane",
+    },
+    CommandSpec {
+        keyword: "restart",
+        usage: "restart [agent]",
+        desc: "Restart an agent (focused pane if omitted)",
+    },
+    CommandSpec {
+        keyword: "layout",
+        usage: "layout [preset]",
+        desc: "Apply a layout preset (cycles if omitted)",
+    },
+    CommandSpec {
+        keyword: "send",
+        usage: "send <agent> <message>",
+        desc: "Send a message to one agent",
+    },
+    CommandSpec {
+        keyword: "broadcast",
+        usage: "broadcast <message>",
+        desc: "Broadcast a message to all agents",
+    },
+    CommandSpec {
+        keyword: "status",
+        usage: "status",
+        desc: "Log every agent's current state",
+    },
+    CommandSpec {
+        keyword: "config",
+        usage: "config get|set|list [key] [value]",
+        desc: "Runtime config get / set / list",
+    },
+    CommandSpec {
+        keyword: "set",
+        usage: "set <key> <value>",
+        desc: "Set a runtime config key (`config set` shorthand)",
+    },
+];
+
+/// The command specs whose keyword (first token) starts with `input`'s first
+/// token — the palette's prefix-match completion candidates. Empty/whitespace
+/// input matches ALL (list-on-open). Keyword-only (P0); argument-value completion
+/// (backend / agent / config-key / preset names) is a follow-up.
+pub(crate) fn matching_specs(input: &str) -> Vec<&'static CommandSpec> {
+    let first = input.split_whitespace().next().unwrap_or("");
+    COMMAND_SPECS
+        .iter()
+        .filter(|s| s.keyword.starts_with(first))
+        .collect()
+}
+
 /// Execute a command palette command. Returns true if layout changed (needs resize).
+///
+/// ⚠ Adding/renaming a command keyword here? Sync `COMMAND_SPECS` above (the
+/// completion list) — `command_specs_cover_execute_arms` enforces coverage.
 pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
     let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
     if parts.is_empty() {
@@ -512,5 +597,53 @@ mod tests {
             "palette :set copy_on_select off must persist to runtime-config.json"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #t-5 command-palette completion ──────────────────────────────────────
+
+    #[test]
+    fn matching_specs_prefix_filters_first_token() {
+        // Empty / whitespace input → ALL specs (list-on-open, the operator's
+        // "what commands exist?" entry point).
+        assert_eq!(matching_specs("").len(), COMMAND_SPECS.len());
+        assert_eq!(matching_specs("   ").len(), COMMAND_SPECS.len());
+        // Prefix narrows; only `config` starts with "co".
+        let co = matching_specs("co");
+        assert!(co.iter().any(|s| s.keyword == "config"));
+        assert!(co.iter().all(|s| s.keyword.starts_with("co")));
+        // First token only: trailing args don't drop the keyword match.
+        assert!(matching_specs("config get foo")
+            .iter()
+            .any(|s| s.keyword == "config"));
+        // No match → empty (so Tab-complete is a no-op).
+        assert!(matching_specs("zzz").is_empty());
+    }
+
+    /// Structural sync guard: every `COMMAND_SPECS` keyword must appear as a
+    /// string literal inside `execute`, so a typo'd/stale spec can't ship a
+    /// completion the dispatcher doesn't handle. Source-scan (NOT live `execute`
+    /// calls — `spawn`/`restart` fork real PTY processes); pure + cross-platform.
+    /// Scan only the slice from `fn execute(` to the test module, so the
+    /// `COMMAND_SPECS` definition above and these tests below can't self-satisfy it.
+    #[test]
+    fn command_specs_cover_execute_arms() {
+        let src = include_str!("commands.rs");
+        let from_execute = src
+            .split_once("fn execute(cmd:")
+            .map(|(_, rest)| rest)
+            .expect("execute fn must exist");
+        let exec_body = from_execute
+            .split_once("#[cfg(test)]")
+            .map(|(body, _)| body)
+            .unwrap_or(from_execute);
+        for spec in COMMAND_SPECS {
+            let arm = format!("\"{}\"", spec.keyword);
+            assert!(
+                exec_body.contains(&arm),
+                "COMMAND_SPECS keyword {:?} has no {} arm in execute — add the arm or remove the spec",
+                spec.keyword,
+                arm
+            );
+        }
     }
 }
