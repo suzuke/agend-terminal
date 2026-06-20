@@ -230,9 +230,7 @@ impl Backend {
             | Backend::Codex
             | Backend::OpenCode
             | Backend::Agy => self.preset().command.to_string(),
-            Backend::Shell => {
-                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string())
-            }
+            Backend::Shell => crate::shell_command(),
             Backend::Raw(path) => path.clone(),
         }
     }

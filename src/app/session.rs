@@ -241,8 +241,7 @@ pub(super) fn restore_with_reconciliation(
                 Some(pane)
             }
             None => {
-                let shell =
-                    std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
+                let shell = crate::shell_command();
                 let (pane, job) = super::pane_factory::build_deferred_direct_pane(
                     layout,
                     home,

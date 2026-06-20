@@ -18,12 +18,7 @@ pub(crate) fn lock_state(
 /// Shared tokio runtime for all Telegram sync→async calls.
 pub(super) fn telegram_runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("telegram tokio runtime")
-    })
+    RT.get_or_init(|| crate::shared_async::build_current_thread_runtime("telegram tokio runtime"))
 }
 
 /// Run a future on the Telegram runtime. If already inside an async context

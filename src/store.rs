@@ -105,16 +105,6 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
     }
 }
 
-/// Save a typed struct to a JSON file. Returns error on failure.
-#[allow(dead_code)] // Last caller (deployments::save) migrated to save_atomic; kept for future use
-pub fn save<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(data)?)?;
-    Ok(())
-}
-
 /// #965 process-wide unique tmp suffix counter. Combined with `process::id`
 /// so cross-process concurrent atomic_write calls (CLI + daemon, or
 /// multiple agend-terminal CLIs) also receive distinct tmp paths.
@@ -509,7 +499,7 @@ mod tests {
             items: vec!["a".into(), "b".into()],
             count: 42,
         };
-        save(&path, &data).expect("save");
+        save_atomic(&path, &data).expect("save");
         let loaded: TestData = load(&path);
         assert_eq!(loaded, data);
         fs::remove_dir_all(&dir).ok();
@@ -550,7 +540,7 @@ mod tests {
             items: vec!["x".into()],
             count: 1,
         };
-        save(&path, &data).expect("save with nested dirs");
+        save_atomic(&path, &data).expect("save with nested dirs");
         let loaded: TestData = load(&path);
         assert_eq!(loaded, data);
         fs::remove_dir_all(&dir).ok();
@@ -568,8 +558,8 @@ mod tests {
             items: vec!["new".into()],
             count: 2,
         };
-        save(&path, &v1).expect("save v1");
-        save(&path, &v2).expect("save v2");
+        save_atomic(&path, &v1).expect("save v1");
+        save_atomic(&path, &v2).expect("save v2");
         let loaded: TestData = load(&path);
         assert_eq!(loaded, v2);
         fs::remove_dir_all(&dir).ok();

@@ -292,8 +292,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 crate::render::scratch_shell_rect(ratatui::layout::Rect::new(0, 0, cols, rows));
             let inner_w = box_rect.width.saturating_sub(2);
             let inner_h = box_rect.height.saturating_sub(2);
-            let shell =
-                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
+            let shell = crate::shell_command();
             // Open the scratch shell in the focused pane's working
             // directory — typically where the user is already thinking /
             // editing, so sibling commands (git status, ls, etc.) Just Work.

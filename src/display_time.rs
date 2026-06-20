@@ -29,22 +29,7 @@ pub fn format_local_short(rfc3339: &str, tz: Option<&str>) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
         return rfc3339.chars().take(10).collect();
     };
-    match tz {
-        Some(iana) => match iana.parse::<chrono_tz::Tz>() {
-            Ok(tz) => parsed.with_timezone(&tz).format("%m-%d %H:%M").to_string(),
-            Err(_) => {
-                warn_invalid_iana_once(iana);
-                parsed
-                    .with_timezone(&chrono::Local)
-                    .format("%m-%d %H:%M")
-                    .to_string()
-            }
-        },
-        None => parsed
-            .with_timezone(&chrono::Local)
-            .format("%m-%d %H:%M")
-            .to_string(),
-    }
+    render_in_tz(parsed, tz, "%m-%d %H:%M")
 }
 
 /// #1487: format a UTC instant in the operator display timezone as a
@@ -61,15 +46,28 @@ pub fn format_local_short(rfc3339: &str, tz: Option<&str>) -> String {
 /// (system tz); invalid IANA → warn-once + `chrono::Local` fallback.
 pub fn format_iso_offset(now: chrono::DateTime<chrono::Utc>, tz: Option<&str>) -> String {
     const FMT: &str = "%Y-%m-%dT%H:%M:%S%:z";
+    render_in_tz(now, tz, FMT)
+}
+
+/// #2050 simplify PR-E (⑨): the shared timezone-render branch behind
+/// [`format_local_short`] and [`format_iso_offset`] — resolve the IANA `tz`
+/// (warn-once + `chrono::Local` fallback on an invalid name; `None` → `Local`)
+/// and format `dt` with `fmt`. Byte-identical to the former inline matches; the
+/// warn-once + fallback ordering is preserved verbatim.
+fn render_in_tz<Tz: chrono::TimeZone>(
+    dt: chrono::DateTime<Tz>,
+    tz: Option<&str>,
+    fmt: &str,
+) -> String {
     match tz {
         Some(iana) => match iana.parse::<chrono_tz::Tz>() {
-            Ok(tz) => now.with_timezone(&tz).format(FMT).to_string(),
+            Ok(tz) => dt.with_timezone(&tz).format(fmt).to_string(),
             Err(_) => {
                 warn_invalid_iana_once(iana);
-                now.with_timezone(&chrono::Local).format(FMT).to_string()
+                dt.with_timezone(&chrono::Local).format(fmt).to_string()
             }
         },
-        None => now.with_timezone(&chrono::Local).format(FMT).to_string(),
+        None => dt.with_timezone(&chrono::Local).format(fmt).to_string(),
     }
 }
 

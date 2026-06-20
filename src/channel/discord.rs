@@ -422,12 +422,7 @@ pub(crate) fn send_keepalive_patch(
 /// Shared tokio runtime for Discord sync→async calls.
 fn discord_runtime() -> &'static tokio::runtime::Runtime {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("discord tokio runtime")
-    })
+    RT.get_or_init(|| crate::shared_async::build_current_thread_runtime("discord tokio runtime"))
 }
 
 /// #1476: run a Discord async call to completion, safe even when already inside

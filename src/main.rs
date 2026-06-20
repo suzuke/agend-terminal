@@ -66,6 +66,7 @@ mod schedules;
 mod scm;
 mod screenshot;
 mod service;
+mod shared_async;
 mod skills;
 mod snapshot;
 mod state;
@@ -109,6 +110,13 @@ pub fn default_shell() -> &'static str {
     {
         "/bin/bash"
     }
+}
+
+/// #2050 simplify PR-E (⑭): resolve the interactive shell for scratch/shell panes
+/// — `$SHELL`, else [`default_shell`]. Single point for a future fleet.yaml shell
+/// override. Was inlined verbatim at five call sites.
+pub fn shell_command() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string())
 }
 
 pub fn home_dir() -> PathBuf {
