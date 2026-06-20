@@ -42,88 +42,61 @@ use crate::daemon::mcp_registry_watcher::{DaemonBinaryStale, McpRegistryWatcherT
 use crate::daemon::retention::RetentionSupervisor;
 use crate::daemon::waiting_on_stale::WaitingOnStaleTracker;
 use parking_lot::Mutex;
-use std::collections::HashSet;
 
-/// Sprint 59 Wave 1 PR-1 (#9): per-task ETA stall scan, throttled to 5min.
-pub(crate) struct AntiStallHandler {
-    tracker: Mutex<AntiStallTracker>,
-}
-impl AntiStallHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(AntiStallTracker::default()),
+/// #2050 simplify: collapse the truly-uniform `maybe_scan`-over-`ctx.home`
+/// tracker wrappers. Each is `struct H { tracker: Mutex<T> }` + an arg-less
+/// `new()` + a [`PerTickHandler`] impl whose `run` calls
+/// `self.tracker.lock().maybe_scan(ctx.home)`; only the type, the `name`
+/// literal, and the per-wrapper doc differ. The 4 NON-uniform handlers
+/// (McpRegistry's extra `binary_stale`, WaitingOnStale's and ConflictNotify's
+/// `retain_active` prunes, Retention's `maybe_sweep`) stay hand-written below.
+/// Behaviour-identical: `<$T>::default()` ≡ the original `T::default()`, same
+/// `name()`, same per-tick `maybe_scan(ctx.home)`. The doc on each invocation is
+/// re-emitted onto the generated struct so the issue history survives.
+macro_rules! tracker_handler {
+    ($(#[$doc:meta])* $H:ident => $T:ty, $name:literal) => {
+        $(#[$doc])*
+        pub(crate) struct $H {
+            tracker: Mutex<$T>,
         }
-    }
-}
-impl PerTickHandler for AntiStallHandler {
-    fn name(&self) -> &'static str {
-        "anti_stall"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
-
-/// Sprint 59 Wave 1 PR-2 (#10+#12): per-agent + fleet idle thresholds, 5min.
-pub(crate) struct IdleWatchdogHandler {
-    tracker: Mutex<IdleWatchdogTracker>,
-}
-impl IdleWatchdogHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(IdleWatchdogTracker::default()),
+        impl $H {
+            pub(crate) fn new() -> Self {
+                Self {
+                    tracker: Mutex::new(<$T>::default()),
+                }
+            }
         }
-    }
-}
-impl PerTickHandler for IdleWatchdogHandler {
-    fn name(&self) -> &'static str {
-        "idle_watchdog"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
+        impl PerTickHandler for $H {
+            fn name(&self) -> &'static str {
+                $name
+            }
+            fn run(&self, ctx: &TickContext<'_>) {
+                self.tracker.lock().maybe_scan(ctx.home);
+            }
+        }
+    };
 }
 
-/// Sprint 59 Wave 1 PR-4-recover (B): operator-decision auto-default on
-/// timeout, 5min throttle.
-pub(crate) struct DecisionTimeoutHandler {
-    tracker: Mutex<DecisionTimeoutTracker>,
-}
-impl DecisionTimeoutHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(DecisionTimeoutTracker::default()),
-        }
-    }
-}
-impl PerTickHandler for DecisionTimeoutHandler {
-    fn name(&self) -> &'static str {
-        "decision_timeout"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
+tracker_handler!(
+    /// Sprint 59 Wave 1 PR-1 (#9): per-task ETA stall scan, throttled to 5min.
+    AntiStallHandler => AntiStallTracker, "anti_stall"
+);
 
-/// Sprint 59 Wave 2 PR-3 (#13): deployment-cadence helper-staleness ping.
-pub(crate) struct HelperStalenessHandler {
-    tracker: Mutex<HelperStalenessWatchdogTracker>,
-}
-impl HelperStalenessHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(HelperStalenessWatchdogTracker::default()),
-        }
-    }
-}
-impl PerTickHandler for HelperStalenessHandler {
-    fn name(&self) -> &'static str {
-        "helper_staleness"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
+tracker_handler!(
+    /// Sprint 59 Wave 1 PR-2 (#10+#12): per-agent + fleet idle thresholds, 5min.
+    IdleWatchdogHandler => IdleWatchdogTracker, "idle_watchdog"
+);
+
+tracker_handler!(
+    /// Sprint 59 Wave 1 PR-4-recover (B): operator-decision auto-default on
+    /// timeout, 5min throttle.
+    DecisionTimeoutHandler => DecisionTimeoutTracker, "decision_timeout"
+);
+
+tracker_handler!(
+    /// Sprint 59 Wave 2 PR-3 (#13): deployment-cadence helper-staleness ping.
+    HelperStalenessHandler => HelperStalenessWatchdogTracker, "helper_staleness"
+);
 
 /// Sprint 60 W1 PR-2 (#P0-2): daemon-binary hot-reload detector. Flips the
 /// shared TUI status-bar flag (`DaemonBinaryStale`) the render loop reads —
@@ -174,10 +147,7 @@ impl PerTickHandler for WaitingOnStaleHandler {
         // doesn't leak one permanent entry per ever-stale agent, and a same-name
         // redeploy can't inherit a stale dedup timestamp that false-suppresses a
         // real alert.
-        let live: HashSet<String> = {
-            let reg = crate::agent::lock_registry(ctx.registry);
-            reg.values().map(|h| h.name.to_string()).collect()
-        };
+        let live = crate::agent::live_agent_names(ctx.registry);
         self.tracker.lock().retain_active(&live);
     }
 }
@@ -206,93 +176,30 @@ impl PerTickHandler for ConflictNotifyHandler {
         // #1923 G5 cleanup-on-delete (was supervisor.rs:425-430): prune
         // per-agent conflict state for agents no longer in the registry. Runs
         // every tick, unconditionally, exactly as the supervisor `.retain` did.
-        let live: HashSet<String> = {
-            let reg = crate::agent::lock_registry(ctx.registry);
-            reg.values().map(|h| h.name.to_string()).collect()
-        };
+        let live = crate::agent::live_agent_names(ctx.registry);
         self.tracker.lock().retain_active(&live);
     }
 }
 
-/// #852 residual PR-B: per-tick canonical-drift (detached-HEAD residue) scan.
-pub(crate) struct CanonicalDriftHandler {
-    tracker: Mutex<CanonicalDriftTracker>,
-}
-impl CanonicalDriftHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(CanonicalDriftTracker::default()),
-        }
-    }
-}
-impl PerTickHandler for CanonicalDriftHandler {
-    fn name(&self) -> &'static str {
-        "canonical_drift"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
+tracker_handler!(
+    /// #852 residual PR-B: per-tick canonical-drift (detached-HEAD residue) scan.
+    CanonicalDriftHandler => CanonicalDriftTracker, "canonical_drift"
+);
 
-/// #870: per-tick auto-release scan (faster ~30s cadence, internal).
-pub(crate) struct AutoReleaseHandler {
-    tracker: Mutex<AutoReleaseTracker>,
-}
-impl AutoReleaseHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(AutoReleaseTracker::default()),
-        }
-    }
-}
-impl PerTickHandler for AutoReleaseHandler {
-    fn name(&self) -> &'static str {
-        "auto_release"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
+tracker_handler!(
+    /// #870: per-tick auto-release scan (faster ~30s cadence, internal).
+    AutoReleaseHandler => AutoReleaseTracker, "auto_release"
+);
 
-/// PR1 watchdog L1: cross-team-safe dispatch-idle scan (~60s, internal).
-pub(crate) struct DispatchIdleHandler {
-    tracker: Mutex<DispatchIdleTracker>,
-}
-impl DispatchIdleHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(DispatchIdleTracker::default()),
-        }
-    }
-}
-impl PerTickHandler for DispatchIdleHandler {
-    fn name(&self) -> &'static str {
-        "dispatch_idle"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
+tracker_handler!(
+    /// PR1 watchdog L1: cross-team-safe dispatch-idle scan (~60s, internal).
+    DispatchIdleHandler => DispatchIdleTracker, "dispatch_idle"
+);
 
-/// PR1 watchdog L2: generic per-team auto-nudge on exceeded dispatches.
-pub(crate) struct DispatchIdleNudgeHandler {
-    tracker: Mutex<DispatchIdleNudgeTracker>,
-}
-impl DispatchIdleNudgeHandler {
-    pub(crate) fn new() -> Self {
-        Self {
-            tracker: Mutex::new(DispatchIdleNudgeTracker::default()),
-        }
-    }
-}
-impl PerTickHandler for DispatchIdleNudgeHandler {
-    fn name(&self) -> &'static str {
-        "dispatch_idle_nudge"
-    }
-    fn run(&self, ctx: &TickContext<'_>) {
-        self.tracker.lock().maybe_scan(ctx.home);
-    }
-}
+tracker_handler!(
+    /// PR1 watchdog L2: generic per-team auto-nudge on exceeded dispatches.
+    DispatchIdleNudgeHandler => DispatchIdleNudgeTracker, "dispatch_idle_nudge"
+);
 
 /// Retention sweep (review-task / tmp GC supervisor).
 pub(crate) struct RetentionHandler {

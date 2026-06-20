@@ -361,6 +361,27 @@ pub fn lock_registry(reg: &AgentRegistry) -> RegistryGuard<'_> {
     RegistryGuard { inner }
 }
 
+/// #2050 simplify: the live-agent-name registry-snapshot idiom — a `HashSet`
+/// of the current handle names taken under the registry lock — centralized
+/// from the 4 daemon-lane copies (`supervisor` + `supervisor_trackers`). The 3
+/// app-lane sites build the set inline before a `.filter` and are left as-is
+/// (outside this lane).
+pub(crate) fn live_agent_names(registry: &AgentRegistry) -> std::collections::HashSet<String> {
+    lock_registry(registry)
+        .values()
+        .map(|h| h.name.to_string())
+        .collect()
+}
+
+/// `Vec` sibling of [`live_agent_names`] for the one caller
+/// (`check_pane_input_not_submitted`) that needs an ordered `&[String]` slice.
+pub(crate) fn live_agent_names_vec(registry: &AgentRegistry) -> Vec<String> {
+    lock_registry(registry)
+        .values()
+        .map(|h| h.name.to_string())
+        .collect()
+}
+
 // ── #945 Phase 1: pending-registry slot for deferred attach ────────────
 //
 // `bootstrap::telegram_init` runs in a background thread (~6s of HTTP

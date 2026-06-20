@@ -384,10 +384,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             // W1.1 (#2050): the sibling `conflict_notify_tracker.retain_active`
             // prune moved into `ConflictNotifyHandler::run` alongside the
             // tracker it cleans (its state now lives in that handler).
-            let live_agents: std::collections::HashSet<String> = {
-                let reg = agent::lock_registry(&registry);
-                reg.values().map(|h| h.name.to_string()).collect()
-            };
+            let live_agents = agent::live_agent_names(&registry);
             notify_tracks.retain(|name, _| live_agents.contains(name));
             // CR-2026-06-14 (resource-leak): `pending_auth` has NO
             // cleanup-on-delete path of its own — entries are only removed inside
@@ -433,10 +430,7 @@ pub(crate) fn check_pane_input_not_submitted(
     tracks: &mut HashMap<String, PaneInputTrack>,
     loop_started_at: Instant,
 ) {
-    let agent_names: Vec<String> = {
-        let reg = agent::lock_registry(registry);
-        reg.values().map(|h| h.name.to_string()).collect()
-    };
+    let agent_names = agent::live_agent_names_vec(registry);
     check_pane_input_not_submitted_for_agents(home, &agent_names, tracks, loop_started_at);
 }
 
