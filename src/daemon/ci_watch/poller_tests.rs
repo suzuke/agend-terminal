@@ -1,31 +1,6 @@
 use super::*;
 use crate::agent::AgentRegistry;
 
-enum RunsResponse<'a> {
-    Run(&'a serde_json::Value),
-    NoRuns,
-    ApiError(String),
-}
-
-fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse<'_> {
-    if !(200..300).contains(&status) {
-        let message = body["message"].as_str().unwrap_or("(no message)");
-        let hint = if status == 403
-            && std::env::var("GITHUB_TOKEN").is_err()
-            && message.to_lowercase().contains("rate limit")
-        {
-            " — set GITHUB_TOKEN to raise the unauthenticated 60/hr cap"
-        } else {
-            ""
-        };
-        return RunsResponse::ApiError(format!("GH API {status}: {message}{hint}"));
-    }
-    match body["workflow_runs"].as_array().and_then(|a| a.first()) {
-        Some(run) => RunsResponse::Run(run),
-        None => RunsResponse::NoRuns,
-    }
-}
-
 #[test]
 fn ci_watches_dir_returns_expected_path() {
     let home = std::path::Path::new("/tmp/test");
@@ -244,83 +219,146 @@ fn test_force_push_invalidates_run_id() {
 // the production `remove_watch(.., reason = "pr_terminal")` and asserts both
 // the file removal and the `ci_watch_removed` event-log entry.
 
-// --- classify_runs_response: silent-rate-limit regression pin ---
+// --- GitHubCiProvider::poll_runs status classification (real-path) ---
+//
+// These replace the former `classify_response_*` units that drove a
+// test-only shadow `classify_runs_response`. They drive the PRODUCTION
+// `GitHubCiProvider::poll_runs` against a mock HTTP server (mirrors the
+// `gitlab_poll_runs_parses_pipelines` pattern) so a divergence in the real
+// status→{Runs, ApiError} classification is actually caught. Core pin: a 403
+// rate-limit MUST surface as `ApiError`, never an empty `Runs` set — the
+// silent-CI-swallow regression. (Production has no `NoRuns` variant; a 2xx
+// with no runs is `Runs { runs: [] }`.)
+
+/// One-shot mock HTTP server returning a caller-chosen status line + JSON
+/// body, then closing. Unlike `gitlab_mock_server` (hardcoded 200) this lets
+/// a test exercise the error-classification arms of `poll_runs`.
+fn github_status_mock_server(status_line: &str, body: &str) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let body = body.to_string();
+    let status_line = status_line.to_string();
+    // fire-and-forget: test mock server thread, joined by the caller
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).expect("read");
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).expect("write");
+    });
+    (port, handle)
+}
+
+fn github_poll(port: u16) -> anyhow::Result<super::CiPollResult> {
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    rt.block_on(provider.poll_runs("o/r", "main"))
+}
 
 #[test]
-fn classify_response_picks_first_run_on_2xx() {
+fn github_poll_runs_2xx_parses_workflow_runs() {
     let body = serde_json::json!({
-        "workflow_runs": [{"id": 42, "head_sha": "abc"}, {"id": 41}]
-    });
-    match classify_runs_response(200, &body) {
-        RunsResponse::Run(r) => assert_eq!(r["id"].as_u64(), Some(42)),
-        other => panic!("expected Run, got {:?}", std::mem::discriminant(&other)),
+        "workflow_runs": [
+            {"id": 42, "head_sha": "abc", "conclusion": "success",
+             "html_url": "https://example.com/42", "name": "CI", "run_attempt": 1},
+            {"id": 41, "head_sha": "def", "conclusion": "failure",
+             "html_url": "https://example.com/41", "name": "CI", "run_attempt": 1}
+        ]
+    })
+    .to_string();
+    let (port, handle) = github_status_mock_server("200 OK", &body);
+    let result = github_poll(port);
+    handle.join().expect("mock");
+
+    let runs = match result.expect("poll_runs") {
+        super::CiPollResult::Runs { runs, .. } => runs,
+        other => panic!("expected Runs, got {other:?}"),
+    };
+    assert_eq!(runs.len(), 2, "both workflow_runs must be parsed");
+    assert_eq!(runs[0].id, 42);
+    assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
+    assert_eq!(runs[0].head_sha, "abc");
+}
+
+#[test]
+fn github_poll_runs_2xx_empty_yields_empty_runs() {
+    // A genuine "no runs yet" (200 + empty array) and a 200 with the
+    // `workflow_runs` key absent entirely must BOTH classify as an empty
+    // `Runs` set — never panic, never an ApiError. This is the legit case
+    // the 403 pin below must stay distinguishable from.
+    for body in [r#"{"workflow_runs": []}"#, "{}"] {
+        let (port, handle) = github_status_mock_server("200 OK", body);
+        let result = github_poll(port);
+        handle.join().expect("mock");
+        match result.expect("poll_runs") {
+            super::CiPollResult::Runs { runs, .. } => {
+                assert!(runs.is_empty(), "200 empty must yield empty runs: {body}");
+            }
+            other => panic!("200 empty must be empty Runs, got {other:?}: {body}"),
+        }
     }
 }
 
 #[test]
-fn classify_response_no_runs_on_2xx_empty_array() {
-    // Genuine "branch has no runs yet" — must NOT be confused with
-    // an API error.
-    let body = serde_json::json!({"workflow_runs": []});
-    assert!(matches!(
-        classify_runs_response(200, &body),
-        RunsResponse::NoRuns
-    ));
-}
-
-#[test]
-fn classify_response_rate_limit_is_api_error_not_no_runs() {
-    // Real-world body returned by GitHub when an unauthenticated
-    // client exceeds 60/hr. Without the status check, the absence
-    // of `workflow_runs` here looks identical to the legit empty
-    // case above and silently swallows every subsequent CI event.
+fn github_poll_runs_403_rate_limit_is_api_error_not_empty_runs() {
+    // CORE PIN (silent-rate-limit regression): GitHub returns a 403 with no
+    // `workflow_runs` when an unauthenticated client exceeds 60/hr. Without
+    // the production status guard this body is indistinguishable from the
+    // legit empty case above and would silently swallow every CI event. The
+    // classification MUST be `ApiError` with the status surfaced — NOT an
+    // empty `Runs`. The token hint is gated on the process-wide token cache
+    // (env → gh CLI), so we assert the status+message classification, not
+    // the exact hint text.
     let body = serde_json::json!({
-        "message": "API rate limit exceeded for 1.2.3.4. (But here's the good news: ...)",
+        "message": "API rate limit exceeded for 1.2.3.4.",
         "documentation_url": "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting"
-    });
-    match classify_runs_response(403, &body) {
-        RunsResponse::ApiError(msg) => {
-            assert!(msg.contains("403"), "msg should include status: {msg}");
+    })
+    .to_string();
+    let (port, handle) = github_status_mock_server("403 Forbidden", &body);
+    let result = github_poll(port);
+    handle.join().expect("mock");
+    match result.expect("poll_runs") {
+        super::CiPollResult::ApiError {
+            status, message, ..
+        } => {
+            assert_eq!(status, 403, "403 status must be surfaced");
             assert!(
-                msg.contains("rate limit"),
-                "msg should surface GH message: {msg}"
+                message.contains("403"),
+                "message must include status: {message}"
+            );
+            assert!(
+                message.to_lowercase().contains("rate limit"),
+                "message must surface the GH body: {message}"
             );
         }
-        _ => panic!("rate-limit response must be ApiError, not NoRuns"),
+        other => {
+            panic!("403 rate-limit MUST be ApiError, got {other:?} (silent-swallow regression)")
+        }
     }
 }
 
 #[test]
-fn classify_response_token_hint_only_when_unauthenticated_403() {
-    // Hint should fire on unauthenticated 403 rate-limit. We can't
-    // safely mutate $GITHUB_TOKEN in a parallel-test process, so
-    // assert only the prefix shape and trust the env-gated branch.
-    let body =
-        serde_json::json!({"message": "API rate limit exceeded for example. Authenticated …"});
-    let RunsResponse::ApiError(msg) = classify_runs_response(403, &body) else {
-        panic!("expected ApiError");
-    };
-    assert!(msg.starts_with("GH API 403: API rate limit exceeded"));
-}
-
-#[test]
-fn classify_response_5xx_is_api_error() {
-    let body = serde_json::json!({"message": "Server Error"});
-    assert!(matches!(
-        classify_runs_response(500, &body),
-        RunsResponse::ApiError(_)
-    ));
-}
-
-#[test]
-fn classify_response_unknown_payload_falls_through_safely() {
-    // 200 OK but missing workflow_runs entirely (would never happen
-    // in practice but must not panic).
-    let body = serde_json::json!({});
-    assert!(matches!(
-        classify_runs_response(200, &body),
-        RunsResponse::NoRuns
-    ));
+fn github_poll_runs_5xx_is_api_error() {
+    // A 5xx server error must also classify as `ApiError`, never empty `Runs`.
+    let body = serde_json::json!({"message": "Server Error"}).to_string();
+    let (port, handle) = github_status_mock_server("500 Internal Server Error", &body);
+    let result = github_poll(port);
+    handle.join().expect("mock");
+    match result.expect("poll_runs") {
+        super::CiPollResult::ApiError { status, .. } => assert_eq!(status, 500),
+        other => panic!("5xx MUST be ApiError, got {other:?}"),
+    }
 }
 
 // --- github_token_warning: preventive watch_ci response hint ---
