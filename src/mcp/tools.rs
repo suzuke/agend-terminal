@@ -291,6 +291,20 @@ pub(crate) fn def_deployment() -> Value {
         }, "required": ["action"]}})
 }
 
+pub(crate) fn def_ephemeral() -> Value {
+    json!({"name": "ephemeral", "description": "#1967 Phase-1 (PR1 scaffold): manage short-lived cross-backend ephemeral workers OUTSIDE managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap. NOTE: PR1 spawns a FAKE /bin/sleep child — real headless backend transport is a later PR.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["spawn", "list", "reap"]},
+            "backend": {"type": "string", "description": "spawn: target backend (e.g. opencode). PR1 spawns a fake child regardless; real backends land in PR2/PR3."},
+            "workflow_id": {"type": "string", "description": "spawn: the owning workflow id (required). list/reap: optional filter to one workflow."},
+            "parent": {"type": "string", "description": "spawn: optional parent worker/agent id for the telemetry tree."},
+            "ttl_secs": {"type": "number", "description": "spawn: max wall-clock TTL in seconds (cost guard). Default 1800, clamped to 7200. The reap sweep terminates a worker past its TTL."},
+            "token_budget": {"type": "number", "description": "spawn: per-worker token budget (recorded; enforcement lands in a later PR)."},
+            "worker_id": {"type": "string", "description": "reap: reap a single worker by id."},
+            "all_stale": {"type": "boolean", "description": "reap: reap all due/dead workers (TTL-expired, terminal, or process gone)."}
+        }, "required": ["action"]}})
+}
+
 pub(crate) fn def_ci() -> Value {
     json!({"name": "ci", "description": "Manage CI watching. Actions: watch, unwatch, status.",
         "inputSchema": {"type": "object", "properties": {
@@ -584,9 +598,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            36,
-            "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36. \
-             Current tools: {:?}",
+            37,
+            "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
+             + ephemeral (#1967 Phase-1) = 37. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -917,6 +931,14 @@ mod tests {
             ("deployment", "directory", "deployments.rs working-dir override"),
             ("deployment", "name", "deployments.rs deployment name"),
             ("deployment", "branch", "deployments.rs per-instance worktree"),
+            // ── ephemeral (#1967 Phase-1) ──
+            ("ephemeral", "action", "mcp/handlers/dispatch.rs spawn/list/reap"),
+            ("ephemeral", "backend", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.backend"),
+            ("ephemeral", "workflow_id", "mcp/handlers/ephemeral.rs spawn/list/reap workflow filter"),
+            ("ephemeral", "parent", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.parent"),
+            ("ephemeral", "ttl_secs", "mcp/handlers/ephemeral.rs handle_spawn → ephemeral_tracking::resolve_ttl (max-wall-TTL guard)"),
+            ("ephemeral", "worker_id", "mcp/handlers/ephemeral.rs handle_reap → reap_one"),
+            ("ephemeral", "all_stale", "mcp/handlers/ephemeral.rs handle_reap → reap_sweep"),
             // ── ci ──
             ("ci", "action", "ci/mod.rs routing"),
             ("ci", "repository", "ci/mod.rs watch/unwatch/status"),
@@ -1010,6 +1032,11 @@ mod tests {
                 "reporting_cadence",
                 "#649 Phase-1 passthrough; Phase-2 cadence scheduler deferred",
             ),
+            (
+                "ephemeral",
+                "token_budget",
+                "#1967 PR6 per-workflow token-budget enforcement deferred (recorded on the worker in PR1)",
+            ),
         ];
 
         // The coordination tools this guard enforces (every declared field must be
@@ -1021,6 +1048,7 @@ mod tests {
             "team",
             "schedule",
             "deployment",
+            "ephemeral",
             "ci",
             "repo",
             "bind_self",

@@ -722,6 +722,11 @@ pub(crate) fn build_default_handlers(
         // safety net. Same 360-tick cadence as the GC siblings; app-mode (the
         // live daemon is app-mode). (B) OFF → no backups → natural no-op.
         Box::new(per_tick::ReconcileBackupsGcHandler::new(360)),
+        // #1967 Phase-1 (PR1): reap ephemeral workers every ~1min (6 ticks) —
+        // removes/terminates terminal, max-wall-TTL-expired (cost guard), or
+        // already-dead workers. Runs in app mode too (not allowlisted out); the
+        // live daemon is app-mode. Idle cost: one read of a usually-tiny JSON sidecar.
+        Box::new(per_tick::EphemeralReapHandler::new(6)),
         // Context% alert (operator-directed): every 6 ticks (~1min) refresh +
         // ≥80% orchestrator alert. The transcript-estimate file IO lives in
         // this handler's tick (lock-free during the read), NOT in the PTY
