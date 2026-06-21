@@ -22,6 +22,24 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+/// #freeze-4 A1: chunk size the initial screen dump is split into when fed through
+/// the pane's rx (instead of one unbounded `vterm.process(&dump)`). Matches the
+/// PTY read size so the render loop's boot/steady drain treats dump bytes exactly
+/// like live output — keeps the boot-phase per-frame TIME cap tight (a single
+/// chunk can't blow it) and removes the last unbounded process on the restart path.
+const DUMP_CHUNK_BYTES: usize = 8 * 1024;
+
+/// #freeze-4 probe (env-gated, `AGEND_FREEZE_INSTRUMENT`): log the initial screen
+/// dump size per pane at attach, so an operator restart-repro can size the
+/// restart-flood (the `vterm.process(&dump)` cost was previously uninstrumented —
+/// `#freeze-backlog` only sees the rx stream). Off by default → zero overhead.
+fn freeze_dump_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("AGEND_FREEZE_INSTRUMENT").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 /// Spawn an agent/shell via spawn_agent and add as a new tab.
 #[allow(clippy::too_many_arguments)]
 /// Whether a spawned pane is a managed fleet agent or an unmanaged local shell.
@@ -347,10 +365,17 @@ fn spawn_and_subscribe(
 /// Cheap, **main-thread** half of an attach (#render-first phase-(b)): apply the
 /// [`spawn_and_subscribe`] result to the placeholder pane and start the output
 /// forwarder. MUST run on the render thread — it mutates the `Pane` (which lives
-/// in the main-thread-owned `Layout`) and processes the dump BEFORE the forwarder
-/// is started, so the initial screen is seeded ahead of any post-subscribe stream
-/// (the render loop's `drain_output` only ever sees post-dump bytes → no
-/// out-of-order first frame).
+/// in the main-thread-owned `Layout`).
+///
+/// #freeze-4 A1: the initial screen dump is pushed into the pane's rx (chunked,
+/// AHEAD of the forwarder) instead of an unbounded one-shot `vterm.process(&dump)`.
+/// The forwarder is started only after the whole dump is enqueued, so FIFO
+/// preserves the seed-before-stream order (dump bytes are drained before any
+/// post-subscribe byte). This routes the dump through the SAME bounded drain path
+/// as live output — the render loop's boot-phase (time-capped) / steady-state
+/// (byte-capped) `drain_all_panes` bounds the per-frame cost, removing the last
+/// unbounded process on the restart path. (At restart, every pane's dump enqueues
+/// at once → the boot phase absorbs the flood instead of an interactive freeze.)
 fn apply_attachment(
     pane: &mut Pane,
     instance_id: crate::types::InstanceId,
@@ -360,11 +385,28 @@ fn apply_attachment(
     wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     pane.instance_id = instance_id;
-    // Feed the screen dump into the placeholder's local VTerm
-    pane.vterm.process(&dump);
+    let pane_id = pane.id;
+    // #freeze-4 A1: enqueue the dump through rx (chunked, FIFO before the forwarder)
+    // rather than processing it unbounded into the VTerm here.
+    if freeze_dump_probe_enabled() && !dump.is_empty() {
+        tracing::info!(
+            tag = "#freeze-dump",
+            pane_id = pane_id,
+            dump_bytes = dump.len(),
+            chunks = dump.len().div_ceil(DUMP_CHUNK_BYTES),
+            "attach screen dump enqueued to rx"
+        );
+    }
+    for chunk in dump.chunks(DUMP_CHUNK_BYTES) {
+        if fwd_tx.send(chunk.to_vec()).is_err() {
+            return; // pane already dropped → nothing to forward
+        }
+    }
+    // Wake the loop so the just-enqueued dump is drained (the boot phase / drain
+    // re-arm catches it; the forwarder also wakes on each subsequent live chunk).
+    let _ = wakeup_tx.send(pane_id);
 
     // Forward subscriber output to wakeup channel via the placeholder's fwd_tx
-    let pane_id = pane.id;
     let name = pane.agent_name.to_string();
     let tx = wakeup_tx.clone();
     // fire-and-forget: forwarder exits when fwd_tx.send() fails (pane
@@ -1205,10 +1247,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// must-resolve: a worker `Ready` outcome seeds the dump into the pane and
-    /// starts the forwarder (subscriber bytes reach the pane's output channel).
+    /// must-resolve: a worker `Ready` outcome enqueues the dump and starts the
+    /// forwarder. #freeze-4 A1: the dump is no longer processed directly into the
+    /// VTerm — it is pushed (chunked, FIFO) through the pane's output channel AHEAD
+    /// of the forwarder, so the render loop's bounded drain handles it like live
+    /// output. So the dump must arrive on the output channel FIRST, then
+    /// post-subscribe stream bytes.
     #[test]
-    fn apply_ready_outcome_seeds_dump_and_starts_forwarder() {
+    fn apply_ready_outcome_enqueues_dump_then_forwards_freeze4() {
         let home = tmp_home("rf_ready");
         let mut layout = Layout::new();
         let mut name_counter = HashMap::new();
@@ -1245,11 +1291,18 @@ mod tests {
             fwd_tx,
             &wakeup_tx,
         );
-        assert!(
-            screen_of(&pane).contains("DUMP-XYZ"),
-            "the worker's dump must be seeded into the pane vterm"
+        // #freeze-4 A1: the dump is enqueued through the output channel (chunked,
+        // FIFO) ahead of the forwarder — NOT seeded directly into the VTerm. It
+        // must arrive FIRST (here "DUMP-XYZ" < one chunk → one message).
+        let dumped = fwd_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dump enqueued to the output channel");
+        assert_eq!(
+            dumped, b"DUMP-XYZ",
+            "the dump must be enqueued to rx (ahead of the stream), not processed \
+             unbounded into the vterm"
         );
-        // Forwarder is live: a subscriber byte reaches the (passed) fwd channel.
+        // Forwarder is live + FIFO: a subscriber byte arrives AFTER the dump.
         sub_tx
             .send(b"hello".to_vec())
             .expect("send on an open channel");
