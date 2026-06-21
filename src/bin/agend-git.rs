@@ -203,7 +203,7 @@ fn main() {
             // that runs first); the arm as a whole is now always-pass → MAY
             // exit(1). Fail-closed (see `push_trust_root_denylist_violation`).
             if let Some(reason) = push_trust_root_denylist_violation(&worktree) {
-                emit_deny_error(subcommand, &reason, &agent);
+                emit_deny_error(subcommand, &reason, &agent, Some(&binding));
                 write_git_event_typed(
                     &home,
                     &agent,
@@ -243,7 +243,7 @@ fn main() {
             std::process::exit(0);
         }
         Action::Deny(reason) => {
-            emit_deny_error(subcommand, &reason, &agent);
+            emit_deny_error(subcommand, &reason, &agent, Some(&binding));
             write_git_event_typed(&home, &agent, subcommand, "deny", None, Some(&reason));
             std::process::exit(1);
         }
@@ -1441,11 +1441,19 @@ fn enforce_agent_canonical_bypass_deny(args: &[String]) {
         return;
     }
     let sub = sub_args.first().map(|s| s.as_str()).unwrap_or("");
+    // #2379 ②: header + canonical-specific bypass are unique to this early deny
+    // (no Binding is loaded here — env+cwd only), but the "where to run instead"
+    // remedy reuses the SHARED builder so it stays in sync with the Action::Deny
+    // path. No binding in scope → the generic (unbound) remedy.
     eprintln!(
-        "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo.\n\
-         If the daemon auto-bound a worktree for this task (check `binding_state`), cd into it and use normal git \
-         (no AGEND_GIT_BYPASS); otherwise use `bind_self` or ask lead. A stray provision here detaches the operator's canonical HEAD (#2234).\n\
-         If you genuinely must: ask lead, or set AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot."
+        "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo."
+    );
+    eprintln!("           a stray provision here detaches the operator's canonical HEAD (#2234).");
+    for line in deny_remedy_lines(None) {
+        eprintln!("{line}");
+    }
+    eprintln!(
+        "           or, if you genuinely must: set AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot (or ask lead)."
     );
     std::process::exit(1);
 }
@@ -2032,9 +2040,41 @@ fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 // ── Error + Telemetry ───────────────────────────────────────────────────
 
-fn emit_deny_error(subcmd: &str, reason: &str, agent: &str) {
-    for line in format_deny_error(subcmd, reason, agent) {
+fn emit_deny_error(subcmd: &str, reason: &str, agent: &str, binding: Option<&Binding>) {
+    for line in format_deny_error(subcmd, reason, agent, binding) {
         eprintln!("{line}");
+    }
+}
+
+/// #2379 ②: the shared, context-aware "where to run this instead" remedy block,
+/// reused by every deny exit so they stay consistent. Pure `format!`, ZERO I/O —
+/// `binding` is the IN-SCOPE binding (already loaded before `classify`) at the
+/// `Action::Deny` / push-denylist sites, and `None` at the early canonical-bypass
+/// deny (env+cwd only, no binding loaded). When the caller is bound, it names the
+/// agent's own worktree so the fix is actionable ("cd there"); otherwise it points
+/// at the ways to get a worktree. (Intentionally avoids "security"-flavoured
+/// wording per the operator copy rule — enforced by a meta-test.)
+fn deny_remedy_lines(binding: Option<&Binding>) -> Vec<String> {
+    match binding.and_then(|b| b.worktree.as_deref().map(|wt| (b, wt))) {
+        // Bound: the agent has a worktree — it's just running git in the wrong place.
+        Some((b, wt)) => {
+            let branch = b.branch.as_deref().unwrap_or("<unknown>");
+            let task = b.task_id.as_deref().unwrap_or("—");
+            vec![
+                format!("           your assigned worktree is {wt}"),
+                format!(
+                    "           (branch '{branch}', task {task}) — cd there and run git, no bypass needed"
+                ),
+            ]
+        }
+        // Unbound (or no binding in scope): point at how to get a worktree.
+        None => vec![
+            "           you have no active worktree binding here:".to_string(),
+            "             - if the daemon auto-bound one for this task, check `binding_state` and cd into it"
+                .to_string(),
+            "             - otherwise get one via the task board, `repo action=checkout bind=true`, or `bind_self`"
+                .to_string(),
+        ],
     }
 }
 
@@ -2045,15 +2085,34 @@ fn emit_deny_error(subcmd: &str, reason: &str, agent: &str) {
 /// forms exist; the hint enumerates all of them so operators don't
 /// have to grep the source to discover the agent-specific or
 /// time-limited variants.
-fn format_deny_error(subcmd: &str, reason: &str, agent: &str) -> Vec<String> {
-    vec![
+///
+/// #2379 ②: now carries the in-scope binding context via [`deny_remedy_lines`]
+/// so every deny tells the caller WHERE to run the command instead (its own
+/// worktree, or how to get one) — not just how to bypass.
+fn format_deny_error(
+    subcmd: &str,
+    reason: &str,
+    agent: &str,
+    binding: Option<&Binding>,
+) -> Vec<String> {
+    let mut lines = vec![
         format!("agend-git: ERROR git {subcmd} denied"),
         format!("           agent={agent}, reason: {reason}"),
-        "           HINT: use the task board for a worktree assignment, or bypass with one of:".to_string(),
+    ];
+    lines.extend(deny_remedy_lines(binding));
+    lines.push("           or bypass with one of:".to_string());
+    lines.push(
         "             AGEND_GIT_BYPASS=1               one-shot emergency override".to_string(),
-        "             AGEND_GIT_BYPASS_AGENT=<name>    agent-specific exemption (matches AGEND_INSTANCE_NAME)".to_string(),
-        "             AGEND_GIT_BYPASS_UNTIL=<epoch>   time-limited exemption (Unix seconds, not ISO)".to_string(),
-    ]
+    );
+    lines.push(
+        "             AGEND_GIT_BYPASS_AGENT=<name>    agent-specific exemption (matches AGEND_INSTANCE_NAME)"
+            .to_string(),
+    );
+    lines.push(
+        "             AGEND_GIT_BYPASS_UNTIL=<epoch>   time-limited exemption (Unix seconds, not ISO)"
+            .to_string(),
+    );
+    lines
 }
 
 /// Sprint 57 Wave 2 Track D: structured audit-event writer with an
@@ -2510,7 +2569,7 @@ mod tests {
 
     #[test]
     fn deny_hint_lists_all_three_bypass_forms() {
-        let lines = format_deny_error("commit", "unbound", "dev");
+        let lines = format_deny_error("commit", "unbound", "dev", None);
         let joined = lines.join("\n");
         for var in [
             "AGEND_GIT_BYPASS=1",
@@ -2525,6 +2584,89 @@ mod tests {
         assert!(
             joined.contains("epoch") && joined.contains("Unix seconds"),
             "AGEND_GIT_BYPASS_UNTIL hint must clarify epoch wording (not ISO), got:\n{joined}"
+        );
+    }
+
+    /// #2379 ②: a BOUND caller's deny names its OWN worktree (branch + task) so the
+    /// remedy is "cd there", not just "bypass" — the in-scope binding context
+    /// (zero I/O). Also retains the 3-form bypass hint.
+    #[test]
+    fn deny_message_names_bound_worktree_2379() {
+        let binding = Binding {
+            task_id: Some("t-42".into()),
+            branch: Some("feat/x".into()),
+            worktree: Some("/wt/feat-x".into()),
+        };
+        let joined =
+            format_deny_error("checkout", "cross-branch", "dev", Some(&binding)).join("\n");
+        assert!(
+            joined.contains("/wt/feat-x"),
+            "must name the bound worktree, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("feat/x"),
+            "must name the bound branch, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("t-42"),
+            "must name the task, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("no bypass needed"),
+            "bound remedy is 'cd there', got:\n{joined}"
+        );
+        assert!(
+            joined.contains("AGEND_GIT_BYPASS=1"),
+            "3-form bypass hint retained, got:\n{joined}"
+        );
+    }
+
+    /// #2379 ②: an UNBOUND caller (empty binding) and a no-binding deny (`None`,
+    /// the early canonical-bypass path) both get the SAME generic "get a worktree"
+    /// remedy via the shared builder.
+    #[test]
+    fn deny_message_unbound_points_at_getting_a_worktree_2379() {
+        let empty = Binding::default();
+        for binding in [Some(&empty), None] {
+            let joined = format_deny_error("commit", "unbound", "dev", binding).join("\n");
+            assert!(
+                joined.contains("binding_state"),
+                "unbound remedy must mention binding_state, got:\n{joined}"
+            );
+            assert!(
+                joined.contains("bind_self") || joined.contains("repo action=checkout"),
+                "unbound remedy must point at provisioning a worktree, got:\n{joined}"
+            );
+        }
+        // The shared builder is what the canonical-bypass deny (no Binding) reuses.
+        assert!(
+            deny_remedy_lines(None).join("\n").contains("binding_state"),
+            "the shared remedy builder serves the no-binding deny too"
+        );
+    }
+
+    /// #2379 ②: operator copy rule — deny prose must NOT use "security"/"安全"
+    /// wording. Guards every shared deny-copy builder (the bulk of the deny prose).
+    #[test]
+    fn deny_copy_has_no_security_wording_2379() {
+        let bound = Binding {
+            task_id: Some("t-1".into()),
+            branch: Some("b".into()),
+            worktree: Some("/wt".into()),
+        };
+        let mut corpus: Vec<String> = Vec::new();
+        corpus.extend(format_deny_error("checkout", "r", "dev", Some(&bound)));
+        corpus.extend(format_deny_error("commit", "r", "dev", None));
+        corpus.extend(deny_remedy_lines(Some(&bound)));
+        corpus.extend(deny_remedy_lines(None));
+        let joined = corpus.join("\n");
+        assert!(
+            !joined.to_lowercase().contains("security"),
+            "deny copy must not use 'security' wording:\n{joined}"
+        );
+        assert!(
+            !joined.contains("安全"),
+            "deny copy must not use '安全' wording:\n{joined}"
         );
     }
 
