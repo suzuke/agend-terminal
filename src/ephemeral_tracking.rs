@@ -382,6 +382,9 @@ mod tests {
         dir
     }
 
+    // Only the #[cfg(unix)] real-fake-child tests build a SpawnSpec; gate the
+    // helper so Windows clippy (-D warnings) doesn't flag it as dead code.
+    #[cfg(unix)]
     fn spec(workflow_id: &str, ttl_secs: Option<u64>) -> SpawnSpec {
         SpawnSpec {
             workflow_id: workflow_id.to_string(),
