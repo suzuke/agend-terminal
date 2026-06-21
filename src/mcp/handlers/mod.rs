@@ -86,12 +86,19 @@ use instance::resolve_team_layout;
 
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
+    // arch F5 (t-…47102): a read-only tool (pure query, no state change) skips the
+    // two per-call DISK side-effects below — the usage append and the heartbeat RMW
+    // — so a polling agent doesn't pay disk on every `list_instances`/`binding_state`.
+    // The in-mem heartbeat (the authoritative liveness signal) still fires; see below.
+    let read_only = is_read_only_tool(tool);
     // #2055 step 1: instrument-only usage stats — record THAT this tool was
     // called + which optional params it carried, into <home>/mcp-usage-stats.jsonl.
     // Best-effort, zero behaviour change: it never touches `args` or the result
     // and swallows all errors. This is the single dispatch chokepoint, so every
-    // tool call is observed exactly once.
-    crate::mcp::usage_stats::record(&home, tool, args);
+    // (non-read-only) tool call is observed exactly once.
+    if !read_only {
+        crate::mcp::usage_stats::record(&home, tool, args);
+    }
     // Explicit arg beats env var. Cross-instance arms require `Some`;
     // anonymous/standalone arms tolerate the empty `&str` view.
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
@@ -104,15 +111,31 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     // ordering: pair lock acquired BEFORE disk I/O, released AFTER (lock
     // is leaf-level per docs/DAEMON-LOCK-ORDERING.md).
     if !instance_name.is_empty() {
+        // The in-mem pair heartbeat is the AUTHORITATIVE liveness source
+        // (supervisor/router/dispatch_idle all read `heartbeat_pair`). It is cheap
+        // (no disk), so it fires for EVERY tool call incl. read-only — a read-only
+        // poll still proves the agent is alive.
+        let cold_start =
+            crate::daemon::heartbeat_pair::snapshot_for(instance_name).heartbeat_at_ms == 0;
         crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
             p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
         });
-        save_metadata(
-            &home,
-            instance_name,
-            "last_heartbeat",
-            json!(chrono::Utc::now().to_rfc3339()),
-        );
+        // Disk `last_heartbeat` RMW: skip for a read-only tool (the perf win) EXCEPT
+        // on the cold→warm first call after a (re)start. The supervisor reads disk
+        // `last_heartbeat` ONLY as the crash-recovery fallback while the in-mem pair
+        // is still cold (`heartbeat_at_ms == 0`, supervisor.rs ~1248); refreshing it
+        // on that one transition keeps the post-restart fallback fresh, so a
+        // read-only-only agent can't be falsely stale-escalated. Once the pair is
+        // warm the fallback is never consulted, so subsequent read-only polls skip
+        // the disk write.
+        if !read_only || cold_start {
+            save_metadata(
+                &home,
+                instance_name,
+                "last_heartbeat",
+                json!(chrono::Utc::now().to_rfc3339()),
+            );
+        }
     }
 
     // #694 BLOCK 2 — dispatch table lookup. Returns `Some` for migrated
@@ -136,6 +159,29 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     // dispatch.rs::tests pins that every tool in `tool_definitions()`
     // is routed by `dispatch.rs`.)
     json!({"error": format!("unknown tool: {tool}")})
+}
+
+/// arch F5 (t-…47102): MCP tools that are PURE QUERIES — no state change, no
+/// outbound effect. `handle_tool` skips its two per-call disk side-effects (the
+/// usage append + the heartbeat RMW) for these so a polling agent doesn't pay
+/// disk on every call; the in-mem heartbeat still fires, so liveness is preserved.
+///
+/// Conservative allowlist — only tools that NEVER mutate. Deliberately NOT here:
+/// `inbox` (drain transitions unread→delivering), `download_attachment` (writes a
+/// file), and every action-based tool (`task`/`decision`/`team`/`schedule`/
+/// `deployment`/`ci`/`health`/`repo`/`mode`) whose read-vs-write splits by
+/// `action` — those keep the full path rather than coupling this chokepoint to
+/// each tool's per-action semantics (the minority of read actions pay the IO).
+fn is_read_only_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "list_instances"
+            | "binding_state"
+            | "gc_dry_run"
+            | "tokens"
+            | "pane_snapshot"
+            | "tui_screenshot"
+    )
 }
 
 #[cfg(test)]

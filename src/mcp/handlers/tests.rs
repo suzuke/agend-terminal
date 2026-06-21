@@ -3374,3 +3374,136 @@ fn fallback_send_preserves_query_kind_survives_clear_med5() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── arch F5 (t-…47102): read-only tools skip the two per-call disk IOs ──────
+// (usage append + heartbeat RMW) while KEEPING the cheap in-mem heartbeat
+// (the authoritative liveness signal). Cold-start still refreshes disk so the
+// supervisor's crash-recovery fallback can't falsely stale-escalate.
+
+/// Warm read-only call: skips usage append + disk last_heartbeat RMW, but the
+/// in-mem `heartbeat_pair` is STILL bumped (load-bearing — liveness preserved).
+#[test]
+fn read_only_tool_skips_disk_io_but_bumps_inmem_heartbeat() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ro_warm");
+    std::env::set_var("AGEND_HOME", &home);
+    let agent = "ro-warm-agent";
+    // Warm the pair (heartbeat_at_ms = 1 > 0) so the cold-start refresh is NOT taken.
+    crate::daemon::heartbeat_pair::update_with(agent, |p| p.heartbeat_at_ms = 1);
+    // Pre-seed a sentinel disk last_heartbeat so we can detect a (skipped) rewrite.
+    save_metadata(&home, agent, "last_heartbeat", json!("SENTINEL"));
+
+    let _ = handle_tool("binding_state", &json!({"instance": agent}), agent);
+
+    // (a) in-mem heartbeat bumped 1 → ~now (liveness preserved for a read-only poll).
+    let after = crate::daemon::heartbeat_pair::snapshot_for(agent).heartbeat_at_ms;
+    assert!(
+        after > 1,
+        "read-only call must bump the in-mem heartbeat (got {after})"
+    );
+    // (b) disk last_heartbeat NOT rewritten (warm read-only skips the RMW).
+    let mut info = json!({});
+    merge_metadata(&home, agent, &mut info);
+    assert_eq!(
+        info["last_heartbeat"], "SENTINEL",
+        "warm read-only must NOT rewrite disk last_heartbeat"
+    );
+    // (c) no usage-stats line for the read-only tool.
+    let stats = std::fs::read_to_string(home.join("mcp-usage-stats.jsonl")).unwrap_or_default();
+    assert!(
+        !stats.contains("binding_state"),
+        "read-only tool must not append usage stats: {stats:?}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Cold-start (in-mem pair == 0, i.e. first call after a daemon (re)start): a
+/// read-only call DOES refresh disk last_heartbeat — the supervisor reads it as
+/// the crash-recovery fallback while the pair is cold, so this keeps it fresh.
+#[test]
+fn read_only_cold_start_refreshes_disk_heartbeat() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ro_cold");
+    std::env::set_var("AGEND_HOME", &home);
+    let agent = "ro-cold-agent";
+    // Force the pair cold.
+    crate::daemon::heartbeat_pair::update_with(agent, |p| p.heartbeat_at_ms = 0);
+
+    let _ = handle_tool("binding_state", &json!({"instance": agent}), agent);
+
+    let mut info = json!({});
+    merge_metadata(&home, agent, &mut info);
+    assert!(
+        info["last_heartbeat"].is_string(),
+        "cold-start read-only MUST refresh disk last_heartbeat (supervisor fallback)"
+    );
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for(agent).heartbeat_at_ms > 0,
+        "cold-start call warms the in-mem pair"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A non-read-only tool (here `mode`, action-based → NOT in the allowlist) keeps
+/// the full path: usage append + disk last_heartbeat both fire (unchanged).
+#[test]
+fn non_read_only_tool_still_writes_usage_and_disk_heartbeat() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("rw_full");
+    std::env::set_var("AGEND_HOME", &home);
+    let agent = "rw-full-agent";
+    crate::daemon::heartbeat_pair::update_with(agent, |p| p.heartbeat_at_ms = 1);
+    save_metadata(&home, agent, "last_heartbeat", json!("OLD"));
+
+    let _ = handle_tool("mode", &json!({"action": "get"}), agent);
+
+    let mut info = json!({});
+    merge_metadata(&home, agent, &mut info);
+    assert_ne!(
+        info["last_heartbeat"], "OLD",
+        "non-read-only tool must refresh disk last_heartbeat"
+    );
+    let stats = std::fs::read_to_string(home.join("mcp-usage-stats.jsonl")).unwrap_or_default();
+    assert!(
+        stats.contains("\"mode\""),
+        "non-read-only tool must append usage stats: {stats:?}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The allowlist is exactly the six pure-query tools; mutating + action-based
+/// tools are excluded (they keep the full path).
+#[test]
+fn is_read_only_tool_allowlist() {
+    for t in [
+        "list_instances",
+        "binding_state",
+        "gc_dry_run",
+        "tokens",
+        "pane_snapshot",
+        "tui_screenshot",
+    ] {
+        assert!(is_read_only_tool(t), "{t} must be classified read-only");
+    }
+    for t in [
+        "send",
+        "inbox",
+        "task",
+        "decision",
+        "bind_self",
+        "mode",
+        "download_attachment",
+        "restart_instance",
+    ] {
+        assert!(
+            !is_read_only_tool(t),
+            "{t} must NOT be classified read-only"
+        );
+    }
+}
