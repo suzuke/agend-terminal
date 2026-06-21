@@ -53,7 +53,6 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Hot-file event count above which [`compact`] archives the older slice.
-#[allow(dead_code)]
 pub const COMPACTION_KEEP: usize = 10_000;
 
 /// Sister-module log basename used with [`crate::event_log::append`] +
@@ -1104,7 +1103,7 @@ pub(crate) fn append_batch_at(
     };
 
     crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        let start_seq = max_seq_for_instance(log_path, &instance)? + 1;
+        let start_seq = next_seq_under_lock(board, log_path, &instance, count as u64)?;
         let mut lines = Vec::with_capacity(count);
         for (i, event) in events.into_iter().enumerate() {
             let seq = start_seq + i as u64;
@@ -1122,6 +1121,7 @@ pub(crate) fn append_batch_at(
         Ok(lines)
     })?;
     invalidate_replay_cache();
+    maybe_compact_events(board);
     Ok(seqs)
 }
 
@@ -1187,7 +1187,7 @@ where
             rejection = Some(reason);
             return Ok(Vec::new()); // empty ⇒ no write
         }
-        let start_seq = max_seq_for_instance(log_path, &instance)? + 1;
+        let start_seq = next_seq_under_lock(board, log_path, &instance, count as u64)?;
         let mut lines = Vec::with_capacity(count);
         for (i, event) in events.into_iter().enumerate() {
             let seq = start_seq + i as u64;
@@ -1209,6 +1209,7 @@ where
         return Ok(Err(reason));
     }
     invalidate_replay_cache();
+    maybe_compact_events(board);
     Ok(Ok(seqs))
 }
 
@@ -1278,7 +1279,7 @@ where
             rejection = Some(reason);
             return Ok(Vec::new()); // empty ⇒ no write
         }
-        let seq = max_seq_for_instance(log_path, &instance)? + 1;
+        let seq = next_seq_under_lock(board, log_path, &instance, 1)?;
         assigned_seq = Some(seq);
         let envelope = TaskEventEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -1295,6 +1296,7 @@ where
         return Ok(Err(reason));
     }
     invalidate_replay_cache();
+    maybe_compact_events(board);
     if let Some(seq) = assigned_seq {
         return Ok(Ok(seq));
     }
@@ -1368,12 +1370,15 @@ pub(crate) fn append_done_if_legal_at(
 /// already-persisted one, and replay's idempotency skip (`seq <= last_seen`)
 /// would SILENTLY DROP the real task transition. The on-disk file is the only
 /// source of truth all appenders share. The scan is cheap because task-event
-/// appends are agent/human-paced (not a hot loop) and batches share one scan —
-/// NOT because the file is bounded: `compact` (which would cap it at
-/// `COMPACTION_KEEP`) is currently dead code with no production caller, so the
-/// hot log grows unbounded. Any cross-process-correct approach must re-read the
-/// file when it changes anyway; the previous cache was O(1) only by trusting
-/// stale cross-process state — the exact bug fixed here.
+/// appends are agent/human-paced (not a hot loop), batches share one scan, and
+/// `compact_at` (now wired via [`maybe_compact_events`]) bounds the hot log to
+/// `COMPACTION_KEEP`. Because compaction ARCHIVES the older slice OUT of the hot
+/// log, this hot-only scan no longer sees an instance whose events were all
+/// archived — so callers go through [`next_seq_under_lock`], which maxes this
+/// scan with the per-instance seq sidecar (which survives compaction) to keep
+/// the high-water correct. A cross-process-correct approach must re-read on
+/// change anyway; the previous process-local cache was O(1) only by trusting
+/// stale cross-process state — the exact bug avoided here.
 fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Result<u64> {
     let content = match std::fs::read_to_string(log_path) {
         Ok(c) => c,
@@ -1392,6 +1397,104 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
         }
     }
     Ok(max)
+}
+
+// ── Per-instance seq high-water sidecar (retention seq-safety) ────────
+//
+// `compact_at` archives the older slice of the hot log, but
+// `max_seq_for_instance` scans ONLY the hot log (H10's cross-process
+// contract). So once ALL of an instance's events have been archived, the
+// hot scan returns 0 and the next append would mint a seq `<=` an
+// already-persisted one — replay's idempotency skip (`seq <= last_seen`)
+// would then SILENTLY DROP the real transition. (This is exactly why
+// `compact` was left dead: an unbounded hot log keeps the full history in
+// one file, so the hot scan was always complete.)
+//
+// Fix: persist a per-instance high-water in a small sidecar that survives
+// compaction. It is a DERIVED CACHE of the authoritative event log, not a
+// new source of truth — any load failure (missing / corrupt) rebuilds it
+// from a full hot+archive scan, so it can never wedge. The committed
+// high-water is `max(sidecar, hot-scan)`: the hot-scan term keeps it
+// crash-safe (a crash between the sidecar write and the hot append leaves
+// the sidecar AHEAD, never behind → at worst a seq gap, never a collision).
+fn seq_sidecar_path(board: &Path) -> PathBuf {
+    board.join(format!("{LOG_NAME}_seq.json"))
+}
+
+/// Best-effort scan of hot log + every archive segment for the max seq per
+/// instance. Lenient parse (skip torn lines — replay is the strict reader),
+/// mirroring [`max_seq_for_instance`]. Used to (re)build the sidecar.
+fn scan_seq_highwater(board: &Path) -> BTreeMap<String, u64> {
+    let mut hw: BTreeMap<String, u64> = BTreeMap::new();
+    let mut absorb = |path: &Path| {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(env) = serde_json::from_str::<TaskEventEnvelope>(line) {
+                let slot = hw.entry(env.instance.as_str().to_string()).or_insert(0);
+                *slot = (*slot).max(env.seq);
+            }
+        }
+    };
+    if let Ok(entries) = std::fs::read_dir(archive_dir(board)) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                absorb(&p);
+            }
+        }
+    }
+    absorb(&log_path(board));
+    hw
+}
+
+/// Load the per-instance high-water sidecar, rebuilding from a full
+/// hot+archive scan on any failure (missing / unparseable). The rebuild is
+/// persisted so the O(history) scan happens at most once per board.
+fn load_seq_highwater(board: &Path) -> BTreeMap<String, u64> {
+    if let Ok(content) = std::fs::read_to_string(seq_sidecar_path(board)) {
+        if let Ok(map) = serde_json::from_str::<BTreeMap<String, u64>>(&content) {
+            return map;
+        }
+    }
+    // Missing or corrupt → rebuild from the authoritative log + persist.
+    let rebuilt = scan_seq_highwater(board);
+    let _ = write_seq_highwater(board, &rebuilt);
+    rebuilt
+}
+
+/// Atomic-write the sidecar (crash-safe tmp + rename via [`crate::store::atomic_write`]).
+fn write_seq_highwater(board: &Path, hw: &BTreeMap<String, u64>) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(hw)?;
+    crate::store::atomic_write(&seq_sidecar_path(board), &bytes)
+}
+
+/// Compute the start seq for `instance`'s batch of `count` events and persist
+/// the bumped high-water — all under the caller's append lock. The high-water
+/// is `max(sidecar, hot-scan)` (archive-safe + crash-safe). The sidecar is
+/// written BEFORE the caller appends the lines, so a crash can only leave it
+/// ahead of the hot log (a harmless seq gap), never behind (a collision →
+/// silent replay drop).
+fn next_seq_under_lock(
+    board: &Path,
+    log_path: &Path,
+    instance: &InstanceName,
+    count: u64,
+) -> anyhow::Result<u64> {
+    let mut hw = load_seq_highwater(board);
+    let prev = hw
+        .get(instance.as_str())
+        .copied()
+        .unwrap_or(0)
+        .max(max_seq_for_instance(log_path, instance)?);
+    let start = prev + 1;
+    hw.insert(instance.as_str().to_string(), start + count - 1);
+    write_seq_highwater(board, &hw)?;
+    Ok(start)
 }
 
 // ── Replay cache ─────────────────────────────────────────────────────
@@ -1846,13 +1949,28 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
 /// short-circuits when the hot log already fits the threshold. Holds the
 /// same lock as [`append`] so concurrent appenders see a consistent
 /// hot-file at all times.
+/// Home-default wrapper; production compaction runs through [`compact_at`]
+/// (board-scoped) via [`maybe_compact_events`]. Retained for API symmetry +
+/// test use.
 #[allow(dead_code)]
 pub fn compact(home: &Path) -> anyhow::Result<()> {
     compact_at(&board_root(home, DEFAULT_PROJECT))
 }
 
-/// #2117 board-root variant of [`compact`].
+/// #2117 board-root variant of [`compact`]. Wired into the append path via
+/// [`maybe_compact_events`] (this was dead code — the source of the unbounded
+/// hot-log growth this change fixes).
 pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
+    compact_at_with_keep(board, COMPACTION_KEEP)
+}
+
+/// Threshold-injected core of [`compact_at`] (#2135-style testability — tests
+/// pass a small `keep` rather than generating `COMPACTION_KEEP` events).
+/// Byte-identical to the prior `compact_at` body when `keep == COMPACTION_KEEP`.
+/// The older slice is ARCHIVED (replay folds archive + hot → no data loss); the
+/// per-instance seq sidecar is independent of this rewrite, so an instance whose
+/// events are all archived keeps a correct seq high-water ([`next_seq_under_lock`]).
+fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
     let log_path = log_path(board);
     if !log_path.exists() {
         return Ok(());
@@ -1862,10 +1980,10 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
     crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
         let content = std::fs::read_to_string(log_path)?;
         let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() <= COMPACTION_KEEP {
+        if lines.len() <= keep {
             return Ok(Vec::new());
         }
-        let split = lines.len() - COMPACTION_KEEP;
+        let split = lines.len() - keep;
         let archived: String = lines[..split].iter().map(|l| format!("{l}\n")).collect();
         let kept: String = lines[split..].iter().map(|l| format!("{l}\n")).collect();
 
@@ -1890,6 +2008,18 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
         // always re-scans the on-disk file, so the atomic replace is observed.)
         Ok(Vec::new())
     })
+}
+
+/// Opportunistic, non-fatal hot-log compaction after an append (mirrors
+/// `tasks::board_router::maybe_compact_index`). [`compact_at`] self-gates on
+/// `COMPACTION_KEEP` (a no-op when the hot log already fits) and ARCHIVES —
+/// never drops — the older slice, so replay (archive + hot) is unaffected. A
+/// failure never propagates: the append already committed; compaction is
+/// opportunistic cleanup.
+fn maybe_compact_events(board: &Path) {
+    if let Err(e) = compact_at(board) {
+        tracing::warn!(error = %e, "task_events compaction failed (non-fatal; append already durable)");
+    }
 }
 
 #[cfg(test)]
@@ -2306,6 +2436,158 @@ mod tests {
         let arc = archive_dir(&home);
         let entries: Vec<_> = fs::read_dir(&arc).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1, "exactly one archive file expected");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Retention seq-safety (E1) ─────────────────────────────────────
+    //
+    // GATE (neuter-RED): an instance whose events are ALL archived must still
+    // get a non-colliding seq on its next append, so replay does NOT silently
+    // drop the new transition. Without the per-instance seq sidecar,
+    // `max_seq_for_instance` scans the hot log only → 0 for the archived
+    // instance → seq reuse → replay's `seq <= last_seen` idempotency drops it.
+    // (Neuter `load_seq_highwater` to always return an empty map ⇒ this RED.)
+    #[test]
+    #[serial]
+    fn retention_idle_instance_all_archived_no_seq_collision_gate() {
+        let home = tmp_home("retain-collision");
+        let board = board_root(&home, DEFAULT_PROJECT);
+        let a = InstanceName::from("idle-agent");
+        let b = InstanceName::from("busy-agent");
+        let keep = 5;
+
+        // A emits its only event, then B floods past `keep` so A's event archives.
+        append(&home, &a, sample_event("t-A1")).unwrap();
+        for i in 0..(keep + 2) {
+            append(&home, &b, sample_event(&format!("t-B{i}"))).unwrap();
+        }
+        compact_at_with_keep(&board, keep).unwrap();
+
+        // Precondition: A's events are out of the hot log (hot-only scan = 0).
+        assert_eq!(
+            max_seq_for_instance(&log_path(&board), &a).unwrap(),
+            0,
+            "precondition: A's events must all be archived out of the hot log"
+        );
+
+        // A appends again — must get a fresh, non-colliding seq.
+        append(&home, &a, sample_event("t-A2")).unwrap();
+
+        let state = replay(&home).unwrap();
+        assert!(
+            state.tasks.contains_key(&TaskId::from("t-A2")),
+            "re-appended transition was SILENTLY DROPPED (seq collision)"
+        );
+        assert!(
+            state.tasks.contains_key(&TaskId::from("t-A1")),
+            "the archived original transition must still replay"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // Variant: A's events land in an OLD archive segment while a LATER segment
+    // holds only OTHER instances. A "scan-newest-archive-segment" shortcut would
+    // miss A's high-water → collision; the full-coverage sidecar does not. This
+    // is why the fix is a persisted sidecar, not an archive re-scan.
+    #[test]
+    #[serial]
+    fn retention_idle_instance_in_old_archive_segment_no_collision() {
+        let home = tmp_home("retain-old-seg");
+        let board = board_root(&home, DEFAULT_PROJECT);
+        let a = InstanceName::from("idle-agent");
+        let b = InstanceName::from("busy-b");
+        let c = InstanceName::from("busy-c");
+        let keep = 3;
+
+        // Segment 1: A + B → compact archives A (oldest) into segment 1.
+        append(&home, &a, sample_event("t-A1")).unwrap();
+        for i in 0..(keep + 1) {
+            append(&home, &b, sample_event(&format!("t-B{i}"))).unwrap();
+        }
+        compact_at_with_keep(&board, keep).unwrap();
+
+        // Segment 2: C floods → compact archives the leftovers into a NEWER
+        // segment that contains NO A events.
+        for i in 0..(keep + 1) {
+            append(&home, &c, sample_event(&format!("t-C{i}"))).unwrap();
+        }
+        compact_at_with_keep(&board, keep).unwrap();
+
+        assert_eq!(
+            max_seq_for_instance(&log_path(&board), &a).unwrap(),
+            0,
+            "precondition: A only in an OLD archive segment, not the hot log"
+        );
+        append(&home, &a, sample_event("t-A2")).unwrap();
+        let state = replay(&home).unwrap();
+        assert!(
+            state.tasks.contains_key(&TaskId::from("t-A2")),
+            "sidecar must cover A's high-water even from an OLD archive segment"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // (a) The wiring: a normal append past COMPACTION_KEEP triggers
+    // `maybe_compact_events`, bounding the hot log (the unbounded-growth fix).
+    // Direct-write COMPACTION_KEEP+1 (cheap), then ONE real append.
+    #[test]
+    #[serial]
+    fn retention_append_triggers_compaction_bounds_hot_log() {
+        let home = tmp_home("retain-bound");
+        let board = board_root(&home, DEFAULT_PROJECT);
+        let inst = InstanceName::from("u");
+        let log = log_path(&board);
+        let mut lines = String::new();
+        for i in 1..=(COMPACTION_KEEP + 1) {
+            let env = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: i as u64,
+                timestamp: format!("2026-06-21T{:02}:00:00Z", i % 24),
+                instance: inst.clone(),
+                emitter_id: None,
+                event: TaskEvent::Unblocked {
+                    task_id: format!("t-{i}").as_str().into(),
+                },
+            };
+            lines.push_str(&serde_json::to_string(&env).unwrap());
+            lines.push('\n');
+        }
+        fs::write(&log, lines).unwrap();
+        assert!(fs::read_to_string(&log).unwrap().lines().count() > COMPACTION_KEEP);
+        append(&home, &inst, sample_event("t-trigger")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            COMPACTION_KEEP,
+            "a normal append past COMPACTION_KEEP must trigger compaction and bound the hot log"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // (b) Compaction ARCHIVES (never drops): replay folds archive+hot, so the
+    // reconstructed state is identical before and after compaction.
+    #[test]
+    #[serial]
+    fn retention_replay_state_survives_compaction_zero_loss() {
+        let home = tmp_home("retain-noloss");
+        let board = board_root(&home, DEFAULT_PROJECT);
+        let a = InstanceName::from("agent");
+        let keep = 4;
+        for i in 0..(keep + 4) {
+            append(&home, &a, sample_event(&format!("t-{i}"))).unwrap();
+        }
+        let before = replay(&home).unwrap();
+        compact_at_with_keep(&board, keep).unwrap();
+        let after = replay(&home).unwrap();
+        assert_eq!(
+            before.tasks.keys().collect::<Vec<_>>(),
+            after.tasks.keys().collect::<Vec<_>>(),
+            "compaction archives (not drops) → replay state must be unchanged"
+        );
+        assert_eq!(
+            before.tasks.len(),
+            keep + 4,
+            "all tasks present pre-compaction"
+        );
         fs::remove_dir_all(&home).ok();
     }
 

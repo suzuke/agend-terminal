@@ -40,6 +40,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("daemon.", "daemon.<date>.log — tracing legitimately names the deleted instance"),
     ("event-log.jsonl", "append-only audit trail — create/delete events name the instance by design"),
     ("task_events.jsonl", "append-only task-event log — owner/assignee history named by design"),
+    ("task_events_seq.json", "INTENTIONAL: board-level per-emitter seq high-water sidecar (sibling of task_events.jsonl). Retaining a deleted instance's high-water is REQUIRED — its events still live in the archive, so a same-named re-creation must not reuse seqs (would silently drop transitions on replay). Same fleet-shared-board class as task_events.jsonl."),
     // #t-…34628-8 RCA: same append-only-audit class as event-log.jsonl. Written by
     // the agend-git shim (src/bin/agend-git.rs — #2158 bypass-audit / #2234 cwd-drift)
     // whenever a daemon git op runs through the shim (git_helpers.rs::git_cmd sets
