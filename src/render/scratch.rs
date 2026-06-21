@@ -43,7 +43,10 @@ pub fn render_scratch_shell(
         return;
     }
 
-    pane.drain_output();
+    // #freeze-2: the scratch-shell is a single user-opened overlay pane, not the
+    // boot-flood many-agent render path, so it keeps draining fully each frame
+    // (unbounded) — behavior unchanged. The budget-cap targets `render_pane`.
+    let _ = pane.drain_output(usize::MAX);
 
     // W2.6: the same render-authoritative resize as `core_render::render_pane`.
     // `block.inner(oa)` here equals `PaneContentRect::from_bordered_area(oa)`

@@ -75,6 +75,20 @@ pub struct Selection {
     pub end: (i64, u16),
 }
 
+/// #freeze-2 probe (env-gated, `AGEND_FREEZE_INSTRUMENT`): per-frame `drain_output`
+/// cost threshold in microseconds, or `None` when disabled (zero overhead). Read
+/// once and cached. Lets an operator restart-repro confirm the freeze is in
+/// `drain_output` and that the budget bounds it. Off by default → no behavior
+/// change. `"1"` => the 2 ms default; `"<N>"` (N>1) => custom µs; else disabled.
+fn drain_probe_threshold_us() -> Option<u64> {
+    static PROBE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| match std::env::var("AGEND_FREEZE_INSTRUMENT") {
+        Ok(v) if v == "1" => Some(2_000),
+        Ok(v) => v.parse::<u64>().ok().filter(|n| *n > 1),
+        Err(_) => None,
+    })
+}
+
 impl Pane {
     /// Convert a viewport row (0-based within the pane interior) to an absolute
     /// scrollback logical line at the current scroll position. Inverse of
@@ -111,19 +125,57 @@ impl Pane {
         })
     }
 
-    /// Drain pending output into the local VTerm.
-    pub fn drain_output(&mut self) {
-        while let Ok(data) = self.rx.try_recv() {
-            self.vterm.process(&data);
-            if self.backend.is_some() {
-                let text = String::from_utf8_lossy(&data);
-                if text.contains("[from:") {
-                    self.has_notification = true;
+    /// Drain up to `budget_bytes` of pending PTY output into the local VTerm,
+    /// leaving any remainder queued in the (unbounded) channel. Returns `true` if
+    /// output still remains — the render loop re-arms a redraw on this so the
+    /// backlog finishes draining over subsequent frames.
+    ///
+    /// #freeze-2 (t-…74503): this `vterm.process` loop runs on the MAIN thread
+    /// inside `terminal.draw`. Un-bounded, a boot/restart backlog (every agent
+    /// re-attaching + dumping its screen) made one draw take ~100 ms+ → the loop
+    /// couldn't service input → freeze. (CPU, not a lock — #2380's lock-free
+    /// snapshot addressed a different, smaller consumer.) Bounding the per-frame
+    /// work keeps `terminal.draw` short so input stays responsive while the pane
+    /// visually catches up across a few frames. Lossless + FIFO: chunks are
+    /// processed in receive order; unprocessed chunks stay queued.
+    #[must_use = "re-arm a redraw when output remains, or the backlog stalls"]
+    pub fn drain_output(&mut self, budget_bytes: usize) -> bool {
+        let probe_threshold = drain_probe_threshold_us();
+        let probe_start = probe_threshold.map(|_| Instant::now());
+        let mut drained = 0usize;
+        // Process whole chunks until the byte budget is met (per-chunk granularity:
+        // the last chunk may carry us slightly over — chunks are PTY-read-bounded).
+        while drained < budget_bytes {
+            match self.rx.try_recv() {
+                Ok(data) => {
+                    drained += data.len();
+                    self.vterm.process(&data);
+                    if self.backend.is_some() {
+                        let text = String::from_utf8_lossy(&data);
+                        if text.contains("[from:") {
+                            self.has_notification = true;
+                        }
+                    }
                 }
+                Err(_) => break, // channel empty (or disconnected)
             }
         }
         // Don't auto-scroll if user has scrolled back (they're reading history).
         // User scrolls back to bottom manually via mouse or Ctrl+B [ → j.
+        let more = !self.rx.is_empty();
+        if let (Some(threshold), Some(start)) = (probe_threshold, probe_start) {
+            let us = start.elapsed().as_micros() as u64;
+            if us >= threshold {
+                tracing::info!(
+                    tag = "#freeze-drain",
+                    drain_us = us,
+                    bytes = drained,
+                    more = more,
+                    "drain_output budget cycle"
+                );
+            }
+        }
+        more
     }
 
     /// Write bytes (keystrokes, paste) to this pane's underlying process.
@@ -341,6 +393,50 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         }
+    }
+
+    /// #freeze-2: `drain_output` must (a) cap per call at the byte budget, (b)
+    /// report "more remaining" so the loop re-arms, (c) over repeated calls drain
+    /// the WHOLE backlog, (d) losslessly and in FIFO order.
+    #[test]
+    fn drain_output_budget_caps_and_drains_losslessly_in_fifo_order() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut pane = test_pane(rx, 80, 4);
+        // 10 distinct single-byte chunks: '0'..='9' (1 byte each).
+        for c in b'0'..=b'9' {
+            let _ = tx.send(vec![c]); // unbounded + live rx → never fails
+        }
+        drop(tx); // disconnect so try_recv ends the loop once the queue is empty
+
+        // First call, 3-byte budget: processes exactly chunks '0','1','2' (the
+        // while-budget check trips at drained==3), leaving '3'..='9' queued.
+        let more = pane.drain_output(3);
+        assert!(
+            more,
+            "a 3-byte budget over 10 queued bytes must leave a remainder"
+        );
+        let after_first = pane.vterm.tail_lines(4);
+        assert!(
+            after_first.contains("012"),
+            "budgeted prefix processed: {after_first:?}"
+        );
+        assert!(
+            !after_first.contains('3'),
+            "budget cap: the 4th chunk must NOT be processed yet: {after_first:?}"
+        );
+
+        // Drain the rest over subsequent "frames" until dry.
+        let mut frames = 0;
+        while pane.drain_output(3) {
+            frames += 1;
+            assert!(frames < 50, "must converge to drained");
+        }
+        // Lossless + FIFO: every chunk processed, in order.
+        let final_lines = pane.vterm.tail_lines(4);
+        assert!(
+            final_lines.contains("0123456789"),
+            "all chunks must be drained in FIFO order: {final_lines:?}"
+        );
     }
 
     #[test]

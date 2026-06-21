@@ -796,6 +796,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // resize its pane's VTerm/PTY during render.
                 render_active_overlay(frame, &mut overlay, &layout, &registry, &home);
             })?;
+            // #freeze-2: a budget-capped `drain_output` may have left a backlog in
+            // a visible pane's channel. Re-arm `dirty` so the next frame continues
+            // draining (the select-timeout below already shrinks to the frame
+            // boundary when dirty) — the backlog clears over a few frames instead
+            // of one input-stalling mega-draw.
+            if render::active_tab_has_pending_output(&layout) {
+                dirty = true;
+            }
         }
 
         // #t-84833-10: wake the loop at the next frame boundary when a change is
