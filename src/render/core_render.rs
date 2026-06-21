@@ -54,6 +54,35 @@ pub fn state_color(state: AgentState) -> Color {
     }
 }
 
+/// #freeze-2 (t-…74503): max bytes of queued PTY output a pane drains into its
+/// VTerm per frame, inside `terminal.draw` on the main thread (see
+/// `Pane::drain_output`). Caps per-frame CPU so a boot/restart backlog can't stall
+/// the draw (and thus input); the remainder drains over the next frames. Tunable —
+/// smaller = snappier input under flood / slower visual catch-up. Calibrated to
+/// keep `terminal.draw` responsive (a few ms); verify with the `#freeze-drain`
+/// probe (`AGEND_FREEZE_INSTRUMENT`).
+const DRAIN_OUTPUT_BUDGET_BYTES: usize = 32 * 1024;
+
+/// #freeze-2: does any pane the render path actually DRAINS in the active tab
+/// still have queued PTY output? The render loop re-arms `dirty` on this so a
+/// budget-capped `drain_output` finishes draining over subsequent frames. Mirrors
+/// `render_pane_tree`'s pane selection (zoom = only the focused pane is drawn).
+pub fn active_tab_has_pending_output(layout: &Layout) -> bool {
+    let Some(tab) = layout.tabs.get(layout.active) else {
+        return false;
+    };
+    if tab.zoomed {
+        tab.root()
+            .find_pane(tab.focus_id)
+            .is_some_and(|p| !p.rx.is_empty())
+    } else {
+        tab.root()
+            .pane_ids()
+            .iter()
+            .any(|id| tab.root().find_pane(*id).is_some_and(|p| !p.rx.is_empty()))
+    }
+}
+
 fn build_agent_state_snapshot(
     layout: &Layout,
     registry: &AgentRegistry,
@@ -375,7 +404,10 @@ fn render_pane(
     is_drag_source: bool,
     is_drag_target: bool,
 ) -> PaneBorderInfo {
-    pane.drain_output();
+    // #freeze-2: budget-capped — the render loop re-arms `dirty` via
+    // `active_tab_has_pending_output` when a backlog remains, so this can't stall
+    // the draw. The returned "more" is observed there, not here.
+    let _ = pane.drain_output(DRAIN_OUTPUT_BUDGET_BYTES);
 
     if focused {
         pane.has_notification = false;
@@ -1251,5 +1283,38 @@ mod tests {
              lock-free published mirror, not take core.lock()"
         );
         holder.join().unwrap();
+    }
+
+    /// #freeze-2: the render loop re-arms `dirty` on this when a budget-capped
+    /// `drain_output` leaves a backlog — so it MUST report a visible pane's queued
+    /// rx (else the backlog stalls; correctness rule ①). Cross-platform (no PTY).
+    #[test]
+    fn active_tab_has_pending_output_reflects_visible_pane_queue() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(38, 11),
+            rx,
+            id: 1,
+            backend: Some(crate::backend::Backend::ClaudeCode),
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
+
+        // Empty channel → nothing to re-arm.
+        assert!(!active_tab_has_pending_output(&layout));
+        // Queued output on the visible pane → re-arm so the next frame drains it.
+        tx.send(b"backlog".to_vec()).unwrap();
+        assert!(active_tab_has_pending_output(&layout));
     }
 }
