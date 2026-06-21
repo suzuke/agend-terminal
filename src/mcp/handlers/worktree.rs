@@ -120,19 +120,21 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             })
         }
         Err(err) => {
-            // Map `DispatchError` to the pre-#781 string-code shape so
-            // existing callers keep parsing the same surface. The follow-up
-            // to dispatch on `err.code` belongs with bind_self's consumer
-            // migration.
-            let msg = err.message;
-            let code = if msg.contains("E4.5") {
-                "e4_5_protected_branch"
-            } else if msg.contains("already leased") {
-                "cross_agent_conflict"
-            } else {
-                "lease_failed"
+            // Map `DispatchError` to the pre-#781 string-code response shape, but
+            // dispatch on the TYPED `err.code` — NOT message substrings
+            // (smells#2 Pattern-A / de2eb8 finding #1). The old
+            // `msg.contains("already leased")` misclassified the two
+            // `LeaseConflict` producers whose message lacks that phrase
+            // (lock-acquire failure, `worktree::create` None) as `lease_failed`
+            // instead of `cross_agent_conflict`; matching the variant fixes that
+            // and consolidates all lease conflicts under one stable code.
+            use super::dispatch_hook::ErrorCode;
+            let code = match err.code {
+                ErrorCode::ProtectedBranch => "e4_5_protected_branch",
+                ErrorCode::LeaseConflict => "cross_agent_conflict",
+                _ => "lease_failed",
             };
-            json!({"error": msg, "code": code})
+            json!({"error": err.message, "code": code})
         }
     }
 }

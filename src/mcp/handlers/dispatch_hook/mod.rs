@@ -490,6 +490,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // so this swap leaves concurrency serialized exactly as before.
     let workspace_b = crate::worktree_pool::workspace_as_worktree_enabled(target);
     let map_lease_err = |msg: String| {
+        // stringly-allow: the lease layer returns an anyhow string; this is the
+        // SINGLE boundary that classifies it into the typed `ErrorCode`. Consumers
+        // (e.g. worktree.rs bind_self) dispatch on `err.code`, not the message.
         let code = if msg.contains("E4.5") {
             ErrorCode::ProtectedBranch
         } else {

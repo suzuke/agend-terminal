@@ -1580,6 +1580,9 @@ static REPLAY_FAILCLOSED_EVENT_EMITTED: std::sync::atomic::AtomicBool =
 /// accepted rather than expanding scope.
 fn surface_failclosed_replay_once(board: &Path, err: &anyhow::Error) {
     let msg = err.to_string();
+    // stringly-allow: `err` is an `anyhow::Error` from replay with no typed
+    // variant for the fail-closed condition; the message text is the only signal
+    // for the once-per-boot board-freeze alert gate.
     if !msg.contains("fail-closed") {
         return;
     }

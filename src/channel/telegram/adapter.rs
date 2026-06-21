@@ -244,6 +244,9 @@ impl crate::channel::Channel for TelegramChannel {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     let msg = format!("{e}");
+                    // stringly-allow: teloxide exposes no typed "already-deleted"
+                    // error variant, so matching the API message text is the only
+                    // signal for this idempotent-delete fast-path.
                     if msg.contains("message to delete not found")
                         || msg.contains("message can't be deleted")
                     {

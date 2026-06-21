@@ -787,6 +787,9 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Attach { name }) => {
             if let Err(e) = tui::attach(&home, &name) {
                 let err = format!("{e:#}").to_ascii_lowercase();
+                // stringly-allow: `tui::attach` surfaces anyhow-wrapped
+                // connection/io errors (no typed variant) — message text is the
+                // only signal for picking the right operator hint.
                 if err.contains("no active daemon") {
                     daemon_not_running_hint();
                 } else if err.contains("port file missing")
