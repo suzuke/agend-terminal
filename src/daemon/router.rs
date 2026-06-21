@@ -568,4 +568,81 @@ mod tests {
         crate::channel::reset_active_channel_for_test();
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── Sprint 52 Invariant 4 (real-path): mirror dedup ≤1 emit/turn ──
+
+    /// Replaces the `MirrorState` shadow simulator + the
+    /// `mirror_dedup_no_double_within_turn` proptest that lived in
+    /// `tests/sprint52_stress.rs`. Those re-implemented the dedup gate in a
+    /// fake struct, so a regression in the REAL gate would not have failed
+    /// them. This drives the PRODUCTION `try_dispatch_mirror` against the
+    /// real `heartbeat_pair` state + a recording channel over a randomized
+    /// (seeded, deterministic) sequence of turns, and pins the invariant:
+    /// at most ONE mirror is emitted per turn.
+    ///
+    /// Each turn re-arms `reply_to_channel` + bumps `input_id` before EVERY
+    /// dispatch attempt, so neither the `reply_to_channel.is_none()` gate nor
+    /// the `last_mirror_event_id` gate can independently suppress the second
+    /// attempt — the `mirror_dispatched_for_turn` flag check (the L184 gate)
+    /// is the ONLY thing preventing a double-emit.
+    ///
+    /// neuter-RED: delete the `if pair.mirror_dispatched_for_turn { … }` early
+    /// return in `try_dispatch_mirror` and this test goes RED (a turn emits >1
+    /// because the re-armed reply target + bumped input_id pass every other
+    /// gate).
+    #[test]
+    fn mirror_dedup_at_most_one_emit_per_turn_real_gate() {
+        let _g = registry_guard();
+        crate::channel::reset_active_channel_for_test();
+        let tg = RecordingMockChannel::arc("telegram");
+        crate::channel::register_active_channel(tg.clone());
+
+        let agent = "test_mirror_dedup_property";
+        let home = std::env::temp_dir().join(format!("agend-router-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+
+        // Deterministic xorshift PRNG (no Instant/rand → reproducible).
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut input_id: u64 = 0;
+        let turns = 300;
+        for turn in 0..turns {
+            // Start a fresh turn: clear the per-turn dedup flags, arm a target.
+            input_id += 1;
+            crate::daemon::heartbeat_pair::update_with(agent, |p| {
+                p.reply_to_channel = Some("telegram".into());
+                p.reply_to_input_id = Some(input_id);
+                p.mirror_dispatched_for_turn = false;
+                p.mirror_skip_until_next_turn = false;
+                p.last_mirror_event_id = None;
+            });
+            let before = tg.count();
+
+            // 2..=4 dispatch attempts within this turn; re-arm reply target +
+            // bump input_id before each so only the dedup flag can block.
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let attempts = 2 + (rng % 3);
+            for _ in 0..attempts {
+                input_id += 1;
+                crate::daemon::heartbeat_pair::update_with(agent, |p| {
+                    p.reply_to_channel = Some("telegram".into());
+                    p.reply_to_input_id = Some(input_id);
+                });
+                let mut buf = make_buffer("mirror text long enough to dispatch within the turn");
+                buf.input_id = Some(input_id);
+                try_dispatch_mirror(&home, agent, &mut buf);
+            }
+
+            let emitted = tg.count() - before;
+            assert!(
+                emitted <= 1,
+                "turn {turn} emitted {emitted} mirrors (>1) over {attempts} attempts: \
+                 the mirror_dispatched_for_turn dedup gate failed"
+            );
+        }
+
+        crate::channel::reset_active_channel_for_test();
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
