@@ -194,6 +194,26 @@ fn main() {
             exec_real_git(&strip_target_overrides(&args), Some(&worktree))
         }
         Action::CleanupAndChdirPushPass(worktree) => {
+            // #2379 ③ denylist-core: refuse a push whose range carries a
+            // trust-root file BEFORE the (never-blocking) init-pile cleanup.
+            // ⚠ CONTRACT CHANGE: this is the FIRST blocking deny on the push
+            // path — until now `CleanupAndChdirPushPass` always passed through
+            // to real `git push`. `cleanup_init_pile_pre_push` below KEEPS its
+            // "NEVER blocks" contract (this is a separate, independent check
+            // that runs first); the arm as a whole is now always-pass → MAY
+            // exit(1). Fail-closed (see `push_trust_root_denylist_violation`).
+            if let Some(reason) = push_trust_root_denylist_violation(&worktree) {
+                emit_deny_error(subcommand, &reason, &agent);
+                write_git_event_typed(
+                    &home,
+                    &agent,
+                    subcommand,
+                    "deny_trust_root",
+                    None,
+                    Some(&reason),
+                );
+                std::process::exit(1);
+            }
             // #883: best-effort pre-push cleanup of empty `init`
             // heartbeat commits. Failure is logged + we still pass
             // through to real `git push` — cleanup MUST NOT block
@@ -1612,6 +1632,11 @@ fn log_init_heartbeat_forensics(home: &str, agent: &str, args: &[String]) {
 /// stderr and the function returns; `main` then proceeds to
 /// `exec_real_git` as usual. Cleanup is a best-effort hygiene
 /// improvement, not a correctness gate.
+///
+/// (THIS function's never-blocks contract is unchanged. Note the push PATH can
+/// now block: `#2379` `push_trust_root_denylist_violation` runs BEFORE this in
+/// the `CleanupAndChdirPushPass` arm and may `exit(1)` — a separate guardrail,
+/// not part of this hygiene pass.)
 fn cleanup_init_pile_pre_push(worktree: &str) {
     // List commits between origin/main..HEAD with hash + subject.
     let log_out = match Command::new("git")
@@ -1791,6 +1816,97 @@ fn commit_is_empty_heartbeat(worktree: &str, hash: &str) -> bool {
         _ => return false,
     };
     diff_out.stdout.trim_ascii().is_empty()
+}
+
+// ── #2379 ③ denylist-core: trust-root push deny ─────────────────────────
+
+/// Trust-root filenames an agent must never push into a shared repo. These live
+/// in `$AGEND_HOME` (the config-integrity key, the fleet config, the append-only
+/// audit logs); `.gitignore` blocks the common ones but `git add -f` bypasses it,
+/// so this denylist is the push-time enforcement layer. Matched against a blob's
+/// repo-relative BASENAME / extension (see `trust_root_basename_denied`).
+const TRUST_ROOT_DENY_NAMES: &[&str] = &[".config-integrity-key", "policy.toml", "fleet.yaml"];
+
+/// Whether a repo-relative blob path is a trust-root file: its BASENAME is an
+/// exact trust-root name, or it is an audit log (`*.jsonl`). Pure — fed by the
+/// impure range enumeration.
+///
+/// ⚠ Matches the repo-relative path's basename, NOT a `$AGEND_HOME` filesystem
+/// prefix: a managed worktree lives UNDER `$AGEND_HOME/worktrees/<agent>/<branch>`
+/// (binding.rs), so an abs-path-under-`$AGEND_HOME` test would match EVERY file in
+/// the worktree and false-block every push. `git --name-only` yields repo-relative
+/// paths, so basename matching is correct. Basename via `rsplit('/')` (NOT
+/// `lstrip`/`trim_start_matches`, which would eat the leading dot of
+/// `.config-integrity-key`). Basename-anywhere, so a sub-directory dodge
+/// (`stash/fleet.yaml`) is still caught.
+fn trust_root_basename_denied(repo_relative_path: &str) -> bool {
+    let basename = repo_relative_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo_relative_path);
+    TRUST_ROOT_DENY_NAMES.contains(&basename) || basename.ends_with(".jsonl")
+}
+
+/// The repo-relative paths touched by any commit in the push range
+/// (`origin/main..HEAD`) — the union of `--name-only` across the range, so a
+/// trust-root blob added in an intermediate commit is caught even if a later
+/// commit deletes it (the blob is still in the pushed history). Runs real git in
+/// the worktree with `AGEND_GIT_BYPASS=1` (mirrors `cleanup_init_pile_pre_push`'s
+/// established range base). Returns `Err(msg)` when the range can't be computed
+/// (e.g. `origin/main` not fetched) so the caller can fail CLOSED.
+fn push_range_files(worktree: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .args([
+            "log",
+            "--name-only",
+            "--pretty=format:",
+            "origin/main..HEAD",
+        ])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map_err(|e| format!("git log spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git log origin/main..HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// Scan the push range for a trust-root file; return an actionable deny reason or
+/// `None` to allow. **Fails CLOSED**: a range-computation error returns a deny
+/// reason — security over best-effort. This is intentionally STRICTER than
+/// `cleanup_init_pile_pre_push`, which no-ops (allows the push) on the same
+/// `origin/main..HEAD` error; that cleanup is hygiene, this is a guardrail.
+fn push_trust_root_denylist_violation(worktree: &str) -> Option<String> {
+    match push_range_files(worktree) {
+        Ok(files) => files
+            .into_iter()
+            .find(|p| trust_root_basename_denied(p))
+            .map(|p| {
+                format!(
+                    "push range contains a trust-root file: `{p}` — $AGEND_HOME config / \
+                     integrity key / audit logs must never be pushed into a shared repo. \
+                     Drop it from the pushed commits (e.g. `git rm --cached {p}` then amend/rebase) \
+                     and retry."
+                )
+            }),
+        Err(e) => Some(format!(
+            "could not verify the push against the trust-root denylist ({e}); refusing to \
+             push (fail-closed). Fetch origin so `origin/main..HEAD` resolves \
+             (`git fetch origin`), then retry."
+        )),
+    }
 }
 
 // ── Exec ────────────────────────────────────────────────────────────────
@@ -4322,5 +4438,261 @@ mod tests {
         assert_eq!(ev["argv"][2], "/tmp/stray");
         assert_eq!(ev["process_ancestry"][0], "100 1 git");
         assert!(ev["timestamp"].is_string(), "must carry a timestamp");
+    }
+
+    // ── #2379 ③ denylist-core tests ───────────────────────────────
+
+    /// Pure matcher table: trust-root basenames (at any depth) + `*.jsonl` are
+    /// denied; normal repo files and near-misses are allowed. Includes the
+    /// abs-prefix counter-example proving we match the repo-relative BASENAME, not
+    /// a `$AGEND_HOME` filesystem prefix (which would false-block every file in a
+    /// managed worktree under `$AGEND_HOME/worktrees/...`).
+    #[test]
+    fn trust_root_basename_denied_table_2379() {
+        for p in [
+            ".config-integrity-key",
+            "policy.toml",
+            "fleet.yaml",
+            "config/policy.toml", // basename-anywhere (sub-dir dodge)
+            "stash/sub/fleet.yaml",
+            "deep/.config-integrity-key",
+            "event-log.jsonl",
+            "logs/fleet_events.jsonl", // *.jsonl glob, nested
+            "a/b/c/turn_sentinel_shadow.jsonl",
+        ] {
+            assert!(trust_root_basename_denied(p), "{p:?} must be DENIED");
+        }
+        for p in [
+            "src/main.rs",
+            "Cargo.toml",
+            "README.md",
+            "src/policy.rs",    // not policy.toml
+            "fleet.yaml.bak",   // basename ≠ fleet.yaml
+            "config/fleet.yml", // .yml ≠ .yaml
+            "data/notes.json",  // .json ≠ .jsonl
+            "policy.toml.example",
+            ".config-integrity-key.txt",
+        ] {
+            assert!(!trust_root_basename_denied(p), "{p:?} must be ALLOWED");
+        }
+        // ⚠ abs-prefix counter-example: a normal file whose ABSOLUTE path sits
+        // under `$AGEND_HOME/.agend-terminal/worktrees/...` is NOT denied — only
+        // its basename matters. Proves basename-match ≠ `$AGEND_HOME`-prefix match
+        // (the bug the lead flagged: a prefix test would block 100% of pushes).
+        assert!(!trust_root_basename_denied(
+            "/Users/x/.agend-terminal/worktrees/dev/feat/x/src/foo.rs"
+        ));
+        // …and a genuine trust-root basename in such a path IS denied — by basename.
+        assert!(trust_root_basename_denied(
+            "/Users/x/.agend-terminal/worktrees/dev/feat/x/fleet.yaml"
+        ));
+    }
+
+    fn git_run_2379(args: &[&str], dir: &std::path::Path) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .output()
+            .expect("git spawn")
+    }
+
+    /// Build a temp repo with a real `origin` remote, seed `origin/main` with one
+    /// commit, and check out a fresh `feat/test` branch — so `origin/main..HEAD`
+    /// resolves. Returns the worktree path (caller removes `worktree.parent()`).
+    fn build_repo_with_origin_main_2379(tag: &str) -> std::path::PathBuf {
+        let id = format!(
+            "{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base = std::env::temp_dir().join(format!("agend-2379-{id}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let origin_bare = base.join("origin.git");
+        let worktree = base.join("worktree");
+        assert!(git_run_2379(
+            &[
+                "init",
+                "--bare",
+                "-b",
+                "main",
+                origin_bare.to_str().unwrap()
+            ],
+            &base
+        )
+        .status
+        .success());
+        assert!(git_run_2379(
+            &[
+                "clone",
+                origin_bare.to_str().unwrap(),
+                worktree.to_str().unwrap()
+            ],
+            &base
+        )
+        .status
+        .success());
+        git_run_2379(&["config", "user.name", "test"], &worktree);
+        git_run_2379(&["config", "user.email", "test@test.local"], &worktree);
+        git_run_2379(&["config", "commit.gpgsign", "false"], &worktree);
+        std::fs::write(worktree.join("README.md"), "initial\n").unwrap();
+        assert!(git_run_2379(&["add", "README.md"], &worktree)
+            .status
+            .success());
+        assert!(git_run_2379(&["commit", "-m", "initial"], &worktree)
+            .status
+            .success());
+        assert!(git_run_2379(&["push", "origin", "main"], &worktree)
+            .status
+            .success());
+        assert!(git_run_2379(&["checkout", "-b", "feat/test"], &worktree)
+            .status
+            .success());
+        worktree
+    }
+
+    /// CONTRACT RED→GREEN (real-git): a clean push range is allowed, but one that
+    /// carries a force-added trust-root file (`git add -f` bypasses `.gitignore` —
+    /// the actual threat) is DENIED with an actionable reason naming the file. RED
+    /// if `trust_root_basename_denied` always returns false (the deny disappears).
+    /// Joins the nextest `git-subprocess` group (spawns real git; #1893).
+    #[test]
+    fn denylist_blocks_force_added_trust_root_in_push_range_2379() {
+        let wt = build_repo_with_origin_main_2379("blocks");
+        // Clean commit — must be allowed.
+        std::fs::write(wt.join("feature.txt"), "real work\n").unwrap();
+        assert!(git_run_2379(&["add", "feature.txt"], &wt).status.success());
+        assert!(git_run_2379(&["commit", "-m", "feat: real"], &wt)
+            .status
+            .success());
+        assert_eq!(
+            push_trust_root_denylist_violation(wt.to_str().unwrap()),
+            None,
+            "a clean push range must be allowed"
+        );
+
+        // Force-add a trust-root file (simulates the gitignore-bypass threat).
+        std::fs::write(wt.join("fleet.yaml"), "stolen\n").unwrap();
+        assert!(git_run_2379(&["add", "-f", "fleet.yaml"], &wt)
+            .status
+            .success());
+        assert!(git_run_2379(&["commit", "-m", "sneak in trust-root"], &wt)
+            .status
+            .success());
+        let violation = push_trust_root_denylist_violation(wt.to_str().unwrap());
+        assert!(
+            violation
+                .as_deref()
+                .is_some_and(|r| r.contains("fleet.yaml")),
+            "force-added trust-root file must be denied with an actionable reason naming it, \
+             got: {violation:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    /// A trust-root blob added in an INTERMEDIATE commit then deleted in a later
+    /// one is still in the pushed history — the per-commit `--name-only` union
+    /// catches it (a net `diff` would miss it). Joins `git-subprocess`.
+    #[test]
+    fn denylist_catches_trust_root_added_then_deleted_in_range_2379() {
+        let wt = build_repo_with_origin_main_2379("addremove");
+        std::fs::write(wt.join("policy.toml"), "x\n").unwrap();
+        assert!(git_run_2379(&["add", "-f", "policy.toml"], &wt)
+            .status
+            .success());
+        assert!(git_run_2379(&["commit", "-m", "add trust-root"], &wt)
+            .status
+            .success());
+        // Later commit removes it — but the blob remains in the pushed range.
+        assert!(git_run_2379(&["rm", "policy.toml"], &wt).status.success());
+        assert!(git_run_2379(&["commit", "-m", "remove it"], &wt)
+            .status
+            .success());
+        let violation = push_trust_root_denylist_violation(wt.to_str().unwrap());
+        assert!(
+            violation
+                .as_deref()
+                .is_some_and(|r| r.contains("policy.toml")),
+            "trust-root added-then-deleted in range must still be denied, got: {violation:?}"
+        );
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    /// FAIL-CLOSED: when the range can't be computed (`origin/main` absent), the
+    /// denylist refuses the push rather than allowing it unverified — STRICTER than
+    /// `cleanup_init_pile_pre_push`, which no-ops on the same error. Joins
+    /// `git-subprocess`.
+    #[test]
+    fn denylist_fails_closed_when_origin_main_missing_2379() {
+        let base = std::env::temp_dir().join(format!(
+            "agend-2379-failclosed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // A repo with NO remote / no origin/main ref → origin/main..HEAD errors.
+        assert!(
+            git_run_2379(&["init", "-b", "main", base.to_str().unwrap()], &base)
+                .status
+                .success()
+        );
+        git_run_2379(&["config", "user.name", "test"], &base);
+        git_run_2379(&["config", "user.email", "test@test.local"], &base);
+        git_run_2379(&["config", "commit.gpgsign", "false"], &base);
+        std::fs::write(base.join("a.txt"), "x\n").unwrap();
+        assert!(git_run_2379(&["add", "a.txt"], &base).status.success());
+        assert!(git_run_2379(&["commit", "-m", "c"], &base).status.success());
+        let violation = push_trust_root_denylist_violation(base.to_str().unwrap());
+        assert!(
+            violation
+                .as_deref()
+                .is_some_and(|r| r.contains("fail-closed")),
+            "missing origin/main must FAIL CLOSED with an actionable reason, got: {violation:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Persistent guard (lead decision b): the denylist patterns must produce ZERO
+    /// hits on the REAL repo's tracked tree. If a legitimate tracked `*.jsonl`
+    /// fixture / `policy.toml` / etc. is ever committed, this RED-flags so the deny
+    /// surface is reviewed (allowlist) instead of silently blocking real pushes —
+    /// replaces the spike's one-shot manual `git ls-tree` probe. Joins
+    /// `git-subprocess` (spawns real git).
+    #[test]
+    fn tracked_tree_has_zero_trust_root_hits_persistent_guard_2379() {
+        let out = Command::new("git")
+            .args(["ls-files"])
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git ls-files spawn");
+        assert!(
+            out.status.success(),
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hits: Vec<&str> = std::str::from_utf8(&out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|p| trust_root_basename_denied(p))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "tracked tree must have ZERO trust-root denylist hits; found {hits:?}. If one is a \
+             legitimate repo file, the #2379 denylist needs an allowlist entry — do NOT let it \
+             through silently."
+        );
     }
 }
