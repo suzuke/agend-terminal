@@ -126,9 +126,10 @@ impl Pane {
     }
 
     /// Drain up to `budget_bytes` of pending PTY output into the local VTerm,
-    /// leaving any remainder queued in the (unbounded) channel. Returns `true` if
-    /// output still remains — the render loop re-arms a redraw on this so the
-    /// backlog finishes draining over subsequent frames.
+    /// leaving any remainder queued in the (unbounded) channel. Returns the number
+    /// of BYTES drained this call. Callers that share one per-frame budget across
+    /// many panes (`render::drain_all_panes`) subtract it from the remaining budget;
+    /// whether output still remains is `!pane.rx.is_empty()`.
     ///
     /// #freeze-2 (t-…74503): this `vterm.process` loop runs on the MAIN thread
     /// inside `terminal.draw`. Un-bounded, a boot/restart backlog (every agent
@@ -138,8 +139,7 @@ impl Pane {
     /// work keeps `terminal.draw` short so input stays responsive while the pane
     /// visually catches up across a few frames. Lossless + FIFO: chunks are
     /// processed in receive order; unprocessed chunks stay queued.
-    #[must_use = "re-arm a redraw when output remains, or the backlog stalls"]
-    pub fn drain_output(&mut self, budget_bytes: usize) -> bool {
+    pub fn drain_output(&mut self, budget_bytes: usize) -> usize {
         let probe_threshold = drain_probe_threshold_us();
         let probe_start = probe_threshold.map(|_| Instant::now());
         let mut drained = 0usize;
@@ -162,7 +162,6 @@ impl Pane {
         }
         // Don't auto-scroll if user has scrolled back (they're reading history).
         // User scrolls back to bottom manually via mouse or Ctrl+B [ → j.
-        let more = !self.rx.is_empty();
         if let (Some(threshold), Some(start)) = (probe_threshold, probe_start) {
             let us = start.elapsed().as_micros() as u64;
             if us >= threshold {
@@ -170,12 +169,12 @@ impl Pane {
                     tag = "#freeze-drain",
                     drain_us = us,
                     bytes = drained,
-                    more = more,
+                    more = !self.rx.is_empty(),
                     "drain_output budget cycle"
                 );
             }
         }
-        more
+        drained
     }
 
     /// Write bytes (keystrokes, paste) to this pane's underlying process.
@@ -395,9 +394,10 @@ mod tests {
         }
     }
 
-    /// #freeze-2: `drain_output` must (a) cap per call at the byte budget, (b)
-    /// report "more remaining" so the loop re-arms, (c) over repeated calls drain
-    /// the WHOLE backlog, (d) losslessly and in FIFO order.
+    /// #freeze-2: `drain_output` must (a) cap per call at the byte budget and
+    /// return the bytes drained, (b) leave the remainder queued (`!rx.is_empty()`)
+    /// so the loop re-arms, (c) over repeated calls drain the WHOLE backlog, (d)
+    /// losslessly and in FIFO order.
     #[test]
     fn drain_output_budget_caps_and_drains_losslessly_in_fifo_order() {
         let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
@@ -408,11 +408,15 @@ mod tests {
         }
         drop(tx); // disconnect so try_recv ends the loop once the queue is empty
 
-        // First call, 3-byte budget: processes exactly chunks '0','1','2' (the
-        // while-budget check trips at drained==3), leaving '3'..='9' queued.
-        let more = pane.drain_output(3);
+        // First call, 3-byte budget: processes exactly chunks '0','1','2' (3 bytes,
+        // the while-budget check trips at drained==3), leaving '3'..='9' queued.
+        let drained = pane.drain_output(3);
+        assert_eq!(
+            drained, 3,
+            "a 3-byte budget drains exactly 3 one-byte chunks"
+        );
         assert!(
-            more,
+            !pane.rx.is_empty(),
             "a 3-byte budget over 10 queued bytes must leave a remainder"
         );
         let after_first = pane.vterm.tail_lines(4);
@@ -425,9 +429,10 @@ mod tests {
             "budget cap: the 4th chunk must NOT be processed yet: {after_first:?}"
         );
 
-        // Drain the rest over subsequent "frames" until dry.
+        // Drain the rest over subsequent "frames" until dry (a call drains 0 once
+        // the queue is empty).
         let mut frames = 0;
-        while pane.drain_output(3) {
+        while pane.drain_output(3) > 0 {
             frames += 1;
             assert!(frames < 50, "must converge to drained");
         }
@@ -437,6 +442,67 @@ mod tests {
             final_lines.contains("0123456789"),
             "all chunks must be drained in FIFO order: {final_lines:?}"
         );
+    }
+
+    // ── #freeze-3 H2 (background-tab catch-up) deterministic proofs ────────
+
+    /// #freeze-3 H2 MEMORY: the pane's `rx` is an UNBOUNDED channel — left undrained
+    /// (the pre-fix background-tab case) it queues EVERY chunk, growing ∝ the
+    /// agent's output. This pins the hazard the render loop's `drain_all_panes` must
+    /// bound: it now drains every pane every frame, so a backgrounded pane's `rx`
+    /// never reaches this state in practice (see
+    /// `core_render::tests::drain_all_panes_bounds_background_rx_freeze3`).
+    #[test]
+    fn backgrounded_pane_rx_accumulates_unbounded_freeze3() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let pane = test_pane(rx, 80, 24);
+        for _ in 0..1000 {
+            let _ = tx.send(vec![b'y'; 1024]); // live unbounded rx → never fails
+        }
+        assert_eq!(
+            pane.rx.len(),
+            1000,
+            "an un-drained pane queues every chunk — unbounded memory (~1 MiB here; \
+             grows without limit). The fix is to drain it every frame regardless of \
+             which tab is active."
+        );
+    }
+
+    /// #freeze-3 H2 SIZING: a budget-capped drain processes
+    /// `DRAIN_OUTPUT_BUDGET_BYTES` (32 KiB) per frame, so draining a backlog takes
+    /// `ceil(backlog / 32KiB)` frames — LINEAR in the backlog. At `FRAME_INTERVAL`
+    /// = 33 ms: 1 MiB ≈ 32 frames ≈ 1 s, 16 MiB ≈ 512 ≈ 17 s. This is exactly the
+    /// residual #2385 left: it turned "one 107 ms input-stall" into a non-blocking
+    /// but UNBOUNDED-LENGTH catch-up — unbounded because the *backlog* was unbounded
+    /// (background tabs never drained). The #freeze-3 fix bounds the backlog by
+    /// draining every pane every frame; this test sizes the per-frame budget.
+    #[test]
+    fn drain_catchup_frames_scale_linearly_with_backlog_h2_freeze3() {
+        const BUDGET: usize = 32 * 1024; // mirror DRAIN_OUTPUT_BUDGET_BYTES
+        const CHUNK: usize = 4 * 1024; // PTY-read-sized chunk
+        for &(kib, want_frames) in &[(128usize, 4usize), (256, 8), (512, 16)] {
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+            let mut pane = test_pane(rx, 80, 24);
+            let total = kib * 1024;
+            for _ in 0..(total / CHUNK) {
+                let _ = tx.send(vec![b'x'; CHUNK]); // live unbounded rx → never fails
+            }
+            // Count per-frame bounded drains until dry (the render loop's re-arm).
+            let mut frames = 0usize;
+            loop {
+                frames += 1;
+                assert!(frames < 100_000, "must converge to drained");
+                pane.drain_output(BUDGET);
+                if pane.rx.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                frames, want_frames,
+                "{kib} KiB backlog must take ceil({kib}KiB / 32KiB) = {want_frames} \
+                 bounded-drain frames (catch-up is LINEAR in backlog)"
+            );
+        }
     }
 
     #[test]

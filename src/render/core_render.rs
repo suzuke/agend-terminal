@@ -83,6 +83,94 @@ pub fn active_tab_has_pending_output(layout: &Layout) -> bool {
     }
 }
 
+/// #freeze-3 (t-…50793): total bytes drained across ALL panes per frame, shared
+/// active-tab-first. Caps per-frame main-thread VTerm work regardless of pane
+/// count — the boot/restart flood is every pane dumping its screen at once, so a
+/// naive per-pane budget would scale to `N × DRAIN_OUTPUT_BUDGET_BYTES` and
+/// re-create the #freeze-2 long-draw that #2385 bounded for the active pane alone.
+/// Sized at 2× the per-pane budget: the active tab keeps its full snappy budget
+/// (zero draw-time regression when the background is idle) and the background
+/// panes share the remainder.
+const DRAIN_ALL_TOTAL_BUDGET_BYTES: usize = 2 * DRAIN_OUTPUT_BUDGET_BYTES;
+
+/// #freeze-3 (t-…50793) ROOT FIX: drain queued PTY output for EVERY pane (both the
+/// active tab's and the background tabs') into its own `Pane.vterm`, within the
+/// single shared per-frame `DRAIN_ALL_TOTAL_BUDGET_BYTES`, spending the ACTIVE
+/// tab's panes first so the visible catch-up keeps priority. Returns `true` if any
+/// pane still has queued output after this pass.
+///
+/// This fixes the residual freeze #2385 left: `render_pane` only ever drained the
+/// ACTIVE tab, so a backgrounded busy tab's `pane.rx` grew UNBOUNDED and switching
+/// to it replayed `ceil(backlog / budget)` frames of catch-up — proportional to
+/// how long the tab was backgrounded (the operator's multi-second "一直刷新").
+/// Draining every pane every frame keeps each `rx` bounded → the switch is
+/// instant and memory is bounded.
+///
+/// All work is on the MAIN thread against `Pane.vterm` (owned, NOT behind
+/// core.lock — the PTY read loops feed the SEPARATE `AgentCore.vterm`), so there
+/// is zero contention with the per-agent core locks (perf-R1 safe).
+///
+/// Re-arm: the render loop re-arms its redraw on the ACTIVE tab's backlog only
+/// (`active_tab_has_pending_output`) — background draining needs no redraw and is
+/// guaranteed a next pass by the loop's ≤50ms idle cadence plus per-output
+/// wakeups (both set `dirty` → frame-due → this runs again).
+///
+/// Limitation: a single background agent sustaining > one pane's drain rate
+/// (~`DRAIN_OUTPUT_BUDGET_BYTES`/frame) indefinitely can delay OTHER background
+/// panes' drain (active-first + the shared cap) — they still drain once it pauses,
+/// and the active tab plus that agent are never starved. KISS: no cross-frame
+/// round-robin cursor.
+pub fn drain_all_panes(layout: &mut Layout) -> bool {
+    let active = layout.active;
+    let mut remaining = DRAIN_ALL_TOTAL_BUDGET_BYTES;
+    let mut more = false;
+    let mut probe_panes_with_backlog = 0usize;
+    let mut probe_max_rx_chunks = 0usize;
+    // Active tab first (visible catch-up priority), then the rest in tab order.
+    let order = std::iter::once(active).chain((0..layout.tabs.len()).filter(move |&i| i != active));
+    for tab_idx in order {
+        let Some(tab) = layout.tabs.get_mut(tab_idx) else {
+            continue;
+        };
+        for id in tab.root().pane_ids() {
+            let Some(pane) = tab.root_mut().find_pane_mut(id) else {
+                continue;
+            };
+            let budget = DRAIN_OUTPUT_BUDGET_BYTES.min(remaining);
+            remaining = remaining.saturating_sub(pane.drain_output(budget));
+            let rx_chunks = pane.rx.len();
+            if rx_chunks > 0 {
+                more = true;
+                probe_panes_with_backlog += 1;
+                probe_max_rx_chunks = probe_max_rx_chunks.max(rx_chunks);
+            }
+        }
+    }
+    // #freeze-3 probe (env-gated, `AGEND_FREEZE_INSTRUMENT`): summarize residual
+    // backlog so an operator restart-repro can confirm background rx stays bounded.
+    // Off by default → zero behavior change.
+    if probe_panes_with_backlog > 0 && freeze_backlog_probe_enabled() {
+        tracing::info!(
+            tag = "#freeze-backlog",
+            panes_with_backlog = probe_panes_with_backlog,
+            max_rx_chunks = probe_max_rx_chunks,
+            budget_spent = DRAIN_ALL_TOTAL_BUDGET_BYTES - remaining,
+            "drain_all_panes residual backlog"
+        );
+    }
+    more
+}
+
+/// #freeze-3 probe gate: the `#freeze-backlog` summary in `drain_all_panes` fires
+/// only when `AGEND_FREEZE_INSTRUMENT` is set (any non-empty, non-`"0"` value),
+/// mirroring `Pane::drain_output`'s `#freeze-drain` probe. Read once, cached.
+fn freeze_backlog_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("AGEND_FREEZE_INSTRUMENT").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 fn build_agent_state_snapshot(
     layout: &Layout,
     registry: &AgentRegistry,
@@ -404,11 +492,11 @@ fn render_pane(
     is_drag_source: bool,
     is_drag_target: bool,
 ) -> PaneBorderInfo {
-    // #freeze-2: budget-capped — the render loop re-arms `dirty` via
-    // `active_tab_has_pending_output` when a backlog remains, so this can't stall
-    // the draw. The returned "more" is observed there, not here.
-    let _ = pane.drain_output(DRAIN_OUTPUT_BUDGET_BYTES);
-
+    // #freeze-3: draining moved OUT of the render path into the render loop's
+    // `drain_all_panes`, which drains EVERY tab's panes (not just the active one)
+    // so a backgrounded tab's `rx` stays bounded. `render_pane` is now a pure
+    // VTerm read; the active tab's catch-up re-arm still rides on
+    // `active_tab_has_pending_output` in the loop.
     if focused {
         pane.has_notification = false;
     }
@@ -1316,5 +1404,146 @@ mod tests {
         // Queued output on the visible pane → re-arm so the next frame drains it.
         tx.send(b"backlog".to_vec()).unwrap();
         assert!(active_tab_has_pending_output(&layout));
+    }
+
+    fn pane_with_rx(id: usize, rx: crossbeam_channel::Receiver<Vec<u8>>) -> Pane {
+        Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(38, 11),
+            rx,
+            id,
+            backend: Some(crate::backend::Backend::ClaudeCode),
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    /// #freeze-3 H2 MECHANISM: the per-frame drain re-arm
+    /// (`active_tab_has_pending_output`, the render loop's signal to keep the
+    /// VISIBLE catch-up going) only sees the ACTIVE tab. A backgrounded tab's
+    /// backlog therefore never re-arms a *redraw* — correct, since hidden tabs need
+    /// no redraw. (Background draining is the job of `drain_all_panes`, gated below;
+    /// this test pins the re-arm's active-only scope so the two stay decoupled.)
+    /// Cross-platform.
+    #[test]
+    fn rearm_ignores_backgrounded_tab_backlog_freeze3() {
+        let (_tx0, rx0) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (tx1, rx1) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "t0".to_string(),
+            pane_with_rx(1, rx0),
+        ));
+        layout.add_tab(crate::layout::Tab::new(
+            "t1".to_string(),
+            pane_with_rx(2, rx1),
+        ));
+        layout.goto_tab(0); // add_tab focuses the new tab; make t0 the active one.
+
+        // active = 0 (t0). Backlog ONLY on the BACKGROUND tab (t1).
+        tx1.send(b"backlog".to_vec()).unwrap();
+        assert!(
+            !active_tab_has_pending_output(&layout),
+            "a backgrounded tab's backlog must NOT re-arm a redraw — its catch-up is \
+             invisible; it is drained by `drain_all_panes`, not the redraw re-arm"
+        );
+
+        // Switch to t1 → its backlog is now the active tab's → the re-arm fires.
+        layout.goto_tab(1);
+        assert!(
+            active_tab_has_pending_output(&layout),
+            "switching to the backlogged tab makes it active → re-arm fires (redraw)"
+        );
+    }
+
+    /// #freeze-3 ROOT-FIX GATE: `drain_all_panes` must drain a BACKGROUND tab's
+    /// pane too (not just the active tab), so a backgrounded busy pane's `rx`
+    /// converges to EMPTY over a BOUNDED number of frames instead of accumulating
+    /// unbounded. This is the fix for the residual switch-time catch-up #2385 left:
+    /// pre-fix only the active tab drained, so switching to a long-backgrounded tab
+    /// replayed `ceil(backlog / budget)` frames (∝ background duration). RED if
+    /// `drain_all_panes` skipped background tabs (the bug): the background `rx`
+    /// would never drain and the loop below would not converge. Cross-platform.
+    #[test]
+    fn drain_all_panes_bounds_background_rx_freeze3() {
+        const CHUNK: usize = 4 * 1024; // PTY-read-sized chunk
+
+        let (_tx0, rx0) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (tx1, rx1) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "t0".to_string(),
+            pane_with_rx(1, rx0),
+        ));
+        layout.add_tab(crate::layout::Tab::new(
+            "t1".to_string(),
+            pane_with_rx(2, rx1),
+        ));
+        layout.goto_tab(0); // t0 ACTIVE (idle), t1 BACKGROUND (flooded).
+
+        // Flood the BACKGROUND tab with a backlog the active render path never sees.
+        let backlog = 512 * 1024;
+        let chunks = backlog / CHUNK; // 128 chunks
+        for _ in 0..chunks {
+            tx1.send(vec![b'x'; CHUNK]).unwrap();
+        }
+        let bg_rx_len = |layout: &Layout| -> usize {
+            layout.tabs[1]
+                .root()
+                .find_pane(2)
+                .map(|p| p.rx.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            bg_rx_len(&layout),
+            chunks,
+            "precondition: the whole backlog is queued on the background pane"
+        );
+
+        // Each `drain_all_panes` call == one render frame. The background pane MUST
+        // drain down to empty over a bounded number of frames (the fix), not stay
+        // queued (the bug). The active tab is idle and leaves the shared budget, so
+        // t1 drains DRAIN_OUTPUT_BUDGET_BYTES (32 KiB = 8 chunks) per frame.
+        let mut frames = 0usize;
+        let mut prev = bg_rx_len(&layout);
+        loop {
+            let more = drain_all_panes(&mut layout);
+            frames += 1;
+            assert!(
+                frames < 1_000,
+                "background backlog must converge to drained (it did not — the bug: \
+                 a background tab is never drained, so its rx grows unbounded)"
+            );
+            let now = bg_rx_len(&layout);
+            assert!(
+                now < prev,
+                "each frame must make progress draining the background pane \
+                 (prev={prev} now={now})"
+            );
+            prev = now;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(
+            bg_rx_len(&layout),
+            0,
+            "after convergence the background rx is empty → switching to it shows \
+             no catch-up"
+        );
+        assert_eq!(
+            frames, 16,
+            "512 KiB backlog drains in ceil(512KiB / 32KiB) = 16 bounded frames at \
+             the per-pane budget (the backlog itself is now bounded because draining \
+             runs every frame for background tabs too)"
+        );
     }
 }

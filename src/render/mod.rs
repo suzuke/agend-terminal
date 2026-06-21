@@ -8,7 +8,7 @@ pub mod panels_fleet;
 pub mod resize;
 pub mod scratch;
 
-pub use core_render::{active_tab_has_pending_output, render};
+pub use core_render::{active_tab_has_pending_output, drain_all_panes, render};
 pub use overlay::{
     render_command_palette, render_confirm, render_help, render_menu, render_move_pane_target,
     render_rename, render_scroll_indicator, render_tab_list,

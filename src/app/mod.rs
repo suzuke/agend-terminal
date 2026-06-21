@@ -770,6 +770,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         if dirty && should_draw(last_draw, frame_now, FRAME_INTERVAL) {
             last_draw = Some(frame_now);
             dirty = false;
+            // #freeze-3: drain queued PTY output for EVERY pane (active +
+            // background) into its VTerm BEFORE drawing, within one shared
+            // per-frame byte budget. `render_pane` no longer drains, so a
+            // backgrounded busy tab's `rx` stays bounded instead of replaying a
+            // multi-second catch-up when switched to. Background panes are drained
+            // but not redrawn; only the active tab is painted below.
+            render::drain_all_panes(&mut layout);
             terminal.draw(|frame| {
                 // #1027: snapshot the shared daemon-binary-stale flag once
                 // per frame so the render path sees a consistent value.
@@ -801,11 +808,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // resize its pane's VTerm/PTY during render.
                 render_active_overlay(frame, &mut overlay, &layout, &registry, &home);
             })?;
-            // #freeze-2: a budget-capped `drain_output` may have left a backlog in
-            // a visible pane's channel. Re-arm `dirty` so the next frame continues
-            // draining (the select-timeout below already shrinks to the frame
-            // boundary when dirty) — the backlog clears over a few frames instead
-            // of one input-stalling mega-draw.
+            // #freeze-2/#freeze-3: the budget-capped `drain_all_panes` above may
+            // have left a backlog in a VISIBLE pane's channel. Re-arm `dirty` so
+            // the next frame continues the active tab's catch-up (the select-timeout
+            // below shrinks to the frame boundary when dirty) — it clears over a few
+            // frames instead of one input-stalling mega-draw. Background backlog
+            // needs no redraw: the loop's ≤50ms idle cadence + per-output wakeups
+            // guarantee `drain_all_panes` runs again to bound every pane's `rx`.
             if render::active_tab_has_pending_output(&layout) {
                 dirty = true;
             }
