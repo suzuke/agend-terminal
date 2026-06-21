@@ -1441,20 +1441,12 @@ fn enforce_agent_canonical_bypass_deny(args: &[String]) {
         return;
     }
     let sub = sub_args.first().map(|s| s.as_str()).unwrap_or("");
-    // #2379 ②: header + canonical-specific bypass are unique to this early deny
-    // (no Binding is loaded here — env+cwd only), but the "where to run instead"
-    // remedy reuses the SHARED builder so it stays in sync with the Action::Deny
-    // path. No binding in scope → the generic (unbound) remedy.
-    eprintln!(
-        "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo."
-    );
-    eprintln!("           a stray provision here detaches the operator's canonical HEAD (#2234).");
-    for line in deny_remedy_lines(None) {
+    // #2379 ② (r6): the unique header + canonical-specific bypass live in a
+    // testable formatter (so the no-"security"-wording meta-test covers THIS prose
+    // too, not just the Action::Deny path) — it reuses the shared `deny_remedy_lines`.
+    for line in format_canonical_bypass_deny(&agent, sub) {
         eprintln!("{line}");
     }
-    eprintln!(
-        "           or, if you genuinely must: set AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot (or ask lead)."
-    );
     std::process::exit(1);
 }
 
@@ -2055,9 +2047,15 @@ fn emit_deny_error(subcmd: &str, reason: &str, agent: &str, binding: Option<&Bin
 /// at the ways to get a worktree. (Intentionally avoids "security"-flavoured
 /// wording per the operator copy rule — enforced by a meta-test.)
 fn deny_remedy_lines(binding: Option<&Binding>) -> Vec<String> {
-    match binding.and_then(|b| b.worktree.as_deref().map(|wt| (b, wt))) {
-        // Bound: the agent has a worktree — it's just running git in the wrong place.
-        Some((b, wt)) => {
+    // #2379 ② (r6): decide "bound" by the SAME predicate production uses —
+    // `is_bound` (task_id.is_some()) — AND require a worktree to name, so the
+    // remedy can never contradict classify's deny verdict. A partial binding
+    // (task_id=None, worktree=Some) is UNBOUND to classify, so it must get the
+    // generic remedy here too — never a "your assigned worktree is <stale>" line
+    // pointing at a path the caller isn't actually assigned to.
+    match binding {
+        Some(b) if is_bound(b) && b.worktree.is_some() => {
+            let wt = b.worktree.as_deref().unwrap_or_default();
             let branch = b.branch.as_deref().unwrap_or("<unknown>");
             let task = b.task_id.as_deref().unwrap_or("—");
             vec![
@@ -2067,8 +2065,8 @@ fn deny_remedy_lines(binding: Option<&Binding>) -> Vec<String> {
                 ),
             ]
         }
-        // Unbound (or no binding in scope): point at how to get a worktree.
-        None => vec![
+        // Unbound / partial binding / no binding in scope: point at how to get one.
+        _ => vec![
             "           you have no active worktree binding here:".to_string(),
             "             - if the daemon auto-bound one for this task, check `binding_state` and cd into it"
                 .to_string(),
@@ -2076,6 +2074,28 @@ fn deny_remedy_lines(binding: Option<&Binding>) -> Vec<String> {
                 .to_string(),
         ],
     }
+}
+
+/// #2379 ② (r6): the canonical-bypass deny block as a testable `Vec<String>`.
+/// The header + the canonical-specific `AGEND_GIT_ALLOW_CANONICAL_MUTATE` bypass
+/// are unique to this early deny (no `Binding` is loaded — env+cwd only, so the
+/// generic [`deny_remedy_lines`]`(None)` remedy is used). Extracted from the
+/// inline `eprintln!`s so the no-"security"-wording meta-test covers this prose
+/// too (the inline form was a meta-test blind spot — r6).
+fn format_canonical_bypass_deny(agent: &str, sub: &str) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "agend-git: DENIED — agent '{agent}' must not bypass-{sub} in a canonical-rooted repo."
+        ),
+        "           a stray provision here detaches the operator's canonical HEAD (#2234)."
+            .to_string(),
+    ];
+    lines.extend(deny_remedy_lines(None));
+    lines.push(
+        "           or, if you genuinely must: set AGEND_GIT_ALLOW_CANONICAL_MUTATE=1 for a one-shot (or ask lead)."
+            .to_string(),
+    );
+    lines
 }
 
 /// Sprint 54 P2-4: build the deny-error block as a `Vec<String>` so the
@@ -2659,6 +2679,10 @@ mod tests {
         corpus.extend(format_deny_error("commit", "r", "dev", None));
         corpus.extend(deny_remedy_lines(Some(&bound)));
         corpus.extend(deny_remedy_lines(None));
+        // #2379 ② (r6 FIX1): the canonical-bypass deny prose has its own header —
+        // it MUST be in the corpus or "security" could slip in there undetected
+        // (the inline-eprintln form was a meta-test blind spot).
+        corpus.extend(format_canonical_bypass_deny("dev", "worktree"));
         let joined = corpus.join("\n");
         assert!(
             !joined.to_lowercase().contains("security"),
@@ -2667,6 +2691,35 @@ mod tests {
         assert!(
             !joined.contains("安全"),
             "deny copy must not use '安全' wording:\n{joined}"
+        );
+    }
+
+    /// #2379 ② (r6 FIX2): a PARTIAL binding (worktree set but task_id=None) is
+    /// UNBOUND to production `is_bound` (task_id.is_some()) → classify denies it.
+    /// The remedy must NOT then claim "your assigned worktree is <that path>" (a
+    /// self-contradiction). It must use the generic remedy and never name the stale
+    /// path. RED pre-fix (deny_remedy_lines keyed on worktree.is_some() → named
+    /// `/other/path`); GREEN after keying on `is_bound`.
+    #[test]
+    fn deny_remedy_partial_binding_uses_generic_not_stale_path_2379() {
+        let partial = Binding {
+            task_id: None,
+            branch: Some("feat/x".into()),
+            worktree: Some("/other/path".into()),
+        };
+        assert!(
+            !is_bound(&partial),
+            "precondition: task_id=None ⇒ unbound to the production is_bound predicate"
+        );
+        let joined = deny_remedy_lines(Some(&partial)).join("\n");
+        assert!(
+            !joined.contains("/other/path"),
+            "a partial binding (task_id=None) is denied as unbound — the remedy must NOT \
+             name it as 'your assigned worktree' (would contradict the deny):\n{joined}"
+        );
+        assert!(
+            joined.contains("binding_state") || joined.contains("bind_self"),
+            "partial binding must fall through to the generic 'get a worktree' remedy:\n{joined}"
         );
     }
 
