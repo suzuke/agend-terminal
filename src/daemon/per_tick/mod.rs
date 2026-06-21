@@ -3,9 +3,8 @@
 //! The daemon main loop (`run_core` in `src/daemon/mod.rs`) historically
 //! inlined every periodic concern in a single 200-line block. This module
 //! introduces a thin trait, [`PerTickHandler`], so each periodic concern
-//! can be moved into its own file, owned state and all, then invoked from
-//! the main loop in the same position it occupied before. The trait is
-//! deliberately minimal — pattern relocation, not abstraction.
+//! lives in its own file, owned state and all. The trait is deliberately
+//! minimal — pattern relocation, not abstraction.
 //!
 //! Cumulative extraction state (handlers grow per PR):
 //!
@@ -21,11 +20,11 @@
 //!   T-B3 PR body. Stateless wrapper around the `externals.retain`
 //!   liveness sweep.
 //!
-//! Follow-up PRs (T-B4+) will move further subsystems behind the same
-//! trait. Until then, the daemon loop holds the handlers as named locals
-//! and calls them at their original sites — a single `Vec<Box<dyn …>>`
-//! iteration would reorder execution and is deferred until enough
-//! handlers exist for the uniform iteration to be the natural shape.
+//! Execution: [`crate::daemon::build_default_handlers`] builds the ordered
+//! `Vec<Box<dyn PerTickHandler>>` once at startup, and each tick the loop
+//! runs it through [`run_handlers_with_panic_guard`] (a panicking handler is
+//! isolated, never aborting the tick). Further subsystems move behind the
+//! same trait by extending that Vec.
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use parking_lot::Mutex;
