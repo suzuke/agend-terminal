@@ -297,7 +297,12 @@ fn render_active_overlay(
             ref input,
             selected,
         } => {
-            render::render_command_palette(frame, input, *selected);
+            // Compute the completion once (same `palette_completion` the key
+            // handler uses) and hand it to the renderer, so the highlighted
+            // candidate always matches what Tab completes. Registry is touched
+            // only for agent-argument completion — off the per-pane render path.
+            let completion = commands::palette_completion(input, registry);
+            render::render_command_palette(frame, input, *selected, &completion);
         }
         Overlay::Decisions {
             ref items,

@@ -328,23 +328,48 @@ pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {
 }
 
 /// #t-5: command palette with prefix-match completion. Renders the `:input` line
-/// plus a candidate list — `commands::matching_specs(input)`, derived live from the
-/// input (empty input lists all, the "what commands exist?" entry point) — with the
-/// `selected` candidate highlighted, modeled on [`render_menu`]. Keyword-only (P0).
-pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
+/// plus the precomputed [`Completion`] (the same one the key handler uses, so the
+/// highlight always matches what Tab completes) with the `selected` candidate
+/// highlighted, modeled on [`render_menu`]. The candidate rows are command
+/// keywords while typing the command, argument values once past it, or a single
+/// dim usage hint for a free-form argument (not selectable).
+pub fn render_command_palette(
+    frame: &mut Frame,
+    input: &str,
+    selected: usize,
+    completion: &crate::app::commands::Completion,
+) {
+    use crate::app::commands::Completion;
     let area = frame.area();
-    let matches = crate::app::commands::matching_specs(input);
-    // Cap rows so the popup can't outgrow the screen; the full set (11) fits.
-    let shown = matches.len().min(12);
-    let sel = selected.min(shown.saturating_sub(1));
+
+    // Display rows for the candidate area. A usage hint is informational (not
+    // selectable), so it never takes the highlight.
+    let rows: Vec<String> = match completion {
+        Completion::Keyword(specs) => specs
+            .iter()
+            .map(|s| format!("{:<26} {}", s.usage, s.desc))
+            .collect(),
+        Completion::Values(values) => values.clone(),
+        Completion::UsageHint(usage) => vec![format!("usage: {usage}")],
+    };
+    let selectable = !matches!(completion, Completion::UsageHint(_));
+
+    // Window the list to the popup; beyond it the operator narrows by typing. The
+    // highlight uses the SAME `clamp_selected` the key handler / `tab_complete`
+    // use, so the highlighted row is always the candidate Tab will complete — even
+    // when `selected` ran past the window (>MAX_PALETTE_ROWS candidates).
+    let shown = rows.len().min(crate::app::commands::MAX_PALETTE_ROWS);
+    let sel = completion.clamp_selected(selected);
 
     let w = 64u16.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
-    let y = area.height / 3;
     // 1 input line + `shown` candidate rows + 2 border rows, clamped to the screen.
     let height = u16::try_from(shown + 3)
         .unwrap_or(u16::MAX)
         .min(area.height);
+    // Anchor at ~1/3 down, but pull up so a tall popup (up to MAX_PALETTE_ROWS
+    // value candidates) never spills past the bottom edge on a short terminal.
+    let y = (area.height / 3).min(area.height.saturating_sub(height));
     let ra = Rect::new(x, y, w, height);
     let inner = render_titled_popup(frame, ra, Color::Cyan, " : Command — Tab ↑↓ Enter Esc ");
 
@@ -353,8 +378,9 @@ pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
         format!(":{input}"),
         Style::default().fg(Color::White),
     )));
-    for (i, spec) in matches.iter().take(shown).enumerate() {
-        let style = if i == sel {
+    for (i, row) in rows.iter().take(shown).enumerate() {
+        let highlighted = selectable && i == sel;
+        let style = if highlighted {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -362,11 +388,8 @@ pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        let prefix = if i == sel { "> " } else { "  " };
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{:<26} {}", spec.usage, spec.desc),
-            style,
-        )));
+        let prefix = if highlighted { "> " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("{prefix}{row}"), style)));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
@@ -422,38 +445,99 @@ mod tests {
         assert_eq!((r.x, r.y, r.width, r.height), (25, 15, 50, 10));
     }
 
+    fn palette_text_sel(
+        input: &str,
+        selected: usize,
+        completion: &crate::app::commands::Completion,
+    ) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_command_palette(frame, input, selected, completion))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn palette_text(input: &str, completion: &crate::app::commands::Completion) -> String {
+        palette_text_sel(input, 0, completion)
+    }
+
     /// #t-5 UX smoke: the palette lists ALL commands on empty input (the operator's
     /// "what commands exist?" discovery), and prefix-filters to matching keywords.
     #[test]
     fn command_palette_lists_all_on_open_and_prefix_filters() {
-        fn palette_text(input: &str) -> String {
-            let backend = ratatui::backend::TestBackend::new(80, 20);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal
-                .draw(|frame| render_command_palette(frame, input, 0))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let mut out = String::new();
-            for y in 0..buf.area.height {
-                for x in 0..buf.area.width {
-                    out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
-                }
-                out.push('\n');
-            }
-            out
-        }
+        use crate::app::commands::{matching_specs, Completion};
         // Empty input → list every command.
-        let all = palette_text("");
+        let all = palette_text("", &Completion::Keyword(matching_specs("")));
         assert!(
             all.contains("spawn") && all.contains("config") && all.contains("layout"),
             "empty input must list all commands:\n{all}"
         );
         // Prefix narrows to matching keyword(s) only.
-        let co = palette_text("co");
+        let co = palette_text("co", &Completion::Keyword(matching_specs("co")));
         assert!(co.contains("config"), "`co` must show config:\n{co}");
         assert!(
             !co.contains("spawn") && !co.contains("layout"),
             "`co` must hide non-matching commands:\n{co}"
+        );
+    }
+
+    /// #t-… param-value completion render: a `Values` completion lists the dynamic
+    /// candidates, and a `UsageHint` (free-form argument) renders the dim hint line
+    /// instead — directly answering the operator's "what do I put here?".
+    #[test]
+    fn command_palette_renders_values_and_usage_hint() {
+        use crate::app::commands::Completion;
+        // Value list (e.g. `:spawn foo <backend>`).
+        let vals = palette_text(
+            "spawn foo ",
+            &Completion::Values(vec!["claude".to_string(), "codex".to_string()]),
+        );
+        assert!(
+            vals.contains("claude") && vals.contains("codex"),
+            "value completion must list the candidates:\n{vals}"
+        );
+        // Free-form argument → usage hint, no value list.
+        let hint = palette_text("set key ", &Completion::UsageHint("set <key> <value>"));
+        assert!(
+            hint.contains("usage:") && hint.contains("set <key> <value>"),
+            "free-form arg must show the usage hint:\n{hint}"
+        );
+    }
+
+    /// r4 regression: with >MAX_PALETTE_ROWS candidates the popup windows the list
+    /// and the highlight (`> `) lands on the last VISIBLE row — never an off-screen
+    /// candidate — so it matches what `tab_complete` completes. RED before the fix
+    /// (render clamped the highlight to row 11 while Tab used the raw `selected`).
+    #[test]
+    fn command_palette_highlight_stays_within_visible_window() {
+        use crate::app::commands::{Completion, MAX_PALETTE_ROWS};
+        let values: Vec<String> = (0..20).map(|i| format!("agent{i:02}")).collect();
+        let comp = Completion::Values(values);
+        // `selected` ran past the window (e.g. Down held). The highlight is the
+        // last visible candidate (agent11), and no off-window candidate renders.
+        let out = palette_text_sel("kill ", 14, &comp);
+        assert!(
+            out.contains("> agent11"),
+            "highlight must be the last visible candidate (agent11):\n{out}"
+        );
+        assert!(
+            !out.contains("agent14") && !out.contains("agent19"),
+            "off-window candidates must not render:\n{out}"
+        );
+        // At most MAX_PALETTE_ROWS candidate rows are shown.
+        let shown_rows = out.matches("agent").count();
+        assert!(
+            shown_rows <= MAX_PALETTE_ROWS,
+            "windowed to <= {MAX_PALETTE_ROWS} rows, got {shown_rows}:\n{out}"
         );
     }
 }
