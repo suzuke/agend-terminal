@@ -2820,3 +2820,120 @@ fn signal_kill_escalates_only_for_self_orch_1744_h5() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── #CR-2026-06-14 (real-path): bootstrap registry→core lock ordering ──
+
+/// Replaces the fragile source-scanning invariant in
+/// `tests/review_bootstrap_lock_nesting_agent_binding.rs` (a grep over
+/// `spawn_instructions_bootstrap`'s body) with a REAL concurrent deadlock test
+/// that drives the production `wait_for_idle_inject_target` readiness loop
+/// against a competing core→registry path.
+///
+/// Finding: the readiness poll must snapshot `Arc::clone(&h.core)` UNDER the
+/// tier-1 registry lock, DROP the registry guard, and only THEN lock the core —
+/// never registry→core nested. Because that function locks the registry via a
+/// plain `parking_lot::Mutex` (NOT the tier-tracked wrapper), `sync_audit`
+/// cannot catch the nesting; only a runtime deadlock test can. A nested
+/// acquisition establishes a registry→core order that a core→registry path
+/// (which exists elsewhere) deadlocks against, every 200ms at startup.
+///
+/// Determinism: each round a `Barrier` releases both threads together AFTER the
+/// contender already holds the core lock, forcing the dangerous interleaving —
+/// the bootstrap path must acquire the registry while the contender holds the
+/// core. With the FIXED code the bootstrap path drops the registry before
+/// touching the core, so no cycle exists and every round completes. With the
+/// nesting reintroduced (neuter-RED), the bootstrap path holds the registry
+/// while blocking on the core while the contender blocks on the registry → the
+/// round deadlocks and the watchdog (`recv_timeout`) fires → RED.
+///
+/// The registry + core are LOCAL to this test (no global daemon state), so a
+/// neutered deadlock leaks only local locks — no cross-test contamination and
+/// no nextest serialize group is required.
+///
+/// neuter-RED: in `wait_for_idle_inject_target`, lock the core WHILE holding the
+/// registry guard — e.g. call `bootstrap_core_is_idle(&h.core)` inside the
+/// `let reg = registry.lock(); match reg.get(..) { Some(h) => ... }` block
+/// instead of cloning the `Arc` out and dropping `reg` first. This test then
+/// deadlocks and the 60s watchdog fires.
+#[test]
+fn bootstrap_readiness_no_registry_core_deadlock_real_path() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry.lock().insert(id, mk_handle_1441("boot", id));
+    // The agent's core Arc, for the core→registry contender. mk_handle_1441's
+    // StateTracker::new(None) starts Idle, so the readiness loop breaks on its
+    // first poll iteration (after the core.lock() that contends with B).
+    let core = Arc::clone(&registry.lock().get(&id).expect("handle present").core);
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let reg_worker = Arc::clone(&registry);
+    let core_worker = Arc::clone(&core);
+
+    // The rounds run on a worker thread so a neutered deadlock hangs the worker
+    // (and its A/B children) without blocking the watchdog below. Looped because
+    // the registry-acquisition race only reveals the deadlock when the bootstrap
+    // thread wins the registry; the post-barrier yield in B biases toward that,
+    // and 24 rounds make a neutered build deadlock with overwhelming probability
+    // while a correct build stays fast.
+    // fire-and-forget: test rounds-runner; on a neutered deadlock it (and its
+    // joined A/B children) hang holding LOCAL locks only — the watchdog below
+    // is the join, and the process reaps it on test-exit.
+    std::thread::spawn(move || {
+        for _ in 0..24 {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            // Thread A: the PRODUCTION readiness path (registry → clone core Arc
+            // → drop registry → core). A short timeout bounds the poll loop.
+            let reg_a = Arc::clone(&reg_worker);
+            let bar_a = Arc::clone(&barrier);
+            let a = std::thread::spawn(move || {
+                bar_a.wait();
+                let _ = wait_for_idle_inject_target(
+                    &reg_a,
+                    id,
+                    "boot",
+                    Duration::from_millis(500),
+                    None,
+                    "deadlock-test",
+                );
+            });
+
+            // Thread B: a core→registry contender (the opposite acquisition
+            // order). Holds the core BEFORE the barrier so A's core.lock()
+            // contends; yields after the barrier so A tends to win the registry.
+            let reg_b = Arc::clone(&reg_worker);
+            let core_b = Arc::clone(&core_worker);
+            let bar_b = Arc::clone(&barrier);
+            let b = std::thread::spawn(move || {
+                let _core_guard = core_b.lock();
+                bar_b.wait();
+                std::thread::yield_now();
+                let _reg_guard = reg_b.lock();
+                // both guards drop here
+            });
+
+            a.join().expect("thread A");
+            b.join().expect("thread B");
+        }
+        let _ = done_tx.send(());
+    });
+
+    match done_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(()) => {
+            // All rounds completed → the bootstrap path never held the registry
+            // while acquiring the core. Cleanup is safe (no thread holds locks).
+            for h in registry.lock().values() {
+                let _ = h.child.lock().kill();
+            }
+        }
+        Err(_) => panic!(
+            "registry→core deadlock: the bootstrap readiness loop held the \
+             tier-1 registry lock while acquiring the per-agent core lock. It \
+             must snapshot Arc::clone(&h.core) under the registry lock, drop the \
+             guard, THEN lock the core."
+        ),
+    }
+}
