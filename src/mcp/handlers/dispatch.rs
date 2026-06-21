@@ -29,7 +29,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::{
-    binding_state, channel, ci, comms, force_release, instance, restart, schedule, task, worktree,
+    binding_state, channel, ci, comms, ephemeral, force_release, instance, restart, schedule, task,
+    worktree,
 };
 
 /// Shared per-call context — every common parameter `handle_tool`
@@ -283,6 +284,12 @@ action_adapter!(dispatch_deployment, "deployment", [
     "deploy"   => schedule::handle_deploy_template,      hai;
     "teardown" => schedule::handle_teardown_deployment,   ha;
     "list"     => schedule::handle_list_deployments,      h;
+]);
+
+action_adapter!(dispatch_ephemeral, "ephemeral", [
+    "spawn" => ephemeral::handle_spawn, hai;
+    "list"  => ephemeral::handle_list,  ha;
+    "reap"  => ephemeral::handle_reap,  ha;
 ]);
 
 action_adapter!(dispatch_health, "health", [
@@ -608,6 +615,7 @@ mod tests {
                 "team",
                 "schedule",
                 "deployment",
+                "ephemeral",
                 "ci",
                 "health",
                 "watchdog",
@@ -622,7 +630,7 @@ mod tests {
                 "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 36);
+        assert_eq!(crate::mcp::registry::all().len(), 37);
     }
 
     #[test]

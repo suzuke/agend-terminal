@@ -233,6 +233,12 @@ pub(crate) fn boot_hygiene_sweeps(home: &Path) {
     time_step("boot_sweep_zombies", || {
         crate::daemon::boot_sweep::boot_sweep_zombies(home);
     });
+    // #1967 Phase-1 (PR1): reap ephemeral workers orphaned by a previous (possibly
+    // crashed) daemon — every tracked worker predates this boot, so terminate any
+    // still-alive (start-token-guarded) and clear the sidecar store.
+    time_step("reap_orphaned_ephemeral_workers", || {
+        crate::ephemeral_tracking::reap_on_boot(home);
+    });
     // #942/#943: rename legacy-format watch files (DefaultHasher+non-canonical)
     // to canonical+sha256 form. One-shot at boot; idempotent on repeated runs.
     // Active migration (option b from dev-2 cross-audit Pushback 3) prevents

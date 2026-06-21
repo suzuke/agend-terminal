@@ -7,6 +7,7 @@ mod comms;
 pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
+mod ephemeral;
 mod force_release;
 pub(crate) mod instance;
 mod instance_metadata;
