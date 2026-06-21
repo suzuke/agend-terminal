@@ -205,6 +205,21 @@ fn trace_tty_size(enabled: bool, phase: &str) {
 /// 33 ms ≈ 30 fps is plenty for a TUI and halves the render CPU vs 60 fps.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
+/// #freeze-4 (t-…2324) per-frame TIME budget for the BOOT catch-up drain
+/// ([`render::drain_all_panes_until`]). Load-bearing safety: each boot frame yields
+/// to `select!` (input) after this much draining, so a restart flood can never
+/// hard-freeze input — worst case the loading phase lasts a few more frames. ~80 ms
+/// keeps input serviced ~12×/s while clearing the flood far faster than the
+/// steady-state 64 KiB/frame. Provisional (conservative); tune from `#freeze-*`
+/// restart data if needed.
+const BOOT_FRAME_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// #freeze-4 hard ceiling on the boot catch-up phase: after this the loop reverts
+/// to the steady-state cap regardless of remaining backlog (which then drains under
+/// the normal bounded path). Guarantees boot can't hang unbounded on a pathological
+/// backlog. Provisional (conservative).
+const MAX_BOOT_CATCHUP: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Pure frame-cap decision (the test seam): may we draw now? `None` = never drawn
 /// (always draw the first frame); otherwise only once `FRAME_INTERVAL` has elapsed
 /// since the last draw. Independent of *what* changed — coalescing/dirtiness is
@@ -682,6 +697,18 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // `should_sync_notifications`). Mirrors `last_draw`'s frame-cap state.
     let mut last_notif_sync: Option<std::time::Instant> = None;
 
+    // #freeze-4 (t-…2324) restart-flood boot phase: at restart every pane carries a
+    // pre-restart backlog (its dump enqueues via #freeze-4 A1, plus the post-subscribe
+    // burst). Until that flood is drained, the loop runs a bounded "loading" phase —
+    // a TIME-capped drain ([`render::drain_all_panes_until`]) that clears the flood
+    // fast while still yielding to input every frame, shown as a loading indicator —
+    // instead of letting the steady-state 64 KiB/frame cap trickle it out over ~1s of
+    // interactive freeze. Exits to the steady path once all deferred attaches are
+    // applied AND every pane's rx is drained, or after `MAX_BOOT_CATCHUP`.
+    let boot_start = std::time::Instant::now();
+    let attaches_expected = pending_fwd.len();
+    let mut booting = true;
+
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
@@ -770,13 +797,35 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         if dirty && should_draw(last_draw, frame_now, FRAME_INTERVAL) {
             last_draw = Some(frame_now);
             dirty = false;
-            // #freeze-3: drain queued PTY output for EVERY pane (active +
-            // background) into its VTerm BEFORE drawing, within one shared
-            // per-frame byte budget. `render_pane` no longer drains, so a
-            // backgrounded busy tab's `rx` stays bounded instead of replaying a
-            // multi-second catch-up when switched to. Background panes are drained
-            // but not redrawn; only the active tab is painted below.
-            render::drain_all_panes(&mut layout);
+            // #freeze-4: during the bounded boot catch-up phase, drain the restart
+            // flood with a per-frame TIME-capped drain — it clears the backlog fast
+            // as a "loading" phase while still yielding to input every frame. Exit
+            // to the steady path once all deferred attaches are applied AND every
+            // pane's rx is drained, or after MAX_BOOT_CATCHUP (so boot can't hang).
+            if booting {
+                let backlog_remains =
+                    render::drain_all_panes_until(&mut layout, BOOT_FRAME_TIME_CAP);
+                let timed_out = boot_start.elapsed() >= MAX_BOOT_CATCHUP;
+                if (pending_fwd.is_empty() && !backlog_remains) || timed_out {
+                    booting = false;
+                    tracing::info!(
+                        phase = "boot-catchup-complete",
+                        elapsed_ms = boot_start.elapsed().as_millis() as u64,
+                        attaches_expected = attaches_expected,
+                        attaches_pending = pending_fwd.len(),
+                        timed_out = timed_out,
+                        "#freeze-4: restart-flood boot catch-up drained"
+                    );
+                }
+            } else {
+                // #freeze-3: drain queued PTY output for EVERY pane (active +
+                // background) into its VTerm BEFORE drawing, within one shared
+                // per-frame byte budget. `render_pane` no longer drains, so a
+                // backgrounded busy tab's `rx` stays bounded instead of replaying a
+                // multi-second catch-up when switched to. Background panes are drained
+                // but not redrawn; only the active tab is painted below.
+                render::drain_all_panes(&mut layout);
+            }
             terminal.draw(|frame| {
                 // #1027: snapshot the shared daemon-binary-stale flag once
                 // per frame so the render path sees a consistent value.
@@ -807,15 +856,26 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
                 render_active_overlay(frame, &mut overlay, &layout, &registry, &home);
+                // #freeze-4: loading indicator while the boot catch-up phase absorbs
+                // the restart flood (so it reads as loading-with-progress, not a freeze).
+                if booting {
+                    render::render_boot_indicator(
+                        frame,
+                        attaches_expected.saturating_sub(pending_fwd.len()),
+                        attaches_expected,
+                    );
+                }
             })?;
-            // #freeze-2/#freeze-3: the budget-capped `drain_all_panes` above may
-            // have left a backlog in a VISIBLE pane's channel. Re-arm `dirty` so
-            // the next frame continues the active tab's catch-up (the select-timeout
-            // below shrinks to the frame boundary when dirty) — it clears over a few
-            // frames instead of one input-stalling mega-draw. Background backlog
-            // needs no redraw: the loop's ≤50ms idle cadence + per-output wakeups
-            // guarantee `drain_all_panes` runs again to bound every pane's `rx`.
-            if render::active_tab_has_pending_output(&layout) {
+            // #freeze-4: while booting, keep cycling at frame cadence so the
+            // time-capped catch-up runs every frame until the restart flood clears.
+            // #freeze-2/#freeze-3: otherwise the budget-capped `drain_all_panes`
+            // above may have left a backlog in a VISIBLE pane's channel — re-arm
+            // `dirty` so the next frame continues the active tab's catch-up (the
+            // select-timeout below shrinks to the frame boundary when dirty), clearing
+            // over a few frames instead of one input-stalling mega-draw. Background
+            // backlog needs no redraw: the loop's ≤50ms idle cadence + per-output
+            // wakeups guarantee `drain_all_panes` runs again to bound every pane's `rx`.
+            if booting || render::active_tab_has_pending_output(&layout) {
                 dirty = true;
             }
         }

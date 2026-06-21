@@ -1,6 +1,7 @@
 //! Core rendering: main entry point, tab bar, status bar, pane tree.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use super::border::{render_border_grid, render_pane_titles};
 use crate::agent::{self, AgentRegistry};
@@ -169,6 +170,82 @@ fn freeze_backlog_probe_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("AGEND_FREEZE_INSTRUMENT").is_ok_and(|v| !v.is_empty() && v != "0")
     })
+}
+
+/// #freeze-4: per-pane byte budget for the BOOT-phase drain. Generous (8× the
+/// steady per-pane budget) so a restart flood clears in few loading frames; the
+/// real limiter is the per-frame TIME cap below, this just bounds how far a single
+/// pane can run past that cap (≈ one pane's worth of `DUMP_CHUNK_BYTES` chunks).
+const DRAIN_BOOT_PER_PANE_BUDGET_BYTES: usize = 8 * DRAIN_OUTPUT_BUDGET_BYTES;
+
+/// #freeze-4 (t-…2324) BOOT-phase drain: drain panes active-first until everything
+/// is empty OR `time_cap` elapses; returns `true` if any backlog remains. Unlike
+/// the steady-state byte-capped [`drain_all_panes`] (#2385/#2393, left untouched),
+/// this uses a per-frame TIME budget — the clock is checked between panes and the
+/// pass stops once `time_cap` is spent.
+///
+/// The TIME cap is the load-bearing safety: it GUARANTEES the render loop returns
+/// to `select!` to service input every frame, so a restart flood can NEVER hard-
+/// freeze input regardless of backlog size — worst case the bounded boot/loading
+/// phase just lasts a few more frames. Used only inside the bounded boot window
+/// (see the render loop's `booting` state); steady state is unchanged.
+pub fn drain_all_panes_until(layout: &mut Layout, time_cap: Duration) -> bool {
+    let start = Instant::now();
+    let active = layout.active;
+    let mut more = false;
+    let order = std::iter::once(active).chain((0..layout.tabs.len()).filter(move |&i| i != active));
+    for tab_idx in order {
+        let Some(tab) = layout.tabs.get_mut(tab_idx) else {
+            continue;
+        };
+        for id in tab.root().pane_ids() {
+            let Some(pane) = tab.root_mut().find_pane_mut(id) else {
+                continue;
+            };
+            pane.drain_output(DRAIN_BOOT_PER_PANE_BUDGET_BYTES);
+            if !pane.rx.is_empty() {
+                more = true;
+            }
+            // Yield after each pane once the per-frame time budget is spent so the
+            // loop services input; remaining panes/backlog drain next boot frame.
+            if start.elapsed() >= time_cap {
+                return true;
+            }
+        }
+    }
+    more
+}
+
+/// #freeze-4: a small top-centered "loading" notice shown during the bounded boot
+/// catch-up phase, so the restart flood reads as a load (with progress) rather than
+/// a freeze. `applied`/`expected` = attaches completed / total deferred attaches.
+pub fn render_boot_indicator(frame: &mut Frame, applied: usize, expected: usize) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = if expected > 0 {
+        format!(" loading — attaching {applied}/{expected} agents… ")
+    } else {
+        " loading… ".to_string()
+    };
+    let w = (text.chars().count() as u16).min(area.width);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y,
+        width: w,
+        height: 1,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(text).alignment(Alignment::Center).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        rect,
+    );
 }
 
 fn build_agent_state_snapshot(
@@ -1545,5 +1622,96 @@ mod tests {
              the per-pane budget (the backlog itself is now bounded because draining \
              runs every frame for background tabs too)"
         );
+    }
+
+    // ── #freeze-4 restart-flood boot-phase drain ──────────────────────────
+
+    /// Build N tabs, each pane flooded with `chunks_per_pane` × 4 KiB (a restart
+    /// flood). Senders are returned so the caller keeps them alive (rx stays
+    /// connected). Tab 0 is active.
+    fn flooded_layout(
+        n: usize,
+        chunks_per_pane: usize,
+    ) -> (Layout, Vec<crossbeam_channel::Sender<Vec<u8>>>) {
+        const CHUNK: usize = 4 * 1024;
+        let mut layout = Layout::new();
+        let mut txs = Vec::new();
+        for id in 1..=n {
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+            for _ in 0..chunks_per_pane {
+                tx.send(vec![b'x'; CHUNK]).unwrap();
+            }
+            layout.add_tab(crate::layout::Tab::new(
+                format!("t{id}"),
+                pane_with_rx(id, rx),
+            ));
+            txs.push(tx);
+        }
+        layout.goto_tab(0);
+        (layout, txs)
+    }
+
+    fn rx_len_of(layout: &Layout, tab_idx: usize, pane_id: usize) -> usize {
+        layout.tabs[tab_idx]
+            .root()
+            .find_pane(pane_id)
+            .map(|p| p.rx.len())
+            .unwrap_or(0)
+    }
+
+    /// #freeze-4 LOAD-BEARING SAFETY: the per-frame TIME cap MUST stop the boot
+    /// drain mid-pass so the render loop returns to `select!` to service input every
+    /// frame — a restart flood can never hard-freeze input regardless of backlog.
+    /// A `Duration::ZERO` cap must yield after the FIRST pane, leaving later panes
+    /// UNTOUCHED. RED if the time-cap check is removed (neutered): the pass would
+    /// drain every pane in one call and the untouched assertion fails. Cross-platform.
+    #[test]
+    fn drain_all_panes_until_time_cap_yields_after_bounded_work_freeze4() {
+        // 100 × 4 KiB = 400 KiB/pane, larger than the boot per-pane budget so a pane
+        // can't be drained to empty "for free" in a single visit.
+        let (mut layout, txs) = flooded_layout(3, 100);
+
+        let more = drain_all_panes_until(&mut layout, Duration::ZERO);
+        assert!(
+            more,
+            "a ZERO time-cap with backlog remaining must report more pending"
+        );
+        // The LAST pane in drain order (tab 2, id 3) must still hold its FULL backlog
+        // — the ZERO cap stopped the pass long before reaching it.
+        assert_eq!(
+            rx_len_of(&layout, 2, 3),
+            100,
+            "ZERO time-cap must yield before draining every pane (without the cap, \
+             all panes drain in one call → input would be starved)"
+        );
+        drop(txs);
+    }
+
+    /// #freeze-4: given time (a generous cap, as the bounded boot window provides),
+    /// the boot drain clears the WHOLE restart flood across active + background tabs
+    /// in a bounded number of frames → after the boot phase no pane carries backlog
+    /// into interactive use.
+    #[test]
+    fn drain_all_panes_until_clears_whole_flood_when_uncapped_freeze4() {
+        let (mut layout, txs) = flooded_layout(3, 100);
+
+        let mut frames = 0usize;
+        loop {
+            let more = drain_all_panes_until(&mut layout, Duration::from_secs(30));
+            frames += 1;
+            assert!(frames < 1000, "boot catch-up must converge");
+            if !more {
+                break;
+            }
+        }
+        for (tab_idx, pane_id) in [(0usize, 1usize), (1, 2), (2, 3)] {
+            assert_eq!(
+                rx_len_of(&layout, tab_idx, pane_id),
+                0,
+                "every pane's restart backlog must be fully drained in the boot phase \
+                 (tab {tab_idx} pane {pane_id})"
+            );
+        }
+        drop(txs);
     }
 }
