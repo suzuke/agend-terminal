@@ -354,17 +354,22 @@ pub fn render_command_palette(
     };
     let selectable = !matches!(completion, Completion::UsageHint(_));
 
-    // Cap rows so the popup can't outgrow the screen; the full keyword set (11) fits.
-    let shown = rows.len().min(12);
-    let sel = selected.min(shown.saturating_sub(1));
+    // Window the list to the popup; beyond it the operator narrows by typing. The
+    // highlight uses the SAME `clamp_selected` the key handler / `tab_complete`
+    // use, so the highlighted row is always the candidate Tab will complete — even
+    // when `selected` ran past the window (>MAX_PALETTE_ROWS candidates).
+    let shown = rows.len().min(crate::app::commands::MAX_PALETTE_ROWS);
+    let sel = completion.clamp_selected(selected);
 
     let w = 64u16.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
-    let y = area.height / 3;
     // 1 input line + `shown` candidate rows + 2 border rows, clamped to the screen.
     let height = u16::try_from(shown + 3)
         .unwrap_or(u16::MAX)
         .min(area.height);
+    // Anchor at ~1/3 down, but pull up so a tall popup (up to MAX_PALETTE_ROWS
+    // value candidates) never spills past the bottom edge on a short terminal.
+    let y = (area.height / 3).min(area.height.saturating_sub(height));
     let ra = Rect::new(x, y, w, height);
     let inner = render_titled_popup(frame, ra, Color::Cyan, " : Command — Tab ↑↓ Enter Esc ");
 
@@ -440,11 +445,15 @@ mod tests {
         assert_eq!((r.x, r.y, r.width, r.height), (25, 15, 50, 10));
     }
 
-    fn palette_text(input: &str, completion: &crate::app::commands::Completion) -> String {
+    fn palette_text_sel(
+        input: &str,
+        selected: usize,
+        completion: &crate::app::commands::Completion,
+    ) -> String {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_command_palette(frame, input, 0, completion))
+            .draw(|frame| render_command_palette(frame, input, selected, completion))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
@@ -455,6 +464,10 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn palette_text(input: &str, completion: &crate::app::commands::Completion) -> String {
+        palette_text_sel(input, 0, completion)
     }
 
     /// #t-5 UX smoke: the palette lists ALL commands on empty input (the operator's
@@ -497,6 +510,34 @@ mod tests {
         assert!(
             hint.contains("usage:") && hint.contains("set <key> <value>"),
             "free-form arg must show the usage hint:\n{hint}"
+        );
+    }
+
+    /// r4 regression: with >MAX_PALETTE_ROWS candidates the popup windows the list
+    /// and the highlight (`> `) lands on the last VISIBLE row — never an off-screen
+    /// candidate — so it matches what `tab_complete` completes. RED before the fix
+    /// (render clamped the highlight to row 11 while Tab used the raw `selected`).
+    #[test]
+    fn command_palette_highlight_stays_within_visible_window() {
+        use crate::app::commands::{Completion, MAX_PALETTE_ROWS};
+        let values: Vec<String> = (0..20).map(|i| format!("agent{i:02}")).collect();
+        let comp = Completion::Values(values);
+        // `selected` ran past the window (e.g. Down held). The highlight is the
+        // last visible candidate (agent11), and no off-window candidate renders.
+        let out = palette_text_sel("kill ", 14, &comp);
+        assert!(
+            out.contains("> agent11"),
+            "highlight must be the last visible candidate (agent11):\n{out}"
+        );
+        assert!(
+            !out.contains("agent14") && !out.contains("agent19"),
+            "off-window candidates must not render:\n{out}"
+        );
+        // At most MAX_PALETTE_ROWS candidate rows are shown.
+        let shown_rows = out.matches("agent").count();
+        assert!(
+            shown_rows <= MAX_PALETTE_ROWS,
+            "windowed to <= {MAX_PALETTE_ROWS} rows, got {shown_rows}:\n{out}"
         );
     }
 }

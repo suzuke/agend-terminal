@@ -141,6 +141,13 @@ pub(crate) fn matching_specs(input: &str) -> Vec<&'static CommandSpec> {
         .collect()
 }
 
+/// Max candidate rows the palette popup renders (and the operator can navigate to)
+/// at once. Beyond this the list is windowed to the first `MAX_PALETTE_ROWS` and
+/// the operator narrows by typing — so the renderer, `tab_complete`, and the Down
+/// bound all index within the SAME window and the highlight can never point off
+/// screen from what Tab completes.
+pub(crate) const MAX_PALETTE_ROWS: usize = 12;
+
 /// What the palette should offer for the current `input`: the command keyword
 /// list (still typing the command), the dynamic value list for the argument
 /// position under the cursor, or a usage hint (free-form argument). Computed by
@@ -162,6 +169,21 @@ impl Completion {
             Completion::Values(v) => v.len(),
             Completion::UsageHint(_) => 0,
         }
+    }
+
+    /// Candidates actually shown and reachable — the count capped to the popup
+    /// window. The Down bound uses this so `selected` can't run past the visible
+    /// rows.
+    pub(crate) fn visible_count(&self) -> usize {
+        self.candidate_count().min(MAX_PALETTE_ROWS)
+    }
+
+    /// Clamp a (possibly stale or off-window) `selected` to the visible window —
+    /// the SINGLE source of truth for "which candidate is highlighted". Both the
+    /// renderer and [`tab_complete`] index with this, so the on-screen highlight
+    /// and the Tab target are always the same candidate.
+    pub(crate) fn clamp_selected(&self, selected: usize) -> usize {
+        selected.min(self.visible_count().saturating_sub(1))
     }
 }
 
@@ -267,20 +289,24 @@ pub(crate) fn palette_completion(input: &str, registry: &AgentRegistry) -> Compl
     }
 }
 
-/// Tab handler: complete the token under the cursor to the `selected` candidate,
-/// keeping the palette open with a trailing space so the next argument can be
-/// typed. Returns `None` (a no-op) when there is nothing to complete (usage hint
-/// or empty candidate list). The keyword path preserves any already-typed
-/// arguments (P0 behavior); the value path replaces only the current token.
+/// Tab handler: complete the token under the cursor to the highlighted candidate
+/// of the precomputed `completion`, keeping the palette open with a trailing space
+/// so the next argument can be typed. Returns `None` (a no-op) when there is
+/// nothing to complete (usage hint or empty candidate list). The keyword path
+/// preserves any already-typed arguments (P0 behavior); the value path replaces
+/// only the current token. Takes the same `completion` the renderer drew, indexed
+/// via the shared [`Completion::clamp_selected`], so Tab can never complete a
+/// candidate other than the one highlighted on screen (the >12-candidate
+/// highlight/Tab desync r4 caught).
 pub(crate) fn tab_complete(
     input: &str,
+    completion: &Completion,
     selected: usize,
-    registry: &AgentRegistry,
 ) -> Option<String> {
     let cur = cursor(input);
-    match palette_completion(input, registry) {
+    let idx = completion.clamp_selected(selected);
+    match completion {
         Completion::Keyword(specs) => {
-            let idx = selected.min(specs.len().saturating_sub(1));
             let keyword = specs.get(idx)?.keyword;
             // Keep arguments already typed after the keyword (P0 behavior).
             let rest = cur
@@ -297,7 +323,6 @@ pub(crate) fn tab_complete(
             })
         }
         Completion::Values(values) => {
-            let idx = selected.min(values.len().saturating_sub(1));
             let value = values.get(idx)?;
             // `pos >= 1` on the value path, so the prefix is never empty.
             let prefix = cur.tokens[..cur.pos].join(" ");
@@ -1003,6 +1028,13 @@ mod tests {
         );
     }
 
+    /// Compute the completion for `input` (as the renderer + key handler do) and
+    /// Tab-complete at `selected`.
+    fn tab(input: &str, selected: usize, reg: &crate::agent::AgentRegistry) -> Option<String> {
+        let comp = palette_completion(input, reg);
+        tab_complete(input, &comp, selected)
+    }
+
     /// Tab completes the token under the cursor (keyword or value), leaving a
     /// trailing space for the next argument; the keyword path keeps already-typed
     /// arguments, and there's no-op when nothing is completable.
@@ -1010,30 +1042,73 @@ mod tests {
     fn tab_complete_completes_current_token_with_trailing_space() {
         let reg = empty_registry();
         // Keyword: prefix → full keyword + space.
-        assert_eq!(tab_complete("la", 0, &reg).as_deref(), Some("layout "));
+        assert_eq!(tab("la", 0, &reg).as_deref(), Some("layout "));
         // Keyword while an arg is already typed → keyword filled, arg kept (P0).
-        assert_eq!(
-            tab_complete("sp foo", 0, &reg).as_deref(),
-            Some("spawn foo")
-        );
+        assert_eq!(tab("sp foo", 0, &reg).as_deref(), Some("spawn foo"));
         // Value (backend): replace current token, keep preceding, add space.
         assert_eq!(
-            tab_complete("spawn foo cl", 0, &reg).as_deref(),
+            tab("spawn foo cl", 0, &reg).as_deref(),
             Some("spawn foo claude ")
         );
         // Empty partial → first candidate.
         assert_eq!(
-            tab_complete("layout ", 0, &reg).as_deref(),
+            tab("layout ", 0, &reg).as_deref(),
             Some("layout even-horizontal ")
         );
         // config sub-command.
-        assert_eq!(
-            tab_complete("config s", 0, &reg).as_deref(),
-            Some("config set ")
-        );
+        assert_eq!(tab("config s", 0, &reg).as_deref(), Some("config set "));
         // Free-form arg → no-op (nothing to complete).
-        assert_eq!(tab_complete("set key ", 0, &reg), None);
+        assert_eq!(tab("set key ", 0, &reg), None);
         // No candidate matches the partial → no-op.
-        assert_eq!(tab_complete("spawn foo zzz", 0, &reg), None);
+        assert_eq!(tab("spawn foo zzz", 0, &reg), None);
+    }
+
+    /// r4 regression: with >MAX_PALETTE_ROWS candidates the renderer windows the
+    /// list and clamps the highlight to the last visible row, so Tab MUST complete
+    /// that same visible candidate — never the off-screen raw `selected`. The
+    /// shared `clamp_selected` guarantees it; this pins the contract (and is RED if
+    /// Tab ever re-clamps against the full list again).
+    #[test]
+    fn tab_complete_targets_visible_highlight_not_offscreen_when_over_window() {
+        // 20 synthetic agent-style candidates (the real >12 trigger is a fleet of
+        // >12 live agents for `:kill`/`:restart`/`:send <agent>`).
+        let values: Vec<String> = (0..20).map(|i| format!("agent{i:02}")).collect();
+        let comp = Completion::Values(values);
+        // The renderer highlights `clamp_selected(selected)` = last visible row.
+        let visible_last = MAX_PALETTE_ROWS - 1; // 11
+        assert_eq!(comp.clamp_selected(14), visible_last);
+        assert_eq!(comp.clamp_selected(99), visible_last);
+        // Tab at a past-the-window `selected` completes the VISIBLE candidate
+        // (agent11), not the off-screen agent14.
+        assert_eq!(
+            tab_complete("kill ", &comp, 14).as_deref(),
+            Some("kill agent11 ")
+        );
+        // Within the window, Tab tracks `selected` exactly.
+        assert_eq!(
+            tab_complete("kill ", &comp, 3).as_deref(),
+            Some("kill agent03 ")
+        );
+    }
+
+    /// `visible_count`/`clamp_selected` window math: never exceeds the cap, and a
+    /// short list clamps to its real last index.
+    #[test]
+    fn completion_window_clamps_selected_into_visible_range() {
+        let many = Completion::Values((0..20).map(|i| format!("v{i}")).collect());
+        assert_eq!(many.visible_count(), MAX_PALETTE_ROWS);
+        assert_eq!(many.clamp_selected(0), 0);
+        assert_eq!(
+            many.clamp_selected(MAX_PALETTE_ROWS - 1),
+            MAX_PALETTE_ROWS - 1
+        );
+        assert_eq!(
+            many.clamp_selected(MAX_PALETTE_ROWS + 5),
+            MAX_PALETTE_ROWS - 1
+        );
+
+        let few = Completion::Values(vec!["x".into(), "y".into(), "z".into()]);
+        assert_eq!(few.visible_count(), 3);
+        assert_eq!(few.clamp_selected(99), 2);
     }
 }

@@ -599,7 +599,10 @@ pub(super) fn handle_key(
                 *selected = selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                let n = super::commands::palette_completion(input, ctx.registry).candidate_count();
+                // Bound to the VISIBLE window (capped at MAX_PALETTE_ROWS), not
+                // the full count — otherwise `selected` could run past the last
+                // rendered row and Tab would complete an off-screen candidate.
+                let n = super::commands::palette_completion(input, ctx.registry).visible_count();
                 if *selected + 1 < n {
                     *selected += 1;
                 }
@@ -609,9 +612,12 @@ pub(super) fn handle_key(
             // value once the keyword is complete — keeping the palette open with
             // a trailing space for the next argument. No-op when there's nothing
             // to complete (the clamp + empty handling live in `tab_complete`).
+            // Computed from the SAME `palette_completion` the renderer drew so the
+            // completed candidate matches the on-screen highlight.
             KeyCode::Tab => {
+                let completion = super::commands::palette_completion(input, ctx.registry);
                 if let Some(new_input) =
-                    super::commands::tab_complete(input, *selected, ctx.registry)
+                    super::commands::tab_complete(input, &completion, *selected)
                 {
                     *input = new_input;
                     *selected = 0;
