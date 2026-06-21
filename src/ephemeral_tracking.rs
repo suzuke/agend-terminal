@@ -569,6 +569,21 @@ mod tests {
         }
     }
 
+    /// Poll until `pid` is dead or a short deadline. Termination + OS process-
+    /// object cleanup can lag briefly (notably on Windows: an exited process stays
+    /// queryable until its last handle closes), so a death check must NOT assert
+    /// immediately. The caller must have dropped the `Child` handle first.
+    fn assert_dead_within(pid: u32, label: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::process::is_pid_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label}: pid {pid} still alive after deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn resolve_ttl_defaults_and_clamps() {
         assert_eq!(resolve_ttl(None), DEFAULT_WALL_TTL_SECS);
@@ -724,10 +739,7 @@ mod tests {
             0,
             "reaped worker removed from store"
         );
-        assert!(
-            !crate::process::is_pid_alive(w.pid),
-            "reap must terminate the real headless process"
-        );
+        assert_dead_within(w.pid, "reap must terminate the real headless process");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -743,10 +755,7 @@ mod tests {
         let reaped = reap_sweep_at(&home, future);
         assert_eq!(reaped.len(), 1, "the TTL-expired worker must be reaped");
         assert_eq!(list(&home, None).len(), 0);
-        assert!(
-            !crate::process::is_pid_alive(w.pid),
-            "TTL reap must terminate the real process"
-        );
+        assert_dead_within(w.pid, "TTL reap must terminate the real process");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -817,9 +826,12 @@ mod tests {
         let pid = handle.pid();
         assert!(crate::process::is_pid_alive(pid));
         t.cancel(&mut handle);
-        assert!(
-            !crate::process::is_pid_alive(pid),
-            "cancel must terminate the process"
-        );
+        // Drop the Child handle before checking liveness: on Windows an exited
+        // process still reports alive while ANY handle to it is open (the OS frees
+        // the process object only on the last CloseHandle). Production's
+        // `terminate_worker` drops the handle the same way (it owns it via
+        // LIVE_CHILDREN.remove), so this mirrors the real reap path.
+        drop(handle);
+        assert_dead_within(pid, "cancel must terminate the process");
     }
 }
