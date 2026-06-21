@@ -1801,6 +1801,526 @@ pub fn gc_dry_run(home: &Path) -> Vec<GcCandidate> {
     candidates
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// t-…50793-9: managed-worktree `target/` retention sweep.
+//
+// Build `target/` dirs are the dominant fleet disk consumer (incident
+// 2026-06-21: r4 ~90GB + dev-2 ~64GB stale worktree targets → /Users ENOSPC →
+// daemon inbox went readonly). The whole-worktree GC above frees `target/` only
+// as a SIDE-EFFECT of deleting the entire worktree, gated on explicit-release +
+// 24h grace OR 7-day abandonment — so an alive-agent-never-released worktree
+// (e.g. a reviewer that finished a branch but never released) leaks `target/`
+// indefinitely. This sweep reclaims a managed worktree's `target/` once it goes
+// STALE (no build activity within the age threshold) WITHOUT deleting the
+// worktree/checkout itself. `target/` is regenerable (already excluded from
+// worktree backups), so a swept worktree pays only a one-time rebuild on reuse.
+//
+// SAFETY (footgun — must NEVER delete canonical/operator data, never clobber an
+// active build). Layered:
+//   1. marker-STRICT enumeration — only worktrees under `home/worktrees` that
+//      carry `.agend-managed`, via `target_sweep_worktrees` (NOT the looser
+//      `fs_managed_worktrees`, which unions markerless workspace gitlinks incl.
+//      operator-owned ones). The operator's canonical repo has no marker + lives
+//      OUTSIDE the managed root → unreachable by the enumerator.
+//   2. symlinked-root refusal + canonical-home confinement (`safe_managed_root`)
+//      — never enumerate or delete through a symlinked / home-escaping root.
+//   3. symlink refusal — a worktree's `target` must be a REAL directory; a
+//      symlinked `target` (could point at the canonical 49GB target) is refused.
+//   4. active-build exclusion (`predicate_protects`, round-4) — a build can only
+//      happen in a worktree whose owner is in the daemon ROSTER and CURRENTLY
+//      bound HERE (stable signals; liveness is FLAPPY and was dropped). Such
+//      worktrees are excluded. The delete pass HOLDS the owner's
+//      `.binding.json.lock` (the SAME lock `bind_full` takes) through
+//      predicate→recheck→delete, so the binding can't change under us — closing
+//      the bound-but-not-yet-live and rebind-during-window races (the lock
+//      guards BIND, not cargo). Only instance-gone / bound-elsewhere / unbound
+//      stale targets are swept.
+//   5. fail-CLOSED mtime gate — swept only when nothing under `target/` changed
+//      within `max_age`, RE-checked immediately before deletion (load-bearing
+//      last line: any stat/read error ⇒ treated as active ⇒ skip). ONLY
+//      `target/` is removed — never the worktree dir or source.
+
+/// Default staleness age for the `target/` sweep — no build activity within
+/// this window ⇒ eligible. Conservative: a 2-day-idle build cache is cheap to
+/// regenerate relative to the GBs reclaimed.
+const TARGET_GC_AGE_HOURS_DEFAULT: u64 = 48;
+
+/// Resolve the `target/` sweep config from env. Returns `None` when the sweep
+/// is disabled via `AGEND_TARGET_GC_DISABLE` (operator kill-switch).
+/// `(max_age, min_size_bytes)`:
+///   - `AGEND_TARGET_GC_AGE_HOURS` (default 48) — staleness window.
+///   - `AGEND_TARGET_GC_MIN_SIZE_BYTES` (default 0 = no floor) — skip targets
+///     smaller than this (avoid churn on trivially-small build dirs).
+pub fn target_gc_config() -> Option<(std::time::Duration, u64)> {
+    if std::env::var_os("AGEND_TARGET_GC_DISABLE").is_some() {
+        return None;
+    }
+    let hours = std::env::var("AGEND_TARGET_GC_AGE_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(TARGET_GC_AGE_HOURS_DEFAULT);
+    let min_size = std::env::var("AGEND_TARGET_GC_MIN_SIZE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some((
+        std::time::Duration::from_secs(hours.saturating_mul(3600)),
+        min_size,
+    ))
+}
+
+/// A managed-worktree `target/` dir eligible for the retention sweep.
+#[derive(Debug, Clone)]
+pub struct TargetSweepCandidate {
+    pub worktree: PathBuf,
+    pub target: PathBuf,
+    pub agent: String,
+    /// Seconds since the most-recent modification anywhere under `target/`.
+    pub idle_secs: u64,
+    pub size_bytes: u64,
+}
+
+/// Outcome of one `target/` removal.
+#[derive(Debug, Clone)]
+pub struct TargetSweepResult {
+    pub target: PathBuf,
+    pub agent: String,
+    pub removed: bool,
+    pub freed_bytes: u64,
+    pub error: Option<String>,
+}
+
+/// Fail-CLOSED activity probe for a DESTRUCTIVE sweep. Returns `true` if ANY
+/// entry under `path` (inclusive) was modified at/after `cutoff` OR if any
+/// `symlink_metadata`/`read_dir`/mtime call fails — i.e. uncertainty ⇒ `true` ⇒
+/// the caller MUST NOT delete. Returns `false` (eligible) ONLY when the ENTIRE
+/// tree was readable AND every mtime is older than `cutoff`. Uses
+/// `symlink_metadata` and recurses only into REAL directories, so it never
+/// follows symlinks (can't escape the tree or loop). Early-exits on the first
+/// fresh/unreadable entry (fast path for active builds).
+fn tree_active_or_unreadable(path: &Path, cutoff: std::time::SystemTime) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return true; // can't stat ⇒ uncertain ⇒ fail-closed (treat as active)
+    };
+    match meta.modified() {
+        Ok(m) if m >= cutoff => return true, // fresh ⇒ active
+        Ok(_) => {}
+        Err(_) => return true, // no mtime ⇒ uncertain ⇒ fail-closed
+    }
+    if meta.file_type().is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return true; // can't list a dir we're about to delete ⇒ fail-closed
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true; // unreadable entry ⇒ fail-closed
+            };
+            if tree_active_or_unreadable(&entry.path(), cutoff) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Total bytes under `path` (real files; symlinks counted by their own link
+/// size, never followed). Best-effort — unreadable entries are skipped.
+fn tree_size_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_dir() {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                total = total.saturating_add(tree_size_bytes(&entry.path()));
+            }
+        }
+        total
+    } else {
+        meta.len()
+    }
+}
+
+/// Newest mtime anywhere under `path` (inclusive); `None` if unreadable. Full
+/// walk (no early-exit) — used only to compute `idle_secs` for the preview.
+fn tree_newest_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let mut newest = meta.modified().ok();
+    if meta.file_type().is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Some(m) = tree_newest_mtime(&entry.path()) {
+                    newest = Some(match newest {
+                        Some(n) if n >= m => n,
+                        _ => m,
+                    });
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Operator-facing scope boundary (no-silent-coverage-cap, lead VET condition).
+/// This sweep reclaims `target/` ONLY for `.agend-managed` `home/worktrees`
+/// worktrees whose owner is GONE from the daemon roster, or in the roster but
+/// bound ELSEWHERE / unbound (instance-gone / rebound-away / orphan). It
+/// deliberately does NOT reclaim any worktree whose owner is in the roster AND
+/// currently bound there — REGARDLESS of liveness — because that owner can start
+/// a build at any instant (mtime cannot prevent a build starting between check
+/// and delete). It also does NOT touch legacy markerless `workspace/<agent>/target`
+/// or agent-self-built `.claude/worktrees/*/target` (the larger fleet consumers,
+/// but markerless = the operator-data danger zone, left to a separate
+/// authoritative binding-registry sweep). Surfaced in dry-run/log so
+/// reclaimed-space figures never imply the fleet disk problem is fully solved.
+pub const TARGET_SWEEP_SCOPE_NOTE: &str = "scope: sweeps stale target/ ONLY for .agend-managed home/worktrees worktrees whose owner is gone from the roster, or bound elsewhere/unbound (instance-gone / rebound-away / orphan). NOT reclaimed: any currently-bound worktree (regardless of liveness — a build can start anytime), legacy markerless workspace/<agent>/target, or .claude/worktrees/*/target.";
+
+/// Marker-STRICT enumerator for the `target/` sweep (r6/r4 #1 fix): ONLY
+/// daemon-leased worktrees under `home/worktrees` that carry the
+/// `.agend-managed` marker, via `collect_managed_worktrees`. Deliberately does
+/// NOT union `workspace_gitlink_worktrees` — that scan collects `.git`-gitlink
+/// dirs WITHOUT a marker (incl. operator-owned, interrupted-reconcile
+/// worktrees), which is by-design for read-only LISTING but a footgun for a
+/// DESTRUCTIVE sweep. A sweep must never inherit the looser enumeration.
+fn target_sweep_worktrees(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_managed_worktrees(
+        &daemon_managed_worktree_root(home),
+        MARKER_WALK_MAX_DEPTH,
+        &mut out,
+    );
+    out
+}
+
+/// Resolve the canonical `home/worktrees` sweep root, or `None` if it is unsafe
+/// to sweep — root missing, root is a symlink, or root escapes the canonical
+/// home (r6 #2 fix). Anchoring confinement to the canonical HOME and refusing a
+/// symlinked root closes "canonicalize-a-symlinked-root-then-trust-it" escapes.
+/// (FIX1 already drops the workspace enumeration that was the real escape
+/// vector; this is defense-in-depth.)
+fn safe_managed_root(home: &Path) -> Option<PathBuf> {
+    let root = daemon_managed_worktree_root(home);
+    match std::fs::symlink_metadata(&root) {
+        Ok(m) if m.file_type().is_symlink() => return None, // never sweep through a symlinked root
+        Ok(_) => {}
+        Err(_) => return None, // missing/unreadable ⇒ nothing to sweep
+    }
+    let canon_home = dunce::canonicalize(home).ok()?;
+    let canon_root = dunce::canonicalize(&root).ok()?;
+    canon_root.starts_with(&canon_home).then_some(canon_root)
+}
+
+/// Validate `target` is safe to hard-delete: the managed root must be safe
+/// (`safe_managed_root` — non-symlink, under canonical home), `target` must be a
+/// REAL directory (not a symlink — a symlinked `target` could point at the
+/// canonical repo's target), and `canonicalize(target)` must resolve under the
+/// canonical managed root. Returns the validated canonical target path.
+fn validate_target_for_delete(home: &Path, target: &Path) -> Result<PathBuf, String> {
+    let canon_root = safe_managed_root(home).ok_or_else(|| {
+        "refusing: managed root is missing, a symlink, or escapes home".to_string()
+    })?;
+    let meta = std::fs::symlink_metadata(target).map_err(|e| format!("stat failed: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err("refusing: `target` is a symlink (could escape to canonical)".to_string());
+    }
+    if !meta.file_type().is_dir() {
+        return Err("refusing: `target` is not a directory".to_string());
+    }
+    let canon = dunce::canonicalize(target).map_err(|e| format!("canonicalize failed: {e}"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(format!(
+            "refusing: {} does not resolve under the managed root {}",
+            canon.display(),
+            canon_root.display()
+        ));
+    }
+    Ok(canon)
+}
+
+/// Stable-signal protect predicate (round-4, r6 re-DUAL — DROPS the flappy
+/// `liveness` signal that caused the bound-but-not-yet-live TOCTOU). A worktree
+/// is PROTECTED when its owner instance is in the `roster` AND its binding
+/// currently points HERE — meaning a process can still build in it. The binding
+/// is read from DISK (not the in-process cache) so the caller's held
+/// `.binding.json.lock` makes it authoritative (no bind can mutate it).
+///
+/// - owner unresolvable: PROTECT (fail-closed).
+/// - owner NOT in roster (deleted): sweepable — no process can ever bind here again.
+/// - in roster, binding points HERE: PROTECT — could build (closes the
+///   bound-but-not-yet-live race).
+/// - in roster, binding elsewhere/absent: sweepable (can't rebind here while the
+///   caller holds the bind lock).
+/// - in roster, binding UNREADABLE/malformed: PROTECT (fail-closed).
+fn predicate_protects(home: &Path, wt: &Path, roster: &std::collections::HashSet<String>) -> bool {
+    let Some(owner) = agent_from_layout(home, wt) else {
+        return true; // unresolvable owner ⇒ fail-closed protect
+    };
+    if !roster.contains(&owner) {
+        return false; // instance gone (deleted) ⇒ no process can build ⇒ sweepable
+    }
+    let binding_path = crate::paths::runtime_dir(home)
+        .join(&owner)
+        .join("binding.json");
+    if !binding_path.exists() {
+        return false; // in roster but unbound ⇒ sweepable (can't rebind under our lock)
+    }
+    // Read the FILE directly (not the cache) so the caller's held lock is the
+    // source of truth for the binding.
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match std::fs::read_to_string(&binding_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) => match v["worktree"].as_str() {
+                Some(bw) => canon(std::path::Path::new(bw)) == canon(wt), // bound HERE ⇒ PROTECT
+                None => true, // malformed (no worktree field) ⇒ fail-closed PROTECT
+            },
+            Err(_) => true, // parse error ⇒ fail-closed PROTECT
+        },
+        Err(_) => true, // exists but unreadable ⇒ fail-closed PROTECT
+    }
+}
+
+/// Snapshot the daemon's known-agent roster (stable membership, NOT flappy
+/// process-liveness — round-4) for a sweep pass.
+fn sweep_roster(home: &Path) -> std::collections::HashSet<String> {
+    crate::runtime::list_agents_with_fallback(home)
+        .into_iter()
+        .collect()
+}
+
+/// Enumerate daemon-leased worktrees (marker-strict, `home/worktrees` only —
+/// see [`target_sweep_worktrees`] / [`TARGET_SWEEP_SCOPE_NOTE`]) whose `target/`
+/// build dir is STALE (no activity within `max_age`, fail-closed), NOT protected
+/// by [`predicate_protects`] (owner-in-roster + bound-here), and at least
+/// `min_size` bytes. Resolves the roster itself; tests use the `_with_roster`
+/// variant to inject a deterministic roster.
+pub fn target_sweep_candidates(
+    home: &Path,
+    max_age: std::time::Duration,
+    min_size: u64,
+) -> Vec<TargetSweepCandidate> {
+    target_sweep_candidates_with_roster(home, max_age, min_size, &sweep_roster(home))
+}
+
+/// Roster-injected core of [`target_sweep_candidates`]. NOTE: the protect
+/// predicate here is BEST-EFFORT (no `.binding.json.lock` held — this is the
+/// enumeration/dry-run pass). The AUTHORITATIVE, lock-frozen protect check runs
+/// in [`target_sweep_run_with_roster`] before each delete.
+pub(crate) fn target_sweep_candidates_with_roster(
+    home: &Path,
+    max_age: std::time::Duration,
+    min_size: u64,
+    roster: &std::collections::HashSet<String>,
+) -> Vec<TargetSweepCandidate> {
+    // SAFETY 2: never enumerate through a symlinked / escaping managed root.
+    if safe_managed_root(home).is_none() {
+        return Vec::new();
+    }
+    let now = std::time::SystemTime::now();
+    let cutoff = now.checked_sub(max_age).unwrap_or(now);
+    let mut out = Vec::new();
+    for wt in target_sweep_worktrees(home) {
+        // SAFETY 4 (active-build): owner in roster + bound here ⇒ a process can
+        // build at any instant ⇒ exclude. (Best-effort here; re-checked under
+        // the bind lock in the run pass.)
+        if predicate_protects(home, &wt, roster) {
+            continue;
+        }
+        let target = wt.join("target");
+        // SAFETY 3: real directory only (symlink_metadata → is_dir is false for
+        // a symlink-to-dir, so a symlinked `target` is skipped here too).
+        let Ok(meta) = std::fs::symlink_metadata(&target) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        // SAFETY 5 (fail-closed): active build OR any unreadable entry ⇒ skip.
+        if tree_active_or_unreadable(&target, cutoff) {
+            continue;
+        }
+        let size_bytes = tree_size_bytes(&target);
+        if size_bytes < min_size {
+            continue;
+        }
+        let idle_secs = tree_newest_mtime(&target)
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let agent = agent_from_layout(home, &wt).unwrap_or_default();
+        out.push(TargetSweepCandidate {
+            worktree: wt,
+            target,
+            agent,
+            idle_secs,
+            size_bytes,
+        });
+    }
+    out
+}
+
+/// Execute the `target/` sweep. For each candidate, try-acquire the OWNER's
+/// `.binding.json.lock` (the SAME lock `bind_full` holds) and HOLD it through
+/// {predicate → marker re-assert → fail-closed mtime recheck → delete}. While
+/// held, no bind/rebind can occur (bind_full would block on it), so the protect
+/// predicate is authoritative and a rebind-to-here cannot race the delete.
+/// Contended lock ⇒ an active bind/release ⇒ SKIP this worktree this tick
+/// (fail-safe). Resolves the roster itself; tests use the `_with_roster` variant.
+pub fn target_sweep_run(
+    home: &Path,
+    max_age: std::time::Duration,
+    min_size: u64,
+) -> Vec<TargetSweepResult> {
+    target_sweep_run_with_roster(home, max_age, min_size, &sweep_roster(home))
+}
+
+/// Roster-injected core of [`target_sweep_run`].
+pub(crate) fn target_sweep_run_with_roster(
+    home: &Path,
+    max_age: std::time::Duration,
+    min_size: u64,
+    roster: &std::collections::HashSet<String>,
+) -> Vec<TargetSweepResult> {
+    let candidates = target_sweep_candidates_with_roster(home, max_age, min_size, roster);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    for c in &candidates {
+        let skip = |reason: String| TargetSweepResult {
+            target: c.target.clone(),
+            agent: c.agent.clone(),
+            removed: false,
+            freed_bytes: 0,
+            error: Some(reason),
+        };
+        let Some(owner) = agent_from_layout(home, &c.worktree) else {
+            results.push(skip(
+                "skipped: unresolvable owner (fail-closed)".to_string(),
+            ));
+            continue;
+        };
+        // Hold the owner's binding lock through {predicate → recheck → delete}.
+        // bind_full holds this same lock while writing binding.json, so while we
+        // hold it NO bind/rebind can occur — freezing the binding the predicate
+        // reads and making a rebind-to-here-vs-delete race impossible. Non-blocking:
+        // a held lock = an active bind/release in flight ⇒ skip this tick (fail-safe).
+        let lock_path = crate::paths::runtime_dir(home)
+            .join(&owner)
+            .join(".binding.json.lock");
+        let _lock = match crate::store::try_acquire_file_lock(&lock_path) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                results.push(skip(
+                    "skipped: binding lock held (bind/release in flight)".to_string(),
+                ));
+                continue;
+            }
+            Err(e) => {
+                results.push(skip(format!(
+                    "skipped: binding lock error (fail-closed): {e}"
+                )));
+                continue;
+            }
+        };
+        // UNDER LOCK — binding is frozen ⇒ this protect check is authoritative.
+        if predicate_protects(home, &c.worktree, roster) {
+            results.push(skip(
+                "skipped: owner in roster + bound here (active-build protection)".to_string(),
+            ));
+            continue;
+        }
+        // Re-assert the daemon-managed marker at delete time.
+        if !is_daemon_managed(&c.worktree) {
+            results.push(skip(
+                "skipped: worktree no longer .agend-managed".to_string(),
+            ));
+            continue;
+        }
+        // LOAD-BEARING fail-closed last line: any fresh mtime OR unreadable
+        // entry ⇒ skip (don't delete).
+        let now = std::time::SystemTime::now();
+        let cutoff = now.checked_sub(max_age).unwrap_or(now);
+        if tree_active_or_unreadable(&c.target, cutoff) {
+            results.push(skip(
+                "skipped: target became active/unreadable before delete".to_string(),
+            ));
+            continue;
+        }
+        // SAFETY 2 & 3: symlinked-root/target refusal + canonical-root confinement.
+        // Removes ONLY `target/` (canon resolves under the managed root) — never
+        // the worktree dir or source.
+        let canon = match validate_target_for_delete(home, &c.target) {
+            Ok(p) => p,
+            Err(e) => {
+                results.push(skip(e));
+                continue;
+            }
+        };
+        match std::fs::remove_dir_all(&canon) {
+            Ok(()) => results.push(TargetSweepResult {
+                target: c.target.clone(),
+                agent: c.agent.clone(),
+                removed: true,
+                freed_bytes: c.size_bytes,
+                error: None,
+            }),
+            Err(e) => results.push(skip(format!("remove failed: {e}"))),
+        }
+    }
+    let removed_count = results.iter().filter(|r| r.removed).count();
+    if removed_count > 0 {
+        let freed: u64 = results
+            .iter()
+            .filter(|r| r.removed)
+            .map(|r| r.freed_bytes)
+            .sum();
+        crate::event_log::log(
+            home,
+            "target_gc",
+            "",
+            &format!(
+                "{removed_count} stale target/ dirs reclaimed (~{} MB)",
+                freed / (1024 * 1024)
+            ),
+        );
+    }
+    results
+}
+
+/// Non-destructive preview of `target/` sweep candidates (mirrors `gc_dry_run`).
+/// Resolves config from env; returns empty when the sweep is disabled.
+pub fn target_sweep_dry_run(home: &Path) -> Vec<TargetSweepCandidate> {
+    let Some((max_age, min_size)) = target_gc_config() else {
+        return Vec::new();
+    };
+    let candidates = target_sweep_candidates(home, max_age, min_size);
+    for c in &candidates {
+        tracing::info!(
+            agent = %c.agent,
+            target = %c.target.display(),
+            idle_secs = c.idle_secs,
+            size_bytes = c.size_bytes,
+            "target_sweep_dry_run candidate"
+        );
+    }
+    if !candidates.is_empty() {
+        let total: u64 = candidates.iter().map(|c| c.size_bytes).sum();
+        crate::event_log::log(
+            home,
+            "target_sweep_dry_run",
+            "",
+            &format!(
+                "{} stale target/ dirs (~{} MB) eligible — {}",
+                candidates.len(),
+                total / (1024 * 1024),
+                TARGET_SWEEP_SCOPE_NOTE
+            ),
+        );
+    }
+    candidates
+}
+
 /// Result of a single GC removal attempt.
 #[derive(Debug, Clone)]
 pub struct GcResult {
@@ -4951,6 +5471,471 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── t-…50793-9: managed-worktree target/ retention sweep ──────────────
+    // These exercise the REAL sweep against on-disk fixtures. Unix-gated
+    // because they set past mtimes via `touch -t` and create symlinks; the
+    // helpers are #[cfg(unix)] for the same reason (Windows -D warnings would
+    // flag them as dead otherwise).
+
+    /// Age every entry under `p` (dirs+files) to a fixed past time (2025-01-01),
+    /// well over the 48h staleness window relative to the test clock.
+    #[cfg(unix)]
+    fn touch_old(p: &Path) {
+        let _ = std::process::Command::new("touch")
+            .args(["-t", "202501010000"])
+            .arg(p)
+            .status();
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                touch_old(&e.path());
+            }
+        }
+    }
+
+    /// Create a daemon-managed worktree (`.agend-managed` marker) under
+    /// `home/worktrees/<agent>/<branch>` with a populated `target/`. `stale`
+    /// ages the whole `target/` tree past the window. Returns (worktree, target).
+    #[cfg(unix)]
+    fn mk_managed_target(
+        home: &Path,
+        agent: &str,
+        branch: &str,
+        stale: bool,
+    ) -> (PathBuf, PathBuf) {
+        let wt = daemon_managed_worktree_root(home).join(agent).join(branch);
+        std::fs::create_dir_all(wt.join("target").join("debug")).unwrap();
+        std::fs::write(
+            wt.join(MANAGED_MARKER),
+            format!(
+                "agent={agent}\nbranch={branch}\nleased_at={}\n",
+                chrono::Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+        std::fs::write(wt.join("target").join("debug").join("app"), vec![0u8; 4096]).unwrap();
+        if stale {
+            touch_old(&wt.join("target"));
+        }
+        (wt.clone(), wt.join("target"))
+    }
+
+    /// ① Sweep a STALE managed `target/` — deleted; the worktree + marker survive.
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_reclaims_stale_managed_target() {
+        let home = tmp_home("tgt-stale");
+        let (wt, target) = mk_managed_target(&home, "dev-x", "feat/foo", true);
+        assert!(target.exists());
+        let age = std::time::Duration::from_secs(48 * 3600);
+
+        let cands = target_sweep_candidates(&home, age, 0);
+        assert_eq!(cands.len(), 1, "stale managed target/ must be a candidate");
+
+        let results = target_sweep_run(&home, age, 0);
+        assert!(
+            results.iter().any(|r| r.removed),
+            "stale target/ must be removed: {results:?}"
+        );
+        assert!(!target.exists(), "target/ must be deleted");
+        assert!(
+            wt.exists() && wt.join(MANAGED_MARKER).exists(),
+            "worktree + marker MUST survive — only target/ is swept"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ② NEVER sweep an unmanaged dir, and NEVER follow a `target` symlink that
+    /// escapes to canonical/operator data (the core footgun).
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_refuses_unmanaged_and_symlinked_canonical() {
+        let home = tmp_home("tgt-safe");
+        let age = std::time::Duration::from_secs(48 * 3600);
+
+        // (a) unmanaged worktree dir (NO .agend-managed marker) with a stale target/.
+        let unmanaged = daemon_managed_worktree_root(&home)
+            .join("nomarker")
+            .join("br");
+        std::fs::create_dir_all(unmanaged.join("target")).unwrap();
+        std::fs::write(unmanaged.join("target").join("f"), b"x").unwrap();
+        touch_old(&unmanaged.join("target"));
+
+        // (b) a "canonical" repo target OUTSIDE the managed roots, plus a managed
+        //     worktree whose `target` is a SYMLINK pointing at it (escape attempt).
+        let canonical = home.join("canonical-repo").join("target");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("precious.bin"), b"operator-data").unwrap();
+        touch_old(&canonical);
+        let wt = daemon_managed_worktree_root(&home).join("dev-y").join("br");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(MANAGED_MARKER), "agent=dev-y\nbranch=br\n").unwrap();
+        std::os::unix::fs::symlink(&canonical, wt.join("target")).unwrap();
+
+        let cands = target_sweep_candidates(&home, age, 0);
+        assert!(
+            cands.is_empty(),
+            "unmanaged target + symlink-to-canonical must NOT be candidates: {cands:?}"
+        );
+
+        let results = target_sweep_run(&home, age, 0);
+        assert!(
+            results.iter().all(|r| !r.removed),
+            "nothing must be deleted: {results:?}"
+        );
+        assert!(
+            canonical.join("precious.bin").exists(),
+            "canonical operator data MUST survive the symlink-escape attempt"
+        );
+        assert!(
+            unmanaged.join("target").exists(),
+            "unmanaged target/ MUST survive"
+        );
+        // Direct unit on the guard: a symlinked target is refused.
+        assert!(
+            validate_target_for_delete(&home, &wt.join("target")).is_err(),
+            "symlinked target must be refused by validate_target_for_delete"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ③ Skip an ACTIVE build (fresh mtime within the window) — not deleted.
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_skips_fresh_active_build_target() {
+        let home = tmp_home("tgt-fresh");
+        let (_, target) = mk_managed_target(&home, "dev-z", "feat/bar", false); // fresh
+        let age = std::time::Duration::from_secs(48 * 3600);
+
+        let cands = target_sweep_candidates(&home, age, 0);
+        assert!(
+            cands.is_empty(),
+            "fresh (active-build) target/ must be skipped: {cands:?}"
+        );
+        let results = target_sweep_run(&home, age, 0);
+        assert!(results.iter().all(|r| !r.removed));
+        assert!(target.exists(), "active target/ MUST survive");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ④ Dry-run previews the stale candidate WITHOUT deleting it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn target_sweep_dry_run_previews_without_deleting() {
+        let home = tmp_home("tgt-dry");
+        let (_, target) = mk_managed_target(&home, "dev-d", "feat/baz", true); // stale
+                                                                               // dry_run reads env config — pin to defaults (enabled, 48h).
+        std::env::remove_var("AGEND_TARGET_GC_DISABLE");
+        std::env::remove_var("AGEND_TARGET_GC_AGE_HOURS");
+        std::env::remove_var("AGEND_TARGET_GC_MIN_SIZE_BYTES");
+
+        let preview = target_sweep_dry_run(&home);
+        assert_eq!(preview.len(), 1, "dry-run must preview the stale candidate");
+        assert!(preview[0].size_bytes > 0, "preview reports a size");
+        assert!(target.exists(), "dry-run MUST NOT delete");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Rework regression tests (r6 REJECT repros, PR #2398) ──────────────
+
+    /// R1 (r6 #1): a markerless `workspace/<agent>` gitlink worktree — caught by
+    /// the looser `fs_managed_worktrees` union — is NEVER swept. The sweep's
+    /// marker-strict enumerator walks `home/worktrees` only. neuter: revert
+    /// `target_sweep_candidates` to `fs_managed_worktrees(home)` ⇒ this goes RED
+    /// (the operator workspace target/ becomes a candidate + is deleted).
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_ignores_markerless_workspace_gitlink() {
+        let home = tmp_home("tgt-ws-markerless");
+        // The managed root must EXIST so the run reaches the enumerator (else
+        // safe_managed_root short-circuits and the neuter is masked). Empty
+        // home/worktrees ⇒ the marker-strict enumerator finds nothing; only the
+        // looser union would (wrongly) pull in the workspace gitlink below.
+        std::fs::create_dir_all(daemon_managed_worktree_root(&home)).unwrap();
+        let ws = crate::paths::workspace_dir(&home).join("operator-owned");
+        std::fs::create_dir_all(ws.join("target")).unwrap();
+        std::fs::write(ws.join(".git"), b"gitdir: /elsewhere\n").unwrap(); // gitlink FILE, NO marker
+        std::fs::write(ws.join("target").join("f"), vec![0u8; 2048]).unwrap();
+        touch_old(&ws.join("target"));
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        let cands = target_sweep_candidates(&home, age, 0);
+        assert!(
+            cands.is_empty(),
+            "markerless workspace gitlink must NOT be a candidate: {cands:?}"
+        );
+        let results = target_sweep_run(&home, age, 0);
+        assert!(results.iter().all(|r| !r.removed));
+        assert!(
+            ws.join("target").exists(),
+            "operator workspace target/ MUST survive"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R2a (r6 #2, symlink-ROOT arm ISOLATED): `home/worktrees` symlinked to a
+    /// real dir INSIDE home — confinement (canon under home) WOULD pass, so
+    /// `safe_managed_root`'s SYMLINK arm is the SOLE guard. neuter: drop the
+    /// symlink arm ⇒ the inside-home root is enumerated + its stale managed
+    /// target swept (RED). (Isolates the symlink arm — r6's MEDIUM: the old
+    /// combined-gut neuter didn't, since confinement independently caught it.)
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_aborts_on_symlinked_root_inside_home() {
+        let home = tmp_home("tgt-symroot-in");
+        // Real dir INSIDE home holding a stale managed worktree (agent not live
+        // → would be swept if enumeration reached it).
+        let real_root = home.join("real-wt-root");
+        let wt = real_root.join("dev-sa").join("br");
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join(MANAGED_MARKER), "agent=dev-sa\nbranch=br\n").unwrap();
+        std::fs::write(wt.join("target").join("f"), vec![0u8; 2048]).unwrap();
+        touch_old(&wt.join("target"));
+        std::os::unix::fs::symlink(&real_root, daemon_managed_worktree_root(&home)).unwrap();
+
+        // Symlink arm rejects even though confinement-to-home would pass.
+        assert!(
+            safe_managed_root(&home).is_none(),
+            "a symlinked managed root must be rejected by the symlink arm"
+        );
+        let age = std::time::Duration::from_secs(48 * 3600);
+        assert!(target_sweep_candidates(&home, age, 0).is_empty());
+        assert!(target_sweep_run(&home, age, 0).iter().all(|r| !r.removed));
+        assert!(
+            wt.join("target").exists(),
+            "must not sweep through a symlinked managed root"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R2b (r6 #2 / r4 — CONFINEMENT isolated, the real CRITICAL-2 guard): an
+    /// ancestor-escape — `home/worktrees` is REAL, but a child `<agent>` dir is a
+    /// SYMLINK to an external tree (outside home) with a real `target/`. The
+    /// safe_managed_root symlink arm does NOT fire (the ROOT is real); only
+    /// `validate_target_for_delete`'s canonical-root CONFINEMENT stands. neuter:
+    /// drop that confinement ⇒ external operator target swept (RED).
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_confinement_blocks_ancestor_escape() {
+        let home = tmp_home("tgt-confine");
+        std::fs::create_dir_all(daemon_managed_worktree_root(&home)).unwrap(); // REAL root
+        let external = tmp_home("tgt-confine-ext");
+        let ext_wt = external.join("wt");
+        std::fs::create_dir_all(ext_wt.join("target")).unwrap();
+        std::fs::write(ext_wt.join("target").join("precious.bin"), b"operator-data").unwrap();
+        std::fs::write(ext_wt.join(MANAGED_MARKER), "agent=dev-ce\nbranch=br\n").unwrap();
+        touch_old(&ext_wt.join("target"));
+        // home/worktrees/dev-ce → external worktree (real root, SYMLINKED child).
+        std::os::unix::fs::symlink(&ext_wt, daemon_managed_worktree_root(&home).join("dev-ce"))
+            .unwrap();
+
+        // Root is real → symlink arm does NOT fire; confinement is the sole guard.
+        assert!(
+            safe_managed_root(&home).is_some(),
+            "a real managed root must pass safe_managed_root"
+        );
+        let escaping_target = daemon_managed_worktree_root(&home)
+            .join("dev-ce")
+            .join("target");
+        assert!(
+            validate_target_for_delete(&home, &escaping_target).is_err(),
+            "confinement must reject a target that resolves outside the managed root"
+        );
+        let age = std::time::Duration::from_secs(48 * 3600);
+        let results = target_sweep_run(&home, age, 0);
+        assert!(results.iter().all(|r| !r.removed));
+        assert!(
+            ext_wt.join("target").join("precious.bin").exists(),
+            "external operator data MUST survive (confinement)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&external).ok();
+    }
+
+    /// R3 (r6 #4): a managed `target/` containing an UNREADABLE subdir (read_dir
+    /// errors) FAILS CLOSED — treated as active, NOT deleted. neuter: revert the
+    /// activity probe to return `false` on error ⇒ the dir is swept despite being
+    /// unreadable (RED).
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_fail_closed_on_unreadable_subdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("tgt-failclosed");
+        let (_, target) = mk_managed_target(&home, "dev-fc", "feat/fc", true); // stale
+        let locked = target.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("x"), b"y").unwrap();
+        touch_old(&target); // age the whole tree (incl. locked) past the window
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        let cands = target_sweep_candidates(&home, age, 0);
+        let removed = target_sweep_run(&home, age, 0).iter().any(|r| r.removed);
+        // Restore perms BEFORE asserting so cleanup always succeeds.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+
+        assert!(
+            cands.is_empty(),
+            "target with an unreadable subdir must fail-closed (not a candidate): {cands:?}"
+        );
+        assert!(
+            !removed,
+            "fail-closed: target with an unreadable subdir must NOT be deleted"
+        );
+        assert!(target.exists(), "target/ MUST survive fail-closed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Write a binding.json for `agent` pointing at `worktree` (where
+    /// `binding::read` looks: `runtime_dir/<agent>/binding.json`).
+    #[cfg(unix)]
+    fn write_binding(home: &Path, agent: &str, worktree: &Path) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::json!({ "worktree": worktree.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// FIX3 round-4 (r6 active-build TOCTOU): owner IN roster + bound HERE ⇒
+    /// PROTECTED, regardless of liveness — closes the bound-but-not-yet-live race
+    /// (the flappy liveness signal is gone). neuter: gut `predicate_protects`
+    /// (force not-protected) ⇒ the bound target is swept ⇒ RED.
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_protects_bound_in_roster() {
+        let home = tmp_home("tgt-bound-roster");
+        let (wt, target) = mk_managed_target(&home, "own-a", "feat/x", true); // stale
+        write_binding(&home, "own-a", &wt);
+        let roster = std::collections::HashSet::from(["own-a".to_string()]);
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        assert!(
+            target_sweep_candidates_with_roster(&home, age, 0, &roster).is_empty(),
+            "in-roster + bound-here must be PROTECTED"
+        );
+        assert!(target_sweep_run_with_roster(&home, age, 0, &roster)
+            .iter()
+            .all(|r| !r.removed));
+        assert!(target.exists(), "bound-in-roster target/ MUST survive");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Round-4: an instance GONE from the roster (deleted) is sweepable even with
+    /// a stale binding pointing here — it can never bind again (the real orphan
+    /// reclaim, e.g. claude-8145a9).
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_reclaims_instance_gone() {
+        let home = tmp_home("tgt-gone");
+        let (wt, target) = mk_managed_target(&home, "own-gone", "feat/y", true); // stale
+        write_binding(&home, "own-gone", &wt); // stale binding points here...
+        let roster = std::collections::HashSet::new(); // ...but owner NOT in roster (deleted)
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        assert_eq!(
+            target_sweep_candidates_with_roster(&home, age, 0, &roster).len(),
+            1,
+            "a gone instance's stale-bound target must be sweepable"
+        );
+        assert!(target_sweep_run_with_roster(&home, age, 0, &roster)
+            .iter()
+            .any(|r| r.removed));
+        assert!(
+            !target.exists(),
+            "gone-instance stale target/ must be reclaimed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Round-4: a roster member that REBOUND AWAY (binding points elsewhere)
+    /// leaves this worktree sweepable.
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_reclaims_rebound_away() {
+        let home = tmp_home("tgt-rebound");
+        let (_wt, target) = mk_managed_target(&home, "own-reb", "feat/old", true); // stale
+        let elsewhere = daemon_managed_worktree_root(&home)
+            .join("own-reb")
+            .join("feat-new");
+        write_binding(&home, "own-reb", &elsewhere); // bound ELSEWHERE
+        let roster = std::collections::HashSet::from(["own-reb".to_string()]);
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        assert_eq!(
+            target_sweep_candidates_with_roster(&home, age, 0, &roster).len(),
+            1,
+            "a rebound-away worktree must be sweepable"
+        );
+        assert!(target_sweep_run_with_roster(&home, age, 0, &roster)
+            .iter()
+            .any(|r| r.removed));
+        assert!(
+            !target.exists(),
+            "rebound-away stale target/ must be reclaimed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Round-4 (fixes the None fail-open): a roster member whose binding.json
+    /// EXISTS but is UNREADABLE/malformed ⇒ fail-closed PROTECT. neuter: revert
+    /// the predicate's Err/None arm to `false` ⇒ swept ⇒ RED.
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_fail_closed_on_unreadable_binding() {
+        let home = tmp_home("tgt-badbind");
+        let (_wt, target) = mk_managed_target(&home, "own-bad", "feat/z", true); // stale
+        let dir = crate::paths::runtime_dir(&home).join("own-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binding.json"), b"{ this is not valid json").unwrap();
+        let roster = std::collections::HashSet::from(["own-bad".to_string()]);
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        assert!(
+            target_sweep_candidates_with_roster(&home, age, 0, &roster).is_empty(),
+            "an unreadable binding for a roster member must fail-closed PROTECT"
+        );
+        assert!(target_sweep_run_with_roster(&home, age, 0, &roster)
+            .iter()
+            .all(|r| !r.removed));
+        assert!(
+            target.exists(),
+            "fail-closed: target/ MUST survive unreadable binding"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Round-4: the run pass HOLDS the owner's .binding.json.lock; a contended
+    /// lock (bind/release in flight) ⇒ SKIP this tick — never delete while the
+    /// binding could change under us. neuter: drop the try-lock ⇒ deletes despite
+    /// the held lock ⇒ RED.
+    #[cfg(unix)]
+    #[test]
+    fn target_sweep_skips_when_bind_lock_contended() {
+        let home = tmp_home("tgt-lockcontend");
+        // stale + NOT in roster ⇒ would be sweepable, but the held lock must veto.
+        let (_wt, target) = mk_managed_target(&home, "own-lk", "feat/lk", true);
+        let lock_path = crate::paths::runtime_dir(&home)
+            .join("own-lk")
+            .join(".binding.json.lock");
+        let _held = crate::store::acquire_file_lock(&lock_path).expect("hold the bind lock");
+        let roster = std::collections::HashSet::new();
+
+        let age = std::time::Duration::from_secs(48 * 3600);
+        let results = target_sweep_run_with_roster(&home, age, 0, &roster);
+        assert!(
+            results.iter().all(|r| !r.removed),
+            "must skip while the bind lock is held: {results:?}"
+        );
+        assert!(
+            target.exists(),
+            "target/ MUST survive while the bind lock is held"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 

@@ -9,6 +9,7 @@ pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
 mod ephemeral;
 mod force_release;
+mod gc;
 pub(crate) mod instance;
 mod instance_metadata;
 mod instance_queries;

@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::{
-    binding_state, channel, ci, comms, ephemeral, force_release, instance, restart, schedule, task,
-    worktree,
+    binding_state, channel, ci, comms, ephemeral, force_release, gc, instance, restart, schedule,
+    task, worktree,
 };
 
 /// Shared per-call context — every common parameter `handle_tool`
@@ -240,7 +240,7 @@ adapter!(
     has,
     force_release::handle_force_release_worktree
 );
-adapter!(dispatch_gc_dry_run, has, worktree::handle_gc_dry_run);
+adapter!(dispatch_gc_dry_run, has, gc::handle_gc_dry_run);
 adapter!(
     dispatch_download_attachment,
     hai,
