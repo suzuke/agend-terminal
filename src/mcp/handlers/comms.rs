@@ -5,6 +5,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::send_envelope::SendEnvelope;
 use super::{comms_gates::enforce_send_invariants, err_needs_identity, is_ok_result};
 
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
@@ -75,14 +76,26 @@ pub(super) fn handle_send_to_instance(
     let thread_id = args["thread_id"].as_str();
     let parent_id = args["parent_id"].as_str();
 
+    // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; the
+    // SendEnvelope projection carries it (+ the rest of the directive set) into
+    // BOTH `params` and the fallback, so they cannot drift (smells#2).
+    let env = SendEnvelope {
+        from: sender.as_str().to_string(),
+        target: target.to_string(),
+        text: text.to_string(),
+        // MED-5: carry `kind` (else a fallback `kind=query` lands kind=None and
+        // `inbox clear` swallows it) — now via the shared envelope.
+        kind: kind.map(String::from),
+        thread_id: thread_id.map(String::from),
+        parent_id: parent_id.map(String::from),
+        ..SendEnvelope::directives_from_args(args)
+    };
     let result = match crate::api::call(
         home,
         &json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
-            // #1024 (closes #1002 ROOT 2): `reviewed_head` MUST be forwarded; see
-            // sibling `handle_report_result` + `auto_release::is_verdict_message`.
-            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(), "terminal": args["terminal"].as_bool() }
+            "params": env.to_send_params(),
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -91,7 +104,11 @@ pub(super) fn handle_send_to_instance(
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
-            // Centralised fallback (Sprint 40 T-7 B4)
+            // Centralised fallback (Sprint 40 T-7 B4). #1024/#1833 fix: the
+            // fallback now carries the SAME directive set as `params` (shared
+            // SendEnvelope projection) — it previously dropped reviewed_head +
+            // sequencing/eta/cadence/worktree_binding, a latent verdict-correlation
+            // gap when a verdict send hit the API-down path.
             let mut resolved_thread = thread_id.map(String::from);
             let resolved_parent = parent_id.map(String::from);
             if resolved_thread.is_none() {
@@ -101,20 +118,10 @@ pub(super) fn handle_send_to_instance(
                     }
                 }
             }
-            let msg = crate::inbox::InboxMessage {
-                thread_id: resolved_thread,
-                parent_id: resolved_parent,
-                correlation_id: args["correlation_id"].as_str().map(String::from),
-                from: format!("from:{}", sender.as_str()),
-                text: text.to_string(),
-                // MED-5: carry `kind` (happy path + sibling fallbacks do) — else a
-                // fallback `kind=query` lands kind=None and `inbox clear` swallows it.
-                kind: kind.map(String::from),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                delivery_mode: Some("inbox_fallback".to_string()),
-                terminal: args["terminal"].as_bool(),
-                ..Default::default()
-            };
+            let mut fb = env.clone();
+            fb.thread_id = resolved_thread;
+            fb.parent_id = resolved_parent;
+            let msg = fb.to_inbox_message();
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
     };
@@ -302,53 +309,38 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         msg.push_str(&format!(" (task id: {tid})"));
     }
 
+    // HIGH-1/#1833: the dispatch directives the SEND handler reads — now carried
+    // by the shared SendEnvelope into BOTH params and the fallback, so the
+    // re-marshal can't drop them again (smells#2). #2099 `no_report_expected`
+    // included.
+    let env = SendEnvelope {
+        from: sender.as_str().to_string(),
+        target: target.to_string(),
+        text: msg.clone(),
+        kind: Some("task".to_string()),
+        thread_id: args["thread_id"].as_str().map(String::from),
+        parent_id: args["parent_id"].as_str().map(String::from),
+        task_id: task_id_str.map(String::from),
+        force_meta: force_meta_json.clone(),
+        provenance: Some(json!({ "from": sender.as_str(), "task": task })),
+        branch: args["branch"].as_str().map(String::from),
+        ..SendEnvelope::directives_from_args(args)
+    };
     let result = match crate::api::call(
         home,
         &json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
-            // HIGH-1: forward the dispatch directives the SEND handler reads that
-            // this re-marshal dropped (#1833 class; worktree_binding_required gates).
-            "params": {
-                "from": sender.as_str(), "target": target, "text": msg, "kind": "task",
-                "task_id": task_id_str, "force_meta": force_meta_json,
-                "provenance": { "from": sender.as_str(), "task": task },
-                "branch": args["branch"].as_str(), "expect_reply_within_secs": args["expect_reply_within_secs"].as_i64(),
-                "correlation_id": args["correlation_id"].as_str(), "reviewed_head": args["reviewed_head"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(),
-                "worktree_binding_required": args["worktree_binding_required"].as_bool(), "terminal": args["terminal"].as_bool(), "thread_id": args["thread_id"].as_str(), "parent_id": args["parent_id"].as_str(),
-                // #2099: forward the fire-and-forget flag so the API-side
-                // dispatch_idle record path (the SECOND ~30min nag channel,
-                // besides the DispatchEntry sweep) can also skip it.
-                "no_report_expected": args["no_report_expected"].as_bool(),
-            }
+            "params": env.to_send_params(),
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
-            // Centralised fallback (Sprint 40 T-7 B4)
-            let inbox_msg = crate::inbox::InboxMessage {
-                task_id: task_id_str.map(String::from),
-                force_meta: force_meta_json.as_ref().and_then(|v| {
-                    serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()
-                }),
-                delivery_mode: Some("inbox_fallback".to_string()),
-                from: format!("from:{}", sender.as_str()),
-                text: msg.clone(),
-                kind: Some("task".to_string()),
-                // HIGH-1: carry the dispatch directives so an API-blip fallback doesn't lose them.
-                correlation_id: args["correlation_id"].as_str().map(String::from),
-                reviewed_head: args["reviewed_head"].as_str().map(String::from),
-                sequencing: args["sequencing"].as_str().map(String::from),
-                eta_minutes: args["eta_minutes"].as_u64().map(|v| v as u32),
-                reporting_cadence: args["reporting_cadence"].as_str().map(String::from),
-                worktree_binding_required: args["worktree_binding_required"].as_bool(),
-                terminal: args["terminal"].as_bool(),
-                thread_id: args["thread_id"].as_str().map(String::from),
-                parent_id: args["parent_id"].as_str().map(String::from),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                ..Default::default()
-            };
+            // Centralised fallback (Sprint 40 T-7 B4). HIGH-1/#1833: the directive
+            // set is carried by the SAME envelope projected to the inbox message,
+            // so it can't drift from `params`.
+            let inbox_msg = env.to_inbox_message();
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
     };
@@ -428,7 +420,6 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         args["artifacts"].as_str(),
     );
     let result = {
-        let correlation_id = args["correlation_id"].as_str();
         let reviewed_head = args["reviewed_head"].as_str();
 
         // M3: SHA-staleness gate — if reviewed_head is provided, verify against PR HEAD.
@@ -468,41 +459,33 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             );
         }
 
+        // smells#2: report carries {correlation_id, reviewed_head, terminal}
+        // (a reply needs no dispatch directives); the shared SendEnvelope reads
+        // the directive set from args (the rest stay None → emitted as inert null
+        // keys, read as absent) and projects to BOTH params and the fallback.
+        let env = SendEnvelope {
+            from: sender.as_str().to_string(),
+            target: target.to_string(),
+            text: msg.clone(),
+            kind: Some("report".to_string()),
+            thread_id: args["thread_id"].as_str().map(String::from),
+            parent_id: args["parent_id"].as_str().map(String::from),
+            ..SendEnvelope::directives_from_args(args)
+        };
         match crate::api::call(
             home,
             &json!({
                 "request_id": uuid::Uuid::new_v4().to_string(),
                 "method": crate::api::method::SEND,
-                "params": {
-                    "from": sender.as_str(),
-                    "target": target,
-                    "text": msg,
-                    "kind": "report",
-                    "correlation_id": correlation_id,
-                    "reviewed_head": reviewed_head,
-                    "thread_id": args["thread_id"].as_str(),
-                    "parent_id": args["parent_id"].as_str(),
-                    "terminal": args["terminal"].as_bool(),
-                }
+                "params": env.to_send_params(),
             }),
         ) {
             Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
             Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
             Err(e) => {
-                // Centralised fallback (Sprint 40 T-7 B4)
-                let inbox_msg = crate::inbox::InboxMessage {
-                    thread_id: args["thread_id"].as_str().map(String::from),
-                    parent_id: args["parent_id"].as_str().map(String::from),
-                    correlation_id: correlation_id.map(String::from),
-                    reviewed_head: reviewed_head.map(String::from),
-                    delivery_mode: Some("inbox_fallback".to_string()),
-                    from: format!("from:{}", sender.as_str()),
-                    text: msg.clone(),
-                    kind: Some("report".to_string()),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    terminal: args["terminal"].as_bool(),
-                    ..Default::default()
-                };
+                // Centralised fallback (Sprint 40 T-7 B4) — shared SendEnvelope
+                // projection keeps the fallback aligned with params.
+                let inbox_msg = env.to_inbox_message();
                 crate::agent_ops::fallback_deliver(
                     home,
                     sender.as_str(),

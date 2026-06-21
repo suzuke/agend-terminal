@@ -14,6 +14,7 @@ mod instance_queries;
 pub(crate) mod instance_state;
 mod restart;
 mod schedule;
+mod send_envelope;
 mod task;
 mod worktree;
 
