@@ -1317,4 +1317,62 @@ mod tests {
         tx.send(b"backlog".to_vec()).unwrap();
         assert!(active_tab_has_pending_output(&layout));
     }
+
+    /// #freeze-3 H2 MECHANISM: the per-frame drain re-arm
+    /// (`active_tab_has_pending_output`, the render loop's signal to keep
+    /// draining) only sees the ACTIVE tab. A backgrounded tab's backlog therefore
+    /// never re-arms a drain — it accumulates untouched until the tab is switched
+    /// to, at which point its backlog becomes the active one and the catch-up
+    /// begins. (Pairs with `render_pane` being the sole render-path drain site,
+    /// which `render_pane_tree` calls only for `layout.active`.) Cross-platform.
+    #[test]
+    fn rearm_ignores_backgrounded_tab_backlog_freeze3() {
+        fn pane_with_rx(id: usize, rx: crossbeam_channel::Receiver<Vec<u8>>) -> Pane {
+            Pane {
+                agent_name: "agent".into(),
+                instance_id: crate::types::InstanceId::default(),
+                vterm: VTerm::new(38, 11),
+                rx,
+                id,
+                backend: Some(crate::backend::Backend::ClaudeCode),
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
+                selection: None,
+                source: PaneSource::Local,
+            }
+        }
+        let (_tx0, rx0) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (tx1, rx1) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "t0".to_string(),
+            pane_with_rx(1, rx0),
+        ));
+        layout.add_tab(crate::layout::Tab::new(
+            "t1".to_string(),
+            pane_with_rx(2, rx1),
+        ));
+        layout.goto_tab(0); // add_tab focuses the new tab; make t0 the active one.
+
+        // active = 0 (t0). Backlog ONLY on the BACKGROUND tab (t1).
+        tx1.send(b"backlog".to_vec()).unwrap();
+        assert!(
+            !active_tab_has_pending_output(&layout),
+            "a backgrounded tab's backlog must NOT re-arm a drain — it stays queued \
+             (unbounded) while the tab is hidden"
+        );
+
+        // Switch to t1 → its backlog is now the active tab's → the re-arm fires and
+        // the catch-up drain begins.
+        layout.goto_tab(1);
+        assert!(
+            active_tab_has_pending_output(&layout),
+            "switching to the backlogged tab makes it active → re-arm fires (drain begins)"
+        );
+    }
 }

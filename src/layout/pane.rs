@@ -455,4 +455,60 @@ mod tests {
         );
         assert!(!pane.is_composing());
     }
+
+    // ── #freeze-3 H2 (background-tab catch-up) deterministic proofs ────────
+
+    /// #freeze-3 H2 MEMORY: a backgrounded pane (never drained — `drain_output`
+    /// only runs for the rendered/active tab) queues EVERY chunk, so its rx grows
+    /// ∝ the agent's output — an unbounded memory accumulation until the tab is
+    /// switched to. The fix must bound this, not just the switch-time catch-up.
+    #[test]
+    fn backgrounded_pane_rx_accumulates_unbounded_freeze3() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let pane = test_pane(rx, 80, 24);
+        for _ in 0..1000 {
+            let _ = tx.send(vec![b'y'; 1024]); // live unbounded rx → never fails
+        }
+        assert_eq!(
+            pane.rx.len(),
+            1000,
+            "an un-drained (backgrounded) pane queues every chunk — unbounded memory \
+             (~1 MiB here; grows without limit while the tab stays backgrounded)"
+        );
+    }
+
+    /// #freeze-3 H2 SIZING: once a backgrounded backlog exists, switching to the
+    /// tab drains it at `DRAIN_OUTPUT_BUDGET_BYTES` (32 KiB) per frame, so the
+    /// visible catch-up is `ceil(backlog / 32KiB)` frames — LINEAR in the backlog.
+    /// At `FRAME_INTERVAL` = 33 ms: 1 MiB ≈ 32 frames ≈ 1 s, 16 MiB ≈ 512 ≈ 17 s.
+    /// This is exactly the residual #2385 left: it turned "one 107 ms input-stall"
+    /// into a non-blocking but UNBOUNDED-LENGTH per-frame catch-up. The numbers
+    /// here size the fix budget (e.g. fast-forward / background-drain rate).
+    #[test]
+    fn drain_catchup_frames_scale_linearly_with_backlog_h2_freeze3() {
+        const BUDGET: usize = 32 * 1024; // mirror DRAIN_OUTPUT_BUDGET_BYTES
+        const CHUNK: usize = 4 * 1024; // PTY-read-sized chunk
+        for &(kib, want_frames) in &[(128usize, 4usize), (256, 8), (512, 16)] {
+            let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+            let mut pane = test_pane(rx, 80, 24);
+            let total = kib * 1024;
+            for _ in 0..(total / CHUNK) {
+                let _ = tx.send(vec![b'x'; CHUNK]); // live unbounded rx → never fails
+            }
+            // Count per-frame bounded drains until dry (the render loop's re-arm).
+            let mut frames = 0usize;
+            loop {
+                frames += 1;
+                assert!(frames < 100_000, "must converge to drained");
+                if !pane.drain_output(BUDGET) {
+                    break;
+                }
+            }
+            assert_eq!(
+                frames, want_frames,
+                "{kib} KiB backlog must take ceil({kib}KiB / 32KiB) = {want_frames} \
+                 bounded-drain frames (catch-up is LINEAR in backlog)"
+            );
+        }
+    }
 }
