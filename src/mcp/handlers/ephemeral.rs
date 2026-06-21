@@ -29,7 +29,7 @@ pub(super) fn handle_spawn(home: &Path, args: &Value, _instance_name: &str) -> V
         ttl_secs: args["ttl_secs"].as_u64(),
         token_budget: args["token_budget"].as_u64(),
     };
-    match crate::ephemeral_tracking::spawn_and_track(home, spec) {
+    match crate::ephemeral_tracking::spawn_and_track(home, spec, &crate::headless::StdioTransport) {
         Ok(w) => json!({
             "ok": true,
             "worker_id": w.worker_id,
@@ -37,7 +37,7 @@ pub(super) fn handle_spawn(home: &Path, args: &Value, _instance_name: &str) -> V
             "workflow_id": w.workflow_id,
             "backend": w.backend,
             "ttl_secs": w.ttl_secs,
-            "note": "PR1 scaffold: fake /bin/sleep child — no real backend transport yet",
+            "note": "PR2: real headless process (no-PTY, piped stdio); no protocol driving it yet (PR3 ACP)",
         }),
         Err(e) => json!({"error": e.to_string()}),
     }

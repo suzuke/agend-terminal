@@ -134,3 +134,64 @@ portable-pty pipe-mode vs std::process → PR2 (low risk, std::process default).
 - **Token attribution accuracy** — transcript scrape is post-hoc/cwd-keyed/claude+codex-only;
   ACP usage messages preferred but unverified — budget only as good as the token signal.
 - **Scope creep** — keep to ephemeral spawn/reap; Phase 2/3 stay trigger-conditioned.
+
+---
+
+## PR2 (headless spawn) — landed (lead-vetted Option Y)
+
+Replaced PR1's fake `/bin/sleep` child with a REAL headless process. Key choices:
+
+- **Option Y (not a `build_command` refactor)**: `build_command` (`agent/mod.rs:710`)
+  is ~250 lines of security-sensitive managed-hot-path code (env-isolation,
+  cwd symlink-validation, git-shim PATH + `AGEND_REAL_GIT`, opencode XDG
+  provisioning, fleet-env filtering) with side effects — refactoring it into a
+  shared `ResolvedSpawn` was rejected as over-engineering + a managed-hot-path
+  regression risk for parts PR2's stub worker doesn't use. Instead the new
+  `headless::resolve_headless_command` reuses the SAME single-source helpers
+  (`which` / `preset_spawn_args` / `spawn_flags` / `agent::resolve_child_env`) →
+  no argv/isolation drift; `build_command` is untouched (zero PTY regression).
+- **`HeadlessTransport`** (`src/headless.rs`) = lifecycle only (`spawn` + `cancel`);
+  the ACP protocol methods (handshake/prompt/stream) are PR3. Captured stdin/
+  stdout/stderr pipes ride on `HeadlessHandle` for PR3.
+- **Admission BEFORE spawn** (r4 PR1 note): `reserve → spawn → finalize`.
+  `try_reserve_slot` is a single atomic RMW (no TOCTOU); an over-cap spawn rejects
+  WITHOUT creating any process. `stale_reserving` rows (crash between reserve and
+  finalize, age > `RESERVE_STALE_SECS` = 60s) are reaped by the sweep; the sweep
+  gates reserving rows on the stale timeout, NOT pid-liveness (pid=0 reads as dead
+  and would race an in-flight finalize).
+- **Reap reuses PR1** (start-token PID-recycle guard, `terminate_worker`); reap =
+  single-process SIGTERM + `wait()`.
+
+### ⚠ PR3 PREREQUISITES — deferred PTY/real-backend setup (do NOT bury)
+`resolve_headless_command` applies only the transport-agnostic CORE (program,
+argv, #1440 env-isolation, identity env). The following `build_command` steps are
+NOT done in PR2 (the stub worker has no protocol → runs no real backend) and MUST
+be added before PR3 lets a real backend run headless — each is a correctness or
+SECURITY prerequisite:
+
+1. **git-shim PATH shadowing + `AGEND_REAL_GIT` (#1504)** — without prepending
+   `$AGEND_HOME/bin` to PATH, a headless backend's `git` ESCAPES the `agend-git`
+   safety gate (push-denylist, worktree guards). SECURITY-critical.
+2. **cwd validation + provisioning** (`api::validate_working_directory` +
+   `create_dir_all` + symlink revalidation).
+3. **opencode per-instance XDG isolation (#1519) + autoupdate disable (#1956/#1970)**.
+4. **fleet.yaml user-env passthrough with #2106 credential filtering**.
+5. terminal env (`TERM`/`COLORTERM`/`FORCE_COLOR`) + git-editor env
+   (`GIT_EDITOR`/`GIT_SEQUENCE_EDITOR`/`EDITOR`/`VISUAL`) + `LANG`.
+
+(The same list is duplicated at the top of `src/headless.rs` so it is visible
+from the spawn site.)
+
+### Windows posture
+The headless spawn (`std::process`) + `process::terminate` (TerminateProcess) are
+cross-platform. The real-process lifecycle tests run on ALL CI platforms incl.
+windows-latest (the test spawns `/bin/sleep` on unix, `ping -n` on Windows) — so
+the spawn+reap path is RUNTIME-exercised on Windows, not just compile-verified
+(the xwin lesson: cross-compile-green ≠ runtime-pass). Ephemeral workers remain a
+unix-first runtime feature; no backend is Windows-only.
+
+### Honest scope
+PR2 is the SPAWN MECHANISM only. A spawned worker has NO protocol driving it, so it
+does no useful work until PR3 (ACP) drives the captured stdio. PR2 does NOT touch
+ACP/JSON-RPC, the telemetry layers (PR4/5), token-budget enforcement (PR6), or
+group-kill/graceful-cancel (later).
