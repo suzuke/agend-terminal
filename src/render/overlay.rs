@@ -328,14 +328,34 @@ pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {
 }
 
 /// #t-5: command palette with prefix-match completion. Renders the `:input` line
-/// plus a candidate list — `commands::matching_specs(input)`, derived live from the
-/// input (empty input lists all, the "what commands exist?" entry point) — with the
-/// `selected` candidate highlighted, modeled on [`render_menu`]. Keyword-only (P0).
-pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
+/// plus the precomputed [`Completion`] (the same one the key handler uses, so the
+/// highlight always matches what Tab completes) with the `selected` candidate
+/// highlighted, modeled on [`render_menu`]. The candidate rows are command
+/// keywords while typing the command, argument values once past it, or a single
+/// dim usage hint for a free-form argument (not selectable).
+pub fn render_command_palette(
+    frame: &mut Frame,
+    input: &str,
+    selected: usize,
+    completion: &crate::app::commands::Completion,
+) {
+    use crate::app::commands::Completion;
     let area = frame.area();
-    let matches = crate::app::commands::matching_specs(input);
-    // Cap rows so the popup can't outgrow the screen; the full set (11) fits.
-    let shown = matches.len().min(12);
+
+    // Display rows for the candidate area. A usage hint is informational (not
+    // selectable), so it never takes the highlight.
+    let rows: Vec<String> = match completion {
+        Completion::Keyword(specs) => specs
+            .iter()
+            .map(|s| format!("{:<26} {}", s.usage, s.desc))
+            .collect(),
+        Completion::Values(values) => values.clone(),
+        Completion::UsageHint(usage) => vec![format!("usage: {usage}")],
+    };
+    let selectable = !matches!(completion, Completion::UsageHint(_));
+
+    // Cap rows so the popup can't outgrow the screen; the full keyword set (11) fits.
+    let shown = rows.len().min(12);
     let sel = selected.min(shown.saturating_sub(1));
 
     let w = 64u16.min(area.width.saturating_sub(4));
@@ -353,8 +373,9 @@ pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
         format!(":{input}"),
         Style::default().fg(Color::White),
     )));
-    for (i, spec) in matches.iter().take(shown).enumerate() {
-        let style = if i == sel {
+    for (i, row) in rows.iter().take(shown).enumerate() {
+        let highlighted = selectable && i == sel;
+        let style = if highlighted {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -362,11 +383,8 @@ pub fn render_command_palette(frame: &mut Frame, input: &str, selected: usize) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        let prefix = if i == sel { "> " } else { "  " };
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{:<26} {}", spec.usage, spec.desc),
-            style,
-        )));
+        let prefix = if highlighted { "> " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("{prefix}{row}"), style)));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
@@ -422,38 +440,63 @@ mod tests {
         assert_eq!((r.x, r.y, r.width, r.height), (25, 15, 50, 10));
     }
 
+    fn palette_text(input: &str, completion: &crate::app::commands::Completion) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_command_palette(frame, input, 0, completion))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// #t-5 UX smoke: the palette lists ALL commands on empty input (the operator's
     /// "what commands exist?" discovery), and prefix-filters to matching keywords.
     #[test]
     fn command_palette_lists_all_on_open_and_prefix_filters() {
-        fn palette_text(input: &str) -> String {
-            let backend = ratatui::backend::TestBackend::new(80, 20);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            terminal
-                .draw(|frame| render_command_palette(frame, input, 0))
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let mut out = String::new();
-            for y in 0..buf.area.height {
-                for x in 0..buf.area.width {
-                    out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
-                }
-                out.push('\n');
-            }
-            out
-        }
+        use crate::app::commands::{matching_specs, Completion};
         // Empty input → list every command.
-        let all = palette_text("");
+        let all = palette_text("", &Completion::Keyword(matching_specs("")));
         assert!(
             all.contains("spawn") && all.contains("config") && all.contains("layout"),
             "empty input must list all commands:\n{all}"
         );
         // Prefix narrows to matching keyword(s) only.
-        let co = palette_text("co");
+        let co = palette_text("co", &Completion::Keyword(matching_specs("co")));
         assert!(co.contains("config"), "`co` must show config:\n{co}");
         assert!(
             !co.contains("spawn") && !co.contains("layout"),
             "`co` must hide non-matching commands:\n{co}"
+        );
+    }
+
+    /// #t-… param-value completion render: a `Values` completion lists the dynamic
+    /// candidates, and a `UsageHint` (free-form argument) renders the dim hint line
+    /// instead — directly answering the operator's "what do I put here?".
+    #[test]
+    fn command_palette_renders_values_and_usage_hint() {
+        use crate::app::commands::Completion;
+        // Value list (e.g. `:spawn foo <backend>`).
+        let vals = palette_text(
+            "spawn foo ",
+            &Completion::Values(vec!["claude".to_string(), "codex".to_string()]),
+        );
+        assert!(
+            vals.contains("claude") && vals.contains("codex"),
+            "value completion must list the candidates:\n{vals}"
+        );
+        // Free-form argument → usage hint, no value list.
+        let hint = palette_text("set key ", &Completion::UsageHint("set <key> <value>"));
+        assert!(
+            hint.contains("usage:") && hint.contains("set <key> <value>"),
+            "free-form arg must show the usage hint:\n{hint}"
         );
     }
 }

@@ -593,38 +593,27 @@ pub(super) fn handle_key(
             KeyCode::Esc => {
                 *overlay = Overlay::None;
             }
-            // #t-5 completion nav: move the highlight within the candidate list.
+            // #t-5 completion nav: move the highlight within the candidate list
+            // (keywords while typing the command, argument values once past it).
             KeyCode::Up => {
                 *selected = selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                let n = super::commands::matching_specs(input).len();
+                let n = super::commands::palette_completion(input, ctx.registry).candidate_count();
                 if *selected + 1 < n {
                     *selected += 1;
                 }
             }
-            // Tab: complete the FIRST token to the highlighted keyword, keep the
-            // palette open (and a trailing space) so the operator types args next.
-            // No-op when the prefix matches nothing.
+            // Tab: complete the token under the cursor to the highlighted
+            // candidate — the command keyword while typing it, or an argument
+            // value once the keyword is complete — keeping the palette open with
+            // a trailing space for the next argument. No-op when there's nothing
+            // to complete (the clamp + empty handling live in `tab_complete`).
             KeyCode::Tab => {
-                let matches = super::commands::matching_specs(input);
-                // Clamp `selected` at the use-site (same as render): it may be
-                // stale — e.g. a paste shrank the candidate list below it — and
-                // Tab must complete the candidate the operator actually sees
-                // highlighted, not silently no-op on an out-of-range index.
-                let idx = (*selected).min(matches.len().saturating_sub(1));
-                let keyword = matches.get(idx).map(|s| s.keyword.to_string());
-                if let Some(keyword) = keyword {
-                    let rest: String = input
-                        .split_whitespace()
-                        .skip(1)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    *input = if rest.is_empty() {
-                        format!("{keyword} ")
-                    } else {
-                        format!("{keyword} {rest}")
-                    };
+                if let Some(new_input) =
+                    super::commands::tab_complete(input, *selected, ctx.registry)
+                {
+                    *input = new_input;
                     *selected = 0;
                 }
             }

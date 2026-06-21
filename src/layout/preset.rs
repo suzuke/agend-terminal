@@ -52,6 +52,20 @@ impl LayoutPreset {
     pub fn all_names() -> &'static str {
         "even-horizontal, even-vertical, main-vertical, main-horizontal, tiled"
     }
+
+    /// The preset names as individual completion candidates (the command-palette
+    /// `:layout <preset>` value list). Sibling of [`all_names`], which joins these
+    /// for a log line; `preset_names_match_variants` pins the two in sync with
+    /// `name`/`from_name` so a new variant can't silently drift.
+    pub fn names() -> &'static [&'static str] {
+        &[
+            "even-horizontal",
+            "even-vertical",
+            "main-vertical",
+            "main-horizontal",
+            "tiled",
+        ]
+    }
 }
 
 /// Collect all panes from a tree in left-to-right order (consuming the tree).
@@ -118,5 +132,24 @@ pub(super) fn build_preset(panes: Vec<Pane>, preset: LayoutPreset) -> PaneNode {
             }
         }
         LayoutPreset::Tiled => build_tree(panes, SplitDir::Horizontal, true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `names()` (completion candidates) must stay in sync with the canonical
+    /// `name`/`from_name`/`all_names`: every listed name must round-trip through
+    /// `from_name` back to a preset whose `name()` equals it, and the joined
+    /// `all_names` must be exactly the names comma-joined. Catches a new variant
+    /// (or a typo) drifting one list out of step.
+    #[test]
+    fn preset_names_match_variants() {
+        for n in LayoutPreset::names() {
+            let p = LayoutPreset::from_name(n).unwrap_or_else(|| panic!("from_name({n}) is None"));
+            assert_eq!(p.name(), *n, "name() round-trip mismatch for {n}");
+        }
+        assert_eq!(LayoutPreset::names().join(", "), LayoutPreset::all_names());
     }
 }

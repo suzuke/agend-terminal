@@ -23,16 +23,41 @@ pub(super) struct CommandCtx<'a> {
     pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
 
+/// The dynamic source feeding a command-argument position, declared per token in
+/// [`CommandSpec::args`] and resolved to concrete candidate strings by
+/// [`arg_values`]. `Free` = no finite candidate set (the palette shows a usage
+/// hint instead of a value list). Drives argument-value completion; `execute`
+/// is unaffected (it still parses the raw input string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgSource {
+    /// Spawn-able backend names (`Backend::all`).
+    Backend,
+    /// Layout preset names (`LayoutPreset::names`).
+    Preset,
+    /// Runtime-config key names (`runtime_config::keys`).
+    ConfigKey,
+    /// `config` sub-command: `get` | `set` | `list`.
+    ConfigSub,
+    /// Live agent names (`agent::live_agent_names_vec`).
+    Agent,
+    /// Free-form value with no finite candidate set (show usage hint).
+    Free,
+}
+
 /// #t-5 command-palette completion: declarative metadata for the `:` commands —
-/// keyword + usage + one-line description. Consumed ONLY by the completion list
-/// (`matching_specs` + `render::overlay::render_command_palette`); `execute`
-/// below stays the source of truth for BEHAVIOR and is unchanged. ⚠ Adding or
-/// renaming a command in `execute` REQUIRES a matching entry here — the
+/// keyword + usage + one-line description + per-argument source. Consumed ONLY by
+/// the completion list (`matching_specs` / `palette_completion` +
+/// `render::overlay::render_command_palette`); `execute` below stays the source
+/// of truth for BEHAVIOR and is unchanged. ⚠ Adding or renaming a command in
+/// `execute` REQUIRES a matching entry here — the
 /// `command_specs_match_execute_arms_bidirectional` test fails otherwise.
 pub(crate) struct CommandSpec {
     pub keyword: &'static str,
     pub usage: &'static str,
     pub desc: &'static str,
+    /// Source for each positional argument, in order. `args[i]` feeds the value
+    /// completion for the `i`-th argument (the token AFTER the keyword).
+    pub args: &'static [ArgSource],
 }
 
 pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
@@ -40,56 +65,67 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         keyword: "spawn",
         usage: "spawn [name] [backend]",
         desc: "New agent in a new tab",
+        args: &[ArgSource::Free, ArgSource::Backend],
     },
     CommandSpec {
         keyword: "vsplit",
         usage: "vsplit [name] [backend]",
         desc: "New agent; split focused pane vertically",
+        args: &[ArgSource::Free, ArgSource::Backend],
     },
     CommandSpec {
         keyword: "hsplit",
         usage: "hsplit [name] [backend]",
         desc: "New agent; split focused pane horizontally",
+        args: &[ArgSource::Free, ArgSource::Backend],
     },
     CommandSpec {
         keyword: "kill",
         usage: "kill <agent>",
         desc: "Close an agent's pane",
+        args: &[ArgSource::Agent],
     },
     CommandSpec {
         keyword: "restart",
         usage: "restart [agent]",
         desc: "Restart an agent (focused pane if omitted)",
+        args: &[ArgSource::Agent],
     },
     CommandSpec {
         keyword: "layout",
         usage: "layout [preset]",
         desc: "Apply a layout preset (cycles if omitted)",
+        args: &[ArgSource::Preset],
     },
     CommandSpec {
         keyword: "send",
         usage: "send <agent> <message>",
         desc: "Send a message to one agent",
+        args: &[ArgSource::Agent, ArgSource::Free],
     },
     CommandSpec {
         keyword: "broadcast",
         usage: "broadcast <message>",
         desc: "Broadcast a message to all agents",
+        args: &[ArgSource::Free],
     },
     CommandSpec {
         keyword: "status",
         usage: "status",
         desc: "Log every agent's current state",
+        args: &[],
     },
     CommandSpec {
         keyword: "config",
         usage: "config get|set|list [key] [value]",
         desc: "Runtime config get / set / list",
+        args: &[ArgSource::ConfigSub, ArgSource::ConfigKey, ArgSource::Free],
     },
     CommandSpec {
         keyword: "set",
         usage: "set <key> <value>",
         desc: "Set a runtime config key (`config set` shorthand)",
+        args: &[ArgSource::ConfigKey, ArgSource::Free],
     },
 ];
 
@@ -103,6 +139,172 @@ pub(crate) fn matching_specs(input: &str) -> Vec<&'static CommandSpec> {
         .iter()
         .filter(|s| s.keyword.starts_with(first))
         .collect()
+}
+
+/// What the palette should offer for the current `input`: the command keyword
+/// list (still typing the command), the dynamic value list for the argument
+/// position under the cursor, or a usage hint (free-form argument). Computed by
+/// [`palette_completion`]; consumed identically by the key handler (navigation /
+/// Tab) and the renderer so the highlighted candidate always matches what Tab
+/// completes.
+pub(crate) enum Completion {
+    Keyword(Vec<&'static CommandSpec>),
+    Values(Vec<String>),
+    UsageHint(&'static str),
+}
+
+impl Completion {
+    /// Number of selectable candidates (a usage hint is informational, not
+    /// selectable, so it counts as zero — Down/clamp must not land on it).
+    pub(crate) fn candidate_count(&self) -> usize {
+        match self {
+            Completion::Keyword(v) => v.len(),
+            Completion::Values(v) => v.len(),
+            Completion::UsageHint(_) => 0,
+        }
+    }
+}
+
+/// The token under the cursor for palette completion. Mirrors `execute`'s
+/// whitespace tokenization so a completed candidate lands at the position
+/// `execute` will parse it as: `pos` is the token index under the cursor (0 = the
+/// command keyword), and `partial` is the text already typed for that token
+/// (empty when a trailing space has opened a fresh token).
+struct Cursor<'a> {
+    tokens: Vec<&'a str>,
+    pos: usize,
+    partial: &'a str,
+}
+
+fn cursor(input: &str) -> Cursor<'_> {
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if input.ends_with(char::is_whitespace) || tokens.is_empty() {
+        // Trailing space (or empty input) → the cursor opens a fresh token.
+        Cursor {
+            pos: tokens.len(),
+            partial: "",
+            tokens,
+        }
+    } else {
+        let pos = tokens.len() - 1;
+        Cursor {
+            partial: tokens[pos],
+            tokens,
+            pos,
+        }
+    }
+}
+
+/// Concrete candidate strings for an argument source. Only [`ArgSource::Agent`]
+/// touches the registry (a single lock, taken only while completing an agent
+/// argument — never on the per-pane render path), keeping the cost off the
+/// hot path the way #2380's lock-free render snapshot intends.
+fn arg_values(src: ArgSource, registry: &AgentRegistry) -> Vec<String> {
+    match src {
+        ArgSource::Backend => crate::backend::Backend::all()
+            .iter()
+            .map(|b| b.as_str().to_string())
+            .collect(),
+        ArgSource::Preset => crate::layout::LayoutPreset::names()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        ArgSource::ConfigKey => crate::runtime_config::keys(),
+        ArgSource::ConfigSub => {
+            vec!["get".to_string(), "set".to_string(), "list".to_string()]
+        }
+        ArgSource::Agent => crate::agent::live_agent_names_vec(registry),
+        ArgSource::Free => Vec::new(),
+    }
+}
+
+/// Compute the completion for the palette `input`. While typing the command word
+/// (or when the first token is not yet a complete command) this is the keyword
+/// list (P0 behavior, unchanged). Once the keyword is complete and a space has
+/// been typed, it switches to the value list for the argument position under the
+/// cursor, prefix-filtered by what's typed so far; free-form arguments yield a
+/// usage hint instead.
+pub(crate) fn palette_completion(input: &str, registry: &AgentRegistry) -> Completion {
+    let cur = cursor(input);
+    let known_keyword = cur
+        .tokens
+        .first()
+        .is_some_and(|kw| COMMAND_SPECS.iter().any(|c| c.keyword == *kw));
+
+    // Still completing the command word, or the first token isn't a real command
+    // yet → keyword completion (identical to P0).
+    if cur.pos == 0 || !known_keyword {
+        return Completion::Keyword(matching_specs(input));
+    }
+
+    let keyword = cur.tokens[0];
+    let Some(spec) = COMMAND_SPECS.iter().find(|c| c.keyword == keyword) else {
+        return Completion::Keyword(matching_specs(input));
+    };
+
+    let arg_index = cur.pos - 1;
+    let Some(&src) = spec.args.get(arg_index) else {
+        // Past the last declared argument → nothing to complete.
+        return Completion::UsageHint(spec.usage);
+    };
+
+    // `config`'s key (the 2nd argument) is only meaningful after `get`/`set`;
+    // `config list` takes no key, so don't offer one there.
+    if keyword == "config"
+        && arg_index == 1
+        && !matches!(cur.tokens.get(1).copied(), Some("get") | Some("set"))
+    {
+        return Completion::UsageHint(spec.usage);
+    }
+
+    match src {
+        ArgSource::Free => Completion::UsageHint(spec.usage),
+        src => {
+            let mut values = arg_values(src, registry);
+            values.retain(|v| v.starts_with(cur.partial));
+            Completion::Values(values)
+        }
+    }
+}
+
+/// Tab handler: complete the token under the cursor to the `selected` candidate,
+/// keeping the palette open with a trailing space so the next argument can be
+/// typed. Returns `None` (a no-op) when there is nothing to complete (usage hint
+/// or empty candidate list). The keyword path preserves any already-typed
+/// arguments (P0 behavior); the value path replaces only the current token.
+pub(crate) fn tab_complete(
+    input: &str,
+    selected: usize,
+    registry: &AgentRegistry,
+) -> Option<String> {
+    let cur = cursor(input);
+    match palette_completion(input, registry) {
+        Completion::Keyword(specs) => {
+            let idx = selected.min(specs.len().saturating_sub(1));
+            let keyword = specs.get(idx)?.keyword;
+            // Keep arguments already typed after the keyword (P0 behavior).
+            let rest = cur
+                .tokens
+                .iter()
+                .skip(1)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(if rest.is_empty() {
+                format!("{keyword} ")
+            } else {
+                format!("{keyword} {rest}")
+            })
+        }
+        Completion::Values(values) => {
+            let idx = selected.min(values.len().saturating_sub(1));
+            let value = values.get(idx)?;
+            // `pos >= 1` on the value path, so the prefix is never empty.
+            let prefix = cur.tokens[..cur.pos].join(" ");
+            Some(format!("{prefix} {value} "))
+        }
+        Completion::UsageHint(_) => None,
+    }
 }
 
 /// Execute a command palette command. Returns true if layout changed (needs resize).
@@ -662,5 +864,176 @@ mod tests {
             spec_keywords.difference(&arm_keywords).collect::<Vec<_>>(),
             arm_keywords.difference(&spec_keywords).collect::<Vec<_>>(),
         );
+    }
+
+    // ── #t-… param-value (argument) completion ───────────────────────────────
+
+    fn empty_registry() -> crate::agent::AgentRegistry {
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// The declared per-argument sources — the token→source table the operator
+    /// sees. A wrong entry would offer the wrong candidate list at that position.
+    #[test]
+    fn command_specs_arg_sources_match_table() {
+        use ArgSource::*;
+        let want: &[(&str, &[ArgSource])] = &[
+            ("spawn", &[Free, Backend]),
+            ("vsplit", &[Free, Backend]),
+            ("hsplit", &[Free, Backend]),
+            ("kill", &[Agent]),
+            ("restart", &[Agent]),
+            ("layout", &[Preset]),
+            ("send", &[Agent, Free]),
+            ("broadcast", &[Free]),
+            ("status", &[]),
+            ("config", &[ConfigSub, ConfigKey, Free]),
+            ("set", &[ConfigKey, Free]),
+        ];
+        for (kw, args) in want {
+            let spec = COMMAND_SPECS
+                .iter()
+                .find(|s| s.keyword == *kw)
+                .unwrap_or_else(|| panic!("no spec for {kw}"));
+            assert_eq!(spec.args, *args, "arg sources for `{kw}`");
+        }
+    }
+
+    /// Each command/token position resolves to the right candidate kind, and the
+    /// dynamic value lists hold the real candidates, prefix-filtered.
+    #[test]
+    fn palette_completion_routes_each_position_to_correct_source() {
+        let reg = empty_registry();
+        let kind = |input: &str| match palette_completion(input, &reg) {
+            Completion::Keyword(_) => "keyword",
+            Completion::Values(_) => "values",
+            Completion::UsageHint(_) => "hint",
+        };
+        // Position 0 (the command word) → keyword list.
+        assert_eq!(kind("sp"), "keyword");
+        assert_eq!(kind(""), "keyword");
+        // FREE first arg → usage hint (spawn name / broadcast message).
+        assert_eq!(kind("spawn "), "hint");
+        assert_eq!(kind("broadcast "), "hint");
+
+        // backend (spawn t2): the value list holds the real backends, filtered.
+        let Completion::Values(backends) = palette_completion("spawn foo ", &reg) else {
+            panic!("spawn t2 must be a value list");
+        };
+        assert!(
+            backends.contains(&"claude".to_string()) && backends.contains(&"codex".to_string()),
+            "backends: {backends:?}"
+        );
+        let Completion::Values(filtered) = palette_completion("spawn foo cl", &reg) else {
+            panic!("filtered backend must be a value list");
+        };
+        assert_eq!(filtered, vec!["claude".to_string()]);
+
+        // preset (layout t1): exactly LayoutPreset::names().
+        let Completion::Values(presets) = palette_completion("layout ", &reg) else {
+            panic!("layout t1 must be a value list");
+        };
+        let want_presets: Vec<String> = crate::layout::LayoutPreset::names()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(presets, want_presets);
+
+        // config-key (set t1): exactly runtime_config::keys(); value (t2) free.
+        let Completion::Values(keys) = palette_completion("set ", &reg) else {
+            panic!("set t1 must be a value list");
+        };
+        assert_eq!(keys, crate::runtime_config::keys());
+        assert_eq!(kind("set somekey "), "hint");
+
+        // config sub-command (config t1): get/set/list.
+        let Completion::Values(subs) = palette_completion("config ", &reg) else {
+            panic!("config t1 must be a value list");
+        };
+        assert_eq!(
+            subs,
+            vec!["get".to_string(), "set".to_string(), "list".to_string()]
+        );
+        // config key (t2) only after get/set; `list` takes none.
+        assert_eq!(kind("config set "), "values");
+        assert_eq!(kind("config get "), "values");
+        assert_eq!(kind("config list "), "hint");
+
+        // agent positions route to the Agent value source (empty registry → empty
+        // list, but the Values variant proves it's a value position, not keyword).
+        assert_eq!(kind("kill "), "values");
+        assert_eq!(kind("restart "), "values");
+        assert_eq!(kind("send "), "values");
+        // send message (t2) is free-form → hint.
+        assert_eq!(kind("send bob "), "hint");
+    }
+
+    /// The palette's token splitting agrees with `execute`'s `splitn(3, ' ')` so a
+    /// completed value lands in the slot the dispatcher reads it from. `config` is
+    /// the only 4-token command: key at token 2, value at token 3 — exactly where
+    /// `handle_config_command` re-splits `parts[2]`.
+    #[test]
+    fn palette_completion_token_split_aligns_with_execute() {
+        let reg = empty_registry();
+        // `config set <key> <value>`: token2 = key (values), token3 = value (hint).
+        assert!(matches!(
+            palette_completion("config set ", &reg),
+            Completion::Values(_)
+        ));
+        assert!(matches!(
+            palette_completion("config set show_pane_state ", &reg),
+            Completion::UsageHint(_)
+        ));
+        // `set <key> <value>`: token1 = key, token2 = value.
+        assert!(matches!(
+            palette_completion("set ", &reg),
+            Completion::Values(_)
+        ));
+        assert!(matches!(
+            palette_completion("set show_pane_state ", &reg),
+            Completion::UsageHint(_)
+        ));
+        // Mid-token (no trailing space) still completes the position it's editing.
+        let Completion::Values(keys) = palette_completion("set show", &reg) else {
+            panic!("partial key must still be the key position");
+        };
+        assert!(
+            !keys.is_empty() && keys.iter().all(|k| k.starts_with("show")),
+            "partial-filtered keys: {keys:?}"
+        );
+    }
+
+    /// Tab completes the token under the cursor (keyword or value), leaving a
+    /// trailing space for the next argument; the keyword path keeps already-typed
+    /// arguments, and there's no-op when nothing is completable.
+    #[test]
+    fn tab_complete_completes_current_token_with_trailing_space() {
+        let reg = empty_registry();
+        // Keyword: prefix → full keyword + space.
+        assert_eq!(tab_complete("la", 0, &reg).as_deref(), Some("layout "));
+        // Keyword while an arg is already typed → keyword filled, arg kept (P0).
+        assert_eq!(
+            tab_complete("sp foo", 0, &reg).as_deref(),
+            Some("spawn foo")
+        );
+        // Value (backend): replace current token, keep preceding, add space.
+        assert_eq!(
+            tab_complete("spawn foo cl", 0, &reg).as_deref(),
+            Some("spawn foo claude ")
+        );
+        // Empty partial → first candidate.
+        assert_eq!(
+            tab_complete("layout ", 0, &reg).as_deref(),
+            Some("layout even-horizontal ")
+        );
+        // config sub-command.
+        assert_eq!(
+            tab_complete("config s", 0, &reg).as_deref(),
+            Some("config set ")
+        );
+        // Free-form arg → no-op (nothing to complete).
+        assert_eq!(tab_complete("set key ", 0, &reg), None);
+        // No candidate matches the partial → no-op.
+        assert_eq!(tab_complete("spawn foo zzz", 0, &reg), None);
     }
 }
