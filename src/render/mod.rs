@@ -2,6 +2,7 @@
 
 pub mod border;
 pub mod core_render;
+pub mod offthread;
 pub mod overlay;
 pub mod panels;
 pub mod panels_fleet;
