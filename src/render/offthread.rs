@@ -16,10 +16,11 @@
 //! not reintroduce `core.lock` contention. The snapshot is immutable, so render
 //! loads a whole `Arc` and never observes a torn grid.
 
-use crate::vterm::{GridSnapshot, VTerm};
+use crate::vterm::{GridSnapshot, ScrollbackRows, VTerm, SNAPSHOT_SCROLLBACK_ROWS};
 use arc_swap::ArcSwap;
 use crossbeam_channel::{select, Receiver, Sender};
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -81,10 +82,10 @@ impl OffthreadHandle {
     /// `pane.scroll_offset` to this: in off-thread mode the main-thread `pane.vterm`
     /// is idle (drain no-ops), so its `max_scroll()` is 0 and would pin scrolling to
     /// the bottom — the scrollback lives in the parser thread's VTerm, surfaced here
-    /// via the snapshot's `history_rows` (#offthread-scroll). Cheap `load()` (Guard,
-    /// no `Arc` clone).
+    /// via the snapshot's captured `history` depth (#offthread-scroll). Cheap `load()`
+    /// (Guard, no `Arc` clone).
     pub fn scroll_max(&self) -> usize {
-        self.snapshot.load().history_rows as usize
+        self.snapshot.load().history.len()
     }
 
     /// Route a resize to the parser thread (which owns the `VTerm`). Deduped:
@@ -237,6 +238,7 @@ fn parser_loop(
     wakeup_tx: Sender<usize>,
 ) {
     let coalesce = Duration::from_millis(SNAPSHOT_COALESCE_MS);
+    let mut scrollback = ScrollbackCache::new();
 
     loop {
         // Cancel has deterministic priority over a continuously-ready data arm
@@ -293,7 +295,7 @@ fn parser_loop(
                 Some(Event::Data(Ok(d))) => vterm.process(&d),
                 Some(Event::Data(Err(_))) => {
                     // pane gone mid-burst: publish what we have, then exit.
-                    publish(&vterm, &publisher, &wakeup_tx, pane_id, name);
+                    publish(&vterm, &mut scrollback, &publisher, &wakeup_tx, pane_id, name);
                     return;
                 }
                 Some(Event::Resize(Ok((c, r)))) => {
@@ -307,21 +309,98 @@ fn parser_loop(
         }
 
         // Phase 3 — one snapshot per coalesced burst.
-        publish(&vterm, &publisher, &wakeup_tx, pane_id, name);
+        publish(&vterm, &mut scrollback, &publisher, &wakeup_tx, pane_id, name);
     }
 }
 
-/// Build + publish an immutable snapshot and wake the render loop once.
+/// Parser-thread INCREMENTAL scrollback cache (#2411 r4/r6). The original
+/// `vterm.snapshot()` deep-cloned all ≤1000 history rows EVERY burst — even when the
+/// scrollback was unchanged or merely growing — wasting parser CPU+alloc in the exact
+/// flood/restore workload off-thread exists to fix. This keeps the captured rows as
+/// shared `Arc`s and updates them MINIMALLY per burst:
+/// - scrollback UNCHANGED → reuse the last published `Arc` (O(1));
+/// - GREW by `k` rows → capture ONLY the `k` new rows, append, trim to the cap
+///   (old rows stay shared, not re-copied);
+/// - cols changed (resize → reflow) or scrollback SHRANK (`\x1b[3J` / clear) → full
+///   recapture (rare; the safety net for any non-append history change).
+///
+/// Tracks the UNCAPPED `max_scroll` so growth is still detected once the captured
+/// window is pinned at the cap (older rows then scroll out of the front).
+struct ScrollbackCache {
+    /// Newest `min(max_scroll, cap)` rows, OLDEST front — published as the snapshot's
+    /// `history` (index 0 = oldest = `Line(-len)`, back = `Line(-1)`).
+    rows: VecDeque<crate::vterm::ScrollbackRow>,
+    last_max_scroll: usize,
+    last_cols: u16,
+    /// The last published slice, reused verbatim when nothing changed.
+    published: ScrollbackRows,
+}
+
+impl ScrollbackCache {
+    fn new() -> Self {
+        Self {
+            rows: VecDeque::new(),
+            last_max_scroll: 0,
+            // 0 forces the first update to (re)capture, matching the real cols.
+            last_cols: 0,
+            published: crate::vterm::empty_scrollback(),
+        }
+    }
+
+    /// Update from the parser's `vterm` and return the history to publish (a cheap
+    /// `Arc` clone). See the struct doc for the per-case cost.
+    fn update(&mut self, vterm: &VTerm) -> ScrollbackRows {
+        let cols = vterm.cols();
+        let max_scroll = vterm.max_scroll();
+        let cap = SNAPSHOT_SCROLLBACK_ROWS;
+        let mut changed = true;
+        if cols != self.last_cols || max_scroll < self.last_max_scroll {
+            // Resize (history reflowed to new width) or scrollback shrank → recapture.
+            self.rows = vterm.capture_history_tail(max_scroll.min(cap)).into();
+        } else if max_scroll > self.last_max_scroll {
+            let grew = max_scroll - self.last_max_scroll;
+            if grew >= cap {
+                self.rows = vterm.capture_history_tail(cap).into();
+            } else {
+                // Only the `grew` newest rows are new (scrollback is append-only absent
+                // a resize/clear, both handled above); the rest stay shared.
+                for row in vterm.capture_history_tail(grew) {
+                    self.rows.push_back(row);
+                }
+                while self.rows.len() > cap {
+                    self.rows.pop_front();
+                }
+            }
+        } else {
+            changed = false; // max_scroll == last && cols == last → unchanged.
+        }
+        self.last_cols = cols;
+        self.last_max_scroll = max_scroll;
+        if changed {
+            self.published = self.rows.iter().cloned().collect::<Vec<_>>().into();
+        }
+        self.published.clone()
+    }
+}
+
+/// Build + publish an immutable snapshot and wake the render loop once. The visible
+/// grid is captured fresh; the scrollback comes from the incremental `cache`.
 fn publish(
     vterm: &VTerm,
+    cache: &mut ScrollbackCache,
     publisher: &Arc<ArcSwap<GridSnapshot>>,
     wakeup_tx: &Sender<usize>,
     pane_id: usize,
     name: &str,
 ) {
     let probe = instrument_enabled().then(Instant::now);
-    let snap = vterm.snapshot();
-    let bytes = snap.cells.len() * std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
+    let mut snap = vterm.snapshot_visible();
+    snap.history = cache.update(vterm);
+    let cell_bytes = std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
+    // #2411: bytes MUST include history (was under-reported ~21x), so the
+    // `#offthread-snapshot` probe reflects the real per-publish footprint.
+    let history_cells: usize = snap.history.iter().map(|r| r.len()).sum();
+    let bytes = (snap.cells.len() + history_cells) * cell_bytes;
     publisher.store(Arc::new(snap));
     if let Some(start) = probe {
         tracing::info!(

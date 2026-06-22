@@ -313,35 +313,21 @@ impl VTerm {
         }
     }
 
-    /// Option X (off-thread parse, `AGEND_OFFTHREAD_PARSE`): copy the visible grid
-    /// PLUS a bounded scrollback window + cursor into an owned, immutable
-    /// [`GridSnapshot`] that the per-pane parser thread publishes via `ArcSwap`.
-    /// Same per-cell copy as `render_to_buffer_inner`'s L1 scratch (via `safe_cell`,
-    /// clamped to grid dims), but owned (not a borrowed `RefCell`) so it can cross
-    /// the thread boundary. Captures up to [`SNAPSHOT_SCROLLBACK_ROWS`] history rows
-    /// (alacritty negative `Line`s) above the visible screen so the off-thread render
-    /// path can honor a scroll offset (#offthread-scroll). `cells` row `r` ↔
-    /// `Line(r - history_rows)`; row `history_rows` is the live top of screen.
-    pub fn snapshot(&self) -> GridSnapshot {
+    /// Option X (off-thread parse, `AGEND_OFFTHREAD_PARSE`): copy the VISIBLE grid +
+    /// cursor into an owned, immutable [`GridSnapshot`] with NO scrollback (history
+    /// empty). The parser thread publishes via `ArcSwap`. Same per-cell copy as
+    /// `render_to_buffer_inner`'s L1 scratch (via `safe_cell`, clamped to grid dims),
+    /// but owned (not a borrowed `RefCell`) so it can cross the thread boundary. The
+    /// parser injects an incrementally-maintained `history` after this (see
+    /// `ScrollbackCache` in `crate::render::offthread`); tests use [`Self::snapshot`].
+    pub fn snapshot_visible(&self) -> GridSnapshot {
         let grid = self.term.grid();
         let cols = self.cols.min(grid.columns() as u16);
         let rows = self.rows.min(grid.screen_lines() as u16);
-        // Visible grid (offset 0) — unchanged layout/contract.
         let mut cells = Vec::with_capacity(rows as usize * cols as usize);
         for row in 0..rows {
             for c in 0..cols {
                 cells.push(safe_cell(grid, Line(row as i32), c as usize).clone());
-            }
-        }
-        // Bounded scrollback ABOVE the screen, oldest first: row 0 = Line(-h), row
-        // h-1 = Line(-1). Reading negative `Line`s pulls scrollback; `safe_cell`
-        // yields blanks past the buffer end. Capped so the copy + memory stay bounded.
-        let history_rows = self.max_scroll().min(SNAPSHOT_SCROLLBACK_ROWS) as u16;
-        let mut history = Vec::with_capacity(history_rows as usize * cols as usize);
-        for h in 0..history_rows {
-            let grid_line = Line(h as i32 - history_rows as i32);
-            for c in 0..cols {
-                history.push(safe_cell(grid, grid_line, c as usize).clone());
             }
         }
         let cur = grid.cursor.point;
@@ -349,10 +335,41 @@ impl VTerm {
             cols,
             rows,
             cells,
-            history,
-            history_rows,
+            history: empty_scrollback(),
             cursor: (cur.line.0 as u16, cur.column.0 as u16),
         }
+    }
+
+    /// A full one-shot snapshot: the visible grid PLUS the whole bounded scrollback
+    /// (≤ [`SNAPSHOT_SCROLLBACK_ROWS`]) captured fresh. The NON-incremental reference
+    /// path — TEST-ONLY (the parser uses `snapshot_visible` + an incremental
+    /// `ScrollbackCache` to avoid re-capturing unchanged scrollback every burst; the
+    /// `render==live` regression test renders THIS full capture to validate both).
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> GridSnapshot {
+        let mut snap = self.snapshot_visible();
+        let depth = self.max_scroll().min(SNAPSHOT_SCROLLBACK_ROWS);
+        snap.history = std::sync::Arc::from(self.capture_history_tail(depth));
+        snap
+    }
+
+    /// Capture the `count` NEWEST scrollback rows as per-row `Arc`s, OLDEST first:
+    /// index 0 = `Line(-count)`, index `count-1` = `Line(-1)` (the line just above the
+    /// visible top). Reading negative `Line`s pulls scrollback; `safe_cell` yields
+    /// blanks past the buffer end. Each row is `cols` cells. Used by [`Self::snapshot`]
+    /// (full) and the parser's `ScrollbackCache` (incremental append of new rows).
+    pub fn capture_history_tail(&self, count: usize) -> Vec<ScrollbackRow> {
+        let grid = self.term.grid();
+        let cols = self.cols.min(grid.columns() as u16) as usize;
+        (1..=count)
+            .rev()
+            .map(|k| {
+                let line = Line(-(k as i32));
+                (0..cols)
+                    .map(|c| safe_cell(grid, line, c).clone())
+                    .collect::<ScrollbackRow>()
+            })
+            .collect()
     }
 
     fn render_to_buffer_inner(
@@ -952,8 +969,8 @@ impl VTerm {
 /// drain burst via [`VTerm::snapshot`] and publishes it through `ArcSwap`; the
 /// render loop loads the latest and paints it WITHOUT touching the VTerm (which,
 /// in off-thread mode, lives on the parser thread). Holds the visible grid PLUS a
-/// bounded scrollback window ([`history_rows`](GridSnapshot::history_rows) rows
-/// above the visible screen) so the off-thread render path can honor a scroll
+/// bounded scrollback window ([`history`](GridSnapshot::history), `history.len()`
+/// rows above the visible screen) so the off-thread render path can honor a scroll
 /// offset — matching the flag-OFF live path up to [`SNAPSHOT_SCROLLBACK_ROWS`]
 /// rows of history (deeper than that clamps; the live path keeps the full
 /// `scrolling_history`).
@@ -964,27 +981,41 @@ pub struct GridSnapshot {
     /// `rows * cols` cells, row-major, stride = `cols` — the VISIBLE (offset-0)
     /// grid, unchanged. Row 0 is the visible top of screen.
     pub cells: Vec<Cell>,
-    /// Captured scrollback ABOVE the visible screen, kept SEPARATE from `cells` so
-    /// the visible-grid layout/contract is unchanged. `history_rows * cols` cells,
-    /// row-major, OLDEST first: row `history_rows-1` is the line just above the
-    /// visible top (alacritty `Line(-1)`), row 0 the oldest (`Line(-history_rows)`).
-    /// Empty when there is no scrollback. Bounded by [`SNAPSHOT_SCROLLBACK_ROWS`].
-    pub history: Vec<Cell>,
-    /// Number of captured scrollback rows (`history.len() / cols`; 0 = none).
-    pub history_rows: u16,
+    /// Bounded scrollback ABOVE the visible screen as PER-ROW `Arc`s, kept SEPARATE
+    /// from `cells` so the visible-grid layout/contract is unchanged. OLDEST first:
+    /// `history[len-1]` is the line just above the visible top (alacritty `Line(-1)`),
+    /// `history[0]` the oldest (`Line(-len)`); each row is `cols` cells. Empty = no
+    /// scrollback. Bounded by [`SNAPSHOT_SCROLLBACK_ROWS`]. Per-row `Arc`s let the
+    /// parser maintain this INCREMENTALLY (#2411 r4/r6): an unchanged burst reuses
+    /// the whole slice (`Arc` refcount, no copy) and a growing one allocates only the
+    /// NEW rows while sharing the rest — vs the original per-burst deep clone.
+    pub history: ScrollbackRows,
     /// Cursor `(line, col)` in visible coordinates.
     pub cursor: (u16, u16),
 }
 
+/// One scrollback row — `cols` cells, shared via `Arc` so the parser can reuse it
+/// across bursts without copying (see [`GridSnapshot::history`]).
+pub type ScrollbackRow = std::sync::Arc<[Cell]>;
+
+/// Scrollback history as per-row `Arc`s. Cloning the outer `Arc` is O(1); each row
+/// `Arc` is shared, not copied.
+pub type ScrollbackRows = std::sync::Arc<[ScrollbackRow]>;
+
+/// An empty scrollback (no history) — `blank` snapshots and the no-scrollback case.
+pub(crate) fn empty_scrollback() -> ScrollbackRows {
+    std::sync::Arc::from(Vec::<ScrollbackRow>::new())
+}
+
 /// Max scrollback rows captured into a [`GridSnapshot`] for the off-thread render
-/// path (#offthread-scroll). Bounds the per-snapshot copy + memory: a snapshot is
-/// built per coalesced burst on the PARSER thread, so this is off the render/main
-/// thread (it does NOT reintroduce the main-thread freeze Option X removed), but it
-/// still costs ~`(history+rows)×cols` `Cell` copies + holds that much per live
-/// `Arc`. 1000 rows (~20 screens) gives ample interactive scroll-back at a bounded
-/// cost; the flag-OFF live path keeps the full `scrolling_history` (10000). Tunable;
-/// `#offthread-snapshot` logs the real `snapshot_bytes`.
-const SNAPSHOT_SCROLLBACK_ROWS: usize = 1000;
+/// path (#offthread-scroll). Bounds memory + the worst-case (resize/clear) recapture:
+/// the snapshot is built per coalesced burst on the PARSER thread (off the
+/// render/main thread — does NOT reintroduce the main-thread freeze Option X
+/// removed), and per-row `Arc`s make the STEADY-STATE publish cheap (reuse unchanged
+/// rows; allocate only newly-scrolled ones). 1000 rows (~20 screens) gives ample
+/// interactive scroll-back; the flag-OFF live path keeps the full `scrolling_history`
+/// (10000). Tunable; `#offthread-snapshot` logs the real `snapshot_bytes`.
+pub(crate) const SNAPSHOT_SCROLLBACK_ROWS: usize = 1000;
 
 impl GridSnapshot {
     /// A blank snapshot — the initial `ArcSwap` value before the parser thread
@@ -995,8 +1026,7 @@ impl GridSnapshot {
             cols,
             rows,
             cells: vec![Cell::default(); cols as usize * rows as usize],
-            history: Vec::new(),
-            history_rows: 0,
+            history: empty_scrollback(),
             cursor: (0, 0),
         }
     }
@@ -1011,8 +1041,8 @@ impl GridSnapshot {
     /// (`render_to_buffer_inner`) stays byte-identical and untouched; the two
     /// MUST be kept in sync (a P2 cleanup may DRY them once the flag stabilizes).
     /// `scroll_offset` selects the visible window over the captured scrollback
-    /// ([`history_rows`](GridSnapshot::history_rows)) — same semantics as the live
-    /// path, up to the captured depth — and (at offset 0) gates the block cursor.
+    /// ([`history`](GridSnapshot::history)) — same semantics as the live path, up to
+    /// the captured depth — and (at offset 0) gates the block cursor.
     pub fn render_to_buffer(
         &self,
         buf: &mut ratatui::buffer::Buffer,
@@ -1091,6 +1121,7 @@ impl GridSnapshot {
         // so an absurd offset can't wrap the `i32` arithmetic.
         let off: i32 = scroll_offset.min(i32::MAX as usize) as i32;
         let default_cell = || DEFAULT_CELL.get_or_init(Cell::default);
+        let history_rows = self.history.len() as i32;
         for row in 0..rows {
             let line = row as i32 - off;
             let mut col = 0u16;
@@ -1102,10 +1133,11 @@ impl GridSnapshot {
                         .unwrap_or_else(default_cell)
                 } else {
                     // Scrollback: alacritty Line(-k) → history row `history_rows - k`.
-                    let hidx = self.history_rows as i32 + line;
+                    let hidx = history_rows + line;
                     if hidx >= 0 {
                         self.history
-                            .get((hidx as usize) * stride + (col as usize))
+                            .get(hidx as usize)
+                            .and_then(|r| r.get(col as usize))
                             .unwrap_or_else(default_cell)
                     } else {
                         default_cell()
@@ -1382,7 +1414,8 @@ mod tests {
             "12 lines in a 5-row term must produce scrollback"
         );
         assert_eq!(
-            snap.history_rows as usize, max_scroll,
+            snap.history.len(),
+            max_scroll,
             "history ≤ cap → the snapshot captures the FULL scrollback"
         );
         let area = Rect::new(0, 0, 20, 5);
