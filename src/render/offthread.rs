@@ -374,6 +374,45 @@ mod tests {
         );
     }
 
+    /// #offthread-scroll: the handle's `scroll_max` reflects the published
+    /// snapshot's captured scrollback depth, so the scroll clamp isn't pinned to 0.
+    /// The bug was the scroll handlers clamping `scroll_offset` on the IDLE main
+    /// `pane.vterm` (drain no-ops in off-thread mode → its `max_scroll()` is 0),
+    /// pinning every off-thread pane to the bottom. `Pane::scroll_max` now reads this.
+    #[test]
+    fn handle_scroll_max_reflects_published_scrollback() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let vt = VTerm::new(20, 4);
+        let h = spawn_offthread_parser(5, "scroll".to_string(), data_rx, vt, wake_tx)
+            .expect("parser thread spawns");
+        assert_eq!(h.scroll_max(), 0, "blank initial snapshot has no scrollback");
+
+        // Feed more lines than the 4-row screen so content scrolls into history.
+        let mut payload = String::from("\x1b[2J\x1b[H");
+        for i in 1..=10 {
+            payload.push_str(&format!("line{i:02}\r\n"));
+        }
+        data_tx.send(payload.into_bytes()).unwrap();
+
+        // Wait for a publish, then for scroll_max to reflect the captured scrollback.
+        let mut got = false;
+        for _ in 0..10 {
+            if wake_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                break;
+            }
+            if h.scroll_max() > 0 {
+                got = true;
+                break;
+            }
+        }
+        assert!(
+            got,
+            "after >screen output, the handle must report a positive scroll_max"
+        );
+        drop(data_tx);
+    }
+
     /// A resize routed through the handle reaches the parser thread (which owns the
     /// VTerm) and the next snapshot carries the new dims.
     #[test]
