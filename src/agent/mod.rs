@@ -1490,10 +1490,13 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
     // process is ever created on a platform where we cannot guarantee tree-reap.
     #[cfg(windows)]
     {
+        // Tail expression (NOT `return`): on Windows the `#[cfg(unix)]` body below is
+        // stripped, so this block is the fn's tail — a `return` here trips
+        // clippy::needless_return under -D warnings on the windows-latest Check.
         let _ = config;
-        return Err(anyhow::anyhow!(
+        Err(anyhow::anyhow!(
             "ephemeral real-backend spawn is unsupported on Windows: the PTY layer lacks suspended-spawn (CREATE_SUSPENDED), so a backend forking before Job-Object assignment would escape process-tree reap. Ephemeral workers are unix-only for now — tracked by t-20260622062549639786-41860-13."
-        ));
+        ))
     }
     // The remaining implementation is UNIX-ONLY — on Windows the early `return`
     // above makes this unreachable, so it is `#[cfg(unix)]` (and the Windows build
