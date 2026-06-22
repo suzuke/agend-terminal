@@ -76,6 +76,17 @@ impl OffthreadHandle {
         self.snapshot.load_full()
     }
 
+    /// Max scroll-back offset the off-thread render path can honor = the captured
+    /// scrollback depth of the latest snapshot. The scroll handlers clamp
+    /// `pane.scroll_offset` to this: in off-thread mode the main-thread `pane.vterm`
+    /// is idle (drain no-ops), so its `max_scroll()` is 0 and would pin scrolling to
+    /// the bottom — the scrollback lives in the parser thread's VTerm, surfaced here
+    /// via the snapshot's `history_rows` (#offthread-scroll). Cheap `load()` (Guard,
+    /// no `Arc` clone).
+    pub fn scroll_max(&self) -> usize {
+        self.snapshot.load().history_rows as usize
+    }
+
     /// Route a resize to the parser thread (which owns the `VTerm`). Deduped:
     /// returns `false` (no send) when dims are unchanged since the last send.
     /// A closed channel (parser thread gone) is treated as a no-op.

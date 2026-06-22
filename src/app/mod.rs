@@ -1851,7 +1851,9 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
     if let Some(tab) = layout.active_tab_mut() {
         let fid = tab.focus_id;
         if let Some(pane) = tab.root_mut().find_pane_mut(fid) {
-            let max = pane.vterm.max_scroll();
+            // #offthread-scroll: off-thread mode leaves `pane.vterm` idle, so use the
+            // path-aware max (snapshot history when off-thread, else live vterm).
+            let max = pane.scroll_max();
             if delta > 0 {
                 pane.scroll_offset = (pane.scroll_offset + delta as usize).min(max);
             } else {

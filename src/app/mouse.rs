@@ -465,8 +465,8 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                 // distance sets the scroll step (drag further → scroll faster).
                 let row = if mouse.row < inner_y {
                     let overshoot = (inner_y - mouse.row) as usize;
-                    pane.scroll_offset =
-                        (pane.scroll_offset + overshoot).min(pane.vterm.max_scroll());
+                    // #offthread-scroll: path-aware max (off-thread vterm is idle).
+                    pane.scroll_offset = (pane.scroll_offset + overshoot).min(pane.scroll_max());
                     0
                 } else if mouse.row >= inner_y + inner_h {
                     let overshoot = (mouse.row - (inner_y + inner_h - 1)) as usize;

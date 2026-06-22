@@ -138,6 +138,19 @@ fn thread_cpu_time_us() -> Option<u64> {
 }
 
 impl Pane {
+    /// Max scroll-back offset for THIS pane's render path. Off-thread mode
+    /// (`AGEND_OFFTHREAD_PARSE`) renders the parser thread's published snapshot and
+    /// leaves the main-thread `vterm` idle (drain no-ops), so its `max_scroll()` is 0
+    /// and clamping scroll to it would pin every off-thread pane to the bottom
+    /// (#offthread-scroll regression). Use the snapshot's captured scrollback depth
+    /// when off-thread, else the live vterm's full history.
+    pub fn scroll_max(&self) -> usize {
+        match &self.offthread {
+            Some(handle) => handle.scroll_max(),
+            None => self.vterm.max_scroll(),
+        }
+    }
+
     /// Convert a viewport row (0-based within the pane interior) to an absolute
     /// scrollback logical line at the current scroll position. Inverse of
     /// [`Self::logical_line_to_viewport`].

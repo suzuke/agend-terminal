@@ -648,8 +648,9 @@ fn render_pane(
         // Option X (off-thread parse, flag AGEND_OFFTHREAD_PARSE): the parser
         // thread owns the VTerm and publishes an immutable snapshot. The main
         // thread does ZERO parse here — it loads the latest snapshot, paints it,
-        // and routes any resize to the parser thread (which owns the VTerm). P1
-        // renders the live offset-0 grid; off-thread scrollback is a P2 follow-up.
+        // and routes any resize to the parser thread (which owns the VTerm). The
+        // snapshot carries a bounded scrollback window, so `render_offset` scrolls
+        // it like the live path (#offthread-scroll; depth = SNAPSHOT_SCROLLBACK_ROWS).
         let snap = handle.load();
         if let Some(d) = crate::render::resize::ResizeDecision::needed(inner, snap.cols, snap.rows)
         {
