@@ -49,13 +49,7 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
     // Phase 2: the inbox reads + dedup + formatting run lock-free.
     let mut result = Vec::new();
     for name in &idle_names {
-        // #t-…61487: count only actionable-unread OBLIGATIONS (unanswered query / open
-        // task), NOT every unread row. A drained-then-reclaimed `report` (or any
-        // non-obligation) is kind-agnostically counted by `unread_count` and re-pages the
-        // agent every reclaim TTL — the ~2h noise this fixes. Arrival nudges (the
-        // pending-pointer) stay kind-agnostic, so a plain message is still surfaced when it
-        // lands; only the PERIODIC re-nudge is gated to real unhandled obligations.
-        let (count, oldest) = crate::inbox::unread_obligation_count(home, name);
+        let (count, oldest) = crate::inbox::unread_count(home, name);
         if count == 0 {
             continue;
         }
@@ -180,7 +174,11 @@ mod tests {
         }
         assert!(block_end > block_start, "binding block must close");
 
-        let io_needle = ["unread", "_count"].concat();
+        // #t-…61487: match the CALL form (`unread_count(home`), not a bare
+        // `unread_count` token — a doc/comment mention must NOT satisfy the guard
+        // (that is exactly how v1 left this guard "blind": the obligation-count
+        // refactor moved the real call away but a comment kept the loose needle green).
+        let io_needle = ["unread_count", "(home"].concat();
         let locked_region = &prod[block_start..=block_end];
         assert!(
             !locked_region.contains(&io_needle),
@@ -202,9 +200,6 @@ mod tests {
         dir
     }
 
-    // Seeds OBLIGATION messages (kind=query) — post-#t-…61487 the poll-reminder counts
-    // only obligations, so a plain `kind=None` row no longer produces a reminder. query is
-    // the simplest always-obligation kind (no task-board dependency).
     fn seed_unread(home: &Path, agent: &str, count: usize) {
         for i in 0..count {
             let _ = crate::inbox::enqueue(
@@ -215,7 +210,6 @@ mod tests {
                     id: Some(format!("m-{agent}-{i}")),
                     from: "test".into(),
                     text: format!("msg {i}"),
-                    kind: Some("query".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     ..Default::default()
                 },
@@ -227,7 +221,15 @@ mod tests {
     /// than `RECLAIM_TTL_SECS`) directly into the agent's name-based inbox file,
     /// so `reclaim_stale_delivering` reverts them back to unread. Distinct from
     /// `seed_unread` (which seeds plain unread rows reclaim would not touch).
-    fn seed_stale_delivering(home: &Path, agent: &str, count: usize) {
+    ///
+    /// Seeds `kind=query` (an OBLIGATION) on purpose: post-#t-…61487 reclaim only
+    /// re-arms the poll-reminder for re-nudge-worthy rows (obligation / unknown
+    /// kind). The `kind` parameter lets a caller seed an OBLIGATION (`query` →
+    /// reclaim re-arms, the #2299 promise) or a NON-obligation (`report` → reclaim
+    /// must NOT re-arm, the #t-…61487 noise fix). Name-based inbox (`{agent}.jsonl`),
+    /// so `reclaim`'s file-stem agent name == the poll-reminder ledger key and the
+    /// re-arm (or its absence) is observable.
+    fn seed_stale_delivering(home: &Path, agent: &str, count: usize, kind: &str) {
         let inbox_dir = home.join("inbox");
         std::fs::create_dir_all(&inbox_dir).expect("mkdir inbox");
         let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
@@ -238,7 +240,7 @@ mod tests {
                 id: Some(format!("m-{agent}-{i}")),
                 from: "test".into(),
                 text: format!("msg {i}"),
-                kind: Some("query".to_string()), // obligation (post-#t-…61487 count gate)
+                kind: Some(kind.to_string()),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 delivering_at: Some(stale.clone()), // delivered, unconfirmed, stale
                 ..Default::default()                // read_at = None
@@ -380,6 +382,11 @@ mod tests {
     /// observes the `count==0` window here (drain→reclaim between passes — the real
     /// scenario), so this is fixed only by `reclaim_stale_delivering` actively
     /// clearing the agent's poll-reminder dedup, NOT by recording 0 on a 0-count pass.
+    ///
+    /// #t-…61487: reclaim now re-arms CONDITIONALLY — only for re-nudge-worthy rows
+    /// (obligation / unknown kind). This test seeds `kind=query` (obligations), so the
+    /// re-arm still fires. The non-obligation case (a reclaimed `report` must NOT
+    /// re-arm) is `reclaim_does_not_rearm_for_non_obligation_report` below.
     #[test]
     fn reclaim_rearms_poll_reminder_even_when_restored_count_equals_last_notified() {
         let home = tmp_home("reclaim-rearm");
@@ -393,10 +400,10 @@ mod tests {
             "seed: record last-notified count = 3"
         );
 
-        // A dead turn's 3 messages are now stale `delivering` (drained, never
-        // acked). Unread count is 0; no poll pass runs in this window, so the
-        // ledger stays at 3 — the production bug scenario.
-        seed_stale_delivering(&home, agent, 3);
+        // A dead turn's 3 OBLIGATION (query) messages are now stale `delivering`
+        // (drained, never acked). Unread count is 0; no poll pass runs in this window,
+        // so the ledger stays at 3 — the production bug scenario.
+        seed_stale_delivering(&home, agent, 3, "query");
 
         // Reclaim reverts the stale delivering rows back to unread (count → 3).
         crate::inbox::storage::reclaim_stale_delivering(&home);
@@ -420,6 +427,45 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #t-…61487 THE NOISE FIX (complement of `reclaim_rearms_*`): a stale-`delivering`
+    /// REPORT (a non-obligation — the fire-and-forget kind that re-paged every ~2h)
+    /// reclaimed back to unread must NOT re-arm the poll-reminder, so the idle agent is
+    /// not re-paged. Identical name-based fixture + restored-count-equals-last-notified
+    /// setup as `reclaim_rearms_*`, but the conditional re-arm gate SUPPRESSES the
+    /// re-arm for a report. Non-vacuous: reverting the gate to the unconditional
+    /// `poll_reminder::remove_agent` (the pre-#t-…61487 code) makes this fail (the
+    /// dedup clears → the restored count re-pages).
+    #[test]
+    fn reclaim_does_not_rearm_for_non_obligation_report() {
+        let home = tmp_home("reclaim-report-norearm");
+        let agent = "reclaim-report-agent";
+        let registry = mock_registry(agent, AgentState::Idle);
+
+        // Prior state: the poll-reminder last notified this agent at count 1.
+        reset_dedup(agent);
+        assert!(
+            should_notify_and_record(agent, 1),
+            "seed: record last-notified count = 1"
+        );
+
+        // A drained-then-stale `report` (non-obligation), reverted by reclaim.
+        seed_stale_delivering(&home, agent, 1, "report");
+        crate::inbox::storage::reclaim_stale_delivering(&home);
+
+        // Restored count (1, kind-agnostic `unread_count`) EQUALS the last-notified
+        // count (1). The gate did NOT re-arm (report is a recognised non-obligation),
+        // so the dedup still holds 1 → no re-page. (Pre-fix: reclaim's unconditional
+        // re-arm cleared the dedup → re-page = the ~2h noise.)
+        let v = collect_poll_reminders(&home, &registry);
+        assert!(
+            v.is_empty(),
+            "a reclaimed report (non-obligation) must NOT re-arm the poll-reminder: {v:?}"
+        );
+
+        reset_dedup(agent);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn test_collect_poll_reminders_skips_when_busy() {
         let home = tmp_home("collect-busy");
@@ -431,36 +477,6 @@ mod tests {
         let v = collect_poll_reminders(&home, &registry);
         assert!(v.is_empty(), "busy agent must not get reminder");
 
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #t-…61487 regression: a `report` (the fire-and-forget kind that bounced
-    /// unread↔delivering via the reclaim TTL and re-paged every ~2h) must NOT produce
-    /// a poll-reminder — only obligations (query/task) do. `collect` now counts via
-    /// `unread_obligation_count`.
-    #[test]
-    fn collect_skips_report_non_obligation() {
-        let home = tmp_home("collect-report");
-        let agent = "collect-report-agent";
-        let _ = crate::inbox::enqueue(
-            &home,
-            agent,
-            crate::inbox::InboxMessage {
-                schema_version: 1,
-                id: Some("r1".into()),
-                from: "peer".into(),
-                text: "VERIFIED".into(),
-                kind: Some("report".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                ..Default::default()
-            },
-        );
-        let registry = mock_registry(agent, AgentState::Idle);
-        reset_dedup(agent);
-        assert!(
-            collect_poll_reminders(&home, &registry).is_empty(),
-            "a report must not produce a poll-reminder (the drained-report noise)"
-        );
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -3702,42 +3702,63 @@ fn obligation_reason_excludes_terminal_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// THE bug fix: a drained-or-unread `report` is NOT counted by the poll-reminder's
-/// obligation count, while a `query` IS — so a fire-and-forget report can never
-/// re-page the agent, but a blocked sender's query still does.
+/// #t-…61487 LOCK-DISCIPLINE source-scan guard (#1617 class): the reclaim re-nudge
+/// gate `reclaim_renudge_worthy` → `obligation_reason` does task-board IO
+/// (`tasks::load_by_id`). `reclaim_stale_delivering` MUST call it in Phase 2 — AFTER
+/// the `with_inbox_lock(home, &agent_name, |path| { … })` closure closes — never
+/// inside it (holding the per-agent inbox flock across a blocking board read is the
+/// #1617 fleet-stall class). Brace-match the locked closure (mirrors the
+/// poll_reminder `…_not_held_across_registry_lock` guard) and assert the classifier
+/// is OUTSIDE it. Needles are `concat`-built so this scan can't self-satisfy.
 #[test]
-fn unread_obligation_count_excludes_report_includes_query() {
-    let home = tmp_home("oblig-count");
-    // report: not an obligation → 0.
-    enqueue(&home, "ag-report", msg().kind("report").id("r1").build()).ok();
-    assert_eq!(unread_obligation_count(&home, "ag-report").0, 0);
-    // even after a drain (→ delivering) the report stays a non-obligation → 0.
-    drain(&home, "ag-report");
-    assert_eq!(unread_obligation_count(&home, "ag-report").0, 0);
+fn reclaim_renudge_classifier_runs_unlocked_not_under_inbox_lock() {
+    let src = include_str!("storage.rs");
+    let cfg_test = ["#[cfg(", "test)]"].concat();
+    let prod = match src.find(&cfg_test) {
+        Some(i) => &src[..i],
+        None => src,
+    };
+    // Scope to the reclaim fn body (the classifier is DEFINED earlier in the file,
+    // so slicing from the fn start excludes its definition site from the scan).
+    let fn_needle = ["fn reclaim_stale", "_delivering"].concat();
+    let fstart = prod
+        .find(&fn_needle)
+        .expect("reclaim_stale_delivering present");
+    let fn_region = &prod[fstart..];
 
-    // query: an obligation → 1.
-    enqueue(&home, "ag-query", msg().kind("query").id("q1").build()).ok();
-    assert_eq!(unread_obligation_count(&home, "ag-query").0, 1);
-    std::fs::remove_dir_all(&home).ok();
-}
+    // Find + brace-match the `with_inbox_lock(home, &agent_name, |path| { … }` closure.
+    let lock_needle = ["with_inbox_lock(home, &agent_name", ", |path| {"].concat();
+    let lstart = fn_region
+        .find(&lock_needle)
+        .expect("reclaim uses with_inbox_lock(home, &agent_name, |path| …)");
+    let open_rel = fn_region[lstart..].find('{').expect("closure opens");
+    let block_start = lstart + open_rel;
+    let mut depth = 0usize;
+    let mut block_end = block_start;
+    for (i, c) in fn_region[block_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    block_end = block_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(block_end > block_start, "lock closure must close");
 
-/// Decision (a) lock — NO SILENT LOSS: a plain `kind=None` message is NOT counted by
-/// the periodic poll-reminder (`unread_obligation_count` = 0), but the kind-agnostic
-/// arrival count (`unread_count`, the `[AGEND-MSG-PENDING]` pointer) STILL sees it = 1.
-/// So a plain message is surfaced on ARRIVAL; only the periodic re-nudge is gated.
-#[test]
-fn plain_message_excluded_from_obligation_but_arrival_still_counts() {
-    let home = tmp_home("oblig-plain");
-    enqueue(&home, "ag-plain", make_msg("alice", "plain message")).ok(); // kind=None
-    assert_eq!(
-        unread_obligation_count(&home, "ag-plain").0,
-        0,
-        "plain message must NOT drive the periodic poll-reminder"
+    let classifier = ["reclaim_renudge", "_worthy"].concat();
+    let obligation = ["obligation", "_reason"].concat();
+    let locked = &fn_region[block_start..=block_end];
+    assert!(
+        !locked.contains(&classifier) && !locked.contains(&obligation),
+        "reclaim must NOT call reclaim_renudge_worthy/obligation_reason under with_inbox_lock (#1617)"
     );
-    assert_eq!(
-        unread_count(&home, "ag-plain").0,
-        1,
-        "but the arrival pending-pointer count must still surface it (no silent loss)"
+    assert!(
+        fn_region[block_end..].contains(&classifier),
+        "reclaim_renudge_worthy must run AFTER the with_inbox_lock closure closes (Phase 2, unlocked)"
     );
-    std::fs::remove_dir_all(&home).ok();
 }

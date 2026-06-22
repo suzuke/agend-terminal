@@ -2768,6 +2768,83 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Build a single-agent registry with `name` present and forced Idle, so
+    /// `collect_poll_reminders` picks it up (the agent that was absent at send time
+    /// has now come online). Deterministic: `mk_test_handle` attaches no state-detect
+    /// listener, so the Idle state can't be raced away. `#[cfg(unix)]`: `mk_test_handle`
+    /// is `cfg(all(test, unix))`.
+    #[cfg(unix)]
+    fn idle_registry(name: &str) -> agent::AgentRegistry {
+        let id = crate::types::InstanceId::default();
+        let handle = crate::agent::mk_test_handle(name, id);
+        handle.core.lock().state.current = crate::state::AgentState::Idle;
+        let reg: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock().insert(id, handle);
+        reg
+    }
+
+    /// #t-…61487 (r6-required) — routing integration through the REAL send path
+    /// (`handle_send` → `route_and_deliver`), NOT a bare `enqueue` (the gap that sank
+    /// v1, [[unit_test_injected_inputs_hide_discovery_path]]). A `report` to an ABSENT
+    /// target takes `route_and_deliver`'s `!target_in_registry` branch — a bare
+    /// `enqueue` with NO arrival inject — so the kind-agnostic poll-reminder is its
+    /// ONLY recovery wake. This pins NO SILENT LOSS: the absent-target report still
+    /// gets its INITIAL poll-reminder wake. v1's obligation-only count killed this
+    /// (report → not counted → never woken) → r6 REJECT; the revert to kind-agnostic
+    /// `unread_count` restores it, and THIS test (driven through the real router, not
+    /// bare enqueue) guards the regression. The complementary NO-RE-FIRE invariant
+    /// (reclaim must not re-page for a drained report) is pinned deterministically in
+    /// `daemon::poll_reminder`'s `reclaim_does_not_rearm_for_non_obligation_report`
+    /// (a name-based fixture — the real send path backfills a uuid inbox whose
+    /// name→uuid migration makes a by-name drain/reclaim non-deterministic).
+    ///
+    /// `#[cfg(unix)]`: `idle_registry` → `mk_test_handle` is `cfg(all(test, unix))`.
+    #[cfg(unix)]
+    #[test]
+    fn report_to_absent_target_still_gets_initial_poll_wake() {
+        let home = tmp_home("absent-report-route");
+        let target = "offline-rev-route";
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {target}:\n    backend: claude\n  peer:\n    backend: claude\n"),
+        )
+        .ok();
+
+        // ── Send a report via the REAL handler; absent target → inbox_only (no inject). ──
+        let ctx = test_ctx(&home); // empty registry → target is absent
+        let result = handle_send(
+            &json!({
+                "from": "peer",
+                "target": target,
+                "text": "VERIFIED",
+                "kind": "report",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "send must succeed: {result}");
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "absent target → inbox_only (no inject), so the poll-reminder is the only \
+             recovery wake: {result}"
+        );
+
+        // ── Agent comes online idle: the INITIAL wake MUST fire (no silent loss). ──
+        let registry = idle_registry(target);
+        crate::daemon::poll_reminder::remove_agent(target); // clear dedup ledger
+        let first = crate::daemon::poll_reminder::collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            first.len(),
+            1,
+            "absent-target report must still get its INITIAL poll-reminder wake \
+             (kind-agnostic unread_count) — the v1 silent-loss regression guard"
+        );
+        assert!(first[0].1.contains("unread=1"), "got: {}", first[0].1);
+
+        crate::daemon::poll_reminder::remove_agent(target);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #1268: kind=query must NOT produce a dispatch_idle sidecar.
     /// (Replaces #1129 test — query sidecars caused false-positive
     /// watchdog nudges on broadcast queries.)

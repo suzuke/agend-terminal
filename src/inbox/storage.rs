@@ -1002,8 +1002,9 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
 /// Which UNREAD messages are real OBLIGATIONS that MUST keep nagging — `Some(reason)`
 /// = an unhandled obligation (a sender is blocked / a task is open), `None` = safe to
 /// drop from attention. The SINGLE source of truth shared by `inbox action=clear`'s
-/// KEEP-set ([`clear_compact`]) and the periodic poll-reminder ([`unread_obligation_count`]),
-/// so the two can never drift (decision d-20260607081209372642-1).
+/// KEEP-set ([`clear_compact`]) and the reclaim re-nudge gate ([`reclaim_renudge_worthy`],
+/// in [`reclaim_stale_delivering`]), so the two can never drift
+/// (decision d-20260607081209372642-1).
 ///
 /// `query` → always an obligation (the sender is blocked on a reply). `task` → an
 /// obligation unless the board proves it terminal (Done/Cancelled). EVERYTHING ELSE
@@ -1036,50 +1037,37 @@ pub fn obligation_reason(home: &Path, msg: &InboxMessage) -> Option<String> {
     }
 }
 
-/// Count actionable-unread OBLIGATION messages (+ the oldest one's timestamp). Like
-/// [`unread_count`] but ALSO requires [`obligation_reason`] to be `Some` — so a drained
-/// or undrained NON-obligation (report / update / ci-watch / plain `kind=None`) is NOT
-/// counted. This is the poll-reminder's count: it must only periodically re-page an
-/// agent about REAL unhandled work (unanswered query / open task), never about an
-/// already-delivered report that bounced unread↔delivering via the reclaim TTL (the
-/// #t-…61487 noise this fixes). Arrival nudges (the `[AGEND-MSG-PENDING]` pending-pointer,
-/// via [`unread_count`]) stay kind-agnostic, so a plain message is still surfaced on
-/// arrival — only the PERIODIC re-nudge is gated to obligations.
+/// #t-…61487: is a reverted (stale-`delivering` → unread) row worth RE-ARMING the
+/// idle agent's poll-reminder for? `true` for a real obligation (unanswered query /
+/// open task, via [`obligation_reason`]) OR an UNKNOWN kind (forward-compat: re-arm
+/// conservatively rather than silently drop a kind we don't recognise). `false` for a
+/// delivered NON-obligation we DO recognise (report / update / ci-watch / poll / a
+/// plain `kind=None`) — those were the ~2h drained-report re-page noise this fixes.
 ///
-/// Full-message deser (vs `unread_count`'s narrow probe): `obligation_reason` needs
-/// `kind` / `task_id` / `correlation_id`. Not hot — one read per idle agent per
-/// poll-reminder cadence, and the task-board load only fires for `kind=task` rows.
-pub fn unread_obligation_count(
-    home: &Path,
-    name: &str,
-) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
-    let path = inbox_path_resolved(home, name);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return (0, None),
-    };
-    let mut count = 0usize;
-    let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
-    for line in content.lines() {
-        let msg: InboxMessage = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        // Actionable-unread (mirror `UnreadProbe::is_unread`: not read, not in-flight
-        // delivering, not superseded) AND a real obligation.
-        let unread =
-            msg.read_at.is_none() && msg.delivering_at.is_none() && msg.superseded_by.is_none();
-        if unread && obligation_reason(home, &msg).is_some() {
-            count += 1;
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
-                let ts_utc = ts.with_timezone(&chrono::Utc);
-                if oldest.is_none_or(|t| t > ts_utc) {
-                    oldest = Some(ts_utc);
-                }
-            }
-        }
+/// ⚠ LOCK-DISCIPLINE: this calls [`obligation_reason`], which does task-board IO
+/// (`tasks::load_by_id`) for `kind=task`. It MUST run UNLOCKED — in Phase 2 of
+/// [`reclaim_stale_delivering`], after the `with_inbox_lock` closure closes — never
+/// inside it (holding the per-agent inbox flock across a blocking board read is the
+/// #1617 fleet-stall class).
+fn reclaim_renudge_worthy(home: &Path, msg: &InboxMessage) -> bool {
+    obligation_reason(home, msg).is_some() || kind_is_unknown(msg)
+}
+
+/// A `kind` outside the set the daemon is KNOWN to emit. [`obligation_reason`] maps
+/// every recognised non-obligation kind to `None`, so without this helper an
+/// unrecognised future kind would be indistinguishable from a non-obligation and
+/// silently dropped from the reclaim re-nudge. The known set mirrors the kinds the
+/// daemon emits today: `query` / `task` (obligations) + `report` / `update` /
+/// `ci-watch` / `poll` (non-obligations), plus a plain `kind=None`. Anything else →
+/// `true` (unknown → conservatively re-arm; failure mode = noise, never silent loss).
+fn kind_is_unknown(msg: &InboxMessage) -> bool {
+    match msg.kind.as_deref() {
+        None => false, // a plain message is a recognised non-obligation
+        Some(k) => !matches!(
+            k,
+            "query" | "task" | "report" | "update" | "ci-watch" | "poll"
+        ),
     }
-    (count, oldest)
 }
 
 /// Sweep expired messages from all inbox files (#inbox-gc part b).
@@ -1241,15 +1229,19 @@ pub fn reclaim_stale_delivering(home: &Path) {
             Some(n) => n.to_string(),
             None => continue,
         };
-        // Phase 1 (locked): revert stale delivering rows, collect their ids.
-        let reverted_ids: Vec<String> = with_inbox_lock(home, &agent_name, |path| {
+        // Phase 1 (locked): revert stale delivering rows, collect the reverted
+        // MESSAGES (not just ids) so Phase 2 can classify them for the re-nudge gate.
+        // #t-…61487: the classifier (`reclaim_renudge_worthy` → `obligation_reason`)
+        // does task-board IO, so it MUST run in Phase 2 (unlocked) — NEVER here, under
+        // `with_inbox_lock` (#1617 stall class).
+        let reverted: Vec<InboxMessage> = with_inbox_lock(home, &agent_name, |path| {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(_) => return Vec::new(),
             };
             let mut all: Vec<InboxMessage> = Vec::new();
             let mut preserved_forward: Vec<String> = Vec::new();
-            let mut reverted: Vec<String> = Vec::new();
+            let mut reverted: Vec<InboxMessage> = Vec::new();
             let mut changed = false;
             for line in content.lines() {
                 if line.trim().is_empty() {
@@ -1276,9 +1268,9 @@ pub fn reclaim_stale_delivering(home: &Path) {
                         if stale {
                             msg.delivering_at = None; // → unread (re-deliverable)
                             changed = true;
-                            if let Some(ref id) = msg.id {
-                                reverted.push(id.clone());
-                            }
+                            // Collect the full reverted row: Phase 2 reads `id` (dedup
+                            // forget) + `kind`/`task_id`/`correlation_id` (re-nudge gate).
+                            reverted.push(msg.clone());
                         }
                     }
                 }
@@ -1321,8 +1313,10 @@ pub fn reclaim_stale_delivering(home: &Path) {
 
         // Phase 2 (unlocked): drop each reverted row's dedup entry so the
         // daemon's re-inject of the now-unread message isn't suppressed.
-        for id in &reverted_ids {
-            crate::daemon::notification_dedup::global().forget(&agent_name, id);
+        for m in &reverted {
+            if let Some(id) = &m.id {
+                crate::daemon::notification_dedup::global().forget(&agent_name, id);
+            }
         }
         // #t-98760-9 (#2299 regression): also reset this agent's poll-reminder
         // count-dedup. The loop above clears the per-MESSAGE inject dedup, but the
@@ -1333,7 +1327,16 @@ pub fn reclaim_stale_delivering(home: &Path) {
         // Recording 0 on a 0-count poll pass would not suffice (a pass may never
         // observe the count==0 window between drain and reclaim); re-arming here
         // is deterministic.
-        if !reverted_ids.is_empty() {
+        //
+        // #t-…61487: re-arm ONLY if a reverted row is re-nudge-worthy — a real
+        // obligation (unanswered query / open task) or an UNKNOWN kind. A delivered
+        // NON-obligation we recognise (report / update / ci-watch / poll / plain)
+        // must NOT re-arm: that was the ~2h drained-report re-page noise (the
+        // pre-#t-…61487 code re-armed unconditionally). The #2299 promise above
+        // still holds for obligations. `reclaim_renudge_worthy` does task-board IO
+        // (`obligation_reason`) → it runs HERE (unlocked), never under
+        // `with_inbox_lock` (#1617 stall class).
+        if reverted.iter().any(|m| reclaim_renudge_worthy(home, m)) {
             crate::daemon::poll_reminder::remove_agent(&agent_name);
         }
     }

@@ -115,8 +115,8 @@ pub fn handle_inbox_ack(home: &Path, args: &Value, instance_name: &str) -> Value
 /// `requires_response`. Does NOT drain (no reply-ledger arm / heartbeat touch).
 pub fn handle_inbox_clear(home: &Path, instance_name: &str) -> Value {
     // #t-…61487: `obligation_reason` is the SHARED KEEP-set predicate — the same one the
-    // periodic poll-reminder counts (`inbox::unread_obligation_count`), so clear and the
-    // reminder can never drift. (decision d-20260607081209372642-1.)
+    // reclaim re-nudge gate (`reclaim_renudge_worthy` in `reclaim_stale_delivering`) uses,
+    // so clear and the reclaim re-nudge can never drift. (decision d-20260607081209372642-1.)
     let result = crate::inbox::clear_compact(home, instance_name, |msg| {
         crate::inbox::obligation_reason(home, msg)
     });
