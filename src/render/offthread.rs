@@ -94,14 +94,22 @@ impl Drop for OffthreadHandle {
     /// app shutdown, re-attach replace) — strictly more robust than signalling at
     /// individual teardown sites.
     ///
-    /// Why a signal is required: the parser holds a clone of the pane's `rx` and
-    /// the forwarder holds the matching `fwd_tx`, so when a pane closes while its
-    /// agent is still alive, the forwarder's sends keep succeeding and neither
-    /// thread would ever exit on its own. The explicit `cancel_tx.send` wakes the
-    /// parser out of `select!`; it returns WITHOUT publishing (no wakeup send), so
-    /// the join is bounded (the wakeup channel is unbounded → never blocks). Once
-    /// the parser exits it drops its `rx` clone, and the forwarder then exits on
-    /// its next send (its pre-existing flag-OFF lifecycle).
+    /// Why a signal is required: the parser holds a clone of the pane's `rx`, so
+    /// when a pane closes while its agent is still alive the data channel stays
+    /// open and the parser would never exit on its own. The explicit
+    /// `cancel_tx.send` wakes it out of `select!`; it returns WITHOUT publishing (no
+    /// wakeup send), so the join is bounded (the wakeup channel is unbounded → never
+    /// blocks, and `drain_pending_data` is `len()`-bounded + cancel-checked, so even
+    /// a sustained flood can't wedge it — see `parser_loop`).
+    ///
+    /// Forwarder interaction: once the parser exits it drops its `rx` clone, so the
+    /// pane's forwarder reverts to its PRE-EXISTING managed lifecycle — it exits on
+    /// its next `fwd_tx.send` after all receivers (pane.rx + this clone) are gone.
+    /// Off-thread parse therefore does NOT extend the forwarder's lifetime. The one
+    /// residual is pre-existing and NOT off-thread-introduced: a forwarder for a
+    /// closed pane whose agent then goes silent lingers (blocked on the upstream
+    /// channel) until that agent speaks again or dies — bounded, flag-independent,
+    /// tracked as follow-up t-20260622053855100612-41860-5.
     fn drop(&mut self) {
         let _ = self.cancel_tx.send(());
         if let Some(join) = self.join.take() {

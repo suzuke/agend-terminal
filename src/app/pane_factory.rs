@@ -1337,6 +1337,81 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #2404 r6 ② (decision C) — production-shaped: with an ACTIVE agent (the freeze
+    /// scenario), closing the pane reaps the forwarder. Built via the real
+    /// `build_deferred_direct_pane` + `apply_attach_outcome` path (not a synthetic
+    /// clone): the forwarder targets the pane's OWN output channel (`job.fwd_tx` →
+    /// `pane.rx`), so dropping the pane drops the last receiver and the agent's next
+    /// byte makes the forwarder's `fwd_tx.send` fail → it exits. (The off-thread
+    /// parser's deterministic reap is covered in `render::offthread`; the
+    /// quiet-agent forwarder linger is a PRE-EXISTING managed behavior, not
+    /// off-thread-introduced — follow-up t-20260622053855100612-41860-5.)
+    #[test]
+    fn active_agent_pane_close_reaps_forwarder_freeze_scenario() {
+        let home = tmp_home("rf_fwd_reap");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (mut pane, job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        let pid = pane.id;
+        // Upstream agent broadcast — kept ALIVE for the whole test (active agent).
+        let (sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Real attach: the forwarder writes to the pane's OWN channel (job.fwd_tx →
+        // pane.rx), so the pane is the sole receiver.
+        apply_attach_outcome(
+            &mut pane,
+            &registry,
+            AttachOutcome::Ready {
+                pane_id: pid,
+                instance_id: crate::types::InstanceId::default(),
+                rx: sub_rx,
+                dump: Vec::new(),
+                work_dir: home.clone(),
+                name: "shell".into(),
+            },
+            job.fwd_tx,
+            &wakeup_tx,
+        );
+        // Drop the test's wakeup_tx so only the forwarder's clone keeps wakeup_rx
+        // connected — its disconnect then observes the forwarder's exit.
+        drop(wakeup_tx);
+        // Close the pane while the agent is alive: drops pane.rx (the forwarder
+        // channel's last receiver).
+        drop(pane);
+        // The active agent emits one more byte → the forwarder's fwd_tx.send fails
+        // (no receivers) → it exits, dropping its wakeup_tx clone.
+        sub_tx.send(b"x".to_vec()).expect("agent still alive");
+        let mut reaped = false;
+        for _ in 0..50 {
+            if matches!(
+                wakeup_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            ) {
+                reaped = true;
+                break;
+            }
+        }
+        assert!(
+            reaped,
+            "active-agent pane close must reap the forwarder (the freeze scenario)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// must-resolve #3: a `Failed` outcome flips the placeholder to a visible
     /// "failed to start" banner and leaves it a never-routed (closable) pane.
     #[test]
