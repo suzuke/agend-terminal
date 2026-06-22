@@ -506,6 +506,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         }
     }
     fn leaf_agent(id: usize, name: &str) -> Pane {

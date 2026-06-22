@@ -200,6 +200,8 @@ fn build_pane_placeholder(
         selection: None,
         source: crate::layout::PaneSource::Local,
         offthread: None,
+        // No forwarder yet (started in `apply_attachment`); cancel is wired there.
+        _fwd_cancel: None,
     };
     (pane, fwd_tx)
 }
@@ -410,18 +412,30 @@ fn apply_attachment(
     // Forward subscriber output to wakeup channel via the placeholder's fwd_tx
     let name = pane.agent_name.to_string();
     let tx = wakeup_tx.clone();
-    // fire-and-forget: forwarder exits when fwd_tx.send() fails (pane
-    // dropped → fwd_rx dropped → send returns Err) or rx.recv() fails
-    // (agent removed → broadcast sender dropped). H1: lifecycle is
-    // correct — pane drop triggers forwarder exit via channel close.
+    // #forwarder-reap: pair the pane with a cancel receiver the forwarder watches
+    // so a pane close reaps it promptly even when the agent is QUIET. `_fwd_cancel`
+    // lives on the pane; dropping the pane drops it → `fwd_cancel_rx` disconnects →
+    // the `select!` wakes out of a blocking `rx.recv()`.
+    let (fwd_cancel_tx, fwd_cancel_rx) = crossbeam_channel::unbounded::<()>();
+    pane._fwd_cancel = Some(fwd_cancel_tx);
+    // fire-and-forget: forwarder exits when (a) fwd_tx.send() fails (pane dropped
+    // → fwd_rx dropped → send Err), (b) rx.recv() fails (agent removed → broadcast
+    // sender dropped), or (c) fwd_cancel_rx disconnects (pane dropped while the
+    // agent is quiet). H1: pane drop triggers forwarder exit on all three paths.
     std::thread::Builder::new()
         .name(format!("{name}_fwd"))
-        .spawn(move || {
-            while let Ok(data) = rx.recv() {
-                if fwd_tx.send(data).is_err() {
-                    break; // H1: pane closed, fwd_rx dropped
-                }
-                let _ = tx.send(pane_id);
+        .spawn(move || loop {
+            crossbeam_channel::select! {
+                recv(rx) -> msg => match msg {
+                    Ok(data) => {
+                        if fwd_tx.send(data).is_err() {
+                            break; // H1: pane closed, fwd_rx dropped
+                        }
+                        let _ = tx.send(pane_id);
+                    }
+                    Err(_) => break, // agent removed, broadcast sender dropped
+                },
+                recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
             }
         })
         .ok();
@@ -932,18 +946,30 @@ pub(super) fn attach_pane(
 
     let pane_id = layout.next_pane_id();
     let tx = wakeup_tx.clone();
+    // #forwarder-reap: cancel pair so a pane close reaps the forwarder even when
+    // the agent is quiet (mirrors apply_attachment). `_fwd_cancel` goes on the
+    // returned Pane; dropping it disconnects `fwd_cancel_rx` → the `select!` exits.
+    let (fwd_cancel_tx, fwd_cancel_rx) = crossbeam_channel::unbounded::<()>();
     let pane_rx = {
         let n = name.to_string();
         let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        // fire-and-forget: same lifecycle as create_pane forwarder (H1).
+        // fire-and-forget: same lifecycle as create_pane forwarder — exits on
+        // fwd_tx.send fail (pane dropped), rx.recv fail (agent gone), or
+        // fwd_cancel_rx disconnect (pane dropped while agent quiet) (H1).
         std::thread::Builder::new()
             .name(format!("{n}_fwd"))
-            .spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if fwd_tx.send(data).is_err() {
-                        break; // H1: pane closed, fwd_rx dropped
-                    }
-                    let _ = tx.send(pane_id);
+            .spawn(move || loop {
+                crossbeam_channel::select! {
+                    recv(rx) -> msg => match msg {
+                        Ok(data) => {
+                            if fwd_tx.send(data).is_err() {
+                                break; // H1: pane closed, fwd_rx dropped
+                            }
+                            let _ = tx.send(pane_id);
+                        }
+                        Err(_) => break, // agent removed, broadcast sender dropped
+                    },
+                    recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
                 }
             })
             .ok();
@@ -969,6 +995,7 @@ pub(super) fn attach_pane(
         selection: None,
         source: crate::layout::PaneSource::Local,
         offthread: None,
+        _fwd_cancel: Some(fwd_cancel_tx),
     })
 }
 
@@ -1146,6 +1173,15 @@ pub(super) fn create_remote_pane(
         selection: None,
         source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
         offthread: None,
+        // Remote panes forward from a dup'd socket reader, not a crossbeam agent
+        // `rx`, so candidate-B's cancel channel does not apply here. NOTE: this
+        // does NOT mean remote is reaped — the remote forwarder
+        // (`{name}_remote_fwd`) blocks in `read_tagged_frame` and still has the
+        // SAME pre-existing quiet-close linger: a pane close drops only the writer
+        // fd while the dup'd reader holds the TCP open (no FIN). Reaping it needs
+        // `shutdown(Shutdown::Read)`, which crossbeam cancel cannot do. Tracked in
+        // follow-up t-20260622073457027138-41860-19.
+        _fwd_cancel: None,
     })
 }
 
@@ -1337,15 +1373,15 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #2404 r6 ② (decision C) — production-shaped: with an ACTIVE agent (the freeze
-    /// scenario), closing the pane reaps the forwarder. Built via the real
-    /// `build_deferred_direct_pane` + `apply_attach_outcome` path (not a synthetic
-    /// clone): the forwarder targets the pane's OWN output channel (`job.fwd_tx` →
-    /// `pane.rx`), so dropping the pane drops the last receiver and the agent's next
-    /// byte makes the forwarder's `fwd_tx.send` fail → it exits. (The off-thread
-    /// parser's deterministic reap is covered in `render::offthread`; the
-    /// quiet-agent forwarder linger is a PRE-EXISTING managed behavior, not
-    /// off-thread-introduced — follow-up t-20260622053855100612-41860-5.)
+    /// Production-shaped: closing a pane reaps its output forwarder for an ACTIVE
+    /// agent (the freeze scenario). Built via the real `build_deferred_direct_pane`
+    /// and `apply_attach_outcome` path (not a synthetic clone): the forwarder
+    /// targets the pane's OWN output channel (`job.fwd_tx` to `pane.rx`). The agent
+    /// emits a byte the forwarder processes, then the pane is closed while the agent
+    /// stays ALIVE; the #forwarder-reap cancel channel (dropped with the pane) makes
+    /// the forwarder's `select!` exit in bounded time. Companion test
+    /// `quiet_agent_pane_close_reaps_forwarder` covers the quiet case that lingered
+    /// pre-fix. See #2404 r6 (decision C); quiet-linger fix t-…41860-5.
     #[test]
     fn active_agent_pane_close_reaps_forwarder_freeze_scenario() {
         let home = tmp_home("rf_fwd_reap");
@@ -1386,15 +1422,16 @@ mod tests {
             job.fwd_tx,
             &wakeup_tx,
         );
+        // Active agent: emit a byte the forwarder processes while the pane is open.
+        sub_tx.send(b"x".to_vec()).expect("agent alive");
         // Drop the test's wakeup_tx so only the forwarder's clone keeps wakeup_rx
         // connected — its disconnect then observes the forwarder's exit.
         drop(wakeup_tx);
-        // Close the pane while the agent is alive: drops pane.rx (the forwarder
-        // channel's last receiver).
+        // Close the pane while the agent stays ALIVE: drops pane.rx AND
+        // pane._fwd_cancel → the forwarder's select! observes the cancel-channel
+        // disconnect and exits in bounded time (#forwarder-reap), even though the
+        // agent never dies (sub_tx held to the end).
         drop(pane);
-        // The active agent emits one more byte → the forwarder's fwd_tx.send fails
-        // (no receivers) → it exits, dropping its wakeup_tx clone.
-        sub_tx.send(b"x".to_vec()).expect("agent still alive");
         let mut reaped = false;
         for _ in 0..50 {
             if matches!(
@@ -1409,6 +1446,81 @@ mod tests {
             reaped,
             "active-agent pane close must reap the forwarder (the freeze scenario)"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #forwarder-reap (t-…41860-5) — production-shaped: closing a pane reaps its
+    /// output forwarder even when the agent is QUIET and stays ALIVE. This is the
+    /// PRE-EXISTING linger the off-thread P1 review surfaced: the forwarder blocked
+    /// on `rx.recv()` for a silent agent only exited on the agent's next byte/death.
+    /// Built via the real `build_deferred_direct_pane` + `apply_attach_outcome`
+    /// path; the agent's upstream sender (`sub_tx`) is held alive and NEVER emits,
+    /// so the ONLY exit path is the cancel channel dropped with the pane. Seam =
+    /// `wakeup_rx` disconnect (the forwarder's `wakeup_tx` clone drops on exit).
+    /// Neuter-RED: revert the forwarder to `while let Ok(_) = rx.recv()` → a quiet,
+    /// live agent blocks it forever → `wakeup_rx` never disconnects → this fails.
+    #[test]
+    fn quiet_agent_pane_close_reaps_forwarder() {
+        let home = tmp_home("rf_fwd_reap_quiet");
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (mut pane, job) = build_deferred_direct_pane(
+            &mut layout,
+            &home,
+            "shell",
+            "/bin/sh",
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            None,
+            &HashMap::new(),
+            "\r",
+            80,
+            24,
+            &mut name_counter,
+        );
+        let pid = pane.id;
+        // Upstream agent broadcast — kept ALIVE and QUIET for the whole test.
+        let (sub_tx, sub_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        apply_attach_outcome(
+            &mut pane,
+            &registry,
+            AttachOutcome::Ready {
+                pane_id: pid,
+                instance_id: crate::types::InstanceId::default(),
+                rx: sub_rx,
+                dump: Vec::new(),
+                work_dir: home.clone(),
+                name: "shell".into(),
+            },
+            job.fwd_tx,
+            &wakeup_tx,
+        );
+        // Seam: drop the test's wakeup_tx so only the forwarder's clone keeps
+        // wakeup_rx connected — its disconnect then observes the forwarder's exit.
+        drop(wakeup_tx);
+        // Close the pane while the agent is alive but QUIET (no byte ever sent):
+        // pre-fix the forwarder is blocked in rx.recv() forever; the cancel channel
+        // (dropped with the pane) wakes the select! so it exits in bounded time.
+        drop(pane);
+        let mut reaped = false;
+        for _ in 0..50 {
+            if matches!(
+                wakeup_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            ) {
+                reaped = true;
+                break;
+            }
+        }
+        // Agent is still alive here (never emitted) → reap was via the cancel
+        // channel, NOT the pre-existing rx-disconnect path.
+        assert!(
+            reaped,
+            "quiet-agent pane close must reap the forwarder via the cancel channel"
+        );
+        drop(sub_tx);
         std::fs::remove_dir_all(&home).ok();
     }
 
