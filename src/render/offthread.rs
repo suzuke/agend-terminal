@@ -386,7 +386,11 @@ mod tests {
         let vt = VTerm::new(20, 4);
         let h = spawn_offthread_parser(5, "scroll".to_string(), data_rx, vt, wake_tx)
             .expect("parser thread spawns");
-        assert_eq!(h.scroll_max(), 0, "blank initial snapshot has no scrollback");
+        assert_eq!(
+            h.scroll_max(),
+            0,
+            "blank initial snapshot has no scrollback"
+        );
 
         // Feed more lines than the 4-row screen so content scrolls into history.
         let mut payload = String::from("\x1b[2J\x1b[H");
