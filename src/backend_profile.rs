@@ -111,6 +111,16 @@ fn agy_profile() -> BackendProfile {
                 AgentState::UsageLimit,
                 r"Individual quota reached|Contact your administrator to enable overages",
             ),
+            // #2409: Gemini transient "high traffic" server error. ApiError (not
+            // ServerRateLimit) because SRL is `is_high_fp_state` → content anchor
+            // requires an error-line indicator (`Error:` / `429` / …) which this
+            // message lacks; ApiError has no anchor/position gate → pattern match
+            // = immediate transition → the #1697 quick-nudge injects `continue`
+            // once per episode, appropriate for a "try again in a minute" error.
+            (
+                AgentState::ApiError,
+                r"servers are experiencing high traffic|try again in a minute",
+            ),
             (
                 AgentState::PermissionPrompt,
                 r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
