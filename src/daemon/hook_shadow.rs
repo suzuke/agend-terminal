@@ -124,6 +124,30 @@ pub fn resolved_state_for(name: &str) -> HookResolution {
     }
 }
 
+/// #t-26795 (SRL hook-override): the epoch-ms timestamp of the latest hook event IF
+/// it resolves to a FRESH, ACTIVE state, else `None`. The supervisor's
+/// ServerRateLimit retry uses this — a fresh active hook whose timestamp POST-DATES
+/// the rate-limit onset proves the agent is executing tool calls, so a sticky
+/// screen-scraped `ServerRateLimit` is stale and the retry must not fire.
+///
+/// ACTIVE = `{ToolUse, Thinking}` only. `Idle` is deliberately EXCLUDED: a fresh
+/// `Idle` is the turn-ENDED / prior-turn signal (ambiguous w.r.t. a brand-new SRL),
+/// and idle-recovery is already covered by the supervisor's productive-output
+/// `recovered` gate — so this stays the narrow "agent is provably mid-work" signal.
+///
+/// Flag-INDEPENDENT of `AGEND_HOOK_STATE_POC`: it reads the shadow snapshot that
+/// [`record_event`] populates unconditionally for any hook event. (The hooks only
+/// FIRE when the flag wires them into the backend — that is the data's presence, not
+/// this read's gating; a missing snapshot simply yields `None` = fail-safe.)
+pub fn fresh_active_hook_at_ms(name: &str) -> Option<u64> {
+    use crate::state::AgentState;
+    let snap = snapshot_for(name)?;
+    match resolved_state_for(name) {
+        HookResolution::Fresh(AgentState::ToolUse | AgentState::Thinking) => Some(snap.at_ms),
+        _ => None,
+    }
+}
+
 /// #1523: is the hook→authoritative promotion enabled? Gated on the same flag
 /// that injects the hooks, so promotion can never read hooks that aren't wired.
 fn promotion_enabled() -> bool {
