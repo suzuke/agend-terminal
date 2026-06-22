@@ -1371,6 +1371,359 @@ pub fn spawn_agent(
     Ok(instance_id)
 }
 
+/// #1967 PR3a: a live, headless ephemeral worker spawned via [`spawn_ephemeral_worker`].
+///
+/// Unlike a managed agent it is NOT in any [`AgentRegistry`], has NO pane / TUI
+/// listener, and runs NO crash-respawn reaper — it is fire-and-forget plumbing
+/// that owns just the handles PR3b needs (inject + reap):
+/// - `child`: for reaping (`kill_process_tree(pid)` + `child.lock().wait()`).
+/// - `pty_writer` + `core`: retained for the PR3b prompt-inject / capture path.
+///
+/// `Child` isn't `Debug`, so this is NOT `#[derive(Debug)]` — a manual impl that
+/// prints only `pid` is provided so the holder ([`crate::ephemeral_tracking`]) can
+/// still be `Debug`-formatted in diagnostics.
+pub struct EphemeralPtyHandle {
+    pub pid: u32,
+    pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    /// Retained for PR3b prompt-inject. Unused by PR3a (spawn + reap only).
+    #[allow(dead_code)]
+    pub pty_writer: PtyWriter,
+    /// Retained for PR3b turn-detection / capture. Unused by PR3a.
+    #[allow(dead_code)]
+    pub core: Arc<CoreMutex<AgentCore>>,
+    /// Kept ALIVE (not dropped) for the worker's lifetime — matching [`spawn_agent`],
+    /// which retains the master. Not used for resize (no pane), but retaining it
+    /// keeps the PTY lifecycle explicit + cross-platform-safe (ConPTY master
+    /// semantics differ from unix dup'd reader/writer fds — don't rely on the dups
+    /// alone to hold the master side open).
+    #[allow(dead_code)]
+    pub pty_master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl std::fmt::Debug for EphemeralPtyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralPtyHandle")
+            .field("pid", &self.pid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EphemeralPtyHandle {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+/// #1967 PR3a Fix 2 (spawn rollback): a RAII kill-guard that ensures a child
+/// spawned by [`spawn_ephemeral_worker`] is NEVER leaked as a zero-row orphan if a
+/// later setup step (`take_writer` / `try_clone_reader` / read-thread spawn) fails
+/// after the child is already running. Constructed + armed immediately after the
+/// child spawns; `disarm()`-ed only on the success path, right before the `Ok`
+/// return. So every `?` between spawn and `Ok` runs `Drop` while armed → the child
+/// tree is killed and reaped (no orphan process, no orphan handle).
+///
+/// `#[cfg(unix)]`: the only constructor is the unix-only body of
+/// `spawn_ephemeral_worker` (Windows fails closed before any spawn), so this type
+/// does not exist on Windows.
+#[cfg(unix)]
+struct SpawnKillGuard {
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl SpawnKillGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SpawnKillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::process::kill_process_tree(self.pid);
+            let _ = self.child.lock().wait();
+        }
+    }
+}
+
+/// #1967 PR3a: spawn a REAL backend headlessly via a PTY (Route B), reusing the
+/// managed-agent spawn path's security WITHOUT a visible pane and WITHOUT entering
+/// the roster. A STANDALONE FORK of [`spawn_agent`] that:
+///
+/// - calls [`build_command`] UNCHANGED — the security-inheritance invariant: the
+///   ephemeral worker inherits git-shim PATH + `AGEND_REAL_GIT` (#1504), #1440 env
+///   isolation, cwd two-pass validation, opencode XDG isolation (#1519) +
+///   autoupdate-off (#1956/#1970), fleet-env #2106, `AGEND_GIT_BYPASS` strip
+///   (#708), and the terminal/editor/LANG env — IDENTICALLY to a managed agent;
+/// - does NOT insert into any [`AgentRegistry`], register a router subscriber,
+///   spawn a TUI listener, do instructions-bootstrap, or use a `SpawnRollback`;
+/// - runs a minimal [`ephemeral_pty_read_loop`] read thread that drains the PTY +
+///   feeds vterm/state + auto-dismisses update modals, but NEVER calls
+///   `handle_pty_close` (no crash-respawn for ephemeral).
+///
+/// Scope = SAFE spawn + reap only; NO prompt injection / turn-detection / capture
+/// (that is PR3b — which uses the retained `pty_writer` + `core`).
+///
+/// Fix 2 (spawn rollback): a [`SpawnKillGuard`] is armed the instant the child
+/// spawns and disarmed only on the success path, so a failure in any later setup
+/// step (`take_writer` / `try_clone_reader` / read-thread spawn) kills + reaps the
+/// child instead of leaking a zero-row orphan.
+///
+/// ## Unix-only (Windows FAIL-CLOSED)
+///
+/// Ephemeral real-backend spawn is UNSUPPORTED on Windows and this fn returns `Err`
+/// before opening a PTY or spawning anything. The unix tree-kill is a pgid
+/// group-kill (`kill_process_tree`), which has no Windows analogue here: a Windows
+/// Job Object can only be ASSIGNED after `spawn_command` returns, so a backend that
+/// forks in the spawn→assign window escapes the job, and portable-pty exposes no
+/// `CREATE_SUSPENDED` to make the assign race-free. Rather than ship a tree-reap
+/// with a known escape hole, Windows fails closed (no live ephemeral worker ever
+/// exists) — tracked by t-20260622062549639786-41860-13.
+///
+/// ⚠ DRIFT: openpty/spawn plumbing duplicates spawn_agent (~1160-1207); the
+/// vterm.process+state.feed block duplicates pty_read_loop (~1666-1699). Keep in sync.
+pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralPtyHandle> {
+    // Windows FAIL-CLOSED — return BEFORE opening a PTY or spawning anything, so no
+    // process is ever created on a platform where we cannot guarantee tree-reap.
+    #[cfg(windows)]
+    {
+        // Tail expression (NOT `return`): on Windows the `#[cfg(unix)]` body below is
+        // stripped, so this block is the fn's tail — a `return` here trips
+        // clippy::needless_return under -D warnings on the windows-latest Check.
+        let _ = config;
+        Err(anyhow::anyhow!(
+            "ephemeral real-backend spawn is unsupported on Windows: the PTY layer lacks suspended-spawn (CREATE_SUSPENDED), so a backend forking before Job-Object assignment would escape process-tree reap. Ephemeral workers are unix-only for now — tracked by t-20260622062549639786-41860-13."
+        ))
+    }
+    // The remaining implementation is UNIX-ONLY — on Windows the early `return`
+    // above makes this unreachable, so it is `#[cfg(unix)]` (and the Windows build
+    // never compiles a body that depends on `kill_process_tree`'s pgid semantics).
+    #[cfg(unix)]
+    {
+        // build_command(config) UNCHANGED — the security-inheritance invariant. Every
+        // managed-agent security setup (#1504/#1440/#1519/#2106/#708/cwd-validate)
+        // applies identically because we share the exact same builder.
+        let (cmd, detected_backend) = build_command(config)?;
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: config.rows,
+                cols: config.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| anyhow::anyhow!("Failed to spawn '{}': {e}", config.backend_command))?;
+        drop(pair.slave);
+        let child_arc: Arc<Mutex<Box<dyn portable_pty::Child + Send>>> =
+            Arc::new(Mutex::new(child));
+        let pid = child_arc.lock().process_id().unwrap_or(0);
+
+        // Fix 2 (spawn rollback): ARM the kill-guard immediately. From here every `?`
+        // before the `Ok` return runs the guard's `Drop` → kills + reaps the child, so
+        // a failure in writer/reader/thread setup can never leave a zero-row orphan.
+        let mut kill_guard = SpawnKillGuard {
+            child: Arc::clone(&child_arc),
+            pid,
+            armed: true,
+        };
+
+        // Fix 3 (failure-seam, TEST-ONLY): with the kill-guard ARMED and the pid
+        // captured, a test can force a post-spawn failure to PROVE the armed guard's
+        // Drop reaps the live child (zero orphan). All seam code is `#[cfg(test)]` —
+        // absent + zero-cost in production builds.
+        #[cfg(test)]
+        if test_seam::force_postspawn_fail() {
+            test_seam::record_last_pid(pid);
+            return Err(anyhow::anyhow!("test: forced post-spawn failure"));
+        }
+
+        let pty_writer: PtyWriter = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
+        ));
+        let mut pty_reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
+        // Keep the master ALIVE for the worker's lifetime (matches spawn_agent). No pane
+        // → no resize use, but retaining it makes the PTY lifecycle explicit +
+        // cross-platform-safe rather than relying on the dup'd reader/writer to hold the
+        // master side open.
+        let pty_master = pair.master;
+
+        let core = Arc::new(CoreMutex::new(AgentCore {
+            vterm: VTerm::with_pty_writer(config.cols, config.rows, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
+            health: HealthTracker::new(),
+        }));
+
+        let dismiss: Vec<(String, Vec<u8>)> = detected_backend
+            .as_ref()
+            .map(|b| {
+                b.preset()
+                    .dismiss_patterns
+                    .iter()
+                    .map(|dp| (dp.label.to_string(), dp.sequence.to_vec()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dismiss = prepare_dismiss_patterns(&dismiss);
+
+        let core_clone = Arc::clone(&core);
+        let pw_for_dismiss = Arc::clone(&pty_writer);
+        let name = config.name.to_string();
+        // fire-and-forget: drains the worker PTY so the child never blocks on a full
+        // buffer; exits on PTY EOF when the child is reaped. NO handle_pty_close (no
+        // crash-respawn for ephemeral), so the JoinHandle is discarded.
+        std::thread::Builder::new()
+            .name(format!("{name}_eph_pty_read"))
+            .spawn(move || {
+                ephemeral_pty_read_loop(
+                    &mut pty_reader,
+                    &core_clone,
+                    &name,
+                    &pw_for_dismiss,
+                    &dismiss,
+                );
+            })?;
+
+        tracing::info!(
+            target: "ephemeral",
+            worker = %config.name,
+            backend = %config.backend_command,
+            pid,
+            "spawned ephemeral PTY worker (no pane, no roster)"
+        );
+        // Fix 2: all fallible setup succeeded — disarm the kill-guard so the live child
+        // survives the function return (ownership passes to the EphemeralPtyHandle).
+        kill_guard.disarm();
+        Ok(EphemeralPtyHandle {
+            pid,
+            child: child_arc,
+            pty_writer,
+            core,
+            pty_master,
+        })
+    }
+}
+
+/// #1967 PR3a Fix 3 (failure-seam, TEST-ONLY): a process-local toggle + observable
+/// the `spawn_ephemeral_worker` failure-injection test uses to force a post-spawn
+/// failure and read back the pid of the child the armed `SpawnKillGuard` reaped.
+/// `#[cfg(all(test, unix))]` — it does not exist in production builds, and on
+/// Windows ephemeral spawn is fail-closed so the seam (and its only callers, all
+/// unix-only) would be dead code. `pub(crate)` so the proving test in
+/// `crate::ephemeral_tracking::tests` can arm it + read the pid.
+#[cfg(all(test, unix))]
+pub(crate) mod test_seam {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static FORCE_POSTSPAWN_FAIL: AtomicBool = AtomicBool::new(false);
+    static LAST_EPHEMERAL_TEST_PID: AtomicU32 = AtomicU32::new(0);
+
+    /// True when a test has armed the forced post-spawn failure.
+    pub(crate) fn force_postspawn_fail() -> bool {
+        FORCE_POSTSPAWN_FAIL.load(Ordering::SeqCst)
+    }
+
+    /// Arm/disarm the forced post-spawn failure (a test sets it, then resets it).
+    pub(crate) fn set_force_postspawn_fail(on: bool) {
+        FORCE_POSTSPAWN_FAIL.store(on, Ordering::SeqCst);
+    }
+
+    /// Record the pid `spawn_ephemeral_worker` spawned right before the forced
+    /// failure, so the test can assert the armed guard killed+reaped it.
+    pub(crate) fn record_last_pid(pid: u32) {
+        LAST_EPHEMERAL_TEST_PID.store(pid, Ordering::SeqCst);
+    }
+
+    /// Read back the last forced-failure spawn pid (0 if none recorded).
+    pub(crate) fn last_pid() -> u32 {
+        LAST_EPHEMERAL_TEST_PID.load(Ordering::SeqCst)
+    }
+}
+
+/// #1967 PR3a: minimal PTY drain loop for an ephemeral worker — the headless
+/// counterpart to [`pty_read_loop`]. It drains the PTY (so the child never blocks
+/// on a full buffer), feeds VTerm + state detection (identically to `pty_read_loop`
+/// so state-detection can't drift), and auto-dismisses update modals (so an
+/// opencode/agy self-update prompt can't wedge the worker). It does NOT broadcast
+/// (no subscribers) and does NOT call `handle_pty_close` — ephemeral workers have
+/// no crash-respawn reaper; the loop just exits on PTY EOF/err when the worker is
+/// reaped.
+///
+/// ⚠ DRIFT: the vterm.process+state.feed block below duplicates pty_read_loop
+/// (~1666-1699). Keep in sync.
+///
+/// `#[cfg(unix)]`: only the unix-only body of `spawn_ephemeral_worker` spawns this
+/// read thread (Windows fails closed), so it is not compiled on Windows.
+#[cfg(unix)]
+fn ephemeral_pty_read_loop(
+    pty_reader: &mut dyn Read,
+    core: &Arc<CoreMutex<AgentCore>>,
+    name: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+) {
+    let mut buf = [0u8; 8192];
+    let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
+    let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
+    loop {
+        match pty_reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n_bytes) => {
+                let data = &buf[..n_bytes];
+                // Feed VTerm + state detection under one lock — the SAME disjoint
+                // field-borrow block as `pty_read_loop`, MINUS the broadcast (no
+                // subscribers). Kept byte-identical to avoid state-detection drift.
+                let (screen, state_changed, dismiss_latch_off) = {
+                    let mut c = core.lock();
+                    let AgentCore { vterm, state, .. } = &mut *c;
+                    vterm.process(data);
+                    let rows = vterm.rows() as usize;
+                    let screen = vterm.tail_lines_dewrapped(rows);
+                    let state_changed =
+                        state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+                    let dismiss_latch_off = state_changed
+                        && (state.get_state() == crate::state::AgentState::Idle
+                            || state.has_productive_output());
+                    (screen, state_changed, dismiss_latch_off)
+                };
+
+                let in_cooldown = dismiss_cooldown_until
+                    .map(|t| std::time::Instant::now() < t)
+                    .unwrap_or(false);
+                if dismiss_scan_enabled
+                    && state_changed
+                    && !in_cooldown
+                    && try_prepared_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns)
+                {
+                    dismiss_cooldown_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                }
+                if dismiss_latch_off {
+                    dismiss_scan_enabled = false;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(worker = name, error = %e, "ephemeral PTY read error, draining done");
+                break;
+            }
+        }
+    }
+}
+
 /// #CR-2026-06-14: lock the per-agent core (OFF the registry lock path) and
 /// report whether it has reached Idle. Kept as a helper so the readiness check
 /// snapshots `Arc::clone(&h.core)` under the registry lock, drops that guard, and

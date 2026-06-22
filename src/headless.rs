@@ -32,6 +32,18 @@
 //!    once a real backend runs (the git-editor pair pairs with #1).
 //!
 //! See also docs/design/1967-ephemeral-phase1.md (the same deferral list).
+//!
+//! ## #1967 PR3a status — retained but UNUSED by the spawn path
+//! PR3a switched ephemeral spawning to Route B (the PTY path in
+//! [`crate::agent::spawn_ephemeral_worker`], which reuses the full managed-agent
+//! `build_command` security). This module's Route-A (ACP / `std::process`)
+//! transport is no longer wired into `ephemeral_tracking`, so its items are dead
+//! today. It is retained as the seed for a future ACP per-backend enhancement.
+
+// #1967 PR2 Route-A (ACP/std::process) transport — retained as the seed for a
+// future ACP per-backend enhancement; PR3a (Route B) uses the PTY path in
+// agent::spawn_ephemeral_worker.
+#![allow(dead_code)]
 
 use crate::backend::{Backend, SpawnMode};
 use std::path::{Path, PathBuf};
