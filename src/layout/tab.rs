@@ -391,6 +391,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         }
     }
     fn tab_with_pane(name: &str, id: usize, rect: (u16, u16, u16, u16)) -> Tab {

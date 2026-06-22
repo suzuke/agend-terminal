@@ -107,7 +107,9 @@ pub fn spawn_offthread_parser(
     let _ = std::thread::Builder::new()
         .name(format!("{name}_parse"))
         .spawn(move || {
-            parser_loop(pane_id, &name, data_rx, resize_rx, vterm, publisher, wakeup_tx);
+            parser_loop(
+                pane_id, &name, data_rx, resize_rx, vterm, publisher, wakeup_tx,
+            );
         });
 
     OffthreadHandle {
@@ -280,7 +282,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got, "snapshot must reflect resized cols routed to parser thread");
+        assert!(
+            got,
+            "snapshot must reflect resized cols routed to parser thread"
+        );
     }
 
     /// Dropping the handle + closing the data channel makes the parser thread exit
@@ -295,8 +300,8 @@ mod tests {
         let h = spawn_offthread_parser(2, "t".to_string(), data_rx, vt, wake_tx);
         drop(h); // drop resize_tx
         drop(data_tx); // close data channel → thread exits → its wake_tx drops
-        // Once the thread returns, the only remaining wake_tx (moved into it) drops,
-        // so recv returns Disconnected within a bounded time.
+                       // Once the thread returns, the only remaining wake_tx (moved into it) drops,
+                       // so recv returns Disconnected within a bounded time.
         let mut disconnected = false;
         for _ in 0..20 {
             match wake_rx.recv_timeout(Duration::from_millis(200)) {
@@ -307,6 +312,9 @@ mod tests {
                 _ => continue,
             }
         }
-        assert!(disconnected, "parser thread must exit when data channel closes");
+        assert!(
+            disconnected,
+            "parser thread must exit when data channel closes"
+        );
     }
 }

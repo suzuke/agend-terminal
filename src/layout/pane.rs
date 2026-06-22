@@ -54,6 +54,13 @@ pub struct Pane {
     /// Whether input/resize go to a local PTY (via registry) or a remote
     /// daemon-hosted agent (via `BridgeClient`).
     pub source: PaneSource,
+    /// Option X (off-thread parse, `AGEND_OFFTHREAD_PARSE`): when `Some`, a
+    /// per-pane parser thread owns a SEPARATE `VTerm` and publishes immutable
+    /// grid snapshots via `ArcSwap`. The main thread then renders from the latest
+    /// snapshot and does NOT drain `rx` / parse here (`drain_output` no-ops and
+    /// `core_render` paints `snapshot` instead). `None` (default, flag OFF) = the
+    /// byte-identical main-thread drain+parse path.
+    pub offthread: Option<crate::render::offthread::OffthreadHandle>,
 }
 
 /// Text selection anchored to absolute scrollback logical coordinates so it
@@ -172,6 +179,14 @@ impl Pane {
     /// visually catches up across a few frames. Lossless + FIFO: chunks are
     /// processed in receive order; unprocessed chunks stay queued.
     pub fn drain_output(&mut self, budget_bytes: usize) -> usize {
+        // Option X (off-thread parse): when a parser thread owns this pane's VTerm
+        // it is the SOLE consumer of `rx` (a clone), so the main thread must NOT
+        // drain here — doing so would steal chunks from the parser (crossbeam is
+        // MPMC). Render reads the published snapshot instead. Flag OFF (default) →
+        // `offthread` is `None` → no-op and the path below is byte-identical.
+        if self.offthread.is_some() {
+            return 0;
+        }
         let probe_threshold = drain_probe_threshold_us();
         let probe_start = probe_threshold.map(|_| Instant::now());
         // #freeze-cputime: snapshot this thread's CPU time alongside the wall
@@ -372,6 +387,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         }
     }
 
@@ -437,6 +453,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         }
     }
 

@@ -641,15 +641,36 @@ fn render_pane(
         };
     }
     let inner = content.rect();
-    if let Some(d) =
-        crate::render::resize::ResizeDecision::needed(inner, pane.vterm.cols(), pane.vterm.rows())
-    {
-        pane.vterm.resize(d.cols, d.rows);
-        pane.resize_pty(registry, d.cols, d.rows);
-    }
     let render_offset = pane.scroll_offset;
-    pane.vterm
-        .render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
+    // The cursor source differs by render path (live VTerm vs off-thread
+    // snapshot); capture it here so the focused-cursor block below stays shared.
+    let cursor = if let Some(handle) = &pane.offthread {
+        // Option X (off-thread parse, flag AGEND_OFFTHREAD_PARSE): the parser
+        // thread owns the VTerm and publishes an immutable snapshot. The main
+        // thread does ZERO parse here — it loads the latest snapshot, paints it,
+        // and routes any resize to the parser thread (which owns the VTerm). P1
+        // renders the live offset-0 grid; off-thread scrollback is a P2 follow-up.
+        let snap = handle.load();
+        if let Some(d) = crate::render::resize::ResizeDecision::needed(inner, snap.cols, snap.rows)
+        {
+            handle.request_resize(d.cols, d.rows);
+            pane.resize_pty(registry, d.cols, d.rows);
+        }
+        snap.render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
+        snap.cursor
+    } else {
+        if let Some(d) = crate::render::resize::ResizeDecision::needed(
+            inner,
+            pane.vterm.cols(),
+            pane.vterm.rows(),
+        ) {
+            pane.vterm.resize(d.cols, d.rows);
+            pane.resize_pty(registry, d.cols, d.rows);
+        }
+        pane.vterm
+            .render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
+        pane.vterm.cursor_pos()
+    };
 
     if let Some(ref sel) = pane.selection {
         // Selection is stored in absolute scrollback logical coords; map each
@@ -686,7 +707,7 @@ fn render_pane(
     }
 
     if focused {
-        let (cursor_line, cursor_col) = pane.vterm.cursor_pos();
+        let (cursor_line, cursor_col) = cursor;
         let max_x = inner.x + inner.width.saturating_sub(1);
         let max_y = inner.y + inner.height.saturating_sub(1);
         let (cx, cy) = if render_offset == 0 {
@@ -862,6 +883,7 @@ mod tests {
             pending_notification_count: 3,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
         let joined = segments
@@ -889,6 +911,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         // #1713 flag OFF (default): no state badge appended; only the base label
         // (+ the transient Restarting/Crashed tab badge, which lives elsewhere).
@@ -920,6 +943,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         for (state, want) in [
             (AgentState::ServerRateLimit, "[ServerRateLimit]"),
@@ -972,6 +996,7 @@ mod tests {
                 pending_notification_count: 0,
                 selection: None,
                 source: PaneSource::Local,
+                offthread: None,
             },
         );
         let snapshot = HashMap::new();
@@ -1006,6 +1031,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1419,6 +1445,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1472,6 +1499,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1500,6 +1528,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         }
     }
 

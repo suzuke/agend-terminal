@@ -199,6 +199,7 @@ fn build_pane_placeholder(
         pending_notification_count: 0,
         selection: None,
         source: crate::layout::PaneSource::Local,
+        offthread: None,
     };
     (pane, fwd_tx)
 }
@@ -424,6 +425,25 @@ fn apply_attachment(
             }
         })
         .ok();
+
+    // Option X (off-thread parse, flag AGEND_OFFTHREAD_PARSE, default OFF): spawn a
+    // per-pane parser thread that owns its OWN `VTerm` and consumes a CLONE of the
+    // pane's `rx` (the screen dump enqueued above + every live chunk the forwarder
+    // pushes there). The main-thread `drain_output` no-ops while `offthread` is
+    // `Some`, so the parser is the sole consumer (no work-stealing split), and
+    // `render_pane` paints the published snapshot instead of parsing on the main
+    // thread. Flag OFF → no thread spawned, byte-identical to the path above.
+    if crate::render::offthread::offthread_parse_enabled() {
+        let parser_vterm = VTerm::new(pane.vterm.cols(), pane.vterm.rows());
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            pane_id,
+            name,
+            pane.rx.clone(),
+            parser_vterm,
+            wakeup_tx.clone(),
+        );
+        pane.offthread = Some(handle);
+    }
 }
 
 // ── #render-first phase-(b): deferred (background) attach ──────────────────
@@ -946,6 +966,7 @@ pub(super) fn attach_pane(
         pending_notification_count: 0,
         selection: None,
         source: crate::layout::PaneSource::Local,
+        offthread: None,
     })
 }
 
@@ -1122,6 +1143,7 @@ pub(super) fn create_remote_pane(
         pending_notification_count: 0,
         selection: None,
         source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
+        offthread: None,
     })
 }
 

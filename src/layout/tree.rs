@@ -505,6 +505,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         }
     }
     fn leaf_agent(id: usize, name: &str) -> Pane {
