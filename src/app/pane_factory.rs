@@ -435,14 +435,16 @@ fn apply_attachment(
     // thread. Flag OFF → no thread spawned, byte-identical to the path above.
     if crate::render::offthread::offthread_parse_enabled() {
         let parser_vterm = VTerm::new(pane.vterm.cols(), pane.vterm.rows());
-        let handle = crate::render::offthread::spawn_offthread_parser(
+        // spawn returns None if the OS thread can't be created → leave
+        // `offthread = None` so the pane keeps the byte-identical main-thread drain
+        // path rather than being stranded with a dead parser (#2404 r6 ③).
+        pane.offthread = crate::render::offthread::spawn_offthread_parser(
             pane_id,
             name,
             pane.rx.clone(),
             parser_vterm,
             wakeup_tx.clone(),
         );
-        pane.offthread = Some(handle);
     }
 }
 

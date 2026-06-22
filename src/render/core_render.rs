@@ -1075,7 +1075,8 @@ mod tests {
             data_rx,
             VTerm::new(38, 16),
             wake_tx,
-        );
+        )
+        .expect("parser thread spawns");
         data_tx
             .send(b"\x1b[2J\x1b[HOFFTHREAD_SNAP".to_vec())
             .unwrap();

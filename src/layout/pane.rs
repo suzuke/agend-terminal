@@ -527,7 +527,8 @@ mod tests {
             parser_rx,
             VTerm::new(20, 4),
             wake_tx,
-        );
+        )
+        .expect("parser thread spawns");
         let mut pane = test_pane(flood_rx, 20, 4);
         pane.offthread = Some(handle);
         for _ in 0..100 {

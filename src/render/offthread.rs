@@ -18,9 +18,10 @@
 
 use crate::vterm::{GridSnapshot, VTerm};
 use arc_swap::ArcSwap;
-use crossbeam_channel::{select, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{select, Receiver, Sender};
 use std::cell::Cell;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Max snapshot-publish rate: coalesce all parser events within this window into
@@ -61,6 +62,12 @@ pub struct OffthreadHandle {
     /// frame doesn't spam identical resizes (the parser/alacritty would no-op them
     /// anyway, but this avoids the channel traffic).
     last_sent_dims: Cell<(u16, u16)>,
+    /// Cancellation signal to the parser thread. Sending (or dropping this on
+    /// `OffthreadHandle::drop`) wakes the parser out of its `select!` so it exits
+    /// even while its data channel is still open — see [`Drop`] below (#2404 r6 ①).
+    cancel_tx: Sender<()>,
+    /// The parser thread, joined on drop for a leak-free, observable reap.
+    join: Option<JoinHandle<()>>,
 }
 
 impl OffthreadHandle {
@@ -81,42 +88,73 @@ impl OffthreadHandle {
     }
 }
 
+impl Drop for OffthreadHandle {
+    /// Reap the parser thread when the pane is dropped (#2404 r6 ① — fixes the
+    /// thread leak). RAII here covers EVERY pane-drop path (tab/pane/split close,
+    /// app shutdown, re-attach replace) — strictly more robust than signalling at
+    /// individual teardown sites.
+    ///
+    /// Why a signal is required: the parser holds a clone of the pane's `rx` and
+    /// the forwarder holds the matching `fwd_tx`, so when a pane closes while its
+    /// agent is still alive, the forwarder's sends keep succeeding and neither
+    /// thread would ever exit on its own. The explicit `cancel_tx.send` wakes the
+    /// parser out of `select!`; it returns WITHOUT publishing (no wakeup send), so
+    /// the join is bounded (the wakeup channel is unbounded → never blocks). Once
+    /// the parser exits it drops its `rx` clone, and the forwarder then exits on
+    /// its next send (its pre-existing flag-OFF lifecycle).
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 /// Spawn a per-pane parser thread that owns `vterm`, consumes `data_rx` (a clone
 /// of the pane's PTY-output channel — the main-thread drain no-ops in off-thread
 /// mode so this is the sole consumer), and publishes [`GridSnapshot`]s via
-/// `ArcSwap`. Returns the main-thread [`OffthreadHandle`].
+/// `ArcSwap`. Returns the main-thread [`OffthreadHandle`], or `None` if the OS
+/// thread could not be created — the caller then falls back to the main-thread
+/// drain path instead of stranding the pane with no parser (#2404 r6 ③).
 ///
-/// The thread is fire-and-forget: it exits when `data_rx` disconnects (the pane
-/// was dropped → forwarder's `fwd_tx` send fails → channel closes). The initial
-/// snapshot is a blank grid so render always has something to paint.
+/// The thread is reaped on [`OffthreadHandle::drop`] (NOT fire-and-forget): the
+/// stored `JoinHandle` is joined there after a cancel signal, so a pane close can
+/// never leak it (#2404 r6 ①). The initial snapshot is a blank grid so render
+/// always has something to paint.
 pub fn spawn_offthread_parser(
     pane_id: usize,
     name: String,
     data_rx: Receiver<Vec<u8>>,
     vterm: VTerm,
     wakeup_tx: Sender<usize>,
-) -> OffthreadHandle {
+) -> Option<OffthreadHandle> {
     let cols = vterm.cols();
     let rows = vterm.rows();
     let snapshot = Arc::new(ArcSwap::from_pointee(GridSnapshot::blank(cols, rows)));
     let (resize_tx, resize_rx) = crossbeam_channel::unbounded::<(u16, u16)>();
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     let publisher = Arc::clone(&snapshot);
 
-    // fire-and-forget: per-pane parser thread; exits when data_rx disconnects
-    // (pane dropped). No JoinHandle needed — pane teardown closes the channel.
-    let _ = std::thread::Builder::new()
+    // NOT fire-and-forget: the JoinHandle is stored on the returned
+    // `OffthreadHandle` and joined in its `Drop` (after a cancel signal) for a
+    // bounded, leak-free reap on pane close (#2404 r6 ①). On spawn failure return
+    // `None` so the caller keeps the byte-identical main-thread path (#2404 r6 ③).
+    let join = std::thread::Builder::new()
         .name(format!("{name}_parse"))
         .spawn(move || {
             parser_loop(
-                pane_id, &name, data_rx, resize_rx, vterm, publisher, wakeup_tx,
+                pane_id, &name, data_rx, resize_rx, cancel_rx, vterm, publisher, wakeup_tx,
             );
-        });
+        })
+        .ok()?;
 
-    OffthreadHandle {
+    Some(OffthreadHandle {
         snapshot,
         resize_tx,
         last_sent_dims: Cell::new((cols, rows)),
-    }
+        cancel_tx,
+        join: Some(join),
+    })
 }
 
 enum Event {
@@ -124,61 +162,78 @@ enum Event {
     Resize(Result<(u16, u16), crossbeam_channel::RecvError>),
 }
 
+/// Flush all immediately-available data into `vterm` at the CURRENT dims. Called
+/// right before applying a resize so a queued resize can never be parsed ahead of
+/// bytes that were already enqueued (#2404 r6 ②): the main-thread path parses
+/// queued bytes at the old size and only then resizes, and `select!` alone is
+/// non-deterministic, so without this a backlog of pre-resize bytes could be
+/// parsed at the new dims → wrong wrapping.
+///
+/// Residual window (P1, documented — NOT closed here, and pre-existing): the
+/// forwarder feeds this channel asynchronously, so bytes the agent produced at the
+/// old dims but that the forwarder hasn't transferred yet are NOT in the channel
+/// when we drain, and a symmetric ε-skew exists because the render thread issues
+/// `resize_pty` (SIGWINCH) and the parser applies `vterm.resize` on different
+/// threads. The MAIN-THREAD path has the same async-forwarder window (its next
+/// frame parses late bytes at whatever dims `pane.vterm` then holds), so this is
+/// not a regression, and an in-band single channel would NOT close it either (the
+/// late bytes still arrive after the resize). It is a transient: a TUI repaints
+/// its whole screen on SIGWINCH, so any briefly mis-wrapped cells are overwritten
+/// by the post-resize redraw — no persistent corruption. (#2404 r6 ② deeper edge.)
+fn drain_pending_data(data_rx: &Receiver<Vec<u8>>, vterm: &mut VTerm) {
+    while let Ok(d) = data_rx.try_recv() {
+        vterm.process(&d);
+    }
+}
+
 /// The parser thread body: block for an event, coalesce a burst within
 /// [`SNAPSHOT_COALESCE_MS`], apply all events to the owned `VTerm`, then publish
-/// ONE snapshot + one render wakeup. Exits when the data channel disconnects.
+/// ONE snapshot + one render wakeup. Exits when the data channel disconnects OR a
+/// cancel arrives (pane closed — see [`OffthreadHandle`]'s `Drop`); the cancel
+/// path returns WITHOUT publishing so the handle's join is never blocked.
+#[allow(clippy::too_many_arguments)] // thread entry point: per-pane channels + publish context
 fn parser_loop(
     pane_id: usize,
     name: &str,
     data_rx: Receiver<Vec<u8>>,
     resize_rx: Receiver<(u16, u16)>,
+    cancel_rx: Receiver<()>,
     mut vterm: VTerm,
     publisher: Arc<ArcSwap<GridSnapshot>>,
     wakeup_tx: Sender<usize>,
 ) {
     let coalesce = Duration::from_millis(SNAPSHOT_COALESCE_MS);
-    // Once the resize channel disconnects (handle dropped) we stop selecting on it
-    // to avoid a busy-loop on the perpetually-ready Err; data_rx then drives exit.
-    let mut resize_open = true;
 
     loop {
-        // Phase 1 — block for the first event of a burst.
-        let first = if resize_open {
-            select! {
-                recv(data_rx) -> m => Event::Data(m),
-                recv(resize_rx) -> m => Event::Resize(m),
-            }
-        } else {
-            Event::Data(data_rx.recv())
+        // Phase 1 — block for the first event of a burst. A cancel (send or
+        // channel-disconnect when the handle drops) exits immediately, no publish.
+        let first = select! {
+            recv(cancel_rx) -> _ => return,
+            recv(data_rx) -> m => Event::Data(m),
+            recv(resize_rx) -> m => Event::Resize(m),
         };
         match first {
-            Event::Data(Err(_)) => break, // pane gone → exit thread
-            Event::Resize(Err(_)) => {
-                resize_open = false;
-                continue;
-            }
+            // Data channel closed = agent gone + forwarder exited → done.
+            Event::Data(Err(_)) => return,
+            // Resize channel closed = handle dropped (cancel is the primary path,
+            // this is the backstop) → done.
+            Event::Resize(Err(_)) => return,
             Event::Data(Ok(d)) => vterm.process(&d),
-            Event::Resize(Ok((c, r))) => vterm.resize(c, r),
+            Event::Resize(Ok((c, r))) => {
+                drain_pending_data(&data_rx, &mut vterm);
+                vterm.resize(c, r);
+            }
         }
 
         // Phase 2 — coalesce everything that arrives within the window.
         let deadline = Instant::now() + coalesce;
         loop {
             let timeout = deadline.saturating_duration_since(Instant::now());
-            let ev = if resize_open {
-                select! {
-                    recv(data_rx) -> m => Some(Event::Data(m)),
-                    recv(resize_rx) -> m => Some(Event::Resize(m)),
-                    default(timeout) => None,
-                }
-            } else {
-                match data_rx.recv_timeout(timeout) {
-                    Ok(d) => Some(Event::Data(Ok(d))),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        Some(Event::Data(Err(crossbeam_channel::RecvError)))
-                    }
-                }
+            let ev = select! {
+                recv(cancel_rx) -> _ => return,
+                recv(data_rx) -> m => Some(Event::Data(m)),
+                recv(resize_rx) -> m => Some(Event::Resize(m)),
+                default(timeout) => None,
             };
             match ev {
                 None => break, // coalesce window elapsed
@@ -188,8 +243,11 @@ fn parser_loop(
                     publish(&vterm, &publisher, &wakeup_tx, pane_id, name);
                     return;
                 }
-                Some(Event::Resize(Ok((c, r)))) => vterm.resize(c, r),
-                Some(Event::Resize(Err(_))) => resize_open = false,
+                Some(Event::Resize(Ok((c, r)))) => {
+                    drain_pending_data(&data_rx, &mut vterm);
+                    vterm.resize(c, r);
+                }
+                Some(Event::Resize(Err(_))) => return,
             }
         }
 
@@ -227,6 +285,7 @@ fn publish(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crossbeam_channel::RecvTimeoutError;
 
     /// End-to-end: spawn the parser thread, push PTY bytes through `data_rx`,
     /// wait for the publish wakeup, and assert the published snapshot reflects the
@@ -236,7 +295,8 @@ mod tests {
         let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
         let vt = VTerm::new(20, 4);
-        let h = spawn_offthread_parser(7, "test".to_string(), data_rx, vt, wake_tx);
+        let h = spawn_offthread_parser(7, "test".to_string(), data_rx, vt, wake_tx)
+            .expect("parser thread spawns");
 
         // Initial snapshot is blank.
         assert_eq!(h.load().cursor, (0, 0));
@@ -266,7 +326,8 @@ mod tests {
         let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
         let vt = VTerm::new(20, 4);
-        let h = spawn_offthread_parser(1, "t".to_string(), data_rx, vt, wake_tx);
+        let h = spawn_offthread_parser(1, "t".to_string(), data_rx, vt, wake_tx)
+            .expect("parser thread spawns");
 
         assert!(h.request_resize(30, 6), "first resize must send");
         assert!(!h.request_resize(30, 6), "duplicate resize must be deduped");
@@ -289,23 +350,22 @@ mod tests {
         );
     }
 
-    /// Dropping the handle + closing the data channel makes the parser thread exit
-    /// (no leak). We can't join a fire-and-forget thread directly; instead assert
-    /// the wakeup channel disconnects once the thread returns and its `wakeup_tx`
-    /// clone drops.
+    /// Agent-death path: with the handle still alive, closing the data channel
+    /// (the agent's broadcast ended + forwarder exited) makes the parser exit. The
+    /// parser's `wakeup_tx` clone drops on exit, so the wakeup channel disconnects.
     #[test]
     fn parser_thread_exits_when_data_channel_closes() {
         let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
         let vt = VTerm::new(10, 3);
-        let h = spawn_offthread_parser(2, "t".to_string(), data_rx, vt, wake_tx);
-        drop(h); // drop resize_tx
-        drop(data_tx); // close data channel → thread exits → its wake_tx drops
-                       // Once the thread returns, the only remaining wake_tx (moved into it) drops,
-                       // so recv returns Disconnected within a bounded time.
+        // Keep `h` alive (resize/cancel channels open) so this exercises the
+        // data-close exit path, NOT the handle-drop cancel path.
+        let _h = spawn_offthread_parser(2, "t".to_string(), data_rx, vt, wake_tx)
+            .expect("parser thread spawns");
+        drop(data_tx); // close data channel → parser exits → its wake_tx drops
         let mut disconnected = false;
-        for _ in 0..20 {
-            match wake_rx.recv_timeout(Duration::from_millis(200)) {
+        for _ in 0..50 {
+            match wake_rx.recv_timeout(Duration::from_millis(100)) {
                 Err(RecvTimeoutError::Disconnected) => {
                     disconnected = true;
                     break;
@@ -315,7 +375,109 @@ mod tests {
         }
         assert!(
             disconnected,
-            "parser thread must exit when data channel closes"
+            "parser thread must exit when its data channel closes"
+        );
+    }
+
+    /// #2404 r6 ① regression — the thread-leak fix. When the pane is closed while
+    /// the agent is STILL ALIVE, the data channel stays open (the forwarder keeps
+    /// `fwd_tx`, the parser keeps the `rx` clone), so the parser would never exit
+    /// on its own. Dropping the `OffthreadHandle` must reap it anyway via the
+    /// cancel signal + join. We hold `data_tx` (= agent alive) for the whole test,
+    /// drop the handle, then assert the parser exited (its `wakeup_tx` dropped →
+    /// wakeup channel disconnected). The old code (no cancel) would hang here.
+    #[test]
+    fn parser_exits_on_handle_drop_even_with_data_channel_open() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let vt = VTerm::new(10, 3);
+        let h = spawn_offthread_parser(3, "t".to_string(), data_rx, vt, wake_tx)
+            .expect("parser thread spawns");
+        // Agent alive: data channel stays open for the whole test.
+        drop(h); // Drop signals cancel + joins → parser is reaped before this returns.
+        assert!(
+            wake_rx.recv().is_err(),
+            "handle drop must reap the parser even with the data channel open; \
+             its wakeup_tx clone should have dropped"
+        );
+        drop(data_tx); // keep `data_tx` alive until here so the test reflects an alive agent
+    }
+
+    /// #2404 r6 ① — close + re-attach must NOT accumulate ghost parser threads.
+    /// The agent stays alive for the whole test (one data channel held open), and
+    /// each attach/close cycle drops its handle → the parser is reaped (cancel +
+    /// join in `Drop`) before the next cycle. Per-cycle reap is proven by each
+    /// parser's own wakeup channel disconnecting once its thread exits.
+    #[test]
+    fn close_then_reattach_does_not_accumulate_ghost_parsers() {
+        // Agent alive for the whole test: a single data channel, never closed.
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        for cycle in 0..3 {
+            // A fresh wakeup channel per attach so we observe THIS parser's reap.
+            let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+            let h = spawn_offthread_parser(
+                cycle,
+                "t".to_string(),
+                data_rx.clone(),
+                VTerm::new(10, 3),
+                wake_tx,
+            )
+            .expect("parser thread spawns");
+            // "Close the pane": drop the handle while the agent (data_tx) is alive.
+            // The join in Drop reaps the parser before this returns, so its
+            // wakeup_tx clone is gone and this cycle's wake channel disconnects.
+            drop(h);
+            assert!(
+                wake_rx.recv().is_err(),
+                "cycle {cycle}: parser must be reaped on close even with the agent alive"
+            );
+        }
+        drop(data_tx);
+    }
+
+    /// #2404 r6 ② regression — ordering: a queued resize must NOT be applied ahead
+    /// of bytes that were already enqueued. Width-sensitive probe: 20 `X` then
+    /// cursor-home + erase-line. Parsed at cols=20 the 20 X's fill exactly row 0,
+    /// so erase-line blanks the whole line → empty grid. If the resize to cols=5
+    /// were (wrongly) applied first, the 20 X's would wrap to 4 rows and erase-line
+    /// would clear only row 0, leaving X's in rows 1-3. The fix
+    /// (`drain_pending_data` before every resize) makes the empty result
+    /// deterministic regardless of `select!` ordering.
+    #[test]
+    fn resize_does_not_reorder_ahead_of_queued_data() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let vt = VTerm::new(20, 6);
+        let h = spawn_offthread_parser(4, "t".to_string(), data_rx, vt, wake_tx)
+            .expect("parser thread spawns");
+
+        // Queue the width-sensitive bytes, then the resize. Both are pending when
+        // the parser runs; the fix guarantees the bytes are parsed at cols=20 first.
+        data_tx
+            .send(b"XXXXXXXXXXXXXXXXXXXX\x1b[H\x1b[K".to_vec())
+            .unwrap();
+        assert!(h.request_resize(5, 6), "resize to cols=5 must send");
+
+        // Wait until the resize has been applied (snapshot dims == 5).
+        let mut resized = false;
+        for _ in 0..50 {
+            if wake_rx.recv_timeout(Duration::from_millis(100)).is_err() {
+                break;
+            }
+            if h.load().cols == 5 {
+                resized = true;
+                break;
+            }
+        }
+        assert!(resized, "snapshot must reflect the resize to cols=5");
+
+        let snap = h.load();
+        let any_x = snap.cells.iter().any(|c| c.c == 'X');
+        assert!(
+            !any_x,
+            "bytes queued before the resize must be parsed at the OLD width \
+             (erase-line clears the single full row); found stray 'X' = resize \
+             jumped ahead of queued data"
         );
     }
 }
