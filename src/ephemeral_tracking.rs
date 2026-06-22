@@ -96,8 +96,17 @@ pub struct EphemeralWorker {
     pub ttl_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
-    pub phase: String,  // "reserving" | "spawned" | "running" | "done"
+    pub phase: String, // "reserving" | "spawned" | "running" | "prompting" | "done"
     pub status: String, // "reserving" | "running" | "done"
+    /// PR3b: the driver's captured turn transcript slice (the worker's "answer").
+    /// `None` until the one-shot turn completes; absent on workers spawned without
+    /// a prompt (PR3a lifecycle-only spawn). Coarse — durable telemetry is PR4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    /// PR3b: the success oracle's verdict for the turn (terminal Idle ∧ ¬error-class
+    /// ∧ transcript grew). `None` until the turn completes (or no prompt was given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -159,6 +168,12 @@ pub struct SpawnSpec {
     pub backend: String,
     pub ttl_secs: Option<u64>,
     pub token_budget: Option<u64>,
+    /// PR3b: the prompt the driver injects for the worker's one-shot turn. EMPTY =
+    /// PR3a lifecycle-only spawn (no driver thread launched — spawn + reap only).
+    pub prompt: String,
+    /// PR3b: optional model override (e.g. `provider/model` for opencode), passed to
+    /// the backend via its spawn argv. `None` = the backend's configured default.
+    pub model: Option<String>,
 }
 
 /// Why a spawn failed.
@@ -168,6 +183,12 @@ pub enum SpawnError {
     /// that doesn't map to a known backend) — an arbitrary-exec guard. Carries the
     /// rejected input for the operator-facing error.
     UnsupportedBackend(String),
+    /// PR3b: a `prompt` was given for a backend whose one-shot driver is not yet
+    /// smoke-validated. Slice-1 ships the opencode driver ONLY; other backends are
+    /// Slice-2 (each gated on a §5 per-backend smoke per the confirm-first iron rule).
+    /// Carries the rejected backend. A prompt-less spawn of any backend is unaffected
+    /// (the PR3a lifecycle-only spawn path).
+    DriverUnsupported(String),
     /// The hard max-live concurrency cap would be exceeded.
     CapExceeded { live: usize, cap: usize },
     /// The durable cap reservation could not be persisted (store write failed) —
@@ -184,6 +205,12 @@ impl std::fmt::Display for SpawnError {
                 f,
                 "ephemeral spawn: unsupported backend '{b}' — must be a bare backend command \
                  (no path separators), one of: claude, codex, opencode, kiro-cli, agy"
+            ),
+            SpawnError::DriverUnsupported(b) => write!(
+                f,
+                "ephemeral spawn: a prompt-driven one-shot turn is only supported for 'opencode' \
+                 (PR3b Slice-1); backend '{b}' is Slice-2 (pending a per-backend turn-detection \
+                 smoke). Spawn it without a prompt for a lifecycle-only worker."
             ),
             SpawnError::CapExceeded { live, cap } => write!(
                 f,
@@ -352,6 +379,42 @@ fn release_reservation(home: &Path, worker_id: &str) {
     );
 }
 
+/// PR3b: the driver flips a worker's phase to `"prompting"` just before it injects the
+/// prompt, so `ephemeral list` reflects the mid-turn state. Best-effort (log-on-fail) —
+/// a lost write only loses an observability nuance, not correctness. A vanished row
+/// (concurrently reaped) is a no-op.
+pub(crate) fn mark_prompting(home: &Path, worker_id: &str) {
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
+            if let Some(w) = s.workers.iter_mut().find(|w| w.worker_id == worker_id) {
+                w.phase = "prompting".to_string();
+            }
+            Ok(())
+        }),
+        "ephemeral_mark_prompting"
+    );
+}
+
+/// PR3b: the driver writes the one-shot turn's outcome to the worker row and marks it
+/// terminal (`phase` + `status` = `"done"`), so the next [`reap_sweep`] terminates the
+/// now-idle worker process ([`is_due`] fires on `STATUS_DONE`) and frees the cap slot.
+/// Best-effort persist (log-on-fail) — a lost write only delays reap to the wall-TTL
+/// backstop. A vanished row (concurrently reaped) is a no-op.
+pub(crate) fn record_result(home: &Path, worker_id: &str, result_summary: String, success: bool) {
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
+            if let Some(w) = s.workers.iter_mut().find(|w| w.worker_id == worker_id) {
+                w.result_summary = Some(result_summary.clone());
+                w.success = Some(success);
+                w.phase = STATUS_DONE.to_string();
+                w.status = STATUS_DONE.to_string();
+            }
+            Ok(())
+        }),
+        "ephemeral_record_result"
+    );
+}
+
 /// Spawn a real backend HEADLESSLY (Route B — a PTY child with no pane / no
 /// roster, via [`crate::agent::spawn_ephemeral_worker`]) under the hard max-live
 /// cap. Admission is BEFORE the spawn (r4 PR1 note): **reserve → spawn →
@@ -371,6 +434,18 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
         Ok(cmd) => cmd,
         Err(_) => return Err(SpawnError::UnsupportedBackend(spec.backend.clone())),
     };
+
+    // 0b) DRIVER GATE (PR3b) — a `prompt` launches the one-shot driver (inject →
+    //     turn-end → capture → oracle), which is smoke-validated for opencode ONLY
+    //     (Slice-1). Reject a prompt for any other backend BEFORE reserving/spawning
+    //     (confirm-first iron rule: never drive a backend whose turn-end detection
+    //     isn't proven on a real turn). A prompt-LESS spawn of any backend is the PR3a
+    //     lifecycle-only path and is unaffected. Gated in the SHARED SINK so a direct
+    //     caller, not just the MCP handler, is protected.
+    let drive_turn = !spec.prompt.is_empty();
+    if drive_turn && backend_command != crate::backend::Backend::OpenCode.preset().command {
+        return Err(SpawnError::DriverUnsupported(spec.backend.clone()));
+    }
 
     let ttl_secs = resolve_ttl(spec.ttl_secs);
     let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -392,6 +467,8 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
         token_budget: spec.token_budget,
         phase: STATUS_RESERVING.to_string(),
         status: STATUS_RESERVING.to_string(),
+        result_summary: None,
+        success: None,
     };
     match try_reserve_slot(home, reserving) {
         Ok(()) => {}
@@ -410,10 +487,17 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
     //    create_dir_all err is ignored — `build_command` re-creates + re-validates.
     let cwd = home.join("backend-data").join("ephemeral").join(&worker_id);
     std::fs::create_dir_all(&cwd).ok();
+    // PR3b: an optional model override goes into the spawn argv (opencode gets a
+    // provider-prefixed `--model`; see `Backend::push_model_arg`). Empty/None = no-op,
+    // so a model-less spawn is byte-identical to the PR3a `args: &[]`.
+    let mut spawn_args: Vec<String> = Vec::new();
+    if let Some(model) = spec.model.as_deref() {
+        crate::backend::Backend::push_model_arg(&mut spawn_args, backend_command, model);
+    }
     let config = crate::agent::SpawnConfig {
         name: &worker_id,
         backend_command, // canonical (allowlist-resolved) — never the raw input
-        args: &[],
+        args: &spawn_args,
         spawn_mode: crate::backend::SpawnMode::Fresh, // ephemeral workers are always fresh
         cols: 200,
         rows: 50,
@@ -437,6 +521,24 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
     // 3) FINALIZE — stamp the real pid/token + flip reserving → running.
     match finalize_spawn(home, &worker_id, pid, token) {
         Ok(worker) => {
+            // PR3b: launch the one-shot driver BEFORE moving the handle into
+            // LIVE_CHILDREN, capturing the inject target (Arc clones of the retained
+            // pty_writer + core) so the driver is decoupled from the handle the reaper
+            // owns. Only when a prompt was given (opencode, gated in step 0b) — else
+            // this is the PR3a lifecycle-only spawn (no driver thread).
+            if drive_turn {
+                let inject_target = crate::agent::InjectTarget::from_ephemeral(
+                    &handle,
+                    crate::backend::Backend::OpenCode,
+                );
+                crate::ephemeral_driver::spawn_driver(crate::ephemeral_driver::DriverConfig {
+                    home: home.to_path_buf(),
+                    worker_id: worker_id.clone(),
+                    prompt: spec.prompt.clone(),
+                    inject_target,
+                    wall_ttl: std::time::Duration::from_secs(ttl_secs),
+                });
+            }
             LIVE_CHILDREN.lock().insert(worker_id, handle);
             Ok(worker)
         }
@@ -977,6 +1079,8 @@ mod tests {
             backend: "claude".to_string(),
             ttl_secs: Some(60),
             token_budget: None,
+            prompt: String::new(),
+            model: None,
         };
         let res = spawn_and_track(&home, spec);
         assert!(
@@ -1107,6 +1211,8 @@ mod tests {
             backend: "/tmp/evil.sh".to_string(),
             ttl_secs: Some(60),
             token_budget: None,
+            prompt: String::new(),
+            model: None,
         };
         let res = spawn_and_track(&home, spec);
         assert!(
@@ -1131,6 +1237,8 @@ mod tests {
             backend: "bogus".to_string(),
             ttl_secs: Some(60),
             token_budget: None,
+            prompt: String::new(),
+            model: None,
         };
         assert!(matches!(
             spawn_and_track(&home, spec),
@@ -1268,6 +1376,8 @@ mod tests {
             backend: "claude".to_string(), // valid backend so we reach the reserve step
             ttl_secs: Some(60),
             token_budget: None,
+            prompt: String::new(),
+            model: None,
         };
         let res = spawn_and_track(&file_home, spec);
         assert!(
@@ -1596,5 +1706,135 @@ mod tests {
             pid,
             "cleanup: reap the worker spawned by the disarmed-path test",
         );
+    }
+
+    // ─────────────────── PR3b: driver gate + result recording ───────────────────
+
+    /// PR3b driver GATE: a `prompt` for a NON-opencode backend is rejected as
+    /// `DriverUnsupported` BEFORE any reserve/spawn (confirm-first iron rule — only
+    /// opencode's turn-end detection is smoke-validated in Slice-1). Gated in the
+    /// SHARED SINK so a direct caller, not just the MCP handler, is protected. A
+    /// prompt-LESS spawn of any backend is unaffected (the PR3a lifecycle path).
+    #[test]
+    fn spawn_and_track_rejects_prompt_for_non_opencode_backend() {
+        let home = tmp_home("driver-gate");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "claude".to_string(),
+            prompt: "do the thing".to_string(),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::DriverUnsupported(b)) if b == "claude"),
+            "a prompt for a non-opencode backend must be DriverUnsupported: {res:?}"
+        );
+        assert_eq!(
+            list(&home, None).len(),
+            0,
+            "the driver gate rejects before reserve — no row, no process"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR3b: `mark_prompting` flips phase to `prompting`; `record_result` writes the
+    /// outcome and marks the worker terminal (phase + status = `done`) so the next
+    /// reap sweep ([`is_due`] on `STATUS_DONE`) terminates it + frees the cap slot.
+    #[test]
+    fn record_result_marks_done_with_outcome() {
+        let home = tmp_home("record-result");
+        // Seed a running worker row (bypass the cap gate for a pure store test).
+        persist_or_log!(
+            crate::store::mutate_versioned(&store_path(&home), |s: &mut EphemeralStore| {
+                s.workers.push(EphemeralWorker {
+                    worker_id: "w1".to_string(),
+                    pid: 1234,
+                    spawned_at: chrono::Utc::now().to_rfc3339(),
+                    ttl_secs: 100,
+                    phase: "spawned".to_string(),
+                    status: STATUS_RUNNING.to_string(),
+                    ..Default::default()
+                });
+                Ok(())
+            }),
+            "seed"
+        );
+        mark_prompting(&home, "w1");
+        assert_eq!(list(&home, None)[0].phase, "prompting");
+
+        record_result(&home, "w1", "the answer".to_string(), true);
+        let w = list(&home, None);
+        let w = &w[0];
+        assert_eq!(w.result_summary.as_deref(), Some("the answer"));
+        assert_eq!(w.success, Some(true));
+        assert_eq!(w.phase, STATUS_DONE);
+        assert_eq!(
+            w.status, STATUS_DONE,
+            "done status → reap sweep terminates it"
+        );
+        assert!(
+            is_due(w, chrono::Utc::now()),
+            "a done worker is due for the next reap sweep"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// REAL opencode end-to-end (`#[ignore]`: no binary/creds in CI). Drives a real
+    /// headless opencode worker through `spawn_and_track`'s driver path — inject →
+    /// Idle-debounce turn-end → capture → oracle — and asserts the worker records
+    /// success with a non-empty transcript. Run locally:
+    /// `cargo test --bin agend-terminal --features tray -- --ignored ephemeral_opencode_driver_e2e`.
+    /// Uses a FREE model; avoid the `omlx` stub provider (it wedges opencode).
+    /// `#[cfg(unix)]`: ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a real opencode install + auth; run locally"]
+    fn ephemeral_opencode_driver_e2e() {
+        let home = tmp_home("opencode-e2e");
+        let spec = SpawnSpec {
+            workflow_id: "e2e".to_string(),
+            backend: "opencode".to_string(),
+            prompt: "Reply with exactly the word: pong".to_string(),
+            model: Some("opencode/deepseek-v4-flash-free".to_string()),
+            ttl_secs: Some(180),
+            ..Default::default()
+        };
+        let w = spawn_and_track(&home, spec).expect("spawn opencode worker");
+        assert_ne!(w.pid, 0, "a real pid was stamped");
+
+        // The driver runs ASYNC (matches the MCP contract). Poll the row until it
+        // records a result, or a generous cap. No reap sweep runs in-test, so the
+        // done row persists until we reap it explicitly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+        let outcome = loop {
+            match list(&home, None)
+                .into_iter()
+                .find(|r| r.worker_id == w.worker_id)
+            {
+                Some(row) => {
+                    if let Some(success) = row.success {
+                        break Some((success, row.result_summary));
+                    }
+                }
+                None => break None, // unexpectedly reaped
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the driver did not record a result within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+        reap_one(&home, &w.worker_id); // terminate the worker process regardless
+
+        let (success, summary) = outcome.expect("the worker row must carry a result before reap");
+        assert!(
+            success,
+            "a simple prompt turn must succeed; summary={summary:?}"
+        );
+        assert!(
+            summary.map(|s| !s.trim().is_empty()).unwrap_or(false),
+            "result_summary must be non-empty on success"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

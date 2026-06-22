@@ -2923,6 +2923,34 @@ impl InjectTarget {
             core: Arc::clone(&h.core),
         }
     }
+
+    /// PR3b (#1967): build an inject target for a HEADLESS ephemeral worker, which
+    /// has no registry [`AgentHandle`]. The inject params come from the worker's
+    /// backend preset (`inject_prefix` / `submit_key` / `typed_inject`) instead of a
+    /// handle; `deleted` is a fresh always-false flag (an ephemeral worker is never
+    /// registry-deleted). Clones the retained `pty_writer` + `core` (Arc) so the
+    /// returned target is independent of the [`EphemeralPtyHandle`] (which the reaper
+    /// owns in `LIVE_CHILDREN`).
+    pub(crate) fn from_ephemeral(h: &EphemeralPtyHandle, backend: crate::backend::Backend) -> Self {
+        let preset = backend.preset();
+        Self {
+            pty_writer: Arc::clone(&h.pty_writer),
+            inject_prefix: preset.inject_prefix.to_string(),
+            submit_key: preset.submit_key.to_string(),
+            typed_inject: preset.typed_inject,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            core: Arc::clone(&h.core),
+        }
+    }
+}
+
+/// PR3b (#1967): drive a prompt inject into a headless ephemeral worker. The
+/// ephemeral driver lives outside this module ([`crate::ephemeral_driver`]), where
+/// [`InjectTarget`] + [`inject_with_target`] are private — this is the crate-visible
+/// entry point. Synchronous (PTY writes + the #1912 typed-inject readback-confirm),
+/// so it MUST be called off the daemon's threads (the driver's own thread).
+pub(crate) fn run_ephemeral_inject(target: &InjectTarget, text: &[u8]) -> crate::error::Result<()> {
+    inject_with_target(target, text)
 }
 
 /// Send a message to a named agent via direct registry injection.

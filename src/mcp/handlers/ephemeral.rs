@@ -46,6 +46,15 @@ pub(super) fn handle_spawn(home: &Path, args: &Value, _instance_name: &str) -> V
         Some(s) => s.to_string(),
         None => return json!({"error": "ephemeral spawn: missing required parameter 'backend'"}),
     };
+    // PR3b: an optional `prompt` launches the one-shot driver (inject → turn-end →
+    // capture → oracle), opencode ONLY (Slice-1; `spawn_and_track` rejects a prompt for
+    // any other backend). An optional `model` overrides the worker's default model
+    // (provider-prefixed for opencode). A prompt-less spawn is the PR3a lifecycle path.
+    let prompt = args["prompt"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let driven = !prompt.is_empty();
     let spec = crate::ephemeral_tracking::SpawnSpec {
         workflow_id,
         parent: args["parent"]
@@ -55,6 +64,11 @@ pub(super) fn handle_spawn(home: &Path, args: &Value, _instance_name: &str) -> V
         backend,
         ttl_secs: args["ttl_secs"].as_u64(),
         token_budget: args["token_budget"].as_u64(),
+        prompt,
+        model: args["model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     };
     match crate::ephemeral_tracking::spawn_and_track(home, spec) {
         Ok(w) => json!({
@@ -64,7 +78,14 @@ pub(super) fn handle_spawn(home: &Path, args: &Value, _instance_name: &str) -> V
             "workflow_id": w.workflow_id,
             "backend": w.backend,
             "ttl_secs": w.ttl_secs,
-            "note": "PR3a: real backend spawned headlessly via PTY (no pane, no roster); no prompt injection / capture yet (PR3b)",
+            "driven": driven,
+            "note": if driven {
+                "PR3b: spawned headlessly via PTY (no pane, no roster); a one-shot driver is \
+                 running the prompt ASYNC — poll `ephemeral list` for result_summary/success"
+            } else {
+                "PR3a: real backend spawned headlessly via PTY (no pane, no roster); no prompt \
+                 given, so lifecycle-only (spawn + reap, no driver)"
+            },
         }),
         Err(e) => json!({"error": e.to_string()}),
     }

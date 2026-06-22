@@ -32,6 +32,7 @@ mod deployments;
 mod dispatch_tracking;
 mod display_time;
 mod env_util;
+mod ephemeral_driver;
 mod ephemeral_tracking;
 mod error;
 mod event_log;

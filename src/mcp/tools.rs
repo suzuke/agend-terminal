@@ -292,14 +292,16 @@ pub(crate) fn def_deployment() -> Value {
 }
 
 pub(crate) fn def_ephemeral() -> Value {
-    json!({"name": "ephemeral", "description": "#1967 Phase-1 (PR1 scaffold): manage short-lived cross-backend ephemeral workers OUTSIDE managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap. NOTE: PR1 spawns a FAKE /bin/sleep child — real headless backend transport is a later PR.",
+    json!({"name": "ephemeral", "description": "#1967 Phase-1: manage short-lived cross-backend ephemeral workers OUTSIDE managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap. PR3a spawns a REAL backend headlessly via a PTY (gated by AGEND_EPHEMERAL_REAL_BACKEND, default OFF); PR3b: a `prompt` runs a one-shot turn (inject → turn-end → capture → oracle), opencode only.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["spawn", "list", "reap"]},
-            "backend": {"type": "string", "description": "spawn: target backend (e.g. opencode). PR1 spawns a fake child regardless; real backends land in PR2/PR3."},
+            "backend": {"type": "string", "description": "spawn: target backend, a bare command (claude, codex, opencode, kiro-cli, agy). A path or unknown name is rejected."},
             "workflow_id": {"type": "string", "description": "spawn: the owning workflow id (required). list/reap: optional filter to one workflow."},
             "parent": {"type": "string", "description": "spawn: optional parent worker/agent id for the telemetry tree."},
             "ttl_secs": {"type": "number", "description": "spawn: max wall-clock TTL in seconds (cost guard). Default 1800, clamped to 7200. The reap sweep terminates a worker past its TTL."},
             "token_budget": {"type": "number", "description": "spawn: per-worker token budget (recorded; enforcement lands in a later PR)."},
+            "prompt": {"type": "string", "description": "spawn (PR3b): prompt for a one-shot driven turn. Present = launch the driver (opencode ONLY; other backends rejected — Slice-2). Absent = lifecycle-only spawn (no driver). Poll `ephemeral list` for result_summary/success."},
+            "model": {"type": "string", "description": "spawn (PR3b): optional model override for the worker (provider-prefixed for opencode, e.g. opencode/deepseek-v4-flash-free). Default = the backend's configured model."},
             "worker_id": {"type": "string", "description": "reap: reap a single worker by id."},
             "all_stale": {"type": "boolean", "description": "reap: reap all due/dead workers (TTL-expired, terminal, or process gone)."}
         }, "required": ["action"]}})
@@ -937,6 +939,8 @@ mod tests {
             ("ephemeral", "workflow_id", "mcp/handlers/ephemeral.rs spawn/list/reap workflow filter"),
             ("ephemeral", "parent", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.parent"),
             ("ephemeral", "ttl_secs", "mcp/handlers/ephemeral.rs handle_spawn → ephemeral_tracking::resolve_ttl (max-wall-TTL guard)"),
+            ("ephemeral", "prompt", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.prompt → ephemeral_driver one-shot turn (PR3b)"),
+            ("ephemeral", "model", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.model → Backend::push_model_arg spawn argv (PR3b)"),
             ("ephemeral", "worker_id", "mcp/handlers/ephemeral.rs handle_reap → reap_one"),
             ("ephemeral", "all_stale", "mcp/handlers/ephemeral.rs handle_reap → reap_sweep"),
             // ── ci ──
