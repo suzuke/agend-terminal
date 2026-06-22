@@ -208,9 +208,10 @@ impl std::fmt::Display for SpawnError {
             ),
             SpawnError::DriverUnsupported(b) => write!(
                 f,
-                "ephemeral spawn: a prompt-driven one-shot turn is only supported for 'opencode' \
-                 (PR3b Slice-1); backend '{b}' is Slice-2 (pending a per-backend turn-detection \
-                 smoke). Spawn it without a prompt for a lifecycle-only worker."
+                "ephemeral spawn: a prompt-driven one-shot turn is only supported for \
+                 'opencode' and 'claude' (PR3b Slice-1/2); backend '{b}' is pending its own \
+                 per-backend turn-detection smoke. Spawn it without a prompt for a \
+                 lifecycle-only worker."
             ),
             SpawnError::CapExceeded { live, cap } => write!(
                 f,
@@ -250,6 +251,19 @@ pub fn resolve_supported_backend(backend: &str) -> Result<&'static str, String> 
         Some(b) => Ok(b.preset().command),
         None => Err(format!("backend '{backend}' is not a supported backend")),
     }
+}
+
+/// PR3b: backends whose one-shot DRIVER (inject → turn-end → capture → oracle) is
+/// §5-smoke-validated, so a `prompt` may be driven on them. Slice-1 added opencode;
+/// Slice-2 added claude (both proven to render a continuous work marker so the
+/// Idle-debounce isn't fooled by a mid-turn idle — confirm-first iron rule). A prompt
+/// for any other backend is rejected ([`SpawnError::DriverUnsupported`]) until its own
+/// §5 smoke lands. `backend_command` is the canonical, allowlist-resolved command.
+fn driver_supported(backend_command: &str) -> bool {
+    matches!(
+        crate::backend::Backend::from_command(backend_command),
+        Some(crate::backend::Backend::OpenCode | crate::backend::Backend::ClaudeCode)
+    )
 }
 
 /// Why a slot reservation failed.
@@ -436,14 +450,14 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
     };
 
     // 0b) DRIVER GATE (PR3b) — a `prompt` launches the one-shot driver (inject →
-    //     turn-end → capture → oracle), which is smoke-validated for opencode ONLY
-    //     (Slice-1). Reject a prompt for any other backend BEFORE reserving/spawning
-    //     (confirm-first iron rule: never drive a backend whose turn-end detection
-    //     isn't proven on a real turn). A prompt-LESS spawn of any backend is the PR3a
-    //     lifecycle-only path and is unaffected. Gated in the SHARED SINK so a direct
-    //     caller, not just the MCP handler, is protected.
+    //     turn-end → capture → oracle), §5-smoke-validated for the [`driver_supported`]
+    //     backend set (Slice-1 opencode, Slice-2 claude). Reject a prompt for any other
+    //     backend BEFORE reserving/spawning (confirm-first iron rule: never drive a
+    //     backend whose turn-end detection isn't proven on a real turn). A prompt-LESS
+    //     spawn of any backend is the PR3a lifecycle-only path and is unaffected. Gated
+    //     in the SHARED SINK so a direct caller, not just the MCP handler, is protected.
     let drive_turn = !spec.prompt.is_empty();
-    if drive_turn && backend_command != crate::backend::Backend::OpenCode.preset().command {
+    if drive_turn && !driver_supported(backend_command) {
         return Err(SpawnError::DriverUnsupported(spec.backend.clone()));
     }
 
@@ -524,13 +538,16 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
             // PR3b: launch the one-shot driver BEFORE moving the handle into
             // LIVE_CHILDREN, capturing the inject target (Arc clones of the retained
             // pty_writer + core) so the driver is decoupled from the handle the reaper
-            // owns. Only when a prompt was given (opencode, gated in step 0b) — else
-            // this is the PR3a lifecycle-only spawn (no driver thread).
-            if drive_turn {
-                let inject_target = crate::agent::InjectTarget::from_ephemeral(
-                    &handle,
-                    crate::backend::Backend::OpenCode,
-                );
+            // owns. Only when a prompt was given (a driver_supported backend, gated in
+            // step 0b) — else this is the PR3a lifecycle-only spawn (no driver thread).
+            // The real backend (opencode/claude) drives the inject preset + capture, so
+            // `from_ephemeral` gets it (never a hardcode). `from_command` is `Some` here
+            // because step 0b's `driver_supported` already confirmed the canonical command.
+            if let (true, Some(backend)) = (
+                drive_turn,
+                crate::backend::Backend::from_command(backend_command),
+            ) {
+                let inject_target = crate::agent::InjectTarget::from_ephemeral(&handle, backend);
                 crate::ephemeral_driver::spawn_driver(crate::ephemeral_driver::DriverConfig {
                     home: home.to_path_buf(),
                     worker_id: worker_id.clone(),
@@ -1710,24 +1727,25 @@ mod tests {
 
     // ─────────────────── PR3b: driver gate + result recording ───────────────────
 
-    /// PR3b driver GATE: a `prompt` for a NON-opencode backend is rejected as
-    /// `DriverUnsupported` BEFORE any reserve/spawn (confirm-first iron rule — only
-    /// opencode's turn-end detection is smoke-validated in Slice-1). Gated in the
-    /// SHARED SINK so a direct caller, not just the MCP handler, is protected. A
-    /// prompt-LESS spawn of any backend is unaffected (the PR3a lifecycle path).
+    /// PR3b driver GATE: a `prompt` for a backend NOT in [`driver_supported`] is
+    /// rejected as `DriverUnsupported` BEFORE any reserve/spawn (confirm-first iron rule
+    /// — never drive a backend whose turn-detection isn't §5-smoke-proven). codex is the
+    /// canonical still-unsupported backend (Slice-3+). Gated in the SHARED SINK so a
+    /// direct caller, not just the MCP handler, is protected. A prompt-LESS spawn of any
+    /// backend is unaffected (the PR3a lifecycle path).
     #[test]
-    fn spawn_and_track_rejects_prompt_for_non_opencode_backend() {
+    fn spawn_and_track_rejects_prompt_for_unsupported_backend() {
         let home = tmp_home("driver-gate");
         let spec = SpawnSpec {
             workflow_id: "wf".to_string(),
-            backend: "claude".to_string(),
+            backend: "codex".to_string(),
             prompt: "do the thing".to_string(),
             ..Default::default()
         };
         let res = spawn_and_track(&home, spec);
         assert!(
-            matches!(&res, Err(SpawnError::DriverUnsupported(b)) if b == "claude"),
-            "a prompt for a non-opencode backend must be DriverUnsupported: {res:?}"
+            matches!(&res, Err(SpawnError::DriverUnsupported(b)) if b == "codex"),
+            "a prompt for a driver-unsupported backend must be DriverUnsupported: {res:?}"
         );
         assert_eq!(
             list(&home, None).len(),
@@ -1735,6 +1753,32 @@ mod tests {
             "the driver gate rejects before reserve — no row, no process"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR3b Slice-2: the [`driver_supported`] set is exactly {opencode, claude} — the
+    /// §5-smoke-validated backends. Regression-guards the gate generalization: opencode
+    /// (Slice-1) MUST stay supported, claude (Slice-2) is added, and codex/kiro/agy stay
+    /// rejected (their per-backend smoke hasn't landed). Canonical commands + aliases.
+    #[test]
+    fn driver_supported_is_opencode_and_claude_only() {
+        assert!(
+            driver_supported("opencode"),
+            "opencode (Slice-1) must stay supported"
+        );
+        assert!(
+            driver_supported("claude"),
+            "claude (Slice-2) is now supported"
+        );
+        assert!(
+            driver_supported("claude-2.1"),
+            "a claude-prefixed alias maps to ClaudeCode → supported"
+        );
+        for unsupported in ["codex", "kiro-cli", "kiro", "agy"] {
+            assert!(
+                !driver_supported(unsupported),
+                "{unsupported} has no §5 smoke yet → driver unsupported"
+            );
+        }
     }
 
     /// PR3b: `mark_prompting` flips phase to `prompting`; `record_result` writes the
@@ -1830,6 +1874,62 @@ mod tests {
         assert!(
             success,
             "a simple prompt turn must succeed; summary={summary:?}"
+        );
+        assert!(
+            summary.map(|s| !s.trim().is_empty()).unwrap_or(false),
+            "result_summary must be non-empty on success"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// REAL claude end-to-end (`#[ignore]`: no binary/creds in CI) — PR3b Slice-2.
+    /// Drives a real headless claude worker through the SAME driver path (turn-detect /
+    /// oracle / capture reuse, per the §5 smoke) and asserts success with a non-empty
+    /// transcript. Uses the inherited model (no override). Run locally:
+    /// `cargo test --bin agend-terminal --features tray -- --ignored ephemeral_claude_driver_e2e`.
+    /// claude ready is ~11s + a short turn, so the budget is generous.
+    /// `#[cfg(unix)]`: ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a real claude install + auth; run locally"]
+    fn ephemeral_claude_driver_e2e() {
+        let home = tmp_home("claude-e2e");
+        let spec = SpawnSpec {
+            workflow_id: "e2e".to_string(),
+            backend: "claude".to_string(),
+            prompt: "Reply with exactly the word: pong".to_string(),
+            ttl_secs: Some(240),
+            ..Default::default()
+        };
+        let w = spawn_and_track(&home, spec).expect("spawn claude worker");
+        assert_ne!(w.pid, 0, "a real pid was stamped");
+
+        // Driver runs ASYNC; poll the row until it records a result (claude ready ~11s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(210);
+        let outcome = loop {
+            match list(&home, None)
+                .into_iter()
+                .find(|r| r.worker_id == w.worker_id)
+            {
+                Some(row) => {
+                    if let Some(success) = row.success {
+                        break Some((success, row.result_summary));
+                    }
+                }
+                None => break None,
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the driver did not record a result within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+        reap_one(&home, &w.worker_id);
+
+        let (success, summary) = outcome.expect("the worker row must carry a result before reap");
+        assert!(
+            success,
+            "a simple claude prompt turn must succeed; summary={summary:?}"
         );
         assert!(
             summary.map(|s| !s.trim().is_empty()).unwrap_or(false),

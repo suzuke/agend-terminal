@@ -1,8 +1,8 @@
 //! #1967 Phase-1 PR3b: the one-shot ephemeral-worker DRIVER (Route B).
 //!
 //! After [`crate::ephemeral_tracking::spawn_and_track`] finalizes a headless
-//! opencode worker, it launches a background driver thread (this module) that runs
-//! exactly ONE prompt turn to a recorded result:
+//! opencode/claude worker, it launches a background driver thread (this module) that
+//! runs exactly ONE prompt turn to a recorded result:
 //!
 //!   wait-ready → inject prompt → turn-end (Idle-debounce) → capture → oracle → record
 //!
@@ -28,14 +28,19 @@
 //! - **Success oracle = terminal `Idle` ∧ ¬error-class ([`AgentState::is_error`]) ∧
 //!   transcript GREW.** NOT `has_productive_output()` — that is false on a text-only
 //!   success (opencode's productive markers match only tool-use glyphs).
-//! - **Transcript "grew" = non-blank body-line COUNT delta** (excluding the bottom
-//!   ~2 chrome rows: opencode's model/elapsed line + token/commands statusline, which
-//!   churn every render). Counting LINES (not bytes) is robust to chrome content churn
-//!   — the chrome line COUNT is stable across renders.
+//! - **Transcript "grew" = non-blank-line COUNT delta** (baseline at ready ↔ final at
+//!   turn-end). Chrome is NOT excluded from this measure: the footer's row COUNT is
+//!   identical at both samples (only its content — elapsed timer / token count —
+//!   churns), so it cancels in the delta. Counting LINES (not bytes) makes a chrome
+//!   content update invisible to "grew". The `result_summary` (cosmetic) drops the
+//!   trailing footer via a PATTERN-based strip ([`is_trailing_chrome`]) rather than a
+//!   per-backend magic row count, so it survives a backend bumping its footer.
 //!
-//! Scope: opencode ONLY (the only backend the 1a smoke validated; other backends are
-//! Slice-2, each §5-smoke-gated). Durable telemetry (fleet_events L1/L2/L3 + task_events)
-//! is PR4; the result lands on the worker row for now.
+//! Scope: opencode (Slice-1) + claude (Slice-2) — each §5-smoke-validated. The gate
+//! ([`crate::ephemeral_tracking`] `driver_supported`) admits exactly this set; other
+//! backends are later slices. Both proven to render a continuous work marker so the
+//! Idle-debounce isn't fooled by a mid-turn idle. Durable telemetry (fleet_events
+//! L1/L2/L3 + task_events) is PR4; the result lands on the worker row for now.
 
 use crate::agent::InjectTarget;
 use crate::state::AgentState;
@@ -52,12 +57,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TURN_DEBOUNCE_MS: u64 = 3_000;
 
 /// Max wait for the worker to reach its first `Idle` (ready) after spawn (capped by
-/// the worker's wall-TTL). opencode reaches ready in ~2.6 s; this is a generous cap.
+/// the worker's wall-TTL). opencode reaches ready in ~2.6 s, claude in ~11 s; this is a
+/// generous cap for both.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Bottom chrome rows to exclude from the body-line measure (opencode's model/elapsed
-/// line + token/commands statusline). See the module doc's "grew" note.
-const CHROME_TAIL_LINES: usize = 2;
 
 /// Logical lines to dump from the vterm tail for the body measure + result capture.
 /// The worker's vterm is 50 rows; 80 covers the visible screen with margin for
@@ -126,13 +128,13 @@ fn run_turn(cfg: DriverConfig) {
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    // Baseline body-line count (at ready, before inject) for the "grew" measure.
+    // Baseline non-blank-line count (at ready, before inject) for the "grew" measure.
     let baseline_dump = inject_target
         .core
         .lock()
         .vterm
         .tail_lines_dewrapped(CAPTURE_LINES);
-    let baseline_body = body_nonblank_count(&baseline_dump, CHROME_TAIL_LINES);
+    let baseline_body = nonblank_count(&baseline_dump);
 
     // Phase 1 — inject the prompt. Mark phase=prompting first so `ephemeral list`
     // reflects the mid-turn state.
@@ -165,7 +167,7 @@ fn run_turn(cfg: DriverConfig) {
         .vterm
         .tail_lines_dewrapped(CAPTURE_LINES);
     let terminal_state = inject_target.core.lock().state.get_state();
-    let grew = body_nonblank_count(&end_dump, CHROME_TAIL_LINES) > baseline_body;
+    let grew = nonblank_count(&end_dump) > baseline_body;
     let success = oracle_success(terminal_state, grew);
     let summary = build_summary(&end_dump, terminal_state, grew, stop_reason);
 
@@ -197,26 +199,77 @@ fn oracle_success(terminal_state: AgentState, transcript_grew: bool) -> bool {
     terminal_state == AgentState::Idle && !terminal_state.is_error() && transcript_grew
 }
 
-/// Count non-blank "body" lines in a vterm dump, EXCLUDING the bottom `chrome_tail`
-/// rows. Counting LINES (not bytes) is robust to chrome CONTENT churn (the elapsed
-/// timer / token count tick every render but the chrome line COUNT is stable), so a
-/// statusline update is never misread as transcript growth.
-fn body_nonblank_count(dump: &str, chrome_tail: usize) -> usize {
-    let lines: Vec<&str> = dump.lines().collect();
-    let body_end = lines.len().saturating_sub(chrome_tail);
-    lines[..body_end]
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .count()
+/// Count non-blank lines in a vterm dump. Used for the "grew" measure as a
+/// baseline↔final DELTA, so chrome is NOT excluded here: the footer's row COUNT is
+/// identical at baseline and at turn-end (only its CONTENT churns — elapsed timer,
+/// token count), so it cancels in the delta. Counting LINES (not bytes) makes a chrome
+/// content update invisible to "grew". Backend-agnostic — no per-backend tuning.
+fn nonblank_count(dump: &str) -> usize {
+    dump.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
-/// Build the persisted `result_summary`: the body region (chrome rows dropped),
+/// True if `line` is trailing CHROME (a footer / statusline row), not transcript body.
+/// PATTERN-based (PR3b Slice-2 lead vet) rather than a per-backend magic row count, so
+/// it survives a backend bumping its footer's row count. Covers opencode + claude
+/// footers; an unrecognized footer line simply isn't stripped — purely COSMETIC (the
+/// "grew" oracle never uses this; it's chrome-cancelling). Used only to clean the
+/// persisted `result_summary`.
+fn is_trailing_chrome(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true; // trailing blank rows
+    }
+    // A separator / box-drawing-frame-only row (claude's `───` rules + box borders).
+    if t.chars().all(|c| {
+        matches!(
+            c,
+            '─' | '━'
+                | '│'
+                | '┃'
+                | '╭'
+                | '╮'
+                | '╰'
+                | '╯'
+                | '├'
+                | '┤'
+                | '┬'
+                | '┴'
+                | ' '
+        )
+    }) {
+        return true;
+    }
+    // A lone input-prompt glyph = an EMPTY input box (NOT `❯ <prompt>`, which is body).
+    if matches!(t, "❯" | "›" | ">" | "┃") {
+        return true;
+    }
+    // Known backend footer statuslines (claude + opencode).
+    let lower = t.to_ascii_lowercase();
+    lower.contains("bypass permissions")        // claude: `⏵⏵ bypass permissions …`
+        || lower.contains("ctx used")           // claude: `Model: … | Ctx Used: …`
+        || lower.starts_with("model:")          // claude statusline
+        || lower.starts_with("▣ build")         // opencode completion line
+        || lower.contains("esc to interrupt") // any working footer (safety; not at Idle)
+}
+
+/// The transcript body = the dump with its trailing chrome rows stripped (pattern-
+/// based). Walks from the bottom dropping chrome rows, stops at the first body row.
+fn strip_trailing_chrome(dump: &str) -> String {
+    let lines: Vec<&str> = dump.lines().collect();
+    let keep = lines.len()
+        - lines
+            .iter()
+            .rev()
+            .take_while(|l| is_trailing_chrome(l))
+            .count();
+    lines[..keep].join("\n")
+}
+
+/// Build the persisted `result_summary`: the body region (trailing chrome stripped),
 /// trimmed of trailing blanks and capped at [`MAX_SUMMARY_BYTES`], prefixed with a
 /// one-line verdict so a reader sees the outcome without re-deriving it.
 fn build_summary(dump: &str, terminal_state: AgentState, grew: bool, stop_reason: &str) -> String {
-    let lines: Vec<&str> = dump.lines().collect();
-    let body_end = lines.len().saturating_sub(CHROME_TAIL_LINES);
-    let body = lines[..body_end].join("\n");
+    let body = strip_trailing_chrome(dump);
     let body = body.trim_end();
     let header = format!("[{terminal_state:?} grew={grew} stop={stop_reason}]\n");
     let mut out = header;
@@ -354,45 +407,72 @@ mod tests {
         assert!(!oracle_success(AgentState::Thinking, true));
     }
 
-    // ─────────────────────────── body-line measure ─────────────────────────
+    // ─────────────── grew measure (nonblank delta) + chrome strip ───────────────
 
     #[test]
-    fn body_count_excludes_chrome_and_blanks() {
-        // 3 body lines + 1 blank + 2 chrome rows → counts only the 3 non-blank body.
-        let dump = "answer line 1\nanswer line 2\nanswer line 3\n\nmodel · 2s\ntokens 42";
-        assert_eq!(body_nonblank_count(dump, CHROME_TAIL_LINES), 3);
+    fn nonblank_count_ignores_blank_lines() {
+        assert_eq!(nonblank_count("a\n\nb\n   \nc"), 3);
+        assert_eq!(nonblank_count(""), 0);
     }
 
     #[test]
-    fn body_count_chrome_churn_does_not_grow() {
-        // Same body, only the chrome (elapsed timer / token count) changed → the body
-        // count is identical, so a chrome update is NOT misread as transcript growth.
-        let before = "prompt echo\nmodel · 1s\ntokens 10";
-        let after = "prompt echo\nmodel · 9s\ntokens 99";
-        assert_eq!(
-            body_nonblank_count(before, CHROME_TAIL_LINES),
-            body_nonblank_count(after, CHROME_TAIL_LINES),
-            "chrome churn must not change the body count"
-        );
+    fn nonblank_count_stable_under_chrome_churn() {
+        // The "grew" measure is a baseline↔final DELTA; the footer's row COUNT is
+        // constant (only its content — elapsed timer / token count — churns), so a
+        // chrome update never changes the count → never misread as growth.
+        let before = "prompt echo\nModel: Opus | Ctx Used: 1.0%\n⏵⏵ bypass permissions on";
+        let after = "prompt echo\nModel: Opus | Ctx Used: 9.0%\n⏵⏵ bypass permissions on";
+        assert_eq!(nonblank_count(before), nonblank_count(after));
     }
 
     #[test]
-    fn body_count_handles_dump_shorter_than_chrome_tail() {
-        // saturating_sub: a tiny dump (fewer rows than chrome_tail) yields 0, no panic.
-        assert_eq!(body_nonblank_count("x", 2), 0);
-        assert_eq!(body_nonblank_count("", 2), 0);
-    }
-
-    #[test]
-    fn transcript_growth_detected_via_body_delta() {
-        let baseline = "prompt echo\nmodel · 0s\ntokens 0";
-        let grown = "prompt echo\nassistant reply line\nmore reply\nmodel · 4s\ntokens 88";
-        let baseline_body = body_nonblank_count(baseline, CHROME_TAIL_LINES);
-        let grown_body = body_nonblank_count(grown, CHROME_TAIL_LINES);
+    fn transcript_growth_detected_via_nonblank_delta() {
+        // Baseline (ready, before inject) vs final (after a reply) — the assistant's new
+        // lines register as growth even though the footer rows are unchanged.
+        let baseline = "❯ prompt\n─────\n❯\nModel: Opus | Ctx Used: 0%";
+        let grown =
+            "❯ prompt\n⏺ assistant reply\n⏺ more reply\n─────\n❯\nModel: Opus | Ctx Used: 3%";
         assert!(
-            grown_body > baseline_body,
+            nonblank_count(grown) > nonblank_count(baseline),
             "the assistant reply must register as growth"
         );
+    }
+
+    /// Pattern-based chrome strip drops claude's footer (rules / empty `❯` box / Model
+    /// statusline / bypass line) but keeps the answer + the `✻ Worked` completion line.
+    #[test]
+    fn strip_trailing_chrome_drops_claude_footer() {
+        let dump = "the answer\n✻ Worked for 6s\n\n──────────\n❯\n──────────\n  Model: Opus 4.8 | Ctx Used: 3.0%\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let body = strip_trailing_chrome(dump);
+        assert!(body.contains("the answer"), "body answer kept");
+        assert!(body.contains("✻ Worked for 6s"), "completion marker kept");
+        assert!(
+            !body.contains("bypass permissions"),
+            "claude footer dropped"
+        );
+        assert!(!body.contains("Model:"), "claude statusline dropped");
+        assert!(!body.contains('❯'), "empty input box dropped");
+    }
+
+    /// A `❯ <prompt>` echo (content after the glyph) is BODY, not chrome — only a LONE
+    /// `❯` (empty input box) is stripped.
+    #[test]
+    fn strip_trailing_chrome_keeps_prompt_echo() {
+        let dump = "❯ do the thing\nresult here\n❯";
+        let body = strip_trailing_chrome(dump);
+        assert!(body.contains("❯ do the thing"), "the prompt echo is body");
+        assert!(body.contains("result here"));
+        assert!(
+            body.ends_with("result here"),
+            "the trailing empty ❯ box is stripped"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_chrome_handles_all_chrome_and_empty() {
+        // All-chrome / empty dumps return empty, no panic (the `len - take_while` math).
+        assert_eq!(strip_trailing_chrome(""), "");
+        assert_eq!(strip_trailing_chrome("──────\n❯\n\n"), "");
     }
 
     // ───────────────────── turn-end detector (debounce) ─────────────────────
@@ -467,13 +547,14 @@ mod tests {
 
     #[test]
     fn summary_drops_chrome_and_prefixes_verdict() {
-        let dump = "the answer\nmodel · 2s\ntokens 42";
+        let dump =
+            "the answer\n─────\n❯\n  Model: Opus | Ctx Used: 3.0%\n  ⏵⏵ bypass permissions on";
         let s = build_summary(dump, AgentState::Idle, true, "turn ended (Idle held)");
         assert!(s.starts_with("[Idle grew=true stop=turn ended (Idle held)]"));
         assert!(s.contains("the answer"));
         assert!(
-            !s.contains("tokens 42"),
-            "the chrome statusline must be dropped"
+            !s.contains("bypass permissions") && !s.contains("Model:"),
+            "the chrome footer must be dropped from the summary"
         );
     }
 
