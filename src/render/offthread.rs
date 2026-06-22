@@ -295,7 +295,14 @@ fn parser_loop(
                 Some(Event::Data(Ok(d))) => vterm.process(&d),
                 Some(Event::Data(Err(_))) => {
                     // pane gone mid-burst: publish what we have, then exit.
-                    publish(&vterm, &mut scrollback, &publisher, &wakeup_tx, pane_id, name);
+                    publish(
+                        &vterm,
+                        &mut scrollback,
+                        &publisher,
+                        &wakeup_tx,
+                        pane_id,
+                        name,
+                    );
                     return;
                 }
                 Some(Event::Resize(Ok((c, r)))) => {
@@ -309,7 +316,14 @@ fn parser_loop(
         }
 
         // Phase 3 — one snapshot per coalesced burst.
-        publish(&vterm, &mut scrollback, &publisher, &wakeup_tx, pane_id, name);
+        publish(
+            &vterm,
+            &mut scrollback,
+            &publisher,
+            &wakeup_tx,
+            pane_id,
+            name,
+        );
     }
 }
 
@@ -530,7 +544,14 @@ mod tests {
         );
         let area = Rect::new(0, 0, 12, 5);
         let max_scroll = vt.max_scroll();
-        for off in [0usize, 1, 3, max_scroll.saturating_sub(1), max_scroll, max_scroll + 5] {
+        for off in [
+            0usize,
+            1,
+            3,
+            max_scroll.saturating_sub(1),
+            max_scroll,
+            max_scroll + 5,
+        ] {
             let mut a = Buffer::empty(area);
             let mut b = Buffer::empty(area);
             incr.render_to_buffer(&mut a, area, off, false);
@@ -574,9 +595,12 @@ mod tests {
             vt.process(format!("l{i:02}\r\n").as_bytes());
             cache.update(&vt);
         }
-        assert!(!cache.rows.is_empty(), "must have scrollback to test sharing");
+        assert!(
+            !cache.rows.is_empty(),
+            "must have scrollback to test sharing"
+        );
         let kept = Arc::clone(&cache.rows[0]); // an existing (older) row
-        // Grow further (well under the cap, so the front is not trimmed).
+                                               // Grow further (well under the cap, so the front is not trimmed).
         for i in 11..=15 {
             vt.process(format!("l{i:02}\r\n").as_bytes());
             cache.update(&vt);
