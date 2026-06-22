@@ -316,6 +316,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         }
     }
     fn mk_leaf(id: usize, name: &str) -> PaneNode {

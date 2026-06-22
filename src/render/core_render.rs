@@ -884,6 +884,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         };
         let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
         let joined = segments
@@ -912,6 +913,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         };
         // #1713 flag OFF (default): no state badge appended; only the base label
         // (+ the transient Restarting/Crashed tab badge, which lives elsewhere).
@@ -944,6 +946,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         };
         for (state, want) in [
             (AgentState::ServerRateLimit, "[ServerRateLimit]"),
@@ -997,6 +1000,7 @@ mod tests {
                 selection: None,
                 source: PaneSource::Local,
                 offthread: None,
+                _fwd_cancel: None,
             },
         );
         let snapshot = HashMap::new();
@@ -1032,6 +1036,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1108,6 +1113,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: Some(handle),
+            _fwd_cancel: None,
         };
         assert!(
             pane.vterm.tail_lines(16).trim().is_empty(),
@@ -1530,6 +1536,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1584,6 +1591,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1613,6 +1621,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         }
     }
 

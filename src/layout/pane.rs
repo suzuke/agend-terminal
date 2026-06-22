@@ -61,6 +61,15 @@ pub struct Pane {
     /// `core_render` paints `snapshot` instead). `None` (default, flag OFF) = the
     /// byte-identical main-thread drain+parse path.
     pub offthread: Option<crate::render::offthread::OffthreadHandle>,
+    /// #forwarder-reap: held ONLY for its `Drop`. The output-forwarder thread
+    /// `select!`s on the agent `rx` AND the receiver paired with this sender, so
+    /// dropping the pane (close) drops this sender → that receiver disconnects →
+    /// a forwarder blocked on a QUIET agent's `rx.recv()` wakes and exits in
+    /// bounded time, instead of lingering until the agent next speaks or dies.
+    /// `None` for panes with no crossbeam forwarder: the placeholder before
+    /// attach, remote `BridgeClient` panes (socket reader, own lifecycle), and
+    /// test panes. Set to `Some` by `apply_attachment` / `attach_pane`.
+    pub _fwd_cancel: Option<crossbeam_channel::Sender<()>>,
 }
 
 /// Text selection anchored to absolute scrollback logical coordinates so it
@@ -388,6 +397,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         }
     }
 
@@ -454,6 +464,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         }
     }
 

@@ -392,6 +392,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
             offthread: None,
+            _fwd_cancel: None,
         }
     }
     fn tab_with_pane(name: &str, id: usize, rect: (u16, u16, u16, u16)) -> Tab {
