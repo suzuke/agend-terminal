@@ -583,49 +583,38 @@ mod tests {
         );
     }
 
-    /// #2404 r6 ② regression — ordering: a queued resize must NOT be applied ahead
-    /// of bytes that were already enqueued. Width-sensitive probe: 20 `X` then
-    /// cursor-home + erase-line. Parsed at cols=20 the 20 X's fill exactly row 0,
-    /// so erase-line blanks the whole line → empty grid. If the resize to cols=5
-    /// were (wrongly) applied first, the 20 X's would wrap to 4 rows and erase-line
-    /// would clear only row 0, leaving X's in rows 1-3. The fix
-    /// (`drain_pending_data` before every resize) makes the empty result
-    /// deterministic regardless of `select!` ordering.
+    /// #2404 r6 ② regression (DETERMINISTIC) — ordering: queued data must be parsed
+    /// at the OLD dims BEFORE a resize is applied. Exercises `parser_loop`'s exact
+    /// resize handling (`drain_pending_data` then `vterm.resize`) SYNCHRONOUSLY, so
+    /// it does not depend on thread / `select!` timing — the prior thread-driven
+    /// version was racy (r6 round-2: no barrier guaranteeing both arms pending; it
+    /// passed locally + on ubuntu but flaked on macos CI). Width-sensitive probe:
+    /// 20 `X` then cursor-home + erase-line. Parsed at cols=20 the 20 X's fill
+    /// exactly row 0, so erase-line blanks the whole line → empty grid. Had the
+    /// resize to cols=5 been applied first (the bug), the 20 X's would wrap to 4
+    /// rows and erase-line would clear only row 0, leaving X's in rows 1-3.
     #[test]
-    fn resize_does_not_reorder_ahead_of_queued_data() {
+    fn queued_data_is_parsed_at_old_dims_before_a_resize() {
         let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
-        let vt = VTerm::new(20, 6);
-        let h = spawn_offthread_parser(4, "t".to_string(), data_rx, vt, wake_tx)
-            .expect("parser thread spawns");
-
-        // Queue the width-sensitive bytes, then the resize. Both are pending when
-        // the parser runs; the fix guarantees the bytes are parsed at cols=20 first.
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let mut vt = VTerm::new(20, 6);
+        // Bytes are queued BEFORE the resize is handled — exactly the state the
+        // parser is in when it dequeues a resize while data is still in the channel.
         data_tx
             .send(b"XXXXXXXXXXXXXXXXXXXX\x1b[H\x1b[K".to_vec())
             .unwrap();
-        assert!(h.request_resize(5, 6), "resize to cols=5 must send");
-
-        // Wait until the resize has been applied (snapshot dims == 5).
-        let mut resized = false;
-        for _ in 0..50 {
-            if wake_rx.recv_timeout(Duration::from_millis(100)).is_err() {
-                break;
-            }
-            if h.load().cols == 5 {
-                resized = true;
-                break;
-            }
-        }
-        assert!(resized, "snapshot must reflect the resize to cols=5");
-
-        let snap = h.load();
-        let any_x = snap.cells.iter().any(|c| c.c == 'X');
+        // parser_loop's resize handling, in order: flush queued data at the OLD
+        // dims, then resize.
+        let cancelled = drain_pending_data(&data_rx, &cancel_rx, &mut vt);
+        assert!(!cancelled, "no cancel was sent");
+        vt.resize(5, 6);
+        // The 20 X's were parsed at cols=20 (one full row, then erase-line cleared
+        // it), so the resized snapshot has NO stray X.
+        let snap = vt.snapshot();
         assert!(
-            !any_x,
-            "bytes queued before the resize must be parsed at the OLD width \
-             (erase-line clears the single full row); found stray 'X' = resize \
-             jumped ahead of queued data"
+            !snap.cells.iter().any(|c| c.c == 'X'),
+            "queued bytes must be parsed at the OLD width before the resize; \
+             a stray 'X' means the resize jumped ahead of queued data"
         );
     }
 }
