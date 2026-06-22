@@ -89,6 +89,38 @@ fn drain_probe_threshold_us() -> Option<u64> {
     })
 }
 
+/// #freeze-cputime probe: this thread's consumed CPU time in microseconds, or
+/// `None` when unavailable. Pairs with the `#freeze-drain` wall-clock
+/// (`drain_us`) so an operator restart-repro can tell a CPU-bound parse
+/// (`drain_us ≈ cpu_us`) apart from a preempted / descheduled render thread
+/// (`drain_us ≫ cpu_us`) — the former argues for off-thread parse, the latter
+/// for a cheaper stagger-reattach. Unix uses `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`
+/// (macOS 10.12+ / Linux — the operator is on macOS); Windows is a best-effort
+/// skip (`None`). Called ONLY when the probe is enabled, so the flag-off path
+/// issues zero extra syscalls.
+#[cfg(unix)]
+fn thread_cpu_time_us() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes a fully-initialized `timespec` through the
+    // valid stack pointer; `CLOCK_THREAD_CPUTIME_ID` is a POSIX per-thread clock
+    // id present on macOS and Linux. No aliasing or lifetime concerns.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return None;
+    }
+    Some((ts.tv_sec as u64).wrapping_mul(1_000_000) + (ts.tv_nsec as u64) / 1_000)
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time_us() -> Option<u64> {
+    // Windows: best-effort skip — the `#freeze-drain` probe is exercised on the
+    // operator's macOS box, so `cpu_us` logs as the `-1` "unavailable" sentinel.
+    None
+}
+
 impl Pane {
     /// Convert a viewport row (0-based within the pane interior) to an absolute
     /// scrollback logical line at the current scroll position. Inverse of
@@ -142,6 +174,10 @@ impl Pane {
     pub fn drain_output(&mut self, budget_bytes: usize) -> usize {
         let probe_threshold = drain_probe_threshold_us();
         let probe_start = probe_threshold.map(|_| Instant::now());
+        // #freeze-cputime: snapshot this thread's CPU time alongside the wall
+        // clock, but ONLY when the probe is enabled — `and_then` is the gate, so
+        // a `None` `probe_threshold` (flag off) issues no `clock_gettime` here.
+        let probe_cpu_start = probe_threshold.and_then(|_| thread_cpu_time_us());
         let mut drained = 0usize;
         // Process whole chunks until the byte budget is met (per-chunk granularity:
         // the last chunk may carry us slightly over — chunks are PTY-read-bounded).
@@ -165,9 +201,19 @@ impl Pane {
         if let (Some(threshold), Some(start)) = (probe_threshold, probe_start) {
             let us = start.elapsed().as_micros() as u64;
             if us >= threshold {
+                // #freeze-cputime: thread CPU time consumed across this drain
+                // cycle (same span as `drain_us`). `drain_us ≈ cpu_us` ⇒ CPU-bound
+                // parse (off-thread parse worth it); `drain_us ≫ cpu_us` ⇒ render
+                // thread was preempted / descheduled (cheaper stagger-reattach
+                // fix). `-1` = unavailable (Windows / clock failure).
+                let cpu_us: i64 = match (probe_cpu_start, thread_cpu_time_us()) {
+                    (Some(s), Some(e)) => e.saturating_sub(s) as i64,
+                    _ => -1,
+                };
                 tracing::info!(
                     tag = "#freeze-drain",
                     drain_us = us,
+                    cpu_us = cpu_us,
                     bytes = drained,
                     more = !self.rx.is_empty(),
                     "drain_output budget cycle"
@@ -520,5 +566,26 @@ mod tests {
                 - std::time::Duration::from_millis(1),
         );
         assert!(!pane.is_composing());
+    }
+
+    // #freeze-cputime: the probe's thread-CPU-time source must work on the
+    // operator's platform (macOS) and Linux, and advance monotonically as the
+    // thread burns CPU — otherwise the `drain_us` vs `cpu_us` comparison the
+    // confirm-first probe rests on would be meaningless. Uses real CPU work (no
+    // sleep) so it measures thread CPU time, not wall time.
+    #[cfg(unix)]
+    #[test]
+    fn thread_cpu_time_us_is_some_and_monotonic() {
+        let t0 = thread_cpu_time_us().expect("CLOCK_THREAD_CPUTIME_ID available on unix");
+        let mut acc = 0u64;
+        for i in 0..5_000_000u64 {
+            acc = acc.wrapping_add(i.wrapping_mul(2_654_435_761));
+        }
+        std::hint::black_box(acc);
+        let t1 = thread_cpu_time_us().expect("second CPU-time sample");
+        assert!(
+            t1 >= t0,
+            "thread CPU time must be monotonic non-decreasing: {t0} -> {t1}"
+        );
     }
 }
