@@ -16,6 +16,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// One agent's latest hook-derived observation.
@@ -42,11 +43,26 @@ pub struct HookShadow {
     /// nothing → no `UserPromptSubmit`), so the inject-delivery watchdog needs
     /// it to survive the PreToolUse/Stop events that follow within its window.
     pub last_user_prompt_submit_ms: Option<u64>,
+    /// #t-26795: a process-global MONOTONIC sequence stamped on every
+    /// [`record_event`]. The SRL hook-override compares an agent's latest active-hook
+    /// seq against a per-episode FLOOR — a STRICTLY greater seq proves a NEW hook
+    /// arrived since the floor was consumed (forward progress), which an epoch-ms
+    /// timestamp cannot guarantee under wall-clock rollback. Only same-agent
+    /// latest-vs-floor is ever compared, so the global counter needs no per-agent map.
+    pub seq: u64,
 }
 
 fn store() -> &'static Mutex<HashMap<String, HookShadow>> {
     static S: OnceLock<Mutex<HashMap<String, HookShadow>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// #t-26795: the next process-global monotonic hook sequence. Starts at 1 so the
+/// SRL-override floor's `unwrap_or(0)` default (an agent with no prior hook) is
+/// strictly below any real seq.
+fn next_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// CR-2026-06-14: drop a deleted/redeployed agent's shadow entry. The global
@@ -111,10 +127,22 @@ pub enum HookResolution {
 /// `#hook-shadow` log keeps it operator-visible. The trade is a DEFINITELY-fixed
 /// false-nudge against a missed-nudge only on a double-drop corner — worth it.
 pub fn resolved_state_for(name: &str) -> HookResolution {
+    match snapshot_for(name) {
+        Some(snap) => resolve_snapshot(&snap),
+        None => HookResolution::Unknown,
+    }
+}
+
+/// Pure freshness/state resolution over a SINGLE, already-read snapshot.
+///
+/// #t-26795 (r6 finding-3): split out so a caller that also needs a field of the
+/// snapshot (e.g. [`fresh_active_hook_seq`]) resolves state AND that field from
+/// the SAME clone under ONE `store()` lock. Calling `snapshot_for` and then
+/// `resolved_state_for` separately re-locks and re-reads, which a concurrent
+/// [`record_event`] can tear — pairing generation-A's `at_ms` with generation-B's
+/// resolved state.
+fn resolve_snapshot(snap: &HookShadow) -> HookResolution {
     use crate::state::AgentState;
-    let Some(snap) = snapshot_for(name) else {
-        return HookResolution::Unknown;
-    };
     let age_ms = now_ms().saturating_sub(snap.at_ms);
     match snap.derived_state {
         // ToolUse: valid until the PostToolUse/Stop event overwrites it (above).
@@ -124,10 +152,11 @@ pub fn resolved_state_for(name: &str) -> HookResolution {
     }
 }
 
-/// #t-26795 (SRL hook-override): the epoch-ms timestamp of the latest hook event IF
-/// it resolves to a FRESH, ACTIVE state, else `None`. The supervisor's
-/// ServerRateLimit retry uses this — a fresh active hook whose timestamp POST-DATES
-/// the rate-limit onset proves the agent is executing tool calls, so a sticky
+/// #t-26795 (SRL hook-override): the monotonic [`HookShadow::seq`] of the latest hook
+/// event IF it resolves to a FRESH, ACTIVE state, else `None`. The supervisor's
+/// ServerRateLimit retry compares this against the per-episode floor — a seq STRICTLY
+/// greater than the floor proves a NEW tool-call/thinking hook arrived since the floor
+/// was last consumed (forward progress → the agent is executing), so a sticky
 /// screen-scraped `ServerRateLimit` is stale and the retry must not fire.
 ///
 /// ACTIVE = `{ToolUse, Thinking}` only. `Idle` is deliberately EXCLUDED: a fresh
@@ -139,13 +168,25 @@ pub fn resolved_state_for(name: &str) -> HookResolution {
 /// [`record_event`] populates unconditionally for any hook event. (The hooks only
 /// FIRE when the flag wires them into the backend — that is the data's presence, not
 /// this read's gating; a missing snapshot simply yields `None` = fail-safe.)
-pub fn fresh_active_hook_at_ms(name: &str) -> Option<u64> {
+pub fn fresh_active_hook_seq(name: &str) -> Option<u64> {
     use crate::state::AgentState;
+    // #t-26795 (r6 finding-3): ONE snapshot clone — resolve the state AND read its
+    // monotonic `seq` from the SAME generation. A second `resolved_state_for(name)`
+    // would re-lock and re-read, which a concurrent `record_event` can tear (gen-A
+    // seq paired with gen-B state).
     let snap = snapshot_for(name)?;
-    match resolved_state_for(name) {
-        HookResolution::Fresh(AgentState::ToolUse | AgentState::Thinking) => Some(snap.at_ms),
+    match resolve_snapshot(&snap) {
+        HookResolution::Fresh(AgentState::ToolUse | AgentState::Thinking) => Some(snap.seq),
         _ => None,
     }
+}
+
+/// #t-26795: the agent's latest recorded hook seq (ANY state), or 0 if none. The
+/// SRL-override seeds the per-episode floor with THIS at onset — so a hook recorded
+/// BEFORE the rate-limit began (seq ≤ floor) can't override a genuine new SRL
+/// (edge-a), while a hook recorded AFTER onset gets a strictly greater global seq.
+pub fn latest_hook_seq(name: &str) -> u64 {
+    snapshot_for(name).map(|s| s.seq).unwrap_or(0)
 }
 
 /// #1523: is the hook→authoritative promotion enabled? Gated on the same flag
@@ -281,6 +322,7 @@ pub fn record_event(
             derived_state: derived,
             at_ms: now,
             last_user_prompt_submit_ms,
+            seq: next_seq(),
         },
     );
     derived
@@ -316,6 +358,7 @@ pub(crate) fn set_user_prompt_submit_for_test(name: &str, ms: u64) {
         derived_state: Some(crate::state::AgentState::Thinking),
         at_ms: ms,
         last_user_prompt_submit_ms: Some(ms),
+        seq: next_seq(),
     });
     entry.last_user_prompt_submit_ms = Some(ms);
 }
@@ -333,36 +376,60 @@ mod tests {
     use crate::state::AgentState;
     use serial_test::serial;
 
-    /// #t-26795: `fresh_active_hook_at_ms` returns a ts ONLY for a fresh ACTIVE hook
+    /// #t-26795: `fresh_active_hook_seq` returns a seq ONLY for a fresh ACTIVE hook
     /// (ToolUse/Thinking). Idle (turn-ended) is excluded; an aged-out Thinking is
     /// Stale → None; ToolUse never stales (event-pair). Absent → None.
     #[test]
     #[serial]
-    fn fresh_active_hook_at_ms_active_only() {
+    fn fresh_active_hook_seq_active_only() {
         record_event("fah-tooluse", "PreToolUse", None);
         assert!(
-            fresh_active_hook_at_ms("fah-tooluse").is_some(),
+            fresh_active_hook_seq("fah-tooluse").is_some(),
             "ToolUse is active"
         );
         record_event("fah-thinking", "PostToolUse", None);
         assert!(
-            fresh_active_hook_at_ms("fah-thinking").is_some(),
+            fresh_active_hook_seq("fah-thinking").is_some(),
             "Thinking is active"
         );
         record_event("fah-idle", "Stop", None);
         assert!(
-            fresh_active_hook_at_ms("fah-idle").is_none(),
+            fresh_active_hook_seq("fah-idle").is_none(),
             "Idle (turn-ended) is excluded — left to the productive-output recovery path"
         );
         assert!(
-            fresh_active_hook_at_ms("fah-absent").is_none(),
+            fresh_active_hook_seq("fah-absent").is_none(),
             "no hook → None"
         );
         record_event("fah-stale", "PostToolUse", None);
         backdate_for_test("fah-stale", HOOK_FRESHNESS.as_millis() as u64 + 1000);
         assert!(
-            fresh_active_hook_at_ms("fah-stale").is_none(),
+            fresh_active_hook_seq("fah-stale").is_none(),
             "a Thinking hook aged past freshness → Stale → None"
+        );
+    }
+
+    /// #t-26795 (r6 finding-3): `fresh_active_hook_seq` resolves state and reads the
+    /// `seq` from ONE snapshot clone via the pure `resolve_snapshot` seam, so the
+    /// returned seq always belongs to the same generation whose state was resolved.
+    /// The torn double-read this replaces is timing-dependent (needs a concurrent
+    /// `record_event` to land between two locks), so this pins the seam + the
+    /// seq↔state pairing contract — the race-freedom itself rests on the structural
+    /// single-clone invariant, not on this test.
+    #[test]
+    #[serial]
+    fn fresh_active_hook_returns_its_own_snapshot_seq() {
+        record_event("f3-consistency", "PreToolUse", None);
+        let snap = snapshot_for("f3-consistency").expect("recorded");
+        assert_eq!(
+            resolve_snapshot(&snap),
+            HookResolution::Fresh(AgentState::ToolUse),
+            "pure resolver maps the cloned snapshot"
+        );
+        assert_eq!(
+            fresh_active_hook_seq("f3-consistency"),
+            Some(snap.seq),
+            "returned seq is the SAME snapshot's seq (one clone, no torn read)"
         );
     }
 

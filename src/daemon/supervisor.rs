@@ -302,8 +302,9 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut apierror_nudge_counts: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut last_continue_inject: HashMap<String, Instant> = HashMap::new();
-    // #t-26795: stable first-onset epoch-ms per agent (see `process_error_recovery`).
-    let mut srl_onset: HashMap<String, u64> = HashMap::new();
+    // #t-26795: per-agent SRL forward-progress hook-seq floor (see
+    // `process_error_recovery`).
+    let mut srl_floor: HashMap<String, u64> = HashMap::new();
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     // W1.1 (#2050): the 12 periodic trackers (anti_stall, idle_watchdog,
     // decision_timeout, helper_staleness, mcp_registry, waiting_on_stale,
@@ -342,7 +343,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
                 &mut apierror_episodes,
                 &mut apierror_nudge_counts,
                 &mut last_continue_inject,
-                &mut srl_onset,
+                &mut srl_floor,
                 loop_started_at,
             );
             check_pane_input_not_submitted(
@@ -1885,32 +1886,26 @@ fn classify_inject_failure(consecutive_failures: u32) -> InjectFailAction {
     }
 }
 
-/// #t-26795: epoch-ms now — matches the hook snapshot's `at_ms` clock for the
-/// post-onset comparison (the rest of the supervisor uses `Instant` for backoff).
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// #t-26795 (PURE, unit-tested): does a fresh claude hook prove the agent recovered
 /// from a STICKY screen-scraped `ServerRateLimit`? True iff the backend is claude AND
-/// a fresh ACTIVE hook event exists whose epoch-ms POST-DATES the rate-limit onset
-/// (the agent emitted a tool-call hook AFTER the throttle began → it is executing, so
-/// the screen text is stale). A pre-onset hook (a prior turn's, fired BEFORE this SRL)
-/// is rejected — the load-bearing edge against masking a genuine new-turn SRL.
+/// a fresh ACTIVE hook's monotonic seq is STRICTLY GREATER than the per-episode floor
+/// — i.e. a NEW tool-call/thinking hook arrived since the floor was last consumed
+/// (forward progress → the agent is executing → the screen text is stale). The floor
+/// starts at the agent's latest hook seq at onset, so a pre-onset hook (seq ≤ floor)
+/// is rejected (the load-bearing edge against masking a genuine new SRL); once a
+/// recovery hook is consumed the floor ADVANCES to it, so a later genuine episode with
+/// NO newer hook (seq == floor) re-arms instead of being permanently masked.
 /// non-claude / no-hook / stale-hook → false → the screen-driven path is unchanged.
 fn hook_recovered_for_srl(
     is_claude: bool,
-    hook_active_at_ms: Option<u64>,
-    srl_onset_ms: Option<u64>,
+    hook_active_seq: Option<u64>,
+    floor: Option<u64>,
 ) -> bool {
-    is_claude && matches!((hook_active_at_ms, srl_onset_ms), (Some(h), Some(o)) if h > o)
+    is_claude && matches!((hook_active_seq, floor), (Some(h), Some(f)) if h > f)
 }
 
 // Threads the run_loop's long-lived per-agent error/retry state maps (retry_tracks,
-// apierror_episodes, apierror_nudge_counts, last_continue_inject, srl_onset); bundling
+// apierror_episodes, apierror_nudge_counts, last_continue_inject, srl_floor); bundling
 // them into a struct would not improve clarity here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_error_recovery(
@@ -1920,12 +1915,14 @@ pub(crate) fn process_error_recovery(
     apierror_episodes: &mut std::collections::HashSet<String>,
     apierror_nudge_counts: &mut HashMap<String, u32>,
     last_continue_inject: &mut HashMap<String, Instant>,
-    // #t-26795: per-agent epoch-ms of the FIRST ServerRateLimit detection of the
-    // current episode, STABLE across the detect→clear→re-detect flap (or_insert never
-    // overwrites; removed only on a genuine screen-state exit). The hook-override
-    // compares a fresh active hook's timestamp against THIS — a resetting onset would
-    // make a just-pre-re-detect hook look pre-onset and the flap would survive.
-    srl_onset: &mut HashMap<String, u64>,
+    // #t-26795: per-agent forward-progress FLOOR = the monotonic hook seq last
+    // CONSUMED to clear this ServerRateLimit episode. Seeded at onset with the agent's
+    // latest hook seq (or_insert never overwrites → stable across the detect→clear→
+    // re-detect flap; removed on a genuine screen exit), then ADVANCED on every
+    // override. The hook-override fires only for a fresh active hook STRICTLY newer
+    // than this — so a stale recovery hook can't permanently mask a later genuine
+    // episode (r6 finding-1), and a pre-onset hook (seq ≤ floor) can't mask edge-a.
+    srl_floor: &mut HashMap<String, u64>,
     loop_started_at: Instant,
 ) {
     use crate::state::AgentState;
@@ -1994,28 +1991,38 @@ pub(crate) fn process_error_recovery(
 
             // ── #t-26795 SRL hook-override (operator-reported sticky-screen flap) ──
             // A sticky screen-scraped ServerRateLimit while a FRESH claude hook proves
-            // the agent is mid-tool-call = the screen text is stale. Track the STABLE
-            // first-onset (or_insert never overwrites → survives the detect→clear→
-            // re-detect flap; removed only on a genuine screen exit), then treat a fresh
-            // ACTIVE hook that POST-DATES it as a third recovery signal. ADD-ONLY —
-            // composes with recovered/self_cleared; claude-only; a non-claude / missing /
-            // stale / pre-onset hook falls through to the unchanged screen-driven path.
+            // the agent is mid-tool-call = the screen text is stale. Seed a per-episode
+            // FLOOR with the agent's latest hook seq at onset (or_insert never
+            // overwrites → survives the detect→clear→re-detect flap; removed only on a
+            // genuine screen exit); a fresh ACTIVE hook whose seq is STRICTLY newer
+            // than the floor is a third recovery signal. ADD-ONLY — composes with
+            // recovered/self_cleared; claude-only; a non-claude / missing / stale /
+            // pre-onset hook falls through to the unchanged screen-driven path.
             if state == AgentState::ServerRateLimit {
-                srl_onset
+                srl_floor
                     .entry(name.to_string())
-                    .or_insert_with(now_epoch_ms);
+                    .or_insert_with(|| crate::daemon::hook_shadow::latest_hook_seq(name));
             } else {
-                srl_onset.remove(name);
+                srl_floor.remove(name);
             }
             let is_claude = crate::backend::Backend::parse_str(handle.backend_command.as_str())
                 .has_state_hooks();
-            let hook_active_at_ms = if is_claude {
-                crate::daemon::hook_shadow::fresh_active_hook_at_ms(name)
+            let hook_active_seq = if is_claude {
+                crate::daemon::hook_shadow::fresh_active_hook_seq(name)
             } else {
                 None
             };
             let hook_recovered =
-                hook_recovered_for_srl(is_claude, hook_active_at_ms, srl_onset.get(name).copied());
+                hook_recovered_for_srl(is_claude, hook_active_seq, srl_floor.get(name).copied());
+            if hook_recovered {
+                // FORWARD-PROGRESS (r6 finding-1): advance the floor to the consumed
+                // hook so a LATER genuine episode — screen still sticky-SRL but the
+                // agent now truly stuck (no NEWER hook) — re-arms the retry instead of
+                // being permanently masked by this episode's stale recovery hook.
+                if let Some(seq) = hook_active_seq {
+                    srl_floor.insert(name.to_string(), seq);
+                }
+            }
 
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
@@ -2245,6 +2252,10 @@ pub(crate) fn process_error_recovery(
     apierror_episodes.retain(|name| active_names.contains(name));
     apierror_nudge_counts.retain(|name, _| active_names.contains(name));
     last_continue_inject.retain(|name, _| active_names.contains(name));
+    // #t-26795 (r6 finding-2): the SRL forward-progress floor map must churn-prune
+    // too, or a delete/restart leaves a residual floor and a same-name replacement's
+    // `or_insert` INHERITS it — masking the new instance's genuine first SRL.
+    srl_floor.retain(|name, _| active_names.contains(name));
     // #t-81376 Phase-0 shadow: prune expectation/latch maps for churned agents
     // (no-op unless AGEND_RECOVERY_SHADOW=1). `()` → control-flow-inert.
     crate::daemon::recovery_shadow::retain_live(&|n| active_names.contains(n));
@@ -3942,58 +3953,64 @@ instances:
 
     // ─────────────────── #t-26795 SRL hook-override ───────────────────
 
-    /// PURE truth-table for the hook→recovery decision.
+    /// PURE truth-table + FORWARD-PROGRESS (test ②) for the hook→recovery decision:
+    /// a hook seq STRICTLY greater than the floor recovers; a seq equal to (consumed)
+    /// or below (pre-onset) the floor does not — so once the floor advances onto a
+    /// hook, that SAME hook no longer overrides, only a NEWER one does.
     #[test]
     fn hook_recovered_for_srl_truth_table() {
-        let onset = 1000u64;
+        let floor = 1000u64;
         assert!(
-            super::hook_recovered_for_srl(true, Some(1500), Some(onset)),
-            "claude + fresh active hook POST-onset → recovered"
+            super::hook_recovered_for_srl(true, Some(1500), Some(floor)),
+            "claude + a fresh active hook NEWER than the floor → recovered (forward progress)"
         );
         assert!(
-            !super::hook_recovered_for_srl(true, Some(500), Some(onset)),
-            "PRE-onset hook (prior turn) rejected → genuine new SRL not masked"
+            !super::hook_recovered_for_srl(true, Some(500), Some(floor)),
+            "a hook seq BELOW the floor (pre-onset / prior turn) → genuine new SRL not masked"
         );
         assert!(
-            !super::hook_recovered_for_srl(true, Some(1000), Some(onset)),
-            "exactly at onset is not strictly after → not recovered"
+            !super::hook_recovered_for_srl(true, Some(1000), Some(floor)),
+            "a hook seq EQUAL to the floor (already consumed — no newer hook) → not recovered → re-arms"
         );
         assert!(
-            !super::hook_recovered_for_srl(true, None, Some(onset)),
+            !super::hook_recovered_for_srl(true, None, Some(floor)),
             "no fresh ACTIVE hook (idle/stale/absent) → not recovered"
         );
         assert!(
             !super::hook_recovered_for_srl(true, Some(1500), None),
-            "no onset (agent not in SRL) → not recovered"
+            "no floor (agent not in SRL) → not recovered"
         );
         assert!(
-            !super::hook_recovered_for_srl(false, Some(1500), Some(onset)),
+            !super::hook_recovered_for_srl(false, Some(1500), Some(floor)),
             "non-claude backend → never (unaffected)"
         );
     }
 
     /// FLAP REGRESSION (operator's exact symptom, #t-26795). An agent latched on a
     /// STICKY screen `ServerRateLimit` with `recovered`=false (no productive output
-    /// this instant) but a FRESH claude hook (tool calls firing) whose timestamp
-    /// POST-DATES the rate-limit onset → the retry track must stay CLEARED across
-    /// re-detect ticks (no re-arm = the `continue`-spam flap killed), and the onset
-    /// stays STABLE across the flap. NEUTER: drop `|| hook_recovered` from the clear
-    /// gate → a recovered=false tick re-arms → this RED.
+    /// this instant) but ALIVE — firing a NEW tool-call hook every tick. Each fresh
+    /// hook seq exceeds the floor (forward progress) → the retry track stays CLEARED
+    /// across re-detect ticks (no re-arm = the `continue`-spam flap killed) and the
+    /// floor advances as each hook is consumed. NEUTER: drop `|| hook_recovered` from
+    /// the clear gate → a recovered=false tick re-arms → this RED.
     #[test]
     #[serial_test::serial]
     fn srl_hook_override_kills_flap() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home = tmp_home("srl-hook-flap");
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
-        let mut srl_onset: HashMap<String, u64> = HashMap::new();
+        let mut srl_floor: HashMap<String, u64> = HashMap::new();
         let name = "srl-flap-agent";
         let (handle, _r) = mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
         registry.lock().insert(handle.id, handle);
-        // Stable onset in the PAST; a fresh active hook (now) POST-DATES it.
-        let onset = super::now_epoch_ms().saturating_sub(60_000);
-        srl_onset.insert(name.to_string(), onset);
-        crate::daemon::hook_shadow::record_event(name, "PreToolUse", None); // Fresh(ToolUse) @ now
+        // Onset baseline: a pre-SRL hook pins the floor BELOW the recovery hooks.
+        crate::daemon::hook_shadow::record_event(name, "Stop", None); // idle baseline
+        let floor = crate::daemon::hook_shadow::latest_hook_seq(name);
+        srl_floor.insert(name.to_string(), floor);
+        // The agent is actually ALIVE (false sticky SRL): it fires a NEW tool-call hook
+        // each tick → each seq > floor → forward progress → the retry stays cleared.
         for _ in 0..3 {
+            crate::daemon::hook_shadow::record_event(name, "PreToolUse", None);
             super::process_error_recovery(
                 &home,
                 &registry,
@@ -4001,39 +4018,129 @@ instances:
                 &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
-                &mut srl_onset,
+                &mut srl_floor,
                 past_boot_grace(),
+            );
+            assert!(
+                !tracks.contains_key(name),
+                "a fresh post-floor claude hook each tick keeps the SRL retry cleared — the continue-spam flap is killed"
             );
         }
         assert!(
-            !tracks.contains_key(name),
-            "a fresh post-onset claude hook must keep the SRL retry cleared — no re-arm flap"
-        );
-        assert_eq!(
-            srl_onset.get(name).copied(),
-            Some(onset),
-            "onset must stay STABLE across re-detect (or_insert never overwrites)"
+            srl_floor.get(name).copied().expect("floor present after override") > floor,
+            "the floor ADVANCES to the latest consumed hook seq (forward progress)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// EDGE (#t-26795): a genuine NEW SRL must NOT be masked — a hook that PRE-DATES
-    /// the onset (a prior turn's, backdated before this episode) does not override;
-    /// the retry arms normally.
+    /// FORWARD-PROGRESS (test ①, #t-26795 r6 finding-1): the multi-episode case the
+    /// stable first-onset design missed, driven end-to-end through the code. The
+    /// screen STAYS sticky-SRL the whole time (never emits a non-SRL tick → the floor
+    /// is never reset). (a) onset: an idle baseline seeds the floor, no active hook →
+    /// the retry ARMS. (b) episode A: a fresh tool-call hook (seq > floor) overrides
+    /// AND ADVANCES the floor onto it → the retry clears. (c) episode B: the agent is
+    /// now genuinely stuck — NO newer hook — so that SAME hook's seq == the advanced
+    /// floor → no override → the retry must RE-ARM. NEUTER: drop the floor-advance
+    /// (revert to the stable first-onset design) → the still-fresh episode-A hook
+    /// stays seq > the un-advanced floor → it permanently re-masks B → no re-arm → RED.
+    #[test]
+    #[serial_test::serial]
+    fn srl_forward_progress_rearms_genuine_episode_b() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-fwd-progress");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        let mut srl_floor: HashMap<String, u64> = HashMap::new();
+        let name = "srl-fwd-agent";
+        let (handle, _r) = mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert(handle.id, handle);
+        let pe = |tracks: &mut HashMap<String, RateLimitRetry>,
+                  srl_floor: &mut HashMap<String, u64>| {
+            super::process_error_recovery(
+                &home,
+                &registry,
+                tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                srl_floor,
+                past_boot_grace(),
+            );
+        };
+        // (a) onset: an idle baseline seeds the floor; no active hook → the retry arms.
+        crate::daemon::hook_shadow::record_event(name, "Stop", None);
+        pe(&mut tracks, &mut srl_floor);
+        assert!(
+            tracks.contains_key(name),
+            "onset with no active hook arms the retry"
+        );
+        // (b) episode A: a fresh tool-call hook NEWER than the floor overrides AND the
+        // production code advances the floor onto it → the retry clears.
+        crate::daemon::hook_shadow::record_event(name, "PreToolUse", None);
+        pe(&mut tracks, &mut srl_floor);
+        assert!(
+            !tracks.contains_key(name),
+            "episode A: a fresh post-floor hook overrides — the retry clears"
+        );
+        // (c) episode B: agent genuinely stuck — NO newer hook. The same episode-A hook
+        // is still Fresh(ToolUse) but its seq == the advanced floor → no override.
+        pe(&mut tracks, &mut srl_floor);
+        assert!(
+            tracks.contains_key(name),
+            "a genuine episode B (no hook newer than the CONSUMED floor) must re-arm the retry — forward progress, not permanent mask"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// CHURN PRUNE (#t-26795 r6 finding-2): a deleted/restarted agent's SRL floor
+    /// must be dropped when it leaves the registry, or a same-name replacement's
+    /// `or_insert` INHERITS the stale floor and the new instance's genuine first SRL
+    /// is masked. NEUTER: drop the `srl_floor.retain(...)` churn-prune → RED.
+    #[test]
+    #[serial_test::serial]
+    fn srl_floor_pruned_on_agent_churn() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-floor-churn");
+        let mut srl_floor: HashMap<String, u64> = HashMap::new();
+        // A prior instance left a floor seq behind; it is NO LONGER in the registry
+        // (deleted / restarted under the same name).
+        srl_floor.insert("recycled-name".to_string(), 1);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut srl_floor,
+            past_boot_grace(),
+        );
+        assert!(
+            !srl_floor.contains_key("recycled-name"),
+            "a churned-out agent's SRL floor must be pruned so a same-name replacement re-arms its genuine first SRL"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// EDGE (#t-26795): a genuine NEW SRL must NOT be masked. The agent's latest hook
+    /// PRESENT at onset seeds the floor to its OWN seq, so with NO newer hook the
+    /// active seq EQUALS the floor → not strictly greater → no override → the retry
+    /// arms. (A hook present at onset is "pre-onset" w.r.t. the floor it seeds.) This
+    /// exercises the `or_insert_with(latest_hook_seq)` onset-init path — r4's blessed
+    /// edge-a, preserved under the seq model. NEUTER: relax `h > f` to `h >= f` → the
+    /// onset hook wrongly overrides → no arm → RED.
     #[test]
     #[serial_test::serial]
     fn srl_genuine_not_masked_by_pre_onset_hook() {
         let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let home = tmp_home("srl-genuine");
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
-        let mut srl_onset: HashMap<String, u64> = HashMap::new();
+        let mut srl_floor: HashMap<String, u64> = HashMap::new();
         let name = "srl-genuine-agent";
         let (handle, _r) = mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
         registry.lock().insert(handle.id, handle);
-        // A hook from a PRIOR turn: recorded then backdated to BEFORE the onset the
-        // tick stamps (now). hook(now-120s) < onset(now) → pre-onset → no override.
+        // A hook present at onset: the floor `or_insert`s to its seq → active seq ==
+        // floor → no override. No newer hook arrives = a genuine SRL.
         crate::daemon::hook_shadow::record_event(name, "PreToolUse", None);
-        crate::daemon::hook_shadow::backdate_for_test(name, 120_000);
         super::process_error_recovery(
             &home,
             &registry,
@@ -4041,12 +4148,12 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
-            &mut srl_onset,
+            &mut srl_floor,
             past_boot_grace(),
         );
         assert!(
             tracks.contains_key(name),
-            "a pre-onset hook must NOT mask a genuine SRL — the retry must arm"
+            "a hook no newer than the onset floor must NOT mask a genuine SRL — the retry must arm"
         );
         std::fs::remove_dir_all(&home).ok();
     }
