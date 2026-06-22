@@ -496,6 +496,151 @@ mod tests {
         drop(data_tx);
     }
 
+    // ───────────── ScrollbackCache (#2411 r4/r6 incremental rework) ─────────────
+
+    /// CORRECTNESS: the INCREMENTAL `ScrollbackCache` (drive it per burst, the way
+    /// `parser_loop` does) must produce a history that renders IDENTICALLY to the
+    /// full one-shot `vterm.snapshot()` (the r4-verified reference) at every offset —
+    /// across growth past the visible screen + a resize (reflow → recapture). This is
+    /// the guard that the per-burst incremental append never diverges from a full copy.
+    #[test]
+    fn scrollback_cache_renders_identically_to_full_capture() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut vt = VTerm::new(20, 5);
+        vt.process(b"\x1b[2J\x1b[H");
+        let mut cache = ScrollbackCache::new();
+        // Drive the cache exactly like the parser: update after each burst, incl a
+        // mid-run resize (exercises the cols-change recapture path).
+        for i in 1..=40 {
+            vt.process(format!("line{i:02}\r\n").as_bytes());
+            cache.update(&vt);
+            if i == 25 {
+                vt.resize(12, 5);
+                cache.update(&vt);
+            }
+        }
+        let mut incr = vt.snapshot_visible();
+        incr.history = cache.update(&vt);
+        let full = vt.snapshot(); // full one-shot reference (r4-verified render)
+        assert_eq!(
+            incr.history.len(),
+            full.history.len(),
+            "incremental + full must capture the same depth"
+        );
+        let area = Rect::new(0, 0, 12, 5);
+        let max_scroll = vt.max_scroll();
+        for off in [0usize, 1, 3, max_scroll.saturating_sub(1), max_scroll, max_scroll + 5] {
+            let mut a = Buffer::empty(area);
+            let mut b = Buffer::empty(area);
+            incr.render_to_buffer(&mut a, area, off, false);
+            full.render_to_buffer(&mut b, area, off, false);
+            assert_eq!(
+                a, b,
+                "incremental cache must render identically to the full capture at offset={off}"
+            );
+        }
+    }
+
+    /// DIRTY-SKIP (r4 fix): when the scrollback is UNCHANGED between bursts, the cache
+    /// returns the SAME `Arc` — no re-clone (the original bug was deep-cloning every
+    /// burst even when nothing scrolled).
+    #[test]
+    fn scrollback_cache_reuses_arc_when_unchanged() {
+        let mut vt = VTerm::new(20, 4);
+        vt.process(b"\x1b[2J\x1b[H");
+        for i in 1..=8 {
+            vt.process(format!("l{i}\r\n").as_bytes());
+        }
+        let mut cache = ScrollbackCache::new();
+        cache.update(&vt); // populate
+        let a = cache.update(&vt); // no new output since last
+        let b = cache.update(&vt); // still none
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "unchanged scrollback must reuse the same Arc (no per-burst re-clone)"
+        );
+    }
+
+    /// PERF MECHANISM (r6 fix): on growth the cache ALLOCATES ONLY the new rows and
+    /// SHARES the old ones — a previously-captured row is the SAME `Arc` after more
+    /// output, not a re-copy. This is what makes the flood/restore publish cheap.
+    #[test]
+    fn scrollback_cache_shares_old_rows_on_growth() {
+        let mut vt = VTerm::new(20, 4);
+        vt.process(b"\x1b[2J\x1b[H");
+        let mut cache = ScrollbackCache::new();
+        for i in 1..=10 {
+            vt.process(format!("l{i:02}\r\n").as_bytes());
+            cache.update(&vt);
+        }
+        assert!(!cache.rows.is_empty(), "must have scrollback to test sharing");
+        let kept = Arc::clone(&cache.rows[0]); // an existing (older) row
+        // Grow further (well under the cap, so the front is not trimmed).
+        for i in 11..=15 {
+            vt.process(format!("l{i:02}\r\n").as_bytes());
+            cache.update(&vt);
+        }
+        assert!(
+            cache.rows.iter().any(|r| Arc::ptr_eq(r, &kept)),
+            "an old scrollback row must be REUSED (shared Arc), not re-cloned on growth"
+        );
+    }
+
+    /// BENCHMARK (#[ignore]: timing, run locally) — quantifies the r6 fix: per-publish
+    /// cost of the OLD full-recapture (`vterm.snapshot()`) vs the NEW incremental
+    /// `ScrollbackCache` under a sustained flood that scrolls rows into history every
+    /// burst (the restart/restore workload). Run:
+    /// `cargo test --bin agend-terminal -- --ignored --nocapture scrollback_bench`.
+    #[test]
+    #[ignore = "timing benchmark; run locally with --nocapture"]
+    fn scrollback_bench_incremental_vs_full_recapture() {
+        let cols = 200u16;
+        let mut vt = VTerm::new(cols, 50);
+        vt.process(b"\x1b[2J\x1b[H");
+        // Pre-fill history to the cap so both paths work the worst case.
+        for i in 0..1200 {
+            vt.process(format!("seed line {i} ........................\r\n").as_bytes());
+        }
+        let bursts = 500;
+        // OLD: full recapture every burst.
+        let t_full = {
+            let start = Instant::now();
+            for i in 0..bursts {
+                vt.process(format!("flood {i} ........................\r\n").as_bytes());
+                let _ = vt.snapshot(); // deep-clones all ≤1000 history rows
+            }
+            start.elapsed()
+        };
+        // NEW: incremental cache every burst.
+        let t_incr = {
+            let mut cache = ScrollbackCache::new();
+            cache.update(&vt);
+            let start = Instant::now();
+            for i in 0..bursts {
+                vt.process(format!("flood {i} ........................\r\n").as_bytes());
+                let mut snap = vt.snapshot_visible();
+                snap.history = cache.update(&vt);
+                std::hint::black_box(&snap);
+            }
+            start.elapsed()
+        };
+        println!(
+            "scrollback_bench (cols={cols}, cap={SNAPSHOT_SCROLLBACK_ROWS}, {bursts} bursts):\n  \
+             FULL recapture : {t_full:?} ({:?}/burst)\n  \
+             INCREMENTAL    : {t_incr:?} ({:?}/burst)\n  \
+             speedup        : {:.1}x",
+            t_full / bursts,
+            t_incr / bursts,
+            t_full.as_secs_f64() / t_incr.as_secs_f64().max(1e-9),
+        );
+        assert!(
+            t_incr * 3 < t_full,
+            "incremental must be materially cheaper than full recapture under flood \
+             (full={t_full:?}, incr={t_incr:?})"
+        );
+    }
+
     /// A resize routed through the handle reaches the parser thread (which owns the
     /// VTerm) and the next snapshot carries the new dims.
     #[test]
