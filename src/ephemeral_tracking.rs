@@ -164,8 +164,15 @@ pub struct SpawnSpec {
 /// Why a spawn failed.
 #[derive(Debug)]
 pub enum SpawnError {
+    /// The requested `backend` is not on the allowlist (a path, or a basename
+    /// that doesn't map to a known backend) — an arbitrary-exec guard. Carries the
+    /// rejected input for the operator-facing error.
+    UnsupportedBackend(String),
     /// The hard max-live concurrency cap would be exceeded.
     CapExceeded { live: usize, cap: usize },
+    /// The durable cap reservation could not be persisted (store write failed) —
+    /// admission fails CLOSED rather than spawning with no durable reservation.
+    Reserve(std::io::Error),
     /// The headless process failed to launch (or finalize).
     Spawn(std::io::Error),
 }
@@ -173,36 +180,86 @@ pub enum SpawnError {
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SpawnError::UnsupportedBackend(b) => write!(
+                f,
+                "ephemeral spawn: unsupported backend '{b}' — must be a bare backend command \
+                 (no path separators), one of: claude, codex, opencode, kiro-cli, agy"
+            ),
             SpawnError::CapExceeded { live, cap } => write!(
                 f,
                 "ephemeral worker cap reached ({live}/{cap} live) — reap or wait before spawning more"
+            ),
+            SpawnError::Reserve(e) => write!(
+                f,
+                "ephemeral spawn: failed to persist the cap reservation (admission fails closed, no process spawned): {e}"
             ),
             SpawnError::Spawn(e) => write!(f, "failed to spawn ephemeral worker: {e}"),
         }
     }
 }
 
+/// Validate a requested `backend` string against the allowlist and resolve it to
+/// the CANONICAL backend command (security keystone — closes the arbitrary-exec
+/// vector that the raw `backend` → `build_command` → `which::which` path opened).
+///
+/// Rejects (returns `Err`):
+/// - any string containing a path separator (`/` or `\`) — a path is an
+///   arbitrary-exec vector (`/tmp/evil.sh`), never a backend command;
+/// - any basename that [`crate::backend::Backend::from_command`] does not map to a
+///   known backend (`from_command` returns `None`; it never returns Shell/Raw).
+///
+/// On accept, returns the backend's CANONICAL command
+/// ([`crate::backend::BackendPreset::command`] — `claude`/`codex`/`opencode`/
+/// `kiro-cli`/`agy`), NEVER the caller's raw input — so a `claude-evil` basename
+/// (which `from_command` maps to ClaudeCode by prefix) is launched as the real
+/// `claude` binary with its canonical preset, not the attacker's name.
+pub fn resolve_supported_backend(backend: &str) -> Result<&'static str, String> {
+    if backend.contains('/') || backend.contains('\\') {
+        return Err(format!(
+            "backend '{backend}' looks like a path — only a bare backend command is allowed"
+        ));
+    }
+    match crate::backend::Backend::from_command(backend) {
+        Some(b) => Ok(b.preset().command),
+        None => Err(format!("backend '{backend}' is not a supported backend")),
+    }
+}
+
+/// Why a slot reservation failed.
+#[derive(Debug)]
+enum ReserveError {
+    /// The hard max-live concurrency cap is full (carries the live count).
+    CapExceeded(usize),
+    /// The store write failed — admission must fail CLOSED (no spawn).
+    Persist(std::io::Error),
+}
+
 /// Atomic admission RESERVE (r4 PR1 note: admission happens BEFORE spawning the
 /// real process). In ONE locked read-modify-write: if the live count is below
 /// [`max_live_workers`], insert `reserving` (a [`STATUS_RESERVING`] row, pid=0)
-/// and return `Ok`; else `Err(live)` WITHOUT inserting — so an over-cap spawn
-/// rejects before any OS process exists. Single RMW under the store flock →
-/// concurrent reserves can never push the count past the cap (no TOCTOU).
-fn try_reserve_slot(home: &Path, reserving: EphemeralWorker) -> Result<(), usize> {
+/// and return `Ok`; else `Err(ReserveError::CapExceeded(live))` WITHOUT inserting —
+/// so an over-cap spawn rejects before any OS process exists. Single RMW under the
+/// store flock → concurrent reserves can never push the count past the cap (no
+/// TOCTOU).
+///
+/// A STORE WRITE FAILURE is NOT swallowed — it surfaces as
+/// `Err(ReserveError::Persist(_))` so admission can fail CLOSED. Swallowing it
+/// (the old `persist_or_log!` path) would return `Ok` with NO durable reservation
+/// on disk, then OS-spawn anyway — a worker that the cap can no longer see (it
+/// would re-admit over the cap, and a crash before finalize leaves no row to reap).
+fn try_reserve_slot(home: &Path, reserving: EphemeralWorker) -> Result<(), ReserveError> {
     let mut rejected_at = None;
-    persist_or_log!(
-        crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
-            if s.workers.len() >= max_live_workers() {
-                rejected_at = Some(s.workers.len());
-                return Ok(());
-            }
-            s.workers.push(reserving.clone());
-            Ok(())
-        }),
-        "ephemeral_reserve"
-    );
+    crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
+        if s.workers.len() >= max_live_workers() {
+            rejected_at = Some(s.workers.len());
+            return Ok(());
+        }
+        s.workers.push(reserving.clone());
+        Ok(())
+    })
+    .map_err(|e| ReserveError::Persist(std::io::Error::other(e.to_string())))?;
     match rejected_at {
-        Some(live) => Err(live),
+        Some(live) => Err(ReserveError::CapExceeded(live)),
         None => Ok(()),
     }
 }
@@ -257,17 +314,30 @@ fn release_reservation(home: &Path, worker_id: &str) {
 /// (`spawn_ephemeral_worker` calls the SAME `build_command`). Returns the live
 /// [`EphemeralWorker`].
 pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, SpawnError> {
+    // 0) BACKEND ALLOWLIST (security keystone) — validate BEFORE reserving any slot
+    //    or spawning any process. `spawn_and_track` is the SHARED SINK every spawn
+    //    funnels through (the MCP handler AND any direct caller), so gating here —
+    //    not in the handler — protects every entry. A path or an unknown basename
+    //    is rejected; the canonical command is used for the spawn + persisted row
+    //    (NEVER the raw input — `claude-evil` → real `claude`).
+    let backend_command = match resolve_supported_backend(&spec.backend) {
+        Ok(cmd) => cmd,
+        Err(_) => return Err(SpawnError::UnsupportedBackend(spec.backend.clone())),
+    };
+
     let ttl_secs = resolve_ttl(spec.ttl_secs);
     let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
     let worker_id = format!("eph-{}-{}", std::process::id(), seq);
 
     // 1) ADMISSION BEFORE SPAWN — reserve the cap slot atomically. Over cap →
-    //    reject here, before any OS process exists (r4 PR1 NON-BLOCKING note).
+    //    reject here, before any OS process exists (r4 PR1 NON-BLOCKING note). A
+    //    persist failure → fail CLOSED (return, no spawn). Persist the CANONICAL
+    //    backend command so list/reap show the resolved binary, not the raw input.
     let reserving = EphemeralWorker {
         worker_id: worker_id.clone(),
         workflow_id: spec.workflow_id.clone(),
         parent: spec.parent.clone(),
-        backend: spec.backend.clone(),
+        backend: backend_command.to_string(),
         pid: 0,
         process_start_token: None,
         spawned_at: chrono::Utc::now().to_rfc3339(),
@@ -276,11 +346,15 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
         phase: STATUS_RESERVING.to_string(),
         status: STATUS_RESERVING.to_string(),
     };
-    if let Err(live) = try_reserve_slot(home, reserving) {
-        return Err(SpawnError::CapExceeded {
-            live,
-            cap: max_live_workers(),
-        });
+    match try_reserve_slot(home, reserving) {
+        Ok(()) => {}
+        Err(ReserveError::CapExceeded(live)) => {
+            return Err(SpawnError::CapExceeded {
+                live,
+                cap: max_live_workers(),
+            });
+        }
+        Err(ReserveError::Persist(e)) => return Err(SpawnError::Reserve(e)),
     }
 
     // 2) SPAWN the real backend headlessly — only now that a slot is reserved.
@@ -291,7 +365,7 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
     std::fs::create_dir_all(&cwd).ok();
     let config = crate::agent::SpawnConfig {
         name: &worker_id,
-        backend_command: &spec.backend,
+        backend_command, // canonical (allowlist-resolved) — never the raw input
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh, // ephemeral workers are always fresh
         cols: 200,
@@ -467,37 +541,61 @@ pub fn reap_on_boot(home: &Path) -> usize {
 /// Terminate a reaped worker's process TREE and reap its zombie.
 ///
 /// If we still hold the live [`crate::agent::EphemeralPtyHandle`] (spawned this
-/// daemon life): group-kill the whole PTY-session tree
-/// ([`crate::process::kill_process_tree`]) then `wait()` to collect the exit (no
-/// zombie). Otherwise (e.g. a restart orphan, no in-memory handle): a
-/// start-token-guarded group-kill — a recycled pid is never killed, and init
-/// reaps the orphan's zombie.
+/// daemon life), the PRIMARY live path: the whole worker tree is killed and the
+/// leader's zombie reaped — **unix** = pgid group-kill via
+/// [`crate::process::kill_process_tree`] (a PTY child is its own session leader, so
+/// the PGID covers every grandchild the backend forked); **windows** = the
+/// EphemeralPtyHandle owns a Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// and the worker + all descendants are assigned to it at spawn, so DROPPING the
+/// handle closes the job handle and the OS kills the entire tree (a real tree-kill,
+/// unlike bare `TerminateProcess` which only kills the leader). On windows we also
+/// call `kill_process_tree(pid)` first as a belt-and-suspenders leader kill, but the
+/// Job-Object close is the tree mechanism. Then `wait()` collects the leader's exit
+/// (no zombie) and the handle drops.
 ///
-/// PR3a: group-kill is now DONE (the PR2 "group-kill DEFERRED" note is resolved).
-/// A PTY child is its own session leader, so `kill_process_tree` reaps the worker
-/// AND any children the real backend forked — no explicit `process_group(0)` is
-/// needed (the PTY already establishes the session). Route B has NO protocol cancel
-/// (confirmed for opencode in the ACP sub-spike), so cancel stays a hard
-/// process-tree kill; a PTY-level graceful quit (the backend's `quit_command`)
+/// Otherwise (a restart orphan — no in-memory handle, so no Job Object either):
+/// a start-token-guarded `kill_process_tree`, FAIL-CLOSED. We signal the orphan
+/// ONLY when its start-token identity is fully confirmed: a stored token is
+/// present AND the live pid's current token is present AND they match. If the
+/// stored token is `None`, or the pid's current token can't be read, or they
+/// differ, we do NOT signal — a recycled pid belonging to an innocent process is
+/// never killed (the prior fail-OPEN logic killed when the stored token was
+/// `None`). On windows this restart-orphan path is leader-only (`TerminateProcess`
+/// — bare `kill_process_tree` on windows has no Job Object to close); restart
+/// orphans are rare (the primary live path uses the job), so a leader-only
+/// fallback here is an accepted edge.
+///
+/// PR3a: group-kill is now DONE (the PR2 "group-kill DEFERRED" note is resolved) —
+/// unix=pgid group-kill, windows=Job Object KILL_ON_JOB_CLOSE. Route B has NO
+/// protocol cancel (confirmed for opencode in the ACP sub-spike), so cancel stays a
+/// hard process-tree kill; a PTY-level graceful quit (the backend's `quit_command`)
 /// before the kill is an optional later refinement, not a protocol step.
 fn terminate_worker(w: &EphemeralWorker) {
     if let Some(handle) = LIVE_CHILDREN.lock().remove(&w.worker_id) {
-        // Group-kill the PTY-session tree, then reap the leader's zombie.
+        // PRIMARY live path. unix: pgid group-kill. windows: the leader kill plus
+        // the Job-Object close (on handle drop below) takes down the whole tree.
         crate::process::kill_process_tree(handle.pid());
         let _ = handle.child.lock().wait();
+        // `handle` drops here → on windows the Job Object handle closes →
+        // KILL_ON_JOB_CLOSE terminates any descendants the leader-kill missed.
         return;
     }
     if w.pid == 0 || !crate::process::is_pid_alive(w.pid) {
         return;
     }
-    // No handle (restart orphan): only terminate if the start-token still matches,
-    // so a recycled pid belonging to an innocent process is never signalled.
-    if let Some(tok) = w.process_start_token {
-        if crate::process::process_start_token(w.pid) != Some(tok) {
-            return;
+    // No handle (restart orphan): FAIL-CLOSED — only terminate when the start-token
+    // identity is FULLY confirmed (stored Some, current Some, equal). A missing
+    // stored token, an unreadable current token, or a mismatch all mean "cannot
+    // prove this pid is still our worker" → do NOT signal a possibly-recycled pid.
+    match (
+        w.process_start_token,
+        crate::process::process_start_token(w.pid),
+    ) {
+        (Some(stored), Some(current)) if stored == current => {
+            crate::process::kill_process_tree(w.pid);
         }
+        _ => {}
     }
-    crate::process::kill_process_tree(w.pid);
 }
 
 #[cfg(test)]
@@ -658,7 +756,10 @@ mod tests {
             ..Default::default()
         };
         let res = try_reserve_slot(&home, over);
-        assert_eq!(res, Err(cap), "at cap must reject");
+        assert!(
+            matches!(res, Err(ReserveError::CapExceeded(live)) if live == cap),
+            "at cap must reject with CapExceeded({cap})"
+        );
         assert_eq!(
             list(&home, None).len(),
             cap,
@@ -885,5 +986,383 @@ mod tests {
         let _ = handle.child.lock().wait();
         drop(handle);
         assert_dead_within(pid, "kill_process_tree must reap the ephemeral PTY worker");
+    }
+
+    // ───────────────────────── Fix 1: backend allowlist (SECURITY) ──────────────
+
+    /// The security keystone: `resolve_supported_backend` rejects a PATH (arbitrary-
+    /// exec vector) and an unknown basename, accepts a known backend basename, and
+    /// — critically — returns the CANONICAL command, never the raw input (so a
+    /// `claude-evil` basename launches the real `claude`, not the attacker's name).
+    #[test]
+    fn resolve_supported_backend_rejects_paths_and_canonicalizes() {
+        // Paths (forward + back slash) are rejected — arbitrary-exec vector.
+        assert!(resolve_supported_backend("/tmp/evil.sh").is_err());
+        assert!(resolve_supported_backend("./x").is_err());
+        assert!(resolve_supported_backend("..\\evil.exe").is_err());
+        assert!(
+            resolve_supported_backend("/usr/local/bin/claude").is_err(),
+            "even a path whose basename IS a backend is rejected — paths are never allowed"
+        );
+        // Unknown bare basenames are rejected.
+        assert!(resolve_supported_backend("bogus").is_err());
+        assert!(resolve_supported_backend("").is_err());
+        // Known backends resolve to their CANONICAL command.
+        assert_eq!(resolve_supported_backend("opencode"), Ok("opencode"));
+        assert_eq!(resolve_supported_backend("claude"), Ok("claude"));
+        // `claude-*` prefix maps to ClaudeCode but is canonicalized to `claude`
+        // (NEVER the raw `claude-2.1` — no attacker-controlled name reaches spawn).
+        assert_eq!(resolve_supported_backend("claude-2.1"), Ok("claude"));
+        assert_eq!(
+            resolve_supported_backend("claude-evil"),
+            Ok("claude"),
+            "a hostile claude-prefixed basename must launch the canonical `claude`"
+        );
+        // `kiro` alias canonicalizes to `kiro-cli`.
+        assert_eq!(resolve_supported_backend("kiro"), Ok("kiro-cli"));
+        assert_eq!(resolve_supported_backend("codex"), Ok("codex"));
+        assert_eq!(resolve_supported_backend("agy"), Ok("agy"));
+    }
+
+    /// `spawn_and_track` with a PATH backend is rejected as `UnsupportedBackend`
+    /// BEFORE any slot is reserved and BEFORE any OS process is spawned — the
+    /// shared-sink gate (so a direct caller, not just the MCP handler, is protected).
+    #[test]
+    fn spawn_and_track_rejects_path_backend_no_reserve_no_process() {
+        let home = tmp_home("evil-backend");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            parent: None,
+            backend: "/tmp/evil.sh".to_string(),
+            ttl_secs: Some(60),
+            token_budget: None,
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::UnsupportedBackend(b)) if b == "/tmp/evil.sh"),
+            "a path backend must be rejected as UnsupportedBackend: {res:?}"
+        );
+        assert_eq!(
+            list(&home, None).len(),
+            0,
+            "rejection happens before reserve — NO row is created (and no process)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `spawn_and_track` with an unknown basename is also rejected, no reservation.
+    #[test]
+    fn spawn_and_track_rejects_unknown_backend() {
+        let home = tmp_home("unknown-backend");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            parent: None,
+            backend: "bogus".to_string(),
+            ttl_secs: Some(60),
+            token_budget: None,
+        };
+        assert!(matches!(
+            spawn_and_track(&home, spec),
+            Err(SpawnError::UnsupportedBackend(_))
+        ));
+        assert_eq!(list(&home, None).len(), 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ───────────────────── Fix 4: PID identity fail-CLOSED on reap ──────────────
+
+    /// `terminate_worker`'s NO-HANDLE (restart-orphan) path must FAIL CLOSED: a
+    /// worker whose stored start-token is `None` must NOT be killed (the old
+    /// fail-OPEN logic killed it, risking an innocent recycled pid). We point the
+    /// row at a LIVE pid we own (this test process) with no stored token and assert
+    /// it survives the terminate call — there is no in-memory handle, so the
+    /// no-handle branch runs.
+    #[test]
+    fn terminate_no_handle_fails_closed_when_token_none() {
+        let self_pid = std::process::id();
+        let w = EphemeralWorker {
+            worker_id: "orphan-no-token".to_string(),
+            pid: self_pid,
+            process_start_token: None, // unknown identity → must NOT kill
+            status: STATUS_RUNNING.to_string(),
+            spawned_at: chrono::Utc::now().to_rfc3339(),
+            ttl_secs: 100,
+            ..Default::default()
+        };
+        // No LIVE_CHILDREN entry for this worker_id → no-handle branch.
+        terminate_worker(&w);
+        assert!(
+            crate::process::is_pid_alive(self_pid),
+            "fail-closed: a None stored token must NOT signal the pid"
+        );
+    }
+
+    /// Fail-CLOSED when the stored token is Some but the live pid's CURRENT token
+    /// is unavailable/mismatched: still must NOT kill. We use a deliberately bogus
+    /// stored token against our own live pid; the current token won't match, so the
+    /// guard must refuse to signal.
+    #[test]
+    fn terminate_no_handle_fails_closed_on_token_mismatch() {
+        let self_pid = std::process::id();
+        // A stored token that cannot equal the live process's real start token.
+        let w = EphemeralWorker {
+            worker_id: "orphan-mismatch".to_string(),
+            pid: self_pid,
+            process_start_token: Some(0xDEAD_BEEF_DEAD_BEEF),
+            status: STATUS_RUNNING.to_string(),
+            spawned_at: chrono::Utc::now().to_rfc3339(),
+            ttl_secs: 100,
+            ..Default::default()
+        };
+        terminate_worker(&w);
+        assert!(
+            crate::process::is_pid_alive(self_pid),
+            "fail-closed: a mismatched stored token must NOT signal the pid"
+        );
+    }
+
+    /// Fail-CLOSED inverse: when the stored token MATCHES the live pid's current
+    /// token (full identity confirmed), the no-handle path DOES kill. Spawn a real
+    /// throwaway process, read its real start-token, and assert terminate reaps it.
+    #[test]
+    fn terminate_no_handle_kills_on_token_match() {
+        let (program, args) = long_lived_cmd();
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(&args);
+        // The no-handle path calls `kill_process_tree`, which SIGKILLs the target's
+        // whole PROCESS GROUP. The child must be in its OWN group (setsid) or it
+        // would take the test runner down with it. (The spawned-via-PTY workers in
+        // the other tests are session leaders already, so this only matters here.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd.spawn().expect("spawn throwaway long-lived process");
+        let pid = child.id();
+        let token = crate::process::process_start_token(pid);
+        assert!(
+            token.is_some(),
+            "the platform must report a start token for the matched-kill case"
+        );
+        let w = EphemeralWorker {
+            worker_id: "orphan-match".to_string(),
+            pid,
+            process_start_token: token, // stored == current → confirmed identity
+            status: STATUS_RUNNING.to_string(),
+            spawned_at: chrono::Utc::now().to_rfc3339(),
+            ttl_secs: 100,
+            ..Default::default()
+        };
+        terminate_worker(&w);
+        let _ = child.wait(); // reap our own spawned child's zombie
+        assert_dead_within(pid, "confirmed-identity orphan must be killed");
+    }
+
+    // ─────────────────── Fix 5: durable cap reservation fail-closed ─────────────
+
+    /// `try_reserve_slot` must NOT swallow a store-write failure: it must surface
+    /// `ReserveError::Persist`. We induce a write failure by pointing the store at a
+    /// path whose parent is a FILE (so `mutate_versioned`'s `create_dir_all(parent)`
+    /// errors). `spawn_and_track` is then driven against the same broken home and
+    /// must reject with `SpawnError::Reserve` WITHOUT OS-spawning.
+    #[test]
+    fn reserve_persist_failure_fails_closed_no_spawn() {
+        // home is a regular FILE, so store_path(home) = <file>/ephemeral_workers.json
+        // and mutate_versioned's create_dir_all(parent==<file>) fails.
+        let file_home = std::env::temp_dir().join(format!(
+            "agend-eph-unwritable-{}-{}",
+            std::process::id(),
+            WORKER_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&file_home, b"x").expect("create the blocking file");
+
+        // try_reserve_slot surfaces the persist error (does not swallow → Ok).
+        let r = try_reserve_slot(&file_home, reserving_row("r", 0));
+        assert!(
+            matches!(r, Err(ReserveError::Persist(_))),
+            "a store-write failure must surface as ReserveError::Persist, not be swallowed: {r:?}"
+        );
+
+        // spawn_and_track maps it to SpawnError::Reserve and does NOT spawn.
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            parent: None,
+            backend: "claude".to_string(), // valid backend so we reach the reserve step
+            ttl_secs: Some(60),
+            token_budget: None,
+        };
+        let res = spawn_and_track(&file_home, spec);
+        assert!(
+            matches!(res, Err(SpawnError::Reserve(_))),
+            "a persist failure must fail closed (reject, no spawn): {res:?}"
+        );
+        std::fs::remove_file(&file_home).ok();
+    }
+
+    /// Fix 3 (production-shaped tree-kill): spawn a LEADER that itself backgrounds a
+    /// long-lived GRANDCHILD, capture BOTH pids, reap through the real
+    /// `terminate_worker` (handle path), and assert BOTH are dead. This replaces the
+    /// old childless-process coverage: on unix the pgid group-kill must reach the
+    /// grandchild; on windows the Job Object's KILL_ON_JOB_CLOSE must (the assigned
+    /// tree dies on handle drop).
+    #[test]
+    fn reap_kills_leader_and_grandchild_tree() {
+        let home = tmp_home("tree-kill");
+        let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let worker_id = format!("eph-tree-{}-{}", std::process::id(), seq);
+
+        // A leader that backgrounds a real grandchild and prints the grandchild pid,
+        // then waits — so the leader stays alive holding the tree open.
+        #[cfg(unix)]
+        let (program, args) = (
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), "sleep 300 & echo $!; wait".to_string()],
+        );
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd".to_string(),
+            vec![
+                "/c".to_string(),
+                // `timeout` is a transient delay child; `ping -t` is the LONG-LIVED
+                // descendant we capture + assert dies via KILL_ON_JOB_CLOSE. The 2s
+                // delay makes `ping -t` spawn AFTER the Job Object is assigned to the
+                // leader — otherwise a descendant created in the ~ms spawn→assign
+                // window would escape the job (the known assign-after-spawn race, see
+                // create_kill_on_close_job). This delay is a TEST artifact to prove
+                // the kill deterministically, not a production requirement.
+                "timeout /t 2 /nobreak >NUL && ping -t 127.0.0.1 >NUL".to_string(),
+            ],
+        );
+
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: &program,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let handle = crate::agent::spawn_ephemeral_worker(&config).expect("spawn leader");
+        let leader_pid = handle.pid();
+        assert!(crate::process::is_pid_alive(leader_pid), "leader is alive");
+
+        // On unix, read the grandchild pid the leader echoed to its PTY by draining
+        // a writer-side… simpler: the read-loop drains the PTY, so we instead spawn
+        // our OWN observation: re-run the same shell isn't representative. Use the
+        // leader's process group to find a real grandchild via the OS.
+        #[cfg(unix)]
+        let grandchild_pid: Option<u32> = {
+            // Poll for a child process of the leader (the backgrounded `sleep`).
+            // `pgrep -P <leader>` lists direct children; the sleep is a grandchild
+            // of sh's subshell but a child of the leader's group — pgrep -g covers
+            // the group. We accept either path: any pid in the leader's group that
+            // is NOT the leader.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut found = None;
+            while std::time::Instant::now() < deadline {
+                let out = std::process::Command::new("pgrep")
+                    .args(["-g", &leader_pid.to_string()])
+                    .output();
+                if let Ok(o) = out {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        if let Ok(p) = line.trim().parse::<u32>() {
+                            if p != leader_pid && crate::process::is_pid_alive(p) {
+                                found = Some(p);
+                            }
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            found
+        };
+        #[cfg(unix)]
+        assert!(
+            grandchild_pid.is_some(),
+            "a real grandchild (backgrounded sleep) must exist in the leader's group"
+        );
+
+        // Windows: capture the LONG-LIVED descendant (the leader's `ping -t` child)
+        // and assert IT dies on reap — proving the Job Object reaps DESCENDANTS, not
+        // just the leader (a leader-only check would pass even with a broken job).
+        #[cfg(windows)]
+        let grandchild_pid: Option<u32> = {
+            // Sleep past the leader's 2s delay so `ping -t` has spawned AFTER the job
+            // assignment, then find it as a child of the leader via WMI/CIM.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let mut found = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while std::time::Instant::now() < deadline {
+                let out = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "Get-CimInstance Win32_Process -Filter \"ParentProcessId={leader_pid}\" | ForEach-Object {{ $_.ProcessId }}"
+                        ),
+                    ])
+                    .output();
+                if let Ok(o) = out {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        if let Ok(p) = line.trim().parse::<u32>() {
+                            if p != leader_pid && crate::process::is_pid_alive(p) {
+                                found = Some(p);
+                            }
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            found
+        };
+        #[cfg(windows)]
+        assert!(
+            grandchild_pid.is_some(),
+            "a long-lived descendant (ping -t, spawned post-assignment) must exist under the leader"
+        );
+
+        // Track the worker so the reap goes through the REAL terminate_worker
+        // (handle path: unix pgid group-kill / windows Job Object close).
+        let token = crate::process::process_start_token(leader_pid);
+        let mut reserving = reserving_row(&worker_id, 0);
+        reserving.backend = "sleep".to_string();
+        try_reserve_slot(&home, reserving).expect("reserve");
+        finalize_spawn(&home, &worker_id, leader_pid, token).expect("finalize");
+        LIVE_CHILDREN.lock().insert(worker_id.clone(), handle);
+
+        let reaped = reap_one(&home, &worker_id).expect("reap_one");
+        assert_eq!(reaped.worker_id, worker_id);
+
+        assert_dead_within(leader_pid, "leader must be killed by the tree reap");
+        #[cfg(unix)]
+        if let Some(gc) = grandchild_pid {
+            assert_dead_within(gc, "the grandchild must ALSO be killed (pgid group-kill)");
+        }
+        #[cfg(windows)]
+        if let Some(gc) = grandchild_pid {
+            assert_dead_within(
+                gc,
+                "the descendant must ALSO be killed (Job Object KILL_ON_JOB_CLOSE)",
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

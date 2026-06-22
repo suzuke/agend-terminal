@@ -1398,6 +1398,44 @@ pub struct EphemeralPtyHandle {
     /// alone to hold the master side open).
     #[allow(dead_code)]
     pub pty_master: Box<dyn portable_pty::MasterPty + Send>,
+    /// #1967 PR3a Fix 3 (windows tree-kill): a Job Object the worker + all its
+    /// descendants are assigned to, created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    /// Dropping this handle closes the job → the OS kills the WHOLE tree (a real
+    /// tree-kill, unlike bare `TerminateProcess` which only hits the leader). Held
+    /// here so the lifetime is tied to the worker; [`crate::ephemeral_tracking`]
+    /// drops the [`EphemeralPtyHandle`] on reap, which closes the job. On unix the
+    /// pgid group-kill in `kill_process_tree` does the tree-kill, so no field exists.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub job: JobHandle,
+}
+
+/// #1967 PR3a Fix 3: a Windows Job Object handle that KILLS its assigned process
+/// tree on close (created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). `Drop` closes
+/// the underlying `HANDLE`, which — via KILL_ON_JOB_CLOSE — terminates every
+/// process still assigned to the job (the worker leader + any descendant the
+/// backend forked). A raw `HANDLE` (`*mut c_void`) is not `Send`; the worker handle
+/// is moved across threads (into [`crate::ephemeral_tracking::LIVE_CHILDREN`] and
+/// dropped on a reap thread), so we assert `Send` — sound because the only
+/// operation we perform cross-thread is `CloseHandle`, which is thread-safe for a
+/// job handle we exclusively own.
+#[cfg(windows)]
+pub struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // Closing the last job handle with KILL_ON_JOB_CLOSE set terminates the
+            // whole assigned tree. Safe: we exclusively own this handle.
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for EphemeralPtyHandle {
@@ -1411,6 +1449,34 @@ impl std::fmt::Debug for EphemeralPtyHandle {
 impl EphemeralPtyHandle {
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+}
+
+/// #1967 PR3a Fix 2 (spawn rollback): a RAII kill-guard that ensures a child
+/// spawned by [`spawn_ephemeral_worker`] is NEVER leaked as a zero-row orphan if a
+/// later setup step (`take_writer` / `try_clone_reader` / read-thread spawn) fails
+/// after the child is already running. Constructed + armed immediately after the
+/// child spawns; `disarm()`-ed only on the success path, right before the `Ok`
+/// return. So every `?` between spawn and `Ok` runs `Drop` while armed → the child
+/// tree is killed and reaped (no orphan process, no orphan handle).
+struct SpawnKillGuard {
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    pid: u32,
+    armed: bool,
+}
+
+impl SpawnKillGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SpawnKillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::process::kill_process_tree(self.pid);
+            let _ = self.child.lock().wait();
+        }
     }
 }
 
@@ -1431,6 +1497,13 @@ impl EphemeralPtyHandle {
 ///
 /// Scope = SAFE spawn + reap only; NO prompt injection / turn-detection / capture
 /// (that is PR3b — which uses the retained `pty_writer` + `core`).
+///
+/// Fix 2 (spawn rollback): a [`SpawnKillGuard`] is armed the instant the child
+/// spawns and disarmed only on the success path, so a failure in any later setup
+/// step (`take_writer` / `try_clone_reader` / read-thread spawn) kills + reaps the
+/// child instead of leaking a zero-row orphan. Fix 3 (windows tree-kill): a Job
+/// Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` owns the worker tree so reap
+/// (handle drop) is a real tree-kill, not a leader-only `TerminateProcess`.
 ///
 /// ⚠ DRIFT: openpty/spawn plumbing duplicates spawn_agent (~1160-1207); the
 /// vterm.process+state.feed block duplicates pty_read_loop (~1666-1699). Keep in sync.
@@ -1457,6 +1530,23 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
     drop(pair.slave);
     let child_arc: Arc<Mutex<Box<dyn portable_pty::Child + Send>>> = Arc::new(Mutex::new(child));
     let pid = child_arc.lock().process_id().unwrap_or(0);
+
+    // Fix 2 (spawn rollback): ARM the kill-guard immediately. From here every `?`
+    // before the `Ok` return runs the guard's `Drop` → kills + reaps the child, so
+    // a failure in writer/reader/thread setup can never leave a zero-row orphan.
+    let mut kill_guard = SpawnKillGuard {
+        child: Arc::clone(&child_arc),
+        pid,
+        armed: true,
+    };
+
+    // Fix 3 (windows tree-kill): create a Job Object with KILL_ON_JOB_CLOSE and
+    // assign the just-spawned worker to it BEFORE any fallible step, so the whole
+    // tree dies when the job handle drops (on success → stored in the handle and
+    // dropped on reap; on the `?` paths below → dropped here, killing the tree).
+    // On unix the pgid group-kill is the tree mechanism, so no job is created.
+    #[cfg(windows)]
+    let job = create_kill_on_close_job(pid)?;
 
     let pty_writer: PtyWriter = Arc::new(Mutex::new(
         pair.master
@@ -1517,13 +1607,85 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
         pid,
         "spawned ephemeral PTY worker (no pane, no roster)"
     );
+    // Fix 2: all fallible setup succeeded — disarm the kill-guard so the live child
+    // survives the function return (ownership passes to the EphemeralPtyHandle).
+    kill_guard.disarm();
     Ok(EphemeralPtyHandle {
         pid,
         child: child_arc,
         pty_writer,
         core,
         pty_master,
+        #[cfg(windows)]
+        job,
     })
+}
+
+/// #1967 PR3a Fix 3: create a Windows Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assign process `pid` to it, returning
+/// the owning [`JobHandle`]. Dropping the returned handle closes the job → the OS
+/// terminates the WHOLE assigned tree (the worker + every descendant, since a child
+/// the worker spawns inherits the job by default). This is the windows tree-kill
+/// mechanism (bare `TerminateProcess` only kills the leader). On any Win32 failure
+/// the partial job handle is closed before erroring, so no handle leaks.
+/// #1967 PR3a Fix 3: put the worker under a Windows Job Object with
+/// `KILL_ON_JOB_CLOSE`, so closing the [`JobHandle`] on reap terminates the WHOLE
+/// assigned tree (not just the leader — the gap r6 caught: `kill_process_tree` on
+/// Windows only `TerminateProcess`-es the leader). Ephemeral-scoped — the shared
+/// `kill_process_tree` is untouched (managed agents unaffected).
+///
+/// ⚠ ASSIGN-AFTER-SPAWN RACE: the worker is assigned to the job AFTER `spawn_command`
+/// returns, so a descendant the backend forks in the ~ms window BEFORE assignment is
+/// NOT in the job and would survive a job-close reap. For the headless TUI backends
+/// (claude/codex/opencode/kiro/agy) startup→fork takes far longer than that window,
+/// so this is low-risk in practice; a fully race-free fix needs `CREATE_SUSPENDED` +
+/// assign + resume, which portable-pty does not expose. Flagged as known MVP-acceptable
+/// (the wall-TTL reap is the cost backstop regardless). The reap test spawns its
+/// descendant AFTER a delay to assert the post-assignment kill deterministically.
+#[cfg(windows)]
+fn create_kill_on_close_job(pid: u32) -> anyhow::Result<JobHandle> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(anyhow::anyhow!("CreateJobObjectW failed"));
+        }
+        // Configure the job to kill every assigned process when the last handle
+        // closes — this is what makes the job a real tree-kill on drop.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            CloseHandle(job);
+            return Err(anyhow::anyhow!("SetInformationJobObject failed"));
+        }
+        let proc_handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+        if proc_handle.is_null() {
+            CloseHandle(job);
+            return Err(anyhow::anyhow!("OpenProcess(worker) failed"));
+        }
+        let assigned = AssignProcessToJobObject(job, proc_handle);
+        CloseHandle(proc_handle);
+        if assigned == 0 {
+            CloseHandle(job);
+            return Err(anyhow::anyhow!("AssignProcessToJobObject failed"));
+        }
+        Ok(JobHandle(job))
+    }
 }
 
 /// #1967 PR3a: minimal PTY drain loop for an ephemeral worker — the headless
