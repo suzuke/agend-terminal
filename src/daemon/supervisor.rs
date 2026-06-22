@@ -302,6 +302,8 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut apierror_nudge_counts: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut last_continue_inject: HashMap<String, Instant> = HashMap::new();
+    // #t-26795: stable first-onset epoch-ms per agent (see `process_error_recovery`).
+    let mut srl_onset: HashMap<String, u64> = HashMap::new();
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     // W1.1 (#2050): the 12 periodic trackers (anti_stall, idle_watchdog,
     // decision_timeout, helper_staleness, mcp_registry, waiting_on_stale,
@@ -340,6 +342,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
                 &mut apierror_episodes,
                 &mut apierror_nudge_counts,
                 &mut last_continue_inject,
+                &mut srl_onset,
                 loop_started_at,
             );
             check_pane_input_not_submitted(
@@ -1882,6 +1885,30 @@ fn classify_inject_failure(consecutive_failures: u32) -> InjectFailAction {
     }
 }
 
+/// #t-26795: epoch-ms now — matches the hook snapshot's `at_ms` clock for the
+/// post-onset comparison (the rest of the supervisor uses `Instant` for backoff).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// #t-26795 (PURE, unit-tested): does a fresh claude hook prove the agent recovered
+/// from a STICKY screen-scraped `ServerRateLimit`? True iff the backend is claude AND
+/// a fresh ACTIVE hook event exists whose epoch-ms POST-DATES the rate-limit onset
+/// (the agent emitted a tool-call hook AFTER the throttle began → it is executing, so
+/// the screen text is stale). A pre-onset hook (a prior turn's, fired BEFORE this SRL)
+/// is rejected — the load-bearing edge against masking a genuine new-turn SRL.
+/// non-claude / no-hook / stale-hook → false → the screen-driven path is unchanged.
+fn hook_recovered_for_srl(
+    is_claude: bool,
+    hook_active_at_ms: Option<u64>,
+    srl_onset_ms: Option<u64>,
+) -> bool {
+    is_claude && matches!((hook_active_at_ms, srl_onset_ms), (Some(h), Some(o)) if h > o)
+}
+
 pub(crate) fn process_error_recovery(
     home: &std::path::Path,
     registry: &AgentRegistry,
@@ -1889,6 +1916,12 @@ pub(crate) fn process_error_recovery(
     apierror_episodes: &mut std::collections::HashSet<String>,
     apierror_nudge_counts: &mut HashMap<String, u32>,
     last_continue_inject: &mut HashMap<String, Instant>,
+    // #t-26795: per-agent epoch-ms of the FIRST ServerRateLimit detection of the
+    // current episode, STABLE across the detect→clear→re-detect flap (or_insert never
+    // overwrites; removed only on a genuine screen-state exit). The hook-override
+    // compares a fresh active hook's timestamp against THIS — a resetting onset would
+    // make a just-pre-re-detect hook look pre-onset and the flap would survive.
+    srl_onset: &mut HashMap<String, u64>,
     loop_started_at: Instant,
 ) {
     use crate::state::AgentState;
@@ -1955,6 +1988,29 @@ pub(crate) fn process_error_recovery(
                 (state, recovered, self_cleared, has_hint, productive_silence)
             };
 
+            // ── #t-26795 SRL hook-override (operator-reported sticky-screen flap) ──
+            // A sticky screen-scraped ServerRateLimit while a FRESH claude hook proves
+            // the agent is mid-tool-call = the screen text is stale. Track the STABLE
+            // first-onset (or_insert never overwrites → survives the detect→clear→
+            // re-detect flap; removed only on a genuine screen exit), then treat a fresh
+            // ACTIVE hook that POST-DATES it as a third recovery signal. ADD-ONLY —
+            // composes with recovered/self_cleared; claude-only; a non-claude / missing /
+            // stale / pre-onset hook falls through to the unchanged screen-driven path.
+            if state == AgentState::ServerRateLimit {
+                srl_onset.entry(name.to_string()).or_insert_with(now_epoch_ms);
+            } else {
+                srl_onset.remove(name);
+            }
+            let is_claude =
+                crate::backend::Backend::parse_str(handle.backend_command.as_str()).has_state_hooks();
+            let hook_active_at_ms = if is_claude {
+                crate::daemon::hook_shadow::fresh_active_hook_at_ms(name)
+            } else {
+                None
+            };
+            let hook_recovered =
+                hook_recovered_for_srl(is_claude, hook_active_at_ms, srl_onset.get(name).copied());
+
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
             // gated on the agent being FRESHLY observed in ServerRateLimit — not on a
@@ -1963,7 +2019,7 @@ pub(crate) fn process_error_recovery(
             // only EXECUTES the lock-free PTY inject for the names decided here. So a
             // track can never blind-fire `continue` into a non-error state (e.g. a
             // PermissionPrompt the agent reached after the throttle cleared).
-            if state == AgentState::ServerRateLimit && (recovered || self_cleared) {
+            if state == AgentState::ServerRateLimit && (recovered || self_cleared || hook_recovered) {
                 // #ratelimit-recovery: still latched ServerRateLimit (the stale
                 // "Server is temporarily limiting" line re-matches in the tail and
                 // working_state_below can't see a marker BELOW the most-recent error
@@ -1985,7 +2041,13 @@ pub(crate) fn process_error_recovery(
                     tracing::info!(
                         agent = %name,
                         productive_silent_secs = productive_silence.as_secs(),
-                        recovered_via = if self_cleared { "agent_self_clear" } else { "productive_output" },
+                        recovered_via = if self_cleared {
+                            "agent_self_clear"
+                        } else if recovered {
+                            "productive_output"
+                        } else {
+                            "hook_active" // #t-26795: fresh post-onset claude hook
+                        },
                         "ServerRateLimit retry cleared — agent recovered"
                     );
                 }
@@ -3859,6 +3921,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -3911,6 +3974,7 @@ instances:
                 &mut Default::default(),
                 &mut Default::default(),
                 &mut last_inject,
+                &mut Default::default(),
                 past_boot_grace(),
             );
         }
@@ -3965,6 +4029,7 @@ instances:
                 &mut Default::default(),
                 &mut Default::default(),
                 &mut last_inject,
+                &mut Default::default(),
                 past_boot_grace(),
             );
         }
@@ -4006,6 +4071,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
             past_boot_grace(),
         );
 
@@ -4041,6 +4107,7 @@ instances:
                 &home,
                 &registry,
                 tracks,
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
@@ -4121,6 +4188,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
 
@@ -4166,6 +4234,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
@@ -4228,6 +4297,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         {
@@ -4259,6 +4329,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -4305,6 +4376,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -4348,6 +4420,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
             past_boot_grace(),
         );
 
@@ -4386,6 +4459,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
@@ -4437,6 +4511,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         let track = tracks
@@ -4494,6 +4569,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
             past_boot_grace(),
         );
 
@@ -4539,6 +4615,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
@@ -4625,6 +4702,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
 
@@ -4676,6 +4754,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -4724,6 +4803,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
@@ -4797,6 +4877,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -4847,6 +4928,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
@@ -4934,6 +5016,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
 
@@ -4986,6 +5069,7 @@ instances:
             &home,
             &registry,
             &mut tracks,
+            &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
@@ -5467,6 +5551,7 @@ instances:
             &mut Default::default(),
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -5504,6 +5589,7 @@ instances:
             &mut episodes,
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
@@ -5527,6 +5613,7 @@ instances:
             &mut episodes,
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert_eq!(
@@ -5561,6 +5648,7 @@ instances:
                 &mut episodes,
                 &mut counts,
                 &mut last_inject,
+                &mut Default::default(),
                 past_boot_grace(),
             );
         }
@@ -5650,6 +5738,7 @@ instances:
             &mut episodes,
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             Instant::now(),
         );
         assert!(
@@ -5669,6 +5758,7 @@ instances:
             &mut episodes,
             &mut Default::default(),
             &mut last_inject,
+            &mut Default::default(),
             past_boot_grace(),
         );
         assert!(
