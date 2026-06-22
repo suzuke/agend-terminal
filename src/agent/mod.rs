@@ -1398,44 +1398,6 @@ pub struct EphemeralPtyHandle {
     /// alone to hold the master side open).
     #[allow(dead_code)]
     pub pty_master: Box<dyn portable_pty::MasterPty + Send>,
-    /// #1967 PR3a Fix 3 (windows tree-kill): a Job Object the worker + all its
-    /// descendants are assigned to, created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-    /// Dropping this handle closes the job → the OS kills the WHOLE tree (a real
-    /// tree-kill, unlike bare `TerminateProcess` which only hits the leader). Held
-    /// here so the lifetime is tied to the worker; [`crate::ephemeral_tracking`]
-    /// drops the [`EphemeralPtyHandle`] on reap, which closes the job. On unix the
-    /// pgid group-kill in `kill_process_tree` does the tree-kill, so no field exists.
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    pub job: JobHandle,
-}
-
-/// #1967 PR3a Fix 3: a Windows Job Object handle that KILLS its assigned process
-/// tree on close (created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). `Drop` closes
-/// the underlying `HANDLE`, which — via KILL_ON_JOB_CLOSE — terminates every
-/// process still assigned to the job (the worker leader + any descendant the
-/// backend forked). A raw `HANDLE` (`*mut c_void`) is not `Send`; the worker handle
-/// is moved across threads (into [`crate::ephemeral_tracking::LIVE_CHILDREN`] and
-/// dropped on a reap thread), so we assert `Send` — sound because the only
-/// operation we perform cross-thread is `CloseHandle`, which is thread-safe for a
-/// job handle we exclusively own.
-#[cfg(windows)]
-pub struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-unsafe impl Send for JobHandle {}
-
-#[cfg(windows)]
-impl Drop for JobHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // Closing the last job handle with KILL_ON_JOB_CLOSE set terminates the
-            // whole assigned tree. Safe: we exclusively own this handle.
-            unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(self.0);
-            }
-        }
-    }
 }
 
 impl std::fmt::Debug for EphemeralPtyHandle {
@@ -1459,18 +1421,25 @@ impl EphemeralPtyHandle {
 /// child spawns; `disarm()`-ed only on the success path, right before the `Ok`
 /// return. So every `?` between spawn and `Ok` runs `Drop` while armed → the child
 /// tree is killed and reaped (no orphan process, no orphan handle).
+///
+/// `#[cfg(unix)]`: the only constructor is the unix-only body of
+/// `spawn_ephemeral_worker` (Windows fails closed before any spawn), so this type
+/// does not exist on Windows.
+#[cfg(unix)]
 struct SpawnKillGuard {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     pid: u32,
     armed: bool,
 }
 
+#[cfg(unix)]
 impl SpawnKillGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
+#[cfg(unix)]
 impl Drop for SpawnKillGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -1501,190 +1470,184 @@ impl Drop for SpawnKillGuard {
 /// Fix 2 (spawn rollback): a [`SpawnKillGuard`] is armed the instant the child
 /// spawns and disarmed only on the success path, so a failure in any later setup
 /// step (`take_writer` / `try_clone_reader` / read-thread spawn) kills + reaps the
-/// child instead of leaking a zero-row orphan. Fix 3 (windows tree-kill): a Job
-/// Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` owns the worker tree so reap
-/// (handle drop) is a real tree-kill, not a leader-only `TerminateProcess`.
+/// child instead of leaking a zero-row orphan.
+///
+/// ## Unix-only (Windows FAIL-CLOSED)
+///
+/// Ephemeral real-backend spawn is UNSUPPORTED on Windows and this fn returns `Err`
+/// before opening a PTY or spawning anything. The unix tree-kill is a pgid
+/// group-kill (`kill_process_tree`), which has no Windows analogue here: a Windows
+/// Job Object can only be ASSIGNED after `spawn_command` returns, so a backend that
+/// forks in the spawn→assign window escapes the job, and portable-pty exposes no
+/// `CREATE_SUSPENDED` to make the assign race-free. Rather than ship a tree-reap
+/// with a known escape hole, Windows fails closed (no live ephemeral worker ever
+/// exists) — tracked by t-20260622062549639786-41860-13.
 ///
 /// ⚠ DRIFT: openpty/spawn plumbing duplicates spawn_agent (~1160-1207); the
 /// vterm.process+state.feed block duplicates pty_read_loop (~1666-1699). Keep in sync.
 pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralPtyHandle> {
-    // build_command(config) UNCHANGED — the security-inheritance invariant. Every
-    // managed-agent security setup (#1504/#1440/#1519/#2106/#708/cwd-validate)
-    // applies identically because we share the exact same builder.
-    let (cmd, detected_backend) = build_command(config)?;
-
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: config.rows,
-            cols: config.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| anyhow::anyhow!("Failed to spawn '{}': {e}", config.backend_command))?;
-    drop(pair.slave);
-    let child_arc: Arc<Mutex<Box<dyn portable_pty::Child + Send>>> = Arc::new(Mutex::new(child));
-    let pid = child_arc.lock().process_id().unwrap_or(0);
-
-    // Fix 2 (spawn rollback): ARM the kill-guard immediately. From here every `?`
-    // before the `Ok` return runs the guard's `Drop` → kills + reaps the child, so
-    // a failure in writer/reader/thread setup can never leave a zero-row orphan.
-    let mut kill_guard = SpawnKillGuard {
-        child: Arc::clone(&child_arc),
-        pid,
-        armed: true,
-    };
-
-    // Fix 3 (windows tree-kill): create a Job Object with KILL_ON_JOB_CLOSE and
-    // assign the just-spawned worker to it BEFORE any fallible step, so the whole
-    // tree dies when the job handle drops (on success → stored in the handle and
-    // dropped on reap; on the `?` paths below → dropped here, killing the tree).
-    // On unix the pgid group-kill is the tree mechanism, so no job is created.
+    // Windows FAIL-CLOSED — return BEFORE opening a PTY or spawning anything, so no
+    // process is ever created on a platform where we cannot guarantee tree-reap.
     #[cfg(windows)]
-    let job = create_kill_on_close_job(pid)?;
+    {
+        let _ = config;
+        return Err(anyhow::anyhow!(
+            "ephemeral real-backend spawn is unsupported on Windows: the PTY layer lacks suspended-spawn (CREATE_SUSPENDED), so a backend forking before Job-Object assignment would escape process-tree reap. Ephemeral workers are unix-only for now — tracked by t-20260622062549639786-41860-13."
+        ));
+    }
+    // The remaining implementation is UNIX-ONLY — on Windows the early `return`
+    // above makes this unreachable, so it is `#[cfg(unix)]` (and the Windows build
+    // never compiles a body that depends on `kill_process_tree`'s pgid semantics).
+    #[cfg(unix)]
+    {
+        // build_command(config) UNCHANGED — the security-inheritance invariant. Every
+        // managed-agent security setup (#1504/#1440/#1519/#2106/#708/cwd-validate)
+        // applies identically because we share the exact same builder.
+        let (cmd, detected_backend) = build_command(config)?;
 
-    let pty_writer: PtyWriter = Arc::new(Mutex::new(
-        pair.master
-            .take_writer()
-            .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
-    ));
-    let mut pty_reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
-    // Keep the master ALIVE for the worker's lifetime (matches spawn_agent). No pane
-    // → no resize use, but retaining it makes the PTY lifecycle explicit +
-    // cross-platform-safe rather than relying on the dup'd reader/writer to hold the
-    // master side open.
-    let pty_master = pair.master;
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: config.rows,
+                cols: config.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
-    let core = Arc::new(CoreMutex::new(AgentCore {
-        vterm: VTerm::with_pty_writer(config.cols, config.rows, Arc::clone(&pty_writer)),
-        subscribers: Vec::new(),
-        state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
-        health: HealthTracker::new(),
-    }));
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| anyhow::anyhow!("Failed to spawn '{}': {e}", config.backend_command))?;
+        drop(pair.slave);
+        let child_arc: Arc<Mutex<Box<dyn portable_pty::Child + Send>>> =
+            Arc::new(Mutex::new(child));
+        let pid = child_arc.lock().process_id().unwrap_or(0);
 
-    let dismiss: Vec<(String, Vec<u8>)> = detected_backend
-        .as_ref()
-        .map(|b| {
-            b.preset()
-                .dismiss_patterns
-                .iter()
-                .map(|dp| (dp.label.to_string(), dp.sequence.to_vec()))
-                .collect()
+        // Fix 2 (spawn rollback): ARM the kill-guard immediately. From here every `?`
+        // before the `Ok` return runs the guard's `Drop` → kills + reaps the child, so
+        // a failure in writer/reader/thread setup can never leave a zero-row orphan.
+        let mut kill_guard = SpawnKillGuard {
+            child: Arc::clone(&child_arc),
+            pid,
+            armed: true,
+        };
+
+        // Fix 3 (failure-seam, TEST-ONLY): with the kill-guard ARMED and the pid
+        // captured, a test can force a post-spawn failure to PROVE the armed guard's
+        // Drop reaps the live child (zero orphan). All seam code is `#[cfg(test)]` —
+        // absent + zero-cost in production builds.
+        #[cfg(test)]
+        if test_seam::force_postspawn_fail() {
+            test_seam::record_last_pid(pid);
+            return Err(anyhow::anyhow!("test: forced post-spawn failure"));
+        }
+
+        let pty_writer: PtyWriter = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
+        ));
+        let mut pty_reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
+        // Keep the master ALIVE for the worker's lifetime (matches spawn_agent). No pane
+        // → no resize use, but retaining it makes the PTY lifecycle explicit +
+        // cross-platform-safe rather than relying on the dup'd reader/writer to hold the
+        // master side open.
+        let pty_master = pair.master;
+
+        let core = Arc::new(CoreMutex::new(AgentCore {
+            vterm: VTerm::with_pty_writer(config.cols, config.rows, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
+            health: HealthTracker::new(),
+        }));
+
+        let dismiss: Vec<(String, Vec<u8>)> = detected_backend
+            .as_ref()
+            .map(|b| {
+                b.preset()
+                    .dismiss_patterns
+                    .iter()
+                    .map(|dp| (dp.label.to_string(), dp.sequence.to_vec()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dismiss = prepare_dismiss_patterns(&dismiss);
+
+        let core_clone = Arc::clone(&core);
+        let pw_for_dismiss = Arc::clone(&pty_writer);
+        let name = config.name.to_string();
+        // fire-and-forget: drains the worker PTY so the child never blocks on a full
+        // buffer; exits on PTY EOF when the child is reaped. NO handle_pty_close (no
+        // crash-respawn for ephemeral), so the JoinHandle is discarded.
+        std::thread::Builder::new()
+            .name(format!("{name}_eph_pty_read"))
+            .spawn(move || {
+                ephemeral_pty_read_loop(
+                    &mut pty_reader,
+                    &core_clone,
+                    &name,
+                    &pw_for_dismiss,
+                    &dismiss,
+                );
+            })?;
+
+        tracing::info!(
+            target: "ephemeral",
+            worker = %config.name,
+            backend = %config.backend_command,
+            pid,
+            "spawned ephemeral PTY worker (no pane, no roster)"
+        );
+        // Fix 2: all fallible setup succeeded — disarm the kill-guard so the live child
+        // survives the function return (ownership passes to the EphemeralPtyHandle).
+        kill_guard.disarm();
+        Ok(EphemeralPtyHandle {
+            pid,
+            child: child_arc,
+            pty_writer,
+            core,
+            pty_master,
         })
-        .unwrap_or_default();
-    let dismiss = prepare_dismiss_patterns(&dismiss);
-
-    let core_clone = Arc::clone(&core);
-    let pw_for_dismiss = Arc::clone(&pty_writer);
-    let name = config.name.to_string();
-    // fire-and-forget: drains the worker PTY so the child never blocks on a full
-    // buffer; exits on PTY EOF when the child is reaped. NO handle_pty_close (no
-    // crash-respawn for ephemeral), so the JoinHandle is discarded.
-    std::thread::Builder::new()
-        .name(format!("{name}_eph_pty_read"))
-        .spawn(move || {
-            ephemeral_pty_read_loop(
-                &mut pty_reader,
-                &core_clone,
-                &name,
-                &pw_for_dismiss,
-                &dismiss,
-            );
-        })?;
-
-    tracing::info!(
-        target: "ephemeral",
-        worker = %config.name,
-        backend = %config.backend_command,
-        pid,
-        "spawned ephemeral PTY worker (no pane, no roster)"
-    );
-    // Fix 2: all fallible setup succeeded — disarm the kill-guard so the live child
-    // survives the function return (ownership passes to the EphemeralPtyHandle).
-    kill_guard.disarm();
-    Ok(EphemeralPtyHandle {
-        pid,
-        child: child_arc,
-        pty_writer,
-        core,
-        pty_master,
-        #[cfg(windows)]
-        job,
-    })
+    }
 }
 
-/// #1967 PR3a Fix 3: create a Windows Job Object with
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and assign process `pid` to it, returning
-/// the owning [`JobHandle`]. Dropping the returned handle closes the job → the OS
-/// terminates the WHOLE assigned tree (the worker + every descendant, since a child
-/// the worker spawns inherits the job by default). This is the windows tree-kill
-/// mechanism (bare `TerminateProcess` only kills the leader). On any Win32 failure
-/// the partial job handle is closed before erroring, so no handle leaks.
-/// #1967 PR3a Fix 3: put the worker under a Windows Job Object with
-/// `KILL_ON_JOB_CLOSE`, so closing the [`JobHandle`] on reap terminates the WHOLE
-/// assigned tree (not just the leader — the gap r6 caught: `kill_process_tree` on
-/// Windows only `TerminateProcess`-es the leader). Ephemeral-scoped — the shared
-/// `kill_process_tree` is untouched (managed agents unaffected).
-///
-/// ⚠ ASSIGN-AFTER-SPAWN RACE: the worker is assigned to the job AFTER `spawn_command`
-/// returns, so a descendant the backend forks in the ~ms window BEFORE assignment is
-/// NOT in the job and would survive a job-close reap. For the headless TUI backends
-/// (claude/codex/opencode/kiro/agy) startup→fork takes far longer than that window,
-/// so this is low-risk in practice; a fully race-free fix needs `CREATE_SUSPENDED` +
-/// assign + resume, which portable-pty does not expose. Flagged as known MVP-acceptable
-/// (the wall-TTL reap is the cost backstop regardless). The reap test spawns its
-/// descendant AFTER a delay to assert the post-assignment kill deterministically.
-#[cfg(windows)]
-fn create_kill_on_close_job(pid: u32) -> anyhow::Result<JobHandle> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-    };
+/// #1967 PR3a Fix 3 (failure-seam, TEST-ONLY): a process-local toggle + observable
+/// the `spawn_ephemeral_worker` failure-injection test uses to force a post-spawn
+/// failure and read back the pid of the child the armed `SpawnKillGuard` reaped.
+/// `#[cfg(all(test, unix))]` — it does not exist in production builds, and on
+/// Windows ephemeral spawn is fail-closed so the seam (and its only callers, all
+/// unix-only) would be dead code. `pub(crate)` so the proving test in
+/// `crate::ephemeral_tracking::tests` can arm it + read the pid.
+#[cfg(all(test, unix))]
+pub(crate) mod test_seam {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() {
-            return Err(anyhow::anyhow!("CreateJobObjectW failed"));
-        }
-        // Configure the job to kill every assigned process when the last handle
-        // closes — this is what makes the job a real tree-kill on drop.
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) == 0
-        {
-            CloseHandle(job);
-            return Err(anyhow::anyhow!("SetInformationJobObject failed"));
-        }
-        let proc_handle = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-        if proc_handle.is_null() {
-            CloseHandle(job);
-            return Err(anyhow::anyhow!("OpenProcess(worker) failed"));
-        }
-        let assigned = AssignProcessToJobObject(job, proc_handle);
-        CloseHandle(proc_handle);
-        if assigned == 0 {
-            CloseHandle(job);
-            return Err(anyhow::anyhow!("AssignProcessToJobObject failed"));
-        }
-        Ok(JobHandle(job))
+    static FORCE_POSTSPAWN_FAIL: AtomicBool = AtomicBool::new(false);
+    static LAST_EPHEMERAL_TEST_PID: AtomicU32 = AtomicU32::new(0);
+
+    /// True when a test has armed the forced post-spawn failure.
+    pub(crate) fn force_postspawn_fail() -> bool {
+        FORCE_POSTSPAWN_FAIL.load(Ordering::SeqCst)
+    }
+
+    /// Arm/disarm the forced post-spawn failure (a test sets it, then resets it).
+    pub(crate) fn set_force_postspawn_fail(on: bool) {
+        FORCE_POSTSPAWN_FAIL.store(on, Ordering::SeqCst);
+    }
+
+    /// Record the pid `spawn_ephemeral_worker` spawned right before the forced
+    /// failure, so the test can assert the armed guard killed+reaped it.
+    pub(crate) fn record_last_pid(pid: u32) {
+        LAST_EPHEMERAL_TEST_PID.store(pid, Ordering::SeqCst);
+    }
+
+    /// Read back the last forced-failure spawn pid (0 if none recorded).
+    pub(crate) fn last_pid() -> u32 {
+        LAST_EPHEMERAL_TEST_PID.load(Ordering::SeqCst)
     }
 }
 
@@ -1699,6 +1662,10 @@ fn create_kill_on_close_job(pid: u32) -> anyhow::Result<JobHandle> {
 ///
 /// ⚠ DRIFT: the vterm.process+state.feed block below duplicates pty_read_loop
 /// (~1666-1699). Keep in sync.
+///
+/// `#[cfg(unix)]`: only the unix-only body of `spawn_ephemeral_worker` spawns this
+/// read thread (Windows fails closed), so it is not compiled on Windows.
+#[cfg(unix)]
 fn ephemeral_pty_read_loop(
     pty_reader: &mut dyn Read,
     core: &Arc<CoreMutex<AgentCore>>,

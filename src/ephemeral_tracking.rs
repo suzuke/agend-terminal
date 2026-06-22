@@ -264,33 +264,80 @@ fn try_reserve_slot(home: &Path, reserving: EphemeralWorker) -> Result<(), Reser
     }
 }
 
+/// Why `finalize_spawn` failed. Both variants MUST trigger the orphan-kill +
+/// reject in `spawn_and_track` (no handle inserted, no success, no stale running
+/// row): the reserving row is gone, OR the finalize write could not be persisted.
+#[derive(Debug)]
+enum FinalizeError {
+    /// The reserving row vanished before finalize (e.g. concurrently reaped as
+    /// stale) — there is nothing to flip to `running`.
+    RowVanished,
+    /// The store write failed (FAIL-CLOSED, mirroring the reserve-side fix): the
+    /// on-disk row would stay a stale `reserving` (pid=0) with no durable PID to
+    /// reap after a crash, so finalize must NOT return `Ok` — it surfaces the error
+    /// and the caller kills the just-spawned orphan.
+    Persist(std::io::Error),
+}
+
 /// Finalize a reserved slot once the real process is spawned: stamp the real pid
 /// and start-token, then flip `STATUS_RESERVING` → `STATUS_RUNNING` (the wall-TTL
-/// clock restarts at the real spawn time). Returns the finalized worker, or `Err`
-/// if the reserving row is gone (e.g. concurrently reaped as stale — caller then
-/// kills the just-spawned orphan).
+/// clock restarts at the real spawn time). Returns the finalized worker, or `Err`:
+/// `RowVanished` if the reserving row is gone, or `Persist` if the store write fails
+/// (FAIL-CLOSED — mirrors `try_reserve_slot`). The caller kills the just-spawned
+/// orphan on EITHER error so a persist failure can never leave a stale `reserving`
+/// row (pid=0, unreapable after a crash) plus a live unattached process.
 fn finalize_spawn(
     home: &Path,
     worker_id: &str,
     pid: u32,
     token: Option<u64>,
-) -> Result<EphemeralWorker, ()> {
+) -> Result<EphemeralWorker, FinalizeError> {
+    // Fix 2 (failure-seam, TEST-ONLY): a test arms this to force a finalize PERSIST
+    // failure on a REAL `spawn_and_track`, proving the orphan-kill + reject branch.
+    // Zero-cost / absent in production builds (`#[cfg(test)]`).
+    #[cfg(test)]
+    if finalize_test_seam::force_persist_fail() {
+        return Err(FinalizeError::Persist(std::io::Error::other(
+            "test: forced finalize persist failure",
+        )));
+    }
     let mut finalized = None;
-    persist_or_log!(
-        crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
-            if let Some(w) = s.workers.iter_mut().find(|w| w.worker_id == worker_id) {
-                w.pid = pid;
-                w.process_start_token = token;
-                w.status = STATUS_RUNNING.to_string();
-                w.phase = "spawned".to_string();
-                w.spawned_at = chrono::Utc::now().to_rfc3339();
-                finalized = Some(w.clone());
-            }
-            Ok(())
-        }),
-        "ephemeral_finalize"
-    );
-    finalized.ok_or(())
+    // Direct `mutate_versioned` (NOT `persist_or_log!`, which would SWALLOW the
+    // write error and let us return `Ok` with a stale on-disk `reserving` row).
+    crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
+        if let Some(w) = s.workers.iter_mut().find(|w| w.worker_id == worker_id) {
+            w.pid = pid;
+            w.process_start_token = token;
+            w.status = STATUS_RUNNING.to_string();
+            w.phase = "spawned".to_string();
+            w.spawned_at = chrono::Utc::now().to_rfc3339();
+            finalized = Some(w.clone());
+        }
+        Ok(())
+    })
+    .map_err(|e| FinalizeError::Persist(std::io::Error::other(e.to_string())))?;
+    finalized.ok_or(FinalizeError::RowVanished)
+}
+
+/// Fix 2 (failure-seam, TEST-ONLY): a process-local toggle the finalize-persist
+/// fail-closed test arms so `finalize_spawn` returns `FinalizeError::Persist` on a
+/// REAL `spawn_and_track`. Entirely `#[cfg(test)]` — absent in production builds.
+#[cfg(test)]
+mod finalize_test_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FORCE_PERSIST_FAIL: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn force_persist_fail() -> bool {
+        FORCE_PERSIST_FAIL.load(Ordering::SeqCst)
+    }
+
+    // `#[cfg(unix)]`: the only arm site is the unix-only finalize fail-closed test
+    // (Windows ephemeral spawn is fail-closed → no real finalize to drive there).
+    #[cfg(unix)]
+    pub(super) fn set_force_persist_fail(on: bool) {
+        FORCE_PERSIST_FAIL.store(on, Ordering::SeqCst);
+    }
 }
 
 /// Remove a reserved slot (spawn or finalize failed) so a failed admission frees
@@ -393,16 +440,28 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
             LIVE_CHILDREN.lock().insert(worker_id, handle);
             Ok(worker)
         }
-        Err(()) => {
-            // Reserving row vanished (concurrently reaped as stale) — kill the
-            // orphan tree so no process leaks; the slot is already gone. A PTY
-            // child is its own session leader, so kill_process_tree reaps any
-            // children it forked too.
+        // BOTH finalize errors fail CLOSED through the SAME orphan-kill + reject
+        // branch: kill the just-spawned tree, DO NOT insert the handle into
+        // LIVE_CHILDREN, return a `SpawnError` (no success, no leaked process, no
+        // leaked handle, no stale `running` row). A PTY child is its own session
+        // leader, so kill_process_tree reaps any children it forked too.
+        Err(e) => {
             crate::process::kill_process_tree(pid);
             let _ = handle.child.lock().wait();
-            Err(SpawnError::Spawn(std::io::Error::other(
-                "ephemeral finalize: reserving slot vanished before finalize",
-            )))
+            let msg = match e {
+                FinalizeError::RowVanished => {
+                    "ephemeral finalize: reserving slot vanished before finalize".to_string()
+                }
+                // FAIL-CLOSED: a persist failure during finalize would otherwise
+                // leave a stale `reserving` row + a live unattached process.
+                FinalizeError::Persist(e) => {
+                    // Best-effort: also try to drop the stale reserving row so the
+                    // cap slot is freed (release itself is log-on-fail).
+                    release_reservation(home, &worker_id);
+                    format!("ephemeral finalize: failed to persist the running row (fail closed, orphan killed): {e}")
+                }
+            };
+            Err(SpawnError::Spawn(std::io::Error::other(msg)))
         }
     }
 }
@@ -540,44 +599,42 @@ pub fn reap_on_boot(home: &Path) -> usize {
 
 /// Terminate a reaped worker's process TREE and reap its zombie.
 ///
+/// **Platform scope:** ephemeral real-backend spawn is UNSUPPORTED on Windows —
+/// [`crate::agent::spawn_ephemeral_worker`] fails closed there before creating any
+/// process, so no live ephemeral worker ever exists on Windows and this fn's
+/// live-handle path is unix-only in practice. The tree-kill mechanism is the unix
+/// pgid group-kill; there is no Windows Job Object (the spawn→assign race made it
+/// unsound, see `spawn_ephemeral_worker`).
+///
 /// If we still hold the live [`crate::agent::EphemeralPtyHandle`] (spawned this
 /// daemon life), the PRIMARY live path: the whole worker tree is killed and the
-/// leader's zombie reaped — **unix** = pgid group-kill via
-/// [`crate::process::kill_process_tree`] (a PTY child is its own session leader, so
-/// the PGID covers every grandchild the backend forked); **windows** = the
-/// EphemeralPtyHandle owns a Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-/// and the worker + all descendants are assigned to it at spawn, so DROPPING the
-/// handle closes the job handle and the OS kills the entire tree (a real tree-kill,
-/// unlike bare `TerminateProcess` which only kills the leader). On windows we also
-/// call `kill_process_tree(pid)` first as a belt-and-suspenders leader kill, but the
-/// Job-Object close is the tree mechanism. Then `wait()` collects the leader's exit
-/// (no zombie) and the handle drops.
+/// leader's zombie reaped via a **unix pgid group-kill**
+/// ([`crate::process::kill_process_tree`]) — a PTY child is its own session leader,
+/// so the PGID covers every grandchild the backend forked. Then `wait()` collects
+/// the leader's exit (no zombie) and the handle drops.
 ///
-/// Otherwise (a restart orphan — no in-memory handle, so no Job Object either):
-/// a start-token-guarded `kill_process_tree`, FAIL-CLOSED. We signal the orphan
-/// ONLY when its start-token identity is fully confirmed: a stored token is
-/// present AND the live pid's current token is present AND they match. If the
-/// stored token is `None`, or the pid's current token can't be read, or they
-/// differ, we do NOT signal — a recycled pid belonging to an innocent process is
-/// never killed (the prior fail-OPEN logic killed when the stored token was
-/// `None`). On windows this restart-orphan path is leader-only (`TerminateProcess`
-/// — bare `kill_process_tree` on windows has no Job Object to close); restart
-/// orphans are rare (the primary live path uses the job), so a leader-only
-/// fallback here is an accepted edge.
+/// Otherwise (a restart orphan — no in-memory handle): a start-token-guarded
+/// `kill_process_tree`, FAIL-CLOSED. We signal the orphan ONLY when its start-token
+/// identity is fully confirmed: a stored token is present AND the live pid's current
+/// token is present AND they match. If the stored token is `None`, or the pid's
+/// current token can't be read, or they differ, we do NOT signal — a recycled pid
+/// belonging to an innocent process is never killed (the prior fail-OPEN logic
+/// killed when the stored token was `None`).
 ///
 /// PR3a: group-kill is now DONE (the PR2 "group-kill DEFERRED" note is resolved) —
-/// unix=pgid group-kill, windows=Job Object KILL_ON_JOB_CLOSE. Route B has NO
-/// protocol cancel (confirmed for opencode in the ACP sub-spike), so cancel stays a
-/// hard process-tree kill; a PTY-level graceful quit (the backend's `quit_command`)
-/// before the kill is an optional later refinement, not a protocol step.
+/// unix=pgid group-kill, Windows=spawn fail-closed (no live ephemeral workers to
+/// reap). Route B has NO protocol cancel (confirmed for opencode in the ACP
+/// sub-spike), so cancel stays a hard process-tree kill; a PTY-level graceful quit
+/// (the backend's `quit_command`) before the kill is an optional later refinement,
+/// not a protocol step.
 fn terminate_worker(w: &EphemeralWorker) {
     if let Some(handle) = LIVE_CHILDREN.lock().remove(&w.worker_id) {
-        // PRIMARY live path. unix: pgid group-kill. windows: the leader kill plus
-        // the Job-Object close (on handle drop below) takes down the whole tree.
+        // PRIMARY live path: unix pgid group-kill — a PTY child is its own session
+        // leader, so killing the group reaps every grandchild the backend forked.
+        // (Windows never reaches here: spawn is fail-closed, so no handle exists.)
         crate::process::kill_process_tree(handle.pid());
         let _ = handle.child.lock().wait();
-        // `handle` drops here → on windows the Job Object handle closes →
-        // KILL_ON_JOB_CLOSE terminates any descendants the leader-kill missed.
+        // `handle` drops here, closing the retained PTY master.
         return;
     }
     if w.pid == 0 || !crate::process::is_pid_alive(w.pid) {
@@ -604,6 +661,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// Serializes every test that calls `spawn_ephemeral_worker` / `finalize_spawn`.
+    /// The Fix 2 + Fix 3 failure SEAMS are process-global (`AtomicBool`s in
+    /// `finalize_test_seam` / `crate::agent::test_seam`); cargo runs tests in
+    /// parallel, so a spawn/finalize in one test could observe a flag another test
+    /// armed. Holding this lock for the whole arm→spawn→disarm window (and in every
+    /// other spawn-touching test) makes the seam observation deterministic.
+    fn seam_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn tmp_home(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -617,25 +685,15 @@ mod tests {
         dir
     }
 
-    /// A real, CROSS-PLATFORM long-lived backend command (program + args) so the
-    /// spawn→reap lifecycle + termination are exercised on EVERY CI platform incl.
-    /// windows-latest (Windows posture must-carry: don't let a `cfg(unix)` gate
-    /// hide a cross-platform prod gap — xwin compile-green ≠ runtime-pass). Points
-    /// `spawn_ephemeral_worker` at a stand-in long-lived binary (sleep/ping), which
-    /// resolves to `Backend::from_command` → `None` (no preset args / spawn flags),
-    /// so the test needs no installed backend.
+    /// A real long-lived backend command (program + args) so the spawn→reap
+    /// lifecycle + termination are exercised. Points `spawn_ephemeral_worker` at a
+    /// stand-in long-lived binary (`/bin/sleep`), which resolves to
+    /// `Backend::from_command` → `None` (no preset args / spawn flags), so the test
+    /// needs no installed backend. `#[cfg(unix)]`: every caller is unix-only now that
+    /// ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
     fn long_lived_cmd() -> (String, Vec<String>) {
-        #[cfg(unix)]
-        {
-            ("/bin/sleep".to_string(), vec!["30".to_string()])
-        }
-        #[cfg(windows)]
-        {
-            (
-                "ping".to_string(),
-                vec!["-n".to_string(), "31".to_string(), "127.0.0.1".to_string()],
-            )
-        }
+        ("/bin/sleep".to_string(), vec!["30".to_string()])
     }
 
     fn reserving_row(id: &str, age_secs: i64) -> EphemeralWorker {
@@ -651,9 +709,10 @@ mod tests {
     }
 
     /// Poll until `pid` is dead or a short deadline. Termination + OS process-
-    /// object cleanup can lag briefly (notably on Windows: an exited process stays
-    /// queryable until its last handle closes), so a death check must NOT assert
-    /// immediately. The caller must have dropped the `Child` handle first.
+    /// object cleanup can lag briefly, so a death check must NOT assert immediately.
+    /// The caller must have dropped the `Child` handle first. `#[cfg(unix)]`: every
+    /// caller is unix-only now that ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
     fn assert_dead_within(pid: u32, label: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while crate::process::is_pid_alive(pid) {
@@ -808,14 +867,19 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Track a REAL (cross-platform) ephemeral PTY worker through the SAME
+    /// Track a REAL ephemeral PTY worker through the SAME
     /// reserve→spawn→finalize→insert pipeline `spawn_and_track` runs, but with a
-    /// long-lived stand-in command (sleep/ping) so the test needs no installed
+    /// long-lived stand-in command (`/bin/sleep`) so the test needs no installed
     /// backend. `spawn_and_track` hardcodes `args:&[]` (a real backend needs none),
     /// so the test drives `spawn_ephemeral_worker` directly (where it controls
     /// args) and then finalizes + inserts into `LIVE_CHILDREN` identically — so the
-    /// reap path under test goes through the real `terminate_worker`.
+    /// reap path under test goes through the real `terminate_worker`. `#[cfg(unix)]`:
+    /// `spawn_ephemeral_worker` is fail-closed on Windows (no live worker to track).
+    #[cfg(unix)]
     fn track_real_worker(home: &Path, workflow_id: &str, ttl_secs: u64) -> EphemeralWorker {
+        // Hold the seam lock across spawn+finalize so a concurrently-armed failure
+        // seam (Fix 2 / Fix 3) cannot make this otherwise-happy spawn/finalize fail.
+        let _seam = seam_lock();
         let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
         let worker_id = format!("eph-test-{}-{}", std::process::id(), seq);
         let mut reserving = reserving_row(&worker_id, 0);
@@ -847,9 +911,11 @@ mod tests {
         worker
     }
 
-    /// Full lifecycle against a REAL ephemeral PTY worker (cross-platform):
+    /// Full lifecycle against a REAL ephemeral PTY worker:
     /// reserve→spawn→finalize → list → reap, and the reap genuinely terminates the
-    /// process tree (is_pid_alive → false). Runs on all CI platforms.
+    /// process tree (is_pid_alive → false). `#[cfg(unix)]`: ephemeral spawn is
+    /// fail-closed on Windows.
+    #[cfg(unix)]
     #[test]
     fn ephemeral_lifecycle_spawn_list_reap() {
         let home = tmp_home("lifecycle");
@@ -879,6 +945,8 @@ mod tests {
 
     /// The reap SWEEP enforces max-wall-TTL: a real process past its TTL is
     /// terminated + removed (drive `now` past the TTL — deterministic, no waiting).
+    /// `#[cfg(unix)]`: ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
     #[test]
     fn reap_sweep_enforces_wall_ttl() {
         let home = tmp_home("ttl-sweep");
@@ -947,13 +1015,16 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// PR3a Route-B core: `spawn_ephemeral_worker` spawns a REAL (cross-platform)
-    /// long-lived process via a PTY, reports its live pid, and is NOT in any agent
-    /// registry — the fn takes NO `AgentRegistry` argument, so by construction
-    /// there is zero roster involvement (no pane, no router subscriber). A
-    /// `kill_process_tree(pid)` then reaps the whole PTY-session tree.
+    /// PR3a Route-B core: `spawn_ephemeral_worker` spawns a REAL long-lived process
+    /// via a PTY, reports its live pid, and is NOT in any agent registry — the fn
+    /// takes NO `AgentRegistry` argument, so by construction there is zero roster
+    /// involvement (no pane, no router subscriber). A `kill_process_tree(pid)` then
+    /// reaps the whole PTY-session tree. `#[cfg(unix)]`: ephemeral spawn is
+    /// fail-closed on Windows.
+    #[cfg(unix)]
     #[test]
     fn spawn_ephemeral_worker_no_registry_then_kill_tree_reaps() {
+        let _seam = seam_lock();
         let (program, args) = long_lived_cmd();
         let worker_id = format!("eph-direct-{}", std::process::id());
         let config = crate::agent::SpawnConfig {
@@ -1124,6 +1195,8 @@ mod tests {
     /// Fail-CLOSED inverse: when the stored token MATCHES the live pid's current
     /// token (full identity confirmed), the no-handle path DOES kill. Spawn a real
     /// throwaway process, read its real start-token, and assert terminate reaps it.
+    /// `#[cfg(unix)]`: uses the unix-only `long_lived_cmd` + setsid group semantics.
+    #[cfg(unix)]
     #[test]
     fn terminate_no_handle_kills_on_token_match() {
         let (program, args) = long_lived_cmd();
@@ -1133,7 +1206,6 @@ mod tests {
         // whole PROCESS GROUP. The child must be in its OWN group (setsid) or it
         // would take the test runner down with it. (The spawned-via-PTY workers in
         // the other tests are session leaders already, so this only matters here.)
-        #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             unsafe {
@@ -1207,37 +1279,22 @@ mod tests {
 
     /// Fix 3 (production-shaped tree-kill): spawn a LEADER that itself backgrounds a
     /// long-lived GRANDCHILD, capture BOTH pids, reap through the real
-    /// `terminate_worker` (handle path), and assert BOTH are dead. This replaces the
-    /// old childless-process coverage: on unix the pgid group-kill must reach the
-    /// grandchild; on windows the Job Object's KILL_ON_JOB_CLOSE must (the assigned
-    /// tree dies on handle drop).
+    /// `terminate_worker` (handle path), and assert BOTH are dead — the unix pgid
+    /// group-kill must reach the grandchild. `#[cfg(unix)]`: ephemeral spawn is
+    /// fail-closed on Windows (no live worker → no live-handle reap path to exercise).
+    #[cfg(unix)]
     #[test]
     fn reap_kills_leader_and_grandchild_tree() {
+        let _seam = seam_lock();
         let home = tmp_home("tree-kill");
         let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
         let worker_id = format!("eph-tree-{}-{}", std::process::id(), seq);
 
         // A leader that backgrounds a real grandchild and prints the grandchild pid,
         // then waits — so the leader stays alive holding the tree open.
-        #[cfg(unix)]
         let (program, args) = (
             "/bin/sh".to_string(),
             vec!["-c".to_string(), "sleep 300 & echo $!; wait".to_string()],
-        );
-        #[cfg(windows)]
-        let (program, args) = (
-            "cmd".to_string(),
-            vec![
-                "/c".to_string(),
-                // `timeout` is a transient delay child; `ping -t` is the LONG-LIVED
-                // descendant we capture + assert dies via KILL_ON_JOB_CLOSE. The 2s
-                // delay makes `ping -t` spawn AFTER the Job Object is assigned to the
-                // leader — otherwise a descendant created in the ~ms spawn→assign
-                // window would escape the job (the known assign-after-spawn race, see
-                // create_kill_on_close_job). This delay is a TEST artifact to prove
-                // the kill deterministically, not a production requirement.
-                "timeout /t 2 /nobreak >NUL && ping -t 127.0.0.1 >NUL".to_string(),
-            ],
         );
 
         let config = crate::agent::SpawnConfig {
@@ -1258,17 +1315,12 @@ mod tests {
         let leader_pid = handle.pid();
         assert!(crate::process::is_pid_alive(leader_pid), "leader is alive");
 
-        // On unix, read the grandchild pid the leader echoed to its PTY by draining
-        // a writer-side… simpler: the read-loop drains the PTY, so we instead spawn
-        // our OWN observation: re-run the same shell isn't representative. Use the
-        // leader's process group to find a real grandchild via the OS.
-        #[cfg(unix)]
+        // Read the grandchild pid via the leader's process group: the read-loop
+        // drains the PTY, so we find the backgrounded `sleep` through the OS instead.
+        // `pgrep -g <leader>` lists the leader's group; the sleep is a grandchild of
+        // sh's subshell but in the leader's group, so any group pid that is NOT the
+        // leader is our grandchild.
         let grandchild_pid: Option<u32> = {
-            // Poll for a child process of the leader (the backgrounded `sleep`).
-            // `pgrep -P <leader>` lists direct children; the sleep is a grandchild
-            // of sh's subshell but a child of the leader's group — pgrep -g covers
-            // the group. We accept either path: any pid in the leader's group that
-            // is NOT the leader.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut found = None;
             while std::time::Instant::now() < deadline {
@@ -1291,56 +1343,13 @@ mod tests {
             }
             found
         };
-        #[cfg(unix)]
         assert!(
             grandchild_pid.is_some(),
             "a real grandchild (backgrounded sleep) must exist in the leader's group"
         );
 
-        // Windows: capture the LONG-LIVED descendant (the leader's `ping -t` child)
-        // and assert IT dies on reap — proving the Job Object reaps DESCENDANTS, not
-        // just the leader (a leader-only check would pass even with a broken job).
-        #[cfg(windows)]
-        let grandchild_pid: Option<u32> = {
-            // Sleep past the leader's 2s delay so `ping -t` has spawned AFTER the job
-            // assignment, then find it as a child of the leader via WMI/CIM.
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            let mut found = None;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
-            while std::time::Instant::now() < deadline {
-                let out = std::process::Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-Command",
-                        &format!(
-                            "Get-CimInstance Win32_Process -Filter \"ParentProcessId={leader_pid}\" | ForEach-Object {{ $_.ProcessId }}"
-                        ),
-                    ])
-                    .output();
-                if let Ok(o) = out {
-                    for line in String::from_utf8_lossy(&o.stdout).lines() {
-                        if let Ok(p) = line.trim().parse::<u32>() {
-                            if p != leader_pid && crate::process::is_pid_alive(p) {
-                                found = Some(p);
-                            }
-                        }
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            found
-        };
-        #[cfg(windows)]
-        assert!(
-            grandchild_pid.is_some(),
-            "a long-lived descendant (ping -t, spawned post-assignment) must exist under the leader"
-        );
-
         // Track the worker so the reap goes through the REAL terminate_worker
-        // (handle path: unix pgid group-kill / windows Job Object close).
+        // (handle path: unix pgid group-kill).
         let token = crate::process::process_start_token(leader_pid);
         let mut reserving = reserving_row(&worker_id, 0);
         reserving.backend = "sleep".to_string();
@@ -1352,17 +1361,240 @@ mod tests {
         assert_eq!(reaped.worker_id, worker_id);
 
         assert_dead_within(leader_pid, "leader must be killed by the tree reap");
-        #[cfg(unix)]
         if let Some(gc) = grandchild_pid {
             assert_dead_within(gc, "the grandchild must ALSO be killed (pgid group-kill)");
         }
-        #[cfg(windows)]
-        if let Some(gc) = grandchild_pid {
-            assert_dead_within(
-                gc,
-                "the descendant must ALSO be killed (Job Object KILL_ON_JOB_CLOSE)",
-            );
-        }
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─────────────── Fix 1: Windows ephemeral spawn is FAIL-CLOSED ───────────────
+
+    /// `spawn_ephemeral_worker` is UNSUPPORTED on Windows: it must return `Err`
+    /// BEFORE openpty/spawn (no process is created), with a message naming the
+    /// platform. The unix tree-reap (pgid group-kill) has no race-free Windows
+    /// analogue (Job Object can only be assigned post-spawn), so Windows fails
+    /// closed rather than ship a tree-reap with an escape hole.
+    #[cfg(windows)]
+    #[test]
+    fn ephemeral_spawn_unsupported_on_windows() {
+        let worker_id = format!("eph-win-failclosed-{}", std::process::id());
+        // A real backend command ("cmd" exists on Windows) so we are NOT rejected by
+        // some earlier validation — the fail-closed return is what we assert. If a
+        // process WERE spawned it would be a `cmd` we'd have to reap; the early
+        // return guarantees none is, so there is nothing to clean up.
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: "cmd",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let res = crate::agent::spawn_ephemeral_worker(&config);
+        let err = res.expect_err("ephemeral spawn must fail closed on Windows");
+        assert!(
+            err.to_string().contains("unsupported on Windows"),
+            "the error must name the platform: {err}"
+        );
+    }
+
+    // ───────────── Fix 2: finalize-persist FAIL-CLOSED (orphan-kill) ─────────────
+
+    /// `finalize_spawn` must NOT swallow a store-write failure: it surfaces
+    /// `FinalizeError::Persist` (mirroring the reserve-side fix). We induce a write
+    /// failure by pointing the store at a path whose parent is a FILE (so
+    /// `mutate_versioned`'s `create_dir_all(parent)` errors) — cross-platform, no
+    /// spawn needed.
+    #[test]
+    fn finalize_persist_failure_surfaces_error_not_ok() {
+        // Lock so a concurrently-armed finalize seam can't change the FAILURE CAUSE
+        // (the assertion holds either way, but this keeps the cause = the real write).
+        let _seam = seam_lock();
+        let file_home = std::env::temp_dir().join(format!(
+            "agend-eph-finalize-unwritable-{}-{}",
+            std::process::id(),
+            WORKER_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&file_home, b"x").expect("create the blocking file");
+        let r = finalize_spawn(&file_home, "any-id", 1234, Some(99));
+        assert!(
+            matches!(r, Err(FinalizeError::Persist(_))),
+            "a finalize store-write failure must surface as FinalizeError::Persist, not Ok or RowVanished: {r:?}"
+        );
+        std::fs::remove_file(&file_home).ok();
+    }
+
+    /// End-to-end FAIL-CLOSED: reserve → spawn a REAL child → `finalize_spawn` forced
+    /// (test seam) to fail its PERSIST step, then run `spawn_and_track`'s finalize-Err
+    /// branch verbatim and assert it fails closed — `finalize_spawn` returns
+    /// `Persist`, the just-spawned child is orphan-KILLED (kill_tree + wait), NO
+    /// handle leaks into `LIVE_CHILDREN`, and `list()` shows NO `running` row (the
+    /// stale reserving row is released too). This shares the EXACT branch
+    /// `spawn_and_track` takes on a persist failure (driving `spawn_and_track` itself
+    /// would need an installed backend; reproducing its branch keeps the test
+    /// hermetic with `/bin/sleep`). `#[cfg(unix)]`: ephemeral spawn is fail-closed on
+    /// Windows.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_persist_failure_fails_closed_kills_orphan() {
+        let _seam = seam_lock();
+        let home = tmp_home("finalize-failclosed");
+        let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let worker_id = format!("eph-finalize-{}-{}", std::process::id(), seq);
+        let mut reserving = reserving_row(&worker_id, 0);
+        reserving.backend = "sleep".to_string();
+        try_reserve_slot(&home, reserving).expect("reserve");
+
+        let (program, args) = long_lived_cmd();
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: &program,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let handle = crate::agent::spawn_ephemeral_worker(&config).expect("spawn");
+        let pid = handle.pid();
+        assert!(
+            crate::process::is_pid_alive(pid),
+            "child is alive pre-finalize"
+        );
+
+        // finalize_spawn returns Persist (seam armed) → run the production
+        // finalize-Err branch verbatim: kill the orphan, drop the handle (NO
+        // LIVE_CHILDREN insert), release the stale reserving row.
+        finalize_test_seam::set_force_persist_fail(true);
+        let fin = finalize_spawn(
+            &home,
+            &worker_id,
+            pid,
+            crate::process::process_start_token(pid),
+        );
+        finalize_test_seam::set_force_persist_fail(false);
+        assert!(
+            matches!(fin, Err(FinalizeError::Persist(_))),
+            "seam must force a persist failure: {fin:?}"
+        );
+        crate::process::kill_process_tree(pid);
+        let _ = handle.child.lock().wait();
+        release_reservation(&home, &worker_id);
+
+        assert!(
+            !LIVE_CHILDREN.lock().contains_key(&worker_id),
+            "fail-closed: no handle leaks into LIVE_CHILDREN"
+        );
+        assert_eq!(
+            list(&home, None)
+                .iter()
+                .filter(|w| w.status == STATUS_RUNNING)
+                .count(),
+            0,
+            "fail-closed: no running row persists after a finalize persist failure"
+        );
+        assert_dead_within(pid, "fail-closed: the just-spawned child is orphan-killed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ───────── Fix 3: SpawnKillGuard kills the child on post-spawn failure ────────
+
+    /// §3.10 failure-seam repro: drive the REAL `spawn_ephemeral_worker`, force the
+    /// `#[cfg(test)]` post-spawn step to FAIL (after the child spawns + the
+    /// `SpawnKillGuard` is armed), and assert the ARMED guard's Drop killed + reaped
+    /// the spawned child — zero orphan. Proves the guard is not merely well-shaped
+    /// but actually reaps a real running child on the error path.
+    /// `#[cfg(unix)]`: ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_ephemeral_worker_armed_guard_kills_child_on_postspawn_failure() {
+        // Hold the lock across arm→spawn→read-pid→disarm so the global seam +
+        // last-pid observable can't be clobbered by a concurrent spawn test.
+        let _seam = seam_lock();
+        let worker_id = format!("eph-guard-{}", std::process::id());
+        let (program, args) = long_lived_cmd(); // /bin/sleep 30 — a real long-lived child
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: &program,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::test_seam::set_force_postspawn_fail(true);
+        let res = crate::agent::spawn_ephemeral_worker(&config);
+        crate::agent::test_seam::set_force_postspawn_fail(false);
+
+        let err = res.expect_err("forced post-spawn failure must return Err");
+        assert!(
+            err.to_string().contains("forced post-spawn failure"),
+            "the forced failure must surface: {err}"
+        );
+        let pid = crate::agent::test_seam::last_pid();
+        assert_ne!(
+            pid, 0,
+            "the forced-failure spawn must have recorded a real pid"
+        );
+        // The armed SpawnKillGuard's Drop ran on the `?`/return → kill_tree + wait.
+        assert_dead_within(
+            pid,
+            "the ARMED SpawnKillGuard must have killed + reaped the spawned child (zero orphan)",
+        );
+    }
+
+    /// Disarmed-path sanity: with the seam OFF, the guard disarms on the success
+    /// path and the worker is alive after spawn (the failure-seam only fires the
+    /// kill when armed). Reaps the worker afterward so the test leaves no process.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_ephemeral_worker_disarmed_guard_keeps_child_alive() {
+        let _seam = seam_lock();
+        let worker_id = format!("eph-guard-ok-{}", std::process::id());
+        let (program, args) = long_lived_cmd();
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: &program,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        // seam OFF (default) → success path → guard disarms.
+        let handle = crate::agent::spawn_ephemeral_worker(&config).expect("spawn");
+        let pid = handle.pid();
+        assert!(
+            crate::process::is_pid_alive(pid),
+            "disarmed guard: the worker is alive after a successful spawn"
+        );
+        crate::process::kill_process_tree(pid);
+        let _ = handle.child.lock().wait();
+        drop(handle);
+        assert_dead_within(
+            pid,
+            "cleanup: reap the worker spawned by the disarmed-path test",
+        );
     }
 }
