@@ -999,6 +999,89 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
     (count, oldest)
 }
 
+/// Which UNREAD messages are real OBLIGATIONS that MUST keep nagging — `Some(reason)`
+/// = an unhandled obligation (a sender is blocked / a task is open), `None` = safe to
+/// drop from attention. The SINGLE source of truth shared by `inbox action=clear`'s
+/// KEEP-set ([`clear_compact`]) and the periodic poll-reminder ([`unread_obligation_count`]),
+/// so the two can never drift (decision d-20260607081209372642-1).
+///
+/// `query` → always an obligation (the sender is blocked on a reply). `task` → an
+/// obligation unless the board proves it terminal (Done/Cancelled). EVERYTHING ELSE
+/// (report / update / ci-watch / poll / a plain `kind=None` message) → `None`: a
+/// fire-and-forget delivery with no one waiting, so it must NOT be re-paged periodically.
+/// When task proof is uncertain we KEEP (failure mode = noise, never hidden work).
+pub fn obligation_reason(home: &Path, msg: &InboxMessage) -> Option<String> {
+    match msg.kind.as_deref() {
+        Some("query") => Some("unanswered query".to_string()),
+        Some("task") => {
+            let tid = msg.task_id.as_deref().or(msg.correlation_id.as_deref());
+            match tid {
+                Some(id) => match crate::tasks::load_by_id(home, id) {
+                    Some(t)
+                        if matches!(
+                            t.status,
+                            crate::task_events::TaskStatus::Done
+                                | crate::task_events::TaskStatus::Cancelled
+                        ) =>
+                    {
+                        None
+                    }
+                    Some(t) => Some(format!("task {id} not terminal (status={})", t.status)),
+                    None => Some(format!("task {id} not on board — kept")),
+                },
+                None => Some("task without id — kept".to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Count actionable-unread OBLIGATION messages (+ the oldest one's timestamp). Like
+/// [`unread_count`] but ALSO requires [`obligation_reason`] to be `Some` — so a drained
+/// or undrained NON-obligation (report / update / ci-watch / plain `kind=None`) is NOT
+/// counted. This is the poll-reminder's count: it must only periodically re-page an
+/// agent about REAL unhandled work (unanswered query / open task), never about an
+/// already-delivered report that bounced unread↔delivering via the reclaim TTL (the
+/// #t-…61487 noise this fixes). Arrival nudges (the `[AGEND-MSG-PENDING]` pending-pointer,
+/// via [`unread_count`]) stay kind-agnostic, so a plain message is still surfaced on
+/// arrival — only the PERIODIC re-nudge is gated to obligations.
+///
+/// Full-message deser (vs `unread_count`'s narrow probe): `obligation_reason` needs
+/// `kind` / `task_id` / `correlation_id`. Not hot — one read per idle agent per
+/// poll-reminder cadence, and the task-board load only fires for `kind=task` rows.
+pub fn unread_obligation_count(
+    home: &Path,
+    name: &str,
+) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
+    let path = inbox_path_resolved(home, name);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (0, None),
+    };
+    let mut count = 0usize;
+    let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for line in content.lines() {
+        let msg: InboxMessage = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Actionable-unread (mirror `UnreadProbe::is_unread`: not read, not in-flight
+        // delivering, not superseded) AND a real obligation.
+        let unread =
+            msg.read_at.is_none() && msg.delivering_at.is_none() && msg.superseded_by.is_none();
+        if unread && obligation_reason(home, &msg).is_some() {
+            count += 1;
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
+                let ts_utc = ts.with_timezone(&chrono::Utc);
+                if oldest.is_none_or(|t| t > ts_utc) {
+                    oldest = Some(ts_utc);
+                }
+            }
+        }
+    }
+    (count, oldest)
+}
+
 /// Sweep expired messages from all inbox files (#inbox-gc part b).
 ///
 /// Two-pass per inbox, both serialised under [`with_inbox_lock`]:

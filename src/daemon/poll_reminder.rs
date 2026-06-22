@@ -49,7 +49,13 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
     // Phase 2: the inbox reads + dedup + formatting run lock-free.
     let mut result = Vec::new();
     for name in &idle_names {
-        let (count, oldest) = crate::inbox::unread_count(home, name);
+        // #t-…61487: count only actionable-unread OBLIGATIONS (unanswered query / open
+        // task), NOT every unread row. A drained-then-reclaimed `report` (or any
+        // non-obligation) is kind-agnostically counted by `unread_count` and re-pages the
+        // agent every reclaim TTL — the ~2h noise this fixes. Arrival nudges (the
+        // pending-pointer) stay kind-agnostic, so a plain message is still surfaced when it
+        // lands; only the PERIODIC re-nudge is gated to real unhandled obligations.
+        let (count, oldest) = crate::inbox::unread_obligation_count(home, name);
         if count == 0 {
             continue;
         }
@@ -196,6 +202,9 @@ mod tests {
         dir
     }
 
+    // Seeds OBLIGATION messages (kind=query) — post-#t-…61487 the poll-reminder counts
+    // only obligations, so a plain `kind=None` row no longer produces a reminder. query is
+    // the simplest always-obligation kind (no task-board dependency).
     fn seed_unread(home: &Path, agent: &str, count: usize) {
         for i in 0..count {
             let _ = crate::inbox::enqueue(
@@ -206,6 +215,7 @@ mod tests {
                     id: Some(format!("m-{agent}-{i}")),
                     from: "test".into(),
                     text: format!("msg {i}"),
+                    kind: Some("query".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     ..Default::default()
                 },
@@ -228,6 +238,7 @@ mod tests {
                 id: Some(format!("m-{agent}-{i}")),
                 from: "test".into(),
                 text: format!("msg {i}"),
+                kind: Some("query".to_string()), // obligation (post-#t-…61487 count gate)
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 delivering_at: Some(stale.clone()), // delivered, unconfirmed, stale
                 ..Default::default()                // read_at = None
@@ -420,6 +431,36 @@ mod tests {
         let v = collect_poll_reminders(&home, &registry);
         assert!(v.is_empty(), "busy agent must not get reminder");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…61487 regression: a `report` (the fire-and-forget kind that bounced
+    /// unread↔delivering via the reclaim TTL and re-paged every ~2h) must NOT produce
+    /// a poll-reminder — only obligations (query/task) do. `collect` now counts via
+    /// `unread_obligation_count`.
+    #[test]
+    fn collect_skips_report_non_obligation() {
+        let home = tmp_home("collect-report");
+        let agent = "collect-report-agent";
+        let _ = crate::inbox::enqueue(
+            &home,
+            agent,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some("r1".into()),
+                from: "peer".into(),
+                text: "VERIFIED".into(),
+                kind: Some("report".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        );
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+        assert!(
+            collect_poll_reminders(&home, &registry).is_empty(),
+            "a report must not produce a poll-reminder (the drained-report noise)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

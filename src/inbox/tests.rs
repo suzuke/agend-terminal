@@ -3630,3 +3630,114 @@ fn test_custom_disk_threshold_env() {
     std::env::remove_var("AGEND_LOW_DISK_THRESHOLD");
     assert_eq!(super::disk::get_low_disk_threshold_bytes(), default_val); // default
 }
+
+// ───────── #t-…61487: poll-reminder counts only OBLIGATIONS ─────────
+
+/// `obligation_reason` classifies kinds: query / open-or-unknown task = obligation;
+/// report / update / plain (kind=None) = NOT. The SINGLE predicate shared by
+/// `inbox action=clear` and the poll-reminder count.
+#[test]
+fn obligation_reason_classifies_kinds() {
+    let home = tmp_home("oblig-kinds");
+    // query → obligation.
+    assert!(obligation_reason(&home, &msg().kind("query").build()).is_some());
+    // report / update / plain → NOT obligations.
+    assert!(obligation_reason(&home, &msg().kind("report").build()).is_none());
+    assert!(obligation_reason(&home, &msg().kind("update").build()).is_none());
+    assert!(obligation_reason(&home, &make_msg("a", "plain")).is_none()); // kind=None
+                                                                          // task with an unknown / no id → kept (obligation) — "uncertain → keep".
+    let mut task_unknown = msg().kind("task").build();
+    task_unknown.correlation_id = Some("t-not-on-board".into());
+    assert!(obligation_reason(&home, &task_unknown).is_some());
+    assert!(obligation_reason(&home, &msg().kind("task").build()).is_some()); // no id → kept
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A terminal (Done) task on the board is NOT an obligation → not counted (the agent
+/// is no longer responsible for it).
+#[test]
+fn obligation_reason_excludes_terminal_task() {
+    let home = tmp_home("oblig-terminal");
+    let inst = crate::task_events::InstanceName::from("u");
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-done".into()),
+            title: "t".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            branch: None,
+            depends_on: vec![],
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+        },
+    )
+    .unwrap();
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Done {
+            task_id: crate::task_events::TaskId("t-done".into()),
+            by: crate::task_events::InstanceName::from("u"),
+            source: crate::task_events::DoneSource::OperatorManual {
+                authored_at: "2026-01-01T00:00:00Z".into(),
+                result: None,
+            },
+        },
+    )
+    .unwrap();
+
+    let mut done_task = msg().kind("task").build();
+    done_task.correlation_id = Some("t-done".into());
+    assert!(
+        obligation_reason(&home, &done_task).is_none(),
+        "a Done task must NOT be an obligation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// THE bug fix: a drained-or-unread `report` is NOT counted by the poll-reminder's
+/// obligation count, while a `query` IS — so a fire-and-forget report can never
+/// re-page the agent, but a blocked sender's query still does.
+#[test]
+fn unread_obligation_count_excludes_report_includes_query() {
+    let home = tmp_home("oblig-count");
+    // report: not an obligation → 0.
+    enqueue(&home, "ag-report", msg().kind("report").id("r1").build()).ok();
+    assert_eq!(unread_obligation_count(&home, "ag-report").0, 0);
+    // even after a drain (→ delivering) the report stays a non-obligation → 0.
+    drain(&home, "ag-report");
+    assert_eq!(unread_obligation_count(&home, "ag-report").0, 0);
+
+    // query: an obligation → 1.
+    enqueue(&home, "ag-query", msg().kind("query").id("q1").build()).ok();
+    assert_eq!(unread_obligation_count(&home, "ag-query").0, 1);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Decision (a) lock — NO SILENT LOSS: a plain `kind=None` message is NOT counted by
+/// the periodic poll-reminder (`unread_obligation_count` = 0), but the kind-agnostic
+/// arrival count (`unread_count`, the `[AGEND-MSG-PENDING]` pointer) STILL sees it = 1.
+/// So a plain message is surfaced on ARRIVAL; only the periodic re-nudge is gated.
+#[test]
+fn plain_message_excluded_from_obligation_but_arrival_still_counts() {
+    let home = tmp_home("oblig-plain");
+    enqueue(&home, "ag-plain", make_msg("alice", "plain message")).ok(); // kind=None
+    assert_eq!(
+        unread_obligation_count(&home, "ag-plain").0,
+        0,
+        "plain message must NOT drive the periodic poll-reminder"
+    );
+    assert_eq!(
+        unread_count(&home, "ag-plain").0,
+        1,
+        "but the arrival pending-pointer count must still surface it (no silent loss)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

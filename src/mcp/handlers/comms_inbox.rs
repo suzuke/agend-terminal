@@ -114,43 +114,13 @@ pub fn handle_inbox_ack(home: &Path, args: &Value, instance_name: &str) -> Value
 /// and returns bounded compact summaries; obligations stay unread + surface in
 /// `requires_response`. Does NOT drain (no reply-ledger arm / heartbeat touch).
 pub fn handle_inbox_clear(home: &Path, instance_name: &str) -> Value {
-    let result =
-        crate::inbox::clear_compact(home, instance_name, |msg| obligation_reason(home, msg));
+    // #t-…61487: `obligation_reason` is the SHARED KEEP-set predicate — the same one the
+    // periodic poll-reminder counts (`inbox::unread_obligation_count`), so clear and the
+    // reminder can never drift. (decision d-20260607081209372642-1.)
+    let result = crate::inbox::clear_compact(home, instance_name, |msg| {
+        crate::inbox::obligation_reason(home, msg)
+    });
     serde_json::to_value(&result).unwrap_or_else(|e| json!({"error": format!("serialize: {e}")}))
-}
-
-/// Trust rule (decision d-20260607081209372642-1): which UNREAD messages MUST
-/// stay unread on a compact-clear. `Some(reason)` → keep unread; `None` → safe
-/// to clear. `read_at` means "non-obligation cleared from attention", NOT
-/// "obligation accepted" — so an unanswered query or an unsettled task is kept.
-/// When proof is uncertain we KEEP (failure mode = noise, never hidden work).
-fn obligation_reason(home: &Path, msg: &crate::inbox::InboxMessage) -> Option<String> {
-    match msg.kind.as_deref() {
-        // An unanswered query — the sender is blocked waiting on a reply.
-        Some("query") => Some("unanswered query".to_string()),
-        // A delegated task — keep unless the task board proves it terminal.
-        Some("task") => {
-            let tid = msg.task_id.as_deref().or(msg.correlation_id.as_deref());
-            match tid {
-                Some(id) => match crate::tasks::load_by_id(home, id) {
-                    Some(t)
-                        if matches!(
-                            t.status,
-                            crate::task_events::TaskStatus::Done
-                                | crate::task_events::TaskStatus::Cancelled
-                        ) =>
-                    {
-                        None
-                    }
-                    Some(t) => Some(format!("task {id} not terminal (status={})", t.status)),
-                    None => Some(format!("task {id} not on board — kept")),
-                },
-                None => Some("task without id — kept".to_string()),
-            }
-        }
-        // update / report / ci-watch / poll / ambient — safe to clear.
-        _ => None,
-    }
 }
 
 #[cfg(test)]
