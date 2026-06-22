@@ -4,15 +4,18 @@
 //! bookkeeping — they are NOT inserted into the agent registry, fleet.yaml,
 //! binding, or the worktree pool. They are tracked only in a small JSON sidecar
 //! (`$AGEND_HOME/ephemeral_workers.json`, mirroring [`crate::dispatch_tracking`])
-//! plus an in-memory [`crate::headless::HeadlessHandle`] map for zombie reaping.
+//! plus an in-memory [`crate::agent::EphemeralPtyHandle`] map for zombie reaping.
 //!
-//! PR2: [`spawn_and_track`] launches a REAL headless process via a
-//! [`crate::headless::HeadlessTransport`] (no PTY, no registry). Admission is
-//! BEFORE the spawn (reserve → spawn → finalize). The worker has no protocol
-//! driving it yet — PR3 (ACP) adds that. See `docs/design/1967-ephemeral-phase1.md`.
+//! PR3a (#1967): [`spawn_and_track`] launches a REAL backend HEADLESSLY via a PTY
+//! (Route B) — [`crate::agent::spawn_ephemeral_worker`], which reuses the
+//! managed-agent spawn path's security (`build_command`) WITHOUT a visible pane
+//! and WITHOUT entering the roster. Admission is BEFORE the spawn (reserve → spawn
+//! → finalize). Scope = SAFE spawn + reap only; no prompt injection / turn
+//! detection / capture yet (PR3b). This replaces PR2's std::process
+//! `StdioTransport` path. See `docs/design/1967-ephemeral-phase1.md`.
 //!
 //! ## Cost guards (lead vet condition — day-1)
-//! - **Hard max-live concurrency cap** ([`MAX_LIVE_WORKERS`]): admission is an
+//! - **Hard max-live concurrency cap** ([`max_live_workers`]): admission is an
 //!   atomic check-and-add under the store flock ([`try_reserve_slot`], BEFORE the
 //!   spawn), so the cap can never be exceeded even under concurrent spawns and an
 //!   over-cap spawn creates no process.
@@ -20,21 +23,37 @@
 //!   the reap sweep terminates any worker whose wall clock exceeds its `ttl_secs`,
 //!   so a wedged/forgotten worker cannot run (and bill) unbounded.
 
-use crate::backend::SpawnMode;
-use crate::headless::{HeadlessHandle, HeadlessTransport};
 use crate::store::SchemaVersioned;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
-/// Cost-guard: hard ceiling on simultaneously-live ephemeral workers. Spawn
-/// admission rejects once the live count would exceed this. Conservative day-1
-/// value against the "20 workers burning money overnight" fear — a deterministic
-/// backstop in place BEFORE real spawn (PR2) and token metering (PR6).
-pub const MAX_LIVE_WORKERS: usize = 8;
+/// Cost-guard default: hard ceiling on simultaneously-live ephemeral workers when
+/// `AGEND_EPHEMERAL_MAX_LIVE` is unset/invalid. Spawn admission rejects once the
+/// live count would exceed [`max_live_workers`]. Conservative day-1 value against
+/// the "workers burning money overnight" fear — a deterministic backstop in place
+/// BEFORE real spawn (PR3a) and token metering (PR6). PR3a lowered the default to
+/// 3 (a real backend per worker is far heavier than PR2's stub process).
+pub const DEFAULT_MAX_LIVE_WORKERS: usize = 3;
+
+/// The resolved hard max-live cap: `AGEND_EPHEMERAL_MAX_LIVE` (a positive integer)
+/// if set/valid, else [`DEFAULT_MAX_LIVE_WORKERS`]. Read once and cached — the
+/// cap is a process-lifetime constant, so an operator changing it requires a
+/// daemon restart (matching every other env-tunable). A zero/negative/garbage
+/// value falls back to the default (the cap can never be disabled to 0).
+pub fn max_live_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("AGEND_EPHEMERAL_MAX_LIVE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_LIVE_WORKERS)
+    })
+}
 
 /// Cost-guard: default max wall-clock TTL for a worker (seconds). 30 min —
 /// generous for a bounded sub-task, tight enough to cap runaway spend.
@@ -59,7 +78,7 @@ const STATUS_RUNNING: &str = "running";
 const STATUS_DONE: &str = "done";
 
 /// One tracked ephemeral worker. Persisted as a JSON row; the live
-/// [`crate::headless::HeadlessHandle`] (for zombie reaping + PR3 stdio) is held
+/// [`crate::agent::EphemeralPtyHandle`] (for zombie reaping + PR3b inject) is held
 /// separately in [`LIVE_CHILDREN`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EphemeralWorker {
@@ -96,11 +115,12 @@ impl crate::store::SchemaVersioned for EphemeralStore {
     }
 }
 
-/// In-memory map of `worker_id → HeadlessHandle` for workers spawned THIS daemon
-/// life, so reap can `wait()` the terminated child (never leak a zombie) and PR3
-/// can reach the captured stdio pipes. Empty after a restart (handles don't
-/// survive) — restart orphans are reaped by [`reap_on_boot`] via pid + start-token.
-static LIVE_CHILDREN: LazyLock<Mutex<HashMap<String, HeadlessHandle>>> =
+/// In-memory map of `worker_id → EphemeralPtyHandle` for workers spawned THIS
+/// daemon life, so reap can `wait()` the terminated child (never leak a zombie)
+/// and PR3b can reach the retained PTY writer + core. Empty after a restart
+/// (handles don't survive) — restart orphans are reaped by [`reap_on_boot`] via
+/// pid + start-token.
+static LIVE_CHILDREN: LazyLock<Mutex<HashMap<String, crate::agent::EphemeralPtyHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Process-local monotonic counter for unique worker ids within a daemon life.
@@ -164,7 +184,7 @@ impl std::fmt::Display for SpawnError {
 
 /// Atomic admission RESERVE (r4 PR1 note: admission happens BEFORE spawning the
 /// real process). In ONE locked read-modify-write: if the live count is below
-/// [`MAX_LIVE_WORKERS`], insert `reserving` (a [`STATUS_RESERVING`] row, pid=0)
+/// [`max_live_workers`], insert `reserving` (a [`STATUS_RESERVING`] row, pid=0)
 /// and return `Ok`; else `Err(live)` WITHOUT inserting — so an over-cap spawn
 /// rejects before any OS process exists. Single RMW under the store flock →
 /// concurrent reserves can never push the count past the cap (no TOCTOU).
@@ -172,7 +192,7 @@ fn try_reserve_slot(home: &Path, reserving: EphemeralWorker) -> Result<(), usize
     let mut rejected_at = None;
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |s: &mut EphemeralStore| {
-            if s.workers.len() >= MAX_LIVE_WORKERS {
+            if s.workers.len() >= max_live_workers() {
                 rejected_at = Some(s.workers.len());
                 return Ok(());
             }
@@ -228,16 +248,15 @@ fn release_reservation(home: &Path, worker_id: &str) {
     );
 }
 
-/// Spawn a real headless worker under the hard max-live cap, via the supplied
-/// [`HeadlessTransport`]. Admission is BEFORE the spawn (r4 PR1 note):
-/// **reserve → spawn → finalize**. An over-cap spawn rejects WITHOUT creating any
-/// process; a spawn/finalize failure releases the reservation (no leaked slot, no
-/// leaked process). Returns the live [`EphemeralWorker`].
-pub fn spawn_and_track(
-    home: &Path,
-    spec: SpawnSpec,
-    transport: &dyn HeadlessTransport,
-) -> Result<EphemeralWorker, SpawnError> {
+/// Spawn a real backend HEADLESSLY (Route B — a PTY child with no pane / no
+/// roster, via [`crate::agent::spawn_ephemeral_worker`]) under the hard max-live
+/// cap. Admission is BEFORE the spawn (r4 PR1 note): **reserve → spawn →
+/// finalize**. An over-cap spawn rejects WITHOUT creating any process; a
+/// spawn/finalize failure releases the reservation (no leaked slot, no leaked
+/// process). The worker inherits the managed-agent spawn security identically
+/// (`spawn_ephemeral_worker` calls the SAME `build_command`). Returns the live
+/// [`EphemeralWorker`].
+pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, SpawnError> {
     let ttl_secs = resolve_ttl(spec.ttl_secs);
     let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
     let worker_id = format!("eph-{}-{}", std::process::id(), seq);
@@ -260,24 +279,35 @@ pub fn spawn_and_track(
     if let Err(live) = try_reserve_slot(home, reserving) {
         return Err(SpawnError::CapExceeded {
             live,
-            cap: MAX_LIVE_WORKERS,
+            cap: max_live_workers(),
         });
     }
 
-    // 2) SPAWN the real headless process — only now that a slot is reserved.
-    let cmd = crate::headless::resolve_headless_command(
-        &spec.backend,
-        &[],              // PR2: no extra caller args
-        SpawnMode::Fresh, // ephemeral workers are always fresh
-        None,             // PR2: cwd validation/provisioning deferred to PR3 (see headless.rs)
-        &worker_id,
-        Some(home),
-    );
-    let handle = match transport.spawn(&cmd) {
+    // 2) SPAWN the real backend headlessly — only now that a slot is reserved.
+    //    Per-worker cwd under $AGEND_HOME/backend-data/ephemeral/<worker_id> so
+    //    `build_command`'s two-pass cwd validation resolves inside AGEND_HOME.
+    //    create_dir_all err is ignored — `build_command` re-creates + re-validates.
+    let cwd = home.join("backend-data").join("ephemeral").join(&worker_id);
+    std::fs::create_dir_all(&cwd).ok();
+    let config = crate::agent::SpawnConfig {
+        name: &worker_id,
+        backend_command: &spec.backend,
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh, // ephemeral workers are always fresh
+        cols: 200,
+        rows: 50,
+        env: None,
+        working_dir: Some(&cwd),
+        submit_key: "\r",
+        home: Some(home),
+        crash_tx: None, // no crash-respawn for ephemeral
+        shutdown: None,
+    };
+    let handle = match crate::agent::spawn_ephemeral_worker(&config) {
         Ok(h) => h,
         Err(e) => {
             release_reservation(home, &worker_id);
-            return Err(SpawnError::Spawn(e));
+            return Err(SpawnError::Spawn(std::io::Error::other(e.to_string())));
         }
     };
     let pid = handle.pid();
@@ -291,10 +321,11 @@ pub fn spawn_and_track(
         }
         Err(()) => {
             // Reserving row vanished (concurrently reaped as stale) — kill the
-            // orphan so no process leaks; the slot is already gone.
-            let mut h = handle;
-            crate::process::terminate(pid);
-            let _ = h.child.wait();
+            // orphan tree so no process leaks; the slot is already gone. A PTY
+            // child is its own session leader, so kill_process_tree reaps any
+            // children it forked too.
+            crate::process::kill_process_tree(pid);
+            let _ = handle.child.lock().wait();
             Err(SpawnError::Spawn(std::io::Error::other(
                 "ephemeral finalize: reserving slot vanished before finalize",
             )))
@@ -433,23 +464,27 @@ pub fn reap_on_boot(home: &Path) -> usize {
     orphans.len()
 }
 
-/// Terminate a reaped worker's process and reap its zombie.
+/// Terminate a reaped worker's process TREE and reap its zombie.
 ///
-/// If we still hold the live [`HeadlessHandle`] (spawned this daemon life):
-/// SIGTERM then `wait()` to collect the exit (no zombie). Otherwise (e.g. a
-/// restart orphan): a start-token-guarded SIGTERM only — a recycled pid is never
-/// killed, and init reaps the orphan's zombie.
+/// If we still hold the live [`crate::agent::EphemeralPtyHandle`] (spawned this
+/// daemon life): group-kill the whole PTY-session tree
+/// ([`crate::process::kill_process_tree`]) then `wait()` to collect the exit (no
+/// zombie). Otherwise (e.g. a restart orphan, no in-memory handle): a
+/// start-token-guarded group-kill — a recycled pid is never killed, and init
+/// reaps the orphan's zombie.
 ///
-/// ⚠ group-kill DEFERRED (PR3): this sends a single-process SIGTERM, matching the
-/// transport's [`HeadlessTransport::cancel`]. PR2's worker is a single stub
-/// process; when PR3 runs a real backend that may fork children, switch to
-/// process-group spawn + `kill_process_tree`, and add the protocol graceful-cancel
-/// BEFORE the hard SIGTERM.
+/// PR3a: group-kill is now DONE (the PR2 "group-kill DEFERRED" note is resolved).
+/// A PTY child is its own session leader, so `kill_process_tree` reaps the worker
+/// AND any children the real backend forked — no explicit `process_group(0)` is
+/// needed (the PTY already establishes the session). Route B has NO protocol cancel
+/// (confirmed for opencode in the ACP sub-spike), so cancel stays a hard
+/// process-tree kill; a PTY-level graceful quit (the backend's `quit_command`)
+/// before the kill is an optional later refinement, not a protocol step.
 fn terminate_worker(w: &EphemeralWorker) {
-    if let Some(mut handle) = LIVE_CHILDREN.lock().remove(&w.worker_id) {
-        // Same lifecycle stop as the transport (SIGTERM + reap) — go through it so
-        // there is one cancel path (PR3 wraps it with a protocol graceful-cancel).
-        crate::headless::StdioTransport.cancel(&mut handle);
+    if let Some(handle) = LIVE_CHILDREN.lock().remove(&w.worker_id) {
+        // Group-kill the PTY-session tree, then reap the leader's zombie.
+        crate::process::kill_process_tree(handle.pid());
+        let _ = handle.child.lock().wait();
         return;
     }
     if w.pid == 0 || !crate::process::is_pid_alive(w.pid) {
@@ -462,7 +497,7 @@ fn terminate_worker(w: &EphemeralWorker) {
             return;
         }
     }
-    crate::process::terminate(w.pid);
+    crate::process::kill_process_tree(w.pid);
 }
 
 #[cfg(test)]
@@ -484,76 +519,24 @@ mod tests {
         dir
     }
 
-    fn stub_spec(workflow_id: &str, ttl_secs: Option<u64>) -> SpawnSpec {
-        SpawnSpec {
-            workflow_id: workflow_id.to_string(),
-            parent: None,
-            backend: "stub".to_string(),
-            ttl_secs,
-            token_budget: None,
-        }
-    }
-
-    /// A real, CROSS-PLATFORM long-lived process so the spawn→reap lifecycle +
-    /// termination are exercised on EVERY CI platform incl. windows-latest
-    /// (Windows posture must-carry: don't let a `cfg(unix)` gate hide a
-    /// cross-platform prod gap — xwin compile-green ≠ runtime-pass).
-    fn long_lived_cmd() -> (PathBuf, Vec<String>) {
+    /// A real, CROSS-PLATFORM long-lived backend command (program + args) so the
+    /// spawn→reap lifecycle + termination are exercised on EVERY CI platform incl.
+    /// windows-latest (Windows posture must-carry: don't let a `cfg(unix)` gate
+    /// hide a cross-platform prod gap — xwin compile-green ≠ runtime-pass). Points
+    /// `spawn_ephemeral_worker` at a stand-in long-lived binary (sleep/ping), which
+    /// resolves to `Backend::from_command` → `None` (no preset args / spawn flags),
+    /// so the test needs no installed backend.
+    fn long_lived_cmd() -> (String, Vec<String>) {
         #[cfg(unix)]
         {
-            (PathBuf::from("/bin/sleep"), vec!["30".to_string()])
+            ("/bin/sleep".to_string(), vec!["30".to_string()])
         }
         #[cfg(windows)]
         {
             (
-                PathBuf::from("ping"),
+                "ping".to_string(),
                 vec!["-n".to_string(), "31".to_string(), "127.0.0.1".to_string()],
             )
-        }
-    }
-
-    /// Test transport: spawns a real cross-platform long-lived process (ignoring
-    /// `cmd.program`, so tests need no installed backend) + counts spawn calls
-    /// (to assert admission-before-spawn creates ZERO process when over cap).
-    struct StubTransport {
-        spawned: std::sync::atomic::AtomicUsize,
-    }
-    impl StubTransport {
-        fn new() -> Self {
-            Self {
-                spawned: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-        fn spawn_count(&self) -> usize {
-            self.spawned.load(Ordering::Relaxed)
-        }
-    }
-    impl HeadlessTransport for StubTransport {
-        fn spawn(
-            &self,
-            _cmd: &crate::headless::HeadlessCommand,
-        ) -> std::io::Result<HeadlessHandle> {
-            self.spawned.fetch_add(1, Ordering::Relaxed);
-            let (program, args) = long_lived_cmd();
-            let mut c = std::process::Command::new(program);
-            c.args(args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            let mut child = c.spawn()?;
-            let stdin = child.stdin.take();
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-            Ok(HeadlessHandle {
-                child,
-                stdin,
-                stdout,
-                stderr,
-            })
-        }
-        fn cancel(&self, handle: &mut HeadlessHandle) {
-            crate::process::terminate(handle.pid());
-            let _ = handle.child.wait();
         }
     }
 
@@ -653,7 +636,8 @@ mod tests {
     #[test]
     fn max_live_cap_rejects_over_limit() {
         let home = tmp_home("cap");
-        for i in 0..MAX_LIVE_WORKERS {
+        let cap = max_live_workers();
+        for i in 0..cap {
             let w = EphemeralWorker {
                 worker_id: format!("w{i}"),
                 pid: 0,
@@ -664,7 +648,7 @@ mod tests {
             };
             assert!(try_reserve_slot(&home, w).is_ok(), "under cap must accept");
         }
-        assert_eq!(list(&home, None).len(), MAX_LIVE_WORKERS);
+        assert_eq!(list(&home, None).len(), cap);
         let over = EphemeralWorker {
             worker_id: "over".to_string(),
             pid: 0,
@@ -674,13 +658,25 @@ mod tests {
             ..Default::default()
         };
         let res = try_reserve_slot(&home, over);
-        assert_eq!(res, Err(MAX_LIVE_WORKERS), "at cap must reject");
+        assert_eq!(res, Err(cap), "at cap must reject");
         assert_eq!(
             list(&home, None).len(),
-            MAX_LIVE_WORKERS,
+            cap,
             "rejected worker must NOT be added"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `max_live_workers` defaults to [`DEFAULT_MAX_LIVE_WORKERS`] absent the env
+    /// override. (The override is read-once/cached so a per-test env mutation can't
+    /// be asserted here without process-isolation — the default path is the one
+    /// that ships and is asserted.)
+    #[test]
+    fn max_live_workers_defaults() {
+        if std::env::var("AGEND_EPHEMERAL_MAX_LIVE").is_err() {
+            assert_eq!(max_live_workers(), DEFAULT_MAX_LIVE_WORKERS);
+        }
+        assert!(max_live_workers() > 0, "the cap can never be 0");
     }
 
     /// Reap-on-boot clears every tracked worker (crash-leaked orphans). Uses
@@ -711,15 +707,52 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Full lifecycle against a REAL (cross-platform) headless process:
-    /// reserve→spawn→finalize → list → reap, and the reap genuinely terminates
-    /// the process (is_pid_alive → false). Runs on all CI platforms.
+    /// Track a REAL (cross-platform) ephemeral PTY worker through the SAME
+    /// reserve→spawn→finalize→insert pipeline `spawn_and_track` runs, but with a
+    /// long-lived stand-in command (sleep/ping) so the test needs no installed
+    /// backend. `spawn_and_track` hardcodes `args:&[]` (a real backend needs none),
+    /// so the test drives `spawn_ephemeral_worker` directly (where it controls
+    /// args) and then finalizes + inserts into `LIVE_CHILDREN` identically — so the
+    /// reap path under test goes through the real `terminate_worker`.
+    fn track_real_worker(home: &Path, workflow_id: &str, ttl_secs: u64) -> EphemeralWorker {
+        let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let worker_id = format!("eph-test-{}-{}", std::process::id(), seq);
+        let mut reserving = reserving_row(&worker_id, 0);
+        reserving.workflow_id = workflow_id.to_string();
+        reserving.backend = "sleep".to_string();
+        reserving.ttl_secs = ttl_secs;
+        try_reserve_slot(home, reserving).expect("reserve");
+
+        let (program, args) = long_lived_cmd();
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: &program,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None, // ad-hoc test spawn — skip the AGEND_HOME cwd-validation seam
+            crash_tx: None,
+            shutdown: None,
+        };
+        let handle = crate::agent::spawn_ephemeral_worker(&config).expect("spawn ephemeral worker");
+        let pid = handle.pid();
+        let token = crate::process::process_start_token(pid);
+        let worker = finalize_spawn(home, &worker_id, pid, token).expect("finalize");
+        LIVE_CHILDREN.lock().insert(worker_id, handle);
+        worker
+    }
+
+    /// Full lifecycle against a REAL ephemeral PTY worker (cross-platform):
+    /// reserve→spawn→finalize → list → reap, and the reap genuinely terminates the
+    /// process tree (is_pid_alive → false). Runs on all CI platforms.
     #[test]
-    fn headless_lifecycle_spawn_list_reap() {
+    fn ephemeral_lifecycle_spawn_list_reap() {
         let home = tmp_home("lifecycle");
-        let t = StubTransport::new();
-        let w = spawn_and_track(&home, stub_spec("wf1", Some(3600)), &t).expect("spawn");
-        assert_eq!(t.spawn_count(), 1, "exactly one process spawned");
+        let w = track_real_worker(&home, "wf1", 3600);
         assert_eq!(w.status, STATUS_RUNNING, "finalized to running");
         assert_ne!(w.pid, 0, "real pid stamped at finalize");
         assert_eq!(
@@ -729,7 +762,7 @@ mod tests {
         );
         assert!(
             crate::process::is_pid_alive(w.pid),
-            "real headless process is alive after spawn"
+            "real ephemeral PTY worker is alive after spawn"
         );
 
         let reaped = reap_one(&home, &w.worker_id).expect("reap_one returns the worker");
@@ -739,7 +772,7 @@ mod tests {
             0,
             "reaped worker removed from store"
         );
-        assert_dead_within(w.pid, "reap must terminate the real headless process");
+        assert_dead_within(w.pid, "reap must terminate the real ephemeral process");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -748,8 +781,7 @@ mod tests {
     #[test]
     fn reap_sweep_enforces_wall_ttl() {
         let home = tmp_home("ttl-sweep");
-        let t = StubTransport::new();
-        let w = spawn_and_track(&home, stub_spec("wf1", Some(60)), &t).expect("spawn");
+        let w = track_real_worker(&home, "wf1", 60);
         assert!(crate::process::is_pid_alive(w.pid));
         let future = chrono::Utc::now() + chrono::Duration::seconds(61);
         let reaped = reap_sweep_at(&home, future);
@@ -760,30 +792,34 @@ mod tests {
     }
 
     /// r4 PR1 NON-BLOCKING note: admission is BEFORE spawn. When the cap is full,
-    /// `spawn_and_track` rejects WITHOUT creating ANY process (the transport's
-    /// spawn is never called) — zero orphan.
+    /// `spawn_and_track` rejects WITHOUT creating ANY process (it returns before the
+    /// spawn branch) — zero orphan, and the store is left untouched.
     #[test]
     fn admission_before_spawn_rejects_over_cap_zero_orphan() {
         let home = tmp_home("cap-noorphan");
+        let cap = max_live_workers();
         // Fill every slot with reservations (no processes).
-        for i in 0..MAX_LIVE_WORKERS {
+        for i in 0..cap {
             try_reserve_slot(&home, reserving_row(&format!("r{i}"), 0)).unwrap();
         }
-        let t = StubTransport::new();
-        let res = spawn_and_track(&home, stub_spec("wf", Some(60)), &t);
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            parent: None,
+            backend: "claude".to_string(),
+            ttl_secs: Some(60),
+            token_budget: None,
+        };
+        let res = spawn_and_track(&home, spec);
         assert!(
             matches!(res, Err(SpawnError::CapExceeded { .. })),
             "over-cap spawn must be rejected"
         );
-        assert_eq!(
-            t.spawn_count(),
-            0,
-            "admission BEFORE spawn: ZERO process created when over cap"
-        );
+        // admission BEFORE spawn: the store still holds exactly the `cap`
+        // reservations — the rejected spawn added (and spawned) nothing.
         assert_eq!(
             list(&home, None).len(),
-            MAX_LIVE_WORKERS,
-            "rejected spawn adds nothing"
+            cap,
+            "rejected spawn adds nothing (zero orphan process, zero orphan row)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -810,28 +846,44 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// `HeadlessTransport::cancel` lifecycle: spawn a real process then cancel it
-    /// → the process is terminated (SIGTERM + reap).
+    /// PR3a Route-B core: `spawn_ephemeral_worker` spawns a REAL (cross-platform)
+    /// long-lived process via a PTY, reports its live pid, and is NOT in any agent
+    /// registry — the fn takes NO `AgentRegistry` argument, so by construction
+    /// there is zero roster involvement (no pane, no router subscriber). A
+    /// `kill_process_tree(pid)` then reaps the whole PTY-session tree.
     #[test]
-    fn headless_transport_cancel_terminates() {
-        let t = StubTransport::new();
-        let cmd = crate::headless::HeadlessCommand {
-            program: PathBuf::from("ignored-by-stub"),
-            args: vec![],
-            env_clear: false,
-            envs: vec![],
-            cwd: None,
+    fn spawn_ephemeral_worker_no_registry_then_kill_tree_reaps() {
+        let (program, args) = long_lived_cmd();
+        let worker_id = format!("eph-direct-{}", std::process::id());
+        let config = crate::agent::SpawnConfig {
+            name: &worker_id,
+            backend_command: &program,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 200,
+            rows: 50,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
         };
-        let mut handle = t.spawn(&cmd).expect("spawn");
+        let handle = crate::agent::spawn_ephemeral_worker(&config).expect("spawn ephemeral worker");
         let pid = handle.pid();
-        assert!(crate::process::is_pid_alive(pid));
-        t.cancel(&mut handle);
-        // Drop the Child handle before checking liveness: on Windows an exited
-        // process still reports alive while ANY handle to it is open (the OS frees
-        // the process object only on the last CloseHandle). Production's
-        // `terminate_worker` drops the handle the same way (it owns it via
-        // LIVE_CHILDREN.remove), so this mirrors the real reap path.
+        assert_ne!(pid, 0, "a live pid was assigned");
+        assert_eq!(handle.pid(), pid, "pid() accessor agrees");
+        assert!(
+            crate::process::is_pid_alive(pid),
+            "the real PTY worker is alive after spawn"
+        );
+
+        // Reap the whole PTY-session tree, then drop the handle so the OS frees the
+        // process object (Windows keeps an exited process queryable while any
+        // handle is open — production's terminate_worker drops it the same way).
+        crate::process::kill_process_tree(pid);
+        let _ = handle.child.lock().wait();
         drop(handle);
-        assert_dead_within(pid, "cancel must terminate the process");
+        assert_dead_within(pid, "kill_process_tree must reap the ephemeral PTY worker");
     }
 }
