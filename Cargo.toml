@@ -78,6 +78,10 @@ ratatui = "0.30"
 # Concurrency
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+# Lock-free single-writer/multi-reader snapshot publish for off-thread parse
+# (Option X, AGEND_OFFTHREAD_PARSE): render loads an immutable GridSnapshot
+# without blocking the per-pane parser thread.
+arc-swap = "1"
 
 # Async (for Telegram + daemon UDS)
 tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "time"] }

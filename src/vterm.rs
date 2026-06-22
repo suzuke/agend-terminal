@@ -313,6 +313,32 @@ impl VTerm {
         }
     }
 
+    /// Option X (off-thread parse, `AGEND_OFFTHREAD_PARSE`): copy the live
+    /// (offset-0) visible grid + cursor into an owned, immutable [`GridSnapshot`]
+    /// that the per-pane parser thread publishes via `ArcSwap`. Same visible-cell
+    /// copy as `render_to_buffer_inner`'s L1 scratch (clamped to the grid dims),
+    /// but owned (not a borrowed `RefCell`) so it can cross the thread boundary.
+    /// Scrollback is NOT captured (P1: off-thread mode renders the live view;
+    /// scroll-back is a P2 follow-up).
+    pub fn snapshot(&self) -> GridSnapshot {
+        let grid = self.term.grid();
+        let cols = self.cols.min(grid.columns() as u16);
+        let rows = self.rows.min(grid.screen_lines() as u16);
+        let mut cells = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows {
+            for c in 0..cols {
+                cells.push(safe_cell(grid, Line(row as i32), c as usize).clone());
+            }
+        }
+        let cur = grid.cursor.point;
+        GridSnapshot {
+            cols,
+            rows,
+            cells,
+            cursor: (cur.line.0 as u16, cur.column.0 as u16),
+        }
+    }
+
     fn render_to_buffer_inner(
         &self,
         buf: &mut ratatui::buffer::Buffer,
@@ -905,6 +931,174 @@ impl VTerm {
     }
 }
 
+/// Immutable per-pane visible-grid snapshot for Option X off-thread parse
+/// (`AGEND_OFFTHREAD_PARSE`). The per-pane parser thread builds one after each
+/// drain burst via [`VTerm::snapshot`] and publishes it through `ArcSwap`; the
+/// render loop loads the latest and paints it WITHOUT touching the VTerm (which,
+/// in off-thread mode, lives on the parser thread). Holds the live (offset-0)
+/// visible cells + cursor only — scrollback is a P1 limitation (off-thread mode
+/// renders the live view).
+#[derive(Clone)]
+pub struct GridSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    /// `rows * cols` cells, row-major, stride = `cols`.
+    pub cells: Vec<Cell>,
+    /// Cursor `(line, col)` in visible coordinates.
+    pub cursor: (u16, u16),
+}
+
+impl GridSnapshot {
+    /// A blank snapshot — the initial `ArcSwap` value before the parser thread
+    /// publishes its first real frame, so the render loop always has something to
+    /// paint (avoids `Option` handling on the hot render path).
+    pub fn blank(cols: u16, rows: u16) -> Self {
+        Self {
+            cols,
+            rows,
+            cells: vec![Cell::default(); cols as usize * rows as usize],
+            cursor: (0, 0),
+        }
+    }
+
+    /// Paint this snapshot into a ratatui buffer. Mirrors
+    /// [`VTerm::render_to_buffer`] (same catch_unwind guard).
+    ///
+    /// ⚠ `render_inner` below is a FAITHFUL COPY of
+    /// `VTerm::render_to_buffer_inner`'s paint half (residual `#1064` strips +
+    /// `#819` wide-char-aware cell loop + block cursor) reading from `self.cells`
+    /// instead of the live grid. Kept deliberately separate so the flag-OFF path
+    /// (`render_to_buffer_inner`) stays byte-identical and untouched; the two
+    /// MUST be kept in sync (a P2 cleanup may DRY them once the flag stabilizes).
+    /// `scroll_offset` only gates the block cursor (P1 snapshot is offset-0 live).
+    pub fn render_to_buffer(
+        &self,
+        buf: &mut ratatui::buffer::Buffer,
+        area: ratatui::layout::Rect,
+        scroll_offset: usize,
+        show_block_cursor: bool,
+    ) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.render_inner(buf, area, scroll_offset, show_block_cursor);
+        }));
+        if let Err(e) = result {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            tracing::warn!(error = %msg, "grid snapshot render panic caught — rendering blank");
+        }
+    }
+
+    fn render_inner(
+        &self,
+        buf: &mut ratatui::buffer::Buffer,
+        area: ratatui::layout::Rect,
+        scroll_offset: usize,
+        show_block_cursor: bool,
+    ) {
+        let stride = self.cols as usize;
+        let rows = self.rows.min(area.height);
+        let cols = self.cols.min(area.width);
+
+        // #1064 residual strips: blank area\core (bottom + right) — non-empty only
+        // when area > snapshot dims (resize race / spawn lag).
+        let buf_right = buf.area().x.saturating_add(buf.area().width);
+        let buf_bottom = buf.area().y.saturating_add(buf.area().height);
+        let default_style = ratatui::style::Style::default();
+        for dy in rows..area.height {
+            let y = area.y.saturating_add(dy);
+            if y >= buf_bottom {
+                break;
+            }
+            for dx in 0..area.width {
+                let x = area.x.saturating_add(dx);
+                if x >= buf_right {
+                    break;
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_char(' ');
+                cell.set_style(default_style);
+            }
+        }
+        for dy in 0..rows {
+            let y = area.y.saturating_add(dy);
+            if y >= buf_bottom {
+                break;
+            }
+            for dx in cols..area.width {
+                let x = area.x.saturating_add(dx);
+                if x >= buf_right {
+                    break;
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_char(' ');
+                cell.set_style(default_style);
+            }
+        }
+
+        for row in 0..rows {
+            let mut col = 0u16;
+            while col < cols {
+                let idx = (row as usize) * stride + (col as usize);
+                let cell = self
+                    .cells
+                    .get(idx)
+                    .unwrap_or_else(|| DEFAULT_CELL.get_or_init(Cell::default));
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    let x = area.x + col;
+                    let y = area.y + row;
+                    if x < buf.area().x + buf.area().width && y < buf.area().y + buf.area().height {
+                        let style = cell_to_ratatui_style(cell.fg, cell.bg, cell.flags);
+                        let buf_cell = &mut buf[(x, y)];
+                        buf_cell.set_char(' ').set_style(style);
+                    }
+                    col += 1;
+                    continue;
+                }
+                let style = cell_to_ratatui_style(cell.fg, cell.bg, cell.flags);
+                let x = area.x + col;
+                let y = area.y + row;
+                if x >= buf.area().x + buf.area().width || y >= buf.area().y + buf.area().height {
+                    col += 1;
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                let buf_cell = &mut buf[(x, y)];
+                buf_cell.set_char(ch).set_style(style);
+                if cell.flags.contains(Flags::WIDE_CHAR) {
+                    let spacer_x = x + 1;
+                    if spacer_x < buf.area().x + buf.area().width
+                        && y < buf.area().y + buf.area().height
+                    {
+                        let spacer_cell = &mut buf[(spacer_x, y)];
+                        spacer_cell.set_char(' ').set_style(style);
+                    }
+                    col += 2;
+                } else {
+                    col += 1;
+                }
+            }
+        }
+
+        if show_block_cursor && scroll_offset == 0 {
+            let (cline, ccol) = self.cursor;
+            let cx = area.x + ccol;
+            let cy = area.y + cline;
+            if cx < area.x + area.width && cy < area.y + area.height {
+                let buf_cell = &mut buf[(cx, cy)];
+                let style = buf_cell
+                    .style()
+                    .add_modifier(ratatui::style::Modifier::REVERSED);
+                buf_cell.set_style(style);
+            }
+        }
+    }
+}
+
 /// Convert alacritty Color to ratatui Color.
 fn color_to_ratatui(color: Color) -> Option<ratatui::style::Color> {
     match color {
@@ -1054,6 +1248,48 @@ mod tests {
         let vt = VTerm::new(80, 24);
         assert_eq!(vt.cols, 80);
         assert_eq!(vt.rows, 24);
+    }
+
+    // Option X: `GridSnapshot::render_to_buffer` is a faithful copy of
+    // `render_to_buffer_inner`'s paint half. This pins the two byte-identical
+    // (wide-char spacer, SGR styles, inverse, block cursor, #1064 residual strips
+    // when area > grid) so the off-thread path can never diverge / tear.
+    #[test]
+    fn snapshot_renders_identically_to_vterm() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut vt = VTerm::new(20, 5);
+        vt.process(
+            "\x1b[2J\x1b[Hhello \x1b[31mred\x1b[0m\r\nrow2 \x1b[1mbold\x1b[0m\r\n日本語x\r\n\x1b[7minv\x1b[0m"
+                .as_bytes(),
+        );
+        let snap = vt.snapshot();
+        // area == grid (20x5) and area > grid (24x7 → exercises residual strips);
+        // both with and without the unfocused block cursor.
+        for (w, h) in [(20u16, 5u16), (24u16, 7u16)] {
+            for cursor in [false, true] {
+                let area = Rect::new(0, 0, w, h);
+                let mut a = Buffer::empty(area);
+                let mut b = Buffer::empty(area);
+                vt.render_to_buffer(&mut a, area, 0, cursor);
+                snap.render_to_buffer(&mut b, area, 0, cursor);
+                assert_eq!(
+                    a, b,
+                    "GridSnapshot paint must match VTerm::render_to_buffer at {w}x{h} cursor={cursor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_captures_dims_and_cursor() {
+        let mut vt = VTerm::new(10, 3);
+        vt.process(b"\x1b[2J\x1b[Hab\r\ncd");
+        let snap = vt.snapshot();
+        assert_eq!((snap.cols, snap.rows), (10, 3));
+        assert_eq!(snap.cells.len(), 30);
+        // cursor sits after "cd" on row 1 (0-based), col 2.
+        assert_eq!(snap.cursor, (1, 2));
     }
 
     // ── CR-2026-06-14: PTY-writer raw-lock hardening (t-30) ──────────────
