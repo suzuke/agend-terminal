@@ -333,13 +333,19 @@ fn parser_loop(
 /// flood/restore workload off-thread exists to fix. This keeps the captured rows as
 /// shared `Arc`s and updates them MINIMALLY per burst:
 /// - scrollback UNCHANGED → reuse the last published `Arc` (O(1));
-/// - GREW by `k` rows → capture ONLY the `k` new rows, append, trim to the cap
-///   (old rows stay shared, not re-copied);
+/// - GREW by `k` rows → capture ONLY the `k` new ROWS (`k` row clones), reusing every
+///   retained row `Arc`, then rebuild the outer pointer slice (`O(cap)` Arc-ptr clones,
+///   NOT `O(cap)` cell copies — the dominant per-cell cost is avoided);
 /// - cols changed (resize → reflow) or scrollback SHRANK (`\x1b[3J` / clear) → full
-///   recapture (rare; the safety net for any non-append history change).
-///
-/// Tracks the UNCAPPED `max_scroll` so growth is still detected once the captured
-/// window is pinned at the cap (older rows then scroll out of the front).
+///   recapture (rare; the safety net for any non-append history change);
+/// - alacritty scrollback SATURATED ([`VTerm::history_saturated`], ≥ `HISTORY_LIMIT`):
+///   `max_scroll` is then PINNED while content keeps evicting+adding, so the grow-delta
+///   below goes blind to the shift (the #2411 r6 stale-window bug). Recapture the tail
+///   every burst there — CORRECT, no stale window. Confined to a pane with ≥10k
+///   scrollback lines + active output (uncommon); below saturation the cheap
+///   incremental path runs. (alacritty 0.26 exposes no monotonic scroll counter that
+///   would let us keep the cheap path past saturation — an exact-counter follow-up
+///   would need upstream support.)
 struct ScrollbackCache {
     /// Newest `min(max_scroll, cap)` rows, OLDEST front — published as the snapshot's
     /// `history` (index 0 = oldest = `Line(-len)`, back = `Line(-1)`).
@@ -371,6 +377,11 @@ impl ScrollbackCache {
         if cols != self.last_cols || max_scroll < self.last_max_scroll {
             // Resize (history reflowed to new width) or scrollback shrank → recapture.
             self.rows = vterm.capture_history_tail(max_scroll.min(cap)).into();
+        } else if vterm.history_saturated() {
+            // alacritty's scrollback is FULL: `max_scroll` is pinned at HISTORY_LIMIT
+            // while content keeps shifting, so the grow-delta below would miss the
+            // shift and serve a STALE window (#2411 r6). Recapture the tail — correct.
+            self.rows = vterm.capture_history_tail(cap).into();
         } else if max_scroll > self.last_max_scroll {
             let grew = max_scroll - self.last_max_scroll;
             if grew >= cap {
@@ -609,6 +620,55 @@ mod tests {
             cache.rows.iter().any(|r| Arc::ptr_eq(r, &kept)),
             "an old scrollback row must be REUSED (shared Arc), not re-cloned on growth"
         );
+    }
+
+    /// #2411 r6 BLOCKER regression — the 10k history-CAP stale-window bug. alacritty's
+    /// scrollback caps at `HISTORY_LIMIT` (10000): past that, `max_scroll` is PINNED
+    /// while content keeps evicting-oldest + adding-newest, so the old `max_scroll`-delta
+    /// detector saw "unchanged" → served a PERMANENTLY STALE window after 10k lines.
+    /// Drive the cache per-burst across >10000 UNIQUE lines (so any stale row mismatches)
+    /// and assert the incremental history renders IDENTICALLY to a fresh full capture at
+    /// every offset. Offset 0 (visible screen) is the control (always fresh); offsets >0
+    /// (scrollback) are where the stale window would show. NEUTER: drop the
+    /// `history_saturated` recapture branch in `update` → the post-10k window freezes →
+    /// the >0 offsets diverge → RED.
+    #[test]
+    fn scrollback_cache_correct_past_10k_history_cap() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut vt = VTerm::new(40, 5);
+        vt.process(b"\x1b[2J\x1b[H");
+        let mut cache = ScrollbackCache::new();
+        // Fill PAST the 10k cap with UNIQUE lines (cheap incremental until ~10k, then
+        // the saturated recapture path for the tail).
+        for i in 0..10_100u32 {
+            vt.process(format!("uniq-line-{i:05}\r\n").as_bytes());
+            cache.update(&vt);
+        }
+        assert!(
+            vt.history_saturated(),
+            "10.1k lines must saturate alacritty's history cap"
+        );
+        let mut incr = vt.snapshot_visible();
+        incr.history = cache.update(&vt);
+        let full = vt.snapshot();
+        assert_eq!(
+            incr.history.len(),
+            full.history.len(),
+            "captured depth must match the fresh full capture at saturation"
+        );
+        let area = Rect::new(0, 0, 40, 5);
+        for off in [0usize, 1, 3, 500, 999] {
+            let mut a = Buffer::empty(area);
+            let mut b = Buffer::empty(area);
+            incr.render_to_buffer(&mut a, area, off, false);
+            full.render_to_buffer(&mut b, area, off, false);
+            assert_eq!(
+                a, b,
+                "past the 10k cap, incremental must match a fresh full capture at offset={off} \
+                 (a stale window — the r6 bug — diverges at offsets >0)"
+            );
+        }
     }
 
     /// BENCHMARK (#[ignore]: timing, run locally) — quantifies the r6 fix: per-publish

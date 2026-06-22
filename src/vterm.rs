@@ -235,6 +235,11 @@ pub struct VTerm {
     snapshot_scratch: std::cell::RefCell<Vec<Cell>>,
 }
 
+/// alacritty scrollback cap for every [`VTerm`] (its `Config::scrolling_history`).
+/// Bounds memory; also the point past which `max_scroll` stops growing (see
+/// [`VTerm::history_saturated`]).
+pub(crate) const HISTORY_LIMIT: usize = 10000;
+
 impl VTerm {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self::with_listener(cols, rows, PtyWriteListener::noop())
@@ -255,7 +260,7 @@ impl VTerm {
     fn with_listener(cols: u16, rows: u16, listener: PtyWriteListener) -> Self {
         let size = VTermSize { cols, rows };
         let config = Config {
-            scrolling_history: 10000,
+            scrolling_history: HISTORY_LIMIT,
             ..Default::default()
         };
         let term = term::Term::new(config, &size, listener);
@@ -582,6 +587,17 @@ impl VTerm {
         let total = self.term.grid().total_lines();
         let screen = self.term.grid().screen_lines();
         total.saturating_sub(screen)
+    }
+
+    /// True once alacritty's scrollback is FULL (`max_scroll` pinned at
+    /// [`HISTORY_LIMIT`]). Past this point `max_scroll` stays constant while content
+    /// keeps evicting-oldest + adding-newest, so a `max_scroll`-delta change detector
+    /// goes blind to the shift (#2411 r6). The off-thread `ScrollbackCache` uses this
+    /// to switch from cheap incremental-append to a per-burst tail recapture (correct,
+    /// no stale window). alacritty 0.26 exposes no monotonic scroll counter that would
+    /// let us keep the cheap path here.
+    pub fn history_saturated(&self) -> bool {
+        self.max_scroll() >= HISTORY_LIMIT
     }
 
     /// Get cursor position (line, column).
