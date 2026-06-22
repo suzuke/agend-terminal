@@ -72,17 +72,25 @@ pub struct Pane {
     pub _fwd_cancel: Option<crossbeam_channel::Sender<()>>,
 }
 
-/// Text selection anchored to absolute scrollback logical coordinates so it
-/// stays pinned to its content under both new output and user scrolling.
+/// Text selection anchored to absolute scrollback line ids so it stays pinned to
+/// its content under both new output and user scrolling.
 ///
-/// `.0` is the logical line index counted from the oldest line currently in
-/// the buffer (`grid_line + max_scroll()`); `.1` is the column. Endpoints are
-/// converted to viewport rows at render / extract time via
-/// [`Pane::logical_line_to_viewport`].
+/// `.0` is an ABSOLUTE line id (`grid_line + `[`selection_base`](Pane::selection_base));
+/// `.1` is the column. Endpoints are produced by [`Pane::viewport_to_logical_line`]
+/// and resolved at render / extract time via [`Pane::logical_line_to_viewport`] /
+/// [`Pane::extract_selection_text`].
 ///
-/// Edge case: a line evicted from the 10000-line history cap loses its anchor
-/// and the selection drifts. Unreachable within a single gesture (would need
-/// ~10000 lines of output in the seconds a drag takes), so left unhandled.
+/// Edge cases (#offthread-selection):
+/// - Live (flag-OFF): the id derives from the live `vterm.max_scroll()`, capped at
+///   alacritty's 10000-row scrollback — a line evicted past that cap loses its anchor
+///   and drifts. Unreachable within a single gesture (~10000 lines in the seconds a
+///   drag takes), so left unhandled.
+/// - Off-thread: the id is monotonic via the published snapshot's `history_origin`
+///   (parser-stamped), so it tracks content across the snapshot window's
+///   evict+append — the >1000-row drift r6 caught. The snapshot window is only
+///   `SNAPSHOT_SCROLLBACK_ROWS` (1000) deep; an endpoint scrolled OUT of that window
+///   resolves to blanks (clamped), NOT wrong content. The same 10000-cap saturation
+///   limit applies (parity-with-live; alacritty exposes no monotonic counter, #2411).
 #[derive(Clone)]
 pub struct Selection {
     /// Start: (logical line, column). May be before or after `end`.
@@ -151,23 +159,55 @@ impl Pane {
         }
     }
 
-    /// Convert a viewport row (0-based within the pane interior) to an absolute
-    /// scrollback logical line at the current scroll position. Inverse of
+    /// #offthread-selection: the ABSOLUTE-line base a selection endpoint is measured
+    /// from. Off-thread it is the published snapshot's visible-top absolute id
+    /// (`history_origin + history.len()`), read from the snapshot — NOT `pane.vterm`,
+    /// which is idle off-thread (`max_scroll()` = 0, the bug root). Flag-OFF it is the
+    /// live `vterm.max_scroll()`. Encoding an endpoint as `row - scroll_offset + base`
+    /// makes it an absolute, monotonic line id (see `GridSnapshot::history_origin`)
+    /// that stays pinned to its content as the snapshot window evicts+appends rows —
+    /// fixing the >1000-row drift a relative depth had. Under-cap off-thread
+    /// `history_origin == 0` so `base == history.len() == scroll_max()` and flag-OFF
+    /// `base == vterm.max_scroll()` → both byte-identical to the pre-anchor form.
+    fn selection_base(&self) -> i64 {
+        match &self.offthread {
+            Some(handle) => {
+                let snap = handle.load();
+                snap.history_origin as i64 + snap.history.len() as i64
+            }
+            None => self.vterm.max_scroll() as i64,
+        }
+    }
+
+    /// Convert a viewport row (0-based within the pane interior) to an ABSOLUTE
+    /// scrollback line id at the current scroll position. Inverse of
     /// [`Self::logical_line_to_viewport`].
     ///
     /// Derivation: render maps viewport row → `grid_line = row - scroll_offset`
-    /// (see `VTerm::render_to_buffer`), and the oldest buffer line sits at
-    /// `grid_line = -max_scroll()`. Counting from that oldest line gives a
-    /// reference stable under append: `logical = grid_line + max_scroll()`.
+    /// (see `VTerm::render_to_buffer`); adding [`selection_base`](Self::selection_base)
+    /// (the absolute id of the visible top) yields an absolute id stable under append
+    /// AND across snapshot-window eviction (#offthread-selection).
     pub fn viewport_to_logical_line(&self, row: u16) -> i64 {
-        row as i64 - self.scroll_offset as i64 + self.vterm.max_scroll() as i64
+        row as i64 - self.scroll_offset as i64 + self.selection_base()
     }
 
-    /// Convert an absolute scrollback logical line back to a viewport row at
-    /// the current scroll position. The result may be negative or `>=` viewport
-    /// height when the anchored content has scrolled off-screen; callers clip.
+    /// Convert an absolute scrollback line id back to a viewport row at the current
+    /// scroll position. The result may be negative or `>=` viewport height when the
+    /// anchored content has scrolled off-screen; callers clip.
     pub fn logical_line_to_viewport(&self, logical: i64) -> i64 {
-        logical + self.scroll_offset as i64 - self.vterm.max_scroll() as i64
+        logical + self.scroll_offset as i64 - self.selection_base()
+    }
+
+    /// Extract the selected text for THIS pane's render path (#offthread-selection).
+    /// Off-thread mode (`offthread = Some`) reads the parser's published
+    /// `GridSnapshot` — the live `vterm` is idle/blank there, so reading it would
+    /// copy nothing. Flag-OFF reads the live `vterm` (byte-identical to before).
+    /// Coordinates are absolute scrollback logical coords from `viewport_to_logical_line`.
+    pub fn extract_selection_text(&self, start: (i64, u16), end: (i64, u16)) -> String {
+        match &self.offthread {
+            Some(handle) => handle.load().extract_text(start, end),
+            None => self.vterm.extract_text(start, end),
+        }
     }
 
     /// Display label: display_name if set, otherwise agent_name.
@@ -479,6 +519,214 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    /// #offthread-selection END-TO-END: an off-thread pane's live `vterm` is idle/
+    /// blank (drain no-ops; the parser thread owns the real grid), so text selection
+    /// must read the published snapshot. Drives the REAL parser, builds an off-thread
+    /// Pane, and asserts `extract_selection_text` (the path mouse copy-on-select +
+    /// Cmd+C use) returns the on-screen content via the snapshot — NOT the empty live
+    /// vterm. Neuter: route `extract_selection_text` back to `pane.vterm` → empty → RED.
+    #[test]
+    fn offthread_pane_extracts_selection_from_snapshot_not_idle_vterm() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(20, 4);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            9,
+            "sel".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+
+        // 8 lines into a 4-row screen → 4 rows scroll into the captured history.
+        let mut payload = String::from("\x1b[2J\x1b[H");
+        for i in 1..=8 {
+            payload.push_str(&format!("row{i:02}\r\n"));
+        }
+        data_tx
+            .send(payload.into_bytes())
+            .expect("parser data channel is live");
+        assert_eq!(
+            wake_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(9),
+            "parser must publish a snapshot"
+        );
+
+        // Off-thread pane: the parser owns the content; the pane's own vterm is idle.
+        let mut pane = test_pane(crossbeam_channel::bounded(1).1, 20, 4);
+        pane.offthread = Some(handle);
+        pane.scroll_offset = 0;
+
+        // The bug: the OLD path (idle vterm) copies nothing.
+        assert!(
+            pane.vterm.extract_text((0, 0), (3, 19)).trim().is_empty(),
+            "precondition: an off-thread pane's live vterm is blank"
+        );
+
+        // Full content (oldest history row .. bottom visible) via the off-thread-aware
+        // depth: must contain the FIRST (scrolled into history) + LAST (visible) lines.
+        let depth = pane.scroll_max() as i64;
+        assert!(
+            depth > 0,
+            "8 lines / 4 rows must produce captured scrollback"
+        );
+        let full = pane.extract_selection_text((0, 0), (depth + 3, 19));
+        assert!(
+            full.contains("row01") && full.contains("row08"),
+            "off-thread selection must copy history + visible content; got {full:?}"
+        );
+
+        // Viewport-mapped selection (the path the mouse uses): the visible screen
+        // rows 0..3 extract real on-screen content, not blanks.
+        let start = (pane.viewport_to_logical_line(0), 0u16);
+        let end = (pane.viewport_to_logical_line(3), 19u16);
+        let visible = pane.extract_selection_text(start, end);
+        assert!(
+            visible.contains("row") && !visible.trim().is_empty(),
+            "viewport selection must copy on-screen content; got {visible:?}"
+        );
+    }
+
+    /// Wait for the parser's first publish, then drain any further publishes until
+    /// quiet, so the loaded snapshot reflects the WHOLE fed burst (not a mid-burst one).
+    fn wait_settled(wake_rx: &crossbeam_channel::Receiver<usize>) {
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("parser must publish at least once");
+        while wake_rx
+            .recv_timeout(std::time::Duration::from_millis(150))
+            .is_ok()
+        {}
+    }
+
+    /// #offthread-selection ANCHOR STABILITY (r6 REJECT @03bf21af). A selection
+    /// endpoint must stay pinned to its content AFTER the snapshot's 1000-row history
+    /// window saturates and shifts — the rejected impl used a RELATIVE depth
+    /// (`grid_line + history.len()`) which drifts there because `history.len()` pins at
+    /// 1000 while content evicts+appends. The absolute `history_origin` fix tracks it.
+    /// Neuter (the rejected coord): drop the `- history_origin` in `extract_text` AND
+    /// the origin in `selection_base` → after the window shift the endpoint drifts →
+    /// `after != before` → RED.
+    #[test]
+    fn offthread_selection_anchor_stable_past_snapshot_window() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(20, 4);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            2,
+            "anchor".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+
+        // 1100 distinct lines → the 1000-row window SATURATES + shifts, and the parser
+        // max_scroll (~1096) ≫ window → history_origin advances past 0.
+        let mut p = String::from("\x1b[2J\x1b[H");
+        for i in 1..=1100 {
+            p.push_str(&format!("L{i:05}\r\n"));
+        }
+        data_tx.send(p.into_bytes()).expect("send burst");
+        wait_settled(&wake_rx);
+
+        let mut pane = test_pane(crossbeam_channel::bounded(1).1, 20, 4);
+        pane.offthread = Some(handle);
+        pane.scroll_offset = 0;
+
+        // The regime r6 flagged: window saturated + origin advanced.
+        let snap0 = pane.offthread.as_ref().expect("offthread set").load();
+        assert_eq!(
+            snap0.history.len(),
+            1000,
+            "1100 lines must saturate the 1000-row snapshot window"
+        );
+        assert!(
+            snap0.history_origin > 0,
+            "history_origin must advance past the window: {}",
+            snap0.history_origin
+        );
+        drop(snap0);
+
+        // Capture the absolute id of the TOP visible row + its content NOW.
+        let cap_top = pane.viewport_to_logical_line(0);
+        let before = pane.extract_selection_text((cap_top, 0), (cap_top, 19));
+        assert!(
+            before.starts_with('L'),
+            "captured a content line: {before:?}"
+        );
+
+        // Publish 10 MORE lines: the captured content scrolls back 10 rows (still in
+        // the 1000-row window). The absolute id is fixed; origin advances by 10.
+        let mut p2 = String::new();
+        for i in 1101..=1110 {
+            p2.push_str(&format!("L{i:05}\r\n"));
+        }
+        data_tx.send(p2.into_bytes()).expect("send more");
+        wait_settled(&wake_rx);
+
+        let after = pane.extract_selection_text((cap_top, 0), (cap_top, 19));
+        assert_eq!(
+            after, before,
+            "absolute anchor must track content across a window shift past the cap (the r6 drift)"
+        );
+    }
+
+    /// #offthread-selection: a resize BETWEEN selection capture and copy must not
+    /// drift the anchor (r6 required). A rows-only resize (cols unchanged → history
+    /// does NOT reflow) shifts the screen/scrollback split → both `max_scroll` and
+    /// `history_origin` move, but the absolute id stays pinned to the same content.
+    #[test]
+    fn offthread_selection_anchor_survives_resize_between_capture_and_copy() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(20, 6);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            3,
+            "resize".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+
+        let mut p = String::from("\x1b[2J\x1b[H");
+        for i in 1..=40 {
+            p.push_str(&format!("R{i:04}\r\n"));
+        }
+        data_tx.send(p.into_bytes()).expect("send burst");
+        wait_settled(&wake_rx);
+
+        let mut pane = test_pane(crossbeam_channel::bounded(1).1, 20, 6);
+        pane.offthread = Some(handle);
+        pane.scroll_offset = 0;
+
+        let cap = pane.viewport_to_logical_line(1); // a visible content row
+        let before = pane.extract_selection_text((cap, 0), (cap, 19));
+        assert!(
+            before.starts_with('R'),
+            "captured a content line: {before:?}"
+        );
+
+        // Resize rows only (cols stay 20 → no history reflow), via the real handle →
+        // the parser re-publishes a fresh snapshot at the new dims with a new origin.
+        assert!(
+            pane.offthread
+                .as_ref()
+                .expect("offthread set")
+                .request_resize(20, 10),
+            "resize must be routed to the parser"
+        );
+        wait_settled(&wake_rx);
+
+        let after = pane.extract_selection_text((cap, 0), (cap, 19));
+        assert_eq!(
+            after, before,
+            "absolute anchor must survive a resize between capture and copy"
+        );
     }
 
     /// #freeze-2: `drain_output` must (a) cap per call at the byte budget and

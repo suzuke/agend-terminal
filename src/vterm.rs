@@ -342,6 +342,9 @@ impl VTerm {
             cells,
             history: empty_scrollback(),
             cursor: (cur.line.0 as u16, cur.column.0 as u16),
+            // No history here → origin is the visible top's absolute id (`max_scroll`).
+            // The parser overwrites this after injecting `history` (see `publish`).
+            history_origin: self.max_scroll() as u64,
         }
     }
 
@@ -355,6 +358,8 @@ impl VTerm {
         let mut snap = self.snapshot_visible();
         let depth = self.max_scroll().min(SNAPSHOT_SCROLLBACK_ROWS);
         snap.history = std::sync::Arc::from(self.capture_history_tail(depth));
+        // origin = base_scroll - captured depth (the rows above this window).
+        snap.history_origin = self.max_scroll().saturating_sub(snap.history.len()) as u64;
         snap
     }
 
@@ -1008,6 +1013,25 @@ pub struct GridSnapshot {
     pub history: ScrollbackRows,
     /// Cursor `(line, col)` in visible coordinates.
     pub cursor: (u16, u16),
+    /// #offthread-selection: absolute line id of `history[0]` (the oldest captured
+    /// row) — the count of lines that have scrolled ABOVE this snapshot's history
+    /// window over the parser VTerm's life (`max_scroll - history.len()` at capture).
+    /// MONOTONIC (until alacritty's 10000 scrollback cap saturates — see below), so a
+    /// selection endpoint can be stored as an ABSOLUTE line id (`history_origin +
+    /// index`) that stays pinned to its content as new output evicts+appends rows,
+    /// even after the `history.len()` window saturates at `SNAPSHOT_SCROLLBACK_ROWS`
+    /// (1000). Decoding against the CURRENT snapshot's `history_origin` (not the
+    /// capture-time one) is what tracks the content across publishes/generations.
+    ///
+    /// Computed by the PARSER from the real VTerm at publish time (the main-thread
+    /// `pane.vterm` is idle off-thread → its `max_scroll()` is 0, useless here).
+    /// PARITY-WITH-LIVE limitation (same as #2411): once `max_scroll` saturates at
+    /// alacritty's 10000-row cap, `history_origin` stops advancing, so a selection
+    /// older than 10000 scrolled lines drifts — exactly the live `VTerm` path's limit
+    /// (alacritty 0.26 exposes no monotonic scroll counter). The 1000-row snapshot
+    /// window is shallower than that; rows scrolled out of the window decode to
+    /// blanks (clamped), NOT wrong content.
+    pub history_origin: u64,
 }
 
 /// One scrollback row — `cols` cells, shared via `Arc` so the parser can reuse it
@@ -1044,7 +1068,87 @@ impl GridSnapshot {
             cells: vec![Cell::default(); cols as usize * rows as usize],
             history: empty_scrollback(),
             cursor: (0, 0),
+            history_origin: 0,
         }
+    }
+
+    /// Extract text from a selection range given in ABSOLUTE line ids (#offthread-
+    /// selection) — the off-thread analog of [`VTerm::extract_text`]. Off-thread mode
+    /// leaves the pane's live `VTerm` idle, so selection reads the published snapshot
+    /// here. An endpoint's `.0` is an absolute line id (`history_origin + index`, see
+    /// [`GridSnapshot::history_origin`]); decoding against THIS snapshot's
+    /// `history_origin` maps it to the alacritty-relative line
+    /// `line = id - history_origin - history.len()` — the SAME cell layout
+    /// `render_inner` paints (`line >= 0` → `cells` row `line`; `line < 0` →
+    /// `history[history.len() + line]`, oldest at index 0). Because the id is
+    /// ABSOLUTE, a selection captured against an OLDER snapshot still resolves to its
+    /// content after the window has evicted+appended rows (the drift r6 caught with a
+    /// relative index). Ids outside the captured window resolve to blanks (clamped),
+    /// NOT wrong content, mirroring the live path's `safe_cell` degrade. Trailing
+    /// spaces trimmed per line.
+    pub fn extract_text(&self, start: (i64, u16), end: (i64, u16)) -> String {
+        let history_rows = self.history.len() as i64;
+        let origin = self.history_origin as i64;
+        let stride = self.cols as usize;
+
+        // Normalize so `s` precedes `e` by (logical line, col) — mirrors VTerm.
+        let (s, e) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let (s_line, s_col) = s;
+        let (e_line, e_col) = e;
+
+        let mut text = String::new();
+        for logical in s_line..=e_line {
+            // absolute id → alacritty-relative line (render's `row - off`). Under-cap
+            // `origin == 0` so this is identical to the relative form; over-cap the
+            // `- origin` is what keeps the anchor pinned as the window shifts.
+            let line = logical - origin - history_rows;
+            let col_start = if logical == s_line { s_col } else { 0 };
+            let col_end = if logical == e_line {
+                e_col
+            } else {
+                self.cols.saturating_sub(1)
+            };
+
+            let mut row_text = String::new();
+            for col in col_start..=col_end {
+                if col as usize >= self.cols as usize {
+                    break;
+                }
+                let cell = if line >= 0 {
+                    if (line as usize) < self.rows as usize {
+                        self.cells.get(line as usize * stride + col as usize)
+                    } else {
+                        None
+                    }
+                } else {
+                    let hidx = history_rows + line;
+                    if hidx >= 0 {
+                        self.history
+                            .get(hidx as usize)
+                            .and_then(|r| r.get(col as usize))
+                    } else {
+                        None
+                    }
+                };
+                match cell {
+                    // A wide char's trailing spacer carries no glyph (its char was
+                    // pushed at the lead cell) — skip it, matching VTerm.
+                    Some(c) if c.flags.contains(Flags::WIDE_CHAR_SPACER) => continue,
+                    Some(c) => row_text.push(if c.c == '\0' { ' ' } else { c.c }),
+                    // Out of the captured window → blank, like `safe_cell`.
+                    None => row_text.push(' '),
+                }
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(row_text.trim_end());
+        }
+        text
     }
 
     /// Paint this snapshot into a ratatui buffer. Mirrors
@@ -1455,6 +1559,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #offthread-selection REGRESSION (operator 2026-06-23: off-thread panes could
+    /// not copy). Text selection reads `pane.vterm` (idle/blank off-thread); the fix
+    /// routes it to the published `GridSnapshot`. This pins
+    /// `GridSnapshot::extract_text` byte-identical to the live `VTerm::extract_text`
+    /// across history + visible + partial-column + multi-line ranges, so mouse
+    /// copy-on-select and Cmd+C copy the SAME content the flag-OFF path would.
+    /// Neuter: have `extract_text` read `cells` only (ignore history) / use the wrong
+    /// history index / return blank → the equality fails on the history ranges.
+    #[test]
+    fn snapshot_extract_text_matches_vterm() {
+        let mut vt = VTerm::new(20, 5);
+        vt.process(b"\x1b[2J\x1b[H");
+        for i in 1..=12 {
+            // 12 lines on a 5-row screen → ≥7 scroll into history (incl. a wide char).
+            vt.process(format!("line{i:02}日\r\n").as_bytes());
+        }
+        let snap = vt.snapshot();
+        let max_scroll = vt.max_scroll() as i64;
+        assert!(
+            max_scroll > 0,
+            "12 lines in a 5-row term must scroll into history"
+        );
+        assert_eq!(
+            snap.history.len() as i64,
+            max_scroll,
+            "history ≤ cap → the snapshot captures the FULL scrollback"
+        );
+        let last = max_scroll + 5 - 1; // bottom visible logical line
+        let cols = 19u16;
+        let ranges = [
+            ((0i64, 0u16), (last, cols)),    // everything: history + visible
+            ((0, 0), (2, cols)),             // fully in history
+            ((max_scroll, 0), (last, cols)), // fully in the visible screen
+            ((1, 3), (4, 6)),                // partial cols, multi-line, history
+            ((last, 0), (last, cols)),       // single bottom line
+            ((0, 5), (last, 2)),             // reversed-ish col span across all
+        ];
+        for (s, e) in ranges {
+            assert_eq!(
+                snap.extract_text(s, e),
+                vt.extract_text(s, e),
+                "GridSnapshot::extract_text must equal VTerm::extract_text for {s:?}..{e:?}"
+            );
+        }
+        // Sanity: a visible content row extracts REAL text, not blanks (guards
+        // against a silently-empty extract passing the equality vacuously).
+        let content = snap.extract_text((max_scroll, 0), (last, cols));
+        assert!(
+            content.contains("line"),
+            "visible-row extract must contain real content, got: {content:?}"
+        );
     }
 
     // ── CR-2026-06-14: PTY-writer raw-lock hardening (t-30) ──────────────

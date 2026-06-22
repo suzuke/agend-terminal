@@ -421,6 +421,12 @@ fn publish(
     let probe = instrument_enabled().then(Instant::now);
     let mut snap = vterm.snapshot_visible();
     snap.history = cache.update(vterm);
+    // #offthread-selection: stamp the snapshot's absolute origin from the REAL parser
+    // VTerm (`max_scroll - history.len()`). MUST be computed here, not at selection
+    // encode/decode time — off-thread the main-thread `pane.vterm` is idle so its
+    // `max_scroll()` is 0. Each published snapshot carries its own origin so an
+    // absolute endpoint stays pinned across publishes. See `GridSnapshot::history_origin`.
+    snap.history_origin = vterm.max_scroll().saturating_sub(snap.history.len()) as u64;
     let cell_bytes = std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
     // #2411: bytes MUST include history (was under-reported ~21x), so the
     // `#offthread-snapshot` probe reflects the real per-publish footprint.

@@ -340,7 +340,9 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
                     let mut copied = false;
                     if let Some(ref sel) = pane.selection {
-                        let text = pane.vterm.extract_text(sel.start, sel.end);
+                        // #offthread-selection: off-thread reads the snapshot, not
+                        // the idle `vterm` (which would copy blank).
+                        let text = pane.extract_selection_text(sel.start, sel.end);
                         if !text.is_empty() {
                             super::mouse::copy_to_clipboard(&text);
                             copied = true;

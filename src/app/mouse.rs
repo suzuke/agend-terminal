@@ -497,7 +497,9 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                     if start == end {
                         pane.selection = None;
                     } else if crate::runtime_config::get().copy_on_select {
-                        let text = pane.vterm.extract_text(start, end);
+                        // #offthread-selection: off-thread reads the snapshot, not
+                        // the idle `vterm` (which would copy blank).
+                        let text = pane.extract_selection_text(start, end);
                         if !text.is_empty() {
                             copy_to_clipboard(&text);
                         }
