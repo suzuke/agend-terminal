@@ -1909,6 +1909,10 @@ fn hook_recovered_for_srl(
     is_claude && matches!((hook_active_at_ms, srl_onset_ms), (Some(h), Some(o)) if h > o)
 }
 
+// Threads the run_loop's long-lived per-agent error/retry state maps (retry_tracks,
+// apierror_episodes, apierror_nudge_counts, last_continue_inject, srl_onset); bundling
+// them into a struct would not improve clarity here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_error_recovery(
     home: &std::path::Path,
     registry: &AgentRegistry,
@@ -1997,12 +2001,14 @@ pub(crate) fn process_error_recovery(
             // composes with recovered/self_cleared; claude-only; a non-claude / missing /
             // stale / pre-onset hook falls through to the unchanged screen-driven path.
             if state == AgentState::ServerRateLimit {
-                srl_onset.entry(name.to_string()).or_insert_with(now_epoch_ms);
+                srl_onset
+                    .entry(name.to_string())
+                    .or_insert_with(now_epoch_ms);
             } else {
                 srl_onset.remove(name);
             }
-            let is_claude =
-                crate::backend::Backend::parse_str(handle.backend_command.as_str()).has_state_hooks();
+            let is_claude = crate::backend::Backend::parse_str(handle.backend_command.as_str())
+                .has_state_hooks();
             let hook_active_at_ms = if is_claude {
                 crate::daemon::hook_shadow::fresh_active_hook_at_ms(name)
             } else {
@@ -2019,7 +2025,8 @@ pub(crate) fn process_error_recovery(
             // only EXECUTES the lock-free PTY inject for the names decided here. So a
             // track can never blind-fire `continue` into a non-error state (e.g. a
             // PermissionPrompt the agent reached after the throttle cleared).
-            if state == AgentState::ServerRateLimit && (recovered || self_cleared || hook_recovered) {
+            if state == AgentState::ServerRateLimit && (recovered || self_cleared || hook_recovered)
+            {
                 // #ratelimit-recovery: still latched ServerRateLimit (the stale
                 // "Server is temporarily limiting" line re-matches in the tail and
                 // working_state_below can't see a marker BELOW the most-recent error
@@ -3980,8 +3987,7 @@ instances:
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         let mut srl_onset: HashMap<String, u64> = HashMap::new();
         let name = "srl-flap-agent";
-        let (handle, _r) =
-            mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
+        let (handle, _r) = mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
         registry.lock().insert(handle.id, handle);
         // Stable onset in the PAST; a fresh active hook (now) POST-DATES it.
         let onset = super::now_epoch_ms().saturating_sub(60_000);
@@ -4022,8 +4028,7 @@ instances:
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         let mut srl_onset: HashMap<String, u64> = HashMap::new();
         let name = "srl-genuine-agent";
-        let (handle, _r) =
-            mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
+        let (handle, _r) = mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
         registry.lock().insert(handle.id, handle);
         // A hook from a PRIOR turn: recorded then backdated to BEFORE the onset the
         // tick stamps (now). hook(now-120s) < onset(now) → pre-onset → no override.

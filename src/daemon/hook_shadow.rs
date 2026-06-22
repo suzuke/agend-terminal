@@ -340,15 +340,24 @@ mod tests {
     #[serial]
     fn fresh_active_hook_at_ms_active_only() {
         record_event("fah-tooluse", "PreToolUse", None);
-        assert!(fresh_active_hook_at_ms("fah-tooluse").is_some(), "ToolUse is active");
+        assert!(
+            fresh_active_hook_at_ms("fah-tooluse").is_some(),
+            "ToolUse is active"
+        );
         record_event("fah-thinking", "PostToolUse", None);
-        assert!(fresh_active_hook_at_ms("fah-thinking").is_some(), "Thinking is active");
+        assert!(
+            fresh_active_hook_at_ms("fah-thinking").is_some(),
+            "Thinking is active"
+        );
         record_event("fah-idle", "Stop", None);
         assert!(
             fresh_active_hook_at_ms("fah-idle").is_none(),
             "Idle (turn-ended) is excluded — left to the productive-output recovery path"
         );
-        assert!(fresh_active_hook_at_ms("fah-absent").is_none(), "no hook → None");
+        assert!(
+            fresh_active_hook_at_ms("fah-absent").is_none(),
+            "no hook → None"
+        );
         record_event("fah-stale", "PostToolUse", None);
         backdate_for_test("fah-stale", HOOK_FRESHNESS.as_millis() as u64 + 1000);
         assert!(
