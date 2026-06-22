@@ -28,13 +28,15 @@
 //! - **Success oracle = terminal `Idle` ∧ ¬error-class ([`AgentState::is_error`]) ∧
 //!   transcript GREW.** NOT `has_productive_output()` — that is false on a text-only
 //!   success (opencode's productive markers match only tool-use glyphs).
-//! - **Transcript "grew" = non-blank-line COUNT delta** (baseline at ready ↔ final at
-//!   turn-end). Chrome is NOT excluded from this measure: the footer's row COUNT is
-//!   identical at both samples (only its content — elapsed timer / token count —
-//!   churns), so it cancels in the delta. Counting LINES (not bytes) makes a chrome
-//!   content update invisible to "grew". The `result_summary` (cosmetic) drops the
-//!   trailing footer via a PATTERN-based strip ([`is_trailing_chrome`]) rather than a
-//!   per-backend magic row count, so it survives a backend bumping its footer.
+//! - **Transcript "grew" = an ANSWER appeared after the prompt echo** ([`transcript_grew`]):
+//!   locate the injected-prompt echo in the (chrome-stripped) transcript and require
+//!   non-blank content after it. This is MONOTONIC + term-size-independent + per-backend-
+//!   free — it does not depend on screen density. (A raw nonblank-COUNT delta only works
+//!   for ALT-SCREEN TUIs whose banner persists in both snapshots, e.g. claude/opencode
+//!   `max_scroll=0`; a SCROLLING-TUI backend would false-negative — #2408 lead vet.) The
+//!   count-delta is kept only as the echo-scrolled-off FALLBACK. The `result_summary`
+//!   (cosmetic) drops the trailing footer via a PATTERN-based strip ([`is_trailing_chrome`]),
+//!   not a per-backend magic row count, so it survives a backend bumping its footer.
 //!
 //! Scope: opencode (Slice-1) + claude (Slice-2) — each §5-smoke-validated. The gate
 //! ([`crate::ephemeral_tracking`] `driver_supported`) admits exactly this set; other
@@ -167,7 +169,7 @@ fn run_turn(cfg: DriverConfig) {
         .vterm
         .tail_lines_dewrapped(CAPTURE_LINES);
     let terminal_state = inject_target.core.lock().state.get_state();
-    let grew = nonblank_count(&end_dump) > baseline_body;
+    let grew = transcript_grew(&end_dump, &prompt, baseline_body);
     let success = oracle_success(terminal_state, grew);
     let summary = build_summary(&end_dump, terminal_state, grew, stop_reason);
 
@@ -199,13 +201,66 @@ fn oracle_success(terminal_state: AgentState, transcript_grew: bool) -> bool {
     terminal_state == AgentState::Idle && !terminal_state.is_error() && transcript_grew
 }
 
-/// Count non-blank lines in a vterm dump. Used for the "grew" measure as a
-/// baseline↔final DELTA, so chrome is NOT excluded here: the footer's row COUNT is
-/// identical at baseline and at turn-end (only its CONTENT churns — elapsed timer,
-/// token count), so it cancels in the delta. Counting LINES (not bytes) makes a chrome
-/// content update invisible to "grew". Backend-agnostic — no per-backend tuning.
+/// Count non-blank lines in a vterm dump. Used as the FALLBACK "grew" signal (see
+/// [`transcript_grew`]): a baseline↔final DELTA. Chrome is NOT excluded — the footer row
+/// COUNT is identical at both samples (only its content churns), so it cancels in the
+/// delta; counting LINES (not bytes) makes a chrome update invisible.
 fn nonblank_count(dump: &str) -> usize {
     dump.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// Did the worker produce an ANSWER this turn? PR3b Slice-2 (lead vet) — a MONOTONIC,
+/// term-size-independent, per-backend-free signal: locate the injected-prompt echo in
+/// the (chrome-stripped) transcript and require non-blank content AFTER it (= the
+/// assistant's reply).
+///
+/// Why not the raw nonblank-COUNT delta: that only works for an ALT-SCREEN TUI whose
+/// startup banner persists in BOTH the baseline and final snapshots (claude/opencode —
+/// empirically `max_scroll=0`), so `final = banner + answer > baseline = banner`. A
+/// SCROLLING-TUI backend (a future slice) would FALSE-NEGATIVE when a dense ready screen
+/// scrolls off behind a short answer (`nonblank(final) ≤ nonblank(baseline)`). Anchoring
+/// on the prompt echo sidesteps screen density entirely — content after the echo is the
+/// answer regardless of how the screen scrolled.
+///
+/// FALLBACK: if the echo is not found (a long turn scrolled it off the captured window),
+/// fall back to the conservative nonblank-COUNT delta (`final > baseline`) so a
+/// genuinely-grown transcript whose echo is no longer visible is not wrongly judged empty.
+fn transcript_grew(end_dump: &str, prompt: &str, baseline_nonblank: usize) -> bool {
+    let body = strip_trailing_chrome(end_dump);
+    let body_lines: Vec<&str> = body.lines().collect();
+    match locate_prompt_echo(&body_lines, prompt) {
+        // Answer = any non-blank line after the echo (trailing chrome already stripped).
+        Some(echo_idx) => body_lines[echo_idx + 1..]
+            .iter()
+            .any(|l| !l.trim().is_empty()),
+        // Echo scrolled off → conservative count-delta fallback.
+        None => nonblank_count(end_dump) > baseline_nonblank,
+    }
+}
+
+/// A stable prefix of the prompt to match the echo on — first ~40 chars (or the whole
+/// prompt if shorter). A prefix (not the full text) so a TUI that WRAPS or truncates a
+/// long echo still anchors on its first rendered line.
+fn prompt_echo_needle(prompt: &str) -> &str {
+    let trimmed = prompt.trim();
+    let end = trimmed
+        .char_indices()
+        .nth(40)
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    &trimmed[..end]
+}
+
+/// Find the transcript line echoing the injected prompt, by matching its prefix
+/// ([`prompt_echo_needle`]). Returns the LAST match (the most recent turn's echo, so a
+/// prompt that also appears earlier in scrollback doesn't mis-anchor). `None` if the
+/// prompt is empty or its echo isn't present (scrolled off / not yet rendered).
+fn locate_prompt_echo(lines: &[&str], prompt: &str) -> Option<usize> {
+    let needle = prompt_echo_needle(prompt);
+    if needle.is_empty() {
+        return None;
+    }
+    lines.iter().rposition(|l| l.contains(needle))
 }
 
 /// True if `line` is trailing CHROME (a footer / statusline row), not transcript body.
@@ -426,16 +481,83 @@ mod tests {
     }
 
     #[test]
-    fn transcript_growth_detected_via_nonblank_delta() {
-        // Baseline (ready, before inject) vs final (after a reply) — the assistant's new
-        // lines register as growth even though the footer rows are unchanged.
+    fn nonblank_delta_fallback_detects_growth() {
+        // The FALLBACK signal (echo scrolled off): baseline vs final nonblank delta.
         let baseline = "❯ prompt\n─────\n❯\nModel: Opus | Ctx Used: 0%";
         let grown =
             "❯ prompt\n⏺ assistant reply\n⏺ more reply\n─────\n❯\nModel: Opus | Ctx Used: 3%";
+        assert!(nonblank_count(grown) > nonblank_count(baseline));
+    }
+
+    // ───────────── grew = prompt-echo anchor (#2408 root fix) ─────────────
+
+    /// THE root-fix test (replaces fixup-dev's `grew_false_negative_when_dense_baseline_
+    /// exceeds_sparse_end`): a DENSE baseline (huge ready banner) + a SPARSE end (short
+    /// answer) — the raw count-delta FALSE-NEGATIVES, but the prompt-echo anchor finds the
+    /// answer after the echo → grew=TRUE. This is the scrolling-TUI failure the new signal
+    /// fixes.
+    #[test]
+    fn grew_true_even_when_sparse_end_is_denser_baseline() {
+        let prompt = "Summarize the file";
+        // Dense baseline: a big ready banner (would be in scrollback for a scrolling TUI).
+        let dense_baseline_nonblank = 50;
+        // Sparse end: the prompt echo + a one-line answer + chrome. nonblank ≈ 3 < 50, so
+        // the count-delta would judge grew=false (the reviewers' false-negative).
+        let sparse_end =
+            "❯ Summarize the file\n⏺ It is a config file.\n─────\n❯\n  Model: Opus | Ctx Used: 2%";
         assert!(
-            nonblank_count(grown) > nonblank_count(baseline),
-            "the assistant reply must register as growth"
+            nonblank_count(sparse_end) < dense_baseline_nonblank,
+            "precondition: this IS the count-delta false-negative shape"
         );
+        assert!(
+            transcript_grew(sparse_end, prompt, dense_baseline_nonblank),
+            "prompt-echo anchor must see the answer after the echo → grew=true"
+        );
+    }
+
+    /// Echo present but NO content after it (worker produced nothing) → grew=false.
+    #[test]
+    fn grew_false_when_no_answer_after_echo() {
+        let prompt = "do the thing";
+        let end = "❯ do the thing\n─────\n❯\n  Model: Opus | Ctx Used: 0%";
+        assert!(
+            !transcript_grew(end, prompt, 0),
+            "only the echo + chrome, no answer → grew=false"
+        );
+    }
+
+    /// Echo NOT found (scrolled off a long turn) → fall back to the nonblank count-delta.
+    #[test]
+    fn grew_falls_back_to_count_delta_when_echo_absent() {
+        let prompt = "a prompt that scrolled off the captured window";
+        // No echo line present; end is denser than baseline → fallback says grew.
+        let end = "⏺ line1\n⏺ line2\n⏺ line3\n─────\n❯";
+        assert!(
+            transcript_grew(end, prompt, 1),
+            "fallback: end denser than baseline → grew"
+        );
+        assert!(
+            !transcript_grew(end, prompt, 99),
+            "fallback: end NOT denser than a huge baseline → not grew"
+        );
+    }
+
+    /// The anchor matches a PREFIX (a wrapped/truncated echo still anchors) and uses the
+    /// LAST occurrence (a prompt repeated in scrollback doesn't mis-anchor to the old one).
+    #[test]
+    fn locate_prompt_echo_prefix_and_last_match() {
+        let prompt = "Reply with exactly the word: pong and nothing else at all";
+        let lines = vec![
+            "❯ Reply with exactly the word: pong and nothing el", // wrapped/truncated echo
+            "⏺ pong",
+        ];
+        // Prefix (first ~40 chars) still matches the truncated echo line.
+        assert_eq!(locate_prompt_echo(&lines, prompt), Some(0));
+        // Last occurrence wins.
+        let repeated = vec!["❯ do x", "⏺ ok", "❯ do x", "⏺ done"];
+        assert_eq!(locate_prompt_echo(&repeated, "do x"), Some(2));
+        // Empty prompt → no anchor.
+        assert_eq!(locate_prompt_echo(&lines, ""), None);
     }
 
     /// Pattern-based chrome strip drops claude's footer (rules / empty `❯` box / Model
