@@ -507,6 +507,50 @@ mod tests {
         );
     }
 
+    /// Option X (S3 wiring): when a parser thread owns this pane's VTerm
+    /// (`offthread = Some`), `drain_output` MUST be a no-op. This is the freeze-fix
+    /// invariant — the main render thread parses ZERO bytes per frame regardless of
+    /// backlog size, so a restart flood (the boot-race) can never stall the draw /
+    /// input loop. It is also a correctness requirement: the parser is the SOLE
+    /// consumer of the pane's `rx` clone (crossbeam is MPMC), so a main-thread drain
+    /// here would STEAL chunks from the parser.
+    #[test]
+    fn drain_output_is_noop_when_offthread_owns_parsing() {
+        // `pane.rx` carries a flood; the parser gets a SEPARATE idle channel so the
+        // assertions are deterministic (the parser never touches `pane.rx`).
+        let (flood_tx, flood_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (_parser_tx, parser_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            1,
+            "t".to_string(),
+            parser_rx,
+            VTerm::new(20, 4),
+            wake_tx,
+        );
+        let mut pane = test_pane(flood_rx, 20, 4);
+        pane.offthread = Some(handle);
+        for _ in 0..100 {
+            let _ = flood_tx.send(b"flood".to_vec());
+        }
+
+        let drained = pane.drain_output(10_000_000);
+        assert_eq!(
+            drained, 0,
+            "offthread pane: main-thread drain must be a no-op"
+        );
+        assert_eq!(
+            pane.rx.len(),
+            100,
+            "main must NOT consume any rx chunks when the parser owns parsing"
+        );
+        assert!(
+            pane.vterm.tail_lines(4).trim().is_empty(),
+            "main-thread VTerm must stay untouched (zero parse on main): {:?}",
+            pane.vterm.tail_lines(4)
+        );
+    }
+
     // ── #freeze-3 H2 (background-tab catch-up) deterministic proofs ────────
 
     /// #freeze-3 H2 MEMORY: the pane's `rx` is an UNBOUNDED channel — left undrained
