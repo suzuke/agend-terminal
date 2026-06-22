@@ -333,6 +333,30 @@ mod tests {
     use crate::state::AgentState;
     use serial_test::serial;
 
+    /// #t-26795: `fresh_active_hook_at_ms` returns a ts ONLY for a fresh ACTIVE hook
+    /// (ToolUse/Thinking). Idle (turn-ended) is excluded; an aged-out Thinking is
+    /// Stale → None; ToolUse never stales (event-pair). Absent → None.
+    #[test]
+    #[serial]
+    fn fresh_active_hook_at_ms_active_only() {
+        record_event("fah-tooluse", "PreToolUse", None);
+        assert!(fresh_active_hook_at_ms("fah-tooluse").is_some(), "ToolUse is active");
+        record_event("fah-thinking", "PostToolUse", None);
+        assert!(fresh_active_hook_at_ms("fah-thinking").is_some(), "Thinking is active");
+        record_event("fah-idle", "Stop", None);
+        assert!(
+            fresh_active_hook_at_ms("fah-idle").is_none(),
+            "Idle (turn-ended) is excluded — left to the productive-output recovery path"
+        );
+        assert!(fresh_active_hook_at_ms("fah-absent").is_none(), "no hook → None");
+        record_event("fah-stale", "PostToolUse", None);
+        backdate_for_test("fah-stale", HOOK_FRESHNESS.as_millis() as u64 + 1000);
+        assert!(
+            fresh_active_hook_at_ms("fah-stale").is_none(),
+            "a Thinking hook aged past freshness → Stale → None"
+        );
+    }
+
     #[test]
     fn derive_map_covers_the_fragile_band() {
         assert_eq!(derive_state("PreToolUse", None), Some(AgentState::ToolUse));

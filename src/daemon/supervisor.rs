@@ -3933,6 +3933,119 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ─────────────────── #t-26795 SRL hook-override ───────────────────
+
+    /// PURE truth-table for the hook→recovery decision.
+    #[test]
+    fn hook_recovered_for_srl_truth_table() {
+        let onset = 1000u64;
+        assert!(
+            super::hook_recovered_for_srl(true, Some(1500), Some(onset)),
+            "claude + fresh active hook POST-onset → recovered"
+        );
+        assert!(
+            !super::hook_recovered_for_srl(true, Some(500), Some(onset)),
+            "PRE-onset hook (prior turn) rejected → genuine new SRL not masked"
+        );
+        assert!(
+            !super::hook_recovered_for_srl(true, Some(1000), Some(onset)),
+            "exactly at onset is not strictly after → not recovered"
+        );
+        assert!(
+            !super::hook_recovered_for_srl(true, None, Some(onset)),
+            "no fresh ACTIVE hook (idle/stale/absent) → not recovered"
+        );
+        assert!(
+            !super::hook_recovered_for_srl(true, Some(1500), None),
+            "no onset (agent not in SRL) → not recovered"
+        );
+        assert!(
+            !super::hook_recovered_for_srl(false, Some(1500), Some(onset)),
+            "non-claude backend → never (unaffected)"
+        );
+    }
+
+    /// FLAP REGRESSION (operator's exact symptom, #t-26795). An agent latched on a
+    /// STICKY screen `ServerRateLimit` with `recovered`=false (no productive output
+    /// this instant) but a FRESH claude hook (tool calls firing) whose timestamp
+    /// POST-DATES the rate-limit onset → the retry track must stay CLEARED across
+    /// re-detect ticks (no re-arm = the `continue`-spam flap killed), and the onset
+    /// stays STABLE across the flap. NEUTER: drop `|| hook_recovered` from the clear
+    /// gate → a recovered=false tick re-arms → this RED.
+    #[test]
+    #[serial_test::serial]
+    fn srl_hook_override_kills_flap() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-hook-flap");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        let mut srl_onset: HashMap<String, u64> = HashMap::new();
+        let name = "srl-flap-agent";
+        let (handle, _r) =
+            mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert(handle.id, handle);
+        // Stable onset in the PAST; a fresh active hook (now) POST-DATES it.
+        let onset = super::now_epoch_ms().saturating_sub(60_000);
+        srl_onset.insert(name.to_string(), onset);
+        crate::daemon::hook_shadow::record_event(name, "PreToolUse", None); // Fresh(ToolUse) @ now
+        for _ in 0..3 {
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut srl_onset,
+                past_boot_grace(),
+            );
+        }
+        assert!(
+            !tracks.contains_key(name),
+            "a fresh post-onset claude hook must keep the SRL retry cleared — no re-arm flap"
+        );
+        assert_eq!(
+            srl_onset.get(name).copied(),
+            Some(onset),
+            "onset must stay STABLE across re-detect (or_insert never overwrites)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// EDGE (#t-26795): a genuine NEW SRL must NOT be masked — a hook that PRE-DATES
+    /// the onset (a prior turn's, backdated before this episode) does not override;
+    /// the retry arms normally.
+    #[test]
+    #[serial_test::serial]
+    fn srl_genuine_not_masked_by_pre_onset_hook() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("srl-genuine");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        let mut srl_onset: HashMap<String, u64> = HashMap::new();
+        let name = "srl-genuine-agent";
+        let (handle, _r) =
+            mock_agent_handle(name, crate::state::AgentState::ServerRateLimit);
+        registry.lock().insert(handle.id, handle);
+        // A hook from a PRIOR turn: recorded then backdated to BEFORE the onset the
+        // tick stamps (now). hook(now-120s) < onset(now) → pre-onset → no override.
+        crate::daemon::hook_shadow::record_event(name, "PreToolUse", None);
+        crate::daemon::hook_shadow::backdate_for_test(name, 120_000);
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut srl_onset,
+            past_boot_grace(),
+        );
+        assert!(
+            tracks.contains_key(name),
+            "a pre-onset hook must NOT mask a genuine SRL — the retry must arm"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #ratelimit-recovery (the live storm that wedged fixup-lead): an agent still
     /// LATCHED ServerRateLimit (the stale "Server is temporarily limiting" line
     /// re-matches in the tail, and `working_state_below` can't see a marker BELOW
