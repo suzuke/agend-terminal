@@ -111,15 +111,24 @@ fn agy_profile() -> BackendProfile {
                 AgentState::UsageLimit,
                 r"Individual quota reached|Contact your administrator to enable overages",
             ),
-            // #2409: Gemini transient "high traffic" server error. ApiError (not
-            // ServerRateLimit) because SRL is `is_high_fp_state` → content anchor
-            // requires an error-line indicator (`Error:` / `429` / …) which this
-            // message lacks; ApiError has no anchor/position gate → pattern match
-            // = immediate transition → the #1697 quick-nudge injects `continue`
-            // once per episode, appropriate for a "try again in a minute" error.
+            // #2409: Gemini transient "high traffic" server error (agy/Antigravity).
+            // ApiError (not ServerRateLimit): SRL is `is_high_fp_state` and needs a
+            // content/red anchor (an error-line indicator like `Error:` / `429`),
+            // which this banner lacks → SRL would false-negative. ApiError has no
+            // anchor/position gate → a pattern match transitions immediately and the
+            // #1697 quick-nudge injects `continue` once per episode — right for a
+            // transient, retryable error.
+            //
+            // Match ONLY the specific "high traffic" phrase, NOT the generic
+            // "try again in a minute" tail: ApiError is un-gated (and agy has no
+            // `input_line_markers`), so a broad phrase would FP on an agent's own
+            // prose (e.g. "I'll try again in a minute"). The real banner ("...are
+            // experiencing high traffic right now, please try again in a minute.")
+            // contains the specific phrase, so this matches it with zero detection
+            // loss. (PR #2410 review.)
             (
                 AgentState::ApiError,
-                r"servers are experiencing high traffic|try again in a minute",
+                r"servers are experiencing high traffic",
             ),
             (
                 AgentState::PermissionPrompt,
@@ -590,6 +599,47 @@ mod agy_quota_2236 {
             patterns.detect(idle),
             Some(AgentState::Idle),
             "#2236: ordinary agy idle pane must NOT be misread as UsageLimit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agy_apierror_2409 {
+    use super::*;
+
+    /// #2409: Gemini's transient "high traffic" banner must classify as `ApiError`
+    /// so `process_error_recovery` fires the #1697 quick-nudge (`continue`) instead
+    /// of leaving the agy agent wedged. Verbatim shape from the issue, WITH the agy
+    /// Idle chrome ("Type your message" / "? for shortcuts") that co-renders — so
+    /// this also proves ApiError outranks Idle (first-match priority; the pattern is
+    /// ordered before Idle in `agy_profile`).
+    const AGY_HIGH_TRAFFIC_PANE: &str = "  Our servers are experiencing high traffic right now, please try again in a minute.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_high_traffic_detects_api_error() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_HIGH_TRAFFIC_PANE),
+            Some(AgentState::ApiError),
+            "#2409: agy 'high traffic' banner must read ApiError (not Idle), feeding the #1697 quick-nudge"
+        );
+    }
+
+    /// FP guard (PR #2410 review): the pattern matches ONLY the specific "high
+    /// traffic" phrase, NOT the generic "try again in a minute" tail. ApiError is
+    /// un-gated (not `is_high_fp_state`, no anchor/position gate, agy has no
+    /// `input_line_markers`), so an agent's OWN prose mentioning "try again in a
+    /// minute" must NOT trip a false ApiError + spurious `continue` nudge. This
+    /// test is RED against the original broad `...|try again in a minute` alternation.
+    const AGY_RETRY_PROSE_PANE: &str = "  I hit a transient upstream error, so I'll try again in a minute once it clears.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_retry_prose_not_misread_as_api_error() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_RETRY_PROSE_PANE),
+            Some(AgentState::Idle),
+            "#2409/PR2410: an agent's own 'try again in a minute' prose must NOT be misread as ApiError"
         );
     }
 }
