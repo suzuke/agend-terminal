@@ -162,28 +162,43 @@ enum Event {
     Resize(Result<(u16, u16), crossbeam_channel::RecvError>),
 }
 
-/// Flush all immediately-available data into `vterm` at the CURRENT dims. Called
-/// right before applying a resize so a queued resize can never be parsed ahead of
-/// bytes that were already enqueued (#2404 r6 ②): the main-thread path parses
-/// queued bytes at the old size and only then resizes, and `select!` alone is
-/// non-deterministic, so without this a backlog of pre-resize bytes could be
-/// parsed at the new dims → wrong wrapping.
+/// Flush the data backlog present RIGHT NOW into `vterm` at the CURRENT dims, then
+/// return. Called before applying a resize so a queued resize never reorders ahead
+/// of already-enqueued bytes (#2404 r6 ②): the main-thread path parses queued bytes
+/// at the old size and only then resizes, and `select!` alone is non-deterministic.
 ///
-/// Residual window (P1, documented — NOT closed here, and pre-existing): the
-/// forwarder feeds this channel asynchronously, so bytes the agent produced at the
-/// old dims but that the forwarder hasn't transferred yet are NOT in the channel
-/// when we drain, and a symmetric ε-skew exists because the render thread issues
-/// `resize_pty` (SIGWINCH) and the parser applies `vterm.resize` on different
-/// threads. The MAIN-THREAD path has the same async-forwarder window (its next
-/// frame parses late bytes at whatever dims `pane.vterm` then holds), so this is
-/// not a regression, and an in-band single channel would NOT close it either (the
-/// late bytes still arrive after the resize). It is a transient: a TUI repaints
-/// its whole screen on SIGWINCH, so any briefly mis-wrapped cells are overwritten
-/// by the post-resize redraw — no persistent corruption. (#2404 r6 ② deeper edge.)
-fn drain_pending_data(data_rx: &Receiver<Vec<u8>>, vterm: &mut VTerm) {
-    while let Ok(d) = data_rx.try_recv() {
-        vterm.process(&d);
+/// BOUNDED to the `len()` snapshot (NOT drain-until-empty): a continuous producer
+/// (forwarder refilling faster than we parse) would make a drain-until-empty loop
+/// never return, hanging the handle's `Drop`-join on the render thread (#2404 r6
+/// re-review ①). Only bytes already queued when the resize was dequeued must
+/// precede it; anything added afterward is genuinely concurrent. Also checks
+/// `cancel_rx` each iteration and returns `true` if a cancel arrived, so a pane
+/// close during a large backlog still returns promptly (caller then exits).
+///
+/// Residual window (P1, documented, pre-existing): the forwarder feeds this channel
+/// asynchronously, so old-dims bytes it hasn't transferred yet are not flushed, and
+/// there is a symmetric ε-skew (the render thread issues `resize_pty`/SIGWINCH while
+/// the parser applies `vterm.resize`). The MAIN-THREAD path has the same
+/// async-forwarder window (its next frame parses late bytes at whatever dims
+/// `pane.vterm` then holds), so this is not a regression, and an in-band single
+/// channel would not close it either (the late bytes still arrive after the
+/// resize). Most TUIs repaint on SIGWINCH, which typically overwrites any briefly
+/// mis-wrapped cells. (#2404 r6 ② deeper edge.)
+fn drain_pending_data(
+    data_rx: &Receiver<Vec<u8>>,
+    cancel_rx: &Receiver<()>,
+    vterm: &mut VTerm,
+) -> bool {
+    for _ in 0..data_rx.len() {
+        if cancel_rx.try_recv().is_ok() {
+            return true;
+        }
+        match data_rx.try_recv() {
+            Ok(d) => vterm.process(&d),
+            Err(_) => break,
+        }
     }
+    false
 }
 
 /// The parser thread body: block for an event, coalesce a burst within
@@ -205,8 +220,16 @@ fn parser_loop(
     let coalesce = Duration::from_millis(SNAPSHOT_COALESCE_MS);
 
     loop {
-        // Phase 1 — block for the first event of a burst. A cancel (send or
-        // channel-disconnect when the handle drops) exits immediately, no publish.
+        // Cancel has deterministic priority over a continuously-ready data arm
+        // (crossbeam `select!` is unbiased, so a flood could otherwise starve it):
+        // check it first each iteration so a pane close is observed in bounded time
+        // even under a sustained flood. (#2404 r6 re-review ①)
+        if cancel_rx.try_recv().is_ok() {
+            return;
+        }
+
+        // Phase 1 — block for the first event of a burst. The cancel arm wakes an
+        // idle parser immediately; the explicit check above covers the flood case.
         let first = select! {
             recv(cancel_rx) -> _ => return,
             recv(data_rx) -> m => Event::Data(m),
@@ -220,17 +243,28 @@ fn parser_loop(
             Event::Resize(Err(_)) => return,
             Event::Data(Ok(d)) => vterm.process(&d),
             Event::Resize(Ok((c, r))) => {
-                drain_pending_data(&data_rx, &mut vterm);
+                if drain_pending_data(&data_rx, &cancel_rx, &mut vterm) {
+                    return;
+                }
                 vterm.resize(c, r);
             }
         }
 
-        // Phase 2 — coalesce everything that arrives within the window.
+        // Phase 2 — coalesce within the window. Bounded by the deadline AND
+        // cancel-responsive even under a sustained flood: a flood keeps `data_rx`
+        // perpetually ready so the `default(timeout)` arm would never fire — break
+        // on the deadline explicitly so we always publish + loop back (re-checking
+        // cancel). (#2404 r6 re-review ①)
         let deadline = Instant::now() + coalesce;
         loop {
+            if cancel_rx.try_recv().is_ok() {
+                return;
+            }
             let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
             let ev = select! {
-                recv(cancel_rx) -> _ => return,
                 recv(data_rx) -> m => Some(Event::Data(m)),
                 recv(resize_rx) -> m => Some(Event::Resize(m)),
                 default(timeout) => None,
@@ -244,7 +278,9 @@ fn parser_loop(
                     return;
                 }
                 Some(Event::Resize(Ok((c, r)))) => {
-                    drain_pending_data(&data_rx, &mut vterm);
+                    if drain_pending_data(&data_rx, &cancel_rx, &mut vterm) {
+                        return;
+                    }
                     vterm.resize(c, r);
                 }
                 Some(Event::Resize(Err(_))) => return,
@@ -433,6 +469,110 @@ mod tests {
             );
         }
         drop(data_tx);
+    }
+
+    /// #2404 r6 re-review ① — the CRITICAL anti-freeze guarantee: dropping the
+    /// handle must reap the parser within a bounded time even under a CONTINUOUS
+    /// data flood (a forwarder refilling faster than the parser parses). With the
+    /// old drain-until-empty + unbiased select, a resize during the flood spun
+    /// `drain_pending_data` forever and the render-thread Drop-join would freeze.
+    /// The fix (len-snapshot-bounded drain + cancel-first) keeps the join bounded.
+    #[test]
+    fn handle_drop_reaps_parser_within_deadline_under_continuous_flood() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let h =
+            spawn_offthread_parser(9, "flood".to_string(), data_rx, VTerm::new(40, 10), wake_tx)
+                .expect("parser thread spawns");
+
+        // Continuous producer: floods data as fast as possible (agent alive + busy).
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if data_tx.send(vec![b'x'; 512]).is_err() {
+                        break; // parser/pane gone
+                    }
+                }
+            })
+        };
+        // Drive a resize into the flood so the parser enters `drain_pending_data`
+        // while data is continuously available — the exact spot the old code spun.
+        assert!(h.request_resize(20, 8), "resize sends");
+
+        // Drop the handle off-thread; assert the Drop-join completes within a strict
+        // deadline. A regression that makes the join unbounded leaves `done` false →
+        // the assert fails in bounded time (no infinite test hang).
+        let done = Arc::new(AtomicBool::new(false));
+        let dropper = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                drop(h); // Drop sends cancel + joins the parser
+                done.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut reaped = false;
+        for _ in 0..200 {
+            if done.load(Ordering::Relaxed) {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = producer.join();
+        let _ = dropper.join();
+        assert!(
+            reaped,
+            "handle drop must reap the parser within the deadline even under a continuous flood"
+        );
+    }
+
+    /// #2404 r6 ② / re-review ① — `drain_pending_data` flushes the queued backlog at
+    /// the current dims in order AND is bounded to the `len()` snapshot: it returns
+    /// even though the sender stays open, so a continuous producer can't wedge it.
+    #[test]
+    fn drain_pending_data_flushes_snapshot_and_is_bounded() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let mut vt = VTerm::new(20, 4);
+        data_tx.send(b"\x1b[2J\x1b[Hab".to_vec()).unwrap();
+        data_tx.send(b"cd".to_vec()).unwrap();
+        // Sender stays open (agent alive) — drain must still return (bounded by len).
+        let cancelled = drain_pending_data(&data_rx, &cancel_rx, &mut vt);
+        assert!(!cancelled, "no cancel was sent");
+        assert!(
+            data_rx.is_empty(),
+            "the queued snapshot must be fully drained"
+        );
+        let snap = vt.snapshot();
+        let row0: String = (0..snap.cols).map(|c| snap.cells[c as usize].c).collect();
+        assert!(
+            row0.starts_with("abcd"),
+            "queued bytes parsed in order at current dims; got {row0:?}"
+        );
+    }
+
+    /// #2404 re-review ① — `drain_pending_data` stops early and returns `true` when a
+    /// cancel arrives, so a pane close during a large backlog still returns promptly.
+    #[test]
+    fn drain_pending_data_returns_early_on_cancel() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+        let mut vt = VTerm::new(20, 4);
+        for _ in 0..100 {
+            data_tx.send(vec![b'x']).unwrap();
+        }
+        cancel_tx.send(()).unwrap(); // cancel pending before the drain runs
+        let cancelled = drain_pending_data(&data_rx, &cancel_rx, &mut vt);
+        assert!(cancelled, "drain must observe the cancel and return true");
+        assert!(
+            !data_rx.is_empty(),
+            "drain must stop early on cancel, leaving the backlog"
+        );
     }
 
     /// #2404 r6 ② regression — ordering: a queued resize must NOT be applied ahead
