@@ -1364,6 +1364,11 @@ fn build_tick_infrastructure(
     // AgentCore::api_activity for false-idle detection). Self-disables if
     // `lsof` is absent.
     crate::api_activity_probe::spawn(Arc::clone(&ctx.registry));
+    // #2413 Phase 2 Slice 1: per-agent CONNECT proxy lifecycle supervisor.
+    // flag-gated (AGEND_CONNECT_PROXY) DEFAULT-OFF → no-op unless enabled; even
+    // when ON nothing injects HTTPS_PROXY into agents yet (Slice 2), so the
+    // proxies sit idle = zero agent risk.
+    crate::connect_proxy::maybe_spawn_supervisor(Arc::clone(&ctx.registry));
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a

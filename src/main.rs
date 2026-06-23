@@ -26,6 +26,7 @@ mod claim_verifier;
 mod cli;
 mod config_integrity;
 mod connect;
+mod connect_proxy;
 mod daemon;
 mod daemon_config;
 mod decisions;
