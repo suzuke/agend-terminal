@@ -19,13 +19,11 @@
 //! machine is unit-testable without a daemon; the per-tick driver (OUT OF SCOPE here)
 //! supplies the snapshot under one `core.lock()`. Runs only under `AGEND_SHADOW_OBSERVER`.
 
-// The core reducer surface (ObservedStatus / AgentRuntime / ScreenSignal / Liveness) is
-// now consumed by the Phase-B per-tick driver (`per_tick::shadow_observe` →
-// `shadow::observe`) + the additive list_instances surface (SHADOW-OBSERVER-ARCH-2413.md
-// §6 step 3). The residual under this allow is `ObservedState::coarse()` — reserved for
-// the §5 quantification harness's coarse-bucket (Idle/Active/WaitingForUser) reporting,
-// which lands next. Narrow to that one item (or drop the allow) once the harden lands.
-#![allow(dead_code)]
+// The whole reducer surface (ObservedStatus / AgentRuntime / ScreenSignal / Liveness +
+// ObservedState::coarse) is now consumed by the Phase-B per-tick driver
+// (`per_tick::shadow_observe` → `shadow::observe`) + the §5 correction telemetry +
+// the additive list_instances surface — so the Phase-A blanket `#![allow(dead_code)]`
+// is gone (driver landed, SHADOW-OBSERVER-ARCH-2413.md §6 step 3/5).
 
 use super::evidence::{Authority, Confidence, Evidence, EvidenceKind};
 use serde::{Deserialize, Serialize};
@@ -155,10 +153,6 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Fold one piece of Evidence into the accumulator. Idempotent-ish: replaying the
     /// same terminal event twice is harmless (close is monotone).
     pub fn ingest(&mut self, ev: &Evidence) {
@@ -440,7 +434,7 @@ mod tests {
 
     #[test]
     fn turn_then_idle_basic() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let s = rt.observe(ScreenSignal::Working, &live_busy(), 1_100);
         assert!(matches!(
@@ -454,7 +448,7 @@ mod tests {
 
     #[test]
     fn tool_span_is_tooluse() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         rt.ingest(&hook(
             EvidenceKind::ToolStarted {
@@ -471,7 +465,7 @@ mod tests {
     /// screen is back at the prompt + no api socket + quiet ⇒ decay to Idle (Inferred).
     #[test]
     fn dropped_stop_reconciles_to_idle() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         // ... no TurnEnded ever arrives (dropped). Much later, screen is idle + quiet.
         let s = rt.observe(ScreenSignal::Idle, &live_quiet(30_000), 60_000);
@@ -482,7 +476,7 @@ mod tests {
     /// A dropped `PostToolUse` leaves the tool span open; same contradiction closes it.
     #[test]
     fn dropped_posttool_reconciles_tool_span() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         rt.ingest(&hook(
             EvidenceKind::ToolStarted {
@@ -501,7 +495,7 @@ mod tests {
     /// would wrongly say Idle here — this is the quantified win).
     #[test]
     fn mid_api_false_idle_stays_active() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let s = rt.observe(ScreenSignal::Idle, &live_busy(), 1_500);
         assert_ne!(
@@ -516,7 +510,7 @@ mod tests {
     /// span. Guards against over-eager TTL decay.
     #[test]
     fn ttl_open_span_without_liveness_does_not_flip() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(
             EvidenceKind::ToolStarted {
                 name: Some("Bash".into()),
@@ -535,7 +529,7 @@ mod tests {
     /// `ApprovalRequired` → WaitingForUser, then `ToolEnded` (proceeded) clears it.
     #[test]
     fn approval_then_proceed_clears_waiting() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         rt.ingest(&hook(EvidenceKind::ApprovalRequired, 1_100));
         let s = rt.observe(ScreenSignal::Approval, &live_busy(), 1_200);
@@ -554,13 +548,13 @@ mod tests {
     #[test]
     fn precedence_orders() {
         // RateLimited > everything: open episode + screen rate-limited.
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let s = rt.observe(ScreenSignal::RateLimited, &live_busy(), 1_100);
         assert_eq!(s.state, ObservedState::RateLimited);
 
         // WaitingForUser > ToolUse: a tool span is open but an approval is pending.
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(
             EvidenceKind::ToolStarted {
                 name: Some("Bash".into()),
@@ -575,7 +569,7 @@ mod tests {
     /// `since_ms` is stable while the state holds, and resets when it changes.
     #[test]
     fn since_ms_stable_across_redrive() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let a = rt.observe(ScreenSignal::Working, &live_busy(), 1_100);
         let b = rt.observe(ScreenSignal::Working, &live_busy(), 5_000);
@@ -588,7 +582,7 @@ mod tests {
     /// A dead child trumps stale "active" hooks.
     #[test]
     fn dead_child_is_idle() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let live = Liveness {
             api_in_flight: false,
@@ -604,7 +598,7 @@ mod tests {
     /// baseline with Weak confidence rather than asserting a stale hook state.
     #[test]
     fn stale_hook_falls_back_to_screen() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         // Way past freshness; screen idle, quiet ⇒ Idle/Weak (not phantom Active).
         let s = rt.observe(
@@ -621,7 +615,7 @@ mod tests {
     /// caught by `child_alive=false`, not the screen.)
     #[test]
     fn screen_other_is_non_decisive() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         // Other screen + quiet + no api, but child alive: reconcile needs screen==Idle,
         // so it does NOT fire → stays Active.
@@ -647,7 +641,7 @@ mod tests {
 
     #[test]
     fn observed_status_serde_roundtrips() {
-        let mut rt = AgentRuntime::new();
+        let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let s = rt.observe(ScreenSignal::Working, &live_busy(), 1_100);
         let j = serde_json::to_value(&s).expect("serialize");

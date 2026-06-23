@@ -20,7 +20,7 @@
 use super::{PerTickHandler, TickContext};
 use crate::agent::AgentCore;
 use crate::daemon::shadow;
-use crate::daemon::shadow::reducer::{Liveness, ScreenSignal};
+use crate::daemon::shadow::reducer::{Liveness, ObservedState, ScreenSignal};
 use crate::state::AgentState;
 use crate::sync_audit::CoreMutex;
 use std::sync::Arc;
@@ -69,17 +69,18 @@ impl PerTickHandler for ShadowObserveHandler {
             // reduce (which takes the shadow buffer/runtime locks — DISJOINT from
             // core.lock, and no thread ever acquires core.lock while holding those, so
             // no ordering hazard), then write the result under a fresh brief lock.
-            let (screen, live) = {
+            let (raw_state, screen, live) = {
                 let c = core.lock();
-                let screen = screen_signal(c.state.get_state());
+                let raw_state = c.state.get_state();
                 let live = Liveness {
                     api_in_flight: c.api_activity.in_flight,
                     productive_silent_ms: c.state.productive_silence().as_millis() as u64,
                     child_alive: *child_alive,
                 };
-                (screen, live)
+                (raw_state, screen_signal(raw_state), live)
             };
             let status = shadow::observe(name, screen, &live, now_ms);
+            log_correction(name, raw_state, screen, &status, &live);
             core.lock().observed_status = Some(status);
         }
     }
@@ -112,6 +113,59 @@ fn screen_signal(s: AgentState) -> ScreenSignal {
         | AgentState::ApiError
         | AgentState::ModelUnsupported
         | AgentState::Crashed => ScreenSignal::Other,
+    }
+}
+
+/// The coarse [`ObservedState`] the raw screen-scrape ALONE would report — the baseline
+/// the reducer is measured against (§5 quantification). `None` for a non-decisive screen
+/// (`Other`), which the reducer never claims to "correct" (no meaningful baseline).
+fn screen_as_observed(screen: ScreenSignal) -> Option<ObservedState> {
+    match screen {
+        ScreenSignal::Idle => Some(ObservedState::Idle),
+        ScreenSignal::Working => Some(ObservedState::Active),
+        ScreenSignal::Approval => Some(ObservedState::WaitingForUser),
+        ScreenSignal::RateLimited => Some(ObservedState::RateLimited),
+        ScreenSignal::Other => None,
+    }
+}
+
+/// §5 quantification telemetry. When the fused `ObservedStatus` disagrees with what the
+/// raw screen-scrape ALONE would report, that's a CORRECTION — the reducer's whole value
+/// (e.g. screen renders `Idle` mid-request but a live hook episode + API socket prove
+/// `Active`; or screen looks `Idle`/ambiguous at a permission prompt but a hook
+/// `ApprovalRequired` proves `WaitingForUser`). Logged at INFO (the headline metric: grep
+/// `#shadow-observer` + "correction" to count false-idles caught / approval splits); the
+/// agreeing per-tick trace is DEBUG. Runs only under the flag ⇒ zero prod noise.
+fn log_correction(
+    name: &str,
+    raw_state: AgentState,
+    screen: ScreenSignal,
+    status: &crate::daemon::shadow::reducer::ObservedStatus,
+    live: &Liveness,
+) {
+    let Some(screen_state) = screen_as_observed(screen) else {
+        return; // non-decisive screen → no baseline to correct
+    };
+    if screen_state != status.state.coarse() {
+        tracing::info!(
+            tag = "#shadow-observer",
+            agent = %name,
+            raw_screen = %raw_state.display_name(),
+            observed = ?status.state,
+            confidence = ?status.confidence,
+            authority = ?status.authority,
+            api_in_flight = live.api_in_flight,
+            productive_silent_ms = live.productive_silent_ms,
+            "shadow correction: ObservedStatus overrides raw screen-scrape"
+        );
+    } else {
+        tracing::debug!(
+            tag = "#shadow-observer",
+            agent = %name,
+            raw_screen = %raw_state.display_name(),
+            observed = ?status.state,
+            "shadow tick: observed agrees with raw screen"
+        );
     }
 }
 
@@ -273,5 +327,58 @@ mod tests {
         assert_eq!(screen_signal(AgentState::Crashed), ScreenSignal::Other);
         assert_eq!(screen_signal(AgentState::GitConflict), ScreenSignal::Other);
         assert_eq!(screen_signal(AgentState::Hang), ScreenSignal::Other);
+    }
+
+    #[test]
+    fn screen_as_observed_baseline_buckets() {
+        assert_eq!(
+            screen_as_observed(ScreenSignal::Idle),
+            Some(ObservedState::Idle)
+        );
+        assert_eq!(
+            screen_as_observed(ScreenSignal::Working),
+            Some(ObservedState::Active)
+        );
+        assert_eq!(
+            screen_as_observed(ScreenSignal::Approval),
+            Some(ObservedState::WaitingForUser)
+        );
+        assert_eq!(
+            screen_as_observed(ScreenSignal::RateLimited),
+            Some(ObservedState::RateLimited)
+        );
+        // A non-decisive screen has no baseline the reducer can "correct".
+        assert_eq!(screen_as_observed(ScreenSignal::Other), None);
+    }
+
+    /// The §5 correction predicate, deterministically: the two headline wins the live
+    /// quantification counts. (a) mid-API false-idle — screen Idle but a fresh hook
+    /// episode + a live socket ⇒ Active ⇒ Idle≠Active ⇒ counts as a correction.
+    /// (b) approval-vs-idle — hook ApprovalRequired but screen reads Idle ⇒ WaitingForUser
+    /// ⇒ correction. (c) control — steady tool-use agrees with the screen ⇒ NOT a
+    /// correction (no false-active regression).
+    #[test]
+    fn correction_predicate_flags_false_idle_and_approval_not_steady() {
+        let is_correction = |screen: ScreenSignal, observed: ObservedState| {
+            screen_as_observed(screen).is_some_and(|b| b != observed.coarse())
+        };
+        // (a) false-idle caught.
+        assert!(is_correction(ScreenSignal::Idle, ObservedState::Active));
+        assert!(is_correction(ScreenSignal::Idle, ObservedState::ToolUse));
+        // (b) approval split out of idle.
+        assert!(is_correction(
+            ScreenSignal::Idle,
+            ObservedState::WaitingForUser
+        ));
+        // (c) steady states agree → no correction (no regression).
+        assert!(!is_correction(
+            ScreenSignal::Working,
+            ObservedState::ToolUse
+        ));
+        assert!(!is_correction(ScreenSignal::Idle, ObservedState::Idle));
+        assert!(!is_correction(
+            ScreenSignal::Approval,
+            ObservedState::WaitingForUser
+        ));
     }
 }
