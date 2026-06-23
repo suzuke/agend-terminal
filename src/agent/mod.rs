@@ -817,13 +817,18 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // backend). Set AFTER env_clear (like AGEND_INSTANCE_NAME) so isolation can't drop
     // it; the hook subprocess inherits both vars from claude's env.
     if crate::daemon::shadow::enabled()
-        && detected_backend.as_ref().is_some_and(|b| b.has_state_hooks())
+        && detected_backend
+            .as_ref()
+            .is_some_and(|b| b.has_state_hooks())
     {
         if let Some(h) = *home {
             match crate::daemon::shadow::new_session_token() {
                 Ok(token) => {
                     crate::daemon::shadow::register(&token, name);
-                    cmd.env("AGENT_TERMINAL_SOCKET", crate::daemon::shadow::socket_path(h));
+                    cmd.env(
+                        "AGENT_TERMINAL_SOCKET",
+                        crate::daemon::shadow::socket_path(h),
+                    );
                     cmd.env("AGENT_TERMINAL_SESSION", &token);
                 }
                 Err(e) => tracing::warn!(

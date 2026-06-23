@@ -145,13 +145,17 @@ pub fn evidence_kind_for_hook(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn hook_to_evidence_mapping_covers_the_contract() {
         let m = |e, n, t| evidence_kind_for_hook(e, n, t);
-        assert_eq!(m("UserPromptSubmit", None, None), Some(EvidenceKind::TurnStarted));
+        assert_eq!(
+            m("UserPromptSubmit", None, None),
+            Some(EvidenceKind::TurnStarted)
+        );
         assert_eq!(
             m("PreToolUse", None, Some("Bash")),
             Some(EvidenceKind::ToolStarted {
@@ -181,7 +185,10 @@ mod tests {
                 stop_reason: Some("failure".to_string())
             })
         );
-        assert_eq!(m("SessionEnd", None, None), Some(EvidenceKind::SessionExited));
+        assert_eq!(
+            m("SessionEnd", None, None),
+            Some(EvidenceKind::SessionExited)
+        );
         // Non-transition hooks + unknown notification → no evidence.
         assert_eq!(m("SessionStart", None, None), None);
         assert_eq!(m("PreCompact", None, None), None);

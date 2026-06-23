@@ -181,8 +181,10 @@ pub fn start(home: &Path) {
     #[cfg(not(unix))]
     {
         let _ = home;
-        tracing::info!(tag = "#shadow-observer",
-            "unix-socket event server unavailable on this platform — local plane disabled");
+        tracing::info!(
+            tag = "#shadow-observer",
+            "unix-socket event server unavailable on this platform — local plane disabled"
+        );
     }
 }
 
@@ -239,10 +241,60 @@ fn handle_conn(stream: std::os::unix::net::UnixStream) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::evidence::EvidenceKind;
+    use super::evidence::{Authority, EvidenceKind};
     use super::*;
     use serial_test::serial;
+
+    /// End-to-end over the REAL unix socket transport: a client (the hook emit) writes
+    /// one token-authenticated frame line; the server's `handle_conn` reads it, ingests,
+    /// and the Evidence lands in the buffer. Proves the socket+token+Evidence path the
+    /// spike exists to validate (the live claude hook does exactly this write).
+    #[cfg(unix)]
+    #[test]
+    #[serial(shadow_observer)]
+    fn socket_round_trip_delivers_evidence() {
+        use std::io::Write;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let token = new_session_token().unwrap();
+        register(&token, "shadow-sock-agent");
+        let dir = std::env::temp_dir().join(format!("agend_shadow_sock_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("shadow-events.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let server = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                handle_conn(stream);
+            }
+        });
+        let mut stream = UnixStream::connect(&sock).expect("connect");
+        let frame = serde_json::json!({
+            "token": token,
+            "hook_event_name": "UserPromptSubmit",
+        });
+        stream
+            .write_all(format!("{frame}\n").as_bytes())
+            .expect("write frame");
+        drop(stream);
+        server.join().unwrap();
+        let evidence = peek("shadow-sock-agent");
+        assert_eq!(
+            evidence.len(),
+            1,
+            "frame delivered over the real socket → 1 evidence"
+        );
+        assert_eq!(evidence[0].kind, EvidenceKind::TurnStarted);
+        assert_eq!(evidence[0].authority, Authority::Hook);
+        assert_eq!(
+            evidence[0].confidence,
+            super::evidence::Confidence::Confirmed
+        );
+        drain("shadow-sock-agent");
+        forget_agent("shadow-sock-agent");
+        let _ = std::fs::remove_file(&sock);
+    }
 
     fn frame(token: &str, event: &str, tool: Option<&str>) -> ShadowFrame {
         ShadowFrame {
