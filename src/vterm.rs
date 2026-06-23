@@ -345,6 +345,13 @@ impl VTerm {
             // No history here → origin is the visible top's absolute id (`max_scroll`).
             // The parser overwrites this after injecting `history` (see `publish`).
             history_origin: self.max_scroll() as u64,
+            // #offthread-mouse: stamp the live mouse-mode from THIS (real) VTerm so the
+            // off-thread forward gate reads it instead of the idle `pane.vterm`. mode is
+            // independent of history, so no `publish`-time fixup is needed (unlike
+            // `history_origin`). Only the parser publish path builds snapshots from a
+            // live VTerm; `pane.vterm` never calls this off-thread.
+            wants_mouse: self.wants_mouse(),
+            mouse_sgr: self.mouse_sgr(),
         }
     }
 
@@ -1032,6 +1039,18 @@ pub struct GridSnapshot {
     /// window is shallower than that; rows scrolled out of the window decode to
     /// blanks (clamped), NOT wrong content.
     pub history_origin: u64,
+    /// #offthread-mouse: whether the terminal application has enabled mouse
+    /// reporting (any of SGR mouse modes 1000/1002/1003) — i.e. `VTerm::wants_mouse`
+    /// captured by the PARSER from the real VTerm at publish. Off-thread the
+    /// main-thread `pane.vterm` is idle (processes no bytes → mode default → mouse
+    /// OFF), so the mouse-forward gate must read THIS, not `pane.vterm`, or it would
+    /// never forward (the dead-gate bug: e.g. a fullscreen claude-code never receives
+    /// its own wheel/click). See `Pane::wants_mouse`.
+    pub wants_mouse: bool,
+    /// #offthread-mouse: whether SGR mouse encoding (1006) is active, paired with
+    /// `wants_mouse` for the forward gate. Parser-captured from the real VTerm at
+    /// publish (same idle-`pane.vterm` reason as `wants_mouse`).
+    pub mouse_sgr: bool,
 }
 
 /// One scrollback row — `cols` cells, shared via `Arc` so the parser can reuse it
@@ -1069,6 +1088,10 @@ impl GridSnapshot {
             history: empty_scrollback(),
             cursor: (0, 0),
             history_origin: 0,
+            // Pre-first-publish: no mouse mode known yet → don't forward (fall through
+            // to agend scroll). The first real publish stamps the live mode.
+            wants_mouse: false,
+            mouse_sgr: false,
         }
     }
 

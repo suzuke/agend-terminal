@@ -549,7 +549,11 @@ fn pane_for_mouse_forward(layout: &Layout, mouse: &MouseEvent) -> Option<(usize,
     // the wants_mouse pane (opencode) was not focused.
     let pane_id = tab.pane_at(mouse.column, mouse.row)?;
     let pane = tab.root().find_pane(pane_id)?;
-    if !pane.vterm.wants_mouse() || !pane.vterm.mouse_sgr() {
+    // #offthread-mouse: read the pane's path-aware mouse mode (parser-stamped snapshot
+    // off-thread, live `vterm` flag-OFF) — NOT `pane.vterm` directly, which is idle
+    // off-thread → mode default → this gate would never fire (dead-gate bug: a
+    // fullscreen claude-code never gets its forwarded wheel/click).
+    if !pane.wants_mouse() || !pane.mouse_sgr() {
         return None;
     }
     let &(px, py, pw, ph) = tab.pane_rects.get(&pane_id)?;
@@ -696,6 +700,63 @@ mod tests {
             routed.map(|(id, _, _)| id),
             Some(1),
             "single-pane opencode tab must still route mouse to that pane"
+        );
+    }
+
+    /// #offthread-mouse (operator 2026-06-23: fullscreen claude-code couldn't wheel-
+    /// scroll). Off-thread the main-thread `pane.vterm` is idle, so the forward gate
+    /// must read the PARSER-stamped mouse mode on the published snapshot — else it
+    /// never fires and a fullscreen claude-code (mouse-capture, self-scrolls) never
+    /// receives its forwarded wheel/click. Drives the real parser through a mouse-
+    /// enable startup, then asserts the gate routes a wheel event to the pane.
+    /// NEUTER-RED: revert the gate to `pane.vterm.wants_mouse()/mouse_sgr()` → the
+    /// idle off-thread vterm has no mouse mode → `None` → the wheel is not forwarded.
+    #[test]
+    fn pane_for_mouse_forward_offthread_reads_snapshot_mouse_mode() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = crate::vterm::VTerm::new(20, 6);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            1,
+            "claude".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+        // Fullscreen claude-code startup: enable mouse tracking (1000) + SGR (1006).
+        data_tx
+            .send(b"\x1b[?1000h\x1b[?1006h".to_vec())
+            .expect("parser data channel live");
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("parser must publish the mouse-mode snapshot");
+
+        let mut pane = leaf(1, "claude");
+        pane.offthread = Some(handle);
+        // The idle main-thread vterm has NO mouse mode (the dead-gate surface) ...
+        assert!(
+            !pane.vterm.wants_mouse(),
+            "off-thread pane.vterm is idle → no mouse mode"
+        );
+        // ... but the path-aware accessors read the parser-stamped snapshot.
+        assert!(
+            pane.wants_mouse() && pane.mouse_sgr(),
+            "off-thread mouse mode must come from the published snapshot"
+        );
+
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("single".to_string(), pane));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0].pane_rects.insert(1, (0, 1, 20, 10));
+
+        let mouse = scroll_up_at(10, 5);
+        let routed = super::pane_for_mouse_forward(&layout, &mouse);
+        assert_eq!(
+            routed.map(|(id, _, _)| id),
+            Some(1),
+            "off-thread mouse-capture pane must route the wheel for forwarding (so claude-code self-scrolls)"
         );
     }
 

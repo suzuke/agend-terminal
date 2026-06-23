@@ -159,6 +159,30 @@ impl Pane {
         }
     }
 
+    /// #offthread-mouse: whether the child terminal has enabled mouse reporting, for
+    /// the mouse-forward gate. Off-thread the main-thread `vterm` is idle (processes
+    /// no bytes → mode default → mouse OFF), so this reads the PARSER-stamped mode on
+    /// the published snapshot, NOT `pane.vterm`. Reading `pane.vterm` off-thread is the
+    /// dead-gate bug: a fullscreen claude-code (alt-screen + mouse-capture, self-
+    /// scrolls) would never receive its forwarded wheel/click. Flag-OFF reads the live
+    /// `vterm` (byte-identical to before).
+    pub fn wants_mouse(&self) -> bool {
+        match &self.offthread {
+            Some(handle) => handle.load().wants_mouse,
+            None => self.vterm.wants_mouse(),
+        }
+    }
+
+    /// #offthread-mouse: whether SGR mouse encoding is active, paired with
+    /// [`wants_mouse`](Self::wants_mouse) for the forward gate. Same off-thread
+    /// snapshot vs flag-OFF `vterm` dispatch.
+    pub fn mouse_sgr(&self) -> bool {
+        match &self.offthread {
+            Some(handle) => handle.load().mouse_sgr,
+            None => self.vterm.mouse_sgr(),
+        }
+    }
+
     /// #offthread-selection: the ABSOLUTE-line base a selection endpoint is measured
     /// from. Off-thread it is the published snapshot's visible-top absolute id
     /// (`history_origin + history.len()`), read from the snapshot — NOT `pane.vterm`,
