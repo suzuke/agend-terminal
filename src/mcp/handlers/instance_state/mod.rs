@@ -280,6 +280,13 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         .and_then(|r| r.working_directory)
         .map(|p| p.display().to_string());
 
+    // Session-reset inbox settle: a replace is always context-lost (fresh
+    // spawn), so settle all DELIVERING rows to PROCESSED before the old
+    // instance is killed. This prevents reclaim_stale_delivering from
+    // reverting them to UNREAD and re-injecting stale messages into the
+    // new, context-less session (agend-customization#159).
+    crate::inbox::settle_delivering_for_session_reset(home, name);
+
     // #1366: kill via DELETE with no_wait — sends kill signal and removes
     // registry entry without blocking up to 5 s for child exit. The OS
     // reaps the old process asynchronously; the new spawn gets its own
@@ -407,6 +414,15 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         Some(r) => r,
         None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
     };
+
+    // Session-reset inbox settle: for a FRESH restart (context-lost), settle
+    // all DELIVERING rows to PROCESSED before killing the old instance.
+    // Resume restarts preserve context → the implicit next-drain ack (A)
+    // handles it; settle would prematurely close messages the resumed agent
+    // still has in context. (agend-customization#159)
+    if mode != "resume" {
+        crate::inbox::settle_delivering_for_session_reset(home, name);
+    }
 
     let _ = crate::api::call(
         home,

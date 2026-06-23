@@ -718,6 +718,37 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     })
 }
 
+/// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
+/// transitioning them to `processed` so [`reclaim_stale_delivering`] will not
+/// revert them to `unread` for re-delivery.
+///
+/// Called by the daemon when an agent's session is **intentionally reset** —
+/// `replace_instance` or `restart_instance mode=fresh` — where the agent's
+/// context is known to be lost. The old session already drained these messages
+/// (they are `delivering`), so treating them as "delivered and processed" is
+/// correct: re-injecting them into a fresh, context-less session would cause
+/// the stale-resend pattern (agend-customization#159).
+///
+/// This does NOT break #2299's at-least-once guarantee for crashes: an
+/// unintentional interruption (OOM, kill -9, backend crash) never reaches this
+/// code path — only the explicit `replace_instance` / `restart mode=fresh`
+/// handlers call it — so `reclaim_stale_delivering` still recovers those.
+///
+/// `restart_instance mode=resume` deliberately does NOT call this: the resumed
+/// session retains context and the implicit next-drain ack (A) handles it.
+pub fn settle_delivering_for_session_reset(home: &Path, name: &str) -> usize {
+    let settled = ack(home, name, None);
+    if settled > 0 {
+        tracing::info!(
+            tag = "#2299-session-settle",
+            agent = %name,
+            count = settled,
+            "session-reset: settled delivering rows to processed (preventing stale re-inject)"
+        );
+    }
+    settled
+}
+
 /// One bounded line in a [`ClearCompactResult`] — a COMPACT projection of an
 /// inbox message (never the full [`InboxMessage`], so a clear can never
 /// reintroduce the multi-megabyte blowup that a full-message drain could).
