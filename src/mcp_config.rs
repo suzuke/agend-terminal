@@ -197,7 +197,11 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     // Empirically verified (2026-06-11 live fleet spawn): the events fire as
     // documented, the TUI shows no artifacts (async), and this upsert
     // preserves pre-existing keys.
-    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1") {
+    // #hook-state-poc OR #2413 Shadow Observer (local plane): either flag wants the
+    // lifecycle hooks wired into the per-workspace settings (still NEVER ~/.claude).
+    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
+        || crate::daemon::shadow::enabled()
+    {
         if let Some(name) = instance_name {
             upsert_state_hooks(&path, name)?;
         }

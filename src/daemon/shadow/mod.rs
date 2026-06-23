@@ -107,7 +107,9 @@ pub fn push(agent: &str, ev: Evidence) {
 }
 
 /// Drain (remove + return, oldest-first) all evidence for `agent` — the reducer's
-/// consume path (Phase B).
+/// consume path (Phase B). Deferred consumer: the Phase-B reducer is OUT OF SCOPE for
+/// this spike, so nothing in prod drains yet (tests do); kept as the buffer's contract.
+#[allow(dead_code)]
 pub fn drain(agent: &str) -> Vec<Evidence> {
     let mut b = buffer().lock();
     b.get_mut(agent)
@@ -115,7 +117,9 @@ pub fn drain(agent: &str) -> Vec<Evidence> {
         .unwrap_or_default()
 }
 
-/// Non-destructive snapshot (oldest-first) — for samples / debug / tests.
+/// Non-destructive snapshot (oldest-first) — for samples / debug / tests. Deferred
+/// consumer (debug/sample surface) like [`drain`]; not yet read in prod this spike.
+#[allow(dead_code)]
 pub fn peek(agent: &str) -> Vec<Evidence> {
     buffer()
         .lock()
@@ -164,14 +168,28 @@ pub fn ingest_frame(frame: &ShadowFrame) -> Option<(String, Evidence)> {
     Some((agent, ev))
 }
 
-/// Start the unix-socket event server (one accept loop on a daemon thread). Removes a
-/// stale socket file first, binds, and processes one JSON frame per connection. No-op
-/// unless [`enabled`]. Errors are logged, never fatal — the observer must never wedge
-/// the daemon.
+/// Start the unix-socket event server (one accept loop on a daemon thread). No-op
+/// unless [`enabled`]. The unix-socket transport is the only platform-specific part;
+/// everything above (token/buffer/mapping) is cross-platform. The fleet runs on
+/// macOS/Linux, so Windows is a logged no-op (the flag is OFF there anyway).
 pub fn start(home: &Path) {
     if !enabled() {
         return;
     }
+    #[cfg(unix)]
+    start_unix(home);
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        tracing::info!(tag = "#shadow-observer",
+            "unix-socket event server unavailable on this platform — local plane disabled");
+    }
+}
+
+/// Removes a stale socket, binds, and processes one JSON frame per connection. Errors
+/// are logged, never fatal — the observer must never wedge the daemon.
+#[cfg(unix)]
+fn start_unix(home: &Path) {
     let path = socket_path(home);
     let _ = std::fs::remove_file(&path); // clear a stale socket from a prior run
     let listener = match std::os::unix::net::UnixListener::bind(&path) {
@@ -201,6 +219,7 @@ pub fn start(home: &Path) {
         .ok();
 }
 
+#[cfg(unix)]
 fn handle_conn(stream: std::os::unix::net::UnixStream) {
     use std::io::{BufRead, BufReader, Read};
     // One small JSON frame per connection. Bound the read (`Read::take` on the stream,

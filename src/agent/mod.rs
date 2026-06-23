@@ -810,6 +810,30 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("AGEND_HOME", h);
     }
 
+    // #2413 Shadow Observer — LOCAL plane (flag default-OFF via AGEND_SHADOW_OBSERVER).
+    // Inject a per-session unix-socket path + a freshly-minted 256-bit token scoped to
+    // THIS spawned claude, so its lifecycle hooks emit token-authenticated evidence to
+    // the daemon WITHOUT touching `~/.claude` global. claude-only (the hook-bearing
+    // backend). Set AFTER env_clear (like AGEND_INSTANCE_NAME) so isolation can't drop
+    // it; the hook subprocess inherits both vars from claude's env.
+    if crate::daemon::shadow::enabled()
+        && detected_backend.as_ref().is_some_and(|b| b.has_state_hooks())
+    {
+        if let Some(h) = *home {
+            match crate::daemon::shadow::new_session_token() {
+                Ok(token) => {
+                    crate::daemon::shadow::register(&token, name);
+                    cmd.env("AGENT_TERMINAL_SOCKET", crate::daemon::shadow::socket_path(h));
+                    cmd.env("AGENT_TERMINAL_SESSION", &token);
+                }
+                Err(e) => tracing::warn!(
+                    agent = %name, error = %e,
+                    "#shadow-observer: session token mint failed — local plane skipped for this spawn"
+                ),
+            }
+        }
+    }
+
     // Phase A Piece-3: GIT_EDITOR + friends = `true` (Unix no-op
     // binary that exits 0 without producing output). Prevents git
     // editor-needing operations from dropping the agent's PTY into

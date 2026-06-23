@@ -894,6 +894,10 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     let ctx = init_daemon_services(home, telegram_pre)?;
 
+    // #2413 Shadow Observer — local plane: start the unix-socket hook-event server
+    // (no-op unless AGEND_SHADOW_OBSERVER=1). Observe-only side-channel; never blocks.
+    crate::daemon::shadow::start(home);
+
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
     // `app::run_app` so owned `agend-terminal app` mode wires the IDENTICAL
