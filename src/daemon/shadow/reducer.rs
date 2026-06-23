@@ -39,17 +39,22 @@ const HOOK_FRESHNESS_MS: u64 = 600_000;
 /// that a genuinely-dropped terminal hook is caught within a few ticks.
 const RECONCILE_SILENCE_MS: u64 = 8_000;
 
-/// An open hook episode with NO fresh hook for this long is presumed phantom — its
-/// closing hook (Stop/PostToolUse) was dropped. Past this, a screen-Idle + sustained
-/// silence reconciles to Idle **even if `api_in_flight` is still true**: the lsof signal
-/// is a proven-unreliable idle *blocker* (lingering / CDN-shared sockets stay
-/// ESTABLISHED long after a turn ends — see SHADOW-OBSERVER-QUANT-2413.md), so it is
-/// WEAK-POSITIVE-ONLY and must never wedge an ended turn at Active forever (#2433 r6
-/// REJECT). A genuinely mid-API turn keeps emitting fresh hooks, so it never crosses
-/// this threshold — the headline mid-API false-idle win is preserved. This is the
-/// pure-time last-resort backstop. Shorter than [`HOOK_FRESHNESS_MS`] (the full
-/// screen-fallback): the episode is decayed to Idle well before the hook plane is
-/// considered wholly stale.
+/// An open hook episode with NO fresh hook for this long is one *precondition* (not the
+/// whole trigger) for the last-resort reconcile: its closing hook (Stop/PostToolUse) may
+/// have dropped. Past this, a screen-Idle + sustained silence reconciles to Idle **even
+/// if `api_in_flight` is still true** — the lsof signal is a proven-unreliable idle
+/// *blocker* (lingering / CDN-shared sockets stay ESTABLISHED long after a turn ends, see
+/// SHADOW-OBSERVER-QUANT-2413.md), so it is WEAK-POSITIVE-ONLY and must never wedge an
+/// ended turn at Active forever (#2433 r6).
+///
+/// Staleness ALONE is not sufficient, because a long model-think is ALSO screen-idle +
+/// productive-silent + hook-silent (claude fires no hooks between `TurnStarted` and the
+/// first tool/Stop, and streams no output while thinking) — reconciling on time alone
+/// would re-introduce the very false-idle this plane exists to beat (#2433 r6 round-2).
+/// So [`AgentRuntime::reconcile_to_idle`] additionally requires the episode to have
+/// PRODUCED output and then fallen quiet (a finished turn), never reconciling a
+/// produced-nothing-yet think. Shorter than [`HOOK_FRESHNESS_MS`] (the full
+/// screen-fallback): the produced-then-quiet episode decays before the plane is wholly stale.
 const EPISODE_STALE_MS: u64 = 300_000;
 
 /// Bound on the explain-trail kept per agent (last-N justifying evidence).
@@ -413,8 +418,22 @@ impl AgentRuntime {
         if !live.api_in_flight {
             return true;
         }
-        // Path 2: socket stuck true, but hooks long gone → dropped close; ignore api.
-        self.last_hook_ms > 0 && now_ms.saturating_sub(self.last_hook_ms) >= EPISODE_STALE_MS
+        // Path 2: socket stuck true (lingering). `api_in_flight` is weak-positive-only, so
+        // it must not BLOCK a reconcile forever — but a pure-time threshold alone would
+        // misclassify a genuine long model-think (which IS, by definition, screen-idle +
+        // productive-silence + an open episode — #2433 r6 round-2). Two conditions, both
+        // required:
+        //  (a) the hook plane is stale (no fresh hook for ≥ EPISODE_STALE_MS ⇒ a closing
+        //      Stop/PostToolUse was almost certainly dropped), AND
+        //  (b) the episode actually PRODUCED output and THEN fell quiet — i.e. the turn
+        //      delivered its answer and looks finished. A turn that has been silent SINCE
+        //      IT STARTED (last productive output predates `episode_since`) is still
+        //      thinking and STAYS Active no matter how long, preserving zero-false-idle.
+        let hook_stale =
+            self.last_hook_ms > 0 && now_ms.saturating_sub(self.last_hook_ms) >= EPISODE_STALE_MS;
+        let last_output_ms = now_ms.saturating_sub(live.productive_silent_ms);
+        let episode_produced_output = last_output_ms >= self.episode_since_ms;
+        hook_stale && episode_produced_output
     }
 }
 
@@ -581,6 +600,29 @@ mod tests {
             s.state,
             ObservedState::Idle,
             "fresh episode + live socket = mid-API in flight → stay Active, not reconciled"
+        );
+    }
+
+    /// #2433 r6 round-2 (verbatim reviewer test): a REAL long silent API turn — a turn
+    /// that has been thinking >300s with `api_in_flight=true` and has NEVER produced output
+    /// (productive-silence spans the whole episode) — must NOT be reconciled to Idle by the
+    /// last-resort path. Productive-silence is the `Thinking` signature, so the stale-hook
+    /// reconcile additionally requires the episode to have produced-then-quieted; a
+    /// produced-nothing-yet think stays Active no matter how long.
+    #[test]
+    fn review_pr2433_long_silent_api_turn_over_300s_currently_reconciles_idle() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
+        let live = Liveness {
+            api_in_flight: true,
+            productive_silent_ms: 301_000,
+            child_alive: true,
+        };
+        let s = rt.observe(ScreenSignal::Idle, &live, 1_000 + EPISODE_STALE_MS + 1);
+        assert_ne!(
+            s.state,
+            ObservedState::Idle,
+            "a real >300s silent API turn would be misclassified idle by the last-resort path"
         );
     }
 
