@@ -33,6 +33,17 @@ use std::time::{Duration, Instant};
 /// cost so the rate can be revisited.
 const SNAPSHOT_COALESCE_MS: u64 = 16;
 
+/// Max time the render thread blocks in [`OffthreadHandle::request_resize`] waiting
+/// for the parser to ACK that it applied the new dims (#2419 r6 rework). The caller
+/// fires SIGWINCH only AFTER this ack, so the child's post-SIGWINCH output is parsed
+/// at the new dims (closing the send-order ≠ process-order race the prior async send
+/// left open). Resize is rare and the parser acks within one burst (well under this),
+/// so the bound only trips if the parser is genuinely wedged — in which case the
+/// caller proceeds to SIGWINCH anyway, degrading to the pre-fix racy behavior (a
+/// brief flicker, self-healed by the next publish + the render backstop) rather than
+/// freezing the render thread. ~3 frames @30fps worst case, for a rare event.
+const RESIZE_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// `AGEND_OFFTHREAD_PARSE`: enable the off-thread parser path. Read once + cached
 /// (same pattern as `AGEND_FREEZE_INSTRUMENT` gates). Default OFF → zero behavior,
 /// no parser thread spawned, main-thread drain path unchanged.
@@ -58,7 +69,10 @@ fn instrument_enabled() -> bool {
 /// lives only on the main render thread.
 pub struct OffthreadHandle {
     snapshot: Arc<ArcSwap<GridSnapshot>>,
-    resize_tx: Sender<(u16, u16)>,
+    /// Each resize carries a per-call `bounded(1)` ack sender: the parser sends `()`
+    /// AFTER it applies the new dims, unblocking `request_resize` so the caller fires
+    /// SIGWINCH only once the parser is at the new size (#2419 r6 sync-resize rework).
+    resize_tx: Sender<(u16, u16, Sender<()>)>,
     /// Last dims sent to the parser thread — render-thread-only, so a steady-state
     /// frame doesn't spam identical resizes (the parser/alacritty would no-op them
     /// anyway, but this avoids the channel traffic).
@@ -88,15 +102,40 @@ impl OffthreadHandle {
         self.snapshot.load().history.len()
     }
 
-    /// Route a resize to the parser thread (which owns the `VTerm`). Deduped:
-    /// returns `false` (no send) when dims are unchanged since the last send.
-    /// A closed channel (parser thread gone) is treated as a no-op.
+    /// Route a resize to the parser thread (which owns the `VTerm`) and BLOCK
+    /// (bounded) until the parser has applied the new dims (#2419 r6 sync-resize
+    /// rework). Returns `true` when a resize was issued, `false` when it was a
+    /// dedup/no-op so the caller can skip the follow-up SIGWINCH (Finding 2).
+    ///
+    /// Deduped: returns `false` WITHOUT sending or blocking when dims are unchanged
+    /// since the last send — so a steady-state render frame never stalls here (the
+    /// backstop calls this every frame). A closed channel (parser thread gone) is
+    /// likewise a `false` no-op.
+    ///
+    /// Why synchronous: the prior async send only guaranteed send-order, not the
+    /// parser's PROCESS-order (its `select!` over data/resize is unbiased, and the
+    /// resize arm drains queued data at the OLD dims first). The caller fires SIGWINCH
+    /// right after this returns; blocking for the parser's ack makes the resize
+    /// APPLIED before SIGWINCH, so the child's post-SIGWINCH full-width output is
+    /// parsed at the new dims — the zoom half-width corruption fix. A wedged parser
+    /// must never freeze the render thread, so the ack wait is bounded by
+    /// [`RESIZE_ACK_TIMEOUT`]; on timeout the caller proceeds (degraded = a brief
+    /// flicker the next publish/backstop heals, not a freeze).
     pub fn request_resize(&self, cols: u16, rows: u16) -> bool {
         if self.last_sent_dims.get() == (cols, rows) {
             return false;
         }
         self.last_sent_dims.set((cols, rows));
-        self.resize_tx.send((cols, rows)).is_ok()
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+        if self.resize_tx.send((cols, rows, ack_tx)).is_err() {
+            return false; // parser thread gone → no-op (no SIGWINCH needed)
+        }
+        // Block until the parser acks the applied resize, bounded so a wedged parser
+        // can't freeze the render thread. `bounded(1)` → the parser's ack.send never
+        // blocks even if we already timed out and dropped `ack_rx` (its send just
+        // fails, harmlessly).
+        let _ = ack_rx.recv_timeout(RESIZE_ACK_TIMEOUT);
+        true
     }
 }
 
@@ -151,7 +190,7 @@ pub fn spawn_offthread_parser(
     let cols = vterm.cols();
     let rows = vterm.rows();
     let snapshot = Arc::new(ArcSwap::from_pointee(GridSnapshot::blank(cols, rows)));
-    let (resize_tx, resize_rx) = crossbeam_channel::unbounded::<(u16, u16)>();
+    let (resize_tx, resize_rx) = crossbeam_channel::unbounded::<(u16, u16, Sender<()>)>();
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     let publisher = Arc::clone(&snapshot);
 
@@ -179,7 +218,7 @@ pub fn spawn_offthread_parser(
 
 enum Event {
     Data(Result<Vec<u8>, crossbeam_channel::RecvError>),
-    Resize(Result<(u16, u16), crossbeam_channel::RecvError>),
+    Resize(Result<(u16, u16, Sender<()>), crossbeam_channel::RecvError>),
 }
 
 /// Flush the data backlog present RIGHT NOW into `vterm` at the CURRENT dims, then
@@ -221,6 +260,31 @@ fn drain_pending_data(
     false
 }
 
+/// Apply a resize on the parser thread, then ACK it (#2419 r6 sync-resize rework).
+/// Order: flush the queued backlog at the OLD dims (pre-resize bytes must not reorder
+/// behind the resize — #2404 r6 ②; correct because the caller is still blocked in
+/// `request_resize` so SIGWINCH has NOT fired and everything queued is genuinely
+/// pre-resize content) → apply the new dims → `ack.send` to unblock the render thread,
+/// which then fires SIGWINCH knowing the parser is already at the new size. Returns
+/// `true` if a cancel arrived during the drain (caller must exit). The ack is
+/// best-effort: `bounded(1)` so it never blocks, and a render thread that already hit
+/// [`RESIZE_ACK_TIMEOUT`] has dropped the receiver → the send fails harmlessly.
+fn apply_resize(
+    data_rx: &Receiver<Vec<u8>>,
+    cancel_rx: &Receiver<()>,
+    vterm: &mut VTerm,
+    cols: u16,
+    rows: u16,
+    ack: Sender<()>,
+) -> bool {
+    if drain_pending_data(data_rx, cancel_rx, vterm) {
+        return true;
+    }
+    vterm.resize(cols, rows);
+    let _ = ack.send(());
+    false
+}
+
 /// The parser thread body: block for an event, coalesce a burst within
 /// [`SNAPSHOT_COALESCE_MS`], apply all events to the owned `VTerm`, then publish
 /// ONE snapshot + one render wakeup. Exits when the data channel disconnects OR a
@@ -231,7 +295,7 @@ fn parser_loop(
     pane_id: usize,
     name: &str,
     data_rx: Receiver<Vec<u8>>,
-    resize_rx: Receiver<(u16, u16)>,
+    resize_rx: Receiver<(u16, u16, Sender<()>)>,
     cancel_rx: Receiver<()>,
     mut vterm: VTerm,
     publisher: Arc<ArcSwap<GridSnapshot>>,
@@ -249,6 +313,26 @@ fn parser_loop(
             return;
         }
 
+        // Resize has priority over a continuously-ready data arm too (#2419 r6): the
+        // unbiased `select!` could otherwise let a data flood starve a pending resize,
+        // stalling the render thread (blocked in `request_resize` on the ack) until the
+        // `RESIZE_ACK_TIMEOUT` fallback. Apply any queued resize first so its ack lands
+        // within one loop iteration even under flood, then publish the resized grid.
+        if let Ok((c, r, ack)) = resize_rx.try_recv() {
+            if apply_resize(&data_rx, &cancel_rx, &mut vterm, c, r, ack) {
+                return; // cancel observed mid-drain
+            }
+            publish(
+                &vterm,
+                &mut scrollback,
+                &publisher,
+                &wakeup_tx,
+                pane_id,
+                name,
+            );
+            continue;
+        }
+
         // Phase 1 — block for the first event of a burst. The cancel arm wakes an
         // idle parser immediately; the explicit check above covers the flood case.
         let first = select! {
@@ -263,11 +347,10 @@ fn parser_loop(
             // this is the backstop) → done.
             Event::Resize(Err(_)) => return,
             Event::Data(Ok(d)) => vterm.process(&d),
-            Event::Resize(Ok((c, r))) => {
-                if drain_pending_data(&data_rx, &cancel_rx, &mut vterm) {
+            Event::Resize(Ok((c, r, ack))) => {
+                if apply_resize(&data_rx, &cancel_rx, &mut vterm, c, r, ack) {
                     return;
                 }
-                vterm.resize(c, r);
             }
         }
 
@@ -305,11 +388,10 @@ fn parser_loop(
                     );
                     return;
                 }
-                Some(Event::Resize(Ok((c, r)))) => {
-                    if drain_pending_data(&data_rx, &cancel_rx, &mut vterm) {
+                Some(Event::Resize(Ok((c, r, ack)))) => {
+                    if apply_resize(&data_rx, &cancel_rx, &mut vterm, c, r, ack) {
                         return;
                     }
-                    vterm.resize(c, r);
                 }
                 Some(Event::Resize(Err(_))) => return,
             }
@@ -984,5 +1066,81 @@ mod tests {
             "queued bytes must be parsed at the OLD width before the resize; \
              a stray 'X' means the resize jumped ahead of queued data"
         );
+    }
+
+    /// #2419 r6 REWORK — the CORE sync-resize race regression (the half-width zoom
+    /// corruption). The prior async `request_resize` only ordered the SEND; the parser's
+    /// unbiased `select!` + old-dims `drain_pending_data` could still parse the child's
+    /// post-SIGWINCH (full-width) output at the STALE dims (r6 proved it with a 256-iter
+    /// probe — send-order != process-order). The fix makes `request_resize` a SYNCHRONOUS
+    /// barrier: it returns only AFTER the parser applied the new dims (ack), so the
+    /// "post-SIGWINCH" output — sent strictly AFTER it returns — is parsed at the NEW
+    /// dims. Looped so the barrier holds EVERY iteration (deterministic GREEN — the ack
+    /// happens-before makes it non-flaky, unlike a bare thread-timing assert).
+    ///
+    /// Width-sensitive probe: 20 'X' then cursor-home + erase-line. At the NEW width 5 the
+    /// 20 X's WRAP to 4 full rows, so erase-line (cursor at row 0) clears ONLY row 0 →
+    /// X's remain in rows 1-3. At the OLD width 20 (the race bug) the 20 X's fill row 0
+    /// exactly → erase-line blanks the whole line → NO X survives anywhere. So "an X below
+    /// row 0" proves the post-barrier data was parsed at the NEW dims.
+    ///
+    /// NEUTER-RED: drop the `ack_rx.recv_timeout` wait in `request_resize` (revert to the
+    /// async send). Then it returns before the parser applies the resize, so the payload
+    /// reaches `data_rx` first; whichever `select!` arm wins parses it at the OLD width
+    /// (the data arm directly, or the resize arm via `drain_pending_data`) → erase-line
+    /// clears the single full row → no X → RED across iterations (r6's probe methodology).
+    #[test]
+    fn request_resize_sync_barrier_makes_post_sigwinch_data_parse_at_new_dims() {
+        // The neuter goes RED with high per-iteration probability (the payload is queued
+        // before the parser processes the resize), so this count reliably catches it
+        // while the fix stays deterministic GREEN.
+        for iter in 0..128 {
+            let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+            let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+            let vt = VTerm::new(20, 6);
+            let h = spawn_offthread_parser(1, "barrier".to_string(), data_rx, vt, wake_tx)
+                .expect("parser thread spawns");
+
+            // SYNCHRONOUS barrier: returns only after the parser is at 5x6 (the ack).
+            assert!(h.request_resize(5, 6), "iter {iter}: resize must be issued");
+
+            // "post-SIGWINCH" output: sent strictly AFTER the barrier → MUST parse at 5.
+            data_tx
+                .send(b"XXXXXXXXXXXXXXXXXXXX\x1b[H\x1b[K".to_vec())
+                .unwrap();
+
+            // Await the publish reflecting the payload at the new width (bounded).
+            let mut snap = h.load();
+            let mut got = false;
+            for _ in 0..10 {
+                if wake_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    break;
+                }
+                snap = h.load();
+                if snap.cols == 5 && snap.cells.iter().any(|c| c.c == 'X') {
+                    got = true;
+                    break;
+                }
+            }
+            assert!(
+                got && snap.cols == 5,
+                "iter {iter}: snapshot must reflect a width-5 parse of post-barrier data; \
+                 got {}x{}",
+                snap.cols,
+                snap.rows
+            );
+            // Decisive: at width 5 the X's wrapped below row 0, so erase-line (which
+            // cleared only row 0) left X's in rows 1-3. At the OLD width 20 (the race bug)
+            // the single full row was blanked → no X. An X below row 0 proves new-dims parse.
+            let cols = snap.cols as usize;
+            let x_below_row0 = (1..snap.rows as usize)
+                .any(|r| (0..cols).any(|c| snap.cells[r * cols + c].c == 'X'));
+            assert!(
+                x_below_row0,
+                "iter {iter}: post-barrier data was parsed at the OLD width (the race) — \
+                 erase-line blanked the single full row and no wrapped X survived"
+            );
+            drop(data_tx);
+        }
     }
 }

@@ -183,11 +183,15 @@ impl Pane {
         }
     }
 
-    /// #offthread-zoom: apply a geometry resize to whichever VTerm actually renders.
-    /// Off-thread the parser thread owns the live VTerm, so route via the handle's
-    /// `request_resize` (caller must do this BEFORE the PTY resize, so the parser's
-    /// resize event is queued ahead of the child's re-rendered output — else the parser
-    /// parses that output at the stale pre-resize dims, the zoom half-width corruption).
+    /// #offthread-zoom (#2419): apply a geometry resize to whichever VTerm actually
+    /// renders. Off-thread the parser thread owns the live VTerm, so route via the
+    /// handle's `request_resize`, which is a SYNCHRONOUS barrier — it BLOCKS until the
+    /// parser has applied the new dims. The caller MUST call this before the PTY resize
+    /// (SIGWINCH): because the barrier guarantees the parser is already at the new dims
+    /// when this returns, the child's post-SIGWINCH re-rendered output is then parsed at
+    /// the new dims, not the stale pre-resize dims (the zoom half-width corruption). The
+    /// prior async send only ordered the SEND, not the parser's unbiased PROCESS-order,
+    /// so the post-SIGWINCH output could still be parsed half-width (r6 REJECT @bd341d05).
     /// The idle main-thread `vterm` is resized too, only so its dims keep tracking the
     /// layout for the size-change guard at the call sites (a render no-op off-thread).
     /// Flag-OFF: `vterm` IS the live render path → byte-identical to a bare resize.

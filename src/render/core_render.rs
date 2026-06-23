@@ -654,8 +654,17 @@ fn render_pane(
         let snap = handle.load();
         if let Some(d) = crate::render::resize::ResizeDecision::needed(inner, snap.cols, snap.rows)
         {
-            handle.request_resize(d.cols, d.rows);
-            pane.resize_pty(registry, d.cols, d.rows);
+            // #2419 (r6 Finding 2): fire SIGWINCH only when the resize actually changed
+            // the parser's dims. `request_resize` is a synchronous barrier (blocks until
+            // the parser is at the new dims) AND deduped on `last_sent_dims` — when dims
+            // are unchanged it returns `false` WITHOUT sending or blocking, so a
+            // steady-state frame neither stalls here nor re-SIGWINCHes the child. The old
+            // unconditional `resize_pty` re-triggered a child redraw EVERY frame until the
+            // snapshot caught up, repeatedly feeding fresh full-width output into the
+            // resize race it was meant to settle.
+            if handle.request_resize(d.cols, d.rows) {
+                pane.resize_pty(registry, d.cols, d.rows);
+            }
         }
         snap.render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
         snap.cursor
