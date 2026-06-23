@@ -85,9 +85,14 @@ pub fn resolve(token: &str) -> Option<String> {
 }
 
 /// Drop an agent's token(s) on despawn/delete so the registry doesn't grow across
-/// churn and a recycled name can't inherit a dead session's binding.
+/// churn and a recycled name can't inherit a dead session's binding. Also clears
+/// the per-agent Evidence buffer + reducer runtime so a same-name respawn starts
+/// CLEAN (no inherited open episode / stale evidence) — the despawn hook is the
+/// lifecycle point that keeps the name-keyed reducer state honest.
 pub fn forget_agent(agent: &str) {
     tokens().lock().retain(|_, a| a != agent);
+    buffer().lock().remove(agent);
+    runtimes().lock().remove(agent);
 }
 
 // ── per-agent evidence buffer ────────────────────────────────────────────────────
@@ -108,9 +113,8 @@ pub fn push(agent: &str, ev: Evidence) {
 }
 
 /// Drain (remove + return, oldest-first) all evidence for `agent` — the reducer's
-/// consume path (Phase B). Deferred consumer: the Phase-B reducer is OUT OF SCOPE for
-/// this spike, so nothing in prod drains yet (tests do); kept as the buffer's contract.
-#[allow(dead_code)]
+/// consume path (Phase B). Consumed by [`observe`] (the per-tick driver folds the
+/// drained evidence into the agent's persistent reducer runtime).
 pub fn drain(agent: &str) -> Vec<Evidence> {
     let mut b = buffer().lock();
     b.get_mut(agent)
@@ -127,6 +131,37 @@ pub fn peek(agent: &str) -> Vec<Evidence> {
         .get(agent)
         .map(|q| q.iter().cloned().collect())
         .unwrap_or_default()
+}
+
+// ── per-agent reducer runtime (Phase B driver) ─────────────────────────────────────
+
+/// Persistent per-agent reducer accumulators. Keyed by NAME (consistent with the
+/// Evidence buffer + token registry above); [`forget_agent`] drops the entry on despawn
+/// so a same-name respawn starts with a fresh [`reducer::AgentRuntime`].
+fn runtimes() -> &'static Mutex<HashMap<String, reducer::AgentRuntime>> {
+    static R: OnceLock<Mutex<HashMap<String, reducer::AgentRuntime>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fold `agent`'s buffered hook Evidence into its persistent reducer runtime, then
+/// derive the [`reducer::ObservedStatus`] from the current screen + liveness snapshot.
+/// The per-tick driver ([`crate::daemon::per_tick::shadow_observe`]) calls this under the
+/// `AGEND_SHADOW_OBSERVER` flag and hangs the result on `AgentCore.observed_status`
+/// (purely ADDITIVE — never rewrites `agent_state`). Draining here is the buffer's sole
+/// consume path: each tick takes the new hook events and advances the episode model.
+pub fn observe(
+    agent: &str,
+    screen: reducer::ScreenSignal,
+    live: &reducer::Liveness,
+    now_ms: u64,
+) -> reducer::ObservedStatus {
+    let evidence = drain(agent);
+    let mut rts = runtimes().lock();
+    let rt = rts.entry(agent.to_string()).or_default();
+    for ev in &evidence {
+        rt.ingest(ev);
+    }
+    rt.observe(screen, live, now_ms)
 }
 
 fn now_ms() -> u64 {

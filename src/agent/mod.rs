@@ -36,6 +36,14 @@ pub struct AgentCore {
     /// reconcile pattern-state against live LLM-socket activity (false-idle
     /// detection) WITHOUT clobbering `agent_state`. Default = no signal yet.
     pub(crate) api_activity: ApiActivity,
+    /// #2413 Phase B (Shadow Observer): the reducer's fused `ObservedStatus`
+    /// (hook-plane Evidence + the screen baseline + lsof liveness → one state
+    /// with confidence/authority + decay/liveness backstop). Purely ADDITIVE —
+    /// it NEVER rewrites `agent_state`; a consumer diffs the two under this same
+    /// `core.lock()` (that diff IS the quantification). `None` until the first
+    /// per-tick reduce under `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ stays
+    /// `None`, zero behaviour change). Written by `per_tick::shadow_observe`.
+    pub(crate) observed_status: Option<crate::daemon::shadow::reducer::ObservedStatus>,
 }
 
 /// #2413 Phase 1: out-of-path "is this agent mid-LLM-call?" signal, derived by
@@ -1255,6 +1263,7 @@ pub fn spawn_agent(
         state: StateTracker::for_agent(detected_backend.as_ref(), name),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
 
     // #1441: resolve the single authoritative instance ID (same source as inbox),
@@ -1618,6 +1627,7 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
             state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
             health: HealthTracker::new(),
             api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
         }));
 
         let dismiss: Vec<(String, Vec<u8>)> = detected_backend
@@ -3102,6 +3112,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let published_state = core.lock().state.published_handle();
     AgentHandle {

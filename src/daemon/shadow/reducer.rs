@@ -19,11 +19,12 @@
 //! machine is unit-testable without a daemon; the per-tick driver (OUT OF SCOPE here)
 //! supplies the snapshot under one `core.lock()`. Runs only under `AGEND_SHADOW_OBSERVER`.
 
-// The public reducer surface (ObservedStatus / AgentRuntime / ScreenSignal / Liveness)
-// is consumed by the Phase-B per-tick driver + the additive list_instances surface
-// (SHADOW-OBSERVER-ARCH-2413.md §6 step 3) — not yet wired, so it is dead in prod until
-// then (flag-OFF anyway). The tests exercise the whole surface. Narrow/remove this when
-// the driver lands. Mirrors the Phase-A deferred-consumer allows on shadow::{drain,peek}.
+// The core reducer surface (ObservedStatus / AgentRuntime / ScreenSignal / Liveness) is
+// now consumed by the Phase-B per-tick driver (`per_tick::shadow_observe` →
+// `shadow::observe`) + the additive list_instances surface (SHADOW-OBSERVER-ARCH-2413.md
+// §6 step 3). The residual under this allow is `ObservedState::coarse()` — reserved for
+// the §5 quantification harness's coarse-bucket (Idle/Active/WaitingForUser) reporting,
+// which lands next. Narrow to that one item (or drop the allow) once the harden lands.
 #![allow(dead_code)]
 
 use super::evidence::{Authority, Confidence, Evidence, EvidenceKind};

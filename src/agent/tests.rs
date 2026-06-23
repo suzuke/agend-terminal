@@ -377,6 +377,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let agent_name = format!("sweep-test-{}", pid_file.display());
     let handle = AgentHandle {
@@ -985,6 +986,7 @@ fn write_to_agent_typed_uses_timeout() {
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let published_state = core.lock().state.published_handle();
     let handle = AgentHandle {
@@ -1564,6 +1566,7 @@ fn readback_test_core(feed: &[u8]) -> Arc<CoreMutex<AgentCore>> {
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }))
 }
 
@@ -1709,6 +1712,7 @@ fn pty_read_error_triggers_cleanup() {
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
 
     let agent_name = "read-err-test";
@@ -1832,6 +1836,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let mut cmd = portable_pty::CommandBuilder::new("sh");
     cmd.arg("-c");
@@ -2002,6 +2007,7 @@ fn run_pty_read_loop_for_r8(
         state: StateTracker::new(Some(&backend)),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let ctx = PtyReadContext {
         name: "r8-dismiss-test".to_string(),
@@ -2195,6 +2201,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     AgentHandle {
         id,

@@ -777,6 +777,13 @@ pub(crate) fn build_default_handlers(
         // claimed/in_progress tasks back to Open + clears the work-stuck latch.
         // Runs in both run_core and app mode (live daemon is app-mode).
         Box::new(per_tick::ReclaimHandler::new(30, work_stuck_latch)),
+        // #2413 Phase B (Shadow Observer): per-tick reduce — fold each agent's buffered
+        // hook Evidence + screen baseline + lsof liveness into an additive
+        // `observed_status` (never rewrites `agent_state`). Flag-OFF default
+        // (`AGEND_SHADOW_OBSERVER=1`) ⇒ a single `enabled()` check then early-return, so
+        // this is a no-op for a default fleet. Daemon-only telemetry → allowlisted out of
+        // app mode (the hook socket server it consumes is started in `run_core`).
+        Box::new(per_tick::ShadowObserveHandler::new()),
     ]
 }
 
