@@ -274,6 +274,7 @@ mod tests {
             subscribers: Vec::new(),
             state: st,
             health: crate::health::HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
         };
         let core = Arc::new(crate::sync_audit::CoreMutex::new(core));
         let published_state = core.lock().state.published_handle();

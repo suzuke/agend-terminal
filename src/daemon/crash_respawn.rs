@@ -473,6 +473,7 @@ mod deleted_gate_tests_1913 {
             subscribers: Vec::new(),
             state: crate::state::StateTracker::new(None),
             health: crate::health::HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
         }));
         AgentHandle {
             id: InstanceId::parse(VICTIM_UUID).expect("uuid"),

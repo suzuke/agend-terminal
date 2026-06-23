@@ -391,6 +391,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     if !attached_mode {
         crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
         crate::instance_monitor::spawn_monitor_tick(home.clone(), Arc::clone(&registry));
+        // #2413 Phase 1: out-of-path lsof API-activity probe (feeds
+        // AgentCore::api_activity for false-idle detection). Self-disables if
+        // `lsof` is absent.
+        crate::api_activity_probe::spawn(Arc::clone(&registry));
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.

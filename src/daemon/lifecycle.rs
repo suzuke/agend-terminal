@@ -340,6 +340,7 @@ mod tests {
             subscribers: Vec::new(),
             state: crate::state::StateTracker::new(None),
             health: crate::health::HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
         }));
         crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),

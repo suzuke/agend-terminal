@@ -297,6 +297,7 @@ pub(crate) fn mock_live_agent_no_context(
         subscribers: Vec::new(),
         state: crate::state::StateTracker::new(None),
         health: crate::health::HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
     }));
     let handle = crate::agent::AgentHandle {
         id: crate::types::InstanceId::default(),

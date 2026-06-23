@@ -1360,6 +1360,10 @@ fn build_tick_infrastructure(
     }
     router::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&ctx.registry));
+    // #2413 Phase 1: out-of-path lsof API-activity probe (feeds
+    // AgentCore::api_activity for false-idle detection). Self-disables if
+    // `lsof` is absent.
+    crate::api_activity_probe::spawn(Arc::clone(&ctx.registry));
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a

@@ -21,7 +21,15 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
         .values()
         .map(|handle| {
             let name = handle.name.to_string();
-            let (agent_state, health_state, blocked_reason, blocked_note, context) = {
+            let (
+                agent_state,
+                health_state,
+                blocked_reason,
+                blocked_note,
+                context,
+                api_in_flight,
+                last_api_activity_at,
+            ) = {
                 let c = handle.core.lock();
                 (
                     c.state.get_state().display_name().to_string(),
@@ -35,6 +43,11 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // ("pattern" = the agent's own statusline, "transcript" =
                     // token-usage estimate). Absent = honestly unknown.
                     c.state.resolved_context(),
+                    // #2413 Phase 1: out-of-path API-activity signal, read under the
+                    // SAME lock as agent_state so a consumer can reconcile the two
+                    // atomically (false-idle = agent_state=="idle" && api_in_flight).
+                    c.api_activity.in_flight,
+                    c.api_activity.last_active_epoch_ms,
                 )
             };
             let entry = json!({
@@ -48,6 +61,10 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "blocked_note": blocked_note,
                 "context_pct": context.map(|(pct, _)| pct),
                 "context_source": context.map(|(_, source)| source),
+                // #2413 Phase 1: live LLM-socket activity (out-of-path lsof probe).
+                // api_in_flight=true while pattern-state is "idle" ⇒ false-idle.
+                "api_in_flight": api_in_flight,
+                "last_api_activity_at": last_api_activity_at,
                 "kind": "managed",
             });
             (name, entry)

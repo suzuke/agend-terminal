@@ -30,6 +30,27 @@ pub struct AgentCore {
     pub(crate) subscribers: Vec<crossbeam_channel::Sender<Vec<u8>>>,
     pub(crate) state: StateTracker,
     pub(crate) health: HealthTracker,
+    /// #2413 Phase 1: out-of-path API-activity signal, fed by the
+    /// `api_activity_probe` daemon thread (one batched `lsof` per tick). Read
+    /// alongside `state` under this same `core.lock()` so `list_instances` can
+    /// reconcile pattern-state against live LLM-socket activity (false-idle
+    /// detection) WITHOUT clobbering `agent_state`. Default = no signal yet.
+    pub(crate) api_activity: ApiActivity,
+}
+
+/// #2413 Phase 1: out-of-path "is this agent mid-LLM-call?" signal, derived by
+/// the `api_activity_probe` from the kernel socket table (never touches the
+/// agent↔LLM connection). Purely ADDITIVE — it never rewrites `agent_state`; a
+/// consumer derives false-idle as `agent_state == "idle" && in_flight`.
+#[derive(Debug, Clone, Default)]
+pub struct ApiActivity {
+    /// The agent's process tree currently holds ≥1 ESTABLISHED socket to an LLM
+    /// endpoint (precise, via the resolved LLM-IP table) — or, when DNS is
+    /// stale, to any public :443 host (graceful raw-:443 fallback).
+    pub in_flight: bool,
+    /// Epoch-ms of the most recent tick where `in_flight` was observed true.
+    /// `None` = never observed active (or no probe has run yet).
+    pub last_active_epoch_ms: Option<u64>,
 }
 
 /// Handle to interact with an agent.
@@ -1204,6 +1225,7 @@ pub fn spawn_agent(
         // detector recomputes the SAME token the agent is told to emit.
         state: StateTracker::for_agent(detected_backend.as_ref(), name),
         health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
     }));
 
     // #1441: resolve the single authoritative instance ID (same source as inbox),
@@ -1566,6 +1588,7 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
             subscribers: Vec::new(),
             state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
             health: HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
         }));
 
         let dismiss: Vec<(String, Vec<u8>)> = detected_backend
@@ -3049,6 +3072,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         subscribers: Vec::new(),
         state: StateTracker::new(None),
         health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
     }));
     let published_state = core.lock().state.published_handle();
     AgentHandle {

@@ -8,6 +8,7 @@ mod agent;
 mod agent_ops;
 mod agy_workspace;
 mod api;
+mod api_activity_probe;
 mod app;
 mod auth_cookie;
 mod backend;
