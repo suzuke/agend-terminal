@@ -4027,7 +4027,11 @@ instances:
             );
         }
         assert!(
-            srl_floor.get(name).copied().expect("floor present after override") > floor,
+            srl_floor
+                .get(name)
+                .copied()
+                .expect("floor present after override")
+                > floor,
             "the floor ADVANCES to the latest consumed hook seq (forward progress)"
         );
         std::fs::remove_dir_all(&home).ok();
