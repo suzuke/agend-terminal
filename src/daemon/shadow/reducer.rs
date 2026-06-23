@@ -402,14 +402,15 @@ impl AgentRuntime {
     ///
     /// Two ways an open episode is contradicted:
     /// 1. **No live socket either** (`!api_in_flight`) — screen-idle + no-api + silence is
-    ///    the original clean contradiction: the turn is genuinely over.
-    /// 2. **Socket stuck, but the hook plane has gone STALE** (no fresh hook for
-    ///    ≥ [`EPISODE_STALE_MS`]) — the closing hook was dropped AND `api_in_flight` is
-    ///    stuck `true` on a lingering socket (the #2433 r6 REJECT: the quantification
-    ///    itself proved sockets stay ESTABLISHED after a turn). Here `api_in_flight` is
-    ///    WEAK-POSITIVE-ONLY and is IGNORED — it must never *block* an idle reconcile, or
-    ///    an ended turn wedges at Active forever. A real mid-API turn keeps FRESH hooks,
-    ///    so it never reaches this path; the headline mid-API false-idle win is preserved.
+    ///    the clean contradiction: the turn is genuinely over (catches a dropped
+    ///    `Stop`/`PostToolUse` even on an open tool span — a dead socket means no work).
+    /// 2. **Socket stuck `true`, but corroborated finished** — `api_in_flight` lingers
+    ///    ESTABLISHED after a turn (and can false-positive on CDN-shared telemetry IPs;
+    ///    the quantification proved this), so it is WEAK-POSITIVE-ONLY: it must neither
+    ///    *block* an idle reconcile forever NOR be ignored so eagerly that a still-working
+    ///    turn reads Idle. Reconcile only with (a) no open tool span, (b) a stale hook
+    ///    plane (≥ [`EPISODE_STALE_MS`] ⇒ dropped close), and (c) produced-then-quiet (a
+    ///    delivered response). #2433 r6 rounds 1-3 pin each of these.
     fn reconcile_to_idle(&self, screen: ScreenSignal, live: &Liveness, now_ms: u64) -> bool {
         if screen != ScreenSignal::Idle || live.productive_silent_ms < RECONCILE_SILENCE_MS {
             return false;
@@ -419,21 +420,33 @@ impl AgentRuntime {
             return true;
         }
         // Path 2: socket stuck true (lingering). `api_in_flight` is weak-positive-only, so
-        // it must not BLOCK a reconcile forever — but a pure-time threshold alone would
-        // misclassify a genuine long model-think (which IS, by definition, screen-idle +
-        // productive-silence + an open episode — #2433 r6 round-2). Two conditions, both
-        // required:
-        //  (a) the hook plane is stale (no fresh hook for ≥ EPISODE_STALE_MS ⇒ a closing
-        //      Stop/PostToolUse was almost certainly dropped), AND
-        //  (b) the episode actually PRODUCED output and THEN fell quiet — i.e. the turn
-        //      delivered its answer and looks finished. A turn that has been silent SINCE
-        //      IT STARTED (last productive output predates `episode_since`) is still
-        //      thinking and STAYS Active no matter how long, preserving zero-false-idle.
+        // it must not BLOCK a reconcile forever — but it also must not be ignored so
+        // eagerly that a still-working turn is called Idle. THREE conditions, all required:
+        //  (a) NO open tool span — an open tool can legitimately run SILENTLY for minutes
+        //      (a long Bash/build), so a live socket + open tool = genuinely `ToolUse`; we
+        //      never reconcile it here (#2433 r6 round-3). A dropped `PostToolUse` is still
+        //      caught by Path 1 once the socket dies (no-api is a clean contradiction).
+        //      Empirically a *running* tool reads screen=Working (verified: `sleep 22`
+        //      held agent_state=`thinking` for its whole 23s — SHADOW-OBSERVER-QUANT-2413),
+        //      so the screen==Idle precondition above already blocks reconcile for a live
+        //      tool; (a) only guards the artificial screen==Idle + open-tool worst-case.
+        //      DOCUMENTED RESIDUAL (the out-of-path limit, only an in-path proxy fully
+        //      closes it): if `PostToolUse` drops WHILE the socket lingers (api stuck true)
+        //      and the screen has returned to Idle, the span stays `ToolUse` until the next
+        //      hook (Stop / next `TurnStarted` / `PromptReady`) — bounded + self-healing.
+        //  (b) the hook plane is stale (no fresh hook for ≥ EPISODE_STALE_MS ⇒ a closing
+        //      Stop was almost certainly dropped), AND
+        //  (c) the episode actually PRODUCED output and THEN fell quiet — i.e. the turn
+        //      delivered its answer and looks finished. A turn silent SINCE IT STARTED
+        //      (last productive output predates `episode_since`) is still thinking and
+        //      STAYS Active no matter how long (#2433 r6 round-2) — productive-silence is
+        //      the `Thinking` signature, so reconciling on it alone would re-create the
+        //      very false-idle this plane exists to beat.
         let hook_stale =
             self.last_hook_ms > 0 && now_ms.saturating_sub(self.last_hook_ms) >= EPISODE_STALE_MS;
         let last_output_ms = now_ms.saturating_sub(live.productive_silent_ms);
         let episode_produced_output = last_output_ms >= self.episode_since_ms;
-        hook_stale && episode_produced_output
+        self.tool_open.is_none() && hook_stale && episode_produced_output
     }
 }
 
@@ -623,6 +636,37 @@ mod tests {
             s.state,
             ObservedState::Idle,
             "a real >300s silent API turn would be misclassified idle by the last-resort path"
+        );
+    }
+
+    /// #2433 r6 round-3 (verbatim reviewer test): an OPEN tool span (a long-running silent
+    /// tool — e.g. a multi-minute Bash/build) with a live API socket must stay `ToolUse`,
+    /// NOT be reconciled to Idle just because the turn produced output earlier. A live
+    /// socket + open tool span = genuinely working; the api-stuck last-resort excludes open
+    /// tools (a dropped `PostToolUse` is still caught by the no-api Path 1 when the socket
+    /// dies).
+    #[test]
+    fn review_pr2433_long_silent_open_tool_after_output_stays_tooluse() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
+        rt.ingest(&hook(EvidenceKind::Responding, 2_000));
+        rt.ingest(&hook(
+            EvidenceKind::ToolStarted {
+                name: Some("Bash".into()),
+            },
+            3_000,
+        ));
+        let now_ms = 3_000 + EPISODE_STALE_MS + 1;
+        let live = Liveness {
+            api_in_flight: true,
+            productive_silent_ms: now_ms - 2_000,
+            child_alive: true,
+        };
+        let s = rt.observe(ScreenSignal::Idle, &live, now_ms);
+        assert_eq!(
+            s.state,
+            ObservedState::ToolUse,
+            "an open tool span with a live API socket must not be reconciled to idle just because prior output exists"
         );
     }
 
