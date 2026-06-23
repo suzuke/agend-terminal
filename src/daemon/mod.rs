@@ -22,6 +22,8 @@ pub(crate) mod heartbeat_pair;
 pub(crate) mod helper_staleness_watchdog;
 pub mod hook_shadow;
 pub(crate) mod idle_watchdog;
+/// #2413 Shadow Observer — local plane (claude hooks side-channel). Spike, flag-OFF.
+pub mod shadow;
 pub(crate) mod inbox_stuck_watchdog;
 pub(crate) mod inject_delivery;
 pub(crate) mod lifecycle;
