@@ -35,6 +35,8 @@ pub(crate) mod recovery_shadow;
 pub(crate) mod restart;
 pub(crate) mod retention;
 pub(crate) mod router;
+/// #2413 Shadow Observer — local plane (claude hooks side-channel). Spike, flag-OFF.
+pub mod shadow;
 pub(crate) mod supervisor;
 pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
@@ -775,6 +777,13 @@ pub(crate) fn build_default_handlers(
         // claimed/in_progress tasks back to Open + clears the work-stuck latch.
         // Runs in both run_core and app mode (live daemon is app-mode).
         Box::new(per_tick::ReclaimHandler::new(30, work_stuck_latch)),
+        // #2413 Phase B (Shadow Observer): per-tick reduce — fold each agent's buffered
+        // hook Evidence + screen baseline + lsof liveness into an additive
+        // `observed_status` (never rewrites `agent_state`). Flag-OFF default
+        // (`AGEND_SHADOW_OBSERVER=1`) ⇒ a single `enabled()` check then early-return, so
+        // this is a no-op for a default fleet. Daemon-only telemetry → allowlisted out of
+        // app mode (the hook socket server it consumes is started in `run_core`).
+        Box::new(per_tick::ShadowObserveHandler::new()),
     ]
 }
 
@@ -891,6 +900,10 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     };
 
     let ctx = init_daemon_services(home, telegram_pre)?;
+
+    // #2413 Shadow Observer — local plane: start the unix-socket hook-event server
+    // (no-op unless AGEND_SHADOW_OBSERVER=1). Observe-only side-channel; never blocks.
+    crate::daemon::shadow::start(home);
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with

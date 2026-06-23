@@ -29,6 +29,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 context,
                 api_in_flight,
                 last_api_activity_at,
+                observed_status,
             ) = {
                 let c = handle.core.lock();
                 (
@@ -48,6 +49,11 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // atomically (false-idle = agent_state=="idle" && api_in_flight).
                     c.api_activity.in_flight,
                     c.api_activity.last_active_epoch_ms,
+                    // #2413 Phase B: the reducer's fused status, read under the SAME
+                    // lock as agent_state so a consumer can diff them atomically (the
+                    // observed-vs-raw diff IS the quantification). None unless the
+                    // per-tick reduce ran under AGEND_SHADOW_OBSERVER=1.
+                    c.observed_status.clone(),
                 )
             };
             let entry = json!({
@@ -65,6 +71,9 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 // api_in_flight=true while pattern-state is "idle" ⇒ false-idle.
                 "api_in_flight": api_in_flight,
                 "last_api_activity_at": last_api_activity_at,
+                // #2413 Phase B: additive reducer status (state/confidence/authority/
+                // evidence-trail/since_ms). null unless the Shadow Observer flag is on.
+                "observed_status": observed_status,
                 "kind": "managed",
             });
             (name, entry)

@@ -141,6 +141,34 @@ pub fn home_dir() -> PathBuf {
 ///
 /// Supports: `KEY=value`, `export KEY=value`, single/double quoted values.
 /// Quoted values preserve `#` inside; unquoted values strip inline comments.
+/// #2413 Shadow Observer local plane: emit one token-authenticated hook frame to the
+/// per-session unix socket (`AGENT_TERMINAL_SOCKET`), if this process was spawned with
+/// a session token (`AGENT_TERMINAL_SESSION`). Best-effort + observe-only: any error is
+/// swallowed so the hook never blocks or fails the agent's action. Unix-only (the
+/// socket transport); a no-op elsewhere.
+#[cfg(unix)]
+fn emit_shadow_frame(payload: &serde_json::Value) {
+    let (Ok(sock), Ok(token)) = (
+        std::env::var("AGENT_TERMINAL_SOCKET"),
+        std::env::var("AGENT_TERMINAL_SESSION"),
+    ) else {
+        return; // not a shadow-observed session
+    };
+    let frame = serde_json::json!({
+        "token": token,
+        "hook_event_name": payload["hook_event_name"],
+        "notification_type": payload["notification_type"],
+        "tool_name": payload["tool_name"],
+    });
+    use std::io::Write;
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
+        let _ = stream.write_all(format!("{frame}\n").as_bytes());
+    }
+}
+
+#[cfg(not(unix))]
+fn emit_shadow_frame(_payload: &serde_json::Value) {}
+
 fn load_dotenv() {
     let env_path = home_dir().join(".env");
     if !env_path.exists() {
@@ -850,6 +878,12 @@ fn main() -> anyhow::Result<()> {
             if let Err(e) = api::call(&home, &req) {
                 eprintln!("hook-event: daemon unreachable ({e}) — event dropped (shadow-mode)");
             }
+            // #2413 Shadow Observer (local plane): if this spawn carries a per-session
+            // socket+token (AGENT_TERMINAL_SOCKET / AGENT_TERMINAL_SESSION in env, set
+            // at spawn for an observed claude), ALSO emit a token-authenticated frame to
+            // the shadow event server — the evidence channel, distinct from the api call
+            // above. Best-effort, observe-only.
+            emit_shadow_frame(&v);
             return Ok(());
         }
         Some(Commands::Inject { name, text }) => {
