@@ -183,6 +183,21 @@ impl Pane {
         }
     }
 
+    /// #offthread-zoom: apply a geometry resize to whichever VTerm actually renders.
+    /// Off-thread the parser thread owns the live VTerm, so route via the handle's
+    /// `request_resize` (caller must do this BEFORE the PTY resize, so the parser's
+    /// resize event is queued ahead of the child's re-rendered output — else the parser
+    /// parses that output at the stale pre-resize dims, the zoom half-width corruption).
+    /// The idle main-thread `vterm` is resized too, only so its dims keep tracking the
+    /// layout for the size-change guard at the call sites (a render no-op off-thread).
+    /// Flag-OFF: `vterm` IS the live render path → byte-identical to a bare resize.
+    pub fn apply_geometry_resize(&mut self, cols: u16, rows: u16) {
+        if let Some(handle) = &self.offthread {
+            handle.request_resize(cols, rows);
+        }
+        self.vterm.resize(cols, rows);
+    }
+
     /// #offthread-selection: the ABSOLUTE-line base a selection endpoint is measured
     /// from. Off-thread it is the published snapshot's visible-top absolute id
     /// (`history_origin + history.len()`), read from the snapshot — NOT `pane.vterm`,
@@ -624,6 +639,55 @@ mod tests {
             .recv_timeout(std::time::Duration::from_millis(150))
             .is_ok()
         {}
+    }
+
+    /// #offthread-zoom (operator 2026-06-23: `Ctrl+B z` corrupted off-thread panes). A
+    /// geometry resize must reach the PARSER (which owns the live VTerm off-thread), not
+    /// just the idle main-thread vterm — else the parser stays at the pre-zoom dims and
+    /// parses the child's re-rendered full-width output at half width. Drives the real
+    /// parser, applies a resize, and asserts the published snapshot resizes.
+    /// NEUTER-RED: drop the `request_resize` in `apply_geometry_resize` → the parser
+    /// never resizes → the snapshot keeps the initial dims → this fails.
+    #[test]
+    fn apply_geometry_resize_routes_offthread_to_parser() {
+        let (_data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(20, 6);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            1,
+            "zoom".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+
+        let mut pane = test_pane(crossbeam_channel::bounded(1).1, 20, 6);
+        pane.offthread = Some(handle);
+
+        // Zoom-resize to a new (full) width — must route to the parser.
+        pane.apply_geometry_resize(60, 18);
+
+        // A resize event makes the parser resize + publish a fresh snapshot.
+        wait_settled(&wake_rx);
+        let snap = pane.offthread.as_ref().expect("offthread set").load();
+        assert_eq!(
+            (snap.cols, snap.rows),
+            (60, 18),
+            "off-thread geometry resize must reach the parser; snapshot is {}x{}",
+            snap.cols,
+            snap.rows
+        );
+    }
+
+    /// Flag-OFF: `apply_geometry_resize` resizes the live main-thread vterm — identical
+    /// to the pre-fix bare `vterm.resize`.
+    #[test]
+    fn apply_geometry_resize_flag_off_resizes_vterm() {
+        let mut pane = test_pane(crossbeam_channel::bounded(1).1, 20, 6);
+        assert!(pane.offthread.is_none());
+        pane.apply_geometry_resize(60, 18);
+        assert_eq!((pane.vterm.cols(), pane.vterm.rows()), (60, 18));
     }
 
     /// #offthread-selection ANCHOR STABILITY (r6 REJECT @03bf21af). A selection

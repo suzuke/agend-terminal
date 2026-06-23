@@ -313,7 +313,13 @@ pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &crate::agen
             let w = pane_area.width.saturating_sub(2);
             let h = pane_area.height.saturating_sub(2);
             if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
-                pane.vterm.resize(w, h);
+                // #offthread-zoom: route the resize to whichever VTerm actually renders
+                // — off-thread the PARSER (queued BEFORE the `resize_pty` loop below), so
+                // the parser resizes before the child's re-rendered full-width output
+                // arrives instead of parsing it at the stale pre-zoom width (the
+                // half-width corruption). Flag-OFF it is the live main-thread vterm
+                // (byte-identical). render_pane's lazy resize stays a deduped backstop.
+                pane.apply_geometry_resize(w, h);
                 resizes.push((pane.id, w, h));
             }
         }
@@ -342,7 +348,13 @@ fn collect_resize_needs(
             let w = area.width.saturating_sub(2);
             let h = area.height.saturating_sub(2);
             if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
-                pane.vterm.resize(w, h);
+                // #offthread-zoom: route the resize to whichever VTerm actually renders
+                // — off-thread the PARSER (queued BEFORE the `resize_pty` loop below), so
+                // the parser resizes before the child's re-rendered full-width output
+                // arrives instead of parsing it at the stale pre-zoom width (the
+                // half-width corruption). Flag-OFF it is the live main-thread vterm
+                // (byte-identical). render_pane's lazy resize stays a deduped backstop.
+                pane.apply_geometry_resize(w, h);
                 resizes.push((pane.id, w, h));
             }
         }
