@@ -273,6 +273,19 @@ Use one of:
 
 **Relationship to §3.19.** §3.19 forbids checkout in CANONICAL. §3.19.2 forbids in-place checkout in the agent's BASE WORKSPACE. Both protect against stale-branch pollution at different boundaries.
 
+### 3.19.3 Source-File Lookup — No Full-Disk Scan
+
+Locating a source file (e.g. the `agend-git` shim source `agend-git.rs`) with a full-disk `find / -name …` or `find ~ -name …` is **forbidden**. Run concurrently across the fleet, it spikes machine load fleet-wide (#2386: load 108 on a 16-core box).
+
+Find source from a **fixed point**, not the filesystem root:
+- Inside your bound worktree/repo: `git ls-files | rg <name>` or `rg --files | rg <name>` (index-scoped, fast).
+- Need the repo root: `git rev-parse --show-toplevel` — never `find /` for a marker file.
+- Path you don't know: read `binding_state` for your worktree path, or ask lead via `kind=query`. Never scan the whole disk.
+
+Do not hardcode machine-specific absolute paths in shared artifacts (the protocol is cross-machine); resolve via `git`.
+
+`↳ 緣由 A-§3.19.3`
+
 ### 3.20 Race-Condition PR Discipline
 
 Race-class PRs ship with hidden timing dependencies that pass CI + reviewer VERIFIED yet break production. The lessons below apply to every spawn / async-coordination / multi-process-startup PR (the "race class"); same discipline framing as §3.19.1. `↳ 緣由 A-§3.20`
@@ -859,6 +872,9 @@ Both failure modes surfaced empirically by the #863 reviewer incident. The bypas
 
 ### A-§3.19.2 — Reviewer Base Workspace Branch Discipline
 Incident 2026-05-20 — fixup-reviewer base dir was found stuck on `fix/900-spawn-env-propagation` with 492 deletion markers from a 2026-05-18 in-place checkout that was never reverted. Recovery cost session backend state (`.codex/.claude/.gemini/.kiro/.opencode/AGENTS.md` removed by `git clean -fd` because those dirs weren't in the fix/900-era `.gitignore`). The reflog showed the original Sprint discipline used `review/NNN-r0` per-PR worktrees correctly (2026-05-16 entries), then drifted to in-place checkouts.
+
+### A-§3.19.3 — Source-File Lookup: No Full-Disk Scan
+#2386 (2026-06-23, operator-confirmed): a `de2eb8` code-review workflow's agents/subagents each ran an ad-hoc full-disk `find / -name agend-git.rs` to locate the git-shim source. Run concurrently across the fleet, this spiked machine load to **108 on a 16-core box** — a one-shot blowup that recurs whenever an agent doesn't know a path and reaches for `find /`. Not an `agend` scan (the daemon never does this); the fix is preventive guidance (§3.19.3), not a code gate: an index-scoped lookup (`git ls-files` / `rg`) inside the bound worktree is both correct and cheap.
 
 ### A-§3.20 — Race-Condition PR Discipline
 Empirical motivation: #881 ("app mode never owns the daemon") shipped CI green + reviewer VERIFIED on 2026-05-17, then surfaced a spawn-and-attach race on the first cold-start with a slow filesystem flush. Operator reverted at 470c251; #882 reopen fix shipped at 0fd89e8 with a probe_api gate + `--foreground` mode + actionable error path.
