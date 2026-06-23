@@ -234,6 +234,28 @@ impl Pane {
         }
     }
 
+    /// #t-97931 (off-thread draft-gate, F-A): the last `n` visible rows of THIS pane's
+    /// render path, for the #1944 draft-protection input-box probe. Off-thread the
+    /// main-thread `vterm` is idle (blank) → read the parser's published snapshot, so
+    /// the gate sees the REAL input box and never mis-reads an unsent draft as empty
+    /// (which would clobber it). Flag-OFF reads the live `vterm` (byte-identical).
+    pub fn tail_lines(&self, n: usize) -> String {
+        match &self.offthread {
+            Some(handle) => handle.load().tail_lines(n),
+            None => self.vterm.tail_lines(n),
+        }
+    }
+
+    /// #t-97931: text + per-char DIM mask of the last `n` visible rows, paired with
+    /// [`tail_lines`](Self::tail_lines) for the codex dim-ghost draft probe. Same
+    /// off-thread snapshot vs flag-OFF `vterm` dispatch.
+    pub fn tail_lines_with_dim(&self, n: usize) -> (String, Vec<bool>) {
+        match &self.offthread {
+            Some(handle) => handle.load().tail_lines_with_dim(n),
+            None => self.vterm.tail_lines_with_dim(n),
+        }
+    }
+
     /// Display label: display_name if set, otherwise agent_name.
     pub fn label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.agent_name)
@@ -476,6 +498,52 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    /// #t-97931 (F-A, off-thread draft-gate) guard ③: the path-aware `Pane::tail_lines*`
+    /// must read the parser's PUBLISHED snapshot off-thread, NOT the idle main-thread
+    /// `pane.vterm` (blank). Else the #1944 draft-protection gate reads an empty input
+    /// box and clobbers a real unsent draft. NEUTER: revert the accessor body to
+    /// `self.vterm.tail_lines*` → off-thread it returns blank → this RED.
+    #[test]
+    fn tail_lines_offthread_reads_snapshot_not_idle_vterm() {
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(40, 6);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            1,
+            "claude".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+        // The agent's input box carries an UNSENT draft + a DIM ghost above it.
+        data_tx
+            .send(b"\x1b[2J\x1b[H\x1b[2mghost\x1b[0m\r\n> draft in progress".to_vec())
+            .expect("parser data channel live");
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("parser must publish the input-box snapshot");
+
+        let mut pane = leaf(1, "claude");
+        pane.offthread = Some(handle);
+        // The idle main-thread vterm is blank — the dead-gate surface the F-A bug read.
+        assert!(
+            pane.vterm.tail_lines(4).trim().is_empty(),
+            "off-thread pane.vterm is idle → tail is blank (the F-A mis-read source)"
+        );
+        // The path-aware accessor reads the parser-published snapshot → sees the draft.
+        let tail = pane.tail_lines(4);
+        assert!(
+            tail.contains("draft in progress"),
+            "off-thread tail_lines must read the snapshot's real input box, got {tail:?}"
+        );
+        let (dtext, dim) = pane.tail_lines_with_dim(4);
+        assert!(
+            dtext.contains("draft in progress") && dim.iter().any(|&d| d),
+            "off-thread tail_lines_with_dim must read snapshot text + DIM mask, got {dtext:?}"
+        );
     }
 
     /// #1432: a fixed content line keeps the same logical anchor regardless of

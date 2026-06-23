@@ -1799,13 +1799,15 @@ where
             // plain marker probe mis-reads as typed content — route it through the
             // DIM-aware check (needs the per-char dim mask). Everyone else uses the
             // text-only probe: marker (claude/agy) → placeholder (kiro) → fallback.
-            // pane.vterm is owned (no lock).
+            // #t-97931 (F-A): route through the path-aware `Pane::tail_lines*` — off-
+            // thread the main-thread `pane.vterm` is idle/blank, so reading it directly
+            // mis-reads a real unsent draft as an empty box and the gate clobbers it.
             if let Some(marker) = b.input_dim_ghost_marker() {
-                let (text, dim) = pane.vterm.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
+                let (text, dim) = pane.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
                 notification_queue::input_box_dim_aware_empty(&text, &dim, marker)
             } else {
                 notification_queue::input_box_empty_probe(
-                    &pane.vterm.tail_lines(DRAFT_INPUT_TAIL_ROWS),
+                    &pane.tail_lines(DRAFT_INPUT_TAIL_ROWS),
                     b.input_prompt_marker(),
                     b.input_empty_placeholder(),
                 )

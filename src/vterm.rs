@@ -29,6 +29,137 @@ fn safe_cell(grid: &alacritty_terminal::grid::Grid<Cell>, line: Line, col: usize
     }
 }
 
+/// A minimal per-cell view for [`tail_lines_core`], decoupling the de-wrap / trim /
+/// DIM logic from the cell SOURCE so the live `VTerm` grid and an off-thread
+/// [`GridSnapshot`]'s flat `cells` share ONE implementation — parity by construction
+/// (#t-97931: the off-thread draft-gate must read the SAME text the live path would,
+/// or it mis-reads an idle pane as an empty input box and clobbers an unsent draft).
+#[derive(Clone, Copy)]
+struct CellView {
+    c: char,
+    fg: Color,
+    dim: bool,
+    wrapline: bool,
+    wide_spacer: bool,
+}
+
+/// Shared core for `VTerm::tail_lines` / `tail_lines_with_fg` / `tail_lines_with_dim`
+/// AND their [`GridSnapshot`] equivalents. `get(row, col)` yields the visible-grid
+/// cell at `(row, col)` (row 0 = visible top); the caller supplies the source — the
+/// live alacritty grid (via `safe_cell`) or a snapshot's `cells`. Knobs:
+///
+/// * `collect_fg` — when false the returned fg/dim vecs are empty (skips the per-cell
+///   `classify_fg` cost; #perf-R1).
+/// * `dewrap` — when true a `WRAPLINE`-soft-wrapped row is joined to its continuation
+///   WITHOUT a `\n` so a single logical line the terminal wrapped stays one line for
+///   the single-line detection regexes (#1808). When false, rows join verbatim with
+///   `\n` (byte-identical legacy text-only output).
+///
+/// Monomorphized per call site, so the closure indirection is zero-cost.
+fn tail_lines_core(
+    cols: usize,
+    rows: usize,
+    n: usize,
+    collect_fg: bool,
+    dewrap: bool,
+    get: impl Fn(usize, usize) -> CellView,
+) -> (String, Vec<CellFg>, Vec<bool>) {
+    let mut lines: Vec<String> = Vec::with_capacity(rows);
+    let mut line_fgs: Vec<Vec<CellFg>> = Vec::with_capacity(rows);
+    // #1948(b): per-char DIM-attribute mask, collected alongside fg (same gate, same
+    // alignment). codex renders its empty-box ghost/placeholder text DIM on the
+    // default colour, which the colour-only `CellFg` can't see — the draft-gate uses
+    // this to tell the ghost apart from the operator's normal-intensity input.
+    let mut line_dims: Vec<Vec<bool>> = Vec::with_capacity(rows);
+    // #1808: per-row soft-wrap flag (alacritty sets `WRAPLINE` on the LAST cell of a
+    // physical row whose logical line continues on the next row).
+    let mut wrapped: Vec<bool> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut line = String::with_capacity(cols);
+        let mut fg: Vec<CellFg> = Vec::new();
+        let mut dim: Vec<bool> = Vec::new();
+        let mut col = 0;
+        while col < cols {
+            let cell = get(row, col);
+            if cell.wide_spacer {
+                col += 1;
+                continue;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            line.push(ch);
+            if collect_fg {
+                fg.push(classify_fg(cell.fg));
+                dim.push(cell.dim);
+            }
+            col += 1;
+        }
+        let row_wrapped = dewrap && cols > 0 && get(row, cols - 1).wrapline;
+        // trim_end drops trailing whitespace; truncate the parallel fg/dim vecs to the
+        // surviving char count so they stay aligned. EXCEPT a soft-wrapped row: its
+        // trailing space can be a significant inter-word space at the wrap column, and
+        // the next row is about to be concatenated WITHOUT a `\n` — trimming it would
+        // fuse two words and re-break the phrase the de-wrap exists to keep whole.
+        let trimmed = if row_wrapped {
+            line.as_str()
+        } else {
+            line.trim_end()
+        };
+        if collect_fg {
+            fg.truncate(trimmed.chars().count());
+            dim.truncate(trimmed.chars().count());
+        }
+        lines.push(trimmed.to_string());
+        line_fgs.push(fg);
+        line_dims.push(dim);
+        wrapped.push(row_wrapped);
+    }
+
+    // Trim blank lines at both ends so terse output doesn't look padded and tail-N
+    // doesn't return the scroll buffer's trailing whitespace.
+    let first = lines
+        .iter()
+        .position(|l| !l.is_empty())
+        .unwrap_or(lines.len());
+    let last = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(first);
+    let visible = &lines[first..last];
+    let visible_fgs = &line_fgs[first..last];
+    let visible_dims = &line_dims[first..last];
+    let visible_wrapped = &wrapped[first..last];
+
+    let start = visible.len().saturating_sub(n);
+    let tail = &visible[start..];
+    let tail_fgs = &visible_fgs[start..];
+    let tail_dims = &visible_dims[start..];
+    let tail_wrapped = &visible_wrapped[start..];
+
+    let mut text = String::new();
+    let mut fg_out: Vec<CellFg> = Vec::new();
+    let mut dim_out: Vec<bool> = Vec::new();
+    for (i, line) in tail.iter().enumerate() {
+        if i > 0 {
+            // #1808: skip the `\n` (and its filler fg/dim cell) when the PREVIOUS row
+            // soft-wrapped into this one — they are one line.
+            if !tail_wrapped[i - 1] {
+                text.push('\n');
+                if collect_fg {
+                    fg_out.push(CellFg::Default);
+                    dim_out.push(false);
+                }
+            }
+        }
+        text.push_str(line);
+        if collect_fg {
+            fg_out.extend_from_slice(&tail_fgs[i]);
+            dim_out.extend_from_slice(&tail_dims[i]);
+        }
+    }
+    (text, fg_out, dim_out)
+}
+
 /// Alacritty emits `Event::PtyWrite` for terminal queries like DSR CPR
 /// (`\x1b[6n`), DA, and mode reports. On ConPTY (Windows), `conhost.exe`
 /// fires these during startup and **blocks the child process until a reply
@@ -788,118 +919,27 @@ impl VTerm {
         collect_fg: bool,
         dewrap: bool,
     ) -> (String, Vec<CellFg>, Vec<bool>) {
+        // #t-97931 (A): delegate to the source-agnostic `tail_lines_core` so the live
+        // grid and the off-thread `GridSnapshot` produce byte-identical output (parity
+        // by construction). `grid` is hoisted so the closure reads it once per cell.
         let grid = self.term.grid();
-        let cols = self.cols as usize;
-        let rows = self.rows as usize;
-
-        let mut lines: Vec<String> = Vec::with_capacity(rows);
-        let mut line_fgs: Vec<Vec<CellFg>> = Vec::with_capacity(rows);
-        // #1948(b): per-char DIM-attribute (`Flags::DIM`) mask, collected
-        // alongside the fg mask (same gate, same alignment). codex renders its
-        // empty-box ghost/placeholder text DIM on the default colour, which the
-        // colour-only `CellFg` can't see — the draft-gate uses this to tell the
-        // ghost apart from the operator's normal-intensity input.
-        let mut line_dims: Vec<Vec<bool>> = Vec::with_capacity(rows);
-        // #1808: per-row soft-wrap flag. alacritty sets `WRAPLINE` on the LAST
-        // cell of a physical row whose logical line CONTINUES on the next row
-        // (its own auto-wrap when text overflows `cols`, NOT a `\n`/cursor-moved
-        // line break). The de-wrap join below consults it so a single logical
-        // line the terminal soft-wrapped across rows is NOT split by a `\n` in
-        // the detection feed — which otherwise inserts `\n` mid-phrase and makes
-        // a single-line state-detection regex miss (the #1808/#1809 SRL bug).
-        // Only the detection path (`collect_fg`) de-wraps; the text-only
-        // `tail_lines` stays byte-identical (display/dialog callers unaffected).
-        let mut wrapped: Vec<bool> = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let mut line = String::with_capacity(cols);
-            let mut fg: Vec<CellFg> = Vec::new();
-            let mut dim: Vec<bool> = Vec::new();
-            let mut col = 0;
-            while col < cols {
+        tail_lines_core(
+            self.cols as usize,
+            self.rows as usize,
+            n,
+            collect_fg,
+            dewrap,
+            |row, col| {
                 let cell = safe_cell(grid, Line(row as i32), col);
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    col += 1;
-                    continue;
+                CellView {
+                    c: cell.c,
+                    fg: cell.fg,
+                    dim: cell.flags.contains(Flags::DIM),
+                    wrapline: cell.flags.contains(Flags::WRAPLINE),
+                    wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
                 }
-                let ch = if cell.c == '\0' { ' ' } else { cell.c };
-                line.push(ch);
-                if collect_fg {
-                    fg.push(classify_fg(cell.fg));
-                    dim.push(cell.flags.contains(Flags::DIM));
-                }
-                col += 1;
-            }
-            let row_wrapped = dewrap
-                && cols > 0
-                && safe_cell(grid, Line(row as i32), cols - 1)
-                    .flags
-                    .contains(Flags::WRAPLINE);
-            // trim_end drops trailing whitespace; truncate the parallel fg vec to
-            // the surviving char count so the two stay aligned. EXCEPT a
-            // soft-wrapped row: its trailing space can be a significant
-            // inter-word space at the wrap column, and the next row is about to
-            // be concatenated WITHOUT a `\n` — trimming it would fuse two words
-            // ("is" + "temporarily" → "istemporarily"), re-breaking the phrase
-            // the de-wrap exists to keep whole.
-            let trimmed = if row_wrapped {
-                line.as_str()
-            } else {
-                line.trim_end()
-            };
-            if collect_fg {
-                fg.truncate(trimmed.chars().count());
-                dim.truncate(trimmed.chars().count());
-            }
-            lines.push(trimmed.to_string());
-            line_fgs.push(fg);
-            line_dims.push(dim);
-            wrapped.push(row_wrapped);
-        }
-
-        // Trim blank lines at both ends so terse output doesn't look padded
-        // and tail-N doesn't return the scroll buffer's trailing whitespace.
-        let first = lines
-            .iter()
-            .position(|l| !l.is_empty())
-            .unwrap_or(lines.len());
-        let last = lines
-            .iter()
-            .rposition(|l| !l.is_empty())
-            .map(|i| i + 1)
-            .unwrap_or(first);
-        let visible = &lines[first..last];
-        let visible_fgs = &line_fgs[first..last];
-        let visible_dims = &line_dims[first..last];
-        let visible_wrapped = &wrapped[first..last];
-
-        let start = visible.len().saturating_sub(n);
-        let tail = &visible[start..];
-        let tail_fgs = &visible_fgs[start..];
-        let tail_dims = &visible_dims[start..];
-        let tail_wrapped = &visible_wrapped[start..];
-
-        let mut text = String::new();
-        let mut fg_out: Vec<CellFg> = Vec::new();
-        let mut dim_out: Vec<bool> = Vec::new();
-        for (i, line) in tail.iter().enumerate() {
-            if i > 0 {
-                // #1808: skip the `\n` (and its filler fg/dim cell) when the
-                // PREVIOUS row soft-wrapped into this one — they are one line.
-                if !tail_wrapped[i - 1] {
-                    text.push('\n');
-                    if collect_fg {
-                        fg_out.push(CellFg::Default);
-                        dim_out.push(false);
-                    }
-                }
-            }
-            text.push_str(line);
-            if collect_fg {
-                fg_out.extend_from_slice(&tail_fgs[i]);
-                dim_out.extend_from_slice(&tail_dims[i]);
-            }
-        }
-        (text, fg_out, dim_out)
+            },
+        )
     }
 
     /// Dump current screen as ANSI escape sequences for full redraw.
@@ -1093,6 +1133,62 @@ impl GridSnapshot {
             wants_mouse: false,
             mouse_sgr: false,
         }
+    }
+
+    /// Per-cell view over the snapshot's VISIBLE grid (`cells`, row-major, stride =
+    /// `cols`, row 0 = visible top) for [`tail_lines_core`]. Out-of-range degrades to a
+    /// blank cell, mirroring the live path's `safe_cell`.
+    fn cell_view(&self, row: usize, col: usize) -> CellView {
+        let cols = self.cols as usize;
+        match self.cells.get(row * cols + col) {
+            Some(cell) => CellView {
+                c: cell.c,
+                fg: cell.fg,
+                dim: cell.flags.contains(Flags::DIM),
+                wrapline: cell.flags.contains(Flags::WRAPLINE),
+                wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
+            },
+            None => CellView {
+                c: ' ',
+                fg: Color::Named(NamedColor::Foreground),
+                dim: false,
+                wrapline: false,
+                wide_spacer: false,
+            },
+        }
+    }
+
+    /// #t-97931 (off-thread draft-gate, F-A): the last `n` visible rows as plain text —
+    /// the off-thread analog of [`VTerm::tail_lines`]. The #1944 draft-protection gate
+    /// reads THIS (the parser's published snapshot) instead of the idle main-thread
+    /// `pane.vterm` (blank off-thread), so it doesn't mis-read a real unsent draft as an
+    /// empty input box and clobber it. Shares `tail_lines_core` with the live path →
+    /// byte-identical for the same grid content.
+    pub fn tail_lines(&self, n: usize) -> String {
+        tail_lines_core(
+            self.cols as usize,
+            self.rows as usize,
+            n,
+            false,
+            false,
+            |row, col| self.cell_view(row, col),
+        )
+        .0
+    }
+
+    /// #t-97931: text + per-char DIM mask of the last `n` visible rows — the off-thread
+    /// analog of [`VTerm::tail_lines_with_dim`] (codex's dim ghost-text vs operator
+    /// input). Same snapshot source / parity as [`Self::tail_lines`].
+    pub fn tail_lines_with_dim(&self, n: usize) -> (String, Vec<bool>) {
+        let (text, _fg, dim) = tail_lines_core(
+            self.cols as usize,
+            self.rows as usize,
+            n,
+            true,
+            true,
+            |row, col| self.cell_view(row, col),
+        );
+        (text, dim)
     }
 
     /// Extract text from a selection range given in ABSOLUTE line ids (#offthread-
@@ -1517,6 +1613,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #t-97931 (F-A parity guard ②): `GridSnapshot::tail_lines*` must be BYTE-IDENTICAL
+    /// to the live `VTerm::tail_lines*` for the same grid — both share `tail_lines_core`,
+    /// so the off-thread draft-gate reads exactly what the live path would. Exercises
+    /// the tricky paths: leading blank row, a DIM (faint) span, a normal draft row, and
+    /// a soft-wrapped long line (WRAPLINE) + trailing blank.
+    #[test]
+    fn snapshot_tail_lines_match_live_vterm() {
+        let mut vt = VTerm::new(12, 6);
+        vt.process(
+            "\x1b[2J\x1b[H\r\n\x1b[2mghost\x1b[0m\r\nhi there\r\nABCDEFGHIJKLMNO\r\n".as_bytes(),
+        );
+        let snap = vt.snapshot();
+        for n in [1usize, 2, 3, 6] {
+            assert_eq!(
+                snap.tail_lines(n),
+                vt.tail_lines(n),
+                "snapshot.tail_lines({n}) must equal live VTerm::tail_lines (parity)"
+            );
+            assert_eq!(
+                snap.tail_lines_with_dim(n),
+                vt.tail_lines_with_dim(n),
+                "snapshot.tail_lines_with_dim({n}) must equal live (text + DIM mask parity)"
+            );
+        }
+        // The DIM mask must carry a true (the faint 'ghost') — proves the snapshot
+        // actually preserves `Flags::DIM`, not a vacuously all-false mask.
+        let (_t, dim) = snap.tail_lines_with_dim(6);
+        assert!(
+            dim.iter().any(|&d| d),
+            "the faint 'ghost' row must mark DIM cells in the snapshot"
+        );
     }
 
     #[test]
