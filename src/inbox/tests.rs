@@ -103,6 +103,10 @@ impl TestMsgBuilder {
         self.0.broadcast_context = Some(v);
         self
     }
+    fn task_id(mut self, v: &str) -> Self {
+        self.0.task_id = Some(v.into());
+        self
+    }
     fn build(self) -> InboxMessage {
         self.0
     }
@@ -3919,6 +3923,129 @@ fn settled_rows_immune_to_reclaim_and_renudge() {
         post.is_empty(),
         "settled row must not be reverted by reclaim → no drainable messages"
     );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+// ── ack_by_correlation (send+ack_inbox) ─────────────────────────────────
+
+/// ack_by_correlation settles only DELIVERING rows whose task_id matches
+/// the given correlation_id — other delivering rows are left untouched.
+#[test]
+fn ack_by_correlation_scoped_settle() {
+    let home = tmp_home("ack-corr-scoped");
+    let agent = "ack-corr-agent";
+
+    // Seed two messages with different task_ids, drain both → DELIVERING.
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("task A dispatch")
+            .kind("task")
+            .task_id("t-aaa")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("task B dispatch")
+            .kind("task")
+            .task_id("t-bbb")
+            .build(),
+    )
+    .unwrap();
+    let drained = drain(&home, agent);
+    assert_eq!(drained.len(), 2);
+
+    // Ack only task A's dispatch.
+    let settled = ack_by_correlation(&home, agent, "t-aaa");
+    assert_eq!(settled, 1, "only the t-aaa row should be settled");
+
+    // Task B's dispatch should still be delivering (not drainable — drain
+    // only returns UNREAD rows). Verify via a second ack_by_correlation for
+    // t-bbb: it should find 1 still-delivering row.
+    let settled_b = ack_by_correlation(&home, agent, "t-bbb");
+    assert_eq!(settled_b, 1, "t-bbb row should still be settling-able");
+
+    // Now both are processed — drain returns nothing.
+    let post = drain(&home, agent);
+    assert!(post.is_empty(), "both are now processed");
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// ack_by_correlation does NOT touch delivering rows with a different task_id.
+#[test]
+fn ack_by_correlation_preserves_non_matching() {
+    let home = tmp_home("ack-corr-preserve");
+    let agent = "ack-preserve-agent";
+
+    // Seed a message with task_id "t-match" and one with "t-other".
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("match")
+            .kind("task")
+            .task_id("t-match")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("other")
+            .kind("task")
+            .task_id("t-other")
+            .build(),
+    )
+    .unwrap();
+    drain(&home, agent);
+
+    // Ack only "t-match".
+    let settled = ack_by_correlation(&home, agent, "t-match");
+    assert_eq!(settled, 1);
+
+    // "t-other" should remain delivering — ack(all) should find 1.
+    let remaining = ack(&home, agent, None);
+    assert_eq!(remaining, 1, "t-other should still be delivering");
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// ack_by_correlation is idempotent: calling it again on an already-settled
+/// correlation_id returns 0.
+#[test]
+fn ack_by_correlation_idempotent() {
+    let home = tmp_home("ack-corr-idempotent");
+    let agent = "ack-idem-agent";
+
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("dispatch")
+            .kind("task")
+            .task_id("t-idem")
+            .build(),
+    )
+    .unwrap();
+    drain(&home, agent);
+
+    let first = ack_by_correlation(&home, agent, "t-idem");
+    assert_eq!(first, 1);
+
+    let second = ack_by_correlation(&home, agent, "t-idem");
+    assert_eq!(second, 0, "already processed → 0 on second call");
 
     fs::remove_dir_all(&home).ok();
 }
