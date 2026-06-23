@@ -91,7 +91,11 @@ pub enum Confidence {
 
 impl Evidence {
     /// A `Hook`-authority, `Confirmed` observation stamped now. The local plane's
-    /// only constructor — every hook event is a confirmed local truth.
+    /// only constructor — every hook event is a confirmed local truth. #2433: its only
+    /// PROD caller is the unix socket-ingest path, so it is dead on non-unix prod;
+    /// `any(unix, test)` keeps it for unix prod + EVERY test build (the platform-agnostic
+    /// reducer tests construct hook Evidence to drive the state machine).
+    #[cfg(any(unix, test))]
     pub fn hook(kind: EvidenceKind, at_ms: u64) -> Self {
         Self {
             kind,
@@ -117,6 +121,10 @@ impl Evidence {
 ///
 /// Rate-limit is deliberately absent: claude hooks do not fire for it (the API plane
 /// owns `RateLimited`).
+///
+/// #2433: only the unix socket-ingest path (+ the mapping's own tests) calls this, so it
+/// is gated like the rest of the hook-ingestion plumbing (dead on non-unix prod).
+#[cfg(any(unix, test))]
 pub fn evidence_kind_for_hook(
     hook_event_name: &str,
     notification_type: Option<&str>,

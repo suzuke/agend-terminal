@@ -39,6 +39,19 @@ const HOOK_FRESHNESS_MS: u64 = 600_000;
 /// that a genuinely-dropped terminal hook is caught within a few ticks.
 const RECONCILE_SILENCE_MS: u64 = 8_000;
 
+/// An open hook episode with NO fresh hook for this long is presumed phantom — its
+/// closing hook (Stop/PostToolUse) was dropped. Past this, a screen-Idle + sustained
+/// silence reconciles to Idle **even if `api_in_flight` is still true**: the lsof signal
+/// is a proven-unreliable idle *blocker* (lingering / CDN-shared sockets stay
+/// ESTABLISHED long after a turn ends — see SHADOW-OBSERVER-QUANT-2413.md), so it is
+/// WEAK-POSITIVE-ONLY and must never wedge an ended turn at Active forever (#2433 r6
+/// REJECT). A genuinely mid-API turn keeps emitting fresh hooks, so it never crosses
+/// this threshold — the headline mid-API false-idle win is preserved. This is the
+/// pure-time last-resort backstop. Shorter than [`HOOK_FRESHNESS_MS`] (the full
+/// screen-fallback): the episode is decayed to Idle well before the hook plane is
+/// considered wholly stale.
+const EPISODE_STALE_MS: u64 = 300_000;
+
 /// Bound on the explain-trail kept per agent (last-N justifying evidence).
 const TRAIL_CAP: usize = 8;
 
@@ -299,7 +312,7 @@ impl AgentRuntime {
         // prompt alone is `Strong`. A sustained-idle + no-api contradiction can clear a
         // phantom-waiting (the approval was answered without a closing hook).
         let waiting = self.waiting || screen == ScreenSignal::Approval;
-        if waiting && !self.reconcile_to_idle(screen, live) {
+        if waiting && !self.reconcile_to_idle(screen, live, now_ms) {
             let (auth, conf) = if self.waiting {
                 (Authority::Hook, Confidence::Confirmed)
             } else {
@@ -316,7 +329,7 @@ impl AgentRuntime {
         // (P3/P4/P5) Active family — only if an episode/tool is open AND liveness does
         // NOT contradict it (the phantom-stuck decay). If it DOES contradict, fall to Idle.
         let active_open = self.episode_open || self.tool_open.is_some();
-        if active_open && !self.reconcile_to_idle(screen, live) {
+        if active_open && !self.reconcile_to_idle(screen, live, now_ms) {
             // Mid-API false-idle beat: screen looks idle but a fresh hook episode + a
             // live socket prove work in flight → keep Active. This is the headline win
             // over raw screen-scrape.
@@ -378,14 +391,30 @@ impl AgentRuntime {
     }
 
     /// The liveness backstop: an open episode/span should be force-closed to Idle when
-    /// liveness CONTRADICTS it — the screen is back at the prompt, no LLM socket is
-    /// live, and productive output has been quiet past the threshold. Time alone never
-    /// trips this; it requires the screen-idle + no-api + sustained-silence conjunction,
-    /// so a normal mid-turn pause (model thinking, socket still open) does NOT decay.
-    fn reconcile_to_idle(&self, screen: ScreenSignal, live: &Liveness) -> bool {
-        screen == ScreenSignal::Idle
-            && !live.api_in_flight
-            && live.productive_silent_ms >= RECONCILE_SILENCE_MS
+    /// liveness CONTRADICTS it. Both paths require the screen back at the prompt + output
+    /// quiet past [`RECONCILE_SILENCE_MS`] — a normal mid-turn pause (output still
+    /// flowing) never decays.
+    ///
+    /// Two ways an open episode is contradicted:
+    /// 1. **No live socket either** (`!api_in_flight`) — screen-idle + no-api + silence is
+    ///    the original clean contradiction: the turn is genuinely over.
+    /// 2. **Socket stuck, but the hook plane has gone STALE** (no fresh hook for
+    ///    ≥ [`EPISODE_STALE_MS`]) — the closing hook was dropped AND `api_in_flight` is
+    ///    stuck `true` on a lingering socket (the #2433 r6 REJECT: the quantification
+    ///    itself proved sockets stay ESTABLISHED after a turn). Here `api_in_flight` is
+    ///    WEAK-POSITIVE-ONLY and is IGNORED — it must never *block* an idle reconcile, or
+    ///    an ended turn wedges at Active forever. A real mid-API turn keeps FRESH hooks,
+    ///    so it never reaches this path; the headline mid-API false-idle win is preserved.
+    fn reconcile_to_idle(&self, screen: ScreenSignal, live: &Liveness, now_ms: u64) -> bool {
+        if screen != ScreenSignal::Idle || live.productive_silent_ms < RECONCILE_SILENCE_MS {
+            return false;
+        }
+        // Path 1: no live socket → clean contradiction.
+        if !live.api_in_flight {
+            return true;
+        }
+        // Path 2: socket stuck true, but hooks long gone → dropped close; ignore api.
+        self.last_hook_ms > 0 && now_ms.saturating_sub(self.last_hook_ms) >= EPISODE_STALE_MS
     }
 }
 
@@ -504,6 +533,55 @@ mod tests {
             "live socket beats idle screen"
         );
         assert_eq!(s.authority, Authority::Hook);
+    }
+
+    /// #2433 r6 REJECT (verbatim reviewer test): a dropped terminal hook + a STUCK
+    /// `api_in_flight=true` (lingering socket — the quantification proved sockets stay
+    /// ESTABLISHED after a turn) must NOT wedge the ended turn at Active forever. Once the
+    /// hook plane is stale + screen Idle + productive silence, `api_in_flight` is ignored
+    /// (weak-positive-only) and the episode reconciles to Idle.
+    #[test]
+    fn review_pr2433_stale_api_socket_does_not_keep_dropped_stop_active_forever() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
+        let live = Liveness {
+            api_in_flight: true,
+            productive_silent_ms: 60_000,
+            child_alive: true,
+        };
+        let s = rt.observe(
+            ScreenSignal::Idle,
+            &live,
+            1_000 + HOOK_FRESHNESS_MS + 60_000,
+        );
+        assert_eq!(
+            s.state,
+            ObservedState::Idle,
+            "stale api_in_flight alone must not keep a dropped terminal hook active forever"
+        );
+    }
+
+    /// The symmetric guard for the #2433 fix: a FRESH hook episode (recent TurnStarted,
+    /// hook age < EPISODE_STALE_MS) + `api_in_flight=true` + screen Idle + silence ≥ 8s —
+    /// i.e. the real mid-API thinking phase from the quantification — must STILL stay
+    /// Active. `api_in_flight` as weak-positive must not be reconciled away while hooks are
+    /// fresh, or the fix would have regressed the headline mid-API false-idle win.
+    #[test]
+    fn fresh_episode_with_live_socket_stays_active_despite_silence() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
+        let live = Liveness {
+            api_in_flight: true,
+            productive_silent_ms: 30_000,
+            child_alive: true,
+        };
+        // Hook age 100s ≪ EPISODE_STALE_MS (300s) ⇒ fresh ⇒ no last-resort reconcile.
+        let s = rt.observe(ScreenSignal::Idle, &live, 1_000 + 100_000);
+        assert_ne!(
+            s.state,
+            ObservedState::Idle,
+            "fresh episode + live socket = mid-API in flight → stay Active, not reconciled"
+        );
     }
 
     /// Time alone (no contradicting liveness — socket still live) must NOT decay an open

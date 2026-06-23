@@ -19,8 +19,14 @@
 pub mod evidence;
 pub mod reducer;
 
-use evidence::{evidence_kind_for_hook, Evidence};
+use evidence::Evidence;
+// #2433: only the unix-gated ingest path uses these — gate the imports to match so they
+// aren't unused on a non-unix prod build (`evidence_kind_for_hook` feeds `ingest_frame`;
+// serde derives only `ShadowFrame`, the wire frame).
+#[cfg(any(unix, test))]
+use evidence::evidence_kind_for_hook;
 use parking_lot::Mutex;
+#[cfg(any(unix, test))]
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -29,10 +35,17 @@ use std::sync::OnceLock;
 /// Per-agent evidence buffer cap — drop-oldest beyond this. A spike bound; the
 /// reducer drains far faster than hooks fire, so this only guards a never-drained
 /// agent from unbounded growth.
+// #2433: the whole hook-INGESTION plane (socket frame → buffer push) feeds the
+// `#[cfg(unix)]` AF_UNIX server, so on a non-unix PROD build it is unreachable and would
+// trip `-D warnings` dead_code. `any(unix, test)` keeps it for unix prod + EVERY test
+// build (the platform-independent reducer/evidence tests construct hook Evidence), while
+// dropping it from non-unix prod. The reducer/driver/buffer-drain are platform-agnostic.
+#[cfg(any(unix, test))]
 const BUFFER_CAP: usize = 256;
 
 /// One wire frame the hook emit writes to the socket (a single JSON line). Mirrors
 /// the existing `hook-event` payload fields + the session token.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowFrame {
     /// Per-session 256-bit token (hex) — proves the frame came from THIS spawned
@@ -80,6 +93,9 @@ pub fn register(token: &str, agent: &str) {
 }
 
 /// Resolve a frame's token to its agent name, or `None` if unknown (forged / stale).
+/// #2433: only the unix socket-ingest path (+ tests) resolves; gate it like the rest of
+/// the ingestion plumbing so it isn't dead on non-unix prod.
+#[cfg(any(unix, test))]
 pub fn resolve(token: &str) -> Option<String> {
     tokens().lock().get(token).cloned()
 }
@@ -102,7 +118,10 @@ fn buffer() -> &'static Mutex<HashMap<String, VecDeque<Evidence>>> {
     B.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Append one observation for `agent`, bounded drop-oldest at [`BUFFER_CAP`].
+/// Append one observation for `agent`, bounded drop-oldest at [`BUFFER_CAP`]. #2433:
+/// only the unix ingest path (+ tests) PUSHES; on non-unix prod the buffer is only ever
+/// drained (empty) by the platform-agnostic reducer, so this is gated like the plumbing.
+#[cfg(any(unix, test))]
 pub fn push(agent: &str, ev: Evidence) {
     let mut b = buffer().lock();
     let q = b.entry(agent.to_string()).or_default();
@@ -164,6 +183,7 @@ pub fn observe(
     rt.observe(screen, live, now_ms)
 }
 
+#[cfg(any(unix, test))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -174,7 +194,9 @@ fn now_ms() -> u64 {
 /// Ingest one frame: validate its token → resolve agent, map the hook → [`Evidence`],
 /// push it, and return `(agent, evidence)` for logging/tests. `None` when the token is
 /// unknown (rejected — anti-spoof) or the hook carries no state transition. Pure w.r.t.
-/// the socket so the round-trip is unit-testable without a real connection.
+/// the socket so the round-trip is unit-testable without a real connection. #2433: gated
+/// like the rest of the ingestion plumbing (its only prod caller is the unix socket).
+#[cfg(any(unix, test))]
 pub fn ingest_frame(frame: &ShadowFrame) -> Option<(String, Evidence)> {
     let agent = match resolve(&frame.token) {
         Some(a) => a,
@@ -257,11 +279,23 @@ fn start_unix(home: &Path) {
         .ok();
 }
 
+/// Per-connection read deadline for the hook-event socket. The accept loop processes
+/// connections SEQUENTIALLY, so without a wall-clock bound a single client that connects
+/// and then never sends a newline would block `read_line` indefinitely and PIN the loop —
+/// starving all subsequent hook delivery (#2433 r6). A starved hook plane in turn makes
+/// the dropped-terminal-hook phantom-stick MORE likely. Generous (a real hook writes one
+/// line + closes in well under a ms); the bound only guards the wedged-client failure mode.
+#[cfg(unix)]
+const SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(unix)]
 fn handle_conn(stream: std::os::unix::net::UnixStream) {
     use std::io::{BufRead, BufReader, Read};
-    // One small JSON frame per connection. Bound the read (`Read::take` on the stream,
-    // then buffer it) so a wedged client can't pin the accept loop.
+    // One small JSON frame per connection, with TWO independent bounds so a wedged client
+    // can never pin the (sequential) accept loop: a wall-clock read deadline
+    // (`set_read_timeout` — a client that connects but never sends a newline) AND a byte
+    // cap (`Read::take` — a client that floods bytes without a newline). #2433 r6.
+    let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
     let mut line = String::new();
     let mut reader = BufReader::new(stream.take(64 * 1024));
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -279,7 +313,10 @@ fn handle_conn(stream: std::os::unix::net::UnixStream) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::evidence::{Authority, EvidenceKind};
+    // `Authority` is referenced only by the `#[cfg(unix)]` socket tests, so importing it
+    // unconditionally would be an unused-import error on a non-unix test build (#2433) —
+    // those tests qualify it inline (`super::evidence::Authority`) instead.
+    use super::evidence::EvidenceKind;
     use super::*;
     use serial_test::serial;
 
@@ -322,13 +359,66 @@ mod tests {
             "frame delivered over the real socket → 1 evidence"
         );
         assert_eq!(evidence[0].kind, EvidenceKind::TurnStarted);
-        assert_eq!(evidence[0].authority, Authority::Hook);
+        assert_eq!(evidence[0].authority, super::evidence::Authority::Hook);
         assert_eq!(
             evidence[0].confidence,
             super::evidence::Confidence::Confirmed
         );
         drain("shadow-sock-agent");
         forget_agent("shadow-sock-agent");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// #2433 r6 (②): a client that connects but NEVER sends a newline must not pin the
+    /// (sequential) accept loop forever — the per-conn read deadline unblocks it, and the
+    /// loop goes on to ingest the next real frame. Without `set_read_timeout`, the first
+    /// `handle_conn` blocks indefinitely and this test hangs (caught as a nextest
+    /// slow-timeout). Takes ~`SOCKET_READ_TIMEOUT` by design.
+    #[cfg(unix)]
+    #[test]
+    #[serial(shadow_observer)]
+    fn handle_conn_read_deadline_unblocks_a_silent_client() {
+        use std::io::Write;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let token = new_session_token().unwrap();
+        register(&token, "shadow-deadline-agent");
+        let dir =
+            std::env::temp_dir().join(format!("agend_shadow_deadline_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("shadow-events.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind");
+        // Server: first conn is SILENT (must return via the deadline, not hang), then the
+        // second conn carries a real frame (must still ingest — proves the loop recovered).
+        let server = std::thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                handle_conn(s);
+            }
+            if let Ok((s, _)) = listener.accept() {
+                handle_conn(s);
+            }
+        });
+        // Silent client connects FIRST (accepted first) and writes nothing; held open
+        // across the deadline so the first `handle_conn` truly never sees a newline.
+        let silent = UnixStream::connect(&sock).expect("connect silent");
+        // Real client queued behind it; its bytes wait in the socket until the loop
+        // recovers from the silent conn and accepts again.
+        let mut real = UnixStream::connect(&sock).expect("connect real");
+        let frame = serde_json::json!({"token": token, "hook_event_name": "UserPromptSubmit"});
+        real.write_all(format!("{frame}\n").as_bytes())
+            .expect("write real frame");
+        drop(real);
+        server.join().unwrap();
+        drop(silent);
+        let evidence = peek("shadow-deadline-agent");
+        assert_eq!(
+            evidence.len(),
+            1,
+            "loop recovered from the silent client and ingested the real frame"
+        );
+        assert_eq!(evidence[0].kind, EvidenceKind::TurnStarted);
+        drain("shadow-deadline-agent");
+        forget_agent("shadow-deadline-agent");
         let _ = std::fs::remove_file(&sock);
     }
 
