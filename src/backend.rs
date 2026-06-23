@@ -789,6 +789,19 @@ impl Backend {
     pub fn spawn_flags(&self, working_dir: &std::path::Path) -> Vec<String> {
         let mut out = Vec::new();
         if matches!(self, Backend::ClaudeCode) {
+            // Force the agent's claude pane to INLINE (classic main-screen) mode,
+            // never fullscreen/alt-screen. Fullscreen hijacks the mouse and has no
+            // scrollback, which breaks agend's embed-and-observe model (pane
+            // selection / scroll / capture). `--settings` with inline JSON MERGES
+            // over the user's `~/.claude/settings.json` — it overrides ONLY `tui`,
+            // leaving hooks / OAuth / model / permissions intact — and is per-spawn,
+            // so the operator's own standalone Claude Code is untouched. NOT `--bare`,
+            // so hooks + OAuth still work. Unconditional (not file-gated): every
+            // claude agent pane must be inline. Passed as one argv element (no shell),
+            // so the JSON needs no escaping.
+            out.push("--settings".to_string());
+            out.push(r#"{"tui":"inline"}"#.to_string());
+
             let instr = working_dir.join(self.preset().instructions_path);
             if instr.exists() {
                 out.push("--append-system-prompt-file".to_string());
@@ -1888,10 +1901,12 @@ mod tests {
     #[test]
     fn spawn_flags_claude_emits_only_for_existing_files() {
         let dir = tmp_dir("spawn_flags_claude_partial");
-        // Nothing on disk yet — no flags.
-        assert!(
-            Backend::ClaudeCode.spawn_flags(&dir).is_empty(),
-            "expected empty when files missing"
+        // Nothing on disk yet — only the unconditional inline `--settings`, no
+        // file-gated flags.
+        assert_eq!(
+            Backend::ClaudeCode.spawn_flags(&dir),
+            vec!["--settings".to_string(), r#"{"tui":"inline"}"#.to_string()],
+            "expected only the inline --settings when files missing"
         );
         // Drop just the instructions file.
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
@@ -1909,21 +1924,52 @@ mod tests {
         std::fs::write(dir.join(".claude/agend.md"), "x").unwrap();
         std::fs::write(dir.join("mcp-config.json"), "{}").unwrap();
         let flags = Backend::ClaudeCode.spawn_flags(&dir);
-        // Each flag appears exactly once, followed by its path arg.
+        // Each flag appears exactly once, followed by its arg: the unconditional
+        // inline `--settings` + the two file-gated flags.
         assert_eq!(
             flags
                 .iter()
                 .filter(|s| s.starts_with("--"))
                 .collect::<Vec<_>>()
                 .len(),
-            2
+            3
         );
+        assert!(flags
+            .windows(2)
+            .any(|w| w[0] == "--settings" && w[1] == r#"{"tui":"inline"}"#));
         assert!(flags
             .windows(2)
             .any(|w| w[0] == "--append-system-prompt-file" && w[1].ends_with(".claude/agend.md")));
         assert!(flags
             .windows(2)
             .any(|w| w[0] == "--mcp-config" && w[1].ends_with("mcp-config.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every claude spawn forces inline tui via `--settings` (unconditional, even
+    /// with no files on disk); no other backend ever gets `--settings`. Guards the
+    /// fullscreen→inline fix for the agent pane (selection / scroll / mouse).
+    #[test]
+    fn spawn_flags_claude_always_forces_inline_tui() {
+        let dir = tmp_dir("spawn_flags_inline_tui");
+        let flags = Backend::ClaudeCode.spawn_flags(&dir);
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w[0] == "--settings" && w[1] == r#"{"tui":"inline"}"#),
+            "claude must force inline tui via --settings, got: {flags:?}"
+        );
+        for b in [
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Agy,
+            Backend::KiroCli,
+        ] {
+            assert!(
+                !b.spawn_flags(&dir).iter().any(|s| s == "--settings"),
+                "{b:?} must not get --settings"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
