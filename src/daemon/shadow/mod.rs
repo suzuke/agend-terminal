@@ -17,6 +17,7 @@
 //! reducer. `flag default OFF` via `AGEND_SHADOW_OBSERVER=1`.
 
 pub mod evidence;
+pub mod reducer;
 
 use evidence::{evidence_kind_for_hook, Evidence};
 use parking_lot::Mutex;
