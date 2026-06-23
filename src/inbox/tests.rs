@@ -103,6 +103,10 @@ impl TestMsgBuilder {
         self.0.broadcast_context = Some(v);
         self
     }
+    fn task_id(mut self, v: &str) -> Self {
+        self.0.task_id = Some(v.into());
+        self
+    }
     fn build(self) -> InboxMessage {
         self.0
     }
@@ -3761,4 +3765,287 @@ fn reclaim_renudge_classifier_runs_unlocked_not_under_inbox_lock() {
         fn_region[block_end..].contains(&classifier),
         "reclaim_renudge_worthy must run AFTER the with_inbox_lock closure closes (Phase 2, unlocked)"
     );
+}
+
+// ── Session-reset settle (agend-customization#159) ──────────────────────
+
+/// settle_delivering_for_session_reset transitions all DELIVERING rows to
+/// PROCESSED (stamps read_at) — the core invariant. After settle, those rows
+/// must NOT be re-delivered by drain() nor reverted by reclaim_stale_delivering().
+#[test]
+fn settle_transitions_delivering_to_processed() {
+    let home = tmp_home("settle-basic");
+    let agent = "settle-agent";
+
+    // Seed 3 unread messages, then drain them → DELIVERING.
+    for i in 0..3 {
+        enqueue(
+            &home,
+            agent,
+            msg()
+                .sender("test")
+                .text(&format!("msg {i}"))
+                .kind("task")
+                .build(),
+        )
+        .unwrap();
+    }
+    let drained = drain(&home, agent);
+    assert_eq!(drained.len(), 3, "all 3 should drain");
+
+    // At this point all 3 are DELIVERING (delivering_at set, read_at None).
+    // Settle them as if this were a session-reset.
+    let settled = settle_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 3, "all 3 delivering rows should be settled");
+
+    // Verify: a subsequent drain returns nothing (all are now PROCESSED).
+    let post_settle_drain = drain(&home, agent);
+    assert!(
+        post_settle_drain.is_empty(),
+        "no messages should be drainable after settle"
+    );
+
+    // Verify: reclaim does NOT revert them (they have read_at set now).
+    reclaim_stale_delivering(&home);
+    let post_reclaim_drain = drain(&home, agent);
+    assert!(
+        post_reclaim_drain.is_empty(),
+        "reclaim must not revert settled (processed) rows"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// settle must NOT touch UNREAD rows — only DELIVERING rows are settled.
+/// Unread messages (never drained) must remain available for the new session.
+#[test]
+fn settle_does_not_touch_unread() {
+    let home = tmp_home("settle-unread");
+    let agent = "settle-unread-agent";
+
+    // Seed 2 messages: drain only the first, leave the second unread.
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("test")
+            .text("drained msg")
+            .kind("task")
+            .build(),
+    )
+    .unwrap();
+    let drained = drain(&home, agent);
+    assert_eq!(drained.len(), 1);
+
+    // Now enqueue a second message (stays unread).
+    enqueue(
+        &home,
+        agent,
+        msg().sender("test").text("unread msg").kind("task").build(),
+    )
+    .unwrap();
+
+    // Settle: should only settle the 1 delivering row, not the unread one.
+    let settled = settle_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 1, "only the delivering row should be settled");
+
+    // The unread message should still be drainable.
+    let post = drain(&home, agent);
+    assert_eq!(post.len(), 1, "the unread message must survive settle");
+    assert_eq!(post[0].text, "unread msg");
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// settle is idempotent: calling it twice does not error or double-count.
+#[test]
+fn settle_is_idempotent() {
+    let home = tmp_home("settle-idempotent");
+    let agent = "settle-idem-agent";
+
+    enqueue(
+        &home,
+        agent,
+        msg().sender("test").text("msg").kind("task").build(),
+    )
+    .unwrap();
+    drain(&home, agent);
+
+    let first = settle_delivering_for_session_reset(&home, agent);
+    assert_eq!(first, 1);
+
+    // Second settle: already processed → 0 newly settled.
+    let second = settle_delivering_for_session_reset(&home, agent);
+    assert_eq!(second, 0, "idempotent: no rows to settle on second call");
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #159 end-to-end: the reclaim-stale-delivering path must NOT re-page an
+/// agent whose delivering rows were settled by a session-reset. This is the
+/// specific scenario that caused stale re-injection.
+#[test]
+fn settled_rows_immune_to_reclaim_and_renudge() {
+    let home = tmp_home("settle-reclaim");
+    let agent = "settle-reclaim-agent";
+
+    // Seed a stale delivering row (delivering_at 2 hours ago, read_at None)
+    // — the exact shape reclaim_stale_delivering targets.
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).unwrap();
+    let stale = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let m = InboxMessage {
+        schema_version: 1,
+        id: Some("m-settle-reclaim-1".to_string()),
+        from: "test".into(),
+        text: "stale dispatch".to_string(),
+        kind: Some("task".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        delivering_at: Some(stale),
+        ..Default::default()
+    };
+    fs::write(
+        inbox_dir.join(format!("{agent}.jsonl")),
+        format!("{}\n", serde_json::to_string(&m).unwrap()),
+    )
+    .unwrap();
+
+    // Settle it (session-reset path).
+    let settled = settle_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 1, "the stale delivering row should be settled");
+
+    // Now run reclaim — it should find nothing to revert (read_at is set).
+    reclaim_stale_delivering(&home);
+
+    // Verify the message is still PROCESSED (not reverted to unread).
+    let post = drain(&home, agent);
+    assert!(
+        post.is_empty(),
+        "settled row must not be reverted by reclaim → no drainable messages"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+// ── ack_by_correlation (send+ack_inbox) ─────────────────────────────────
+
+/// ack_by_correlation settles only DELIVERING rows whose task_id matches
+/// the given correlation_id — other delivering rows are left untouched.
+#[test]
+fn ack_by_correlation_scoped_settle() {
+    let home = tmp_home("ack-corr-scoped");
+    let agent = "ack-corr-agent";
+
+    // Seed two messages with different task_ids, drain both → DELIVERING.
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("task A dispatch")
+            .kind("task")
+            .task_id("t-aaa")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("task B dispatch")
+            .kind("task")
+            .task_id("t-bbb")
+            .build(),
+    )
+    .unwrap();
+    let drained = drain(&home, agent);
+    assert_eq!(drained.len(), 2);
+
+    // Ack only task A's dispatch.
+    let settled = ack_by_correlation(&home, agent, "t-aaa");
+    assert_eq!(settled, 1, "only the t-aaa row should be settled");
+
+    // Task B's dispatch should still be delivering (not drainable — drain
+    // only returns UNREAD rows). Verify via a second ack_by_correlation for
+    // t-bbb: it should find 1 still-delivering row.
+    let settled_b = ack_by_correlation(&home, agent, "t-bbb");
+    assert_eq!(settled_b, 1, "t-bbb row should still be settling-able");
+
+    // Now both are processed — drain returns nothing.
+    let post = drain(&home, agent);
+    assert!(post.is_empty(), "both are now processed");
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// ack_by_correlation does NOT touch delivering rows with a different task_id.
+#[test]
+fn ack_by_correlation_preserves_non_matching() {
+    let home = tmp_home("ack-corr-preserve");
+    let agent = "ack-preserve-agent";
+
+    // Seed a message with task_id "t-match" and one with "t-other".
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("match")
+            .kind("task")
+            .task_id("t-match")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("other")
+            .kind("task")
+            .task_id("t-other")
+            .build(),
+    )
+    .unwrap();
+    drain(&home, agent);
+
+    // Ack only "t-match".
+    let settled = ack_by_correlation(&home, agent, "t-match");
+    assert_eq!(settled, 1);
+
+    // "t-other" should remain delivering — ack(all) should find 1.
+    let remaining = ack(&home, agent, None);
+    assert_eq!(remaining, 1, "t-other should still be delivering");
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// ack_by_correlation is idempotent: calling it again on an already-settled
+/// correlation_id returns 0.
+#[test]
+fn ack_by_correlation_idempotent() {
+    let home = tmp_home("ack-corr-idempotent");
+    let agent = "ack-idem-agent";
+
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .sender("lead")
+            .text("dispatch")
+            .kind("task")
+            .task_id("t-idem")
+            .build(),
+    )
+    .unwrap();
+    drain(&home, agent);
+
+    let first = ack_by_correlation(&home, agent, "t-idem");
+    assert_eq!(first, 1);
+
+    let second = ack_by_correlation(&home, agent, "t-idem");
+    assert_eq!(second, 0, "already processed → 0 on second call");
+
+    fs::remove_dir_all(&home).ok();
 }

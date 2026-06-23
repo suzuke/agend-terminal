@@ -718,6 +718,125 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     })
 }
 
+/// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
+/// transitioning them to `processed` so [`reclaim_stale_delivering`] will not
+/// revert them to `unread` for re-delivery.
+///
+/// Called by the daemon when an agent's session is **intentionally reset** —
+/// `replace_instance` or `restart_instance mode=fresh` — where the agent's
+/// context is known to be lost. The old session already drained these messages
+/// (they are `delivering`), so treating them as "delivered and processed" is
+/// correct: re-injecting them into a fresh, context-less session would cause
+/// the stale-resend pattern (agend-customization#159).
+///
+/// This does NOT break #2299's at-least-once guarantee for crashes: an
+/// unintentional interruption (OOM, kill -9, backend crash) never reaches this
+/// code path — only the explicit `replace_instance` / `restart mode=fresh`
+/// handlers call it — so `reclaim_stale_delivering` still recovers those.
+///
+/// `restart_instance mode=resume` deliberately does NOT call this: the resumed
+/// session retains context and the implicit next-drain ack (A) handles it.
+pub fn settle_delivering_for_session_reset(home: &Path, name: &str) -> usize {
+    let settled = ack(home, name, None);
+    if settled > 0 {
+        tracing::info!(
+            tag = "#2299-session-settle",
+            agent = %name,
+            count = settled,
+            "session-reset: settled delivering rows to processed (preventing stale re-inject)"
+        );
+    }
+    settled
+}
+
+/// Scoped ack: settle DELIVERING rows for `name` where `task_id` matches
+/// `correlation_id`. Used by the `send(kind=report, ack_inbox=true)` flow to
+/// settle exactly the dispatch message(s) that originated the task being
+/// reported on — not every delivering message in the inbox.
+///
+/// This is a filtered variant of [`ack`]: same JSONL read-modify-write
+/// pattern, but only transitions rows where `msg.task_id ==
+/// Some(correlation_id)` AND the row is in `delivering` state.
+///
+/// Returns the count of rows newly transitioned to `processed`.
+pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usize {
+    let path = inbox_path_resolved(home, name);
+    if !path.exists() {
+        return 0;
+    }
+    with_inbox_lock(home, name, |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut all: Vec<InboxMessage> = Vec::new();
+        let mut preserved_forward: Vec<String> = Vec::new();
+        let mut acked = 0usize;
+        let mut changed = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if msg.schema_version > InboxMessage::CURRENT_VERSION {
+                preserved_forward.push(line.to_string());
+                continue;
+            }
+            // Only ack delivering rows whose task_id matches the correlation_id.
+            let task_matches = msg
+                .task_id
+                .as_deref()
+                .is_some_and(|tid| tid == correlation_id);
+            if task_matches && msg.read_at.is_none() && msg.delivering_at.is_some() {
+                msg.read_at = Some(now.clone());
+                acked += 1;
+                changed = true;
+            }
+            all.push(msg);
+        }
+        if changed {
+            let tmp = path.with_extension("jsonl.tmp");
+            let r = (|| -> anyhow::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                for m in &all {
+                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                for raw in &preserved_forward {
+                    writeln!(f, "{raw}")?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&tmp, path)?;
+                Ok(())
+            })();
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "inbox ack_by_correlation write-back failed");
+                return 0;
+            }
+        }
+        if acked > 0 {
+            tracing::info!(
+                agent = %name,
+                %correlation_id,
+                count = acked,
+                "send+ack_inbox: settled delivering rows by correlation_id"
+            );
+        }
+        acked
+    })
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "inbox ack_by_correlation lock failed");
+        0
+    })
+}
+
 /// One bounded line in a [`ClearCompactResult`] — a COMPACT projection of an
 /// inbox message (never the full [`InboxMessage`], so a clear can never
 /// reintroduce the multi-megabyte blowup that a full-message drain could).
