@@ -4989,7 +4989,7 @@ const CLAUDE_STATUSLINE_FRAME: &str = "⏺ working on the thing\n\
 fn claude_context_pct_extracted_from_statusline() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     t.feed(CLAUDE_STATUSLINE_FRAME);
-    let (pct, source) = t.resolved_context().expect("statusline percent extracted");
+    let (pct, source) = t.resolved_context(None).expect("statusline percent extracted");
     assert!((pct - 61.0).abs() < f32::EPSILON);
     assert_eq!(source, ContextProvider::StatusLine);
 }
@@ -5007,7 +5007,7 @@ fn claude_context_pct_duplicate_statusline_last_wins() {
            Model: Fable 5 | Ctx Used: 61.0% | ⎇ b | (+0,-0)\n\
            ⏵⏵ bypass permissions on (shift+tab to cycle)",
     );
-    let (pct, _) = t.resolved_context().expect("reading present");
+    let (pct, _) = t.resolved_context(None).expect("reading present");
     assert!(
         (pct - 61.0).abs() < f32::EPSILON,
         "last (live) statusline wins, got {pct}"
@@ -5028,7 +5028,7 @@ fn kiro_context_pct_extracted_from_footer() {
          \n\
                                        /copy to clipboard",
     );
-    let (pct, source) = t.resolved_context().expect("footer percent extracted");
+    let (pct, source) = t.resolved_context(None).expect("footer percent extracted");
     assert!((pct - 10.0).abs() < f32::EPSILON);
     assert_eq!(source, ContextProvider::StatusLine);
 }
@@ -5052,7 +5052,7 @@ fn context_pct_prose_mention_does_not_match() {
          (no statusline rendered — narrow pane)",
     );
     assert!(
-        t.resolved_context().is_none(),
+        t.resolved_context(None).is_none(),
         "prose mentions (above the status rows / non-statusline form) must not read"
     );
 }
@@ -5064,7 +5064,7 @@ fn context_pct_truncated_statusline_keeps_previous_reading() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     t.feed(CLAUDE_STATUSLINE_FRAME);
     t.feed("totally different screen\nwith no statusline at all\n❯");
-    let (pct, _) = t.resolved_context().expect("previous reading retained");
+    let (pct, _) = t.resolved_context(None).expect("previous reading retained");
     assert!((pct - 61.0).abs() < f32::EPSILON);
 }
 
@@ -5078,12 +5078,12 @@ fn context_pct_truncated_statusline_keeps_previous_reading() {
 fn context_resolution_is_pattern_only_estimate_disabled_1945() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     assert!(
-        t.resolved_context().is_none(),
+        t.resolved_context(None).is_none(),
         "#1945: no pattern reading → honestly unknown (never an estimate)"
     );
     t.feed(CLAUDE_STATUSLINE_FRAME);
     assert_eq!(
-        t.resolved_context().map(|(p, s)| (p as u32, s)),
+        t.resolved_context(None).map(|(p, s)| (p as u32, s)),
         Some((61, ContextProvider::StatusLine)),
         "pattern reading reports with source ContextProvider::StatusLine"
     );
@@ -5094,7 +5094,6 @@ fn context_resolution_is_pattern_only_estimate_disabled_1945() {
 #[test]
 fn context_pct_unknown_for_backends_without_pattern() {
     for backend in [
-        Backend::Codex,
         Backend::OpenCode,
         Backend::Agy,
         Backend::Shell,
@@ -5103,10 +5102,15 @@ fn context_pct_unknown_for_backends_without_pattern() {
         assert_eq!(t.context_provider(), ContextProvider::Unavailable);
         t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
         assert!(
-            t.resolved_context().is_none(),
+            t.resolved_context(None).is_none(),
             "{backend:?} has ContextProvider::Unavailable → unknown"
         );
     }
+
+    let mut t = StateTracker::new(Some(&Backend::Codex));
+    assert_eq!(t.context_provider(), ContextProvider::TranscriptEstimate { confidence: 0.9 });
+    t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
+    assert!(t.resolved_context(None).is_none());
 }
 
 // ── #1947: input-line exclusion — operator-typed / quoted error strings ─────

@@ -416,14 +416,25 @@ const CONTEXT_TAIL_BYTES: u64 = 256 * 1024;
 /// window map + the >110% misjudge guard below are FIXED and test-pinned;
 /// re-enable ONLY after validating estimates against statusline ground truth
 /// (compare `context_pct` pattern readings on wide panes).
-#[allow(dead_code)]
 pub(crate) fn estimate_context_pct(home: &Path, instance: &str) -> Option<f32> {
-    let projects = claude_projects_dir()?;
     let roots: Vec<(String, Vec<PathBuf>)> = instance_roots(home)
         .into_iter()
         .filter(|(name, _)| name == instance)
         .collect();
-    estimate_context_pct_in(&projects, &roots)
+    if roots.is_empty() {
+        return None;
+    }
+    if let Some(projects) = claude_projects_dir() {
+        if let Some(pct) = estimate_context_pct_in(&projects, &roots) {
+            return Some(pct);
+        }
+    }
+    if let Some(sessions) = codex_sessions_dir() {
+        if let Some(pct) = estimate_codex_context_pct_in(&sessions, &roots) {
+            return Some(pct);
+        }
+    }
+    None
 }
 
 /// Testable core of [`estimate_context_pct`]: injected projects dir + roots.
@@ -498,9 +509,66 @@ fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]
     None
 }
 
+/// Codex-specific context estimator: injected sessions dir + roots.
+fn estimate_codex_context_pct_in(sessions_dir: &Path, roots: &[(String, Vec<PathBuf>)]) -> Option<f32> {
+    if roots.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now();
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for fp in codex_session_files(sessions_dir) {
+        let Some(mtime) = std::fs::metadata(&fp).ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        // Stale session → not the live context.
+        if now
+            .duration_since(mtime)
+            .map(|age| age > CONTEXT_ESTIMATE_HORIZON)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if newest.as_ref().is_some_and(|(t, _)| *t >= mtime) {
+            continue;
+        }
+        if transcript_attributes_to(&fp, roots) {
+            newest = Some((mtime, fp));
+        }
+    }
+    let (_, path) = newest?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let rows = parse_codex_rows(&content, roots, None);
+    if rows.is_empty() {
+        return None;
+    }
+    let mut sum = Agg::default();
+    for r in &rows {
+        sum.add(&r.usage);
+    }
+    let total = sum.total_tokens();
+    if total == 0 {
+        return None;
+    }
+    let last_model = &rows.last()?.model;
+    let window = context_window_for(last_model) as f64;
+    let pct = (total as f64 / window) * 100.0;
+    if pct > 110.0 {
+        tracing::warn!(
+            model = %last_model,
+            tokens = total,
+            assumed_window = window as u64,
+            pct = pct as u32,
+            "context estimate exceeds the assumed window — window misjudged, reporting unknown"
+        );
+        return None;
+    }
+    Some(pct.clamp(0.0, 100.0) as f32)
+}
+
 /// Cheap attribution probe: does one of the file's first lines carry a `cwd`
 /// belonging to the instance's roots? Reads only the head — full-content
-/// attribution is the estimator's tail read.
+/// attribution is the estimator's tail read. Supports both top-level `cwd`
+/// (Claude) and nested `payload.cwd` (Codex) formats.
 fn transcript_attributes_to(path: &Path, roots: &[(String, Vec<PathBuf>)]) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -514,6 +582,7 @@ fn transcript_attributes_to(path: &Path, roots: &[(String, Vec<PathBuf>)]) -> bo
             .ok()
             .and_then(|v| {
                 v.get("cwd")
+                    .or_else(|| v.get("payload").and_then(|p| p.get("cwd")))
                     .and_then(Value::as_str)
                     .map(|cwd| attribute(Path::new(cwd), roots).is_some())
             })
@@ -2042,6 +2111,30 @@ mod context_estimate_tests {
             estimate_context_pct_in(&projects, &[]).is_none(),
             "no roots → None"
         );
+    }
+
+    /// Codex session file (rollout) estimates the correct context usage.
+    #[test]
+    fn estimate_respects_codex_rollout_files() {
+        let sessions = tmp("codex-est-sessions");
+        let day = sessions.join("2026").join("06").join("24");
+        std::fs::create_dir_all(&day).unwrap();
+
+        let cwd = "/virtual/workspace/dev-codex";
+        let content = [
+            format!(r#"{{"timestamp":"2026-06-24T00:10:18.000Z","type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#),
+            format!(r#"{{"timestamp":"2026-06-24T00:10:19.000Z","type":"turn_context","payload":{{"model":"gpt-5-codex"}}}}"#),
+            r#"{"timestamp":"2026-06-24T00:10:22.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
+            r#"{"timestamp":"2026-06-24T00:10:29.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":800,"output_tokens":200,"reasoning_output_tokens":60,"total_tokens":2200},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
+        ].join("\n");
+        std::fs::write(day.join("rollout-x.jsonl"), content).unwrap();
+
+        let roots = roots_for("dev-codex", cwd);
+        let pct = estimate_codex_context_pct_in(&sessions, &roots)
+            .expect("estimate produced for codex");
+
+        // 2200 / 200,000 = 1.1%
+        assert!((pct - 1.1).abs() < 0.1, "Codex estimate, got {pct}");
     }
 }
 

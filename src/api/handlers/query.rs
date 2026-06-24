@@ -44,7 +44,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // Context% telemetry: resolved usage + producing source.
                     // Absent = honestly unknown; context_provider says whether
                     // the backend has a trustworthy passive signal at all.
-                    c.state.resolved_context(),
+                    c.state.resolved_context(Some(ctx.home)),
                     c.state.context_provider(),
                     // #2413 Phase 1: out-of-path API-activity signal, read under the
                     // SAME lock as agent_state so a consumer can reconcile the two

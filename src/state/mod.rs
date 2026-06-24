@@ -1494,10 +1494,20 @@ impl StateTracker {
     /// corrected estimator + its root-cause record live on in
     /// `token_cost::estimate_context_pct` (tested, uncalled); re-enable ONLY
     /// after validating its readings against statusline ground truth.
-    pub fn resolved_context(&self) -> Option<(f32, crate::backend_profile::ContextProvider)> {
+    pub fn resolved_context(
+        &self,
+        home: Option<&std::path::Path>,
+    ) -> Option<(f32, crate::backend_profile::ContextProvider)> {
         if let Some((pct, at)) = self.context_pct {
             if at.elapsed() < CONTEXT_FRESH {
                 return Some((pct, self.context_provider));
+            }
+        }
+        if let crate::backend_profile::ContextProvider::TranscriptEstimate { .. } = self.context_provider {
+            if let Some(home_path) = home {
+                if let Some(pct) = crate::token_cost::estimate_context_pct(home_path, &self.instance_name) {
+                    return Some((pct, self.context_provider));
+                }
             }
         }
         None
