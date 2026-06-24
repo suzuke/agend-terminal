@@ -1,8 +1,9 @@
 //! #2413 — opencode HTTP `/event` SSE observer source (Stream plane).
 //!
 //! opencode is client-server: its native TUI EMBEDS an HTTP server (the same binary /
-//! event-bus as `opencode serve`) and is itself a client of it. When
-//! `AGEND_SHADOW_OBSERVER=1`, [`build_command`](crate::agent) injects `--port N` (an
+//! event-bus as `opencode serve`) and is itself a client of it. When the Shadow Observer
+//! is enabled (default-ON; `AGEND_SHADOW_OBSERVER=0` disables),
+//! [`build_command`](crate::agent) injects `--port N` (an
 //! OS-allocated free port, [`alloc_port`]) into the opencode launch so that embedded
 //! server is reachable on a KNOWN port; this module subscribes to
 //! `http://127.0.0.1:N/event` (Server-Sent Events) and maps opencode's NATIVE session

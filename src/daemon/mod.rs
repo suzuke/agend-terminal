@@ -786,9 +786,9 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::ReclaimHandler::new(30, work_stuck_latch)),
         // #2413 Phase B (Shadow Observer): per-tick reduce — fold each agent's buffered
         // hook Evidence + screen baseline + lsof liveness into an additive
-        // `observed_status` (never rewrites `agent_state`). Flag-OFF default
-        // (`AGEND_SHADOW_OBSERVER=1`) ⇒ a single `enabled()` check then early-return, so
-        // this is a no-op for a default fleet. Daemon-only telemetry → allowlisted out of
+        // `observed_status` (never rewrites `agent_state`). Default-ON; under the
+        // `AGEND_SHADOW_OBSERVER=0` kill-switch a single `enabled()` check then early-return
+        // makes it a no-op. Daemon-only telemetry → allowlisted out of
         // app mode (the hook socket server it consumes is started in `run_core`).
         Box::new(per_tick::ShadowObserveHandler::new()),
     ]
@@ -909,7 +909,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     let ctx = init_daemon_services(home, telegram_pre)?;
 
     // #2413 Shadow Observer — local plane: start the unix-socket hook-event server
-    // (no-op unless AGEND_SHADOW_OBSERVER=1). Observe-only side-channel; never blocks.
+    // (no-op under AGEND_SHADOW_OBSERVER=0; default-ON). Observe-only side-channel; never blocks.
     crate::daemon::shadow::start(home);
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
@@ -1386,16 +1386,16 @@ fn build_tick_infrastructure(
     crate::api_activity_probe::spawn(Arc::clone(&ctx.registry));
     // #2413 Phase D: codex rollout-tail observer source (Stream plane) — read-only tail of
     // ~/.codex/sessions/.../rollout-*.jsonl → Evidence → the shared buffer the reducer
-    // consumes. No-op unless AGEND_SHADOW_OBSERVER=1 (flag-OFF default ⇒ zero change).
+    // consumes. No-op under the AGEND_SHADOW_OBSERVER=0 kill-switch (default-ON).
     // ALSO wired into run_app (the live fleet daemon is app mode — #2434 lesson).
     crate::daemon::shadow::rollout::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
     // #2413 opencode plane: SSE `/event` observer source (Stream plane). Subscribes to each
     // opencode agent's embedded server (port injected at spawn) → Evidence → shared buffer.
-    // No-op unless AGEND_SHADOW_OBSERVER=1. ALSO wired into run_app (#2434 lesson).
+    // No-op under AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434).
     crate::daemon::shadow::opencode::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
     // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/<uuid>.jsonl → Evidence →
-    // shared buffer (attribution via the <uuid>.json sidecar cwd). No-op unless
-    // AGEND_SHADOW_OBSERVER=1. ALSO wired into run_app (#2434 lesson).
+    // shared buffer (attribution via the <uuid>.json sidecar cwd). No-op under
+    // AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434 lesson).
     crate::daemon::shadow::kiro::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
 
     crate::inbox::recover_half_writes(home);
