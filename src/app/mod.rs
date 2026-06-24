@@ -2281,41 +2281,50 @@ mod tests {
     /// daemon is `run_app`, so gating `rollout::spawn` to run_core-only would leave codex
     /// agents' observer source dead in production (their `observed_status` would never get
     /// Stream evidence). Production-region scan only (the assert literal lives in the test
-    /// module below — #2434's vacuous-pin lesson). REVERSE-MUTATION verified: deleting the
-    /// real `rollout::spawn(...)` call from run_app turns this RED.
+    /// module below — #2434's vacuous-pin lesson). Production-region scan, **comments
+    /// stripped** (#2447 r6 helper) so a commented-out call does NOT satisfy the pin.
+    /// REVERSE-MUTATION verified: both DELETING and COMMENTING-OUT the real
+    /// `rollout::spawn(...)` call in run_app turn this RED.
     #[test]
     fn run_app_wires_codex_rollout_tailer_2413() {
         let source = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
+        let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
-            prod.contains("crate::daemon::shadow::rollout::spawn("),
+            prod_code.contains("crate::daemon::shadow::rollout::spawn("),
             "run_app must spawn the codex rollout-tail observer in the PRODUCTION region \
-             (#2413 Phase D) — gating it run_core-only would leave codex agents' Stream \
-             observer dead in the app-mode live daemon. No \
-             'crate::daemon::shadow::rollout::spawn(' before the #[cfg(test)] cutoff"
+             (#2413 Phase D) — gating it run_core-only (or commenting it out) would leave codex \
+             agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+             'crate::daemon::shadow::rollout::spawn(' (comments + string-literal contents masked) before the \
+             #[cfg(test)] cutoff"
         );
     }
 
     /// #2413 opencode plane: the opencode SSE `/event` observer source (Stream plane) must
     /// be started in app mode too — SAME #2434 reasoning as the rollout tailer above. The
     /// live fleet daemon is `run_app`, so gating `opencode::spawn` to run_core-only would
-    /// leave opencode agents' observer source dead in production. Production-region scan
-    /// only. REVERSE-MUTATION verified: deleting the real `opencode::spawn(...)` call from
-    /// run_app turns this RED.
+    /// leave opencode agents' observer source dead in production. Production-region scan,
+    /// **comments stripped** (#2447 r6 helper) so a commented-out call does NOT satisfy the
+    /// pin. REVERSE-MUTATION verified: both DELETING and COMMENTING-OUT the real
+    /// `opencode::spawn(...)` call in run_app turn this RED.
     #[test]
     fn run_app_wires_opencode_sse_observer_2413() {
         let source = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
+        let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
-            prod.contains("crate::daemon::shadow::opencode::spawn("),
+            prod_code.contains("crate::daemon::shadow::opencode::spawn("),
             "run_app must spawn the opencode SSE observer in the PRODUCTION region \
-             (#2413 opencode plane) — gating it run_core-only would leave opencode agents' \
-             Stream observer dead in the app-mode live daemon. No \
-             'crate::daemon::shadow::opencode::spawn(' before the #[cfg(test)] cutoff"
+             (#2413 opencode plane) — gating it run_core-only (or commenting it out) would leave \
+             opencode agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+             'crate::daemon::shadow::opencode::spawn(' (comments + string-literal contents masked) before the \
+             #[cfg(test)] cutoff"
         );
     }
 
@@ -2451,6 +2460,154 @@ mod tests {
         out
     }
 
+    /// Replace the CONTENTS of every string / raw-string literal with spaces (delimiters
+    /// kept) in ALREADY-comment-free Rust source; char literals are passed through verbatim
+    /// (they can't hold a multi-char needle, but must be consumed so a `"` inside `'"'`
+    /// doesn't mis-start a string scan). Sibling of [`strip_rust_comments`] used only by the
+    /// wiring pins via [`strip_comments_and_blank_strings`].
+    ///
+    /// #2450 reviewer-6: comment-stripping alone left the pins **string-literal-blind** — a
+    /// needle hidden in a string (`let _ = "…::spawn(";`) survived the strip, so the pin's
+    /// `contains()` still falsely passed (the exact #2434 dead-wiring vacuity, just relocated
+    /// from a comment into a string). Blanking string interiors closes that: the only place
+    /// the needle survives is an ACTIVE code call.
+    fn blank_string_contents(src: &str) -> String {
+        let s: Vec<char> = src.chars().collect();
+        let n = s.len();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < n {
+            let c = s[i];
+            // raw string `r"..."` / `r#"..."#` / `br"..."` — blank interior, keep delimiters.
+            if c == 'r' || (c == 'b' && i + 1 < n && s[i + 1] == 'r') {
+                let r_pos = if c == 'b' { i + 1 } else { i };
+                let mut k = r_pos + 1;
+                let mut hashes = 0;
+                while k < n && s[k] == '#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && s[k] == '"' {
+                    for ch in &s[i..=k] {
+                        out.push(*ch); // opening `r#"` delimiter, verbatim
+                    }
+                    i = k + 1;
+                    loop {
+                        if i >= n {
+                            break;
+                        }
+                        if s[i] == '"' {
+                            let mut h = 0;
+                            while i + 1 + h < n && h < hashes && s[i + 1 + h] == '#' {
+                                h += 1;
+                            }
+                            if h == hashes {
+                                for ch in &s[i..i + 1 + hashes] {
+                                    out.push(*ch); // closing `"#`, verbatim
+                                }
+                                i += 1 + hashes;
+                                break;
+                            }
+                        }
+                        out.push(' '); // blank one interior char
+                        i += 1;
+                    }
+                    continue;
+                }
+                // not a raw string (identifier starting with r/b) → fall through.
+            }
+            // normal / byte string `"..."` — blank interior (honor `\` escapes), keep quotes.
+            if c == '"' {
+                out.push('"');
+                i += 1;
+                while i < n {
+                    if s[i] == '\\' && i + 1 < n {
+                        out.push(' ');
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                    if s[i] == '"' {
+                        out.push('"');
+                        i += 1;
+                        break;
+                    }
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // char literal `'x'` / `'\n'` — pass through verbatim (consume so a `"` inside a
+            // char literal can't start a string scan); a lifetime `'a` is a normal char.
+            if c == '\'' {
+                if i + 1 < n && s[i + 1] == '\\' {
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    i += 2;
+                    if i < n {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    while i < n && s[i] != '\'' {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    if i < n {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 2 < n && s[i + 2] == '\'' {
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    out.push(s[i + 2]);
+                    i += 3;
+                    continue;
+                }
+                // lifetime / stray `'` → normal char.
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// The wiring-pin matcher: strip comments AND blank string-literal contents, so a
+    /// `…::spawn(` needle counts ONLY when it is an ACTIVE code call — not commented out
+    /// (#2447) and not hidden in a string literal (#2450 reviewer-6). Composition of the two
+    /// proven passes; `strip_rust_comments` body is left untouched.
+    fn strip_comments_and_blank_strings(src: &str) -> String {
+        blank_string_contents(&strip_rust_comments(src))
+    }
+
+    /// #2450 reviewer-6 regression: the wiring-pin matcher must treat a `…::spawn(` needle as
+    /// PRESENT only when it is ACTIVE code — not in a comment (#2447) and not hidden inside a
+    /// string / raw-string literal (#2450). Pins reviewer-6's exact false-green break-probe.
+    #[test]
+    fn strip_comments_and_blank_strings_masks_string_and_comment_needles() {
+        let needle = "crate::daemon::shadow::rollout::spawn(";
+        // ACTIVE code call → still present (must NOT false-kill the real wiring).
+        assert!(strip_comments_and_blank_strings(&format!("    {needle}x);")).contains(needle));
+        // reviewer-6 break-probe: needle hidden in a NORMAL string literal → masked.
+        assert!(
+            !strip_comments_and_blank_strings(&format!("let _p = \"{needle}\";")).contains(needle)
+        );
+        // needle hidden in a RAW string literal → masked.
+        assert!(
+            !strip_comments_and_blank_strings(&format!("let _p = r#\"{needle}\"#;"))
+                .contains(needle)
+        );
+        // needle in a comment → masked (the comment-strip pass still applies).
+        assert!(!strip_comments_and_blank_strings(&format!("// {needle}\n")).contains(needle));
+        // string-literal-AWARE preserved: a `"http://x"` URL must not eat the rest of its
+        // line, so real code after it survives (no false-RED).
+        assert!(
+            strip_comments_and_blank_strings("let u = \"http://x\"; keep_me();")
+                .contains("keep_me()")
+        );
+    }
+
     /// #2447 r6 round-2: `strip_rust_comments` must strip REAL comments yet preserve
     /// `//` / `/*` that live inside string / char / raw-string literals (else a `"http://x"`
     /// URL would false-strip its line → a vacuity-fix that introduces a false-RED). Covers
@@ -2507,13 +2664,13 @@ mod tests {
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         // Strip comments FIRST: a commented-out call must not pass the pin (r6 vacuity fix).
-        let prod_code = strip_rust_comments(prod);
+        let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
             prod_code.contains("crate::daemon::shadow::kiro::spawn("),
             "run_app must spawn the kiro session-tail observer in the PRODUCTION region \
              (#2413 kiro plane) — gating it run_core-only (or commenting it out) would leave \
              kiro agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
-             'crate::daemon::shadow::kiro::spawn(' (comments stripped) before the \
+             'crate::daemon::shadow::kiro::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
     }
