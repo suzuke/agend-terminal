@@ -186,6 +186,10 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // but this global `HashMap<name, HookShadow>` had no eviction path (it only
     // ever inserted via `record_event`), leaking one entry per ever-seen agent.
     crate::daemon::hook_shadow::forget(name);
+    // #2413 Shadow Observer (local plane): drop this agent's session token(s) so the
+    // registry doesn't grow across churn and a recycled name can't inherit a dead
+    // session's token binding. Same name↔uuid residual class as the hook-shadow store.
+    crate::daemon::shadow::forget_agent(name);
 
     // #1744-H2: drop the persisted escalation state so a later agent reusing
     // this name does not rehydrate the deleted instance's crash budget /
