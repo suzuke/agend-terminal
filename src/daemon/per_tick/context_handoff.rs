@@ -238,7 +238,7 @@ impl PerTickHandler for ContextHandoffHandler {
             for handle in reg.values() {
                 live.insert(handle.name.as_str().to_string());
                 let core = handle.core.lock();
-                if let Some((pct, _source)) = core.state.resolved_context() {
+                if let Some((pct, _source)) = core.state.resolved_context(Some(ctx.home)) {
                     let is_idle = core.state.get_state() == crate::state::AgentState::Idle;
                     snapshot.push((handle.name.as_str().to_string(), pct, is_idle));
                 }

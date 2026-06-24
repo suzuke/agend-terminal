@@ -370,7 +370,7 @@ fn codex_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Codex),
         },
         context_pattern: None,
-        context_provider: ContextProvider::Unavailable,
+        context_provider: ContextProvider::TranscriptEstimate { confidence: 0.9 },
         input_line_markers: &["›"],
         initial_state: AgentState::Starting,
     }
@@ -511,7 +511,7 @@ mod context_pattern_tests {
         let provider = |b: &Backend| profile(b).context_provider;
         assert_eq!(provider(&Backend::ClaudeCode), ContextProvider::StatusLine);
         assert_eq!(provider(&Backend::KiroCli), ContextProvider::StatusLine);
-        assert_eq!(provider(&Backend::Codex), ContextProvider::Unavailable);
+        assert_eq!(provider(&Backend::Codex), ContextProvider::TranscriptEstimate { confidence: 0.9 });
         assert_eq!(provider(&Backend::OpenCode), ContextProvider::Unavailable);
         assert_eq!(provider(&Backend::Agy), ContextProvider::Unavailable);
         assert_eq!(provider(&Backend::Shell), ContextProvider::Unavailable);
@@ -524,7 +524,6 @@ mod context_pattern_tests {
     #[test]
     fn unavailable_context_providers_do_not_claim_a_pattern() {
         for backend in [
-            Backend::Codex,
             Backend::OpenCode,
             Backend::Agy,
             Backend::Shell,

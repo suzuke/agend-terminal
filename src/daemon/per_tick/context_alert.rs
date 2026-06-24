@@ -114,7 +114,7 @@ impl PerTickHandler for ContextAlertHandler {
             let mut live = std::collections::HashSet::new();
             for handle in reg.values() {
                 live.insert(handle.name.as_str().to_string());
-                if let Some((pct, source)) = handle.core.lock().state.resolved_context() {
+                if let Some((pct, source)) = handle.core.lock().state.resolved_context(Some(ctx.home)) {
                     resolved.push((handle.name.as_str().to_string(), pct, source.source_name()));
                 }
             }
