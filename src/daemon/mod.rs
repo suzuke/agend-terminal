@@ -1389,6 +1389,10 @@ fn build_tick_infrastructure(
     // consumes. No-op unless AGEND_SHADOW_OBSERVER=1 (flag-OFF default ⇒ zero change).
     // ALSO wired into run_app (the live fleet daemon is app mode — #2434 lesson).
     crate::daemon::shadow::rollout::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
+    // #2413 opencode plane: SSE `/event` observer source (Stream plane). Subscribes to each
+    // opencode agent's embedded server (port injected at spawn) → Evidence → shared buffer.
+    // No-op unless AGEND_SHADOW_OBSERVER=1. ALSO wired into run_app (#2434 lesson).
+    crate::daemon::shadow::opencode::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a
