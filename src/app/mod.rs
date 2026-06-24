@@ -2234,20 +2234,28 @@ mod tests {
     /// #2413 Phase B live-fix companion: the reducer driver is useless without the
     /// hook-event SOCKET SERVER feeding its buffer, and `shadow::start` is the only thing
     /// that binds it. `run_core` already calls it; this source-pins that `run_app` does
-    /// too (it appears ONLY in run_app within this file), so the plane can't be
-    /// half-wired in app mode again (driver runs, but folds an always-empty buffer). The
-    /// behavioural end-to-end (flag-on → observed_status populated) is the operator's live
-    /// dogfood + the daemon-side reduce test; this is the cheap cross-platform guard.
+    /// too, so the plane can't be half-wired in app mode again (driver runs, but folds an
+    /// always-empty buffer). The behavioural end-to-end (flag-on → observed_status
+    /// populated) is the operator's live dogfood; this is the cheap cross-platform guard.
+    ///
+    /// Scans ONLY the production region (before the `#[cfg(test)]` cutoff). This
+    /// assertion's own needle literal lives in the test module below, so a WHOLE-FILE
+    /// substring check would self-match and stay green even if the real `run_app` call
+    /// were deleted — the #2433 vacuous-pin class this very PR fixes (DUAL round-1 caught
+    /// it here). Mirrors `run_app_registers_event_bus_subscribers`. REVERSE-MUTATION
+    /// verified: deleting the real `shadow::start(&home)` call from run_app turns this RED.
     #[test]
     fn run_app_wires_shadow_socket_server_2413() {
-        let file = "src/app/mod.rs";
-        let src = std::fs::read_to_string(file)
-            .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{file}")))
-            .unwrap_or_else(|_| panic!("source must be readable: {file}"));
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
-            src.contains("crate::daemon::shadow::start(&home)"),
-            "run_app must start the Shadow Observer hook-socket server (#2413 live-fix) — \
-             gating it to run_core left the whole plane dead in the app-mode live daemon"
+            prod.contains("crate::daemon::shadow::start(&home)"),
+            "run_app must start the Shadow Observer hook-socket server in the PRODUCTION \
+             region (#2413 live-fix) — gating it to run_core left the whole plane dead in \
+             the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \
+             #[cfg(test)] cutoff"
         );
     }
 
