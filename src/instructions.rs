@@ -338,17 +338,21 @@ pub(crate) fn build_instructions_body(
     // "continue" was mistaken by an orchestrator for an operator command and a
     // task was dispatched from it. The daemon now tags such nudges; teach agents
     // to recognize the tag (same trust model as [AGEND-MSG]).
-    // #2435: TUI image paste. Ctrl+B i in the TUI (the attach client OR the app
-    // multi-pane view) reads an image from the operator's clipboard, saves it as
-    // a PNG, and injects this marker. Platform-neutral — the clipboard read works
-    // on macOS/Windows/Linux; the agent only ever sees the marker + a PNG path.
+    // #2435/#2443: TUI image paste. Ctrl+B i in the TUI (the attach client OR the
+    // app multi-pane view) reads an image from the operator's clipboard and
+    // injects this marker. A copied screenshot/region is saved as a PNG; a copied
+    // image FILE is passed through in its own format (e.g. JPG). Platform-neutral —
+    // the agent only ever sees the marker + a readable image path.
     content.push_str("\n## TUI image paste (`[AGEND-IMAGE-PASTE]`)\n\n");
     content
-        .push_str("When you see input beginning with `[AGEND-IMAGE-PASTE: /path/to/file.png]`:\n");
+        .push_str("When you see input beginning with `[AGEND-IMAGE-PASTE] /path/to/file.png`:\n");
     content.push_str(
         "- The operator pressed `Ctrl+B i` in the TUI to paste an image from their clipboard.\n",
     );
-    content.push_str("- The image was saved to the given path as a PNG file.\n");
+    content.push_str(
+        "- The image is at the given path — a PNG (copied screenshot/region) or the original \
+         image file in its own format (e.g. JPG) when a file was copied.\n",
+    );
     content.push_str(
         "- Immediately use your `Read` tool on that path to view the image, then respond based on \
          what you see.\n",

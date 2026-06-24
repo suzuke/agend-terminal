@@ -57,7 +57,7 @@ pub enum Action {
     /// Mode A explicit-copy), persisting the choice. Bound to `Ctrl+B e`.
     ToggleCopyOnSelect,
     /// #2435: paste an image from the clipboard into the focused pane's agent as
-    /// an `[AGEND-IMAGE-PASTE: <path>]` marker. Bound to `Ctrl+B i`. The exhaustive
+    /// an `[AGEND-IMAGE-PASTE] <path>` marker. Bound to `Ctrl+B i`. The exhaustive
     /// `app::dispatch` match makes adding this variant compile-force its app arm —
     /// so the feature cannot be live-in-attach-but-dead-in-app (#2434/#2438 class).
     PasteImage,

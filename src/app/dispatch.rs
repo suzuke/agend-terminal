@@ -649,7 +649,7 @@ mod tests {
         paste_image(&mut ctx, || {
             Ok((
                 std::path::PathBuf::from("/tmp/agend_paste_test.png"),
-                "[AGEND-IMAGE-PASTE: /tmp/agend_paste_test.png]\n".to_string(),
+                "[AGEND-IMAGE-PASTE] /tmp/agend_paste_test.png\n".to_string(),
             ))
         });
 
