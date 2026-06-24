@@ -620,51 +620,69 @@ Normalize: lead MUST `release_worktree(agent: <self>)` BEFORE every `send(kind: 
 
 Lead role does not need a worktree for orchestration work — release immediately after each dispatch is correct hygiene.
 
-### 10.7 Bare `init` Heartbeat Commits — Source & Handling (#1462)
+### 10.7 Bare `init` Commits on a Worktree Branch — Source & Handling (#1462)
 
-Empty `init` commits sometimes pile up on a bound branch. **Correcting the
-prior (inaccurate) wording in this section**: the daemon does NOT write them.
+Empty `init` commits sometimes pile up on a bound branch. **The daemon does NOT
+write them**, and — correcting an earlier hypothesis in this section — they are
+**NOT a backend session-checkpoint "heartbeat" either**.
 
-**Who produces them**: the **backend CLI process** (Claude Code / Codex / etc.)
-emits `git commit --allow-empty -m "init"` itself, as a session-checkpoint
-side effect. These pass through the `agend-git` shim's `ChdirPass` like any
-other agent git call, so the committer is the operator's **global git
-identity** (user.name/user.email), not the daemon. See the matching note on the
-`Action::CleanupAndChdirPushPass` variant in `src/bin/agend-git.rs`.
+**Confirmed source (RCA t-…50430-10)**: they are **`agend-git`'s own BIN-test
+fixtures leaking onto the real branch**. When a dev runs `cargo test --bins` (or
+the `agend-git` bin tests specifically) *inside a bound worktree*, those tests'
+`git commit --allow-empty -m "init"` calls go through the `agend-git` shim, whose
+`ChdirPass` redirects them onto the worktree's REAL branch — the same "in-worktree
+cargo test writes through the shim" trap. The fixtures set
+`-c user.name=t -c user.email=t@t`, so the tell-tale committer on the pile is
+**`t <t@t>`**, which proves the source is the test fixtures — not the daemon, not a
+backend.
 
-**What the daemon actually does** (it never creates these): only
-(a) stamps `Agend-Agent` / `Agend-Task` / `Agend-Branch` / `Agend-Issued-At`
-trailers onto whatever commit happens, via the `prepare-commit-msg` hook, and
-(b) **cleans** them — the 5 git hooks plus the pre-push `agend-git` shim
-(`cleanup_init_pile_pre_push`) soft-reset the empty `init` pile out of the
-push range.
+**Distinct from agend's own init commit**: in a fresh/empty repo agend creates a
+**one-time** init commit, committer `agend-terminal <agend@localhost>`, set with an
+*ephemeral* `-c user.name/-c user.email` on that one commit only
+(`src/worktree.rs:112-115`, under `AGEND_GIT_BYPASS`) — NOT persisted, so it does
+not affect later commits. That is a different, legitimate, single commit. So there
+are two init committers to recognise: the test-leak pile = **`t <t@t>`**; agend's
+own empty-repo init = **`agend@localhost`**. (A real backend commit via the shim's
+`commit → ChdirPass` carries the operator's GLOBAL git identity — the shim does not
+inject `-c user.*`, `src/bin/agend-git.rs:135-136` — but that is the backend's
+*real* work, never the empty-`init` pile.)
 
-**Cadence is episodic, not periodic**: they arrive in **bursts** (several in
-the same second), separated by **hours to days**, triggered by backend session
-events — NOT on a fixed ~90s timer. Idle agents do not steadily accumulate them.
-
-**Distinct from agend's own init commit**: in a fresh/empty repo agend creates
-a **one-time** `init (agend-terminal)` commit (committer `agend@localhost`,
-under `AGEND_GIT_BYPASS`). That is a different, legitimate, single commit — not
-the bare-`init` backend heartbeat described here.
+**What the daemon does** (it never creates these): (a) stamps `Agend-Agent` /
+`Agend-Task` / `Agend-Branch` / `Agend-Issued-At` trailers onto whatever commit
+happens, via the `prepare-commit-msg` hook; (b) **cleans the pile on push** — a
+normal `git push` of a bound worktree routes through the shim's
+`CleanupAndChdirPushPass`, which calls `cleanup_init_pile_pre_push` to soft-reset
+the empty `init` commits out of the push range
+(`src/bin/agend-git.rs:196-222`).
 
 **Agent guidance — do NOT hand-clean the pile**:
-- **Never** manually `git reset --soft` + force-push to scrub the `init` pile.
-  The pre-push shim + the cleanup hooks already strip them from the pushed
-  range, and squash-merge collapses anything that slips through. The local
-  pile is **cosmetic** — it does not reach `main`. (A dev in an earlier session
-  wasted effort force-pushing to remove these; don't repeat that.)
-- **Forensics** (PR #1468, merged): after a rebuild + daemon restart, the shim
-  records the process ancestry the next time a bare `init` fires — this will
-  eventually pin down exactly which backend emits them. Until then, the
-  source is "the backend", not the daemon.
+- **Never** manually rewrite history to scrub it — not `git reset --soft`
+  + force-push, **not `git rebase`** (`rebase -i` / `--onto` to drop the inits),
+  not `commit --amend`. A normal push strips them automatically and squash-merge
+  collapses anything that slips through. The local pile is **cosmetic** — it does
+  not reach `main`, so there is nothing to clean.
+- **It is NOT daemon tampering.** A worktree-local `init` pile (or a base/HEAD that
+  looks "shifted" by it) is the test-fixture leak above — NOT the daemon rewriting
+  your branch. Do not open an RCA over it. ⚠ This exact mistake has recurred:
+  **two separate devs hand-`rebase`d these off as "daemon pollution", one burning a
+  whole RCA spike**, for zero benefit. Let the push handle the pile.
+- **⚠ One real exception — `AGEND_GIT_BYPASS=1 git push`**: a bypass push skips the
+  shim ENTIRELY (`src/bin/agend-git.rs:256`), so `cleanup_init_pile_pre_push` does
+  NOT run and the pile would be pushed as-is. (Note `--no-verify` does NOT cause
+  this — the cleanup is shim code in the push arm, not a git pre-push hook, so it
+  runs regardless of `--no-verify`.) If you must bypass-push a branch carrying the
+  pile, a manual cleanup before that single push is legitimate; otherwise prefer a
+  normal push and leave it alone.
+- **TODO (root fix, not in this PR)**: isolate the `agend-git` BIN tests so their
+  `git commit --allow-empty` fixtures cannot leak through the shim onto the real
+  branch (e.g. run them under bypass / an unbound env). Code fix, cosmetic, low
+  priority.
 
-**Acceptance / §3.10 verifiability**: these commits are NOT to be
-amend-rewritten or force-pushed away (per §10 hard rule). Reviewers look past
-them via `git log --no-merges --grep`. An anchor RED commit may sit between
-`init` commits and the impl GREEN commit — verify §3.10 by
-`git checkout <anchor-sha>` (cargo test fails) → `git checkout <impl-sha>`
-(cargo test passes), ignoring the intervening `init` noise.
+**Acceptance / §3.10 verifiability**: these commits are NOT to be amend-rewritten
+or force-pushed away (per §10 hard rule). Reviewers look past them via
+`git log --no-merges --grep`. An anchor RED commit may sit between `init` commits
+and the impl GREEN commit — verify §3.10 by `git checkout <anchor-sha>` (cargo test
+fails) → `git checkout <impl-sha>` (cargo test passes), ignoring the `init` noise.
 
 ### 10.8 Backend TUI Render Duplication (#1464)
 
