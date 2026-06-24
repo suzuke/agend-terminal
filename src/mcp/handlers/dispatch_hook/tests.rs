@@ -313,7 +313,7 @@ fn same_agent_re_dispatch_idempotent() {
     let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/test", None);
     assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
-    // Same agent re-dispatch same branch with different task_id → idempotent.
+    // Same agent re-dispatch, same (source_repo, branch), different task_id.
     let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/test", None);
     assert!(
         r2.is_ok(),
@@ -321,13 +321,24 @@ fn same_agent_re_dispatch_idempotent() {
         r2.err()
     );
 
-    // Binding should exist with new task_id.
+    // #2158: a re-dispatch to a LIVE binding on the same (source_repo, branch) is a true
+    // idempotent NO-OP — it skips the lease + worktree reset (the data-loss path the fix
+    // closes) and leaves the existing binding UNTOUCHED. The binding therefore stays at
+    // its original task_id (T-1). Pre-#2158 each re-dispatch re-bound and bumped it to T-2;
+    // that bump is exactly the rebind whose `sync_worktree_to_head` wiped uncommitted work.
     let binding = crate::paths::runtime_dir(&home)
         .join("agent-x")
         .join("binding.json");
     let content = std::fs::read_to_string(&binding).expect("read");
     let v: serde_json::Value = serde_json::from_str(&content).expect("parse");
-    assert_eq!(v["task_id"], "T-2", "task_id must update on re-dispatch");
+    assert_eq!(
+        v["branch"], "feat/test",
+        "the live binding is preserved across the no-op re-dispatch"
+    );
+    assert_eq!(
+        v["task_id"], "T-1",
+        "#2158: a no-op re-dispatch to a live binding leaves it untouched (task_id NOT bumped)"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3442,6 +3453,106 @@ fn dispatch_first_bind_leases_normally_2158() {
     assert!(
         wt.exists(),
         "first-bind created the worktree (no skip on a fresh agent — zero regression)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The `source_repo` value recorded in an agent's binding.json.
+fn binding_source_repo(home: &std::path::Path, agent: &str) -> Option<String> {
+    let p = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
+    v["source_repo"].as_str().map(str::to_string)
+}
+
+/// A second standalone git repo with an `origin/main` ref so `ensure_branch_exists`
+/// resolves on the cross-repo fall-through. Mirrors `setup_test_repo`'s git setup but
+/// does NOT touch fleet.yaml — the dispatch carries the source_repo via override.
+fn init_extra_repo(path: &std::path::Path) {
+    std::fs::create_dir_all(path).ok();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
+    };
+    git(&["init", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "init",
+    ]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "file:///dev/null/agend-fixture-no-derive",
+    ]);
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !sha.is_empty() {
+        git(&["update-ref", "refs/remotes/origin/main", &sha]);
+    }
+}
+
+/// (d) #2158 r6: the skip is keyed on `(source_repo, branch)`, NOT branch alone. The
+/// worktree path (`worktree::worktree_path`) is repo-independent, so a re-dispatch with
+/// the SAME branch name but a DIFFERENT source_repo must NOT skip — it must rebind to the
+/// new repo. Pre-fix (branch-only skip) it false-skipped and stranded the stale
+/// `binding.source_repo`. Reverse-mutation: drop the `same_source_repo` term in
+/// `live_binding::can_skip_lease_for_live_binding` and this goes RED — the skip fires and
+/// `binding.source_repo` stays repo-a.
+#[test]
+fn dispatch_same_branch_different_source_repo_must_not_skip_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-srcrepo-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let repo_a = setup_test_repo(&home, "agent-x"); // fleet.yaml: agent-x → repo_a
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/shared", None);
+    assert!(r1.is_ok(), "first lease (repo-a) must succeed: {r1:?}");
+    assert_eq!(
+        binding_source_repo(&home, "agent-x").as_deref(),
+        Some(repo_a.display().to_string().as_str()),
+        "precondition: first bind recorded source_repo = repo-a"
+    );
+
+    // A DIFFERENT source_repo, SAME branch name → must fall through to rebind, not skip.
+    let repo_b = home.join("repo-b");
+    init_extra_repo(&repo_b);
+    let r2 = super::dispatch_auto_bind_lease_with_source(
+        &home,
+        "agent-x",
+        "T-2",
+        "feat/shared",
+        None,
+        Some(&repo_b),
+    );
+    assert!(
+        r2.is_ok(),
+        "cross-repo re-dispatch must rebind, not skip: {r2:?}"
+    );
+
+    assert_eq!(
+        binding_source_repo(&home, "agent-x").as_deref(),
+        Some(repo_b.display().to_string().as_str()),
+        "#2158 r6: same branch + different source_repo MUST NOT skip — binding.source_repo \
+         must update to repo-b (the branch-only skip stranded the stale repo-a pre-fix)"
     );
     std::fs::remove_dir_all(&home).ok();
 }

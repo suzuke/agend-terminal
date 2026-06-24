@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod from_ref;
+mod live_binding;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
@@ -458,33 +459,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                     raw: None,
                 });
             }
-            // #2158 fix (skip-lease-on-live-binding): the agent ALREADY holds a LIVE
-            // binding to the REQUESTED branch. SKIP the entire lease + `worktree::create`
-            // → `sync_worktree_to_head` (a `git reset --hard HEAD` that DESTROYS the
-            // working tree). A re-dispatch / GO / rework that carries `branch=` to an
-            // already-bound agent must NEVER reset its live worktree — that wiped an
-            // uncommitted PR-B in production (2026-06-25, decision d-…563566-0). The live
-            // worktree is the source of truth; this is an idempotent no-op.
-            //
-            // The criterion is the BINDING'S PRESENCE, not dirtiness: a true worktree
-            // REUSE first RELEASES (which CLEARS binding.json → `binding::read` returns
-            // `None` → we never reach here → the lease/reset runs and scrubs the #869
-            // ref-advance pollution residue → #2115/#2196/#2223 preserved). We additionally
-            // require the worktree to still EXIST on disk (matching guard-b's `ex_worktree_live`,
-            // binding.rs); a present binding whose worktree vanished is not "live" → fall
-            // through to re-lease it. This is the "same-branch-early-return" flow guard-b's
-            // doc-comment already names as the legit same-branch path.
-            let worktree_live = existing
-                .get("worktree")
-                .and_then(|v| v.as_str())
-                .map(|w| std::path::Path::new(w).exists())
-                .unwrap_or(false);
-            if worktree_live {
-                tracing::info!(
-                    %target, %branch,
-                    "#2158 dispatch skip-lease: agent already live-bound to this branch — \
-                     idempotent no-op (NOT re-leasing / resetting the live worktree)"
-                );
+            // #2158: skip the lease (and its destructive reuse-path reset) when the agent
+            // already holds a LIVE binding to this EXACT (source_repo, branch). r6
+            // source_repo gate / legacy fail-closed / #2115 rationale: `live_binding`.
+            if live_binding::can_skip_lease_for_live_binding(&existing, &source_repo_str) {
+                tracing::info!(%target, %branch,
+                    "#2158 skip-lease: agent already live-bound to this (source_repo, branch) — no-op");
                 return Ok(DispatchOutcome {
                     source_repo_tier,
                     auto_created_branch: false,
