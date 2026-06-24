@@ -44,6 +44,7 @@ mod github_token;
 mod headless;
 mod health;
 mod identity;
+mod image_paste;
 mod inbox;
 mod instance_monitor;
 mod instructions;

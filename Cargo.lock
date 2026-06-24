@@ -43,6 +43,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "plist",
+ "png",
  "portable-pty",
  "predicates",
  "proptest",
