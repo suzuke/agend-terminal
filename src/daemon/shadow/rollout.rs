@@ -136,10 +136,9 @@ fn parse_iso_ms(s: &str) -> Option<u64> {
         .map(|dt| dt.timestamp_millis().max(0) as u64)
 }
 
-/// Extract the session cwd from a `session_meta` record (rollout line 1). `None` if the
-/// line isn't a `session_meta` or carries no cwd. Returned verbatim — attribution
-/// ([`agent_for_cwd`]) matches by trailing path COMPONENTS, so no string normalization
-/// (the old macOS-only `/private` strip) is needed or applied.
+/// Extract the session cwd from a `session_meta` record (rollout line 1), verbatim. `None`
+/// if the line isn't a `session_meta` or carries no cwd. Any macOS `/private` reconciliation
+/// happens in [`agent_for_cwd`] at comparison time, so the raw cwd is returned here.
 pub(crate) fn session_cwd(line: &str) -> Option<String> {
     let rec: RolloutRecord = serde_json::from_str(line.trim()).ok()?;
     if rec.rtype != "session_meta" {
@@ -148,22 +147,36 @@ pub(crate) fn session_cwd(line: &str) -> Option<String> {
     Some(rec.payload.get("cwd")?.as_str()?.to_string())
 }
 
-/// Map a session cwd → the agend codex agent that owns it. An agend agent's workspace is
-/// `<home>/workspace/<name>`, so we attribute by the cwd's TRAILING TWO path components:
-/// `workspace/<name>` for a LIVE codex agent. #2437 round-3: this is platform-robust where
-/// full-path equality against `home` was NOT — `Path::components` is separator-agnostic
-/// (handles `\` vs `/`), and it sidesteps every cross-platform cwd-format quirk (macOS
-/// `/private/tmp`, drive-letter case, symlink canonicalization, codex's own formatting).
-/// The exact `<name>` must be a live fleet codex agent, so a stray `*/workspace/<name>`
-/// outside the fleet is not attributed.
-fn agent_for_cwd(cwd: &str, codex_agents: &[String]) -> Option<String> {
-    let mut tail = Path::new(cwd).components().rev();
-    let name = tail.next()?.as_os_str().to_str()?; // <name>
-    let parent = tail.next()?.as_os_str().to_str()?; // must be "workspace"
-    if parent != "workspace" {
-        return None;
+/// Map a session cwd → the agend codex agent that owns it. SCOPED + separator-agnostic:
+/// the cwd must EQUAL `<home>/workspace/<name>` for a LIVE codex agent, compared by path
+/// COMPONENTS (`Path` eq handles `\` vs `/`, so it works on Windows — #2437 round-1) AND
+/// rooted at THIS daemon's `home`, so a stray `*/workspace/<name>` OUTSIDE the fleet (a
+/// same-named operator codex, another daemon's home) is NOT attributed (#2437 round-3 r6).
+/// codex canonicalizes `/tmp`→`/private/tmp` on macOS; [`strip_private`] (unix-only)
+/// reconciles that before the comparison.
+fn agent_for_cwd(cwd: &str, home: &Path, codex_agents: &[String]) -> Option<String> {
+    let cwd_path = Path::new(strip_private(cwd));
+    let ws = home.join("workspace");
+    codex_agents
+        .iter()
+        .find(|name| cwd_path == ws.join(name))
+        .cloned()
+}
+
+/// Strip codex's macOS `/private` canonicalization prefix (`/private/tmp/...` → `/tmp/...`)
+/// so a `/tmp`-rooted daemon home matches. cfg-guarded to unix — Windows has no such prefix
+/// and must not have `/private` semantics applied to its paths (#2437 review). No-op
+/// otherwise.
+#[cfg(unix)]
+fn strip_private(p: &str) -> &str {
+    match p.strip_prefix("/private") {
+        Some(rest) if rest.starts_with('/') => rest,
+        _ => p,
     }
-    codex_agents.iter().find(|n| n.as_str() == name).cloned()
+}
+#[cfg(not(unix))]
+fn strip_private(p: &str) -> &str {
+    p
 }
 
 /// Today's codex rollout directory root (`<CODEX_HOME|~/.codex>/sessions`).
@@ -186,7 +199,7 @@ struct Cursor {
 /// Spawn the codex rollout tailer — a fire-and-forget daemon thread (mirrors
 /// `api_activity_probe::spawn`). No-op unless [`super::enabled`]. Wired into BOTH
 /// `run_core` AND `run_app` (the #2434 lesson: the live fleet daemon is app mode).
-pub fn spawn(registry: crate::agent::AgentRegistry) {
+pub fn spawn(registry: crate::agent::AgentRegistry, home: PathBuf) {
     if !super::enabled() {
         return;
     }
@@ -207,7 +220,7 @@ pub fn spawn(registry: crate::agent::AgentRegistry) {
                 "codex rollout tailer listening (stream plane)");
             let mut cursors: HashMap<PathBuf, Cursor> = HashMap::new();
             loop {
-                tail_once(&root, &registry, &mut cursors);
+                tail_once(&root, &registry, &home, &mut cursors);
                 std::thread::sleep(TAIL_TICK);
             }
         });
@@ -219,6 +232,7 @@ pub fn spawn(registry: crate::agent::AgentRegistry) {
 fn tail_once(
     root: &Path,
     registry: &crate::agent::AgentRegistry,
+    home: &Path,
     cursors: &mut HashMap<PathBuf, Cursor>,
 ) {
     let codex_agents = live_codex_agents(registry);
@@ -230,7 +244,7 @@ fn tail_once(
             offset: 0,
             agent: None,
         });
-        drain_file(&file, cur, &codex_agents);
+        drain_file(&file, cur, home, &codex_agents);
     }
 }
 
@@ -294,7 +308,7 @@ fn discover_rollouts(root: &Path) -> Vec<PathBuf> {
 /// the first `session_meta` line) to an agend codex agent, and push each transition as
 /// Evidence. A file not owned by any live codex agent is consumed-and-ignored (cursor
 /// advances so we don't re-scan it).
-fn drain_file(file: &Path, cur: &mut Cursor, codex_agents: &[String]) {
+fn drain_file(file: &Path, cur: &mut Cursor, home: &Path, codex_agents: &[String]) {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let Ok(f) = std::fs::File::open(file) else {
         return;
@@ -334,7 +348,7 @@ fn drain_file(file: &Path, cur: &mut Cursor, codex_agents: &[String]) {
         // Resolve the owning agent from the session_meta header (first line).
         if cur.agent.is_none() {
             if let Some(cwd) = session_cwd(&line) {
-                cur.agent = agent_for_cwd(&cwd, codex_agents);
+                cur.agent = agent_for_cwd(&cwd, home, codex_agents);
             }
             // Either way the header line itself is not a transition.
             continue;
@@ -479,35 +493,60 @@ mod tests {
         assert_eq!(session_cwd(r#"{"type":"event_msg","payload":{}}"#), None);
     }
 
-    /// Attribution by trailing `workspace/<name>` components — separator-agnostic, robust on
-    /// macOS AND Windows (#2437 round-3). Fixtures built with the platform `Path` API + raw
-    /// forms; the macOS `/private` prefix no longer needs special handling (tail-only match).
+    /// Attribution is SCOPED to this daemon's `home` AND separator-agnostic (#2437): a cwd
+    /// attributes only if it equals `<home>/workspace/<live-name>`. Fixtures are built with
+    /// the platform `Path` API (the cwd the SAME way production derives it), so the assert
+    /// holds on macOS AND Windows (`\` separators).
     #[test]
     fn agent_for_cwd_matches_only_fleet_codex_workspace() {
+        let home = std::env::temp_dir().join("svcx_test_home");
         let agents = vec!["cx".to_string(), "cx2".to_string()];
-        // Unix-shaped fleet workspace.
+        // The agent's own workspace (built like production) → match, on any platform.
+        let ws_cx = home.join("workspace").join("cx");
         assert_eq!(
-            agent_for_cwd("/tmp/svcx/workspace/cx", &agents).as_deref(),
+            agent_for_cwd(&ws_cx.to_string_lossy(), &home, &agents).as_deref(),
             Some("cx")
         );
-        // macOS /private form matches WITHOUT any normalization (tail components only).
+        // Unknown agent name UNDER the fleet workspace → None.
+        let ghost = home.join("workspace").join("ghost");
         assert_eq!(
-            agent_for_cwd("/private/tmp/svcx/workspace/cx2", &agents).as_deref(),
-            Some("cx2")
+            agent_for_cwd(&ghost.to_string_lossy(), &home, &agents),
+            None
         );
-        // A real platform path built via the Path API (Windows → `\` separators).
-        let plat = std::path::Path::new("/some/root")
-            .join("workspace")
-            .join("cx");
+        // A cwd not ending in `workspace/<name>` → None.
+        assert_eq!(agent_for_cwd("/some/other/dir", &home, &agents), None);
+    }
+
+    /// #2437 r6 (regression, verbatim): a SAME-NAMED `workspace/<name>` OUTSIDE this daemon's
+    /// home must NOT attribute — the tail-component-only match (round-3) wrongly did.
+    #[test]
+    fn agent_for_cwd_does_not_attribute_same_named_stray_workspace() {
+        let agents = vec!["cx".to_string()];
         assert_eq!(
-            agent_for_cwd(&plat.to_string_lossy(), &agents).as_deref(),
-            Some("cx"),
-            "platform-separator path must still match"
+            agent_for_cwd(
+                "/tmp/operator/workspace/cx",
+                Path::new("/tmp/svcx"),
+                &agents
+            ),
+            None
         );
-        // A stray codex outside any `workspace/<name>` is not attributed.
-        assert_eq!(agent_for_cwd("/Users/x/some/other/dir", &agents), None);
-        // An unknown agent name under a `workspace` dir is not attributed.
-        assert_eq!(agent_for_cwd("/tmp/svcx/workspace/ghost", &agents), None);
+    }
+
+    /// codex canonicalizes `/tmp`→`/private/tmp` on macOS; `strip_private` (unix-only)
+    /// reconciles it so a `/tmp`-rooted home still matches. (Windows has no such prefix.)
+    #[cfg(unix)]
+    #[test]
+    fn agent_for_cwd_reconciles_macos_private_prefix() {
+        let agents = vec!["cx".to_string()];
+        assert_eq!(
+            agent_for_cwd(
+                "/private/tmp/svcx/workspace/cx",
+                Path::new("/tmp/svcx"),
+                &agents
+            )
+            .as_deref(),
+            Some("cx")
+        );
     }
 
     /// Integration: a real on-disk rollout file (session_meta header + a turn) tailed by
@@ -555,7 +594,7 @@ mod tests {
             agent: None,
         };
         let agents = vec!["cxt".to_string()];
-        drain_file(&roll, &mut cur, &agents);
+        drain_file(&roll, &mut cur, &home, &agents);
 
         assert_eq!(
             cur.agent.as_deref(),
@@ -593,7 +632,7 @@ mod tests {
         )
         .unwrap();
         f2.flush().unwrap();
-        drain_file(&roll, &mut cur, &agents);
+        drain_file(&roll, &mut cur, &home, &agents);
         assert_eq!(
             cur.offset, off_after,
             "partial line must not advance the cursor"
@@ -645,7 +684,7 @@ mod tests {
             agent: None,
         };
         let agents = vec!["cxr".to_string()];
-        drain_file(&roll, &mut cur, &agents);
+        drain_file(&roll, &mut cur, &home, &agents);
         assert!(
             cur.offset > 0 && cur.agent.is_some(),
             "first drain advanced"
@@ -673,7 +712,7 @@ mod tests {
             "rebuilt session is shorter than the prior cursor"
         );
 
-        drain_file(&roll, &mut cur, &agents);
+        drain_file(&roll, &mut cur, &home, &agents);
         // Recovered: agent re-resolved from the new header + the new ToolStarted seen (the
         // pre-fix code would have left the cursor past EOF → observer DEAF → empty).
         let evs = super::super::peek("cxr");
