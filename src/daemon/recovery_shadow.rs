@@ -16,7 +16,7 @@
 //!   3. whether the existing SRL retry path already OWNS the episode
 //!      (`had_retry_track` / `retry_count`).
 //!
-//! Invariants (mirror `capture_turn_sentinel_shadow`):
+//! Invariants (shadow-family instrument):
 //! - **D3 #2324 instrument-never-block**: [`arm_expectation`] and
 //!   [`record_recovery_shadow`] return `()` (compiler-guaranteed un-`?`-able) and
 //!   contain no `return`/`process::exit`; both are in the test's
@@ -24,8 +24,7 @@
 //!   control flow is byte-identical.
 //! - **D2 #2323 atomic write**: `recovery_shadow.jsonl` is an APPEND-only log, so
 //!   it is written via the shadow-family `state::append_jsonl` (per-record
-//!   `O_APPEND` atomicity) — the correct idiom for a log, matching
-//!   `capture_turn_sentinel_shadow` / `unclassified_errors.jsonl`. D2 EXEMPTS
+//!   `O_APPEND` atomicity) — the correct idiom for a log. D2 EXEMPTS
 //!   `*.jsonl` appends (a whole-file `atomic_write` would be the wrong primitive).
 
 use parking_lot::Mutex;
@@ -49,8 +48,8 @@ pub(crate) fn would_fire_discriminator(
     expectation && !recovered && has_throttle_hint && !self_cleared
 }
 
-/// Env-gate (mirrors `state::turn_sentinel_shadow_enabled`). Absent / not "1"
-/// ⇒ every entry point below early-returns ⇒ byte-identical behaviour.
+/// Env-gate (the shadow-family env-flag idiom, e.g. `AGEND_PRODUCTIVE_GATE`).
+/// Absent / not "1" ⇒ every entry point below early-returns ⇒ byte-identical behaviour.
 pub(crate) fn enabled() -> bool {
     std::env::var("AGEND_RECOVERY_SHADOW")
         .map(|v| v == "1")
