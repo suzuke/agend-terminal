@@ -202,51 +202,15 @@ pub fn is_promoted(backend_command: &str) -> bool {
     promotion_enabled() && crate::backend::Backend::parse_str(backend_command).has_state_hooks()
 }
 
-/// #1523 PROMOTION (phased v1): the authoritative `AgentState` written to the
-/// daemon's per-tick SNAPSHOT (`snapshot.json`).
-///
-/// When the flag is on AND `backend_command` is a STRONG (hook-instrumented)
-/// backend, a `Fresh` hook resolution WINS over the screen `heuristic`;
-/// `Stale`/`Unknown` (or flag-off / a non-hook backend) fall back to `heuristic`
-/// — **byte-identical** to pre-promotion. Hooks ENHANCE; the heuristic remains
-/// the complete fallback path, so a backend without hooks (or a stale window) is
-/// never worse off than before.
-///
-/// SCOPE (reviewer-2 #2014): this promotes the SNAPSHOT-scoped consumers — the
-/// #1985 nudge surface: `dispatch_idle`, the pane-state badge, and anything that
-/// reads `agent_state_of` / `snapshot.json`. It is NOT yet a global chokepoint.
-/// Several per-tick deciders read the RAW screen heuristic
-/// (`core.state.get_state()`) directly and are UNCHANGED in v1: supervisor
-/// reactions (#1946), hang detection, the recovery dispatcher, the idle /
-/// anti-stall watchdog, `conflict_notify`, and the `query` / `list` API (live
-/// registry read).
-/// Promoting those raw read sites is #1523 epic **phase-2** (post-soak). The
-/// worst snapshot-vs-raw divergence is independently bounded by the #1999
-/// throttle-gate and health-gating, so the phased boundary is safe for v1.
-pub fn authoritative_state(
-    backend_command: &str,
-    name: &str,
-    heuristic: crate::state::AgentState,
-) -> crate::state::AgentState {
-    authoritative_state_inner(promotion_enabled(), backend_command, name, heuristic)
-}
-
-/// Promotion core, split out so tests exercise the flag/backend/freshness logic
-/// without mutating the process-global `AGEND_HOOK_STATE_POC` env var.
-fn authoritative_state_inner(
-    enabled: bool,
-    backend_command: &str,
-    name: &str,
-    heuristic: crate::state::AgentState,
-) -> crate::state::AgentState {
-    if !enabled || !crate::backend::Backend::parse_str(backend_command).has_state_hooks() {
-        return heuristic;
-    }
-    match resolved_state_for(name) {
-        HookResolution::Fresh(state) => state,
-        HookResolution::Stale | HookResolution::Unknown => heuristic,
-    }
-}
+// #2413 (B): the #1523 `authoritative_state` SNAPSHOT promotion (claude-hook-only,
+// `AGEND_HOOK_STATE_POC`-gated POC) was REMOVED here — superseded by the multi-backend
+// Shadow Observer `observed_status` promotion at the snapshot chokepoint
+// (`per_tick/snapshot.rs`, gated by `shadow::operated_dispatch_enabled` + the shared
+// `shadow::gate`). The rest of this module's hook-shadow STORE stays LIVE: it feeds
+// supervisor hang/recovery (`fresh_active_hook_seq`/`latest_hook_seq`/`record_event`),
+// `inject_delivery` (`last_user_prompt_submit_for`), `recovery_shadow`/`divergence_telemetry`
+// (`resolved_state_for`), and `hook_event` (`is_promoted`) — so `AGEND_HOOK_STATE_POC`,
+// `promotion_enabled`, and `is_promoted` are intentionally KEPT (they are not the dead POC).
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -493,11 +457,6 @@ mod tests {
             HookResolution::Fresh(AgentState::ToolUse),
             "a long tool stays ToolUse until PostToolUse/Stop — never freshness-stale"
         );
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "longtool", AgentState::Idle),
-            AgentState::ToolUse,
-            "the still-open tool wins over a (wrong) heuristic"
-        );
         // PostToolUse closes the pair (→ Thinking; freshness applies again).
         record_event("longtool", "PostToolUse", None);
         assert_eq!(
@@ -506,104 +465,13 @@ mod tests {
         );
     }
 
-    /// §3.9: flag OFF → byte-identical to the heuristic, even with a fresh hook.
-    #[test]
-    fn flag_off_is_byte_identical_to_heuristic() {
-        record_event("flagoff", "UserPromptSubmit", None); // → Thinking, fresh
-        assert_eq!(
-            authoritative_state_inner(false, "claude", "flagoff", AgentState::Idle),
-            AgentState::Idle,
-            "flag off must return the heuristic verbatim"
-        );
-    }
-
-    /// §3.9: flag ON + STRONG backend + Fresh hook → the hook state is authoritative.
-    #[test]
-    fn claude_fresh_hook_wins_over_heuristic() {
-        record_event("claude-fresh", "UserPromptSubmit", None); // → Thinking, fresh
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "claude-fresh", AgentState::Idle),
-            AgentState::Thinking,
-            "a fresh hook state wins over the heuristic"
-        );
-    }
-
-    /// §3.9: flag ON + STRONG backend but STALE hook → fall back to the heuristic.
-    #[test]
-    fn stale_hook_falls_back_to_heuristic() {
-        record_event("claude-stale", "SessionStart", None); // → Starting
-        backdate_for_test("claude-stale", HOOK_FRESHNESS.as_millis() as u64 + 1_000);
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "claude-stale", AgentState::Idle),
-            AgentState::Idle,
-            "a stale hook state falls back to the heuristic (the floor)"
-        );
-    }
-
-    /// §3.9: a non-STRONG backend (no hooks fire) always uses the heuristic.
-    /// STRONG (hook) backends = claude + agy (#2413 Phase D: configure_agy now
-    /// injects `.agents/hooks.json` lifecycle hooks); their fresh hook wins over
-    /// the heuristic. Everything else (codex/opencode/kiro/shell) stays heuristic.
-    #[test]
-    fn backend_strength_gates_promotion() {
-        record_event("codex-agent", "UserPromptSubmit", None); // → Thinking, fresh
-        assert_eq!(
-            authoritative_state_inner(true, "codex", "codex-agent", AgentState::Idle),
-            AgentState::Idle,
-            "codex is not a hook backend — heuristic only"
-        );
-        // agy IS a hook backend now (#2413 Phase D) — its fresh hook wins.
-        record_event("agy-agent", "UserPromptSubmit", None);
-        assert_eq!(
-            authoritative_state_inner(true, "agy", "agy-agent", AgentState::Idle),
-            AgentState::Thinking,
-            "agy is a STRONG backend (#2413 Phase D) — its fresh hook wins"
-        );
-        // claude IS strong — its fresh hook wins.
-        record_event("claude-agent", "UserPromptSubmit", None);
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "claude-agent", AgentState::Idle),
-            AgentState::Thinking,
-            "claude is the v1 STRONG backend"
-        );
-    }
-
-    /// §3.9 probe-6 (reviewer-2 #2014): the REAL env-gate wiring — the public
-    /// `authoritative_state` resolves the flag through `promotion_enabled()`
-    /// reading `AGEND_HOOK_STATE_POC`. `#[serial]` + an RAII guard handle the
-    /// process-global env var (restored even on panic).
-    #[test]
-    #[serial(hook_state_poc)] // shares the AGEND_HOOK_STATE_POC env with mcp_config's flag test
-    fn env_flag_gates_promotion_end_to_end() {
-        struct EnvGuard(Option<String>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("AGEND_HOOK_STATE_POC", v),
-                    None => std::env::remove_var("AGEND_HOOK_STATE_POC"),
-                }
-            }
-        }
-        let _guard = EnvGuard(std::env::var("AGEND_HOOK_STATE_POC").ok());
-
-        record_event("env-claude", "UserPromptSubmit", None); // → Thinking, fresh
-
-        // Flag unset → heuristic (the byte-identical path), via the real gate.
-        std::env::remove_var("AGEND_HOOK_STATE_POC");
-        assert_eq!(
-            authoritative_state("claude", "env-claude", AgentState::Idle),
-            AgentState::Idle,
-            "flag unset → heuristic (real env gate)"
-        );
-
-        // Flag = 1 → the fresh claude hook wins, through promotion_enabled().
-        std::env::set_var("AGEND_HOOK_STATE_POC", "1");
-        assert_eq!(
-            authoritative_state("claude", "env-claude", AgentState::Idle),
-            AgentState::Thinking,
-            "flag=1 → the fresh claude hook wins via the real env gate"
-        );
-    }
+    // #2413 (B): the `authoritative_state` / `authoritative_state_inner` promotion tests
+    // (`flag_off_is_byte_identical_to_heuristic`, `claude_fresh_hook_wins_over_heuristic`,
+    // `stale_hook_falls_back_to_heuristic`, `backend_strength_gates_promotion`,
+    // `env_flag_gates_promotion_end_to_end`) were REMOVED with the functions they tested —
+    // the #1523 snapshot promotion is superseded by the Shadow Observer gate (see the
+    // removal note above `is_promoted`). The hook-shadow STORE tests (`resolved_state_for`,
+    // freshness, `record_event`, `is_promoted`) remain — that infra is still live.
 
     /// Refinement round 1: `PreCompact` is TRANSIENT — recorded (event
     /// visible) but mapped to NO persistent state (the ContextFull-vs-Thinking

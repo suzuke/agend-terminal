@@ -681,6 +681,24 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::RespawnWatchdogHandler::new()),
         Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
         Box::new(per_tick::ExternalLivenessHandler::new()),
+        // #2413 (B): ShadowObserve MUST run immediately BEFORE SnapshotRotation so the
+        // snapshot's operated `agent_state` promotion reads THIS tick's `observed_status`
+        // (it was previously LAST in the list → the snapshot would read last tick's). The
+        // reorder is confirm-first safe:
+        //   - ShadowObserve only WRITES `observed_status` + `published_observed`; nothing
+        //     else in this list writes those, so there is no write-write hazard, and no
+        //     handler except SnapshotRotation (below) reads them.
+        //   - Its INPUTS are order-independent of the per-tick sequence: `api_activity` is
+        //     written by a BACKGROUND thread (`api_activity_probe::spawn`), `state` /
+        //     productive-silence by the PTY-feed thread, hook Evidence by the socket
+        //     thread — none are per-tick handlers, so moving ShadowObserve earlier does not
+        //     stale them.
+        //   - The state-transition handlers (HangDetection / RecoveryDispatcher /
+        //     RespawnWatchdog / Watchdog) sit ABOVE this point in BOTH the old and new
+        //     layout, so ShadowObserve observes the same post-transition `state` either way.
+        // The only behaviour change is the intended one: the snapshot promotes from a fresh
+        // (this-tick) `observed_status`.
+        Box::new(per_tick::ShadowObserveHandler::new()),
         Box::new(per_tick::SnapshotRotationHandler::new()),
         Box::new(per_tick::CheckSchedulesHandler::new()),
         Box::new(per_tick::CiWatchPollHandler::new()),
@@ -784,13 +802,6 @@ pub(crate) fn build_default_handlers(
         // claimed/in_progress tasks back to Open + clears the work-stuck latch.
         // Runs in both run_core and app mode (live daemon is app-mode).
         Box::new(per_tick::ReclaimHandler::new(30, work_stuck_latch)),
-        // #2413 Phase B (Shadow Observer): per-tick reduce — fold each agent's buffered
-        // hook Evidence + screen baseline + lsof liveness into an additive
-        // `observed_status` (never rewrites `agent_state`). Default-ON; under the
-        // `AGEND_SHADOW_OBSERVER=0` kill-switch a single `enabled()` check then early-return
-        // makes it a no-op. Daemon-only telemetry → allowlisted out of
-        // app mode (the hook socket server it consumes is started in `run_core`).
-        Box::new(per_tick::ShadowObserveHandler::new()),
     ]
 }
 

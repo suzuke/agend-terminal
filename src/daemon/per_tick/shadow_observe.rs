@@ -20,8 +20,8 @@
 use super::{PerTickHandler, TickContext};
 use crate::agent::AgentCore;
 use crate::daemon::shadow;
-use crate::daemon::shadow::evidence::{Authority, Confidence};
-use crate::daemon::shadow::reducer::{Liveness, ObservedState, ObservedStatus, ScreenSignal};
+use crate::daemon::shadow::gate;
+use crate::daemon::shadow::reducer::{Liveness, ScreenSignal};
 use crate::state::AgentState;
 use crate::sync_audit::CoreMutex;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ impl PerTickHandler for ShadowObserveHandler {
                     productive_silent_ms: c.state.productive_silence().as_millis() as u64,
                     child_alive: *child_alive,
                 };
-                (raw_state, screen_signal(raw_state), live)
+                (raw_state, gate::screen_signal(raw_state), live)
             };
             let status = shadow::observe(name, screen, &live, now_ms);
             log_correction(name, raw_state, screen, &status, &live);
@@ -86,106 +86,13 @@ impl PerTickHandler for ShadowObserveHandler {
             // render snapshot reads (Some ⇒ a high-confidence correction the badge shows;
             // None ⇒ render keeps the raw state). Computed BEFORE `status` moves into
             // `observed_status`. Both writes land under ONE core.lock; `publish_observed`
-            // touches only the separate atomic, NEVER `current` (cycle-proof).
-            let badge = badge_override(screen, &status);
+            // touches only the separate atomic, NEVER `current` (cycle-proof). Same shared
+            // gate the operated snapshot (B) uses, so badge + dispatch can never diverge.
+            let badge = gate::gated_override(raw_state, &status);
             let mut c = core.lock();
             c.observed_status = Some(status);
             c.state.publish_observed(badge);
         }
-    }
-}
-
-/// #2413 (A): the gated BADGE override. Returns `Some(AgentState)` — the state the
-/// pane badge should show INSTEAD of the raw screen-scrape — ONLY when the fused
-/// [`ObservedStatus`] is a HIGH-CONFIDENCE real-time observer-plane correction, i.e.
-/// ALL of: (a) `authority ∈ {Hook, Stream}` (a live lifecycle / event-stream plane,
-/// not the `Screen` baseline and not a low-confidence `Inferred` reconcile); (b)
-/// `confidence ∈ {Confirmed, Strong}` (freshness is already implied — the reducer only
-/// labels a fresh observer plane this high); and (c) it actually DISAGREES with the raw
-/// screen baseline at the coarse level (the §5 correction predicate via
-/// [`screen_as_observed`]), so an agreeing-but-vaguer observed state never DOWNGRADES a
-/// more-specific raw badge (e.g. raw `ToolUse` vs coarse `Active`).
-///
-/// `None` otherwise → render keeps the raw `published` state. This is the regression
-/// firewall the lead approved: weak / screen-only backends (agy has no Hook/Stream
-/// plane → authority is always `Screen`/`ProcessHeuristic`/`Inferred`) can NEVER satisfy
-/// (a) → zero badge regression, by construction. The `Inferred` reconcile-to-Idle is
-/// deliberately excluded — the badge flips only when we are SURE work is in flight or a
-/// human gate is up (lead open-q1: "只 Hook/Stream+Strong 才翻 badge").
-fn badge_override(screen: ScreenSignal, status: &ObservedStatus) -> Option<AgentState> {
-    let high_confidence = matches!(status.authority, Authority::Hook | Authority::Stream)
-        && matches!(
-            status.confidence,
-            Confidence::Confirmed | Confidence::Strong
-        );
-    if !high_confidence {
-        return None;
-    }
-    // Only a genuine §5 correction (coarse-level disagreement with the raw screen
-    // baseline) flips the badge — never a same-coarse refinement.
-    let baseline = screen_as_observed(screen);
-    if !baseline.is_some_and(|b| b != status.state.coarse()) {
-        return None;
-    }
-    badge_state_for(status.state)
-}
-
-/// Map a corrected [`ObservedState`] to the [`AgentState`] the badge renders (reusing
-/// the existing `state_color` / label tables). `Idle` ⇒ `None`: the badge never flips
-/// TO idle on a correction (the only idle-direction correction is the excluded
-/// `Inferred` reconcile).
-fn badge_state_for(state: ObservedState) -> Option<AgentState> {
-    Some(match state {
-        ObservedState::ToolUse => AgentState::ToolUse,
-        ObservedState::Thinking | ObservedState::Responding | ObservedState::Active => {
-            AgentState::Thinking
-        }
-        ObservedState::WaitingForUser => AgentState::AwaitingOperator,
-        ObservedState::RateLimited => AgentState::RateLimit,
-        ObservedState::Idle => return None,
-    })
-}
-
-/// Map the 18-variant screen-scrape [`AgentState`] into the reducer's coarse
-/// [`ScreenSignal`] buckets. Exhaustive (no wildcard) ON PURPOSE: a future `AgentState`
-/// variant forces a compile error here so the map can never silently miss a state.
-fn screen_signal(s: AgentState) -> ScreenSignal {
-    match s {
-        AgentState::Idle => ScreenSignal::Idle,
-        // Actively rendering work (incl. boot/respawn churn, treated as working).
-        AgentState::ToolUse
-        | AgentState::Thinking
-        | AgentState::Starting
-        | AgentState::Restarting => ScreenSignal::Working,
-        // A human gate.
-        AgentState::PermissionPrompt
-        | AgentState::InteractivePrompt
-        | AgentState::AwaitingOperator => ScreenSignal::Approval,
-        AgentState::RateLimit | AgentState::ServerRateLimit | AgentState::UsageLimit => {
-            ScreenSignal::RateLimited
-        }
-        // Non-decisive for the liveness reconcile (it only fires on `Idle`). A genuinely
-        // crashed agent is caught by `child_alive=false`, not by the screen chrome.
-        AgentState::Hang
-        | AgentState::GitConflict
-        | AgentState::ContextFull
-        | AgentState::AuthError
-        | AgentState::ApiError
-        | AgentState::ModelUnsupported
-        | AgentState::Crashed => ScreenSignal::Other,
-    }
-}
-
-/// The coarse [`ObservedState`] the raw screen-scrape ALONE would report — the baseline
-/// the reducer is measured against (§5 quantification). `None` for a non-decisive screen
-/// (`Other`), which the reducer never claims to "correct" (no meaningful baseline).
-fn screen_as_observed(screen: ScreenSignal) -> Option<ObservedState> {
-    match screen {
-        ScreenSignal::Idle => Some(ObservedState::Idle),
-        ScreenSignal::Working => Some(ObservedState::Active),
-        ScreenSignal::Approval => Some(ObservedState::WaitingForUser),
-        ScreenSignal::RateLimited => Some(ObservedState::RateLimited),
-        ScreenSignal::Other => None,
     }
 }
 
@@ -203,7 +110,7 @@ fn log_correction(
     status: &crate::daemon::shadow::reducer::ObservedStatus,
     live: &Liveness,
 ) {
-    let Some(screen_state) = screen_as_observed(screen) else {
+    let Some(screen_state) = gate::screen_as_observed(screen) else {
         return; // non-decisive screen → no baseline to correct
     };
     if screen_state != status.state.coarse() {
@@ -353,217 +260,6 @@ mod tests {
             "flag-OFF ⇒ no reduce ⇒ observed_status stays None"
         );
         shadow::forget_agent(&name);
-    }
-
-    #[test]
-    fn screen_signal_maps_every_bucket() {
-        assert_eq!(screen_signal(AgentState::Idle), ScreenSignal::Idle);
-        assert_eq!(screen_signal(AgentState::ToolUse), ScreenSignal::Working);
-        assert_eq!(screen_signal(AgentState::Thinking), ScreenSignal::Working);
-        assert_eq!(screen_signal(AgentState::Starting), ScreenSignal::Working);
-        assert_eq!(
-            screen_signal(AgentState::PermissionPrompt),
-            ScreenSignal::Approval
-        );
-        assert_eq!(
-            screen_signal(AgentState::InteractivePrompt),
-            ScreenSignal::Approval
-        );
-        assert_eq!(
-            screen_signal(AgentState::AwaitingOperator),
-            ScreenSignal::Approval
-        );
-        assert_eq!(
-            screen_signal(AgentState::RateLimit),
-            ScreenSignal::RateLimited
-        );
-        assert_eq!(
-            screen_signal(AgentState::ServerRateLimit),
-            ScreenSignal::RateLimited
-        );
-        assert_eq!(
-            screen_signal(AgentState::UsageLimit),
-            ScreenSignal::RateLimited
-        );
-        assert_eq!(screen_signal(AgentState::Crashed), ScreenSignal::Other);
-        assert_eq!(screen_signal(AgentState::GitConflict), ScreenSignal::Other);
-        assert_eq!(screen_signal(AgentState::Hang), ScreenSignal::Other);
-    }
-
-    #[test]
-    fn screen_as_observed_baseline_buckets() {
-        assert_eq!(
-            screen_as_observed(ScreenSignal::Idle),
-            Some(ObservedState::Idle)
-        );
-        assert_eq!(
-            screen_as_observed(ScreenSignal::Working),
-            Some(ObservedState::Active)
-        );
-        assert_eq!(
-            screen_as_observed(ScreenSignal::Approval),
-            Some(ObservedState::WaitingForUser)
-        );
-        assert_eq!(
-            screen_as_observed(ScreenSignal::RateLimited),
-            Some(ObservedState::RateLimited)
-        );
-        // A non-decisive screen has no baseline the reducer can "correct".
-        assert_eq!(screen_as_observed(ScreenSignal::Other), None);
-    }
-
-    /// The §5 correction predicate, deterministically: the two headline wins the live
-    /// quantification counts. (a) mid-API false-idle — screen Idle but a fresh hook
-    /// episode + a live socket ⇒ Active ⇒ Idle≠Active ⇒ counts as a correction.
-    /// (b) approval-vs-idle — hook ApprovalRequired but screen reads Idle ⇒ WaitingForUser
-    /// ⇒ correction. (c) control — steady tool-use agrees with the screen ⇒ NOT a
-    /// correction (no false-active regression).
-    #[test]
-    fn correction_predicate_flags_false_idle_and_approval_not_steady() {
-        let is_correction = |screen: ScreenSignal, observed: ObservedState| {
-            screen_as_observed(screen).is_some_and(|b| b != observed.coarse())
-        };
-        // (a) false-idle caught.
-        assert!(is_correction(ScreenSignal::Idle, ObservedState::Active));
-        assert!(is_correction(ScreenSignal::Idle, ObservedState::ToolUse));
-        // (b) approval split out of idle.
-        assert!(is_correction(
-            ScreenSignal::Idle,
-            ObservedState::WaitingForUser
-        ));
-        // (c) steady states agree → no correction (no regression).
-        assert!(!is_correction(
-            ScreenSignal::Working,
-            ObservedState::ToolUse
-        ));
-        assert!(!is_correction(ScreenSignal::Idle, ObservedState::Idle));
-        assert!(!is_correction(
-            ScreenSignal::Approval,
-            ObservedState::WaitingForUser
-        ));
-    }
-
-    // ── #2413 (A): the gated BADGE override ──────────────────────────────────────
-
-    fn status(
-        state: ObservedState,
-        authority: Authority,
-        confidence: Confidence,
-    ) -> ObservedStatus {
-        ObservedStatus {
-            state,
-            confidence,
-            authority,
-            evidence: vec![],
-            since_ms: 0,
-        }
-    }
-
-    /// The headline win: screen renders Idle mid-request, but a fresh Hook (or Stream)
-    /// episode proves Active ⇒ the badge flips to a working state.
-    #[test]
-    fn badge_override_flips_on_high_confidence_false_idle() {
-        let s = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
-        assert_eq!(
-            badge_override(ScreenSignal::Idle, &s),
-            Some(AgentState::Thinking)
-        );
-        // Stream plane (codex) parity.
-        let s = status(
-            ObservedState::ToolUse,
-            Authority::Stream,
-            Confidence::Strong,
-        );
-        assert_eq!(
-            badge_override(ScreenSignal::Idle, &s),
-            Some(AgentState::ToolUse)
-        );
-    }
-
-    /// A hook `ApprovalRequired` (Confirmed) splits WaitingForUser out of an idle/ambiguous
-    /// screen ⇒ the badge shows AwaitingOperator.
-    #[test]
-    fn badge_override_flips_approval_out_of_idle() {
-        let s = status(
-            ObservedState::WaitingForUser,
-            Authority::Hook,
-            Confidence::Confirmed,
-        );
-        assert_eq!(
-            badge_override(ScreenSignal::Idle, &s),
-            Some(AgentState::AwaitingOperator)
-        );
-    }
-
-    /// Regression firewall (1): a screen-only backend (agy — authority always `Screen`)
-    /// can NEVER satisfy the Hook/Stream gate, so the badge keeps the raw state even at
-    /// Strong confidence and a coarse disagreement. Zero regression for weak backends.
-    #[test]
-    fn badge_override_screen_only_backend_keeps_raw() {
-        let s = status(
-            ObservedState::WaitingForUser,
-            Authority::Screen,
-            Confidence::Strong,
-        );
-        assert_eq!(badge_override(ScreenSignal::Idle, &s), None);
-    }
-
-    /// Regression firewall (2): a low-confidence (stale-plane `Probable`) status does not
-    /// flip the badge even with a Hook authority.
-    #[test]
-    fn badge_override_excludes_low_confidence() {
-        let s = status(ObservedState::Active, Authority::Hook, Confidence::Probable);
-        assert_eq!(badge_override(ScreenSignal::Idle, &s), None);
-    }
-
-    /// Lead open-q1: the dropped-hook reconcile-to-Idle (`Inferred`/`Probable`) is
-    /// excluded — the badge only flips when SURE work is in flight / a gate is up.
-    #[test]
-    fn badge_override_excludes_inferred_reconcile() {
-        let s = status(
-            ObservedState::Idle,
-            Authority::Inferred,
-            Confidence::Probable,
-        );
-        assert_eq!(badge_override(ScreenSignal::Working, &s), None);
-    }
-
-    /// No downgrade: a Hook+Strong status that AGREES coarsely with the raw screen
-    /// (both Working) does not flip, so a more-specific raw `ToolUse` is never traded
-    /// for a vaguer observed `Active`.
-    #[test]
-    fn badge_override_no_downgrade_on_coarse_agreement() {
-        let s = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
-        assert_eq!(badge_override(ScreenSignal::Working, &s), None);
-    }
-
-    #[test]
-    fn badge_state_for_maps_active_family_and_excludes_idle() {
-        assert_eq!(
-            badge_state_for(ObservedState::ToolUse),
-            Some(AgentState::ToolUse)
-        );
-        assert_eq!(
-            badge_state_for(ObservedState::Thinking),
-            Some(AgentState::Thinking)
-        );
-        assert_eq!(
-            badge_state_for(ObservedState::Responding),
-            Some(AgentState::Thinking)
-        );
-        assert_eq!(
-            badge_state_for(ObservedState::Active),
-            Some(AgentState::Thinking)
-        );
-        assert_eq!(
-            badge_state_for(ObservedState::WaitingForUser),
-            Some(AgentState::AwaitingOperator)
-        );
-        assert_eq!(
-            badge_state_for(ObservedState::RateLimited),
-            Some(AgentState::RateLimit)
-        );
-        assert_eq!(badge_state_for(ObservedState::Idle), None);
     }
 
     /// Representative confirm-first: flag-ON, a buffered `TurnStarted` (episode open) +

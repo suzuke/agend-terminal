@@ -18,6 +18,7 @@
 //! `AGEND_SHADOW_OBSERVER=0` kill-switch.
 
 pub mod evidence;
+pub(crate) mod gate;
 pub mod kiro;
 pub mod opencode;
 pub mod reducer;
@@ -69,6 +70,17 @@ pub struct ShadowFrame {
 /// thread spawns, no spawn-env injection).
 pub fn enabled() -> bool {
     std::env::var("AGEND_SHADOW_OBSERVER").as_deref() != Ok("0")
+}
+
+/// #2413 (B): `true` when the observer's correction may drive the OPERATED snapshot state
+/// (`agent_state` in `snapshot.json` → the dispatch_idle / inbox / handoff / reply
+/// deciders). **Default ON**, disabled by the explicit `AGEND_OBSERVED_DISPATCH=0`
+/// kill-switch — independent of the badge (A): B changes daemon BEHAVIOUR, A only pixels,
+/// so they must be separately reversible. The promotion ALSO requires [`enabled`] (no
+/// observer ⇒ no `observed_status` to promote), so flipping `AGEND_SHADOW_OBSERVER=0`
+/// disables B too. `=0` is byte-identical to pre-#2413 (snapshot writes the raw heuristic).
+pub fn operated_dispatch_enabled() -> bool {
+    enabled() && std::env::var("AGEND_OBSERVED_DISPATCH").as_deref() != Ok("0")
 }
 
 /// The per-daemon unix socket the hooks emit to. One socket for the daemon; the

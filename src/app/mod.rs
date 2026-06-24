@@ -158,11 +158,32 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 /// the flag on. The fix is symmetric to #1694(a): the reducer driver now runs in app mode
 /// (un-allowlisted), and `run_app` starts the hook-event socket server (`shadow::start`)
 /// alongside the api-activity probe. Flag-OFF by default ⇒ zero behaviour change.
-const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump"];
+/// Per-tick handlers ALWAYS allowlisted out of app-standalone (unconditional skips).
+/// `thread_dump` is an env-gated diagnostic not needed in the interactive TUI.
+///
+/// #2413 PR-B (#1720-class fix): `snapshot_rotation` was REMOVED from this list — see
+/// [`app_snapshot_rotation_enabled`]. The live daemon runs `run_app`, never `run_core`, so
+/// allowlisting `snapshot_rotation` out meant the live daemon NEVER wrote `<home>/snapshot.json`
+/// (it was weeks-stale), and `dispatch_idle` / inbox / handoff / reply — which read it — all
+/// operated on stale state. Same #1720 class already fixed for `recovery_dispatcher` (#1694a)
+/// and `shadow_observe` (#2413 Phase B). It now runs in app mode by default, reversible via the
+/// `AGEND_APP_SNAPSHOT=0` kill-switch.
+const APP_TICK_ALLOWLIST: &[&str] = &["thread_dump"];
+
+/// #2413 PR-B: whether app-standalone runs `snapshot_rotation` (writes `snapshot.json` every
+/// tick). **Default ON** — the #1720-class fix so the live daemon's snapshot-reading deciders
+/// (dispatch_idle / inbox / handoff / reply) see CURRENT state. The `AGEND_APP_SNAPSHOT=0`
+/// kill-switch restores the pre-PR-B behaviour (allowlisted out — no app-mode snapshot write),
+/// a reversible escape hatch since flipping the whole snapshot plane stale→live is a behaviour
+/// change with a broad blast radius.
+fn app_snapshot_rotation_enabled() -> bool {
+    std::env::var("AGEND_APP_SNAPSHOT").as_deref() != Ok("0")
+}
 
 /// Build the per-tick handler set app-standalone runs: the shared
-/// `build_default_handlers` minus `APP_TICK_ALLOWLIST`. Extracted so the
-/// completeness invariant can compare it against the full daemon set.
+/// `build_default_handlers` minus `APP_TICK_ALLOWLIST` (and minus `snapshot_rotation` only when
+/// the `AGEND_APP_SNAPSHOT=0` kill-switch is set). Extracted so the completeness invariant can
+/// compare it against the full daemon set.
 ///
 /// #1694(a): `crash_tx` here is a throwaway sender (its receiver is dropped), so
 /// `stage2_dispatch_available = false` — `RecoveryDispatcherHandler` now RUNS
@@ -173,7 +194,18 @@ fn app_tick_handlers(
 ) -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
     let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
     let mut handlers = crate::daemon::build_default_handlers(crash_tx, false, daemon_binary_stale);
-    handlers.retain(|h| !APP_TICK_ALLOWLIST.contains(&h.name()));
+    let skip_snapshot = !app_snapshot_rotation_enabled();
+    handlers.retain(|h| {
+        let name = h.name();
+        if APP_TICK_ALLOWLIST.contains(&name) {
+            return false;
+        }
+        // #2413 PR-B: snapshot_rotation runs by default; the kill-switch skips it.
+        if skip_snapshot && name == "snapshot_rotation" {
+            return false;
+        }
+        true
+    });
     handlers
 }
 
@@ -2177,9 +2209,14 @@ mod tests {
                 .collect();
 
         // Positive: every non-allowlisted daemon handler must run in app.
+        // #2413 PR-B: `snapshot_rotation` is CONDITIONALLY run (default-ON, kill-switched by
+        // `AGEND_APP_SNAPSHOT=0`), so it is exempt from the "must always run" check regardless
+        // of the ambient env — its default-on + reversibility is pinned separately by
+        // `snapshot_rotation_runs_in_app_mode_by_default_1720`.
         let missing: Vec<&str> = all
             .difference(&app)
             .filter(|n| !APP_TICK_ALLOWLIST.contains(n))
+            .filter(|n| **n != "snapshot_rotation")
             .copied()
             .collect();
         assert!(
@@ -2246,6 +2283,230 @@ mod tests {
             !APP_TICK_ALLOWLIST.contains(&"shadow_observe"),
             "shadow_observe must NOT be allowlisted out of app mode (#2413 live-fix)"
         );
+    }
+
+    /// #2413 PR-B (#1720-class fix): `snapshot_rotation` must RUN in app mode BY DEFAULT so
+    /// the live daemon writes `snapshot.json` every tick (it was allowlisted out → weeks-stale
+    /// → dispatch_idle/inbox/handoff/reply read stale state). Reversible: `AGEND_APP_SNAPSHOT=0`
+    /// restores the allowlisted-out behaviour. Pins both the default-on and the kill-switch.
+    #[test]
+    #[serial_test::serial(app_snapshot_killswitch)]
+    fn snapshot_rotation_runs_in_app_mode_by_default_1720() {
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("AGEND_APP_SNAPSHOT", v),
+                    None => std::env::remove_var("AGEND_APP_SNAPSHOT"),
+                }
+            }
+        }
+        let _g = EnvGuard(std::env::var("AGEND_APP_SNAPSHOT").ok());
+        let names = |stale| {
+            app_tick_handlers(stale)
+                .iter()
+                .map(|h| h.name())
+                .collect::<Vec<_>>()
+        };
+
+        // Default (unset) → snapshot_rotation RUNS in app mode.
+        std::env::remove_var("AGEND_APP_SNAPSHOT");
+        assert!(
+            names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .contains(&"snapshot_rotation"),
+            "snapshot_rotation must RUN in app mode by default (#1720 live-fix)"
+        );
+        assert!(
+            !APP_TICK_ALLOWLIST.contains(&"snapshot_rotation"),
+            "snapshot_rotation must NOT be unconditionally allowlisted out (#1720 live-fix)"
+        );
+
+        // Kill-switch `=0` → reverts to the old allowlisted-out behaviour.
+        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
+        assert!(
+            !names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .contains(&"snapshot_rotation"),
+            "AGEND_APP_SNAPSHOT=0 must restore the allowlisted-out behaviour (no app snapshot write)"
+        );
+    }
+
+    /// #2413 PR-B (#1720 live-fix) — END-TO-END verification on a /tmp home, driving the REAL
+    /// app-mode handler set + real `snapshot.json` + real `dispatch_idle` gate. The
+    /// operator-evidence proof of (a)(b)(c) with the `AGEND_APP_SNAPSHOT` on/off contrast:
+    ///   (a) app mode WRITES `snapshot.json` with the PROMOTED operated state (it was
+    ///       allowlisted out → weeks-stale → all snapshot readers saw stale state);
+    ///   (b) at a REAL false-idle (raw screen Idle + a high-confidence Active
+    ///       `observed_status`), `dispatch_idle` does NOT mis-fire — whereas a stale/raw
+    ///       `idle` snapshot WOULD — and the shared busy-gate `agent_is_busy`
+    ///       (inbox/handoff/reply) reads the agent as BUSY;
+    ///   (c) `AGEND_APP_SNAPSHOT=0` reverts (app does not write) — the reversible escape hatch.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shadow_observer)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn pr_b_end_to_end_operated_state_app_mode_1720() {
+        use crate::daemon::dispatch_idle;
+        use crate::daemon::shadow::evidence::{Authority, Confidence};
+        use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
+        use crate::snapshot::{agent_is_busy, agent_state_of, AgentSnapshot};
+
+        struct G(&'static str, Option<String>);
+        impl Drop for G {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _g = (
+            G(
+                "AGEND_SHADOW_OBSERVER",
+                std::env::var("AGEND_SHADOW_OBSERVER").ok(),
+            ),
+            G(
+                "AGEND_OBSERVED_DISPATCH",
+                std::env::var("AGEND_OBSERVED_DISPATCH").ok(),
+            ),
+            G(
+                "AGEND_APP_SNAPSHOT",
+                std::env::var("AGEND_APP_SNAPSHOT").ok(),
+            ),
+        );
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+        std::env::remove_var("AGEND_OBSERVED_DISPATCH"); // default-ON
+        std::env::remove_var("AGEND_APP_SNAPSHOT"); // default-ON
+
+        let home = std::env::temp_dir().join(format!("agend-pr-b-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+
+        // A false-idle agent: raw screen Idle (mk_test_handle default) + a high-confidence
+        // Active observed_status (the mid-API false-idle the reducer produces live).
+        let id = crate::types::InstanceId::default();
+        let handle = crate::agent::mk_test_handle("victim", id);
+        handle.core.lock().observed_status = Some(ObservedStatus {
+            state: ObservedState::Active,
+            authority: Authority::Hook,
+            confidence: Confidence::Strong,
+            evidence: vec![],
+            since_ms: 0,
+        });
+        let registry: crate::agent::AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+                (id, handle),
+            ])));
+        let externals: crate::agent::ExternalRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let stale = || Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Run ONLY the app-set's snapshot_rotation handler (proves it IS in the real app set
+        // AND that running it writes snapshot.json). Returns whether the app set contained it.
+        let run_app_snapshot = || {
+            let ctx = crate::daemon::per_tick::TickContext {
+                home: &home,
+                registry: &registry,
+                externals: &externals,
+                configs: &configs,
+            };
+            let mut ran = false;
+            for h in app_tick_handlers(stale()) {
+                if h.name() == "snapshot_rotation" {
+                    h.run(&ctx);
+                    ran = true;
+                }
+            }
+            ran
+        };
+
+        // ══ (a)+(b): ON (default) — app writes snapshot.json with the PROMOTED operated state ══
+        assert!(
+            run_app_snapshot(),
+            "(a) app mode runs snapshot_rotation by default (un-allowlisted)"
+        );
+        assert_eq!(
+            agent_state_of(&home, "victim").as_deref(),
+            Some("thinking"),
+            "(a)+(b) app mode wrote snapshot.json with the PROMOTED operated state (false-idle → thinking)"
+        );
+        assert!(
+            agent_is_busy(&home, "victim"),
+            "(b) the shared busy-gate (inbox/handoff/reply) reads the false-idle agent as BUSY"
+        );
+
+        // (b) dispatch_idle: drive the real scan_and_emit on a past-threshold pending dispatch.
+        // Isolate the agent_state gate from the silence gate by holding silence > threshold, so
+        // ONLY agent_state decides suppress-vs-fire.
+        let save_snap = |state: &str| {
+            crate::snapshot::save(
+                &home,
+                &[AgentSnapshot {
+                    name: "victim".to_string(),
+                    backend_command: "claude".to_string(),
+                    args: vec![],
+                    working_dir: None,
+                    submit_key: "\r".to_string(),
+                    health_state: "healthy".to_string(),
+                    agent_state: state.to_string(),
+                    silent_secs: 9_999,
+                    output_silent_secs: 9_999,
+                }],
+            );
+        };
+        let make_overdue = |corr: &str| -> String {
+            let did =
+                dispatch_idle::record_dispatch(&home, "lead", "victim", Some(corr), "task", 60)
+                    .expect("recorded pending dispatch");
+            let p = dispatch_idle::pending_path(&home, &did);
+            let mut v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            v["issued_at"] =
+                serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+            v["status"] = serde_json::json!("pending");
+            v["not_working_streak"] = serde_json::json!(0);
+            crate::store::atomic_write(&p, serde_json::to_string(&v).unwrap().as_bytes()).unwrap();
+            did
+        };
+        let status_of = |did: &str| -> String {
+            dispatch_idle::list_pending(&home)
+                .into_iter()
+                .find(|d| d.dispatch_id == *did)
+                .map(|d| format!("{:?}", d.status))
+                .unwrap_or_else(|| "DELETED".into())
+        };
+
+        // Promoted "thinking" → SUPPRESSED across DEBOUNCE+margin scans (never mis-fires).
+        save_snap("thinking");
+        let did_ok = make_overdue("corr-suppress");
+        for _ in 0..5 {
+            dispatch_idle::scan_and_emit(&home);
+        }
+        assert_eq!(
+            status_of(&did_ok),
+            "Pending",
+            "(b) dispatch_idle SUPPRESSED on the promoted false-idle — did NOT mis-fire"
+        );
+
+        // Contrast: a stale/raw "idle" snapshot (the pre-#1720-fix behaviour) → FIRES (Exceeded).
+        save_snap("idle");
+        let did_fire = make_overdue("corr-fire");
+        for _ in 0..5 {
+            dispatch_idle::scan_and_emit(&home);
+        }
+        assert_eq!(
+            status_of(&did_fire),
+            "Exceeded",
+            "(b-baseline) a stale 'idle' snapshot MIS-FIRES (the bug PR-B fixes for the live daemon)"
+        );
+
+        // ══ (c): AGEND_APP_SNAPSHOT=0 reverts — app does NOT write the snapshot ══
+        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
+        assert!(
+            !run_app_snapshot(),
+            "(c) AGEND_APP_SNAPSHOT=0 reverts: app mode does NOT run snapshot_rotation"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #2413 Phase B live-fix companion: the reducer driver is useless without the
