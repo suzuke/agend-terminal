@@ -827,10 +827,11 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
 
     // #2413 Shadow Observer — LOCAL plane (flag default-OFF via AGEND_SHADOW_OBSERVER).
     // Inject a per-session unix-socket path + a freshly-minted 256-bit token scoped to
-    // THIS spawned claude, so its lifecycle hooks emit token-authenticated evidence to
-    // the daemon WITHOUT touching `~/.claude` global. claude-only (the hook-bearing
-    // backend). Set AFTER env_clear (like AGEND_INSTANCE_NAME) so isolation can't drop
-    // it; the hook subprocess inherits both vars from claude's env.
+    // THIS spawned backend, so its lifecycle hooks emit token-authenticated evidence to
+    // the daemon WITHOUT touching the backend's global config. Hook-bearing backends only
+    // (`has_state_hooks()` = claude + agy #2413 Phase D). Set AFTER env_clear (like
+    // AGEND_INSTANCE_NAME) so isolation can't drop it; the hook subprocess inherits both
+    // vars from the backend's env (claude `.claude` hooks / agy `.agents/hooks.json`).
     if crate::daemon::shadow::enabled()
         && detected_backend
             .as_ref()

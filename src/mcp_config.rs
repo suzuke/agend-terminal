@@ -416,7 +416,112 @@ fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> 
     // re-discovers from the config just written.
     clear_agy_mcp_cache();
 
+    // #2413 Phase D (agy shadow plane): inject per-workspace lifecycle hooks into
+    // `.agents/hooks.json` — agy/Antigravity's hook config (NEVER touches the
+    // global `~/.gemini`, scope rule honored). Same flag gate as claude
+    // (`configure_claude`); needs an instance name for the session↔agent
+    // attribution embedded in the hook command. RE-spike (t-…39100-6) proved these
+    // per-workspace hooks fire live mid-turn.
+    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
+        || crate::daemon::shadow::enabled()
+    {
+        if let Some(name) = instance_name {
+            let hooks_path = working_dir.join(".agents").join("hooks.json");
+            upsert_agy_state_hooks(&hooks_path, name)?;
+        }
+    }
+
     tracing::debug!(path = %path.display(), "configured agy MCP (.agents/)");
+    Ok(())
+}
+
+/// #2413 Phase D: upsert observe-only lifecycle-hook reporters into agy's
+/// per-workspace `.agents/hooks.json` (agy/Antigravity hook config; the global
+/// `~/.gemini` is NEVER touched — scope rule). Agy fires `PreInvocation` (per
+/// model step), `PreTool`/`PostTool`, and `Stop`; each command hook runs the
+/// shared `hook-event` reporter with an explicit `--event` carrying the
+/// CLAUDE-COMPATIBLE name the shadow server already maps, so Evidence + the
+/// reducer are reused UNCHANGED:
+///   PreInvocation→UserPromptSubmit(TurnStarted), PreTool→PreToolUse(ToolStarted),
+///   PostTool→PostToolUse(ToolEnded), Stop→Stop(TurnEnded→idle).
+/// Merge-preserving + idempotent: our entry is identified by the
+/// `hook-event --instance` marker and replaced on re-configure; any operator
+/// hooks under the same event are preserved. The reporter always exits 0
+/// (observe-only — never blocks agy's turn) and the socket write fast-fails when
+/// the per-session socket is absent (shadow off), so this is spawn-safe.
+fn upsert_agy_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
+    // (agy event name, claude-compatible event the shadow server maps).
+    const EVENT_MAP: &[(&str, &str)] = &[
+        ("PreInvocation", "UserPromptSubmit"),
+        ("PreTool", "PreToolUse"),
+        ("PostTool", "PostToolUse"),
+        ("Stop", "Stop"),
+    ];
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "agend-terminal".to_string());
+    let marker = "hook-event --instance";
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                // Fail-CLOSED (same contract as upsert_state_hooks): back up the
+                // corrupt file (rename-first) and refuse to silently clobber it.
+                let backup = path.with_extension(format!(
+                    "corrupt.{}",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                if !crate::store::backup_corrupt_file(path, &backup) {
+                    anyhow::bail!(
+                        "malformed agy hooks at {} and its backup failed; refusing to overwrite (original preserved)",
+                        path.display()
+                    );
+                }
+                tracing::warn!(
+                    path = %path.display(), backup = %backup.display(), error = %e,
+                    "malformed agy hooks.json, backed up corrupt file and starting fresh"
+                );
+                json!({})
+            }
+        }
+    } else {
+        json!({})
+    };
+    if !config.is_object() {
+        config = json!({});
+    }
+    if !config.get("hooks").map(|h| h.is_object()).unwrap_or(false) {
+        config["hooks"] = json!({});
+    }
+    let hooks = config["hooks"]
+        .as_object_mut()
+        .expect("hooks set to object above");
+    for (agy_event, claude_event) in EVENT_MAP {
+        let command = format!("{exe} hook-event --instance {instance_name} --event {claude_event}");
+        let our_entry = json!({ "name": "agend-shadow", "command": command });
+        let arr = hooks
+            .entry((*agy_event).to_string())
+            .or_insert_with(|| json!([]));
+        if !arr.is_array() {
+            *arr = json!([]);
+        }
+        let list = arr.as_array_mut().expect("event value set to array above");
+        // Idempotent: drop our prior entry (marker), preserve operator hooks.
+        list.retain(|e| {
+            !e.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains(marker))
+        });
+        list.push(our_entry);
+    }
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1453,6 +1558,81 @@ mod hook_state_poc_tests {
                 "instance embedded for attribution"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2413 Phase D (agy): the agy hooks upsert writes per-workspace
+    /// `.agents/hooks.json` with agy's OWN event keys (PreInvocation/PreTool/
+    /// PostTool/Stop) mapped to the CLAUDE-compatible `--event` the shadow server
+    /// already understands (so Evidence + reducer are reused unchanged).
+    /// Merge-preserving + idempotent. Reverse-mutation: break EVENT_MAP (e.g.
+    /// PreTool→"ToolUse") → the `--event PreToolUse` assert fails; emit claude
+    /// KEYS (PreToolUse) → the agy-key lookup + the "no claude key" assert fail.
+    #[test]
+    fn upsert_agy_state_hooks_maps_events_merges_and_is_idempotent() {
+        let dir = tmp("agy-hooks");
+        let path = dir.join(".agents").join("hooks.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Pre-existing operator hook under a shared event (Stop) + a foreign event.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "Stop": [{"name": "user-bell", "command": "say done"}],
+                    "SessionStart": [{"name": "user-greet", "command": "echo hi"}],
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        upsert_agy_state_hooks(&path, "agent-x").unwrap();
+        upsert_agy_state_hooks(&path, "agent-x").unwrap(); // idempotent re-run
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        for (agy_ev, claude_ev) in [
+            ("PreInvocation", "UserPromptSubmit"),
+            ("PreTool", "PreToolUse"),
+            ("PostTool", "PostToolUse"),
+            ("Stop", "Stop"),
+        ] {
+            let arr = cfg["hooks"][agy_ev]
+                .as_array()
+                .unwrap_or_else(|| panic!("event {agy_ev} present"));
+            let ours: Vec<_> = arr
+                .iter()
+                .filter(|e| {
+                    e["command"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("hook-event --instance"))
+                })
+                .collect();
+            assert_eq!(ours.len(), 1, "{agy_ev}: exactly one of ours after re-run");
+            let cmd = ours[0]["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("--instance agent-x"),
+                "{agy_ev}: instance embedded"
+            );
+            assert!(
+                cmd.contains(&format!("--event {claude_ev}")),
+                "{agy_ev} → --event {claude_ev}; got {cmd}"
+            );
+        }
+        // Merge-preserving: operator + foreign entries survive.
+        let stop = cfg["hooks"]["Stop"].as_array().unwrap();
+        assert!(
+            stop.iter().any(|e| e["command"] == "say done"),
+            "operator Stop hook preserved"
+        );
+        assert_eq!(cfg["hooks"]["SessionStart"][0]["command"], "echo hi");
+        // agy config must use AGY event KEYS, never claude's.
+        assert!(
+            cfg["hooks"].get("PreToolUse").is_none()
+                && cfg["hooks"].get("UserPromptSubmit").is_none(),
+            "agy hooks.json must key on agy events (PreTool/PreInvocation), not claude's"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

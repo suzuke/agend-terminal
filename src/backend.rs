@@ -58,13 +58,21 @@ impl Backend {
     /// backend always uses the heuristic (no hooks fire, so `resolved_state_for`
     /// stays `Unknown` → heuristic fallback).
     ///
-    /// **claude-only in v1.** `configure_agy` does NOT inject the hooks, and
-    /// production data confirmed it (2026-06-11: ai-scout/agy emitted **0** hook
-    /// events all day, including during a real 16:14 task run; all 3,490 events
-    /// came from claude). Re-adding Agy requires the injection implementation AND
-    /// shadow-data evidence that its hooks fire — not just the enum membership.
+    /// **claude + agy (#2413 Phase D).** Both inject lifecycle hooks that emit
+    /// token-authenticated shadow Evidence: claude via `.claude` settings;
+    /// **agy via per-workspace `.agents/hooks.json`** written by `configure_agy`
+    /// — its `PreInvocation/PreTool/PostTool/Stop` command hooks POST
+    /// claude-compatible frames to the same shadow socket via `hook-event
+    /// --event`. The earlier "claude-only" gate was because Agy's hooks were
+    /// never injected (2026-06-11: agy emitted 0 hook events); the prerequisite
+    /// it named — "injection implementation AND shadow-data evidence that its
+    /// hooks fire" — is now met (RE-spike t-…39100-6 proved per-workspace hooks
+    /// fire live; injection added below). Other backends have no hooks (heuristic
+    /// fallback). Gates: socket-env injection (agent/mod.rs), hook→authoritative
+    /// promotion (hook_shadow.rs, also `AGEND_HOOK_STATE_POC`-gated), divergence
+    /// telemetry, supervisor SRL hook-recovery.
     pub fn has_state_hooks(&self) -> bool {
-        matches!(self, Backend::ClaudeCode)
+        matches!(self, Backend::ClaudeCode | Backend::Agy)
     }
 
     /// #2090: does this backend expose a subagent / sub-task mechanism an agent
@@ -1299,6 +1307,27 @@ impl BackendBehavior for Backend {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #2413 Phase D: agy joins claude as a hook backend (its `.agents/hooks.json`
+    /// lifecycle hooks emit shadow Evidence). This gates socket-env injection +
+    /// hook promotion. Every other backend stays heuristic-only.
+    #[test]
+    fn agy_and_claude_have_state_hooks_others_do_not() {
+        assert!(
+            Backend::Agy.has_state_hooks(),
+            "agy is a hook backend (#2413 Phase D)"
+        );
+        assert!(Backend::ClaudeCode.has_state_hooks());
+        for b in [
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::KiroCli,
+            Backend::Shell,
+            Backend::Raw("x".into()),
+        ] {
+            assert!(!b.has_state_hooks(), "{b:?} must stay heuristic-only");
+        }
+    }
 
     /// #8 Phase 1 parity proof: the `BackendBehavior` facade returns EXACTLY
     /// what the existing inherent methods / free fn return for every variant —
