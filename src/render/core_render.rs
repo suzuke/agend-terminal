@@ -39,6 +39,131 @@ pub fn state_color(state: AgentState) -> Color {
     }
 }
 
+// ── dim non-focused panes (t-…50430, version b) ────────────────────────────────────────
+//
+// Blend every cell of a NON-focused pane's content toward the (dark) terminal background so
+// the focused pane stands out. RGB blend (not `Modifier::DIM`, which is terminal-dependent
+// and weak) → guaranteed visible + cross-terminal consistent. Applied as a post-render
+// per-cell buffer rewrite, mirroring the selection-highlight loop in `render_pane`.
+
+/// Fraction each non-focused cell's colours move toward the terminal background. 0.5 = a
+/// clear "dimmed" look that stays readable (white text → mid-grey). Tunable.
+const DIM_BLEND: f32 = 0.5;
+/// Assumed terminal background (dark) — the blend target. agend fleet terminals are dark;
+/// blending toward black makes non-focused content recede uniformly.
+const TERM_BG_RGB: (u8, u8, u8) = (0, 0, 0);
+/// Assumed default foreground for a `Reset` fg cell (the dominant case — most terminal text
+/// uses the default fg). Resolving it lets that text actually dim, not just the rarer
+/// explicitly-coloured cells.
+const TERM_FG_RGB: (u8, u8, u8) = (204, 204, 204);
+
+/// Linear blend of `c` a `factor` of the way toward `target` (per channel).
+fn blend_rgb(c: (u8, u8, u8), target: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
+    let f = factor.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    (
+        lerp(c.0, target.0),
+        lerp(c.1, target.1),
+        lerp(c.2, target.2),
+    )
+}
+
+/// Resolve a 256-colour index to RGB (standard xterm palette: 0-15 system, 16-231 the
+/// 6×6×6 cube, 232-255 the grayscale ramp).
+fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+    const SYS: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => SYS[i as usize],
+        16..=231 => {
+            let i = i - 16;
+            let conv = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (conv(i / 36), conv((i % 36) / 6), conv(i % 6))
+        }
+        232..=255 => {
+            let v = 8 + (i - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// Resolve a ratatui [`Color`] to RGB for blending. `is_fg` decides how `Reset` resolves:
+/// a `Reset` fg is the terminal's default foreground (so it can dim), while a `Reset` bg is
+/// already the terminal background (the blend target) → `None`, leave it untouched.
+fn color_to_rgb(c: Color, is_fg: bool) -> Option<(u8, u8, u8)> {
+    Some(match c {
+        Color::Reset => {
+            if is_fg {
+                TERM_FG_RGB
+            } else {
+                return None;
+            }
+        }
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => indexed_rgb(i),
+        Color::Black => (0, 0, 0),
+        Color::Red => (128, 0, 0),
+        Color::Green => (0, 128, 0),
+        Color::Yellow => (128, 128, 0),
+        Color::Blue => (0, 0, 128),
+        Color::Magenta => (128, 0, 128),
+        Color::Cyan => (0, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::DarkGray => (128, 128, 128),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (0, 0, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+    })
+}
+
+/// Dim one colour toward the terminal background, or leave it unchanged when it is already
+/// the background (a `Reset` bg).
+fn dim_color(c: Color, is_fg: bool) -> Color {
+    match color_to_rgb(c, is_fg) {
+        Some(rgb) => {
+            let (r, g, b) = blend_rgb(rgb, TERM_BG_RGB, DIM_BLEND);
+            Color::Rgb(r, g, b)
+        }
+        None => c,
+    }
+}
+
+/// Blend every cell in `inner` toward the terminal background — the version-b dim for a
+/// non-focused pane. Per-cell buffer rewrite (same shape as the selection-highlight loop).
+/// Takes `&mut Buffer` (not `&mut Frame`) so it is directly unit-testable with
+/// `Buffer::empty`; the call site passes `frame.buffer_mut()`.
+fn dim_pane_content(buf: &mut ratatui::buffer::Buffer, inner: Rect) {
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        for x in inner.x..inner.x.saturating_add(inner.width) {
+            let cell = &mut buf[(x, y)];
+            let fg = dim_color(cell.fg, true);
+            let bg = dim_color(cell.bg, false);
+            cell.set_fg(fg);
+            cell.set_bg(bg);
+        }
+    }
+}
+
 /// #freeze-2 (t-…74503): max bytes of queued PTY output a pane drains into its
 /// VTerm per frame, inside `terminal.draw` on the main thread (see
 /// `Pane::drain_output`). Caps per-frame CPU so a boot/restart backlog can't stall
@@ -694,6 +819,13 @@ fn render_pane(
             }
             vrow += 1;
         }
+    }
+
+    // Dim a NON-focused pane's content (version b) so the focused pane stands out at a
+    // glance. Toggle: runtime_config.dim_unfocused_panes (default ON). Zoomed mode draws
+    // only the focused pane, so `!focused` naturally skips it — no special case needed.
+    if !focused && crate::runtime_config::get().dim_unfocused_panes {
+        dim_pane_content(frame.buffer_mut(), inner);
     }
 
     if focused {
@@ -1807,5 +1939,113 @@ mod tests {
             );
         }
         drop(txs);
+    }
+
+    // ── dim non-focused panes (version b) ──────────────────────────────────────────────
+
+    /// blend-fn + colour-resolution determinism, incl. the confirm-first readability point
+    /// (a dimmed default-fg cell is a clearly-visible mid-grey, not black).
+    #[test]
+    fn dim_blend_and_color_resolution_are_deterministic() {
+        // RGB blend toward black at 0.5 = halfway (rounded).
+        assert_eq!(
+            blend_rgb((204, 204, 204), TERM_BG_RGB, 0.5),
+            (102, 102, 102)
+        );
+        assert_eq!(
+            blend_rgb((255, 255, 255), TERM_BG_RGB, 0.5),
+            (128, 128, 128)
+        );
+        assert_eq!(blend_rgb((200, 100, 50), TERM_BG_RGB, 0.5), (100, 50, 25));
+        assert_eq!(blend_rgb((10, 20, 30), TERM_BG_RGB, 0.0), (10, 20, 30)); // factor 0 = identity
+
+        // Named/Indexed/Reset → RGB resolution.
+        assert_eq!(color_to_rgb(Color::White, true), Some((255, 255, 255)));
+        assert_eq!(color_to_rgb(Color::Blue, true), Some((0, 0, 128)));
+        assert_eq!(color_to_rgb(Color::Indexed(0), true), Some((0, 0, 0)));
+        assert_eq!(
+            color_to_rgb(Color::Indexed(15), true),
+            Some((255, 255, 255))
+        );
+        assert_eq!(color_to_rgb(Color::Indexed(196), true), Some((255, 0, 0)));
+        assert_eq!(color_to_rgb(Color::Indexed(232), true), Some((8, 8, 8)));
+        assert_eq!(
+            color_to_rgb(Color::Indexed(255), true),
+            Some((238, 238, 238))
+        );
+        // Reset fg resolves to the assumed default fg (so the dominant text dims); Reset bg
+        // is already the background → None (left untouched).
+        assert_eq!(color_to_rgb(Color::Reset, true), Some(TERM_FG_RGB));
+        assert_eq!(color_to_rgb(Color::Reset, false), None);
+
+        // dim_color end-to-end.
+        assert_eq!(
+            dim_color(Color::Rgb(200, 100, 50), true),
+            Color::Rgb(100, 50, 25)
+        );
+        assert_eq!(dim_color(Color::Reset, false), Color::Reset); // bg untouched
+                                                                  // confirm-first: default text dims to a visible mid-grey, NOT black/invisible.
+        let dimmed_default = dim_color(Color::Reset, true);
+        assert_eq!(dimmed_default, Color::Rgb(102, 102, 102));
+        assert_ne!(
+            dimmed_default,
+            Color::Rgb(0, 0, 0),
+            "must stay readable, not vanish"
+        );
+    }
+
+    /// Buffer wiring (models a 2-pane layout): `dim_pane_content` blends ONLY the region it
+    /// is given (the non-focused pane's inner rect), leaving every other cell — i.e. the
+    /// focused pane, which never receives the call — byte-identical. Mirrors how `render_pane`
+    /// calls it solely under `!focused`.
+    #[test]
+    fn dim_pane_content_blends_only_the_nonfocused_region() {
+        use ratatui::buffer::Buffer;
+        // Two side-by-side 5×3 pane regions: left = focused (x 0..5), right = non-focused.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        for y in 0..3u16 {
+            for x in 0..10u16 {
+                buf[(x, y)].set_fg(Color::White);
+                buf[(x, y)].set_bg(Color::Reset);
+            }
+        }
+        // One non-focused cell carries an explicit coloured bg to exercise the bg path.
+        buf[(7, 1)].set_bg(Color::Blue);
+
+        let nonfocused = Rect::new(5, 0, 5, 3);
+        dim_pane_content(&mut buf, nonfocused);
+
+        // Focused (left) region: untouched.
+        for y in 0..3u16 {
+            for x in 0..5u16 {
+                assert_eq!(
+                    buf[(x, y)].fg,
+                    Color::White,
+                    "focused fg unchanged at {x},{y}"
+                );
+                assert_eq!(
+                    buf[(x, y)].bg,
+                    Color::Reset,
+                    "focused bg unchanged at {x},{y}"
+                );
+            }
+        }
+        // Non-focused (right) region: fg blended toward black; Reset bg left as-is.
+        for y in 0..3u16 {
+            for x in 5..10u16 {
+                assert_eq!(
+                    buf[(x, y)].fg,
+                    Color::Rgb(128, 128, 128),
+                    "non-focused fg blended at {x},{y}"
+                );
+            }
+        }
+        assert_eq!(
+            buf[(5, 0)].bg,
+            Color::Reset,
+            "Reset bg stays the terminal background"
+        );
+        // The explicit Blue bg blended toward black.
+        assert_eq!(buf[(7, 1)].bg, Color::Rgb(0, 0, 64), "coloured bg dimmed");
     }
 }

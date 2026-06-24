@@ -56,6 +56,14 @@ pub struct RuntimeConfig {
     /// `default_true` also fills the field for configs written before it existed.
     #[serde(default = "default_true")]
     pub copy_on_select: bool,
+    /// dim-unfocused (t-…50430): when true (DEFAULT), every NON-focused pane's content is
+    /// blended toward the (dark) terminal background so the focused pane stands out at a
+    /// glance — a cross-terminal focus aid that does NOT rely on the terminal-dependent
+    /// `Modifier::DIM`. Read live by `render_pane`; toggle via the `config` MCP tool /
+    /// `:set dim_unfocused_panes on|off`. `default_true` also fills it for configs written
+    /// before it existed (additive — no schema bump).
+    #[serde(default = "default_true")]
+    pub dim_unfocused_panes: bool,
     /// #2090: origin-aware long-task progress reporting mode. `0` = off
     /// (DEFAULT — zero behaviour change).
     ///
@@ -117,6 +125,7 @@ impl Default for RuntimeConfig {
             idle_watchdog_enabled: true,
             show_pane_state: true,
             copy_on_select: true,
+            dim_unfocused_panes: true,
             progress_mode: 0,
             schema_version: RuntimeConfig::CURRENT,
         }
@@ -263,6 +272,14 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use on/off)")),
             };
         }
+        "dim_unfocused_panes" => {
+            // operator-facing UX toggle — accept on/off alongside true/false/1/0.
+            config.dim_unfocused_panes = match value {
+                "true" | "1" | "on" => true,
+                "false" | "0" | "off" => false,
+                _ => return Err(format!("invalid boolean: {value} (use on/off)")),
+            };
+        }
         "progress_mode" => {
             let m: i64 = value
                 .parse()
@@ -316,6 +333,7 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
         "show_pane_state" => Ok(config.show_pane_state.to_string()),
         "copy_on_select" => Ok(config.copy_on_select.to_string()),
+        "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
         "progress_mode" => Ok(config.progress_mode.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
