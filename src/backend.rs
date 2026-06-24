@@ -61,9 +61,9 @@ impl Backend {
     /// **claude + agy (#2413 Phase D).** Both inject lifecycle hooks that emit
     /// token-authenticated shadow Evidence: claude via `.claude` settings;
     /// **agy via per-workspace `.agents/hooks.json`** written by `configure_agy`
-    /// — its `PreInvocation/PreTool/PostTool/Stop` command hooks POST
-    /// claude-compatible frames to the same shadow socket via `hook-event
-    /// --event`. The earlier "claude-only" gate was because Agy's hooks were
+    /// — its `PreInvocation`/`Stop` command hooks POST claude-compatible frames to
+    /// the same shadow socket via `hook-event --event` (agy fires no tool hooks —
+    /// t-…93090-0; busy/idle only, no tool granularity). The earlier "claude-only" gate was because Agy's hooks were
     /// never injected (2026-06-11: agy emitted 0 hook events); the prerequisite
     /// it named — "injection implementation AND shadow-data evidence that its
     /// hooks fire" — is now met (RE-spike t-…39100-6 proved per-workspace hooks
