@@ -36,6 +36,14 @@ pub struct AgentCore {
     /// reconcile pattern-state against live LLM-socket activity (false-idle
     /// detection) WITHOUT clobbering `agent_state`. Default = no signal yet.
     pub(crate) api_activity: ApiActivity,
+    /// #2413 Phase B (Shadow Observer): the reducer's fused `ObservedStatus`
+    /// (hook-plane Evidence + the screen baseline + lsof liveness → one state
+    /// with confidence/authority + decay/liveness backstop). Purely ADDITIVE —
+    /// it NEVER rewrites `agent_state`; a consumer diffs the two under this same
+    /// `core.lock()` (that diff IS the quantification). `None` until the first
+    /// per-tick reduce under `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ stays
+    /// `None`, zero behaviour change). Written by `per_tick::shadow_observe`.
+    pub(crate) observed_status: Option<crate::daemon::shadow::reducer::ObservedStatus>,
 }
 
 /// #2413 Phase 1: out-of-path "is this agent mid-LLM-call?" signal, derived by
@@ -810,6 +818,35 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("AGEND_HOME", h);
     }
 
+    // #2413 Shadow Observer — LOCAL plane (flag default-OFF via AGEND_SHADOW_OBSERVER).
+    // Inject a per-session unix-socket path + a freshly-minted 256-bit token scoped to
+    // THIS spawned claude, so its lifecycle hooks emit token-authenticated evidence to
+    // the daemon WITHOUT touching `~/.claude` global. claude-only (the hook-bearing
+    // backend). Set AFTER env_clear (like AGEND_INSTANCE_NAME) so isolation can't drop
+    // it; the hook subprocess inherits both vars from claude's env.
+    if crate::daemon::shadow::enabled()
+        && detected_backend
+            .as_ref()
+            .is_some_and(|b| b.has_state_hooks())
+    {
+        if let Some(h) = *home {
+            match crate::daemon::shadow::new_session_token() {
+                Ok(token) => {
+                    crate::daemon::shadow::register(&token, name);
+                    cmd.env(
+                        "AGENT_TERMINAL_SOCKET",
+                        crate::daemon::shadow::socket_path(h),
+                    );
+                    cmd.env("AGENT_TERMINAL_SESSION", &token);
+                }
+                Err(e) => tracing::warn!(
+                    agent = %name, error = %e,
+                    "#shadow-observer: session token mint failed — local plane skipped for this spawn"
+                ),
+            }
+        }
+    }
+
     // Phase A Piece-3: GIT_EDITOR + friends = `true` (Unix no-op
     // binary that exits 0 without producing output). Prevents git
     // editor-needing operations from dropping the agent's PTY into
@@ -1226,6 +1263,7 @@ pub fn spawn_agent(
         state: StateTracker::for_agent(detected_backend.as_ref(), name),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
 
     // #1441: resolve the single authoritative instance ID (same source as inbox),
@@ -1589,6 +1627,7 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
             state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
             health: HealthTracker::new(),
             api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
         }));
 
         let dismiss: Vec<(String, Vec<u8>)> = detected_backend
@@ -3073,6 +3112,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         state: StateTracker::new(None),
         health: HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let published_state = core.lock().state.published_handle();
     AgentHandle {

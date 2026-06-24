@@ -149,7 +149,13 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 /// Stage3 instead of silent-dropping (see `build_default_handlers`'
 /// `stage2_dispatch_available = false` below). All stages stay shadow-gated-off by
 /// default — zero behavior change unless an operator opts in.
-const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump"];
+///
+/// #2413 Phase B: `shadow_observe` is allowlisted out of app mode ON PURPOSE — the
+/// hook-event socket server it consumes (`shadow::start`) is started ONLY in `run_core`,
+/// so the whole Shadow Observer plane is run_core-only (the isolated quantification
+/// daemon is `start --foreground` = run_core). Running the reducer in app mode would
+/// only ever fold empty buffers. It is flag-OFF by default regardless.
+const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump", "shadow_observe"];
 
 /// Build the per-tick handler set app-standalone runs: the shared
 /// `build_default_handlers` minus `APP_TICK_ALLOWLIST`. Extracted so the

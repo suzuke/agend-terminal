@@ -3912,6 +3912,7 @@ instances:
             state: crate::state::StateTracker::new(None),
             health: crate::health::HealthTracker::new(),
             api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
         }));
         core.lock().state.current = state;
         // Direct `.current` write bypasses record_set, so sync the lock-free mirror.

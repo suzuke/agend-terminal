@@ -54,6 +54,7 @@ pub(crate) mod progress_mirror;
 pub(crate) mod reclaim;
 pub(crate) mod reconcile_backups_gc;
 pub(crate) mod recovery_dispatcher;
+pub(crate) mod shadow_observe;
 pub(crate) mod snapshot;
 pub(crate) mod supervisor_trackers;
 pub(crate) mod thread_dump;
@@ -83,6 +84,7 @@ pub(crate) use progress_mirror::ProgressMirrorHandler;
 pub(crate) use reclaim::ReclaimHandler;
 pub(crate) use reconcile_backups_gc::ReconcileBackupsGcHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
+pub(crate) use shadow_observe::ShadowObserveHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) use supervisor_trackers::{
     AntiStallHandler, AutoReleaseHandler, CanonicalDriftHandler, ConflictNotifyHandler,
@@ -298,6 +300,7 @@ pub(crate) fn mock_live_agent_no_context(
         state: crate::state::StateTracker::new(None),
         health: crate::health::HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
     }));
     let handle = crate::agent::AgentHandle {
         id: crate::types::InstanceId::default(),
