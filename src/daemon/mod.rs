@@ -1393,6 +1393,10 @@ fn build_tick_infrastructure(
     // opencode agent's embedded server (port injected at spawn) → Evidence → shared buffer.
     // No-op unless AGEND_SHADOW_OBSERVER=1. ALSO wired into run_app (#2434 lesson).
     crate::daemon::shadow::opencode::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
+    // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/<uuid>.jsonl → Evidence →
+    // shared buffer (attribution via the <uuid>.json sidecar cwd). No-op unless
+    // AGEND_SHADOW_OBSERVER=1. ALSO wired into run_app (#2434 lesson).
+    crate::daemon::shadow::kiro::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a

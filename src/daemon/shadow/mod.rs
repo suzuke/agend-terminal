@@ -17,6 +17,7 @@
 //! reducer. `flag default OFF` via `AGEND_SHADOW_OBSERVER=1`.
 
 pub mod evidence;
+pub mod kiro;
 pub mod opencode;
 pub mod reducer;
 pub mod rollout;
