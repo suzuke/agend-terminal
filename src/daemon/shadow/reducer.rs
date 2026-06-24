@@ -462,11 +462,11 @@ impl AgentRuntime {
         //      STAYS Active no matter how long (#2433 r6 round-2) — productive-silence is
         //      the `Thinking` signature, so reconciling on it alone would re-create the
         //      very false-idle this plane exists to beat.
-        let hook_stale = self.last_observer_ms > 0
+        let observer_stale = self.last_observer_ms > 0
             && now_ms.saturating_sub(self.last_observer_ms) >= EPISODE_STALE_MS;
         let last_output_ms = now_ms.saturating_sub(live.productive_silent_ms);
         let episode_produced_output = last_output_ms >= self.episode_since_ms;
-        self.tool_open.is_none() && hook_stale && episode_produced_output
+        self.tool_open.is_none() && observer_stale && episode_produced_output
     }
 }
 

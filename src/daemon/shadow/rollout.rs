@@ -23,6 +23,14 @@ use std::path::{Path, PathBuf};
 /// near-real-time state without busy-spinning the disk.
 const TAIL_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How many LOCAL day-dirs back `discover_rollouts` scans (today + 2 prior). Covers a
+/// session that crosses one or two midnights (its file stays in its START-day dir). #2437 r4.
+const DISCOVER_DAYS: u32 = 3;
+
+/// Only tail rollout files modified within this window — skips dormant old sessions while
+/// still catching a long-running one that crossed midnight (whose file keeps being appended).
+const DISCOVER_RECENT: std::time::Duration = std::time::Duration::from_secs(26 * 3600);
+
 /// One codex rollout JSONL record — only the fields we consume (codex emits more).
 #[derive(Debug, Deserialize)]
 struct RolloutRecord {
@@ -154,14 +162,16 @@ fn normalize_path(p: &str) -> String {
 /// we only attribute rollouts whose cwd matches a CODEX agent's workspace (never a stray
 /// codex the operator launched outside the fleet).
 fn agent_for_cwd(cwd: &str, home: &Path, codex_agents: &[String]) -> Option<String> {
-    let ws_root = normalize_path(&home.join("workspace").to_string_lossy());
-    for name in codex_agents {
-        let ws = format!("{ws_root}/{name}");
-        if cwd == ws {
-            return Some(name.clone());
-        }
-    }
-    None
+    // Compare as PATHS, not formatted strings. `home.join("workspace")` uses the platform
+    // separator (`\` on Windows), so a hardcoded `/` join would MIX separators and never
+    // match on Windows (it didn't — #2437 windows-latest). `Path` equality is
+    // separator-agnostic. `cwd` is already normalized (session_cwd strips the macOS
+    // `/private` prefix) so it shares the home's root form.
+    let cwd_path = Path::new(cwd);
+    codex_agents
+        .iter()
+        .find(|name| cwd_path == home.join("workspace").join(name))
+        .cloned()
 }
 
 /// Today's codex rollout directory root (`<CODEX_HOME|~/.codex>/sessions`).
@@ -242,25 +252,51 @@ fn live_codex_agents(registry: &crate::agent::AgentRegistry) -> Vec<String> {
         .collect()
 }
 
-/// Today's rollout files under `<root>/<Y>/<M>/<D>/`. (Today only — a long-lived session
-/// crossing midnight is rare for an agent and re-discovered as the next day's dir fills;
-/// keeping it to today bounds the scan.)
+/// Recently-modified rollout files under the last [`DISCOVER_DAYS`] day-dirs
+/// (`<root>/<Y>/<M>/<D>/`). #2437 r4: a codex session is named by — and filed under — its
+/// START day (LOCAL date, matching the `rollout-<local-ts>` filename, NOT the UTC `Z`
+/// session_meta stamp). A long-running fleet agent's session crosses midnight and keeps
+/// appending to YESTERDAY's file, which a today-only scan would miss — leaving that agent
+/// OBSERVE-BLIND after every midnight until it restarts. So scan the last few LOCAL
+/// day-dirs and keep only files touched within [`DISCOVER_RECENT`] (bounds the set + skips
+/// dormant prior-day sessions).
 fn discover_rollouts(root: &Path) -> Vec<PathBuf> {
-    let now = chrono::Utc::now();
-    let dir = root
-        .join(now.format("%Y").to_string())
-        .join(now.format("%m").to_string())
-        .join(now.format("%d").to_string());
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    rd.filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
+    let now = chrono::Local::now();
+    let recent_cutoff = std::time::SystemTime::now()
+        .checked_sub(DISCOVER_RECENT)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let mut out = Vec::new();
+    for back in 0..DISCOVER_DAYS {
+        let day = now - chrono::Duration::days(i64::from(back));
+        let dir = root
+            .join(day.format("%Y").to_string())
+            .join(day.format("%m").to_string())
+            .join(day.format("%d").to_string());
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_rollout = p
+                .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
-        })
-        .collect()
+                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
+            if !is_rollout {
+                continue;
+            }
+            // Recency: skip dormant old sessions; keep a long-running one still being
+            // written (its file mtime stays fresh even though its day-dir is older).
+            let fresh = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|m| m >= recent_cutoff)
+                .unwrap_or(true);
+            if fresh {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// Read newly-appended bytes of one rollout file from the cursor offset, attribute it (via
@@ -273,8 +309,16 @@ fn drain_file(file: &Path, cur: &mut Cursor, home: &Path, codex_agents: &[String
         return;
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // #2437 r6: a same-path REBUILD (codex reusing a path, or any truncation) shrinks the
+    // file below our cursor. Detect it and RESET — re-resolve the agent from the new header
+    // and re-drain from 0. Otherwise a shorter rewrite is never read (the observer goes
+    // DEAF for that agent) and a longer one would seek into the middle of a record.
+    if len < cur.offset {
+        cur.offset = 0;
+        cur.agent = None;
+    }
     if len <= cur.offset {
-        return; // nothing new (or truncated/rotated — leave for re-discovery)
+        return; // nothing new
     }
     let mut reader = BufReader::new(f);
     if reader.seek(SeekFrom::Start(cur.offset)).is_err() {
@@ -563,6 +607,87 @@ mod tests {
 
         super::super::drain("cxt");
         super::super::forget_agent("cxt");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #2437 r6 (regression): a same-path REBUILD (codex truncates/reuses a rollout path)
+    /// must REWIND the cursor so the observer keeps seeing the new session — not go DEAF
+    /// because the rebuilt file is shorter than the prior cursor offset.
+    #[test]
+    #[serial(shadow_observer)]
+    fn truncated_rollout_same_path_rewinds_cursor() {
+        use std::io::Write;
+        let home = std::env::temp_dir().join(format!("agend_roll_trunc_{}", std::process::id()));
+        let ws = home.join("workspace").join("cxr");
+        std::fs::create_dir_all(&ws).unwrap();
+        let cwd = ws.to_string_lossy().to_string();
+        let roll = home.join("rollout-trunc.jsonl");
+
+        // First session: header + a turn + padding so the cursor advances well past a short
+        // rebuild. Drain it.
+        let mut f = std::fs::File::create(&roll).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#
+        )
+        .unwrap();
+        for _ in 0..6 {
+            writeln!(
+                f,
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1,"output_tokens":1}}}}}}}}"#
+            )
+            .unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+        let mut cur = Cursor {
+            offset: 0,
+            agent: None,
+        };
+        let agents = vec!["cxr".to_string()];
+        drain_file(&roll, &mut cur, &home, &agents);
+        assert!(
+            cur.offset > 0 && cur.agent.is_some(),
+            "first drain advanced"
+        );
+        let big_offset = cur.offset;
+        super::super::drain("cxr"); // clear the buffer
+
+        // REBUILD: truncate (File::create) + a SHORTER new session. File now < big_offset.
+        let mut f2 = std::fs::File::create(&roll).unwrap();
+        writeln!(
+            f2,
+            r#"{{"type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f2,
+            r#"{{"type":"response_item","payload":{{"type":"function_call","name":"exec_command"}}}}"#
+        )
+        .unwrap();
+        f2.flush().unwrap();
+        drop(f2);
+        assert!(
+            std::fs::metadata(&roll).unwrap().len() < big_offset,
+            "rebuilt session is shorter than the prior cursor"
+        );
+
+        drain_file(&roll, &mut cur, &home, &agents);
+        // Recovered: agent re-resolved from the new header + the new ToolStarted seen (the
+        // pre-fix code would have left the cursor past EOF → observer DEAF → empty).
+        let evs = super::super::peek("cxr");
+        assert!(
+            evs.iter()
+                .any(|e| matches!(&e.kind, EvidenceKind::ToolStarted { .. })),
+            "after truncation the observer must re-drain the rebuilt session, got {evs:?}"
+        );
+        super::super::drain("cxr");
+        super::super::forget_agent("cxr");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
