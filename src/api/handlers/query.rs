@@ -57,8 +57,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     c.api_activity.last_active_epoch_ms,
                     // #2413 Phase B: the reducer's fused status, read under the SAME
                     // lock as agent_state so a consumer can diff them atomically (the
-                    // observed-vs-raw diff IS the quantification). None unless the
-                    // per-tick reduce ran under AGEND_SHADOW_OBSERVER=1.
+                    // observed-vs-raw diff IS the quantification). None only if the per-tick
+                    // reduce didn't run (default-ON; off under AGEND_SHADOW_OBSERVER=0).
                     c.observed_status.clone(),
                 )
             };

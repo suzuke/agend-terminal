@@ -41,8 +41,8 @@ pub struct AgentCore {
     /// with confidence/authority + decay/liveness backstop). Purely ADDITIVE —
     /// it NEVER rewrites `agent_state`; a consumer diffs the two under this same
     /// `core.lock()` (that diff IS the quantification). `None` until the first
-    /// per-tick reduce under `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ stays
-    /// `None`, zero behaviour change). Written by `per_tick::shadow_observe`.
+    /// per-tick reduce (default-ON; stays `None` only under the
+    /// `AGEND_SHADOW_OBSERVER=0` kill-switch). Written by `per_tick::shadow_observe`.
     pub(crate) observed_status: Option<crate::daemon::shadow::reducer::ObservedStatus>,
 }
 
@@ -825,7 +825,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("AGEND_HOME", h);
     }
 
-    // #2413 Shadow Observer — LOCAL plane (flag default-OFF via AGEND_SHADOW_OBSERVER).
+    // #2413 Shadow Observer — LOCAL plane (default-ON; `AGEND_SHADOW_OBSERVER=0` disables).
     // Inject a per-session unix-socket path + a freshly-minted 256-bit token scoped to
     // THIS spawned backend, so its lifecycle hooks emit token-authenticated evidence to
     // the daemon WITHOUT touching the backend's global config. Hook-bearing backends only

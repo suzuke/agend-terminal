@@ -13,8 +13,9 @@
 //!    consumes;
 //! 4. runs the socket event server ([`start`]).
 //!
-//! Spike discipline: prove hook→evidence under the native TUI + no global touch. No
-//! reducer. `flag default OFF` via `AGEND_SHADOW_OBSERVER=1`.
+//! Now **default ON** (graduated after all 5 backends live-verified) — additive only
+//! (`observed_status` is written beside, never drives, `agent_state`). Disable with the
+//! `AGEND_SHADOW_OBSERVER=0` kill-switch.
 
 pub mod evidence;
 pub mod kiro;
@@ -59,10 +60,15 @@ pub struct ShadowFrame {
     pub tool_name: Option<String>,
 }
 
-/// `true` when the Shadow Observer local plane is enabled (`AGEND_SHADOW_OBSERVER=1`).
-/// Default OFF — zero behavior change for every existing spawn.
+/// `true` when the Shadow Observer is enabled. **Default ON** — graduated after all 5
+/// backends (claude/codex/opencode/kiro hook-or-stream, agy screen) were live-verified.
+/// Disabled ONLY by the explicit `AGEND_SHADOW_OBSERVER=0` kill-switch; an absent var,
+/// `=1`, or any other value ⇒ ON. The plane stays purely additive (`observed_status` is
+/// written beside `agent_state`, never drives fleet behaviour), so default-ON is safe; the
+/// `=0` kill-switch is byte-identical to the old default-OFF (no observer tick, no observer
+/// thread spawns, no spawn-env injection).
 pub fn enabled() -> bool {
-    std::env::var("AGEND_SHADOW_OBSERVER").as_deref() == Ok("1")
+    std::env::var("AGEND_SHADOW_OBSERVER").as_deref() != Ok("0")
 }
 
 /// The per-daemon unix socket the hooks emit to. One socket for the daemon; the
@@ -322,6 +328,30 @@ mod tests {
     use super::evidence::EvidenceKind;
     use super::*;
     use serial_test::serial;
+
+    /// The Shadow Observer graduated to **default-ON**: `enabled()` is true unless the
+    /// explicit `AGEND_SHADOW_OBSERVER=0` kill-switch is set. Pins BOTH the default-ON
+    /// behaviour (confirm-first ①) and the `=0`-only opt-out (confirm-first ②) — an absent
+    /// var, `=1`, or any other value ⇒ ON; only `=0` ⇒ OFF.
+    #[test]
+    #[serial(shadow_observer)]
+    fn enabled_is_default_on_with_zero_kill_switch() {
+        let prev = std::env::var("AGEND_SHADOW_OBSERVER").ok();
+        std::env::remove_var("AGEND_SHADOW_OBSERVER");
+        assert!(enabled(), "absent var ⇒ default-ON");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+        assert!(enabled(), "=1 ⇒ ON");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "");
+        assert!(enabled(), "empty value ⇒ ON (only =0 disables)");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "yes");
+        assert!(enabled(), "arbitrary value ⇒ ON");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "0");
+        assert!(!enabled(), "=0 kill-switch ⇒ OFF");
+        match prev {
+            Some(v) => std::env::set_var("AGEND_SHADOW_OBSERVER", v),
+            None => std::env::remove_var("AGEND_SHADOW_OBSERVER"),
+        }
+    }
 
     /// End-to-end over the REAL unix socket transport: a client (the hook emit) writes
     /// one token-authenticated frame line; the server's `handle_conn` reads it, ingests,

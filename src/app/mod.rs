@@ -408,8 +408,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
         // only other caller), so without this the whole Shadow Observer plane was dead in
         // production (observed_status null on every agent under the flag — #1720/#685
-        // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op unless
-        // `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ zero behaviour change). Owner-only
+        // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
+        // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
         // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
         // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
         // detached accept loop that exits with the process; the stale socket is cleared on

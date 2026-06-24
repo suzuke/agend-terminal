@@ -1,8 +1,8 @@
 //! #2413 Shadow Observer — Phase B per-tick driver.
 //!
 //! The reducer ([`crate::daemon::shadow::reducer`]) is a pure state machine; this
-//! handler is the per-tick glue that feeds it. Each tick (when
-//! `AGEND_SHADOW_OBSERVER=1`) it, per managed agent:
+//! handler is the per-tick glue that feeds it. Each tick (default-ON; skipped only under
+//! the `AGEND_SHADOW_OBSERVER=0` kill-switch) it, per managed agent:
 //!   1. snapshots the screen baseline (`agent_state` → [`ScreenSignal`]) + the cheap
 //!      out-of-path liveness ([`Liveness`]: `api_in_flight` / productive-silence /
 //!      child-alive) under one `core.lock()`;
@@ -182,13 +182,14 @@ mod tests {
 
     /// Set `AGEND_SHADOW_OBSERVER`, run a closure, then restore the prior value. Paired
     /// with `#[serial(shadow_observer)]` so the process-global env flip can't leak into a
-    /// parallel test reading `shadow::enabled()`.
+    /// parallel test reading `shadow::enabled()`. Since the plane is now **default-ON**, the
+    /// OFF case must set the explicit `=0` kill-switch (an unset/removed var is now ON).
     fn with_flag<T>(on: bool, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("AGEND_SHADOW_OBSERVER").ok();
         if on {
             std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
         } else {
-            std::env::remove_var("AGEND_SHADOW_OBSERVER");
+            std::env::set_var("AGEND_SHADOW_OBSERVER", "0");
         }
         let out = f();
         match prev {

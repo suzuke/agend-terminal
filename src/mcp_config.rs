@@ -1643,22 +1643,34 @@ mod hook_state_poc_tests {
     /// AGEND_RESTART_HANDOFF fix in #1964 (a fleet agent's inherited env must
     /// not flip the contract under test).
     #[test]
-    #[serial_test::serial(hook_state_poc)] // #2014: shares AGEND_HOOK_STATE_POC with hook_shadow's env test
+    // #2014: shares AGEND_HOOK_STATE_POC with hook_shadow's env test. Also serialized
+    // against `shadow_observer` because this test now drives the AGEND_SHADOW_OBSERVER=0
+    // kill-switch (the plane is default-ON since the graduate), which other shadow tests
+    // also flip.
+    #[serial_test::serial(hook_state_poc, shadow_observer)]
     fn hooks_not_injected_without_flag() {
-        // Serialize the process-global env flip; restore before asserting so
-        // a panic can't leak the cleared flag to other tests. The named serial
-        // group above coordinates this with hook_shadow's promotion env test
-        // (which mutates the SAME var); the local mutex is the in-module backstop.
+        // Serialize the process-global env flips; restore before asserting so a panic can't
+        // leak them to other tests. The serial groups + local mutex coordinate the shared
+        // AGEND_HOOK_STATE_POC / AGEND_SHADOW_OBSERVER vars across tests.
         static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("AGEND_HOOK_STATE_POC").ok();
         std::env::remove_var("AGEND_HOOK_STATE_POC");
+        // The Shadow Observer is now default-ON, and its `|| shadow::enabled()` gate also
+        // drives hook injection — so prove the no-hooks path with BOTH flags off: the
+        // explicit `=0` kill-switch (an absent var would now mean ON).
+        let prev_shadow = std::env::var("AGEND_SHADOW_OBSERVER").ok();
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "0");
 
         let dir = tmp("flag-off");
         // configure_claude needs a git repo; it git-inits itself.
         let result = configure_claude(&dir, Some("agent-y"));
         if let Some(v) = prev {
             std::env::set_var("AGEND_HOOK_STATE_POC", v);
+        }
+        match prev_shadow {
+            Some(v) => std::env::set_var("AGEND_SHADOW_OBSERVER", v),
+            None => std::env::remove_var("AGEND_SHADOW_OBSERVER"),
         }
         result.unwrap();
         let cfg: serde_json::Value = serde_json::from_str(
