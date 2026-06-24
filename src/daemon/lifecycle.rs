@@ -341,6 +341,7 @@ mod tests {
             state: crate::state::StateTracker::new(None),
             health: crate::health::HealthTracker::new(),
             api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
         }));
         crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
