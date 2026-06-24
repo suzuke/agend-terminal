@@ -516,4 +516,61 @@ mod tests {
         super::super::forget_agent("krt");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// END-TO-END dogfood: a real-shape kiro `.jsonl` (Prompt + a `toolUse` AssistantMessage,
+    /// the mid-turn tool-running case the spike proved kiro flushes) → `drain_file` →
+    /// `super::observe` (the per-tick reducer driver) → the agent's `ObservedStatus` is
+    /// derived with **`authority == Stream`** and a working (non-Idle) state. Proves the full
+    /// kiro plane pipeline end-to-end inside the codebase; the REAL kiro binary writes exactly
+    /// this line shape (confirm-first spike, `KIRO-OBSERVER-SPIKE-2026-06-24.md`).
+    #[test]
+    #[serial(shadow_observer)]
+    fn dogfood_kiro_tooluse_yields_stream_observed_status() {
+        use super::super::reducer::{Liveness, ObservedState, ScreenSignal};
+        use std::io::Write;
+        let home = std::env::temp_dir().join(format!("agend_kiro_dog_{}", std::process::id()));
+        let ws = home.join("workspace").join("kdog");
+        std::fs::create_dir_all(&ws).unwrap();
+        let cwd = ws.to_string_lossy().to_string();
+        let sess = home.join("kiro-dog.jsonl");
+        let mut f = std::fs::File::create(&sess).unwrap();
+        writeln!(f, r#"{{"version":"v1","kind":"Prompt","data":{{"content":[{{"kind":"text","data":"build it"}}]}}}}"#).unwrap();
+        writeln!(f, r#"{{"version":"v1","kind":"AssistantMessage","data":{{"content":[{{"kind":"toolUse","data":{{"name":"shell"}}}}]}}}}"#).unwrap();
+        f.flush().unwrap();
+        std::fs::write(
+            home.join("kiro-dog.json"),
+            serde_json::json!({"cwd": &cwd}).to_string(),
+        )
+        .unwrap();
+
+        let mut cur = Cursor {
+            offset: 0,
+            agent: None,
+        };
+        let agents = vec!["kdog".to_string()];
+        drain_file(&sess, &mut cur, &home, &agents);
+        assert_eq!(cur.agent.as_deref(), Some("kdog"));
+
+        // Reducer driver: drain the kiro Evidence + derive the fused status. api in flight +
+        // screen Working so liveness/screen agree it's working (no idle reconcile).
+        let live = Liveness {
+            api_in_flight: true,
+            productive_silent_ms: 0,
+            child_alive: true,
+        };
+        let observed = super::super::observe("kdog", ScreenSignal::Working, &live, 5_000);
+        assert_eq!(
+            observed.authority,
+            Authority::Stream,
+            "observed_status must be Stream-sourced from the kiro .jsonl tail, got {observed:?}"
+        );
+        assert_ne!(
+            observed.state,
+            ObservedState::Idle,
+            "a mid-turn toolUse must read as working, not idle: {observed:?}"
+        );
+
+        super::super::forget_agent("kdog");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
