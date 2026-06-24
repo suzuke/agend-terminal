@@ -3329,3 +3329,119 @@ fn ensure_branch_exists_refresh_uses_origin_not_from_ref_remote_2047() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2158: skip-lease-on-live-binding (2026-06-25 production data-loss fix) ──────
+
+/// The worktree path recorded in an agent's binding.json.
+fn binding_worktree(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+    let p = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
+    std::path::PathBuf::from(v["worktree"].as_str().expect("worktree path in binding"))
+}
+
+/// (a) THE regression test for the 2026-06-25 data-loss: a re-dispatch (`branch=`) to an
+/// agent ALREADY live-bound to that branch must NOT reset its worktree — uncommitted work
+/// survives. Reverse-mutation: delete the `#2158 fix` early-return in dispatch_hook/mod.rs
+/// and this goes RED (the reuse-path `sync_worktree_to_head` runs `reset --hard` + `clean
+/// -fd`, wiping the untracked file). This is the exact shape of the incident that wiped an
+/// uncommitted PR-B.
+#[test]
+fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-wip-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-wip");
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-wip", "T-1", "feat/wip", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+    let wt = binding_worktree(&home, "agent-wip");
+    assert!(wt.exists(), "first dispatch created the worktree");
+
+    // The incident shape: uncommitted work = a NEW untracked file (like PR-B's gate.rs).
+    let wip = wt.join("UNCOMMITTED_WORK.rs");
+    std::fs::write(&wip, "// precious uncommitted work\n").expect("write WIP");
+
+    // Lead sends GO (kind=task, branch=) to the already-live-bound agent → re-dispatch.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-wip", "T-2", "feat/wip", None);
+    assert!(
+        r2.is_ok(),
+        "re-dispatch to a LIVE same-branch binding must be an idempotent OK: {r2:?}"
+    );
+
+    assert!(
+        wip.exists(),
+        "#2158: re-dispatch to a LIVE same-branch binding MUST NOT reset the worktree — \
+         uncommitted work was wiped pre-fix"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wip).unwrap(),
+        "// precious uncommitted work\n",
+        "uncommitted content intact after the re-dispatch"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (b) #2115 PRESERVED: the skip is gated on a PRESENT binding. With binding.json CLEARED
+/// (what `release_worktree` does) but the worktree dir surviving as dirty residue (the
+/// #869-ref-advance / prior-lease shape), a re-dispatch must NOT skip — it re-leases, and
+/// `worktree::create`'s reuse-path `sync_worktree_to_head` STILL scrubs the residue. Proves
+/// the #2158 skip does not over-fire onto a released binding.
+#[test]
+fn dispatch_reuse_after_binding_cleared_still_resets_dirty_2115_preserved_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-reuse-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-reuse");
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-1", "feat/reuse", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+    let wt = binding_worktree(&home, "agent-reuse");
+    assert!(wt.exists());
+
+    // Pollution residue the #2115 reuse-reset is meant to scrub.
+    let pollution = wt.join("STALE_POLLUTION.txt");
+    std::fs::write(&pollution, "stale residue\n").expect("write pollution");
+
+    // RELEASE the binding via the REAL clear path (`unbind` removes binding.json + the
+    // HMAC sidecar AND clears the in-memory binding INDEX `binding::read` consults first),
+    // but KEEP the dirty worktree dir at the reuse path — the "binding released, residue
+    // survives" state (the #869-ref-advance shape; `release_full` would also remove the
+    // dir). This is the precise gate: a cleared binding ⇒ `binding::read` → None ⇒ the
+    // #2158 skip CANNOT fire.
+    crate::binding::unbind(&home, "agent-reuse");
+    assert!(
+        crate::binding::read(&home, "agent-reuse").is_none(),
+        "unbind must clear the binding (file + index) so binding::read returns None"
+    );
+
+    // Re-dispatch same branch → binding::read None → #2158 skip does NOT fire → lease →
+    // worktree::create reuses the surviving dir → sync_worktree_to_head resets + cleans it.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-2", "feat/reuse", None);
+    assert!(r2.is_ok(), "reuse re-dispatch must succeed: {r2:?}");
+
+    assert!(
+        !pollution.exists(),
+        "#2115 preserved: a true REUSE (binding released + dirty residue) MUST still reset — \
+         the #2158 skip must not over-fire on an absent binding"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (c) first-bind (no existing binding) → normal lease, zero regression: the #2158
+/// early-return only triggers on an existing same-branch binding.
+#[test]
+fn dispatch_first_bind_leases_normally_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-first-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-first");
+
+    let r = super::dispatch_auto_bind_lease(&home, "agent-first", "T-1", "feat/first", None);
+    assert!(r.is_ok(), "first-bind must lease normally: {r:?}");
+    let wt = binding_worktree(&home, "agent-first");
+    assert!(
+        wt.exists(),
+        "first-bind created the worktree (no skip on a fresh agent — zero regression)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
