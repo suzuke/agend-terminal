@@ -313,8 +313,9 @@ fn subscribe_once(agent: &str, port: u16, stop: &AtomicBool) -> std::io::Result<
                 }
             }
             // Read timeout (Unix: WouldBlock, Windows: TimedOut): loop to re-check `stop`.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 continue;
             }
@@ -510,9 +511,18 @@ mod tests {
             Some(EvidenceKind::ApprovalRequired)
         );
         // Deliberately-ignored noise (would flood the bounded buffer / not a transition).
-        assert_eq!(kind_of(r#"{"type":"message.part.delta","properties":{}}"#), None);
-        assert_eq!(kind_of(r#"{"type":"session.updated","properties":{}}"#), None);
-        assert_eq!(kind_of(r#"{"type":"server.connected","properties":{}}"#), None);
+        assert_eq!(
+            kind_of(r#"{"type":"message.part.delta","properties":{}}"#),
+            None
+        );
+        assert_eq!(
+            kind_of(r#"{"type":"session.updated","properties":{}}"#),
+            None
+        );
+        assert_eq!(
+            kind_of(r#"{"type":"server.connected","properties":{}}"#),
+            None
+        );
         // Malformed / empty.
         assert_eq!(kind_of("not json"), None);
         assert_eq!(kind_of("{}"), None);
@@ -591,7 +601,10 @@ mod tests {
         let mut d = SseDecoder::default();
         let full = chunk(r#"{"type":"session.next.prompted"}"#);
         let split = full.len() / 2;
-        assert!(d.feed(&full[..split]).is_empty(), "partial chunk yields nothing");
+        assert!(
+            d.feed(&full[..split]).is_empty(),
+            "partial chunk yields nothing"
+        );
         let out = d.feed(&full[split..]);
         assert_eq!(out, vec![r#"{"type":"session.next.prompted"}"#.to_string()]);
     }
@@ -605,6 +618,23 @@ mod tests {
         let part2 = "pe\":\"x\"}\n\n";
         bytes.extend(format!("{:x}\r\n{}\r\n", part2.len(), part2).into_bytes());
         let out = d.feed(&bytes);
+        assert_eq!(out, vec![r#"{"type":"x"}"#.to_string()]);
+    }
+
+    /// The chunk's data bytes are all present but its trailing CRLF has NOT arrived: the
+    /// decoder must WAIT (emit nothing, never panic) until the CRLF completes the chunk.
+    /// Pins the `data_end + 2` guard load-bearing (a `< data_end` neuter panics here).
+    #[test]
+    fn waits_for_trailing_crlf_before_consuming_chunk() {
+        let mut d = SseDecoder::default();
+        let full = chunk(r#"{"type":"x"}"#);
+        // Everything except the final trailing "\r\n".
+        let head = &full[..full.len() - 2];
+        assert!(
+            d.feed(head).is_empty(),
+            "data present but trailing CRLF missing → wait, no emit"
+        );
+        let out = d.feed(&full[full.len() - 2..]);
         assert_eq!(out, vec![r#"{"type":"x"}"#.to_string()]);
     }
 
