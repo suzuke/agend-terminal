@@ -4653,7 +4653,7 @@ mod tests {
             "deep/.config-integrity-key",
             "event-log.jsonl",
             "logs/fleet_events.jsonl", // *.jsonl glob, nested
-            "a/b/c/turn_sentinel_shadow.jsonl",
+            "a/b/c/state-transitions.jsonl",
         ] {
             assert!(trust_root_basename_denied(p), "{p:?} must be DENIED");
         }
