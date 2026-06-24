@@ -610,8 +610,10 @@ mod tests {
     // `last_input_at` (set by Pane::write_input) is the observable proving the
     // marker flowed through the REAL app path (paste_image → write_to_focused →
     // write_input), not just attach. The clipboard read is mocked via the
-    // injected capture so this runs in headless CI; the full real-clipboard
-    // dispatch is covered by an #[ignore] manual test.
+    // injected capture so this runs in headless CI. The full real-clipboard path
+    // (arboard get_image on an actual GUI clipboard image) has NO committed test —
+    // headless CI has no clipboard — and is verified manually on a real desktop
+    // (see the `crate::image_paste` module doc).
     fn focused_last_input_some(ctx: &DispatchCtx<'_>) -> bool {
         ctx.layout
             .active_tab()
