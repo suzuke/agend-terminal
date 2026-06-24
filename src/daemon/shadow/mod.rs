@@ -17,6 +17,7 @@
 //! reducer. `flag default OFF` via `AGEND_SHADOW_OBSERVER=1`.
 
 pub mod evidence;
+pub mod opencode;
 pub mod reducer;
 pub mod rollout;
 
@@ -108,6 +109,9 @@ pub fn forget_agent(agent: &str) {
     tokens().lock().retain(|_, a| a != agent);
     buffer().lock().remove(agent);
     runtimes().lock().remove(agent);
+    // #2413 opencode plane: drop the injected observer port so a same-name respawn
+    // re-registers a fresh one and the supervisor stops the dead subscription.
+    opencode::forget_port(agent);
 }
 
 // ── per-agent evidence buffer ────────────────────────────────────────────────────

@@ -988,6 +988,25 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
     }
 
+    // #2413 opencode plane: when the Shadow Observer is ON, inject `--port N` (an
+    // OS-allocated free port) so opencode's embedded HTTP server is reachable on a KNOWN
+    // port for the SSE `/event` observer to subscribe (opencode is client-server; its TUI
+    // embeds the server). flag-OFF (or any non-opencode backend) → `should_inject` is
+    // false → NOTHING is added → the launch command is byte-identical to today (the
+    // load-bearing flag-OFF safety, regression-pinned in `shadow::opencode` tests). An
+    // alloc failure → skip injection (the agent spawns un-observed, never broken). The
+    // injected port is registered so the observer supervisor knows where to subscribe.
+    if crate::daemon::shadow::opencode::should_inject(
+        detected_backend.as_ref(),
+        crate::daemon::shadow::enabled(),
+    ) {
+        if let Some(port) = crate::daemon::shadow::opencode::alloc_port() {
+            cmd.arg("--port");
+            cmd.arg(port.to_string());
+            crate::daemon::shadow::opencode::register_port(name, port);
+        }
+    }
+
     // Add agend-terminal binary + $AGEND_HOME/bin (shim) to PATH.
     // Shim dir goes first so agend-git shadows /usr/bin/git.
     if let Ok(exe) = std::env::current_exe() {
