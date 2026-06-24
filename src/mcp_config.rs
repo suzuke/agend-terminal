@@ -454,14 +454,16 @@ fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> 
 /// only the two hooks agy actually fires are wired (busy/idle is fully covered;
 /// tool granularity is unavailable on agy, unlike kiro's session-tail observer).
 ///
-/// Merge-preserving + idempotent + self-healing: our entry is identified by the
-/// `hook-event --instance` marker. Every re-configure first strips that marker
-/// from ALL events (so retiring a mapping — e.g. the old PreTool/PostTool — also
-/// removes the dead reporter it once wrote, leaving no dangling no-op behind),
+/// Merge-preserving + idempotent + self-healing: our reporter is identified by
+/// its reserved `name` ("agend-shadow") AND command shape — NOT a bare command
+/// substring, so an operator hook that merely MENTIONS the marker text is never
+/// stripped (#2451 data-loss fix). Every re-configure first drops our prior
+/// reporter from ALL events (so retiring a mapping — e.g. the old PreTool/PostTool
+/// — also removes the dead reporter it once wrote, leaving no dangling no-op),
 /// prunes any event left empty, then re-installs on the live map; operator hooks
-/// (no marker) are preserved. The reporter always exits 0 (observe-only — never
-/// blocks agy's turn) and the socket write fast-fails when the per-session socket
-/// is absent (shadow off), so this is spawn-safe.
+/// are preserved. The reporter always exits 0 (observe-only — never blocks agy's
+/// turn) and the socket write fast-fails when the per-session socket is absent
+/// (shadow off), so this is spawn-safe.
 fn upsert_agy_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
     // (agy event name, claude-compatible event the shadow server maps). Only the
     // two hooks agy actually fires — see fn doc (t-…93090-0: no tool granularity).
@@ -470,6 +472,19 @@ fn upsert_agy_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "agend-terminal".to_string());
     let marker = "hook-event --instance";
+    let our_name = "agend-shadow";
+    // PRECISE ownership: an entry is ours ONLY if it carries our reserved `name`
+    // AND our command shape. Using the command substring alone (the bug #2451
+    // reviewer-6 caught) would delete an operator hook whose command merely
+    // mentions the marker text — a data-loss false positive. We stamp `our_name`
+    // on every entry we write, so name-based matching cleans retired reporters
+    // (PreTool/PostTool from older code) without ever touching operator hooks.
+    let is_ours = |e: &serde_json::Value| {
+        e.get("name").and_then(|n| n.as_str()) == Some(our_name)
+            && e.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains(marker))
+    };
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -511,17 +526,13 @@ fn upsert_agy_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
     let hooks = config["hooks"]
         .as_object_mut()
         .expect("hooks set to object above");
-    // Idempotent + self-healing: first drop ANY prior agend-shadow entry (marker)
-    // from EVERY event — so retiring a mapping (e.g. the PreTool/PostTool tool
-    // hooks agy never fired) also removes the now-dead reporter it once wrote,
-    // instead of leaving a dangling no-op. Operator hooks (no marker) are kept.
+    // Idempotent + self-healing: drop OUR prior reporter (precise `is_ours`) from
+    // EVERY event — so retiring a mapping (e.g. the PreTool/PostTool tool hooks
+    // agy never fired) also removes the now-dead reporter it once wrote, instead
+    // of leaving a dangling no-op. Operator hooks (not is_ours) are kept verbatim.
     for v in hooks.values_mut() {
         if let Some(list) = v.as_array_mut() {
-            list.retain(|e| {
-                !e.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.contains(marker))
-            });
+            list.retain(|e| !is_ours(e));
         }
     }
     // Prune events left empty by the strip (an empty hook list carries no meaning);
@@ -529,7 +540,7 @@ fn upsert_agy_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
     hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
     for (agy_event, claude_event) in EVENT_MAP {
         let command = format!("{exe} hook-event --instance {instance_name} --event {claude_event}");
-        let our_entry = json!({ "name": "agend-shadow", "command": command });
+        let our_entry = json!({ "name": our_name, "command": command });
         let arr = hooks
             .entry((*agy_event).to_string())
             .or_insert_with(|| json!([]));
@@ -1588,25 +1599,35 @@ mod hook_state_poc_tests {
     /// (t-…93090-0: live probe + dogfood — see fn doc), so only the two it fires
     /// are wired: PreInvocation→UserPromptSubmit, Stop→Stop. Merge-preserving,
     /// idempotent, and self-healing (a stale agend-shadow reporter under a RETIRED
-    /// key — the old PreTool/PostTool — is stripped on re-configure). Reverse-
-    /// mutation: break EVENT_MAP (e.g. PreInvocation→"X") → the `--event
-    /// UserPromptSubmit` assert fails; emit a claude KEY (PreToolUse) → the agy-key
-    /// lookup + "no claude key" assert fail; drop the global strip/prune → the
-    /// stale-PreTool self-heal assert fails.
+    /// key — the old PreTool/PostTool — is stripped on re-configure) while ownership
+    /// is PRECISE (name=="agend-shadow", not a bare command substring), so an
+    /// operator hook that merely mentions the marker text in its command survives
+    /// (#2451 data-loss fix). Reverse-mutation: break EVENT_MAP (e.g.
+    /// PreInvocation→"X") → the `--event UserPromptSubmit` assert fails; emit a
+    /// claude KEY (PreToolUse) → the agy-key lookup + "no claude key" assert fail;
+    /// drop the global strip/prune → the stale-PreTool self-heal assert fails;
+    /// widen ownership back to the command substring → the operator-mentions-marker
+    /// preserve assert fails.
     #[test]
     fn upsert_agy_state_hooks_maps_events_merges_and_is_idempotent() {
         let dir = tmp("agy-hooks");
         let path = dir.join(".agents").join("hooks.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Pre-existing: operator hook under a shared event (Stop) + a foreign
-        // event (SessionStart) + a STALE agend-shadow reporter under a RETIRED key
-        // (PreTool, as older code wrote) that self-healing must strip away.
+        // event (SessionStart, with a 2nd operator hook whose COMMAND mentions the
+        // marker but whose NAME is not ours — reviewer-6 #2451 data-loss
+        // counterexample, MUST survive) + a STALE agend-shadow reporter under a
+        // RETIRED key (PreTool, as older code wrote) that self-healing must strip.
         std::fs::write(
             &path,
             serde_json::to_string(&json!({
                 "hooks": {
                     "Stop": [{"name": "user-bell", "command": "say done"}],
-                    "SessionStart": [{"name": "user-greet", "command": "echo hi"}],
+                    "SessionStart": [
+                        {"name": "user-greet", "command": "echo hi"},
+                        {"name": "operator-mentions-marker",
+                         "command": "printf 'hook-event --instance is documented here'"},
+                    ],
                     "PreTool": [{"name": "agend-shadow",
                                  "command": "/x hook-event --instance old --event PreToolUse"}],
                 }
@@ -1651,6 +1672,14 @@ mod hook_state_poc_tests {
             "operator Stop hook preserved"
         );
         assert_eq!(cfg["hooks"]["SessionStart"][0]["command"], "echo hi");
+        // #2451 data-loss fix: an operator hook whose COMMAND mentions the marker
+        // but whose NAME is not ours MUST survive (ownership is name-based, not a
+        // command substring). reviewer-6's counterexample, locked in.
+        let ss = cfg["hooks"]["SessionStart"].as_array().unwrap();
+        assert!(
+            ss.iter().any(|e| e["name"] == "operator-mentions-marker"),
+            "operator hook mentioning the marker text in its command must be preserved"
+        );
         // No tool granularity: PreTool/PostTool are not mapped, and the stale
         // agend-shadow reporter under the retired PreTool key is self-healed away
         // (its only entry was ours → stripped → the empty event pruned).
