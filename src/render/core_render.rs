@@ -14,22 +14,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-/// Sprint 20.5 Track 7 transient state badge (per dev-reviewer
-/// cross-validation B↔C peer-pass): for tab-bar agents in transient
-/// lifecycle states (Restarting / Crashed), surface a short text badge
-/// alongside the colour dot so the registry-vs-process divergence window
-/// is visually announced rather than silent.
-///
-/// Returns `None` for terminal / steady states — most ticks emit no badge,
-/// keeping the tab bar uncluttered.
-pub(super) fn transient_state_badge(state: AgentState) -> Option<&'static str> {
-    match state {
-        AgentState::Restarting => Some(" [respawning]"),
-        AgentState::Crashed => Some(" [crashed]"),
-        _ => None,
-    }
-}
-
 pub fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Starting => Color::White,
@@ -328,7 +312,9 @@ pub fn highest_priority_state(
     best
 }
 
-/// SYNC: layout math (label width, spacing) must match tab_bar_hit_test() in app.rs.
+/// SYNC: per-tab width must match `tab_bar_hit_test()` in app/mouse.rs. Both derive
+/// the label from `Tab::tab_bar_label`; the only other widths are the `*` dot (1), the
+/// inter-tab separator (1), and the trailing ` [+] ` (5).
 fn render_tab_bar(
     frame: &mut Frame,
     area: Rect,
@@ -386,16 +372,10 @@ fn render_tab_bar(
             Span::styled("*", Style::default().fg(sc))
         };
 
-        let has_notif = tab.root().has_notification();
-        let notif_badge = if has_notif && !is_active { " !" } else { "" };
-        let label = format!(" {}{notif_badge} ", tab.name);
+        let label = tab.tab_bar_label(is_active);
 
         spans.push(dot);
         spans.push(Span::styled(label, style));
-
-        if let Some(b) = transient_state_badge(state) {
-            spans.push(Span::styled(b, Style::default().fg(Color::Yellow)));
-        }
     }
 
     let new_tab_style = if matches!(drag_tab_target, Some(DragTabTarget::NewTab)) {
@@ -761,8 +741,7 @@ pub(super) fn pane_title_segments(
     // a `[<State>]` text badge of the DETECTED AgentState so the operator can
     // eyeball-verify detection against the live pane. Extra text only — the
     // pane's colour (state_color) is untouched, and it uses the same
-    // `title_style` so it introduces no new colour. The transient
-    // Restarting/Crashed tab-bar badge (`transient_state_badge`) is unaffected.
+    // `title_style` so it introduces no new colour.
     if show_state_badge {
         segments.push((format!(" [{state:?}]"), title_style));
     }
@@ -1317,23 +1296,6 @@ mod tests {
             !text.contains("daemon binary stale"),
             "binary_stale=false must NOT surface warning, got: {text}"
         );
-    }
-
-    #[test]
-    fn transient_state_badge_emits_for_restarting_and_crashed_only() {
-        assert_eq!(
-            transient_state_badge(AgentState::Restarting),
-            Some(" [respawning]")
-        );
-        assert_eq!(
-            transient_state_badge(AgentState::Crashed),
-            Some(" [crashed]")
-        );
-        assert_eq!(transient_state_badge(AgentState::Idle), None);
-        assert_eq!(transient_state_badge(AgentState::Idle), None);
-        assert_eq!(transient_state_badge(AgentState::ToolUse), None);
-        assert_eq!(transient_state_badge(AgentState::Hang), None);
-        assert_eq!(transient_state_badge(AgentState::PermissionPrompt), None);
     }
 
     #[test]

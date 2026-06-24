@@ -354,7 +354,9 @@ enum TabBarClick {
 }
 
 /// Hit-test the tab bar at the given column.
-/// SYNC: layout math must match render_tab_bar() in render.rs.
+/// SYNC: per-tab width must match `render_tab_bar()` in render/core_render.rs. Both
+/// derive the label from `Tab::tab_bar_label`; the other widths are the `*` dot (1),
+/// the inter-tab separator (1), and the trailing ` [+] ` (5).
 /// M4: This is O(n_tabs) string-width scan, not a full layout re-render.
 /// Caching tab positions would save ~5 iterations but adds invalidation
 /// complexity. Kept as-is — n_tabs is typically 1-5.
@@ -366,10 +368,8 @@ fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
             x += 1;
         } // separator space
         let is_active = i == layout.active;
-        let has_notif = tab.root().has_notification();
-        let badge = if has_notif && !is_active { " !" } else { "" };
-        let label = format!(" {}{badge} ", tab.name);
-        let tab_w = 1 + label.width() as u16; // "*" + label
+        let label = tab.tab_bar_label(is_active);
+        let tab_w = 1 + label.width() as u16; // "*" dot + label
         if col >= x && col < x + tab_w {
             return Some(TabBarClick::Tab(i));
         }
@@ -961,6 +961,68 @@ mod tests {
         // No tabs → only [+] button at col 0
         let result = tab_bar_hit_test(&layout, 0);
         assert_eq!(result, Some(TabBarClick::NewTab));
+    }
+
+    /// #777: `Tab::tab_bar_label` (the shared render/hit-test source of truth) wraps the
+    /// name in spaces and appends the `" !"` unread badge ONLY on inactive tabs.
+    #[test]
+    fn tab_bar_label_notif_badge_is_inactive_only() {
+        let mut p = leaf(1, "a");
+        p.has_notification = true;
+        let tab = Tab::new("work".to_string(), p);
+        assert_eq!(
+            tab.tab_bar_label(false),
+            " work ! ",
+            "inactive + notif → badge"
+        );
+        assert_eq!(
+            tab.tab_bar_label(true),
+            " work ",
+            "active → no badge even with notif"
+        );
+        let plain = Tab::new("x".to_string(), leaf(2, "b"));
+        assert_eq!(plain.tab_bar_label(false), " x ", "no notif → no badge");
+    }
+
+    /// #777 regression: render and `tab_bar_hit_test` must agree on per-tab widths so a
+    /// click never lands on the wrong tab. The old `[respawning]`/`[crashed]` badge
+    /// widened a tab in render ONLY — the hit-test didn't count it, shifting every later
+    /// tab's hit range. Both sides now derive the label from `Tab::tab_bar_label`, so each
+    /// tab's hit boundary equals its rendered width (`*` dot + label), with the separator
+    /// between tabs and ` [+] ` after. Walk varied-width tabs: each tab's first AND last
+    /// column must hit it, and the column right after the last tab must hit `[+]`.
+    #[test]
+    fn tab_bar_hit_test_boundaries_match_shared_label_widths() {
+        use unicode_width::UnicodeWidthStr;
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("alpha".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("b".to_string(), leaf(2, "b")));
+        layout.add_tab(Tab::new("gamma-3".to_string(), leaf(3, "c")));
+
+        let mut x = 0u16;
+        for (i, tab) in layout.tabs.iter().enumerate() {
+            if i > 0 {
+                x += 1; // inter-tab separator column
+            }
+            let w = 1 + tab.tab_bar_label(i == layout.active).width() as u16; // dot + label
+            assert_eq!(
+                tab_bar_hit_test(&layout, x),
+                Some(TabBarClick::Tab(i)),
+                "tab {i} first col {x}"
+            );
+            let last = x + w - 1;
+            assert_eq!(
+                tab_bar_hit_test(&layout, last),
+                Some(TabBarClick::Tab(i)),
+                "tab {i} last col {last}"
+            );
+            x += w;
+        }
+        assert_eq!(
+            tab_bar_hit_test(&layout, x),
+            Some(TabBarClick::NewTab),
+            "col {x} right after the last tab must be the [+] button"
+        );
     }
 
     // --- Sprint 41 T-3 r2: drag state machine tests ---

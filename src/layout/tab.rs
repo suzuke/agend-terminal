@@ -77,6 +77,20 @@ impl Tab {
         self.root.as_mut().expect("root is always Some")
     }
 
+    /// The tab-bar label for this tab: `" <name>[ !] "` — leading/trailing spaces
+    /// plus a `" !"` unread-notification badge shown only on INACTIVE tabs. SHARED by
+    /// `render_tab_bar` (the rendered span) and `tab_bar_hit_test` (its width) so the
+    /// two can never drift on the label — a render-only widener the hit-test didn't
+    /// count was the #777 misaligned-click bug.
+    pub fn tab_bar_label(&self, is_active: bool) -> String {
+        let notif_badge = if self.root().has_notification() && !is_active {
+            " !"
+        } else {
+            ""
+        };
+        format!(" {}{notif_badge} ", self.name)
+    }
+
     pub fn focused_pane(&self) -> Option<&Pane> {
         self.root().find_pane(self.focus_id)
     }
