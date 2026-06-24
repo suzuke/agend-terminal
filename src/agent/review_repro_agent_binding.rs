@@ -1,9 +1,8 @@
 //! review-repro (scope: agent-binding) — verification/reproduction tests for
 //! confirmed code-review findings whose items are private to `src/agent/mod.rs`.
 //!
-//! These are RED against the current (unfixed) code and turn GREEN once the
-//! cited bug is fixed. Each is `#[ignore]`d so CI stays green until the fix
-//! lands; remove `#[ignore]` after fixing to confirm the bug is closed.
+//! These encode the CORRECT post-fix behavior and are GREEN on current code
+//! (the cited bugs are closed); they run un-ignored as live regression guards.
 
 use super::{classify_exit, resolve_instance, ExitKind};
 

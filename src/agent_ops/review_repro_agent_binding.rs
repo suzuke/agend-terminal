@@ -1,10 +1,9 @@
 //! review-repro (scope: agent-binding) — verification/reproduction test for the
 //! `cleanup_working_dir` symlink-traversal finding.
 //!
-//! RED against current (unfixed) code; GREEN once `cleanup_working_dir`
-//! canonicalizes `working_dir` and re-checks it is under the canonicalized
-//! workspace root before `remove_dir_all`. `#[ignore]`d so CI stays green
-//! until the fix lands.
+//! GREEN now that `cleanup_working_dir` canonicalizes `working_dir` and
+//! re-checks it is under the canonicalized workspace root before
+//! `remove_dir_all`; runs un-ignored as a live regression guard.
 
 // only used by the #[cfg(unix)] symlink-traversal test below
 #[cfg(unix)]

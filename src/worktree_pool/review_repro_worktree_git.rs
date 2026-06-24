@@ -1,9 +1,8 @@
 //! Review-repro tests (scope: worktree-git) attached to `worktree_pool.rs`.
 //!
-//! Each `#[ignore]`d test encodes the CORRECT expected behavior for a
-//! confirmed code-review finding: it is RED against the current (buggy)
-//! code and GREEN once the fix lands. Remove the `#[ignore]` after the
-//! corresponding fix to lock the behavior in.
+//! Each test encodes the CORRECT expected behavior for a confirmed code-review
+//! finding and is GREEN on current code (the fix has landed); they run
+//! un-ignored as live regression guards locking the behavior in.
 //!
 //! Placement: in-module submodule so the private `cleanup_merged_branch`
 //! and `evaluate_candidate` are reachable via `super::`.

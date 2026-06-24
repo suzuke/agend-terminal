@@ -1,10 +1,8 @@
 //! Verification / reproduction tests for the `mcp-core-surface` review batch.
 //!
 //! Each `#[test]` encodes the CORRECT expected behavior of an MCP
-//! instance-handler so that it FAILS (red) against the current buggy code and
-//! will PASS (green) once the cited fix lands. Every test carries `#[ignore]`
-//! so CI stays green until the fix is applied (remove `#[ignore]` after the
-//! fix to confirm green).
+//! instance-handler and PASSES (green) on current code (the cited fixes have
+//! landed); they run un-ignored as live regression guards.
 //!
 //! Placement mirrors the sibling `instance_964_tests.rs`: this submodule of
 //! `crate::mcp::handlers` reaches the handlers via `super::` re-exports and the

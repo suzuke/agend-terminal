@@ -17,9 +17,9 @@
 //! The fix routes the (tiny) dismiss keystrokes through `write_with_timeout`
 //! (or a bounded write), so `writer.lock()` no longer appears in dismiss.rs.
 //!
-//! RED now: `writer.lock()` is present (lines that grab the raw lock for the
-//! unbounded `write_all`). GREEN after fix: those raw lock acquisitions are
-//! gone. `#[ignore]`d so CI stays green until the fix lands.
+//! GREEN on current code: the raw `writer.lock()` acquisitions for the
+//! unbounded `write_all` are gone (the fix routes through a bounded write), so
+//! this runs un-ignored as a live regression guard.
 
 use std::path::PathBuf;
 
