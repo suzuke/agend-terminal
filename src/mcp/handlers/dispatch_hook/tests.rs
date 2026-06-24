@@ -3569,3 +3569,56 @@ fn dispatch_same_branch_different_source_repo_must_not_skip_2158() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// (e) #2158 r4: the partial-skip's OWN failure path must not data-loss. When `bind_full`
+/// FAILS on a REUSED live worktree, the rollback must NOT `worktree remove --force` it —
+/// that would wipe the very uncommitted work #2158 protects (the no-op version returned
+/// before this rollback; partial-skip opened the path). Reverse-mutation: revert the
+/// `reused` guard in mod.rs (so the reuse falls into the `else { worktree remove --force }`)
+/// → this goes RED (the live worktree + WIP are deleted).
+#[cfg(unix)]
+#[test]
+fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::temp_dir().join(format!("agend-2158-rbfail-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-rb");
+
+    // First dispatch succeeds → live worktree + binding (in the in-memory index).
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-rb", "T-1", "feat/rb", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+    let wt = binding_worktree(&home, "agent-rb");
+    let wip = wt.join("UNCOMMITTED_WORK.rs");
+    std::fs::write(&wip, "// precious uncommitted work\n").expect("write WIP");
+
+    // Make runtime/agent-rb read-only so the SECOND bind_full's atomic_write fails — the
+    // in-memory binding index still resolves the reuse, so we exercise the REUSE rollback.
+    let runtime_agent = crate::paths::runtime_dir(&home).join("agent-rb");
+    let mut perm = std::fs::metadata(&runtime_agent).unwrap().permissions();
+    perm.set_mode(0o555);
+    std::fs::set_permissions(&runtime_agent, perm.clone()).unwrap();
+
+    // Re-dispatch same (source_repo, branch) → reuse detected → bind_full fails → rollback.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-rb", "T-2", "feat/rb", None);
+    assert!(
+        r2.is_err(),
+        "bind_full failure on the reuse path must surface as Err (#1324)"
+    );
+
+    // Restore perms before the assertions + cleanup.
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&runtime_agent, perm).unwrap();
+
+    // THE assertion: the reused LIVE worktree + its uncommitted work survive the rollback.
+    assert!(
+        wt.exists() && wip.exists(),
+        "#2158 r4: bind_full failure on a REUSED worktree MUST NOT remove the agent's live \
+         tree — `worktree remove --force` here would wipe uncommitted work"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wip).unwrap(),
+        "// precious uncommitted work\n",
+        "uncommitted content intact after the reuse-path bind_full rollback"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
