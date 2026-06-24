@@ -2,9 +2,8 @@
 //! code-review findings, attached in-module to `src/agent_ops.rs` so the
 //! crate-private `validate_branch` is reachable via `super::`.
 //!
-//! Each test encodes the CORRECT post-fix behavior. It is `#[ignore]`d so CI
-//! stays green until the fix lands; remove `#[ignore]` after the fix to
-//! confirm green.
+//! Each test encodes the CORRECT post-fix behavior and is GREEN on current
+//! code; they run un-ignored as live regression guards.
 
 /// Finding: `validate_branch` accepts refnames git itself rejects and, worse,
 /// accepts leading-dot path components (`.`, `.config`, `.git`,

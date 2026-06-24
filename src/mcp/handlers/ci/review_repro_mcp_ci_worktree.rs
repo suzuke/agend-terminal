@@ -1,9 +1,7 @@
 //! Verification / reproduction tests for confirmed code-review findings in the
 //! `ci` MCP handler module (batch: mcp-ci-worktree). Each test encodes the
-//! CORRECT expected behavior: it is RED against the current (buggy) code and
-//! flips GREEN once the cited bug is fixed. Every repro test is `#[ignore]`d so
-//! CI stays green until the fix lands — remove the `#[ignore]` after fixing to
-//! confirm.
+//! CORRECT expected behavior and is GREEN on current code (the cited bugs are
+//! fixed); they run un-ignored as live regression guards.
 //!
 //! Placement: in-module submodule of `src/mcp/handlers/ci/mod.rs` so the
 //! `pub(crate)` handlers (`handle_watch_ci`) and the private

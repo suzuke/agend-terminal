@@ -1,8 +1,7 @@
 //! Verification/reproduction tests for the state-capture review batch.
 //!
-//! Each `#[ignore]`d test encodes the CORRECT post-fix behavior so it is RED
-//! against the current buggy code and GREEN once the fix lands. Remove the
-//! `#[ignore]` after the corresponding fix to confirm.
+//! Each test encodes the CORRECT post-fix behavior and is GREEN on current code
+//! (the cited fixes have landed); they run un-ignored as live regression guards.
 //!
 //! Attached as an in-module submodule of `crate::state` so it can drive the
 //! private `StateTracker` fields/methods (`context_regex`, `instance_name`,

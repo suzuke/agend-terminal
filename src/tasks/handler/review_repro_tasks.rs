@@ -1,7 +1,7 @@
 //! Review-repro tests (SCOPEKEY: tasks) attached to `src/tasks/handler.rs`.
 //!
-//! RED against the current (buggy) code; GREEN once the cited finding is fixed.
-//! `#[ignore]`d so CI stays green until the fix lands.
+//! GREEN on current code (the cited findings are fixed); these run un-ignored
+//! as live regression guards.
 
 #![allow(clippy::expect_used)]
 

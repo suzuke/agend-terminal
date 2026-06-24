@@ -1,9 +1,9 @@
 //! review-repro (scope: agent-binding) — verification/reproduction test for the
 //! `install_hooks` silent-failure finding.
 //!
-//! RED against current (unfixed) code; GREEN once `install_hooks` surfaces a
-//! warning (or returns a Result) when wiring the prepare-commit-msg hook fails.
-//! `#[ignore]`d so CI stays green until the fix lands.
+//! GREEN now that `install_hooks` surfaces a warning (or returns a Result) when
+//! wiring the prepare-commit-msg hook fails; runs un-ignored as a live
+//! regression guard.
 
 use super::install_hooks;
 

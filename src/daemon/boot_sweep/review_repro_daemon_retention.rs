@@ -13,8 +13,11 @@
 //! `<home>/run/<live_pid>/.daemon` with an EMPTY (unparseable) body so
 //! read_daemon_pid returns None, spawns a real SIGTERM-respecting child under
 //! that PID, runs destructive boot_sweep_impl, and asserts the live child
-//! SURVIVES. RED now (the guard is skipped → child killed); GREEN once an
-//! unreadable recorded PID is treated as a guard FAILURE (skip, don't kill).
+//! SURVIVES. GREEN now: #2170's cleanup start-token guard already closes the
+//! harm — an empty `.daemon` yields `start_token` None → IdentityMismatch → the
+//! candidate is NOT killed. This runs as a live regression guard that an
+//! unreadable recorded PID is never mis-killed in a destructive sweep
+//! (boot_sweep guard-level hardening remains an optional follow-up).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -79,7 +82,6 @@ fn spawn_sigterm_respecter() -> (u32, std::thread::JoinHandle<()>) {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "daemon-retention boot_sweep-unreadable-pid-guard: harm already closed by #2170's cleanup start-token guard (this repro is GREEN on current main — the empty .daemon → start_token None → IdentityMismatch → not killed); boot-sweep guard-level hardening is an optional follow-up, re-confirm before un-ignoring"]
 fn unreadable_daemon_pid_must_not_be_killed_in_destructive_sweep_daemon_retention() {
     let home = tmp_home("unreadable-pid");
     let (live_pid, reaper) = spawn_sigterm_respecter();
