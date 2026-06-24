@@ -2322,36 +2322,175 @@ mod tests {
     /// Strip `//` line + `/* */` block comments from Rust source so a wiring-pin
     /// contains-check can't be satisfied by a COMMENTED-OUT call (#2447 r6: the raw
     /// contains() was vacuous — commenting the production call left the text present and the
-    /// pin still passed, the exact #2434 dead-wiring class it must catch). Unicode-correct
-    /// (operates on chars); NOT string-literal-aware, which is fine for our own production
-    /// region where the wired call is never inside a string. Shared so the codex/opencode
-    /// pins can adopt it in a follow-up.
+    /// pin still passed, the exact #2434 dead-wiring class it must catch).
+    ///
+    /// **String-literal-aware** (#2447 r6 round-2): a `//` or `/*` INSIDE a string / char /
+    /// raw-string literal is NOT a comment and is preserved verbatim — so e.g. a
+    /// `"http://x"` URL or a `"/* x */"` payload on a line cannot make the stripper eat the
+    /// rest of that line (a false-RED for the pin). Handles `"..."` (with `\` escapes),
+    /// `'...'` char literals (escape + simple; lifetimes like `'a` are left as-is), and raw
+    /// strings `r"..."` / `r#"..."#` / `br"..."` (hash-count matched, no escapes). Unicode-
+    /// correct. Shared so the codex/opencode app-pins can adopt it (follow-up).
     fn strip_rust_comments(src: &str) -> String {
+        let s: Vec<char> = src.chars().collect();
+        let n = s.len();
         let mut out = String::with_capacity(src.len());
-        let mut chars = src.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '/' && chars.peek() == Some(&'/') {
-                chars.next();
-                for c2 in chars.by_ref() {
-                    if c2 == '\n' {
-                        out.push('\n');
-                        break;
-                    }
+        let mut i = 0;
+        while i < n {
+            let c = s[i];
+            // line comment → skip to (but keep) the newline.
+            if c == '/' && i + 1 < n && s[i + 1] == '/' {
+                i += 2;
+                while i < n && s[i] != '\n' {
+                    i += 1;
                 }
-            } else if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                let mut prev = '\0';
-                for c2 in chars.by_ref() {
-                    if prev == '*' && c2 == '/' {
-                        break;
-                    }
-                    prev = c2;
-                }
-            } else {
-                out.push(c);
+                continue;
             }
+            // block comment → skip to `*/`.
+            if c == '/' && i + 1 < n && s[i + 1] == '*' {
+                i += 2;
+                while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                continue;
+            }
+            // raw string `r"..."` / `r#"..."#` / `br"..."` — copy verbatim (no escapes;
+            // close on `"` + the same number of `#`).
+            if c == 'r' || (c == 'b' && i + 1 < n && s[i + 1] == 'r') {
+                let r_pos = if c == 'b' { i + 1 } else { i };
+                let mut k = r_pos + 1;
+                let mut hashes = 0;
+                while k < n && s[k] == '#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && s[k] == '"' {
+                    for ch in &s[i..=k] {
+                        out.push(*ch);
+                    }
+                    i = k + 1;
+                    loop {
+                        if i >= n {
+                            break;
+                        }
+                        if s[i] == '"' {
+                            let mut h = 0;
+                            while i + 1 + h < n && h < hashes && s[i + 1 + h] == '#' {
+                                h += 1;
+                            }
+                            if h == hashes {
+                                for ch in &s[i..i + 1 + hashes] {
+                                    out.push(*ch);
+                                }
+                                i += 1 + hashes;
+                                break;
+                            }
+                        }
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                // not a raw string (plain identifier starting with r/b) → fall through.
+            }
+            // normal / byte string `"..."` — copy verbatim, honoring `\` escapes.
+            if c == '"' {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    if s[i] == '\\' && i + 1 < n {
+                        out.push(s[i]);
+                        out.push(s[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    out.push(s[i]);
+                    let closing = s[i] == '"';
+                    i += 1;
+                    if closing {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // char literal `'x'` / `'\n'` (vs a lifetime `'a`, left as a normal char).
+            if c == '\'' {
+                if i + 1 < n && s[i + 1] == '\\' {
+                    // escape char literal: `'`, `\`, escaped-char, …, `'`.
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    i += 2;
+                    if i < n {
+                        out.push(s[i]); // the escaped char (covers `'\''`)
+                        i += 1;
+                    }
+                    while i < n && s[i] != '\'' {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    if i < n {
+                        out.push(s[i]); // closing `'`
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 2 < n && s[i + 2] == '\'' {
+                    // simple char literal `'x'` (x may be `"` / `/`, must not start a string).
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    out.push(s[i + 2]);
+                    i += 3;
+                    continue;
+                }
+                // lifetime / stray `'` → normal char.
+            }
+            out.push(c);
+            i += 1;
         }
         out
+    }
+
+    /// #2447 r6 round-2: `strip_rust_comments` must strip REAL comments yet preserve
+    /// `//` / `/*` that live inside string / char / raw-string literals (else a `"http://x"`
+    /// URL would false-strip its line → a vacuity-fix that introduces a false-RED). Covers
+    /// r6's requested cases.
+    #[test]
+    fn strip_rust_comments_is_string_literal_aware() {
+        // Real comments ARE stripped.
+        assert!(!strip_rust_comments("keep // dropme\n").contains("dropme"));
+        let blk = strip_rust_comments("alpha /* dropme */ omega");
+        assert!(!blk.contains("dropme") && blk.contains("alpha") && blk.contains("omega"));
+        // `//` inside a normal string is NOT a comment.
+        assert!(strip_rust_comments(r#"let u = "http://example.com/a";"#)
+            .contains("http://example.com/a"));
+        // `/* */` inside a string is preserved.
+        assert!(strip_rust_comments(r#"let s = "/* not a comment */";"#)
+            .contains("/* not a comment */"));
+        // raw string content (incl. `//`) is preserved.
+        assert!(strip_rust_comments(r##"let r = r#"// not comment"#;"##).contains("// not comment"));
+        // a quote/slash inside a CHAR literal must not start a string / a comment.
+        assert!(strip_rust_comments(r#"let c = '"'; live_after_quote();"#)
+            .contains("live_after_quote()"));
+        assert!(
+            strip_rust_comments("let c = '/'; live_after_slash();").contains("live_after_slash()")
+        );
+        // escaped-quote char literal `'\''` must not desync the scanner.
+        assert!(
+            strip_rust_comments(r"let c = '\''; live_after_esc();").contains("live_after_esc()")
+        );
+        // a real trailing line comment AFTER an in-string `//` is still stripped.
+        let mixed = strip_rust_comments("let u = \"a//b\"; keep(); // dropme\n");
+        assert!(mixed.contains("a//b") && mixed.contains("keep()") && !mixed.contains("dropme"));
+        // the pin's own case: active call survives; commented-out does not.
+        assert!(
+            strip_rust_comments("    crate::daemon::shadow::kiro::spawn(x);")
+                .contains("crate::daemon::shadow::kiro::spawn(")
+        );
+        assert!(
+            !strip_rust_comments("    // crate::daemon::shadow::kiro::spawn(x);")
+                .contains("crate::daemon::shadow::kiro::spawn(")
+        );
     }
 
     /// #2413 kiro plane: the kiro session-tail observer source (Stream plane) must be
