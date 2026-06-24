@@ -5915,6 +5915,72 @@ fn published_mirror_tracks_current_through_record_set() {
     );
 }
 
+/// #2413 (A): the badge-override mirror encode/decode. `publish_observed(Some(s))`
+/// stores `s`'s discriminant (decodes back to `Some(s)`); `publish_observed(None)`
+/// stores the [`crate::state::OBSERVED_NONE`] sentinel (decodes to `None` → render
+/// uses the raw state). The sentinel is NOT a real discriminant, so it can never be
+/// misread as a state.
+#[test]
+fn observed_mirror_encode_decode_roundtrip() {
+    use std::sync::atomic::Ordering;
+    let t = StateTracker::new(None);
+    let observed = t.published_observed_handle();
+    // Default: no correction published yet ⇒ sentinel ⇒ None.
+    assert_eq!(
+        AgentState::from_observed_u8(observed.load(Ordering::Relaxed)),
+        None,
+        "fresh tracker has no badge override"
+    );
+    // A published correction roundtrips.
+    for s in [
+        AgentState::Thinking,
+        AgentState::ToolUse,
+        AgentState::AwaitingOperator,
+        AgentState::RateLimit,
+    ] {
+        t.publish_observed(Some(s));
+        assert_eq!(
+            AgentState::from_observed_u8(observed.load(Ordering::Relaxed)),
+            Some(s),
+            "publish_observed(Some({s:?})) must roundtrip"
+        );
+    }
+    // Clearing the correction returns to the sentinel.
+    t.publish_observed(None);
+    assert_eq!(
+        AgentState::from_observed_u8(observed.load(Ordering::Relaxed)),
+        None,
+        "publish_observed(None) clears the override"
+    );
+}
+
+/// #2413 (A) cycle-proof invariant: `publish_observed` writes ONLY the separate
+/// badge mirror and NEVER `current` — so a corrected badge can never feed back into
+/// the reducer's screen input (which reads `current`). Drive a correction far from
+/// the real state and assert `current` (and its own published mirror) are untouched.
+#[test]
+fn publish_observed_never_mutates_current() {
+    use std::sync::atomic::Ordering;
+    let mut t = StateTracker::new(None); // Idle
+    t.set_restarting(); // current = Restarting (via record_set)
+    let current_before = t.get_state();
+    let published_before = t.published_handle().load(Ordering::Relaxed);
+
+    // Publish a wildly different badge override.
+    t.publish_observed(Some(AgentState::ToolUse));
+
+    assert_eq!(
+        t.get_state(),
+        current_before,
+        "publish_observed must not change `current`"
+    );
+    assert_eq!(
+        t.published_handle().load(Ordering::Relaxed),
+        published_before,
+        "publish_observed must not touch the raw `published` mirror"
+    );
+}
+
 // ── auth_error false-positive fix (operator-reported, dev-3 spike t-…58335-0) ──
 // claude AuthError regex matched generic tokens `unauthorized` + `API key`, and
 // AuthError had NO anchor gate (not in is_high_fp_state / requires_red_anchor), so

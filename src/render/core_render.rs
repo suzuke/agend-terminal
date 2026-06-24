@@ -362,6 +362,12 @@ fn build_agent_state_snapshot(
     registry: &AgentRegistry,
 ) -> HashMap<String, AgentState> {
     let reg = agent::lock_registry(registry);
+    // #2413 (A): show the Shadow Observer's high-confidence badge correction in place
+    // of the raw screen state, unless the operator turned it off (`:set observed_badge
+    // off`) or the whole observer is killed (`AGEND_SHADOW_OBSERVER=0`). Computed ONCE
+    // per frame (not per pane); both reads are cheap but neither belongs in the loop.
+    let show_observed =
+        crate::runtime_config::get().observed_badge && crate::daemon::shadow::enabled();
     let mut snapshot = HashMap::new();
     for tab in &layout.tabs {
         for id in tab.root().pane_ids() {
@@ -370,19 +376,8 @@ fn build_agent_state_snapshot(
                     snapshot
                         .entry(pane.agent_name.to_string())
                         .or_insert_with(|| {
-                            // Read the lock-free published mirror — NO core.lock().
-                            // Under the boot PTY flood the per-agent core lock is
-                            // held 2–6 ms by each `pty_read_loop` feed; taking it
-                            // here (once per pane, every frame) made the render
-                            // snapshot wait up to ~10 ms and starved input. The
-                            // AtomicU8 is written in lockstep by `record_set`.
                             reg.get(&pane.instance_id)
-                                .map(|h| {
-                                    AgentState::from_u8(
-                                        h.published_state
-                                            .load(std::sync::atomic::Ordering::Relaxed),
-                                    )
-                                })
+                                .map(|h| observed_or_raw_state(h, show_observed))
                                 .unwrap_or(AgentState::Idle)
                         });
                 }
@@ -390,6 +385,26 @@ fn build_agent_state_snapshot(
         }
     }
     snapshot
+}
+
+/// #2413 (A): the badge state for one agent — the Shadow Observer's high-confidence
+/// correction (`published_observed`) when `show_observed` AND a correction is published,
+/// else the raw screen-scrape state (`published_state`).
+///
+/// Both reads are lock-free `Relaxed` `AtomicU8` loads — NO `core.lock()`. Under the
+/// boot PTY flood the per-agent core lock is held 2–6 ms by each `pty_read_loop` feed;
+/// taking it here (once per pane, every frame) made the render snapshot wait up to
+/// ~10 ms and starved input. Both atomics are written in lockstep by their writers
+/// (`record_set` for `published_state`; the per-tick `shadow_observe` driver for
+/// `published_observed`), so the render path stays contention-free.
+fn observed_or_raw_state(h: &agent::AgentHandle, show_observed: bool) -> AgentState {
+    use std::sync::atomic::Ordering::Relaxed;
+    if show_observed {
+        if let Some(corrected) = AgentState::from_observed_u8(h.published_observed.load(Relaxed)) {
+            return corrected;
+        }
+    }
+    AgentState::from_u8(h.published_state.load(Relaxed))
 }
 
 pub fn render(
@@ -1592,6 +1607,36 @@ mod tests {
         // separate concern. This test documents the protocol for future
         // wiring; runs only with `cargo test -- --ignored` against a daemon
         // spun up with the env set.
+    }
+
+    /// #2413 (A): the badge picks the Shadow Observer correction over the raw state
+    /// ONLY when `show_observed` AND a correction is published; otherwise the raw
+    /// `published_state` wins. Pins all three branches of `observed_or_raw_state` —
+    /// the lock-free read the render snapshot uses. `#[cfg(unix)]` (mk_test_handle).
+    #[cfg(unix)]
+    #[test]
+    fn observed_or_raw_state_prefers_correction_only_when_enabled() {
+        let id = crate::types::InstanceId::default();
+        let handle = crate::agent::mk_test_handle("agent", id);
+        // Raw screen state = Restarting (via record_set); a published badge override.
+        handle.core.lock().state.set_restarting();
+        handle
+            .core
+            .lock()
+            .state
+            .publish_observed(Some(AgentState::ToolUse));
+
+        // Toggle ON ⇒ the high-confidence correction wins.
+        assert_eq!(observed_or_raw_state(&handle, true), AgentState::ToolUse);
+        // Toggle OFF ⇒ the raw state wins (operator opted out / observer killed).
+        assert_eq!(
+            observed_or_raw_state(&handle, false),
+            AgentState::Restarting
+        );
+
+        // No correction published (sentinel) ⇒ raw state even when enabled.
+        handle.core.lock().state.publish_observed(None);
+        assert_eq!(observed_or_raw_state(&handle, true), AgentState::Restarting);
     }
 
     /// Regression for the post-#2346 residual freeze: the per-frame render state

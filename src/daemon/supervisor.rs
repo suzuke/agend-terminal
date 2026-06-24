@@ -3917,6 +3917,7 @@ instances:
         core.lock().state.current = state;
         // Direct `.current` write bypasses record_set, so sync the lock-free mirror.
         let published_state = core.lock().state.published_handle();
+        let published_observed = core.lock().state.published_observed_handle();
         published_state.store(state as u8, std::sync::atomic::Ordering::Relaxed);
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
@@ -3926,6 +3927,7 @@ instances:
             pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
             core,
             published_state,
+            published_observed,
             child: Arc::new(parking_lot::Mutex::new(child)),
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),

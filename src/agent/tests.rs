@@ -387,6 +387,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         pty_writer,
         pty_master,
         published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
         core,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),
@@ -990,6 +991,7 @@ fn write_to_agent_typed_uses_timeout() {
         observed_status: None,
     }));
     let published_state = core.lock().state.published_handle();
+    let published_observed = core.lock().state.published_observed_handle();
     let handle = AgentHandle {
         id: crate::types::InstanceId::default(),
         name: "typed-test".into(),
@@ -998,6 +1000,7 @@ fn write_to_agent_typed_uses_timeout() {
         pty_master: Arc::new(Mutex::new(pair.master)),
         core,
         published_state,
+        published_observed,
         child: Arc::new(Mutex::new(
             pair.slave
                 .spawn_command(portable_pty::CommandBuilder::new("true"))
@@ -1740,6 +1743,7 @@ fn pty_read_error_triggers_cleanup() {
                     .master,
             )),
             published_state: crate::agent::published_state_of(&core),
+            published_observed: crate::agent::published_observed_of(&core),
             core: Arc::clone(&core),
             child: Arc::new(Mutex::new(
                 portable_pty::native_pty_system()
@@ -1872,6 +1876,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
                 .master,
         )),
         published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
         core,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),
@@ -2214,6 +2219,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         pty_writer,
         pty_master,
         published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
         core,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),

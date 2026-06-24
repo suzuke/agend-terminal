@@ -279,6 +279,7 @@ mod tests {
         };
         let core = Arc::new(crate::sync_audit::CoreMutex::new(core));
         let published_state = core.lock().state.published_handle();
+        let published_observed = core.lock().state.published_observed_handle();
         // `st.current` was set directly (bypasses record_set), so sync the
         // lock-free mirror to match.
         published_state.store(state as u8, std::sync::atomic::Ordering::Relaxed);
@@ -290,6 +291,7 @@ mod tests {
             pty_master: Arc::new(Mutex::new(pair.master)),
             core,
             published_state,
+            published_observed,
             child: Arc::new(Mutex::new(child)),
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),

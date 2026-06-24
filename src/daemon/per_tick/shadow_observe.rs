@@ -20,7 +20,8 @@
 use super::{PerTickHandler, TickContext};
 use crate::agent::AgentCore;
 use crate::daemon::shadow;
-use crate::daemon::shadow::reducer::{Liveness, ObservedState, ScreenSignal};
+use crate::daemon::shadow::evidence::{Authority, Confidence};
+use crate::daemon::shadow::reducer::{Liveness, ObservedState, ObservedStatus, ScreenSignal};
 use crate::state::AgentState;
 use crate::sync_audit::CoreMutex;
 use std::sync::Arc;
@@ -81,9 +82,68 @@ impl PerTickHandler for ShadowObserveHandler {
             };
             let status = shadow::observe(name, screen, &live, now_ms);
             log_correction(name, raw_state, screen, &status, &live);
-            core.lock().observed_status = Some(status);
+            // #2413 (A): publish the GATED badge override into the lock-free mirror the
+            // render snapshot reads (Some ⇒ a high-confidence correction the badge shows;
+            // None ⇒ render keeps the raw state). Computed BEFORE `status` moves into
+            // `observed_status`. Both writes land under ONE core.lock; `publish_observed`
+            // touches only the separate atomic, NEVER `current` (cycle-proof).
+            let badge = badge_override(screen, &status);
+            let mut c = core.lock();
+            c.observed_status = Some(status);
+            c.state.publish_observed(badge);
         }
     }
+}
+
+/// #2413 (A): the gated BADGE override. Returns `Some(AgentState)` — the state the
+/// pane badge should show INSTEAD of the raw screen-scrape — ONLY when the fused
+/// [`ObservedStatus`] is a HIGH-CONFIDENCE real-time observer-plane correction, i.e.
+/// ALL of: (a) `authority ∈ {Hook, Stream}` (a live lifecycle / event-stream plane,
+/// not the `Screen` baseline and not a low-confidence `Inferred` reconcile); (b)
+/// `confidence ∈ {Confirmed, Strong}` (freshness is already implied — the reducer only
+/// labels a fresh observer plane this high); and (c) it actually DISAGREES with the raw
+/// screen baseline at the coarse level (the §5 correction predicate via
+/// [`screen_as_observed`]), so an agreeing-but-vaguer observed state never DOWNGRADES a
+/// more-specific raw badge (e.g. raw `ToolUse` vs coarse `Active`).
+///
+/// `None` otherwise → render keeps the raw `published` state. This is the regression
+/// firewall the lead approved: weak / screen-only backends (agy has no Hook/Stream
+/// plane → authority is always `Screen`/`ProcessHeuristic`/`Inferred`) can NEVER satisfy
+/// (a) → zero badge regression, by construction. The `Inferred` reconcile-to-Idle is
+/// deliberately excluded — the badge flips only when we are SURE work is in flight or a
+/// human gate is up (lead open-q1: "只 Hook/Stream+Strong 才翻 badge").
+fn badge_override(screen: ScreenSignal, status: &ObservedStatus) -> Option<AgentState> {
+    let high_confidence = matches!(status.authority, Authority::Hook | Authority::Stream)
+        && matches!(
+            status.confidence,
+            Confidence::Confirmed | Confidence::Strong
+        );
+    if !high_confidence {
+        return None;
+    }
+    // Only a genuine §5 correction (coarse-level disagreement with the raw screen
+    // baseline) flips the badge — never a same-coarse refinement.
+    let baseline = screen_as_observed(screen);
+    if !baseline.is_some_and(|b| b != status.state.coarse()) {
+        return None;
+    }
+    badge_state_for(status.state)
+}
+
+/// Map a corrected [`ObservedState`] to the [`AgentState`] the badge renders (reusing
+/// the existing `state_color` / label tables). `Idle` ⇒ `None`: the badge never flips
+/// TO idle on a correction (the only idle-direction correction is the excluded
+/// `Inferred` reconcile).
+fn badge_state_for(state: ObservedState) -> Option<AgentState> {
+    Some(match state {
+        ObservedState::ToolUse => AgentState::ToolUse,
+        ObservedState::Thinking | ObservedState::Responding | ObservedState::Active => {
+            AgentState::Thinking
+        }
+        ObservedState::WaitingForUser => AgentState::AwaitingOperator,
+        ObservedState::RateLimited => AgentState::RateLimit,
+        ObservedState::Idle => return None,
+    })
 }
 
 /// Map the 18-variant screen-scrape [`AgentState`] into the reducer's coarse
@@ -381,5 +441,204 @@ mod tests {
             ScreenSignal::Approval,
             ObservedState::WaitingForUser
         ));
+    }
+
+    // ── #2413 (A): the gated BADGE override ──────────────────────────────────────
+
+    fn status(
+        state: ObservedState,
+        authority: Authority,
+        confidence: Confidence,
+    ) -> ObservedStatus {
+        ObservedStatus {
+            state,
+            confidence,
+            authority,
+            evidence: vec![],
+            since_ms: 0,
+        }
+    }
+
+    /// The headline win: screen renders Idle mid-request, but a fresh Hook (or Stream)
+    /// episode proves Active ⇒ the badge flips to a working state.
+    #[test]
+    fn badge_override_flips_on_high_confidence_false_idle() {
+        let s = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
+        assert_eq!(
+            badge_override(ScreenSignal::Idle, &s),
+            Some(AgentState::Thinking)
+        );
+        // Stream plane (codex) parity.
+        let s = status(
+            ObservedState::ToolUse,
+            Authority::Stream,
+            Confidence::Strong,
+        );
+        assert_eq!(
+            badge_override(ScreenSignal::Idle, &s),
+            Some(AgentState::ToolUse)
+        );
+    }
+
+    /// A hook `ApprovalRequired` (Confirmed) splits WaitingForUser out of an idle/ambiguous
+    /// screen ⇒ the badge shows AwaitingOperator.
+    #[test]
+    fn badge_override_flips_approval_out_of_idle() {
+        let s = status(
+            ObservedState::WaitingForUser,
+            Authority::Hook,
+            Confidence::Confirmed,
+        );
+        assert_eq!(
+            badge_override(ScreenSignal::Idle, &s),
+            Some(AgentState::AwaitingOperator)
+        );
+    }
+
+    /// Regression firewall (1): a screen-only backend (agy — authority always `Screen`)
+    /// can NEVER satisfy the Hook/Stream gate, so the badge keeps the raw state even at
+    /// Strong confidence and a coarse disagreement. Zero regression for weak backends.
+    #[test]
+    fn badge_override_screen_only_backend_keeps_raw() {
+        let s = status(
+            ObservedState::WaitingForUser,
+            Authority::Screen,
+            Confidence::Strong,
+        );
+        assert_eq!(badge_override(ScreenSignal::Idle, &s), None);
+    }
+
+    /// Regression firewall (2): a low-confidence (stale-plane `Probable`) status does not
+    /// flip the badge even with a Hook authority.
+    #[test]
+    fn badge_override_excludes_low_confidence() {
+        let s = status(ObservedState::Active, Authority::Hook, Confidence::Probable);
+        assert_eq!(badge_override(ScreenSignal::Idle, &s), None);
+    }
+
+    /// Lead open-q1: the dropped-hook reconcile-to-Idle (`Inferred`/`Probable`) is
+    /// excluded — the badge only flips when SURE work is in flight / a gate is up.
+    #[test]
+    fn badge_override_excludes_inferred_reconcile() {
+        let s = status(
+            ObservedState::Idle,
+            Authority::Inferred,
+            Confidence::Probable,
+        );
+        assert_eq!(badge_override(ScreenSignal::Working, &s), None);
+    }
+
+    /// No downgrade: a Hook+Strong status that AGREES coarsely with the raw screen
+    /// (both Working) does not flip, so a more-specific raw `ToolUse` is never traded
+    /// for a vaguer observed `Active`.
+    #[test]
+    fn badge_override_no_downgrade_on_coarse_agreement() {
+        let s = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
+        assert_eq!(badge_override(ScreenSignal::Working, &s), None);
+    }
+
+    #[test]
+    fn badge_state_for_maps_active_family_and_excludes_idle() {
+        assert_eq!(
+            badge_state_for(ObservedState::ToolUse),
+            Some(AgentState::ToolUse)
+        );
+        assert_eq!(
+            badge_state_for(ObservedState::Thinking),
+            Some(AgentState::Thinking)
+        );
+        assert_eq!(
+            badge_state_for(ObservedState::Responding),
+            Some(AgentState::Thinking)
+        );
+        assert_eq!(
+            badge_state_for(ObservedState::Active),
+            Some(AgentState::Thinking)
+        );
+        assert_eq!(
+            badge_state_for(ObservedState::WaitingForUser),
+            Some(AgentState::AwaitingOperator)
+        );
+        assert_eq!(
+            badge_state_for(ObservedState::RateLimited),
+            Some(AgentState::RateLimit)
+        );
+        assert_eq!(badge_state_for(ObservedState::Idle), None);
+    }
+
+    /// Representative confirm-first: flag-ON, a buffered `TurnStarted` (episode open) +
+    /// a live child + an Idle screen ⇒ the mid-API false-idle correction is GATED and
+    /// PUBLISHED into the lock-free `published_observed` mirror the render badge reads.
+    /// This is the end-to-end pin that the correction actually reaches render, not just
+    /// `observed_status`.
+    #[test]
+    #[serial(shadow_observer)]
+    fn flag_on_publishes_badge_override_to_mirror() {
+        let home = std::env::temp_dir();
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+        let (registry, core, name, _reader) = one_agent_registry("shadow-badge-on");
+
+        let token = shadow::new_session_token().unwrap();
+        shadow::register(&token, &name);
+        shadow::push(
+            &name,
+            Evidence::hook(
+                EvidenceKind::TurnStarted,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            ),
+        );
+
+        with_flag(true, || {
+            let ctx = ctx_for(&home, &registry, &externals, &configs);
+            ShadowObserveHandler::new().run(&ctx);
+        });
+
+        let byte = core
+            .lock()
+            .state
+            .published_observed_handle()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let badge = AgentState::from_observed_u8(byte);
+        assert!(
+            matches!(
+                badge,
+                Some(AgentState::Thinking) | Some(AgentState::ToolUse)
+            ),
+            "mid-API false-idle correction must reach the lock-free badge mirror, got {badge:?}"
+        );
+        shadow::forget_agent(&name);
+    }
+
+    /// Flag-OFF: the handler early-returns, so the badge mirror stays at the no-override
+    /// sentinel (render falls back to the raw state) — byte-identical to pre-#2413.
+    #[test]
+    #[serial(shadow_observer)]
+    fn flag_off_leaves_badge_mirror_at_sentinel() {
+        let home = std::env::temp_dir();
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+        let (registry, core, name, _reader) = one_agent_registry("shadow-badge-off");
+
+        let token = shadow::new_session_token().unwrap();
+        shadow::register(&token, &name);
+        shadow::push(&name, Evidence::hook(EvidenceKind::TurnStarted, 1_000));
+
+        with_flag(false, || {
+            let ctx = ctx_for(&home, &registry, &externals, &configs);
+            ShadowObserveHandler::new().run(&ctx);
+        });
+
+        let byte = core
+            .lock()
+            .state
+            .published_observed_handle()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            AgentState::from_observed_u8(byte),
+            None,
+            "flag-OFF ⇒ no badge override published ⇒ mirror stays at the sentinel"
+        );
+        shadow::forget_agent(&name);
     }
 }

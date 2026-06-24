@@ -82,6 +82,13 @@ pub enum AgentState {
     Restarting,
 }
 
+/// #2413 (A): the "no badge override" sentinel for the Shadow Observer's lock-free
+/// badge-override mirror (`StateTracker::published_observed`). NOT a valid
+/// `AgentState` discriminant (the enum has 18 variants, 0–17), so it can never
+/// collide with a real state byte. When the mirror holds this, the render snapshot
+/// falls back to the raw `published` state.
+pub const OBSERVED_NONE: u8 = u8::MAX;
+
 impl AgentState {
     /// Inverse of the `#[repr(u8)]` discriminant: reconstruct the state from the
     /// byte published into the lock-free `AtomicU8` mirror. Unknown bytes (never
@@ -110,6 +117,16 @@ impl AgentState {
             17 => Self::Restarting,
             _ => Self::Idle,
         }
+    }
+
+    /// #2413 (A): decode the Shadow Observer BADGE-override mirror byte. The
+    /// per-tick `shadow_observe` driver stores [`OBSERVED_NONE`] when no
+    /// high-confidence correction applies (→ `None`, render falls back to the raw
+    /// `published` state) or a real `AgentState` discriminant when a correction
+    /// should override the badge. Checked against the sentinel BEFORE `from_u8` so
+    /// the sentinel can never be misread as `Idle`.
+    pub fn from_observed_u8(v: u8) -> Option<AgentState> {
+        (v != OBSERVED_NONE).then(|| AgentState::from_u8(v))
     }
 
     /// GO-NARROW 6 states that trigger orchestrator notify on transition.
@@ -233,6 +250,17 @@ pub struct StateTracker {
     /// ordering is sufficient: it carries no other memory, and the render path
     /// already tolerates ≤1-frame staleness (it re-snapshots every draw).
     published: Arc<AtomicU8>,
+    /// #2413 (A): lock-free mirror of the Shadow Observer's gated BADGE override —
+    /// the coarse `AgentState` the render snapshot should show INSTEAD of `published`,
+    /// but ONLY when a high-confidence observer-plane correction applies (gated by
+    /// the per-tick `shadow_observe` driver — see `badge_override`). Holds
+    /// [`OBSERVED_NONE`] (no override → render uses raw `published`) until a
+    /// correction is published, and is reset to it whenever the correction lapses.
+    /// SEPARATE from `published` ON PURPOSE: the reducer's screen input is `current`
+    /// (vterm-only) and is NEVER read from this mirror, so a corrected badge can
+    /// never feed back into classification (#2413 cycle-proof). Read lock-free via
+    /// [`StateTracker::published_observed_handle`]; written only by `publish_observed`.
+    published_observed: Arc<AtomicU8>,
     pub(crate) since: Instant,
     pub last_output: Instant,
     /// F9 (#685 sub-task 4): `Some(t)` only when `infer_productivity()` returned
@@ -1302,6 +1330,10 @@ impl StateTracker {
             // Seed the lock-free mirror with the same initial state (record_set
             // keeps it in lockstep thereafter).
             published: Arc::new(AtomicU8::new(initial_state as u8)),
+            // #2413 (A): badge-override mirror starts with no correction; the render
+            // snapshot uses the raw `published` state until the shadow driver
+            // publishes a high-confidence correction.
+            published_observed: Arc::new(AtomicU8::new(OBSERVED_NONE)),
             since: Instant::now(),
             last_output: Instant::now(),
             last_productive_output: None,
@@ -2684,6 +2716,27 @@ impl StateTracker {
     /// atomic `record_set` writes, so reads always observe the latest transition.
     pub fn published_handle(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.published)
+    }
+
+    /// #2413 (A): clone the lock-free badge-override handle (sibling of
+    /// [`published_handle`]). The render snapshot reads it without `core.lock()` to
+    /// show a high-confidence Shadow Observer correction in place of the raw state.
+    pub fn published_observed_handle(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.published_observed)
+    }
+
+    /// #2413 (A): publish the Shadow Observer's gated BADGE override into the
+    /// lock-free mirror the render snapshot reads. `Some(state)` ⇒ a high-confidence
+    /// observer correction the badge should show; `None` ⇒ no override (stores
+    /// [`OBSERVED_NONE`] so render falls back to the raw `published` state). The
+    /// per-tick driver calls this EVERY tick so a lapsed correction is cleared.
+    /// Takes `&self` (the atomic is interior-mutable) and NEVER touches `current` —
+    /// the cycle-proof invariant: a corrected badge can't feed back into the
+    /// reducer's screen input (which reads `current`, not this mirror). Relaxed: a
+    /// standalone value, ≤1-frame render staleness is already tolerated.
+    pub fn publish_observed(&self, badge: Option<AgentState>) {
+        let byte = badge.map_or(OBSERVED_NONE, |s| s as u8);
+        self.published_observed.store(byte, Ordering::Relaxed);
     }
 
     /// Time since the agent last produced PRODUCTIVE output, for the silence-based
