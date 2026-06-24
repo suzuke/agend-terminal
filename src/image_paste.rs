@@ -7,13 +7,15 @@
 //! text + a PNG file, so any backend with a `Read`-style tool works.
 //!
 //! ## Surface-agnostic by design
-//! This module owns ONLY the clipboard→png→temp→marker logic — it does NOT bind
-//! a keystroke or pick a TUI entry point. The keybind wiring (attach CLI vs the
-//! `app` multi-pane TUI) is added by a caller once the operator confirms the
-//! surface (#2435); we have been burned by app-mode vs run_core/attach mode
-//! mismatches before (#2434/#2438), so the entry point is deliberately deferred
-//! while the reusable core ships + is tested now. `#![allow(dead_code)]` covers
-//! the not-yet-wired public entry until that caller lands.
+//! This module owns ONLY the clipboard→png→temp→marker logic — it binds NO
+//! keystroke and picks NO TUI entry. `Ctrl+B i` is wired to BOTH surfaces by
+//! their own dispatchers (operator chose both): the attach CLI (`crate::tui`,
+//! via `BridgeClient`) and the `app` multi-pane TUI (`app::dispatch`, via
+//! `write_to_focused`). Keeping the core here — not in either surface — is what
+//! avoids the app-mode vs run_core/attach mode-mismatch class (#2434/#2438): the
+//! same `capture_clipboard_image` serves both, and `app::dispatch`'s exhaustive
+//! match compile-forces the app arm so the feature can't be live-in-attach-but-
+//! dead-in-app.
 //!
 //! ## Cross-platform testing boundary ([xwin compile ≠ windows runtime])
 //! `arboard` + the `png` encoder are cross-platform and compile for
@@ -24,7 +26,6 @@
 //! Everything else here — PNG encode, temp write, the stale-file sweep, and the
 //! marker chain — is pure/deterministic and unit-tested below, so the
 //! windows-latest CI runtime gates it on Windows too.
-#![allow(dead_code)] // public entry wired to a TUI surface in a #2435 follow-up
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

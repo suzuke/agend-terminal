@@ -56,6 +56,11 @@ pub enum Action {
     /// #2325: toggle the text-selection copy mode (Mode B copy-on-select ↔
     /// Mode A explicit-copy), persisting the choice. Bound to `Ctrl+B e`.
     ToggleCopyOnSelect,
+    /// #2435: paste an image from the clipboard into the focused pane's agent as
+    /// an `[AGEND-IMAGE-PASTE: <path>]` marker. Bound to `Ctrl+B i`. The exhaustive
+    /// `app::dispatch` match makes adding this variant compile-force its app arm —
+    /// so the feature cannot be live-in-attach-but-dead-in-app (#2434/#2438 class).
+    PasteImage,
     None,
 }
 
@@ -220,6 +225,8 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::SHIFT) => Action::Detach,
         KeyCode::Char('?') => Action::ShowHelp,
         KeyCode::Char('~') => Action::ScratchShell,
+        // #2435: paste clipboard image into the focused pane's agent.
+        KeyCode::Char('i') => Action::PasteImage,
 
         _ => Action::None,
     }
@@ -321,6 +328,16 @@ mod tests {
         assert_eq!(
             prefix_action(KeyCode::Char('e'), KeyModifiers::empty()),
             Action::ToggleCopyOnSelect
+        );
+    }
+
+    // --- i: PasteImage (#2435) ---
+
+    #[test]
+    fn keybind_ctrl_b_i_pastes_image() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('i'), KeyModifiers::empty()),
+            Action::PasteImage
         );
     }
 
