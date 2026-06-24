@@ -420,7 +420,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // daemon is app mode, so gating it run_core-only would leave codex agents' observer
         // source dead in production. Read-only tail of ~/.codex/sessions; no-op unless the
         // flag is on (flag-OFF default ⇒ zero behaviour change).
-        crate::daemon::shadow::rollout::spawn(Arc::clone(&registry), home.clone());
+        crate::daemon::shadow::rollout::spawn(Arc::clone(&registry));
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
