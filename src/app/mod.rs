@@ -2319,24 +2319,63 @@ mod tests {
         );
     }
 
+    /// Strip `//` line + `/* */` block comments from Rust source so a wiring-pin
+    /// contains-check can't be satisfied by a COMMENTED-OUT call (#2447 r6: the raw
+    /// contains() was vacuous — commenting the production call left the text present and the
+    /// pin still passed, the exact #2434 dead-wiring class it must catch). Unicode-correct
+    /// (operates on chars); NOT string-literal-aware, which is fine for our own production
+    /// region where the wired call is never inside a string. Shared so the codex/opencode
+    /// pins can adopt it in a follow-up.
+    fn strip_rust_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '/' && chars.peek() == Some(&'/') {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2 == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            } else if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                let mut prev = '\0';
+                for c2 in chars.by_ref() {
+                    if prev == '*' && c2 == '/' {
+                        break;
+                    }
+                    prev = c2;
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     /// #2413 kiro plane: the kiro session-tail observer source (Stream plane) must be
     /// started in app mode too — SAME #2434 reasoning as rollout/opencode above. The live
     /// fleet daemon is `run_app`, so gating `kiro::spawn` to run_core-only would leave kiro
-    /// agents' observer source dead in production. Production-region scan only.
-    /// REVERSE-MUTATION verified: deleting the real `kiro::spawn(...)` call from run_app
-    /// turns this RED.
+    /// agents' observer source dead in production. Production-region scan, **comments
+    /// stripped** so a commented-out call does NOT satisfy the pin. REVERSE-MUTATION
+    /// verified (#2447 r6): both DELETING and COMMENTING-OUT the real `kiro::spawn(...)`
+    /// call in run_app turn this RED.
     #[test]
     fn run_app_wires_kiro_session_tailer_2413() {
         let source = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        // Strip comments FIRST: a commented-out call must not pass the pin (r6 vacuity fix).
+        let prod_code = strip_rust_comments(prod);
         assert!(
-            prod.contains("crate::daemon::shadow::kiro::spawn("),
+            prod_code.contains("crate::daemon::shadow::kiro::spawn("),
             "run_app must spawn the kiro session-tail observer in the PRODUCTION region \
-             (#2413 kiro plane) — gating it run_core-only would leave kiro agents' \
-             Stream observer dead in the app-mode live daemon. No \
-             'crate::daemon::shadow::kiro::spawn(' before the #[cfg(test)] cutoff"
+             (#2413 kiro plane) — gating it run_core-only (or commenting it out) would leave \
+             kiro agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+             'crate::daemon::shadow::kiro::spawn(' (comments stripped) before the \
+             #[cfg(test)] cutoff"
         );
     }
 
