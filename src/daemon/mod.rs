@@ -672,6 +672,13 @@ pub(crate) fn build_default_handlers(
             std::sync::Arc::new(crash_tx),
             stage2_dispatch_available,
         )),
+        // #t-777-3: respawn-stuck watchdog — auto-Fresh-restart an agent whose
+        // Resume spawn hung (corrupt-session `resume --last`), bounded by a
+        // retry cap that escalates a P0 + pause. Recovers via the proven API
+        // restart path so it works in BOTH run_core and the live app-mode daemon
+        // (where the crash_tx→respawn machinery is inert). Disjoint state class
+        // from the Hung ladder above (no crash_tx needed).
+        Box::new(per_tick::RespawnWatchdogHandler::new()),
         Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
         Box::new(per_tick::ExternalLivenessHandler::new()),
         Box::new(per_tick::SnapshotRotationHandler::new()),

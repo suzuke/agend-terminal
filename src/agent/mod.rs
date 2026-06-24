@@ -82,6 +82,13 @@ pub struct AgentHandle {
     pub(crate) typed_inject: bool,
     pub(crate) spawned_at: std::time::Instant,
     pub(crate) spawned_at_epoch_ms: u64,
+    /// The `SpawnMode` this handle's process was spawned with (#t-777-3). Stamped
+    /// at construction from `SpawnConfig.spawn_mode` so the respawn-stuck watchdog
+    /// can tell a hung `Resume` (corrupt-session resume that never came up) from a
+    /// merely-slow `Fresh` boot — it only force-recovers `Resume` spawns, never a
+    /// slow `Fresh` (the load-bearing false-kill guard). Immutable for the life of
+    /// the handle; a respawn replaces the whole handle with a freshly-stamped one.
+    pub(crate) spawn_mode: crate::backend::SpawnMode,
     /// Set by DELETE handler to prevent reaper from spawning shell fallback.
     pub(crate) deleted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1300,6 +1307,9 @@ pub fn spawn_agent(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64,
+                // #t-777-3: stamp the spawn mode so the respawn-stuck watchdog
+                // distinguishes a hung Resume from a slow Fresh boot.
+                spawn_mode: config.spawn_mode,
                 deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
@@ -3129,6 +3139,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         typed_inject: false,
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }

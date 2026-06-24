@@ -394,6 +394,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         typed_inject: false,
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -1007,6 +1008,7 @@ fn write_to_agent_typed_uses_timeout() {
         typed_inject: true,
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let result = write_to_agent_typed(&handle, b"x");
@@ -1757,6 +1759,7 @@ fn pty_read_error_triggers_cleanup() {
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
@@ -1876,6 +1879,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
         typed_inject: false,
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(deleted)),
     };
     (handle, id)
@@ -2217,6 +2221,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         typed_inject: false,
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }

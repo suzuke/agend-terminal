@@ -54,6 +54,7 @@ pub(crate) mod progress_mirror;
 pub(crate) mod reclaim;
 pub(crate) mod reconcile_backups_gc;
 pub(crate) mod recovery_dispatcher;
+pub(crate) mod respawn_watchdog;
 pub(crate) mod shadow_observe;
 pub(crate) mod snapshot;
 pub(crate) mod supervisor_trackers;
@@ -84,6 +85,7 @@ pub(crate) use progress_mirror::ProgressMirrorHandler;
 pub(crate) use reclaim::ReclaimHandler;
 pub(crate) use reconcile_backups_gc::ReconcileBackupsGcHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
+pub(crate) use respawn_watchdog::RespawnWatchdogHandler;
 pub(crate) use shadow_observe::ShadowObserveHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) use supervisor_trackers::{
@@ -316,6 +318,7 @@ pub(crate) fn mock_live_agent_no_context(
         typed_inject: false,
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (handle, reader)

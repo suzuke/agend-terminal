@@ -451,6 +451,31 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
     json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned})
 }
 
+/// #t-777-3: daemon-autonomic self-heal entry — the respawn-stuck watchdog's
+/// narrow path to a **Fresh** restart. Wraps `handle_restart_instance(mode=fresh)`,
+/// which round-trips the PROVEN direct `DELETE`(no_wait)+`SPAWN` api::calls →
+/// `ApiEvent::InstanceCreated` → app pane Fresh respawn (the same path the
+/// operator's manual `restart_instance fresh` takes, working in the live
+/// app-mode daemon where the crash_tx→respawn machinery is inert).
+///
+/// **Gate-exempt BY CONSTRUCTION** (no new operator-gate surface): the inner
+/// `DELETE`/`SPAWN` are DIRECT api methods — operator-transport, which
+/// `operator_gate::check_operation_allowed` returns `Ok` for before `classify`
+/// is consulted. Reached ONLY from the per-tick hang-detection watchdog (never
+/// agent-invocable), so the narrowness is enforced by the trigger, exactly like
+/// crash-respawn / hang-recovery (`operator_gate` module scope note). Returns
+/// whether the SPAWN succeeded so the caller can escalate a failed recovery.
+pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) -> bool {
+    let result = handle_restart_instance(
+        home,
+        &json!({"name": name, "mode": "fresh", "reason": reason}),
+    );
+    result
+        .get("spawned")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub(super) fn resolve_team_layout(
     home: &Path,
     name: &str,

@@ -490,6 +490,7 @@ mod deleted_gate_tests_1913 {
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
             deleted: Arc::new(AtomicBool::new(deleted)),
         }
     }
