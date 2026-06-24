@@ -313,7 +313,7 @@ fn same_agent_re_dispatch_idempotent() {
     let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/test", None);
     assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
-    // Same agent re-dispatch, same (source_repo, branch), different task_id.
+    // Same agent re-dispatch same branch with different task_id → idempotent.
     let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/test", None);
     assert!(
         r2.is_ok(),
@@ -321,24 +321,14 @@ fn same_agent_re_dispatch_idempotent() {
         r2.err()
     );
 
-    // #2158: a re-dispatch to a LIVE binding on the same (source_repo, branch) is a true
-    // idempotent NO-OP — it skips the lease + worktree reset (the data-loss path the fix
-    // closes) and leaves the existing binding UNTOUCHED. The binding therefore stays at
-    // its original task_id (T-1). Pre-#2158 each re-dispatch re-bound and bumped it to T-2;
-    // that bump is exactly the rebind whose `sync_worktree_to_head` wiped uncommitted work.
+    // #2158 partial-skip: the live same-(source_repo, branch) re-dispatch REUSES the
+    // worktree (no reset) but STILL refreshes the binding, so task_id updates to T-2.
     let binding = crate::paths::runtime_dir(&home)
         .join("agent-x")
         .join("binding.json");
     let content = std::fs::read_to_string(&binding).expect("read");
     let v: serde_json::Value = serde_json::from_str(&content).expect("parse");
-    assert_eq!(
-        v["branch"], "feat/test",
-        "the live binding is preserved across the no-op re-dispatch"
-    );
-    assert_eq!(
-        v["task_id"], "T-1",
-        "#2158: a no-op re-dispatch to a live binding leaves it untouched (task_id NOT bumped)"
-    );
+    assert_eq!(v["task_id"], "T-2", "task_id must update on re-dispatch");
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3353,12 +3343,17 @@ fn binding_worktree(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(v["worktree"].as_str().expect("worktree path in binding"))
 }
 
-/// (a) THE regression test for the 2026-06-25 data-loss: a re-dispatch (`branch=`) to an
-/// agent ALREADY live-bound to that branch must NOT reset its worktree — uncommitted work
-/// survives. Reverse-mutation: delete the `#2158 fix` early-return in dispatch_hook/mod.rs
-/// and this goes RED (the reuse-path `sync_worktree_to_head` runs `reset --hard` + `clean
-/// -fd`, wiping the untracked file). This is the exact shape of the incident that wiped an
-/// uncommitted PR-B.
+/// (a) THE partial-skip regression test for the 2026-06-25 data-loss, with BOTH halves
+/// of the #2158 contract + a dual reverse-mutation:
+///   1. data protection — a re-dispatch (`branch=`) to an agent ALREADY live-bound to
+///      that branch must NOT reset its worktree; uncommitted work survives. RM: force
+///      the normal lease path (drop the reuse) → the reuse-path `sync_worktree_to_head`
+///      (`reset --hard` + `clean -fd`) wipes the untracked file → RED. (the incident
+///      shape that wiped an uncommitted PR-B.)
+///   2. metadata refresh — the partial-skip STILL runs `bind_full`, so `binding.task_id`
+///      bumps to the new dispatch (T-2). r6: that field DRIVES task_progress CI push /
+///      auto_release lease+CAS / ci_watch correlation, so a bare no-op stranded T-1. RM:
+///      make the reuse path early-return (skip bind_full) → task_id stays T-1 → RED.
 #[test]
 fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
     let home = std::env::temp_dir().join(format!("agend-2158-wip-{}", std::process::id()));
@@ -3381,6 +3376,7 @@ fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
         "re-dispatch to a LIVE same-branch binding must be an idempotent OK: {r2:?}"
     );
 
+    // (1) data protection: the worktree was reused, not reset.
     assert!(
         wip.exists(),
         "#2158: re-dispatch to a LIVE same-branch binding MUST NOT reset the worktree — \
@@ -3390,6 +3386,13 @@ fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
         std::fs::read_to_string(&wip).unwrap(),
         "// precious uncommitted work\n",
         "uncommitted content intact after the re-dispatch"
+    );
+    // (2) metadata refresh: bind_full still ran on the reused worktree → task_id is T-2.
+    assert_eq!(
+        binding_task_id(&home, "agent-wip").as_deref(),
+        Some("T-2"),
+        "#2158 partial-skip: the reuse path STILL refreshes binding.task_id (r6: it drives \
+         task_progress / auto_release / ci_watch) — a bare no-op stranded T-1"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3465,6 +3468,16 @@ fn binding_source_repo(home: &std::path::Path, agent: &str) -> Option<String> {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
     v["source_repo"].as_str().map(str::to_string)
+}
+
+/// The `task_id` value recorded in an agent's binding.json.
+fn binding_task_id(home: &std::path::Path, agent: &str) -> Option<String> {
+    let p = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
+    v["task_id"].as_str().map(str::to_string)
 }
 
 /// A second standalone git repo with an `origin/main` ref so `ensure_branch_exists`
