@@ -6004,3 +6004,66 @@ fn codex_auth_pattern_drops_generic_api_key_token() {
         "a real codex auth error must still detect"
     );
 }
+
+// ───────────────────────── #2439 context provider telemetry ─────────────────────────
+
+/// #2439: `context_provider` is DERIVED from statusline-pattern presence (not a
+/// stored per-backend field), so backends that read a context statusline report
+/// `StatusLine` and the rest report `Unavailable`. This is the realized mapping a
+/// LIST consumer sees.
+#[test]
+fn context_provider_derived_from_statusline_pattern_presence() {
+    use crate::backend_profile::ContextProvider;
+    // Backends that declare a context_pattern (→ context_regex is_some) read a
+    // statusline percent.
+    for backend in [Backend::ClaudeCode, Backend::KiroCli] {
+        let t = StateTracker::new(Some(&backend));
+        assert_eq!(
+            t.context_provider(),
+            ContextProvider::StatusLine,
+            "{backend:?} reads a statusline context% → StatusLine"
+        );
+        assert_eq!(t.context_provider().source_name(), "statusline");
+    }
+    // Backends with no passive context signal derive Unavailable — a silent null
+    // becomes an explicit, honest "unavailable".
+    for backend in [
+        Backend::Codex,
+        Backend::OpenCode,
+        Backend::Agy,
+        Backend::Shell,
+        Backend::Raw("/opt/whatever".to_string()),
+    ] {
+        let t = StateTracker::new(Some(&backend));
+        assert_eq!(
+            t.context_provider(),
+            ContextProvider::Unavailable,
+            "{backend:?} has no statusline pattern → Unavailable"
+        );
+        assert_eq!(t.context_provider().source_name(), "unavailable");
+    }
+}
+
+/// #2439 CONTRACT: adding `context_provider` must NOT change the existing LIST
+/// `context_source` value — external dashboards key off `"pattern"`. After a real
+/// statusline reading, `resolved_context` still reports `"pattern"` while the new
+/// `context_provider` reports the typed `statusline` capability alongside it.
+#[test]
+fn context_source_stays_pattern_while_context_provider_is_statusline() {
+    use crate::backend_profile::ContextProvider;
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed("ctx used: 42%");
+    let (pct, source) = t
+        .resolved_context()
+        .expect("a fresh statusline reading resolves");
+    assert!((pct - 42.0).abs() < f32::EPSILON, "parsed percent: {pct}");
+    assert_eq!(
+        source, "pattern",
+        "context_source must stay \"pattern\" (external-dashboard contract)"
+    );
+    assert_eq!(
+        t.context_provider(),
+        ContextProvider::StatusLine,
+        "the new typed capability coexists with the unchanged context_source"
+    );
+}

@@ -27,6 +27,36 @@ use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
 use crate::state::AgentState;
 use std::sync::OnceLock;
 
+/// Whether a backend can passively report context-window usage — surfaced as the
+/// LIST `context_provider` telemetry field (#2439). DERIVED at runtime from the
+/// presence of a statusline `context_pattern` (see
+/// [`crate::state::StateTracker::context_provider`]); it is NOT a separately stored
+/// per-backend field, so it can never drift from the pattern table it summarizes.
+/// Unlike `context_source`/`context_pct` (absent when there is no fresh reading),
+/// this is ALWAYS reported: it tells a consumer whether the backend CAN report
+/// context at all, distinct from "has a reading right now".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextProvider {
+    /// The backend renders a status/footer line we can read a context% from (it
+    /// declares a `context_pattern`): Claude, Kiro.
+    StatusLine,
+    /// The backend exposes no trustworthy passive context signal: Codex, OpenCode,
+    /// Agy, and the shell/raw fallbacks. Its `context_pct` is honestly absent
+    /// rather than a guess.
+    Unavailable,
+}
+
+impl ContextProvider {
+    /// Stable LIST/telemetry string. CONTRACT: external dashboards key off these
+    /// values — do not rename without coordinating consumers.
+    pub fn source_name(self) -> &'static str {
+        match self {
+            ContextProvider::StatusLine => "statusline",
+            ContextProvider::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// All per-backend detection data for one backend, co-located.
 ///
 /// #8 Phase 2 step-0: now consumed by PROD — `StatePatterns::for_backend`,

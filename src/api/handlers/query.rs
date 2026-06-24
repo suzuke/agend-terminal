@@ -27,6 +27,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 blocked_reason,
                 blocked_note,
                 context,
+                context_provider,
                 api_in_flight,
                 last_api_activity_at,
                 observed_status,
@@ -44,6 +45,11 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // ("pattern" = the agent's own statusline, "transcript" =
                     // token-usage estimate). Absent = honestly unknown.
                     c.state.resolved_context(),
+                    // #2439: the backend's context-telemetry CAPABILITY (statusline
+                    // vs unavailable), derived from statusline-pattern presence.
+                    // Always present — distinct from context_source/context_pct above,
+                    // which are absent when there's no fresh reading.
+                    c.state.context_provider(),
                     // #2413 Phase 1: out-of-path API-activity signal, read under the
                     // SAME lock as agent_state so a consumer can reconcile the two
                     // atomically (false-idle = agent_state=="idle" && api_in_flight).
@@ -66,7 +72,11 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "blocked_reason": blocked_reason,
                 "blocked_note": blocked_note,
                 "context_pct": context.map(|(pct, _)| pct),
+                // CONTRACT (#2439): keep emitting "pattern" here for the existing
+                // external-dashboard consumers — the new typed capability goes in the
+                // additive `context_provider` field below, NOT by renaming this.
                 "context_source": context.map(|(_, source)| source),
+                "context_provider": context_provider.source_name(),
                 // #2413 Phase 1: live LLM-socket activity (out-of-path lsof probe).
                 // api_in_flight=true while pattern-state is "idle" ⇒ false-idle.
                 "api_in_flight": api_in_flight,
