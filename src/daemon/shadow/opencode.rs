@@ -296,6 +296,16 @@ fn subscribe_once(agent: &str, port: u16, stop: &AtomicBool) -> std::io::Result<
         match stream.read(&mut rb) {
             Ok(0) => return Ok(()), // server closed the stream
             Ok(n) => {
+                // Teardown race (#2440 r6): `stop` may have been set WHILE this `read()`
+                // blocked, and the old server can return headers + a final SSE frame in
+                // this SAME read. Re-check stop BEFORE any decode/push so a torn-down
+                // subscriber (despawn / port-change) never injects a late/stale frame under
+                // this agent name — which would survive `forget_agent` / a same-name
+                // respawn as a phantom transition. (The top-of-loop check only covers a
+                // stop observed BEFORE the read returns.)
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 if header_done {
                     for payload in dec.feed(&rb[..n]) {
                         push_frame(agent, &payload);
@@ -646,5 +656,67 @@ mod tests {
         bytes.extend(b"0\r\n\r\n"); // terminal chunk
         let out = d.feed(&bytes);
         assert_eq!(out, vec![r#"{"type":"session.status"}"#.to_string()]);
+    }
+
+    /// #2440 r6 teardown race: `stop` is set WHILE the subscriber blocks in `read()`, and
+    /// the old server then returns headers + a final SSE frame in that same read. A
+    /// torn-down subscriber must NOT decode/push that late frame (it would survive
+    /// `forget_agent` / a same-name respawn as a phantom transition). Deterministic: the
+    /// server drains the GET (proving the subscriber is now blocked in read) BEFORE setting
+    /// stop, so the post-read stop-check is what must short-circuit. Reverse-mutation:
+    /// removing that post-read check makes this RED (a phantom TurnStarted is pushed).
+    #[test]
+    #[serial(shadow_observer)]
+    fn stopped_subscriber_does_not_push_late_frames_after_stop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let agent = "oc_stop_race";
+        super::super::forget_agent(agent); // clean slate
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_srv = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Drain the GET request — once read, the subscriber is past its top-of-loop
+            // stop check and blocked in read() waiting for the response.
+            let mut req = Vec::new();
+            let mut b = [0u8; 512];
+            while let Ok(n) = sock.read(&mut b) {
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&b[..n]);
+                if find_subslice(&req, b"\r\n\r\n").is_some() {
+                    break;
+                }
+            }
+            // Teardown happens NOW (despawn / port-change), while the subscriber blocks.
+            stop_srv.store(true, Ordering::Relaxed);
+            // The old server flushes headers + a final SSE frame in one write.
+            let body = "data: {\"type\":\"session.next.prompted\"}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+            // drop(sock) closes the stream.
+        });
+
+        let _ = subscribe_once(agent, port, &stop);
+        server.join().unwrap();
+
+        let buffered = super::super::peek(agent);
+        assert!(
+            buffered.is_empty(),
+            "a stopped subscriber must NOT push a frame received after stop, got {buffered:?}"
+        );
+        super::super::forget_agent(agent);
     }
 }
