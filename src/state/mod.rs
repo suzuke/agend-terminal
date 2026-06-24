@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 /// Agent runtime state, ordered by priority (highest last).
 ///
 /// `#[repr(u8)]`: the discriminant (declaration order, `Starting = 0` …
-/// `Restarting = 17`) is mirrored into a lock-free `AtomicU8` so the TUI render
+/// `Restarting = 16`) is mirrored into a lock-free `AtomicU8` so the TUI render
 /// snapshot can read agent state WITHOUT taking `core.lock()` (see
 /// [`StateTracker::published_handle`] + `render::build_agent_state_snapshot`).
 /// [`AgentState::from_u8`] is the inverse; a roundtrip unit test pins them so a
@@ -41,13 +41,15 @@ pub enum AgentState {
     /// routed as raw PTY keystrokes (not inbox-wrapped) via INJECT_RAW.
     AwaitingOperator,
     Idle,
-    ToolUse,
-    Thinking,
+    /// The agent is actively working — thinking or running a tool. (Merged from
+    /// the former `Thinking` + `ToolUse`: no production decision distinguished
+    /// them, and the hook-evidence layer keeps tool granularity separately.)
+    Active,
     /// Startup stalled on a backend-specific modal that blocks normal use
     /// (e.g. codex `Update available!` menu). Distinct from
     /// `PermissionPrompt` so operators can tell "CLI waiting for an OK on
     /// an update menu" from "CLI asking whether to Allow a tool invocation".
-    /// Higher than `Thinking` because real work cannot progress until the
+    /// Higher than `Active` because real work cannot progress until the
     /// modal is dismissed; lower than `PermissionPrompt` because formal
     /// authorization flows take precedence when both match.
     InteractivePrompt,
@@ -84,7 +86,7 @@ pub enum AgentState {
 
 /// #2413 (A): the "no badge override" sentinel for the Shadow Observer's lock-free
 /// badge-override mirror (`StateTracker::published_observed`). NOT a valid
-/// `AgentState` discriminant (the enum has 18 variants, 0–17), so it can never
+/// `AgentState` discriminant (the enum has 17 variants, 0–16), so it can never
 /// collide with a real state byte. When the mirror holds this, the render snapshot
 /// falls back to the raw `published` state.
 pub const OBSERVED_NONE: u8 = u8::MAX;
@@ -101,20 +103,19 @@ impl AgentState {
             1 => Self::Hang,
             2 => Self::AwaitingOperator,
             3 => Self::Idle,
-            4 => Self::ToolUse,
-            5 => Self::Thinking,
-            6 => Self::InteractivePrompt,
-            7 => Self::PermissionPrompt,
-            8 => Self::GitConflict,
-            9 => Self::ContextFull,
-            10 => Self::RateLimit,
-            11 => Self::ServerRateLimit,
-            12 => Self::UsageLimit,
-            13 => Self::AuthError,
-            14 => Self::ApiError,
-            15 => Self::ModelUnsupported,
-            16 => Self::Crashed,
-            17 => Self::Restarting,
+            4 => Self::Active,
+            5 => Self::InteractivePrompt,
+            6 => Self::PermissionPrompt,
+            7 => Self::GitConflict,
+            8 => Self::ContextFull,
+            9 => Self::RateLimit,
+            10 => Self::ServerRateLimit,
+            11 => Self::UsageLimit,
+            12 => Self::AuthError,
+            13 => Self::ApiError,
+            14 => Self::ModelUnsupported,
+            15 => Self::Crashed,
+            16 => Self::Restarting,
             _ => Self::Idle,
         }
     }
@@ -152,8 +153,7 @@ impl AgentState {
             // (priority 3 was `Ready`, collapsed into `Idle` — gap is harmless;
             // priorities are an ordering, not a contiguous index.)
             Self::Idle => 4,
-            Self::ToolUse => 5,
-            Self::Thinking => 6,
+            Self::Active => 6,
             Self::InteractivePrompt => 7,
             Self::PermissionPrompt => 8,
             // Phase A Piece-1: GitConflict shares priority 8 with
@@ -201,8 +201,7 @@ impl AgentState {
             Self::Hang => "hang",
             Self::AwaitingOperator => "awaiting_operator",
             Self::Idle => "idle",
-            Self::ToolUse => "tool_use",
-            Self::Thinking => "thinking",
+            Self::Active => "active",
             Self::InteractivePrompt => "interactive_prompt",
             Self::PermissionPrompt => "permission",
             Self::GitConflict => "git_conflict",
@@ -1163,11 +1162,11 @@ impl StateTracker {
     }
 
     /// If detected state is `PermissionPrompt` but a fresh heartbeat exists,
-    /// override to `Thinking` — the agent is alive and the PTY pattern is a
+    /// override to `Active` — the agent is alive and the PTY pattern is a
     /// false positive (A5 fix, design §4.3).
     fn gate_on_heartbeat(&self, detected: AgentState) -> AgentState {
         if detected == AgentState::PermissionPrompt && self.is_heartbeat_fresh() {
-            AgentState::Thinking
+            AgentState::Active
         } else {
             detected
         }
@@ -1269,7 +1268,7 @@ impl StateTracker {
     ///
     /// Heartbeat gate (A5 fix): after pattern detection, if the detected
     /// state is `PermissionPrompt` but a fresh MCP heartbeat exists, the
-    /// detection is overridden to `Thinking` — the agent is alive and the
+    /// detection is overridden to `Active` — the agent is alive and the
     /// PTY pattern is a false positive.
     ///
     /// Text-only entry point: delegates to [`feed_with_fg`] with an empty
@@ -2161,7 +2160,7 @@ impl StateTracker {
         // stop rendering mid-operation even when the agent is still
         // working, so a brief latch is fine but holding beyond
         // LATCHED_STATE_EXPIRY is almost always stale.
-        let short_expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
+        let short_expiring = matches!(self.current, AgentState::Active);
         if short_expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
             self.transition(AgentState::Idle);
             return;
@@ -2396,17 +2395,17 @@ impl StateTracker {
                 // #1005 Phase A2: oscillation guard. Suppress priority-up
                 // back into the SAME self-expiring latched state we just
                 // left briefly. This is the
-                // `ToolUse(2s) → Idle(2s) → ToolUse(2s)` bounce that
+                // `Active(2s) → Idle(2s) → Active(2s)` bounce that
                 // keeps `since` recent and blocks `LATCHED_STATE_EXPIRY`
                 // (30s) from firing (Scenario C of §F39). Scoped to
-                // {Thinking, ToolUse} — the exact set
+                // `Active` — the exact set
                 // `maybe_expire_latched_state` targets. Operator-driven
                 // dialogs (InteractivePrompt / PermissionPrompt) and
                 // error states are deliberately OUT of scope: those
                 // have legitimate re-entry semantics (operator dismiss
                 // then re-prompt) and their own recovery paths.
                 let now = Instant::now();
-                let guard_applies = matches!(new_state, AgentState::Thinking | AgentState::ToolUse);
+                let guard_applies = matches!(new_state, AgentState::Active);
                 if guard_applies {
                     if let Some((prev_target, prev_at)) = self.last_priority_up_into {
                         let bouncing_to_same = prev_target == new_state;

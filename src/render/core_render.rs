@@ -19,8 +19,7 @@ pub fn state_color(state: AgentState) -> Color {
         AgentState::Starting => Color::White,
         AgentState::AwaitingOperator => Color::Indexed(214),
         AgentState::Idle => Color::DarkGray,
-        AgentState::Thinking => Color::Yellow,
-        AgentState::ToolUse => Color::Blue,
+        AgentState::Active => Color::Yellow,
         AgentState::InteractivePrompt => Color::Indexed(214),
         AgentState::PermissionPrompt => Color::Magenta,
         // Phase A Piece-1: GitConflict shares the magenta band with
@@ -1087,7 +1086,7 @@ mod tests {
         for (state, want) in [
             (AgentState::ServerRateLimit, "[ServerRateLimit]"),
             (AgentState::PermissionPrompt, "[PermissionPrompt]"),
-            (AgentState::Thinking, "[Thinking]"),
+            (AgentState::Active, "[Active]"),
             (AgentState::Idle, "[Idle]"),
         ] {
             let segments = pane_title_segments(&pane, Style::default(), state, true);
@@ -1102,11 +1101,8 @@ mod tests {
     #[test]
     fn state_color_returns_distinct_colors_for_key_states() {
         let idle = state_color(AgentState::Idle);
-        let thinking = state_color(AgentState::Thinking);
-        let tool_use = state_color(AgentState::ToolUse);
-        assert_ne!(idle, thinking, "idle vs thinking must differ");
-        assert_ne!(thinking, tool_use, "thinking vs tool_use must differ");
-        assert_ne!(idle, tool_use, "idle vs tool_use must differ");
+        let active = state_color(AgentState::Active);
+        assert_ne!(idle, active, "idle vs active must differ");
     }
 
     #[test]
@@ -1624,10 +1620,10 @@ mod tests {
             .core
             .lock()
             .state
-            .publish_observed(Some(AgentState::ToolUse));
+            .publish_observed(Some(AgentState::Active));
 
         // Toggle ON ⇒ the high-confidence correction wins.
-        assert_eq!(observed_or_raw_state(&handle, true), AgentState::ToolUse);
+        assert_eq!(observed_or_raw_state(&handle, true), AgentState::Active);
         // Toggle OFF ⇒ the raw state wins (operator opted out / observer killed).
         assert_eq!(
             observed_or_raw_state(&handle, false),

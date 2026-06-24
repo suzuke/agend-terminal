@@ -927,7 +927,7 @@ fn waiting_on_exposed_via_merge_metadata() {
     let actual_home = crate::home_dir();
 
     // Simulate what list_instances does: merge_metadata into agent info
-    let mut info = json!({"name": "sender", "agent_state": "thinking"});
+    let mut info = json!({"name": "sender", "agent_state": "active"});
     merge_metadata(&actual_home, "sender", &mut info);
     assert_eq!(
         info["waiting_on"], "delegation result",

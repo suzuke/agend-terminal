@@ -33,10 +33,7 @@ pub(crate) fn screen_signal(s: AgentState) -> ScreenSignal {
     match s {
         AgentState::Idle => ScreenSignal::Idle,
         // Actively rendering work (incl. boot/respawn churn, treated as working).
-        AgentState::ToolUse
-        | AgentState::Thinking
-        | AgentState::Starting
-        | AgentState::Restarting => ScreenSignal::Working,
+        AgentState::Active | AgentState::Starting | AgentState::Restarting => ScreenSignal::Working,
         // A human gate.
         AgentState::PermissionPrompt
         | AgentState::InteractivePrompt
@@ -74,10 +71,10 @@ pub(crate) fn screen_as_observed(screen: ScreenSignal) -> Option<ObservedState> 
 /// flips TO idle (the only idle-direction correction is the excluded `Inferred` reconcile).
 fn observed_to_agent_state(state: ObservedState) -> Option<AgentState> {
     Some(match state {
-        ObservedState::ToolUse => AgentState::ToolUse,
-        ObservedState::Thinking | ObservedState::Responding | ObservedState::Active => {
-            AgentState::Thinking
-        }
+        ObservedState::ToolUse
+        | ObservedState::Thinking
+        | ObservedState::Responding
+        | ObservedState::Active => AgentState::Active,
         ObservedState::WaitingForUser => AgentState::AwaitingOperator,
         ObservedState::RateLimited => AgentState::RateLimit,
         ObservedState::Idle => return None,
@@ -141,7 +138,7 @@ mod tests {
         let s = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
         assert_eq!(
             gated_override(AgentState::Idle, &s),
-            Some(AgentState::Thinking)
+            Some(AgentState::Active)
         );
         // Stream plane (codex) parity.
         let s = status(
@@ -151,7 +148,7 @@ mod tests {
         );
         assert_eq!(
             gated_override(AgentState::Idle, &s),
-            Some(AgentState::ToolUse)
+            Some(AgentState::Active)
         );
     }
 
@@ -197,15 +194,15 @@ mod tests {
             Authority::Inferred,
             Confidence::Probable,
         );
-        assert_eq!(gated_override(AgentState::ToolUse, &s), None);
+        assert_eq!(gated_override(AgentState::Active, &s), None);
     }
 
     /// No downgrade: a Hook+Strong status that AGREES coarsely with the raw working screen
-    /// does not override, so a more-specific raw `ToolUse` is never traded for vaguer `Active`.
+    /// (`Active`) does not override — the coarse baselines match, so nothing flips.
     #[test]
     fn no_downgrade_on_coarse_agreement() {
         let s = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
-        assert_eq!(gated_override(AgentState::ToolUse, &s), None);
+        assert_eq!(gated_override(AgentState::Active, &s), None);
     }
 
     /// P2 composition invariant (t-…5060-11): a raw GATE screen (`Approval` / `RateLimited`)
@@ -273,19 +270,19 @@ mod tests {
     fn observed_to_agent_state_maps_active_family_and_excludes_idle() {
         assert_eq!(
             observed_to_agent_state(ObservedState::ToolUse),
-            Some(AgentState::ToolUse)
+            Some(AgentState::Active)
         );
         assert_eq!(
             observed_to_agent_state(ObservedState::Thinking),
-            Some(AgentState::Thinking)
+            Some(AgentState::Active)
         );
         assert_eq!(
             observed_to_agent_state(ObservedState::Responding),
-            Some(AgentState::Thinking)
+            Some(AgentState::Active)
         );
         assert_eq!(
             observed_to_agent_state(ObservedState::Active),
-            Some(AgentState::Thinking)
+            Some(AgentState::Active)
         );
         assert_eq!(
             observed_to_agent_state(ObservedState::WaitingForUser),
@@ -301,7 +298,7 @@ mod tests {
     #[test]
     fn screen_signal_maps_gate_classes() {
         assert_eq!(screen_signal(AgentState::Idle), ScreenSignal::Idle);
-        assert_eq!(screen_signal(AgentState::ToolUse), ScreenSignal::Working);
+        assert_eq!(screen_signal(AgentState::Active), ScreenSignal::Working);
         assert_eq!(
             screen_signal(AgentState::PermissionPrompt),
             ScreenSignal::Approval

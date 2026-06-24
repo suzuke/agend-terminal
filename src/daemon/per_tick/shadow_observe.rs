@@ -297,10 +297,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         let badge = AgentState::from_observed_u8(byte);
         assert!(
-            matches!(
-                badge,
-                Some(AgentState::Thinking) | Some(AgentState::ToolUse)
-            ),
+            matches!(badge, Some(AgentState::Active)),
             "mid-API false-idle correction must reach the lock-free badge mirror, got {badge:?}"
         );
         shadow::forget_agent(&name);

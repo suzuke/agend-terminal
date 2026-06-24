@@ -164,8 +164,8 @@ fn agy_profile() -> BackendProfile {
                 AgentState::PermissionPrompt,
                 r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
             ),
-            (AgentState::ToolUse, r"●\s+[A-Z][a-zA-Z]+\("),
-            (AgentState::Thinking, r"esc to cancel"),
+            (AgentState::Active, r"●\s+[A-Z][a-zA-Z]+\("),
+            (AgentState::Active, r"esc to cancel"),
             (AgentState::Idle, r"\? for shortcuts"),
             (AgentState::Idle, r"Antigravity CLI|Type your message"),
         ],
@@ -221,8 +221,8 @@ fn kirocli_profile() -> BackendProfile {
                 AgentState::GitConflict,
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
-            (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
-            (AgentState::Thinking, r"Kiro is working|esc to cancel"),
+            (AgentState::Active, r"execute_bash|fs_read|fs_write"),
+            (AgentState::Active, r"Kiro is working|esc to cancel"),
             (
                 AgentState::Idle,
                 r"\d+%\s*$|ask a question or describe a task",
@@ -281,10 +281,10 @@ fn opencode_profile() -> BackendProfile {
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
             (
-                AgentState::ToolUse,
+                AgentState::Active,
                 r"✱\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b|~\s+(Reading|Writing|Editing|Searching|Listing|Globbing|Grepping)\b",
             ),
-            (AgentState::Thinking, r"esc interrupt"),
+            (AgentState::Active, r"esc interrupt"),
             (
                 AgentState::PermissionPrompt,
                 r"Update Available|Skip\s+Confirm",
@@ -358,7 +358,7 @@ fn codex_profile() -> BackendProfile {
                 AgentState::GitConflict,
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
-            (AgentState::Thinking, r"Working|esc to interrupt"),
+            (AgentState::Active, r"Working|esc to interrupt"),
             (AgentState::Idle, r"›"),
             (AgentState::Idle, r"OpenAI Codex|gpt-.*left"),
         ],
@@ -439,11 +439,11 @@ fn claudecode_profile() -> BackendProfile {
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
             (
-                AgentState::ToolUse,
+                AgentState::Active,
                 r"(?m)^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)|[✓●⏺]\s+(?:Listing|Reading|Writing|Searching|Editing))\b",
             ),
             (
-                AgentState::Thinking,
+                AgentState::Active,
                 r"(?i)[✻✢✶✳✽*·]\s*\w+\x{2026}|\w+\x{2026}\s*\((?:\d+[smh]|running )|thought for [0-9]+s",
             ),
             (AgentState::Idle, r"❯"),
@@ -555,7 +555,7 @@ mod opencode_resumed_idle_2020 {
         let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
         assert_eq!(
             patterns.detect(&working),
-            Some(AgentState::Thinking),
+            Some(AgentState::Active),
             "statusline must not outrank the working marker"
         );
     }

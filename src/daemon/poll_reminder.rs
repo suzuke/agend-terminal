@@ -476,7 +476,7 @@ mod tests {
         let home = tmp_home("collect-busy");
         let agent = "collect-busy-agent";
         seed_unread(&home, agent, 5);
-        let registry = mock_registry(agent, AgentState::Thinking);
+        let registry = mock_registry(agent, AgentState::Active);
         reset_dedup(agent);
 
         let v = collect_poll_reminders(&home, &registry);
@@ -511,7 +511,7 @@ mod tests {
                 working_dir: None,
                 submit_key: "\r".to_string(),
                 health_state: "Healthy".to_string(),
-                agent_state: "thinking".to_string(),
+                agent_state: "active".to_string(),
                 silent_secs: 0,
                 output_silent_secs: 0,
             }],

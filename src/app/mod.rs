@@ -2426,8 +2426,8 @@ mod tests {
         );
         assert_eq!(
             agent_state_of(&home, "victim").as_deref(),
-            Some("thinking"),
-            "(a)+(b) app mode wrote snapshot.json with the PROMOTED operated state (false-idle → thinking)"
+            Some("active"),
+            "(a)+(b) app mode wrote snapshot.json with the PROMOTED operated state (false-idle → active)"
         );
         assert!(
             agent_is_busy(&home, "victim"),
@@ -2475,8 +2475,8 @@ mod tests {
                 .unwrap_or_else(|| "DELETED".into())
         };
 
-        // Promoted "thinking" → SUPPRESSED across DEBOUNCE+margin scans (never mis-fires).
-        save_snap("thinking");
+        // Promoted "active" → SUPPRESSED across DEBOUNCE+margin scans (never mis-fires).
+        save_snap("active");
         let did_ok = make_overdue("corr-suppress");
         for _ in 0..5 {
             dispatch_idle::scan_and_emit(&home);

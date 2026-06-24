@@ -371,7 +371,7 @@ pub(crate) fn should_defer_inject(
     }
     // Agent actively generating → injecting now corrupts the PTY stream
     // (mid-token). Applies to BOTH classes.
-    if matches!(agent_state, Some("thinking") | Some("tool_use")) {
+    if matches!(agent_state, Some("active")) {
         return true;
     }
     if actionable {
@@ -1075,16 +1075,15 @@ mod should_defer_inject_tests_1513 {
     #[test]
     fn busy_defers_both_classes() {
         let h = tmp_home("busy");
-        for st in ["thinking", "tool_use"] {
-            assert!(
-                should_defer_inject(&h, "a", Some(st), true),
-                "actionable defers when {st}"
-            );
-            assert!(
-                should_defer_inject(&h, "a", Some(st), false),
-                "ambient defers when {st}"
-            );
-        }
+        let st = "active";
+        assert!(
+            should_defer_inject(&h, "a", Some(st), true),
+            "actionable defers when {st}"
+        );
+        assert!(
+            should_defer_inject(&h, "a", Some(st), false),
+            "ambient defers when {st}"
+        );
     }
 
     // Actionable wake must reach an agent STUCK waiting → bypass defer.
@@ -1210,8 +1209,8 @@ mod snapshot_busy_tests_1513 {
     #[test]
     fn agent_is_busy_reads_snapshot_state() {
         let h = tmp_home("busy");
-        crate::snapshot::save(&h, &[snap("a", "thinking"), snap("b", "idle")]);
-        assert!(crate::snapshot::agent_is_busy(&h, "a"), "thinking → busy");
+        crate::snapshot::save(&h, &[snap("a", "active"), snap("b", "idle")]);
+        assert!(crate::snapshot::agent_is_busy(&h, "a"), "active → busy");
         assert!(!crate::snapshot::agent_is_busy(&h, "b"), "idle → not busy");
         // missing agent / missing snapshot → fail-open (not busy)
         assert!(
@@ -1262,15 +1261,10 @@ mod should_defer_direct_inject_tests_1513pr2 {
     #[test]
     fn busy_defers_direct_inject() {
         let h = tmp_home("busy");
-        crate::snapshot::save(&h, &[snap("a", "thinking")]);
+        crate::snapshot::save(&h, &[snap("a", "active")]);
         assert!(
             should_defer_direct_inject(&h, "a"),
-            "thinking → defer direct inject"
-        );
-        crate::snapshot::save(&h, &[snap("a", "tool_use")]);
-        assert!(
-            should_defer_direct_inject(&h, "a"),
-            "tool_use → defer direct inject"
+            "active → defer direct inject"
         );
     }
 

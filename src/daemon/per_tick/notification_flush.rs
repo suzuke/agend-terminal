@@ -164,7 +164,7 @@ mod tests {
     fn busy_agent_holds_fresh_then_cap_releases() {
         let home = tmp_home("busy");
         write_fleet(&home);
-        snapshot_state(&home, "a", "thinking");
+        snapshot_state(&home, "a", "active");
 
         notification_queue::enqueue(&home, "a", "fresh").expect("enqueue fresh");
         let count = Arc::new(Mutex::new(0usize));

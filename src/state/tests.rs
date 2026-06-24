@@ -155,7 +155,7 @@ fn permission_prompt_also_expires_to_ready() {
 fn tool_use_still_uses_short_expiry() {
     // Regression guard against accidentally widening the short
     // expiry — Thinking / ToolUse should still drop at 30 s.
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 31);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 31);
     t.tick();
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -180,12 +180,12 @@ fn active_to_passive_needs_hold() {
     let backend = Backend::ClaudeCode;
 
     // Thinking held for only 1s — transition to Idle should NOT happen
-    let mut t = tracker_at(&backend, AgentState::Thinking, 1);
+    let mut t = tracker_at(&backend, AgentState::Active, 1);
     t.transition(AgentState::Idle);
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 
     // Thinking held for 3s (>= 2s active hold) — transition to Idle SHOULD happen
-    let mut t = tracker_at(&backend, AgentState::Thinking, 3);
+    let mut t = tracker_at(&backend, AgentState::Active, 3);
     t.transition(AgentState::Idle);
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -212,8 +212,8 @@ fn higher_priority_instant() {
 
     // Idle → Thinking: higher priority, should transition immediately even at 0s
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::Thinking);
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    t.transition(AgentState::Active);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 // ── #1005 Phase A2: oscillation guard ─────────────────────────────────
@@ -237,8 +237,8 @@ fn oscillation_guard_suppresses_quick_bounce_to_same_active_state() {
     // Step 1: legitimate Idle → ToolUse priority-up (first entry,
     // guard unarmed). Guard records `(ToolUse, t0)` on success.
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
-    assert_eq!(t.get_state(), AgentState::ToolUse);
+    t.transition(AgentState::Active);
+    assert_eq!(t.get_state(), AgentState::Active);
     assert!(t.last_priority_up_into.is_some());
 
     // Step 2: ToolUse held 3s (≥ 2s active min_hold). Pattern
@@ -252,7 +252,7 @@ fn oscillation_guard_suppresses_quick_bounce_to_same_active_state() {
     // Guard MUST suppress the priority-up — operator sees tracker
     // settle in Idle instead of bouncing back into ToolUse.
     t.since = Instant::now() - Duration::from_secs(1);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(
         t.get_state(),
         AgentState::Idle,
@@ -270,16 +270,16 @@ fn oscillation_guard_does_not_suppress_legitimate_re_entry() {
     let backend = Backend::ClaudeCode;
 
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     // Held 3s, then natural drop to Idle
     t.since = Instant::now() - Duration::from_secs(3);
     t.transition(AgentState::Idle);
     // Held Idle for ≥ 5s — legitimate work pause
     t.since = Instant::now() - Duration::from_secs(6);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(
         t.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "#1005 A2: priority-up after ≥ 5s lower-state hold is legitimate, must fire"
     );
 }
@@ -294,42 +294,26 @@ fn oscillation_guard_does_not_suppress_after_window() {
     let backend = Backend::ClaudeCode;
 
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     // Manually age the priority-up record past the window
     let stale = Instant::now() - Duration::from_secs(35);
-    t.last_priority_up_into = Some((AgentState::ToolUse, stale));
+    t.last_priority_up_into = Some((AgentState::Active, stale));
     // Drop to Idle, hold briefly, try priority-up again
     t.current = AgentState::Idle;
     t.since = Instant::now() - Duration::from_secs(1);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(
         t.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "#1005 A2: stale priority-up record (>30s old) must not suppress new re-entry"
     );
 }
 
-/// Phase A2 cross-state independence: a priority-up to a DIFFERENT
-/// active state isn't a bounce — bouncing between Thinking and
-/// ToolUse is legitimate task progression, not oscillation.
-#[test]
-#[serial_test::serial]
-fn oscillation_guard_does_not_suppress_different_active_state() {
-    let backend = Backend::ClaudeCode;
-
-    let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
-    t.since = Instant::now() - Duration::from_secs(3);
-    t.transition(AgentState::Idle);
-    t.since = Instant::now() - Duration::from_secs(1);
-    // Different active state — Thinking, not ToolUse
-    t.transition(AgentState::Thinking);
-    assert_eq!(
-        t.get_state(),
-        AgentState::Thinking,
-        "#1005 A2: priority-up to a DIFFERENT active state must not be suppressed"
-    );
-}
+// Phase A2 cross-state independence test REMOVED in the Thinking+ToolUse→Active
+// merge: it asserted that bouncing between the (then-distinct) Thinking and ToolUse
+// active states was legitimate progression, not oscillation. With both collapsed
+// into the single `Active` state that distinction no longer exists — re-entering
+// `Active` from `Active` IS the bounce the guard suppresses, so the scenario is gone.
 
 /// Phase A2 multi-tick simulation: the #1005 issue's actual cycle
 /// pattern. Without the guard, this loop sticks at ToolUse forever
@@ -343,23 +327,23 @@ fn oscillation_guard_multi_cycle_settles_in_idle() {
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
 
     // Cycle 1: Idle → ToolUse → Idle (each leg held briefly)
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     t.since = Instant::now() - Duration::from_secs(2);
     t.transition(AgentState::Idle);
     t.since = Instant::now() - Duration::from_secs(2);
 
     // Cycle 2: try to re-enter ToolUse (bounce) — must be suppressed
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 2 bounce");
 
     // Cycle 3: more attempts — still suppressed while within window
     t.since = Instant::now() - Duration::from_secs(2);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 3 bounce");
 
     // Cycle 4: still in window — still suppressed
     t.since = Instant::now() - Duration::from_secs(2);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 4 bounce");
 }
 
@@ -376,7 +360,7 @@ fn opencode_tilde_dash_ing_matches_tooluse() {
     t.feed("~ Reading file...");
     assert_eq!(
         t.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "#1005 A2: opencode in-flight `~ Reading…` banner must match ToolUse"
     );
 }
@@ -431,10 +415,10 @@ fn unchanged_screen_does_not_reset_last_output() {
 #[test]
 fn same_state_no_timer_reset() {
     let backend = Backend::ClaudeCode;
-    let mut t = tracker_at(&backend, AgentState::Thinking, 10);
+    let mut t = tracker_at(&backend, AgentState::Active, 10);
     let since_before = t.since;
     // Re-transition to same state — should be no-op
-    t.transition(AgentState::Thinking);
+    t.transition(AgentState::Active);
     assert_eq!(t.since, since_before);
 }
 
@@ -445,7 +429,7 @@ fn feed_fallback_expires_thinking_after_threshold() {
     // Thinking held past LATCHED_STATE_EXPIRY (30s) with no pattern
     // matching on the current screen must drop to Ready so a vanished
     // spinner cannot latch the tracker.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 31);
+    let mut t = tracker_at(&Backend::Agy, AgentState::Active, 31);
     // Fresh screen content that matches no pattern for agy.
     t.feed("some unrelated output that matches nothing");
     assert_eq!(t.get_state(), AgentState::Idle);
@@ -455,14 +439,14 @@ fn feed_fallback_expires_thinking_after_threshold() {
 fn feed_fallback_does_not_expire_before_threshold() {
     // Under the threshold Thinking must stay — legitimate thinking can
     // run for tens of seconds with a quiet but still-active spinner.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 10);
+    let mut t = tracker_at(&Backend::Agy, AgentState::Active, 10);
     t.feed("some unrelated output that matches nothing");
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
 fn feed_fallback_expires_tooluse_after_threshold() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 35);
     t.feed("no tool banner, no ready footer visible here");
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -485,7 +469,7 @@ fn feed_fallback_does_not_expire_fresh_permission_prompt() {
 fn tick_expires_stale_tool_use_without_feed() {
     // ToolUse held > 30s with no PTY output. tick() must expire it
     // to Ready without requiring feed() (which needs new screen text).
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 35);
     t.tick();
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -493,9 +477,9 @@ fn tick_expires_stale_tool_use_without_feed() {
 #[test]
 fn tick_does_not_expire_fresh_tool_use() {
     // ToolUse held < 30s should NOT be expired by tick().
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 10);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 10);
     t.tick();
-    assert_eq!(t.get_state(), AgentState::ToolUse);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -511,7 +495,7 @@ fn tick_does_not_expire_fresh_permission_prompt() {
 #[test]
 fn tick_called_twice_still_expires() {
     // Verify tick() works on repeated calls (no hash-based early return).
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 35);
     t.tick();
     assert_eq!(t.get_state(), AgentState::Idle);
     // Second tick on Ready is a no-op (Ready is not expiring).
@@ -605,14 +589,14 @@ fn feed_fallback_gated_by_hash_dedup() {
     // tracker has been latched forever — the hash dedup short-circuits
     // feed() before detection runs. Feed the same no-match text twice;
     // only the first call can possibly trigger the fallback path.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 31);
+    let mut t = tracker_at(&Backend::Agy, AgentState::Active, 31);
     t.feed("no marker");
     // Tracker already dropped to Ready on the first feed. Reset to
     // Thinking to exercise the dedup-gate specifically.
-    t.current = AgentState::Thinking;
+    t.current = AgentState::Active;
     t.since = Instant::now() - Duration::from_secs(31);
     t.feed("no marker"); // same text → hash dedup → early return
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -651,14 +635,14 @@ fn idle_never_hangs() {
 fn thinking_hang_600s() {
     let mut h = HealthTracker::new();
     assert!(!h.check_hang(
-        AgentState::Thinking,
+        AgentState::Active,
         Duration::from_secs(599),
         Duration::from_secs(0),
         1_000_000,
         0
     ));
     assert!(h.check_hang(
-        AgentState::Thinking,
+        AgentState::Active,
         Duration::from_secs(601),
         Duration::from_secs(0),
         1_000_000,
@@ -673,7 +657,7 @@ fn claude_tooluse_spinner_match() {
     let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
     // Real claude format: spinner glyph + space + tool name
     let detected = patterns.detect("⠋ Read file.txt");
-    assert_eq!(detected, Some(AgentState::ToolUse));
+    assert_eq!(detected, Some(AgentState::Active));
 }
 
 #[test]
@@ -689,7 +673,7 @@ fn claude_tooluse_record_glyph_completion_does_not_fire_per_1005() {
     let detected = patterns.detect("⏺ Write(/tmp/claude-perm-test.txt)");
     assert_ne!(
         detected,
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "#1005: `⏺ Write` completion banner must NOT fire ToolUse"
     );
 }
@@ -775,7 +759,7 @@ fn claude_tooluse_ing_verb_match() {
     ] {
         assert_eq!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "expected ToolUse for {sample:?}"
         );
     }
@@ -820,7 +804,7 @@ fn idle_detection() {
 
 #[test]
 fn context_full_instant_transition() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 0);
     t.feed("compacting context");
     assert_eq!(t.get_state(), AgentState::ContextFull);
 }
@@ -836,7 +820,7 @@ fn auth_error_instant_transition() {
 
 #[test]
 fn permission_prompt_higher_than_thinking() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 0);
     // PermissionPrompt (priority 8) > Thinking (priority 6) — instant.
     // #1546: trigger via the chrome footer (the new anchor), not bare "Allow once".
     t.feed("Esc to cancel · Tab to amend");
@@ -845,7 +829,7 @@ fn permission_prompt_higher_than_thinking() {
 
 #[test]
 fn set_restarting_transitions_state() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 5);
     t.set_restarting();
     assert_eq!(t.get_state(), AgentState::Restarting);
 }
@@ -859,7 +843,7 @@ fn error_state_is_error() {
     assert!(AgentState::ApiError.is_error());
     assert!(AgentState::Crashed.is_error());
     assert!(AgentState::Restarting.is_error());
-    assert!(!AgentState::Thinking.is_error());
+    assert!(!AgentState::Active.is_error());
     assert!(!AgentState::Idle.is_error());
     assert!(!AgentState::Starting.is_error());
 }
@@ -917,8 +901,7 @@ fn set_awaiting_operator_noop_from_non_starting() {
     for s in [
         AgentState::Idle,
         AgentState::Idle,
-        AgentState::Thinking,
-        AgentState::ToolUse,
+        AgentState::Active,
         AgentState::AwaitingOperator,
         AgentState::Crashed,
     ] {
@@ -1153,8 +1136,8 @@ fn recovery_notice_not_armed_for_unrelated_transitions() {
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     st.current = AgentState::Idle;
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
-    st.transition(AgentState::Thinking);
-    assert_eq!(st.get_state(), AgentState::Thinking);
+    st.transition(AgentState::Active);
+    assert_eq!(st.get_state(), AgentState::Active);
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
     st.transition(AgentState::Idle);
     assert_eq!(st.get_state(), AgentState::Idle);
@@ -1244,7 +1227,7 @@ fn codex_tooluse_past_tense_title_does_not_fire_per_1005() {
     for sample in ["• Explored", "• Edited", "• Ran"] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: codex past-tense title `{sample}` is completion record — must NOT fire ToolUse"
         );
     }
@@ -1273,7 +1256,7 @@ fn codex_tooluse_continuation_line_does_not_fire_per_1005() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: codex `└` continuation `{sample}` is completion record — must NOT fire ToolUse"
         );
     }
@@ -1295,7 +1278,7 @@ fn codex_tooluse_apply_patch_completion_does_not_fire_per_1005_rc1() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005 RC1: codex `apply_patch` completion / error surface must NOT fire ToolUse: {sample:?}"
         );
     }
@@ -1303,22 +1286,20 @@ fn codex_tooluse_apply_patch_completion_does_not_fire_per_1005_rc1() {
 
 #[test]
 fn codex_tooluse_does_not_false_positive_on_spinner_or_narration() {
-    // `• Working (...)` is the spinner; `• I'm reading ...` is
-    // assistant narration. Neither should fire ToolUse — pattern
-    // must only match the Explored/Edited/Ran titles and the `└`
-    // continuation line. (Codex Thinking pattern is `Thinking`
-    // which never matches the literal `Working` spinner, so these
-    // lines simply fall through to lower-priority matches or None.)
+    // `• I'm reading ...` is assistant narration: it must NOT match the
+    // tool-title pattern (`Explored/Edited/Ran` titles / the `└` continuation),
+    // so it falls through to lower-priority matches or None.
+    //
+    // (Thinking+ToolUse→Active merge: the former `• Working (...)` spinner
+    // assertion is GONE — it only proved the spinner fired the old `Thinking`
+    // producer rather than the old `ToolUse` title producer. With both collapsed
+    // into `Active`, the `Working|esc to interrupt` spinner legitimately IS
+    // `Active` and the distinction it pinned no longer exists.)
     let patterns = StatePatterns::for_backend(&Backend::Codex);
     assert_ne!(
-        patterns.detect("• Working (1s • esc to interrupt)"),
-        Some(AgentState::ToolUse),
-        "`• Working` spinner must not fire ToolUse"
-    );
-    assert_ne!(
         patterns.detect("• I'm reading README.md from the repo root"),
-        Some(AgentState::ToolUse),
-        "narration `• I'm reading ...` must not fire ToolUse"
+        Some(AgentState::Active),
+        "narration `• I'm reading ...` must not fire the tool-title Active pattern"
     );
 }
 
@@ -1389,7 +1370,7 @@ fn kiro_tooluse_banner_does_not_fire_per_1005() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: kiro `●` completion banner must NOT fire ToolUse: {sample:?}"
         );
     }
@@ -1404,7 +1385,7 @@ fn kiro_tooluse_legacy_internal_names_still_match() {
     for sample in ["execute_bash", "fs_read", "fs_write"] {
         assert_eq!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "expected ToolUse for {sample:?}"
         );
     }
@@ -1419,7 +1400,7 @@ fn pipeline_kiro_thinking_via_vterm() {
     drive(&mut vt, &mut st, b"ask a question or describe a task\r\n");
     assert_eq!(st.get_state(), AgentState::Idle);
     drive(&mut vt, &mut st, b"Kiro is working\r\n");
-    assert_eq!(st.get_state(), AgentState::Thinking);
+    assert_eq!(st.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -1457,7 +1438,7 @@ fn pipeline_opencode_thinking_via_vterm() {
         &mut st,
         b"\xe2\x96\xa0\xe2\xac\x9d\xe2\xac\x9d\xe2\xac\x9d\xe2\xac\x9d  esc interrupt   tab agents\r\n",
     );
-    assert_eq!(st.get_state(), AgentState::Thinking);
+    assert_eq!(st.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -1493,7 +1474,7 @@ fn opencode_tooluse_in_flight_banner_still_fires() {
     ] {
         assert_eq!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "in-flight banner `{sample}` must fire ToolUse"
         );
     }
@@ -1514,7 +1495,7 @@ fn opencode_tooluse_completed_banner_does_not_fire_per_1005() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: opencode `→` completion banner must NOT fire ToolUse: {sample:?}"
         );
     }
@@ -1596,8 +1577,11 @@ fn parse_state(name: &str) -> AgentState {
         "awaiting_operator" => AgentState::AwaitingOperator,
         "ready" => AgentState::Idle,
         "idle" => AgentState::Idle,
-        "tool_use" => AgentState::ToolUse,
-        "thinking" => AgentState::Thinking,
+        // Thinking + ToolUse merged into Active. The legacy fixture state names
+        // (`thinking`/`tool_use`) still parse to `Active` — they always denoted the
+        // same coarse "working" bucket (see the manifest's own "treats thinking and
+        // tool_use identically as working" notes), so the corpus needs no relabel.
+        "active" | "tool_use" | "thinking" => AgentState::Active,
         "interactive_prompt" => AgentState::InteractivePrompt,
         "permission" => AgentState::PermissionPrompt,
         "git_conflict" => AgentState::GitConflict,
@@ -1821,7 +1805,7 @@ fn corpus_measurement_smoke_f9_marker_signals() {
 fn heartbeat_fresh_overrides_permission_prompt() {
     // Pin 1 — A5 incident scenario: agent has fresh heartbeat, PTY
     // shows permission pattern → must NOT latch PermissionPrompt.
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::KiroCli, AgentState::Active, 5);
     t.update_heartbeat(Duration::from_secs(10)); // 10s ago = fresh
     t.feed("shell requires approval");
     assert_ne!(
@@ -1829,14 +1813,14 @@ fn heartbeat_fresh_overrides_permission_prompt() {
         AgentState::PermissionPrompt,
         "fresh heartbeat must suppress PermissionPrompt"
     );
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
 fn stale_heartbeat_allows_permission_prompt() {
     // Pin 2 — stale heartbeat: agent silent for 200s, PTY shows
     // permission pattern → must latch PermissionPrompt normally.
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::KiroCli, AgentState::Active, 5);
     t.update_heartbeat(Duration::from_secs(200)); // 200s ago > 120s
     t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
@@ -1845,7 +1829,7 @@ fn stale_heartbeat_allows_permission_prompt() {
 #[test]
 fn no_heartbeat_allows_permission_prompt() {
     // Pin 3 — no heartbeat ever: default behavior preserved.
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::KiroCli, AgentState::Active, 5);
     // last_heartbeat is None by default
     t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
@@ -1921,7 +1905,7 @@ fn claude_spinner_verb_triggers_thinking() {
     drive(&mut vt, &mut st, b"\xe2\x9c\xbb Cogitating\xe2\x80\xa6\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "claude spinner verb 'Cogitating' must trigger Thinking"
     );
 }
@@ -1936,7 +1920,7 @@ fn claude_thought_for_triggers_thinking() {
     drive(&mut vt, &mut st, b"thought for 12s\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "claude 'thought for Ns' must trigger Thinking"
     );
 }
@@ -1951,7 +1935,7 @@ fn kiro_working_triggers_thinking() {
     drive(&mut vt, &mut st, b"Kiro is working\r\n  esc to cancel\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "kiro 'Kiro is working' must trigger Thinking"
     );
 }
@@ -1970,7 +1954,7 @@ fn codex_working_triggers_thinking() {
     );
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "codex 'Working' or 'esc to interrupt' must trigger Thinking"
     );
 }
@@ -1982,7 +1966,7 @@ fn kiro_literal_thinking_in_chat_does_not_trigger() {
     let detected = patterns.detect("The agent was Thinking about the problem");
     assert_ne!(
         detected,
-        Some(AgentState::Thinking),
+        Some(AgentState::Active),
         "literal 'Thinking' in chat must not trigger Thinking on kiro"
     );
 }
@@ -2003,18 +1987,18 @@ fn claude_tool_banner_at_line_start_triggers_tooluse() {
     let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
     assert_ne!(
         patterns.detect("⏺ Bash(echo hi)"),
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "#1005: completion banner `⏺ Bash` is historical, not active — must NOT fire ToolUse"
     );
     assert_ne!(
         patterns.detect("⏺ Read(README.md)"),
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "#1005: completion banner `⏺ Read` is historical, not active — must NOT fire ToolUse"
     );
     // Glyph + -ing verb = in-flight progress (still active).
     assert_eq!(
         patterns.detect("● Listing files..."),
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "completion glyph + in-flight `-ing` verb = active progress, must fire ToolUse"
     );
 }
@@ -2033,7 +2017,7 @@ fn claude_chat_with_glyph_does_not_trigger_tooluse() {
     );
     assert_ne!(
         st.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "chat content with glyph + distant tool name must NOT trigger ToolUse"
     );
 }
@@ -4033,7 +4017,7 @@ fn retry_storm_recovered_below_error_lands_on_working_state_1768() {
     );
     assert_eq!(
         t.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "#1768: it lands on the working state the marker indicates"
     );
 }
@@ -4116,7 +4100,7 @@ fn usage_limit_recovered_below_error_lands_on_working_state_1777() {
     );
     assert_eq!(
         t.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "#1777: it lands on the working state the marker indicates"
     );
 }
@@ -4254,18 +4238,18 @@ fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
 #[test]
 fn record_set_buffers_transitions_fifo_then_drains() {
     let mut st = StateTracker::new(None); // starts Ready
-    st.record_set(AgentState::Thinking);
+    st.record_set(AgentState::Active);
     st.record_set(AgentState::Idle);
     let (recs, dropped) = st.drain_pending_transitions();
     assert_eq!(dropped, 0);
     assert_eq!(recs.len(), 2);
     assert_eq!(
         (recs[0].from, recs[0].to),
-        (AgentState::Idle, AgentState::Thinking)
+        (AgentState::Idle, AgentState::Active)
     );
     assert_eq!(
         (recs[1].from, recs[1].to),
-        (AgentState::Thinking, AgentState::Idle)
+        (AgentState::Active, AgentState::Idle)
     );
     assert!(!recs[0].ts.is_empty(), "ts must be captured at record time");
     assert!(
@@ -4317,7 +4301,7 @@ fn pending_transitions_bounded_drops_oldest() {
     let overflow = 5usize;
     for i in 0..(StateTracker::PENDING_TRANSITIONS_CAP + overflow) {
         let s = if i % 2 == 0 {
-            AgentState::Thinking
+            AgentState::Active
         } else {
             AgentState::Idle
         };
@@ -4527,7 +4511,7 @@ fn modal_prompt_above_live_tail_still_detected_1518() {
     assert!(
         matches!(
             st.get_state(),
-            AgentState::PermissionPrompt | AgentState::Thinking
+            AgentState::PermissionPrompt | AgentState::Active
         ),
         "#1518: a modal above the live tail must still be detected (full-screen, not bottom-N bounded), got {:?}",
         st.get_state()
@@ -4553,7 +4537,7 @@ fn claude_thinking_anchor_is_verb_agnostic_1541() {
         st.feed(frame);
         assert_eq!(
             st.get_state(),
-            AgentState::Thinking,
+            AgentState::Active,
             "#1541: unlisted-verb spinner {frame:?} must fire Thinking"
         );
     }
@@ -4571,7 +4555,7 @@ fn claude_thinking_anchor_rejects_prose_and_completion_1541() {
         st.feed(frame);
         assert_ne!(
             st.get_state(),
-            AgentState::Thinking,
+            AgentState::Active,
             "#1541: {frame:?} must NOT be misread as Thinking"
         );
     }
@@ -4586,7 +4570,7 @@ fn claude_thinking_anchor_does_not_cross_backends_1541() {
         let detected = StatePatterns::for_backend(&backend).detect(claude_frame);
         assert_ne!(
             detected,
-            Some(AgentState::Thinking),
+            Some(AgentState::Active),
             "#1541: claude sparkle anchor must not fire Thinking on {backend:?}"
         );
     }
@@ -5486,8 +5470,7 @@ fn agentstate_u8_roundtrip() {
         AgentState::Hang,
         AgentState::AwaitingOperator,
         AgentState::Idle,
-        AgentState::ToolUse,
-        AgentState::Thinking,
+        AgentState::Active,
         AgentState::InteractivePrompt,
         AgentState::PermissionPrompt,
         AgentState::GitConflict,
@@ -5557,8 +5540,7 @@ fn observed_mirror_encode_decode_roundtrip() {
     );
     // A published correction roundtrips.
     for s in [
-        AgentState::Thinking,
-        AgentState::ToolUse,
+        AgentState::Active,
         AgentState::AwaitingOperator,
         AgentState::RateLimit,
     ] {
@@ -5591,7 +5573,7 @@ fn publish_observed_never_mutates_current() {
     let published_before = t.published_handle().load(Ordering::Relaxed);
 
     // Publish a wildly different badge override.
-    t.publish_observed(Some(AgentState::ToolUse));
+    t.publish_observed(Some(AgentState::Active));
 
     assert_eq!(
         t.get_state(),

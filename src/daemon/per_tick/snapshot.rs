@@ -226,13 +226,13 @@ mod tests {
                 .agent_state
         };
 
-        // Default-ON: the high-confidence false-idle correction is promoted → "thinking".
+        // Default-ON: the high-confidence false-idle correction is promoted → "active".
         std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
         std::env::remove_var("AGEND_OBSERVED_DISPATCH");
         SnapshotRotationHandler::new().run(&ctx);
         assert_eq!(
             agent_state(&home),
-            "thinking",
+            "active",
             "operated state promotes the high-confidence observed correction"
         );
 

@@ -957,16 +957,14 @@ fn target_is_working(
             // 9-min `Bash` run — emits NO pane marker and NO MCP heartbeat, so
             // `silent_secs` climbs past the window and the silence clock alone
             // false-fired on a plainly-working agent. A genuinely HUNG
-            // thinking/tool_use is NOT dispatch-idle's job: the hang_detector owns
+            // `active` is NOT dispatch-idle's job: the hang_detector owns
             // it (`health::productive_silence_exceeds` → Hung at silent>600s).
             // active-recovery exempt = ONLY `server_rate_limit` (bounded retry +
             // #1744 exhaustion backstop); `api_error` stays NON-exempt (no
             // exhaustion signal owns it → dispatch-idle is its only watchdog,
             // codex #1775 HIGH). See the fn doc for the full rationale.
-            matches!(
-                a.agent_state.as_str(),
-                "thinking" | "tool_use" | "server_rate_limit"
-            ) || a.silent_secs < silence_threshold_secs
+            matches!(a.agent_state.as_str(), "active" | "server_rate_limit")
+                || a.silent_secs < silence_threshold_secs
                 // #1961 phase-2 (4th OR, fail-toward-suppress): the pane
                 // CONTENT changed within the window (raw screen-hash delta,
                 // `output_silent_secs`) — an activity signal that does NOT
@@ -1931,7 +1929,7 @@ mod tests {
         let home = tmp_home("p2-below-cap");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
         let id = write_pending_at(&home, "lead", "dev", Some("t-below"), "task", 600, issued);
-        write_target_snapshot(&home, "dev", "tool_use"); // target_is_working
+        write_target_snapshot(&home, "dev", "active"); // target_is_working
 
         scan_and_emit(&home);
 
@@ -1966,7 +1964,7 @@ mod tests {
         for _ in 0..REFRESH_CAP {
             bump_refresh_count(&home, &id); // already AT the extension cap
         }
-        write_target_snapshot(&home, "dev", "tool_use"); // still working
+        write_target_snapshot(&home, "dev", "active"); // still working
 
         scan_and_emit(&home);
 
@@ -2357,7 +2355,7 @@ mod tests {
         assert_eq!(p.status, DispatchStatus::Pending);
 
         // Target resumes working → streak resets to 0, still no fire.
-        write_target_snapshot(&home, "dev", "tool_use");
+        write_target_snapshot(&home, "dev", "active");
         scan_and_emit(&home);
         let p = list_pending(&home)
             .into_iter()
@@ -3347,14 +3345,14 @@ mod tests {
 
     // ── #1516: agent_state gate (don't fire while target is working) ──
 
-    /// #1694②: map the legacy state label to a productive-silence value so the
+    /// #1694②: map the state label to a productive-silence value so the
     /// pre-existing #1516/#1658 state-based tests keep their intent under the
-    /// silence-clock gate — `thinking`/`tool_use` = recently productive
+    /// silence-clock gate — `active` = recently productive
     /// (`silent_secs` 0 → working), anything else = productive-silent past any
     /// window. New silence-specific tests use [`mk_agent_snapshot_silence`].
     fn mk_agent_snapshot(name: &str, agent_state: &str) -> crate::snapshot::AgentSnapshot {
         let silent_secs = match agent_state {
-            "thinking" | "tool_use" => 0,
+            "active" => 0,
             _ => i64::MAX,
         };
         mk_agent_snapshot_silence(name, agent_state, silent_secs)
@@ -3458,16 +3456,13 @@ mod tests {
         let snap = crate::snapshot::FleetSnapshot {
             timestamp: "t".to_string(),
             agents: vec![
-                // recently productive while NOT thinking/tool_use → still working
+                // recently productive while NOT active → still working
                 mk_agent_snapshot_silence("fresh_idle", "idle", 10),
-                // #toolu-gap: a long LOCAL tool_use (9-min Bash) emits no pane
+                // #toolu-gap: a long LOCAL active span (9-min Bash) emits no pane
                 // marker / MCP heartbeat → silent_secs high, but agent_state is
-                // tool_use → WORKING. A hung one is the hang_detector's job
+                // active → WORKING. A hung one is the hang_detector's job
                 // (productive_silence_exceeds → Hung at silent>600s).
-                mk_agent_snapshot_silence("long_tool_use", "tool_use", 700),
-                // same for thinking: instantaneous-working → WORKING here; a hung
-                // thinking is the hang_detector's, not dispatch-idle's.
-                mk_agent_snapshot_silence("long_thinking", "thinking", 700),
+                mk_agent_snapshot_silence("long_active", "active", 700),
                 // active-recovery exempt: ONLY server_rate_limit (bounded retry +
                 // #1744 exhaustion backstop) → silent but exempt
                 mk_agent_snapshot_silence("rate_limited", "server_rate_limit", 700),
@@ -3480,13 +3475,9 @@ mod tests {
             "recently productive (silent<threshold) → working even when not thinking"
         );
         assert!(
-            target_is_working(Some(&snap), "long_tool_use", T),
-            "#toolu-gap: long local tool_use (silent past window, no pane/heartbeat) \
+            target_is_working(Some(&snap), "long_active", T),
+            "#toolu-gap: long local active span (silent past window, no pane/heartbeat) \
              → WORKING (instantaneous state); hang_detector owns a genuinely hung one"
-        );
-        assert!(
-            target_is_working(Some(&snap), "long_thinking", T),
-            "thinking past window → WORKING (instantaneous state); hang_detector owns hung"
         );
         assert!(
             target_is_working(Some(&snap), "rate_limited", T),
@@ -3514,7 +3505,7 @@ mod tests {
         let home = tmp_home("gate-working");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
         let id = write_pending_at(&home, "lead", "worker", Some("t-w"), "task", 600, issued);
-        crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "thinking")]);
+        crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "active")]);
 
         scan_and_emit(&home);
 
@@ -3628,8 +3619,8 @@ mod tests {
         let home = tmp_home("silence-tooluse");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(800);
         let id = write_pending_at(&home, "lead", "dev", Some("t-tu"), "task", 600, issued);
-        // tool_use AND productive-silent past the window (no pane/heartbeat output).
-        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "tool_use", 700)]);
+        // active AND productive-silent past the window (no pane/heartbeat output).
+        crate::snapshot::save(&home, &[mk_agent_snapshot_silence("dev", "active", 700)]);
 
         for _ in 0..DEBOUNCE_SCANS + 1 {
             scan_and_emit(&home);

@@ -2730,7 +2730,7 @@ mod tests {
         assert!(!AgentState::InteractivePrompt.is_notify_error_class());
         assert!(!AgentState::Idle.is_notify_error_class());
         assert!(!AgentState::Idle.is_notify_error_class());
-        assert!(!AgentState::ToolUse.is_notify_error_class());
+        assert!(!AgentState::Active.is_notify_error_class());
         assert!(!AgentState::Starting.is_notify_error_class());
     }
 
@@ -2790,7 +2790,7 @@ mod tests {
             "empty drain → no reaction"
         );
         assert!(
-            reactions_from_transitions(&[tr(AgentState::Idle, AgentState::ToolUse)]).is_empty(),
+            reactions_from_transitions(&[tr(AgentState::Idle, AgentState::Active)]).is_empty(),
             "net change to a non-error state → no reaction"
         );
     }
@@ -3099,8 +3099,7 @@ instances:
     fn awaiting_gate_non_prompt_state_never_escalates() {
         for s in [
             crate::state::AgentState::Idle,
-            crate::state::AgentState::Thinking,
-            crate::state::AgentState::ToolUse,
+            crate::state::AgentState::Active,
         ] {
             assert!(
                 !awaiting_escalation_allowed(
@@ -4960,11 +4959,10 @@ instances:
             super::clears_server_rate_limit_retry(Idle),
             "#1713: terminal-recovery state Idle must clear the retry track"
         );
-        // Everything else — incl mid-work Thinking/ToolUse and every waiting/error
+        // Everything else — incl mid-work Active and every waiting/error
         // state — must NOT clear.
         for s in [
-            Thinking,
-            ToolUse,
+            Active,
             ServerRateLimit,
             RateLimit,
             ApiError,
@@ -5841,11 +5839,8 @@ instances:
     /// observation continues it.
     #[test]
     fn thinking_transient_keeps_track_and_progress_1713() {
-        let (home, registry, _r) = one_agent_registry(
-            "ag",
-            crate::state::AgentState::Thinking,
-            "1713-thinking-keep",
-        );
+        let (home, registry, _r) =
+            one_agent_registry("ag", crate::state::AgentState::Active, "1713-thinking-keep");
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         // next_retry_at = now (DUE) — proves a due track still does NOT inject when
         // the fresh state is Thinking (the gate is state, not merely the timer).

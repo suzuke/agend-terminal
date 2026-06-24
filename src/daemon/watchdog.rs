@@ -10,10 +10,7 @@ use std::path::Path;
 /// the set-only RateLimit/QuotaExceeded health latch (mirrors the way the
 /// underlying AgentState self-expires when the throttle banner clears).
 fn recovered_from_rate_limit(state: AgentState) -> bool {
-    matches!(
-        state,
-        AgentState::Idle | AgentState::Thinking | AgentState::ToolUse
-    )
+    matches!(state, AgentState::Idle | AgentState::Active)
 }
 
 /// Parse `AGEND_WATCHDOG_DRY_RUN` env var. Returns true for "1"/"true"/"TRUE"/"True".
@@ -209,12 +206,12 @@ mod tests {
             "writing the RCA: the banner says You've hit your weekly limit · resets 4am",
             &mut health,
             false, // live
-            AgentState::Thinking,
+            AgentState::Active,
         );
 
         assert!(
             health.current_reason.is_none(),
-            "#1955: a quoted banner with gated state Thinking must not latch QuotaExceeded, got: {:?}",
+            "#1955: a quoted banner with gated state Active must not latch QuotaExceeded, got: {:?}",
             health.current_reason
         );
         std::fs::remove_dir_all(&home).ok();
@@ -268,7 +265,7 @@ mod tests {
             "Thinking about your request...\n● Read src/main.rs",
             &mut health,
             false,
-            AgentState::Thinking,
+            AgentState::Active,
         );
 
         assert!(
@@ -303,7 +300,7 @@ mod tests {
                 BlockedReason::RateLimit {
                     retry_after_secs: None,
                 },
-                AgentState::ToolUse,
+                AgentState::Active,
             ),
         ] {
             let home = tmp_home("autoclear-rl");
