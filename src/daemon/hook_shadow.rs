@@ -540,9 +540,10 @@ mod tests {
         );
     }
 
-    /// §3.9: a non-STRONG backend (no hooks fire) always uses the heuristic. In
-    /// v1 only claude is strong — agy is heuristic-only (configure_agy injects no
-    /// hooks; production-verified 0 events).
+    /// §3.9: a non-STRONG backend (no hooks fire) always uses the heuristic.
+    /// STRONG (hook) backends = claude + agy (#2413 Phase D: configure_agy now
+    /// injects `.agents/hooks.json` lifecycle hooks); their fresh hook wins over
+    /// the heuristic. Everything else (codex/opencode/kiro/shell) stays heuristic.
     #[test]
     fn backend_strength_gates_promotion() {
         record_event("codex-agent", "UserPromptSubmit", None); // → Thinking, fresh
@@ -551,12 +552,12 @@ mod tests {
             AgentState::Idle,
             "codex is not a hook backend — heuristic only"
         );
-        // agy is NOT strong in v1 — even a (manually-injected) hook is ignored.
+        // agy IS a hook backend now (#2413 Phase D) — its fresh hook wins.
         record_event("agy-agent", "UserPromptSubmit", None);
         assert_eq!(
             authoritative_state_inner(true, "agy", "agy-agent", AgentState::Idle),
-            AgentState::Idle,
-            "agy is heuristic-only in v1 (no hook injection)"
+            AgentState::Thinking,
+            "agy is a STRONG backend (#2413 Phase D) — its fresh hook wins"
         );
         // claude IS strong — its fresh hook wins.
         record_event("claude-agent", "UserPromptSubmit", None);
