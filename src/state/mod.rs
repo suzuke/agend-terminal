@@ -1498,6 +1498,22 @@ impl StateTracker {
         None
     }
 
+    /// The backend's context-telemetry capability for the LIST `context_provider`
+    /// field (#2439). DERIVED from `context_regex.is_some()` — i.e. whether the
+    /// backend declared a statusline `context_pattern` — so it is never a separately
+    /// stored field that could drift from the pattern table. Unlike
+    /// [`resolved_context`](Self::resolved_context) (absent without a fresh reading),
+    /// this is ALWAYS available: `StatusLine` means the backend CAN report context
+    /// (Claude/Kiro), `Unavailable` means it has no passive signal (Codex/OpenCode/
+    /// Agy/shell) so an absent `context_pct` is honest, not a missed read.
+    pub fn context_provider(&self) -> crate::backend_profile::ContextProvider {
+        if self.context_regex.is_some() {
+            crate::backend_profile::ContextProvider::StatusLine
+        } else {
+            crate::backend_profile::ContextProvider::Unavailable
+        }
+    }
+
     /// Feed the current vterm screen text (ANSI already resolved by the
     /// terminal emulator — caller passes plain text rows).
     ///
