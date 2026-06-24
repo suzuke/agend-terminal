@@ -415,6 +415,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // detached accept loop that exits with the process; the stale socket is cleared on
         // next bind (start_unix removes it before binding).
         crate::daemon::shadow::start(&home);
+        // #2413 Phase D: codex rollout-tail observer source (Stream plane). Owner-only +
+        // app-mode-wired for the SAME reason as shadow::start above (#2434): the live fleet
+        // daemon is app mode, so gating it run_core-only would leave codex agents' observer
+        // source dead in production. Read-only tail of ~/.codex/sessions; no-op unless the
+        // flag is on (flag-OFF default ⇒ zero behaviour change).
+        crate::daemon::shadow::rollout::spawn(Arc::clone(&registry), home.clone());
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
@@ -2256,6 +2262,28 @@ mod tests {
              region (#2413 live-fix) — gating it to run_core left the whole plane dead in \
              the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \
              #[cfg(test)] cutoff"
+        );
+    }
+
+    /// #2413 Phase D: the codex rollout-tail observer source (Stream plane) must be started
+    /// in app mode too — same #1720/#685 reasoning as the hook socket above. The live fleet
+    /// daemon is `run_app`, so gating `rollout::spawn` to run_core-only would leave codex
+    /// agents' observer source dead in production (their `observed_status` would never get
+    /// Stream evidence). Production-region scan only (the assert literal lives in the test
+    /// module below — #2434's vacuous-pin lesson). REVERSE-MUTATION verified: deleting the
+    /// real `rollout::spawn(...)` call from run_app turns this RED.
+    #[test]
+    fn run_app_wires_codex_rollout_tailer_2413() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        assert!(
+            prod.contains("crate::daemon::shadow::rollout::spawn("),
+            "run_app must spawn the codex rollout-tail observer in the PRODUCTION region \
+             (#2413 Phase D) — gating it run_core-only would leave codex agents' Stream \
+             observer dead in the app-mode live daemon. No \
+             'crate::daemon::shadow::rollout::spawn(' before the #[cfg(test)] cutoff"
         );
     }
 

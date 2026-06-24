@@ -18,6 +18,7 @@
 
 pub mod evidence;
 pub mod reducer;
+pub mod rollout;
 
 use evidence::Evidence;
 // #2433: only the unix-gated ingest path uses these — gate the imports to match so they
@@ -33,14 +34,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Per-agent evidence buffer cap — drop-oldest beyond this. A spike bound; the
-/// reducer drains far faster than hooks fire, so this only guards a never-drained
+/// reducer drains far faster than evidence fires, so this only guards a never-drained
 /// agent from unbounded growth.
-// #2433: the whole hook-INGESTION plane (socket frame → buffer push) feeds the
-// `#[cfg(unix)]` AF_UNIX server, so on a non-unix PROD build it is unreachable and would
-// trip `-D warnings` dead_code. `any(unix, test)` keeps it for unix prod + EVERY test
-// build (the platform-independent reducer/evidence tests construct hook Evidence), while
-// dropping it from non-unix prod. The reducer/driver/buffer-drain are platform-agnostic.
-#[cfg(any(unix, test))]
+// #2413 Phase D: now used cross-platform — the codex `rollout` plane (std::fs tail) pushes
+// here too, not just the `#[cfg(unix)]` hook socket. So `push`/`BUFFER_CAP` are no longer
+// unix-only and the #2433 `cfg(any(unix, test))` gate is removed (genuinely live on all
+// platforms via the rollout tailer).
 const BUFFER_CAP: usize = 256;
 
 /// One wire frame the hook emit writes to the socket (a single JSON line). Mirrors
@@ -118,10 +117,9 @@ fn buffer() -> &'static Mutex<HashMap<String, VecDeque<Evidence>>> {
     B.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Append one observation for `agent`, bounded drop-oldest at [`BUFFER_CAP`]. #2433:
-/// only the unix ingest path (+ tests) PUSHES; on non-unix prod the buffer is only ever
-/// drained (empty) by the platform-agnostic reducer, so this is gated like the plumbing.
-#[cfg(any(unix, test))]
+/// Append one observation for `agent`, bounded drop-oldest at [`BUFFER_CAP`]. #2413
+/// Phase D: pushed by BOTH the unix hook-ingest path (claude) AND the cross-platform
+/// `rollout` tailer (codex), so it is no longer unix-gated.
 pub fn push(agent: &str, ev: Evidence) {
     let mut b = buffer().lock();
     let q = b.entry(agent.to_string()).or_default();

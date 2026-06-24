@@ -107,6 +107,23 @@ impl Evidence {
             ttl_ms: 0,
         }
     }
+
+    /// A `Stream`-authority, `Strong` observation stamped at the rollout record time —
+    /// the codex rollout-tail plane's constructor (#2413 Phase D). Codex (TUI) live-flushes
+    /// its `~/.codex/sessions/.../rollout-*.jsonl` DURING a turn (confirm-first verified:
+    /// function_call/response_item records appear mid-turn), so a tailed event is a strong
+    /// real-time truth — one notch below `Hook`/`Confirmed` only because it is an
+    /// after-the-fact append-tail, not a synchronous lifecycle callback. Cross-platform
+    /// (std::fs tail, unlike the unix-socket hook plane) ⇒ no cfg gate.
+    pub fn stream(kind: EvidenceKind, at_ms: u64) -> Self {
+        Self {
+            kind,
+            authority: Authority::Stream,
+            confidence: Confidence::Strong,
+            at_ms,
+            ttl_ms: 0,
+        }
+    }
 }
 
 /// Map a claude lifecycle hook to the `EvidenceKind` it evidences, or `None` for a

@@ -159,8 +159,16 @@ pub struct AgentRuntime {
     waiting_since_ms: u64,
     /// Absolute epoch-ms the rate-limit clears (from `RateLimited.retry_at_ms`), if any.
     rate_limited_until_ms: Option<u64>,
-    /// Newest Hook-authority evidence timestamp — drives the freshness fallback.
-    last_hook_ms: u64,
+    /// Newest real-time OBSERVER-plane evidence timestamp (`Hook` for claude, `Stream` for
+    /// codex) — drives the freshness fallback. #2413 Phase D generalized this from Hook-only
+    /// so the codex rollout (`Stream`) plane gets parity; claude has ONLY `Hook`, so its
+    /// behavior is unchanged (this is `max` of Hook timestamps exactly as before).
+    last_observer_ms: u64,
+    /// Which observer plane produced that newest evidence — the authority the active-family
+    /// status is LABELED with when the observer plane is fresh (`Hook`→claude, `Stream`→
+    /// codex). `None` until any Hook/Stream evidence arrives (then the Idle/Screen fallback
+    /// labels apply). Screen/lsof/Inferred are NOT observer planes and never set this.
+    last_observer_authority: Option<Authority>,
     /// Newest `Responding` evidence — distinguishes the `Responding` refinement.
     last_responding_ms: u64,
     /// Stable-`since` bookkeeping: the last derived state + when it was entered.
@@ -174,8 +182,16 @@ impl AgentRuntime {
     /// Fold one piece of Evidence into the accumulator. Idempotent-ish: replaying the
     /// same terminal event twice is harmless (close is monotone).
     pub fn ingest(&mut self, ev: &Evidence) {
-        if ev.authority == Authority::Hook {
-            self.last_hook_ms = self.last_hook_ms.max(ev.at_ms);
+        // #2413 Phase D: track the newest REAL-TIME observer evidence + which plane it came
+        // from (`Hook`=claude lifecycle hooks, `Stream`=codex rollout tail). Generalized from
+        // the prior Hook-only `last_hook_ms.max(at_ms)`; for a claude (Hook-only) agent this
+        // is byte-identical (same max, authority always `Hook`). Screen/lsof/Inferred are not
+        // observer planes and never advance the freshness clock.
+        if matches!(ev.authority, Authority::Hook | Authority::Stream)
+            && ev.at_ms >= self.last_observer_ms
+        {
+            self.last_observer_ms = ev.at_ms;
+            self.last_observer_authority = Some(ev.authority);
         }
         match &ev.kind {
             EvidenceKind::TurnStarted => {
@@ -326,27 +342,31 @@ impl AgentRuntime {
             return (ObservedState::WaitingForUser, auth, conf);
         }
 
-        // Hook freshness: if no hook evidence in the window, the hook plane is stale —
-        // defer to the screen baseline (Weak), the conservative fallback.
-        let hook_fresh =
-            now_ms.saturating_sub(self.last_hook_ms) <= HOOK_FRESHNESS_MS && self.last_hook_ms > 0;
+        // Observer-plane freshness: if no Hook/Stream evidence in the window, the real-time
+        // observer plane is stale — defer to the screen baseline (Weak), the conservative
+        // fallback. (#2413 Phase D: generalized from Hook-only to {Hook|Stream}.)
+        let observer_fresh = now_ms.saturating_sub(self.last_observer_ms) <= HOOK_FRESHNESS_MS
+            && self.last_observer_ms > 0;
 
         // (P3/P4/P5) Active family — only if an episode/tool is open AND liveness does
         // NOT contradict it (the phantom-stuck decay). If it DOES contradict, fall to Idle.
         let active_open = self.episode_open || self.tool_open.is_some();
         if active_open && !self.reconcile_to_idle(screen, live, now_ms) {
-            // Mid-API false-idle beat: screen looks idle but a fresh hook episode + a
-            // live socket prove work in flight → keep Active. This is the headline win
-            // over raw screen-scrape.
+            // Mid-API false-idle beat: screen looks idle but a fresh observer episode (hook
+            // or stream) + a live socket prove work in flight → keep Active. This is the
+            // headline win over raw screen-scrape (now claude AND codex — #2413 Phase D).
             let mid_api_false_idle =
-                screen == ScreenSignal::Idle && hook_fresh && live.api_in_flight;
+                screen == ScreenSignal::Idle && observer_fresh && live.api_in_flight;
 
-            let authority = if hook_fresh {
-                Authority::Hook
+            let authority = if observer_fresh {
+                // Label with the plane that produced the fresh evidence: `Hook` for claude,
+                // `Stream` for codex (#2413 Phase D). Falls back to `Hook` only in the
+                // can't-happen case of observer_fresh with no recorded authority.
+                self.last_observer_authority.unwrap_or(Authority::Hook)
             } else {
                 Authority::Screen
             };
-            let confidence = if hook_fresh {
+            let confidence = if observer_fresh {
                 Confidence::Strong
             } else {
                 Confidence::Probable
@@ -387,7 +407,7 @@ impl AgentRuntime {
         }
         // Genuinely idle. Authority is the screen unless a hook PromptReady/TurnEnded
         // is what closed us — either way Idle is well-supported.
-        let conf = if hook_fresh {
+        let conf = if observer_fresh {
             Confidence::Strong
         } else {
             Confidence::Weak
@@ -442,11 +462,11 @@ impl AgentRuntime {
         //      STAYS Active no matter how long (#2433 r6 round-2) — productive-silence is
         //      the `Thinking` signature, so reconciling on it alone would re-create the
         //      very false-idle this plane exists to beat.
-        let hook_stale =
-            self.last_hook_ms > 0 && now_ms.saturating_sub(self.last_hook_ms) >= EPISODE_STALE_MS;
+        let observer_stale = self.last_observer_ms > 0
+            && now_ms.saturating_sub(self.last_observer_ms) >= EPISODE_STALE_MS;
         let last_output_ms = now_ms.saturating_sub(live.productive_silent_ms);
         let episode_produced_output = last_output_ms >= self.episode_since_ms;
-        self.tool_open.is_none() && hook_stale && episode_produced_output
+        self.tool_open.is_none() && observer_stale && episode_produced_output
     }
 }
 
@@ -565,6 +585,43 @@ mod tests {
             "live socket beats idle screen"
         );
         assert_eq!(s.authority, Authority::Hook);
+    }
+
+    /// #2413 Phase D: a codex agent observed via the `Stream` plane gets PARITY with claude
+    /// — the freshness/authority gate is generalized to {Hook|Stream}, so the active-family
+    /// status is labeled `authority=Stream` (NOT the `Screen` fallback) and the mid-API
+    /// false-idle beat fires for it too. The codex analogue of `mid_api_false_idle_stays_active`.
+    #[test]
+    fn codex_stream_evidence_gets_stream_authority_and_mid_api_beat() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::stream(EvidenceKind::TurnStarted, 1_000));
+        let s = rt.observe(ScreenSignal::Idle, &live_busy(), 1_500);
+        assert_ne!(
+            s.state,
+            ObservedState::Idle,
+            "fresh Stream episode + live socket beats idle screen (codex mid-API beat)"
+        );
+        assert_eq!(
+            s.authority,
+            Authority::Stream,
+            "codex active status is labeled Stream, not the Screen fallback"
+        );
+    }
+
+    /// #2413 Phase D guardrail: generalizing the freshness gate to {Hook|Stream} must leave
+    /// a HOOK-ONLY (claude) agent BYTE-IDENTICAL — its active status stays `authority=Hook`.
+    /// (The whole existing claude reducer suite also pins this; this is the explicit
+    /// Phase-D no-regression anchor the lead asked for.)
+    #[test]
+    fn hook_only_agent_unchanged_after_phase_d_generalization() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
+        let s = rt.observe(ScreenSignal::Idle, &live_busy(), 1_500);
+        assert_eq!(
+            s.authority,
+            Authority::Hook,
+            "claude (Hook-only) authority unaffected by the {{Hook|Stream}} generalization"
+        );
     }
 
     /// #2433 r6 REJECT (verbatim reviewer test): a dropped terminal hook + a STUCK
