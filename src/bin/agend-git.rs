@@ -188,7 +188,13 @@ fn main() {
     match action {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
-            exec_with_conflict_guidance(&strip_target_overrides(&args), &worktree);
+            exec_with_conflict_guidance(
+                &strip_target_overrides(&args),
+                &worktree,
+                &home,
+                &agent,
+                subcommand,
+            );
         }
         Action::ChdirPass(worktree) => {
             exec_real_git(&strip_target_overrides(&args), Some(&worktree))
@@ -1911,7 +1917,13 @@ fn push_trust_root_denylist_violation(worktree: &str) -> Option<String> {
 
 // ── Exec ────────────────────────────────────────────────────────────────
 
-fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
+fn exec_with_conflict_guidance(
+    args: &[String],
+    worktree: &str,
+    home: &str,
+    agent: &str,
+    subcmd: &str,
+) -> ! {
     let git = resolve_real_git();
     // #1504 L3: propagate incremented depth (rebase/merge/pull/cherry-pick reach
     // here and also spawn real git — same recursion vector as exec_real_git).
@@ -1924,7 +1936,7 @@ fn exec_with_conflict_guidance(args: &[String], worktree: &str) -> ! {
     match status {
         Ok(st) => {
             if !st.success() && has_unmerged_files(&git, worktree) {
-                eprint!("{}", format_conflict_guidance());
+                emit_conflict_guidance(home, agent, subcmd);
             }
             #[cfg(unix)]
             {
@@ -2135,6 +2147,44 @@ fn format_deny_error(
     lines
 }
 
+/// #2379 ②: the agent-facing DISPOSITION of a git_event — whether the agent must
+/// STOP or may CONTINUE. Distinct from the fleet-events envelope (`"kind":"git_event"`)
+/// and from the `event` type string; it is the single axis an agent routes its retry
+/// decision on.
+/// - `Deny` — terminal, fail-closed: the op was BLOCKED; the agent must fix + retry.
+/// - `Warn` — advisory: the op proceeded (or a non-blocking condition was flagged); the
+///   agent should heed it but is NOT blocked (e.g. merge conflict, cwd/worktree drift).
+/// - `Info` — pure record (e.g. a recognized exemption); no agent action implied.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Disposition {
+    Deny,
+    Warn,
+    Info,
+}
+
+impl Disposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Disposition::Deny => "deny",
+            Disposition::Warn => "warn",
+            Disposition::Info => "info",
+        }
+    }
+}
+
+/// #2379 ②: the SINGLE SOURCE mapping every emitted `event_type` → its [`Disposition`],
+/// so a type's disposition can never drift between call sites. An unmapped type fails
+/// CLOSED to `Deny` (an unrecognized event reads as "stop + check", never silently
+/// advisory); `disposition_for_covers_all_emitted_event_types_2379` pins every real type.
+fn disposition_for(event_type: &str) -> Disposition {
+    match event_type {
+        "deny" | "deny_trust_root" => Disposition::Deny,
+        "cwd_worktree_drift" | "git_conflict" => Disposition::Warn,
+        "post_merge_cleanup_exempt" => Disposition::Info,
+        _ => Disposition::Deny,
+    }
+}
+
 /// Sprint 57 Wave 2 Track D: structured audit-event writer with an
 /// explicit event-type discriminator. Replaces the previous untyped
 /// `write_git_event` that hardcoded `event="deny"`. `event_type` is
@@ -2142,6 +2192,10 @@ fn format_deny_error(
 /// `"post_merge_cleanup_exempt"`); `target_branch` carries the
 /// resolved checkout target when relevant for the exemption case;
 /// `detail` mirrors the human-readable reason string.
+///
+/// #2379 ②: every event also carries a `disposition` (deny|warn|info, via
+/// [`disposition_for`]) so an agent reading `fleet_events.jsonl` can route deny
+/// (must-stop) vs warn (advisory) WITHOUT re-deriving it from the `event` string.
 fn write_git_event_typed(
     home: &str,
     agent: &str,
@@ -2154,6 +2208,8 @@ fn write_git_event_typed(
     let event = serde_json::json!({
         "kind": "git_event",
         "event": event_type,
+        // #2379 ②: deny|warn|info — the agent's stop-vs-continue routing axis.
+        "disposition": disposition_for(event_type).as_str(),
         "agent": agent,
         "subcommand": subcmd,
         "target_branch": target_branch,
@@ -2183,6 +2239,23 @@ fn has_unmerged_files(git: &str, worktree: &str) -> bool {
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+/// #2379 ②: a merge conflict is a WARN, not a deny — the op ran, git left conflict
+/// markers, and the agent RESOLVES + continues (it must NOT abandon/redo). Previously
+/// this guidance was stderr-only → invisible to fleet observers; mirror it into
+/// `fleet_events.jsonl` as a `git_conflict` event (disposition=warn via `disposition_for`)
+/// for parity with deny events, then print the unchanged stderr guidance.
+fn emit_conflict_guidance(home: &str, agent: &str, subcmd: &str) {
+    write_git_event_typed(
+        home,
+        agent,
+        subcmd,
+        "git_conflict",
+        None,
+        Some("merge conflict — resolve the markers and continue (do not abandon/redo)"),
+    );
+    eprint!("{}", format_conflict_guidance());
 }
 
 fn format_conflict_guidance() -> &'static str {
@@ -2983,6 +3056,95 @@ mod tests {
             "deny reason must round-trip"
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2379 ② kind taxonomy: deny vs warn disposition ─────────────────
+
+    #[test]
+    fn disposition_for_covers_all_emitted_event_types_2379() {
+        // Pin every event_type the shim emits to its disposition (single source of
+        // truth). Reverse-mutation: flip any arm in `disposition_for` → this catches it.
+        // A new event_type added without a mapping falls to the fail-closed Deny default
+        // — add it here AND in disposition_for.
+        assert_eq!(disposition_for("deny"), Disposition::Deny);
+        assert_eq!(disposition_for("deny_trust_root"), Disposition::Deny);
+        assert_eq!(disposition_for("cwd_worktree_drift"), Disposition::Warn);
+        assert_eq!(disposition_for("git_conflict"), Disposition::Warn);
+        assert_eq!(
+            disposition_for("post_merge_cleanup_exempt"),
+            Disposition::Info
+        );
+        // Fail-closed default: an unrecognized event_type reads as terminal, not advisory.
+        assert_eq!(
+            disposition_for("some_future_unmapped_event"),
+            Disposition::Deny
+        );
+    }
+
+    #[test]
+    fn git_event_carries_disposition_field_2379() {
+        // The agent-facing routing axis must land in the JSON: deny→"deny", warn→"warn",
+        // exemption→"info". RM: drop the `"disposition"` line in write_git_event_typed
+        // (or flip disposition_for) → these fail. The envelope `kind` stays "git_event"
+        // (no collision with the new axis).
+        let home = std::env::temp_dir().join(format!(
+            "agend-git-disp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).ok();
+        let read_event = |event_type: &str| -> serde_json::Value {
+            let p = home.join("fleet_events.jsonl");
+            let _ = std::fs::remove_file(&p);
+            write_git_event_typed(
+                home.to_str().unwrap(),
+                "dev",
+                "checkout",
+                event_type,
+                None,
+                Some("x"),
+            );
+            serde_json::from_str(std::fs::read_to_string(&p).unwrap().trim()).unwrap()
+        };
+        assert_eq!(read_event("deny")["disposition"], "deny");
+        assert_eq!(read_event("deny_trust_root")["disposition"], "deny");
+        assert_eq!(read_event("cwd_worktree_drift")["disposition"], "warn");
+        assert_eq!(read_event("git_conflict")["disposition"], "warn");
+        assert_eq!(
+            read_event("post_merge_cleanup_exempt")["disposition"],
+            "info"
+        );
+        assert_eq!(read_event("deny")["kind"], "git_event");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn conflict_guidance_emits_git_conflict_warn_event_2379() {
+        // (b): a merge conflict is now mirrored into fleet_events as a WARN (was
+        // stderr-only → invisible to fleet observers). RM: drop the write_git_event_typed
+        // call in emit_conflict_guidance → no git_conflict line → this fails.
+        let home = std::env::temp_dir().join(format!(
+            "agend-git-conflict-evt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).ok();
+        emit_conflict_guidance(home.to_str().unwrap(), "dev", "rebase");
+        let content = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(v["event"], "git_conflict");
+        assert_eq!(
+            v["disposition"], "warn",
+            "a conflict is advisory (resolve + continue), not a deny"
+        );
+        assert_eq!(v["subcommand"], "rebase");
         std::fs::remove_dir_all(&home).ok();
     }
 
