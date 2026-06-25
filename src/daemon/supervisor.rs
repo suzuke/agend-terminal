@@ -4052,6 +4052,216 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ─────────────────── #2466 work-turn 529 looser-signal arm ───────────────────
+
+    /// PURE truth table for the work-turn throttle arm predicate. The arm fires ONLY with the
+    /// full conjunction; dropping any guard (the primary `blocked_rl`, the `throttle_hint`
+    /// corroboration, the `!recovered`/`!self_cleared` liveness, or the `!has_expectation`
+    /// single-ownership boundary) must turn it off. NEUTER for the integration arm below.
+    #[test]
+    fn work_turn_throttle_arm_truth_table_2466() {
+        // Full conjunction → arm.
+        assert!(
+            super::work_turn_throttle_arm(true, true, false, false, false),
+            "blocked_rl + throttle_hint + !recovered + !self_cleared + !has_expectation → arm"
+        );
+        // Each guard is load-bearing.
+        assert!(
+            !super::work_turn_throttle_arm(false, true, false, false, false),
+            "no blocked_reason=RateLimit (a bare throttle-token mention) → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, false, false, false, false),
+            "no throttle hint on screen → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, true, true, false, false),
+            "recovered (productive output) → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, true, false, true, false),
+            "self_cleared (agent awake) → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, true, false, false, true),
+            "has_expectation (owned by the recovery-turn path) → must NOT arm (single ownership)"
+        );
+    }
+
+    /// LOAD-BEARING (the dev-3 incident, real path through `process_error_recovery`): a work-turn
+    /// hit a 529/ApiError — the StateTracker `AgentState` reads Idle (the #1769 positional defeat)
+    /// but the watchdog's gate-free `classify_pty_output` latched `blocked_reason=RateLimit` and a
+    /// throttle banner is still on screen. The retry arm MUST latch a track (so a `continue` retry
+    /// fires) instead of leaving the agent hung. NEUTER: drop `|| loose_arm` from the arm branch →
+    /// state=Idle falls straight to the Idle-clear branch → no track → RED.
+    #[test]
+    fn work_turn_529_arms_retry_via_looser_signal_2466() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("wt529-arm");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        // state=Idle (NOT ServerRateLimit — the strict arm can't fire), but the looser signals
+        // that the dev-3 incident proved fired: blocked_reason=RateLimit (watchdog/classify) and a
+        // throttle banner on screen (screen_has_throttle_hint).
+        let (handle, _reader) = mock_agent_handle("wt529", crate::state::AgentState::Idle);
+        {
+            let mut core = handle.core.lock();
+            core.health
+                .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            core.vterm
+                .process(b"\r\nAPI Error: Server is temporarily limiting requests\r\n");
+        }
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        assert!(
+            tracks.contains_key("wt529"),
+            "#2466: a work-turn 529 (Idle + blocked_reason=RateLimit + throttle_hint) must arm the retry track via the looser signal"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// FP guard (real path): the loose arm must require BOTH the primary `blocked_reason=RateLimit`
+    /// AND the throttle-hint corroboration. An Idle agent with only one of the two must NOT arm —
+    /// a bare ApiError or a mere prose mention of a throttle token cannot trigger a `continue` spam.
+    #[test]
+    fn work_turn_529_partial_signal_does_not_arm_2466() {
+        let home = tmp_home("wt529-fp");
+
+        // (a) throttle hint on screen but NO blocked_reason=RateLimit (classify did not match a
+        //     real rate-limit error — just a token in prose) → must NOT arm.
+        {
+            let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+            let (handle, _r) = mock_agent_handle("fp-no-blocked", crate::state::AgentState::Idle);
+            handle
+                .core
+                .lock()
+                .vterm
+                .process(b"\r\ndiscussing the 429 limiting error in an RCA\r\n");
+            registry.lock().insert(handle.id, handle);
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                past_boot_grace(),
+            );
+            assert!(
+                !tracks.contains_key("fp-no-blocked"),
+                "#2466 FP: throttle token without blocked_reason=RateLimit must NOT arm"
+            );
+        }
+
+        // (b) blocked_reason=RateLimit but NO throttle hint on screen (banner scrolled off) →
+        //     must NOT arm (corroboration absent).
+        {
+            let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+            let (handle, _r) = mock_agent_handle("fp-no-hint", crate::state::AgentState::Idle);
+            handle
+                .core
+                .lock()
+                .health
+                .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            registry.lock().insert(handle.id, handle);
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                past_boot_grace(),
+            );
+            assert!(
+                !tracks.contains_key("fp-no-hint"),
+                "#2466 FP: blocked_reason=RateLimit without a screen throttle hint must NOT arm"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ARM/CLEAR SYNC (real path): once the throttle signal is gone (blocked_reason cleared) the
+    /// loose arm goes false, so the Idle-clear branch reclaims the track — the work-turn track does
+    /// NOT linger forever. Proves the #4 synchronization: `clears` only fires when `loose_arm` is
+    /// false, so a still-throttled Idle stays armed but a genuinely-cleared Idle clears.
+    #[test]
+    fn work_turn_529_clears_when_throttle_signal_gone_2466() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("wt529-clear");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        let (handle, _reader) = mock_agent_handle("wt529c", crate::state::AgentState::Idle);
+        {
+            let mut core = handle.core.lock();
+            core.health
+                .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            core.vterm
+                .process(b"\r\nAPI Error: Server is temporarily limiting requests\r\n");
+        }
+        let id = handle.id;
+        registry.lock().insert(id, handle);
+
+        // First pass arms the track.
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        assert!(tracks.contains_key("wt529c"), "work-turn 529 armed");
+
+        // The throttle lifts: clear the watchdog latch → blocked_rl false → loose_arm false.
+        registry
+            .lock()
+            .get(&id)
+            .expect("handle present")
+            .core
+            .lock()
+            .health
+            .clear_blocked_reason();
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        assert!(
+            !tracks.contains_key("wt529c"),
+            "#2466: once the throttle latch clears, the Idle-clear branch reclaims the work-turn track (arm/clear synchronized)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ─────────────────── #t-26795 SRL hook-override ───────────────────
 
     /// PURE truth-table + FORWARD-PROGRESS (test ②) for the hook→recovery decision:
