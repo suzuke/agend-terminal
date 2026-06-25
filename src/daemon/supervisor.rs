@@ -1653,8 +1653,15 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
 ///   `recovered_within(RECOVERY_SILENCE)`, so `!recovered` already encodes the productive-silence
 ///   requirement AND preserves the never-produced fresh-agent edge (a just-spawned agent that
 ///   immediately 529s still arms — an explicit silence threshold would wrongly block it).
-/// - `!has_expectation` — single-ownership: a daemon recovery-turn expectation is owned by the
-///   (future) expectation-keyed 529-recovery path, never double-armed here (#2466 boundary).
+///
+/// SINGLE-OWNERSHIP (decision d-20260625052109609105-0): there is NO live production recovery-arm
+/// today — `recovery_shadow` is a measure-only Phase-0 shadow that takes no action — so there is
+/// no episode for this work-turn arm to double-own. The boundary vs the (future) expectation-keyed
+/// 529-recovery is deliberately NOT enforced here: gating on `recovery_shadow`'s expectation map
+/// would let the `AGEND_RECOVERY_SHADOW=1` MEASURE-ONLY flag suppress this production arm — and a
+/// never-cleared expectation could permanently block arming — violating the shadow's zero-behavior
+/// invariant (r6 #2469). When dev-2 promotes 529-recovery to active it will carve the boundary
+/// with a PRODUCTION signal, not the shadow telemetry.
 ///
 /// StopFailure-hook corroboration is deliberately NOT required (hooks are best-effort/droppable,
 /// and would re-introduce a false-negative); it only adds confidence when present (claude).
@@ -1663,9 +1670,8 @@ fn work_turn_throttle_arm(
     has_throttle_hint: bool,
     recovered: bool,
     self_cleared: bool,
-    has_expectation: bool,
 ) -> bool {
-    blocked_rl && has_throttle_hint && !recovered && !self_cleared && !has_expectation
+    blocked_rl && has_throttle_hint && !recovered && !self_cleared
 }
 
 /// #1470 (re-scoped slice, credit @cheerc): notify an agent's team
@@ -2101,14 +2107,10 @@ pub(crate) fn process_error_recovery(
             // a work-turn 529 auto-retries instead of hanging. Threaded as an `|| loose_arm` into
             // the arm branch below so the Idle-clear branch (`clears_server_rate_limit_retry`) only
             // fires when this is FALSE — arm and clear stay synchronized on one signal (no same-tick
-            // fight). `has_expectation` keeps this disjoint from the expectation-keyed recovery path.
-            let loose_arm = work_turn_throttle_arm(
-                blocked_rl,
-                has_throttle_hint,
-                recovered,
-                self_cleared,
-                crate::daemon::recovery_shadow::has_expectation(name),
-            );
+            // fight). Single-ownership vs the future 529-recovery is left to a PRODUCTION signal
+            // (not the measure-only recovery_shadow); see `work_turn_throttle_arm`.
+            let loose_arm =
+                work_turn_throttle_arm(blocked_rl, has_throttle_hint, recovered, self_cleared);
 
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
@@ -4056,35 +4058,31 @@ instances:
 
     /// PURE truth table for the work-turn throttle arm predicate. The arm fires ONLY with the
     /// full conjunction; dropping any guard (the primary `blocked_rl`, the `throttle_hint`
-    /// corroboration, the `!recovered`/`!self_cleared` liveness, or the `!has_expectation`
-    /// single-ownership boundary) must turn it off. NEUTER for the integration arm below.
+    /// corroboration, or the `!recovered`/`!self_cleared` liveness) must turn it off. NEUTER for
+    /// the integration arm below.
     #[test]
     fn work_turn_throttle_arm_truth_table_2466() {
         // Full conjunction → arm.
         assert!(
-            super::work_turn_throttle_arm(true, true, false, false, false),
-            "blocked_rl + throttle_hint + !recovered + !self_cleared + !has_expectation → arm"
+            super::work_turn_throttle_arm(true, true, false, false),
+            "blocked_rl + throttle_hint + !recovered + !self_cleared → arm"
         );
         // Each guard is load-bearing.
         assert!(
-            !super::work_turn_throttle_arm(false, true, false, false, false),
+            !super::work_turn_throttle_arm(false, true, false, false),
             "no blocked_reason=RateLimit (a bare throttle-token mention) → must NOT arm"
         );
         assert!(
-            !super::work_turn_throttle_arm(true, false, false, false, false),
+            !super::work_turn_throttle_arm(true, false, false, false),
             "no throttle hint on screen → must NOT arm"
         );
         assert!(
-            !super::work_turn_throttle_arm(true, true, true, false, false),
+            !super::work_turn_throttle_arm(true, true, true, false),
             "recovered (productive output) → must NOT arm"
         );
         assert!(
-            !super::work_turn_throttle_arm(true, true, false, true, false),
+            !super::work_turn_throttle_arm(true, true, false, true),
             "self_cleared (agent awake) → must NOT arm"
-        );
-        assert!(
-            !super::work_turn_throttle_arm(true, true, false, false, true),
-            "has_expectation (owned by the recovery-turn path) → must NOT arm (single ownership)"
         );
     }
 

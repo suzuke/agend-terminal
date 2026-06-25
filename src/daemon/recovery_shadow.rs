@@ -84,17 +84,6 @@ pub(crate) fn arm_expectation(agent: &str) {
         .insert(agent.to_string(), crate::daemon::heartbeat_pair::now_ms());
 }
 
-/// #2466 single-ownership boundary: is a daemon recovery-turn expectation currently armed
-/// for `agent`? The #2466 work-turn SRL arm consults this so it NEVER double-owns an episode
-/// with the (future) expectation-keyed 529-recovery — that path owns `expectation==true`
-/// (a daemon-injected recovery turn that failed); the work-turn arm owns `expectation==false`.
-/// Today the expectation map is only populated when `AGEND_RECOVERY_SHADOW` is enabled (the
-/// shadow is still measure-only), so this returns `false` and the guard is inert until the
-/// recovery path goes active — the forward-compatible boundary the lead-vetted design requires.
-pub(crate) fn has_expectation(agent: &str) -> bool {
-    expectations().lock().contains_key(agent)
-}
-
 /// Drop per-agent shadow state for agents no longer live (mirror the supervisor's
 /// `retry_tracks.retain`). `()` → control-flow-inert.
 pub(crate) fn retain_live(is_live: &dyn Fn(&str) -> bool) {
