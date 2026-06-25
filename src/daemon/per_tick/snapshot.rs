@@ -40,25 +40,15 @@ impl PerTickHandler for SnapshotRotationHandler {
                 let (agent_state, health_state, silent_secs, output_silent_secs) = {
                     let c = handle.core.lock();
                     // #2413 (B): the OPERATED state — what dispatch_idle / inbox /
-                    // handoff / reply deciders read via snapshot.json. Promote the raw
-                    // screen heuristic to the Shadow Observer's HIGH-CONFIDENCE
-                    // correction (the SAME shared gate the pane badge uses, so badge and
-                    // dispatch can never diverge — #1493 class) when default-ON and a
-                    // correction applies; else the raw heuristic. `AGEND_OBSERVED_DISPATCH=0`
-                    // (or the observer kill-switch) → raw, byte-identical to pre-#2413.
-                    // NEVER writes `State::current` — the cycle-proof invariant (the
-                    // reducer's screen input stays vterm-only, so a promoted state can't
-                    // feed back into classification). Supersedes the #1523
-                    // `authoritative_state` claude-hook-only POC (multi-backend now).
+                    // handoff / reply deciders read via snapshot.json. #2465: the shared
+                    // `operated_state` helper promotes the raw screen heuristic to the
+                    // Shadow Observer's HIGH-CONFIDENCE correction (the SAME shared gate the
+                    // pane badge + the SRL/poll_reminder/reclaim/inject deciders use, so they
+                    // can never diverge — #1493 class) when ON and a correction applies; else
+                    // raw. Supersedes the #1523 `authoritative_state` claude-hook-only POC.
                     let raw = c.state.get_state();
-                    let agent_state = if crate::daemon::shadow::operated_dispatch_enabled() {
-                        c.observed_status
-                            .as_ref()
-                            .and_then(|s| crate::daemon::shadow::gate::gated_override(raw, s))
-                            .unwrap_or(raw)
-                    } else {
-                        raw
-                    };
+                    let agent_state =
+                        crate::daemon::shadow::operated_state(raw, c.observed_status.as_ref());
                     (
                         agent_state.display_name().to_string(),
                         c.health.state.display_name().to_string(),

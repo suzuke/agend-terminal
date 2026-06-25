@@ -21,7 +21,19 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
         crate::fleet::resolve_uuid(ctx.home, name)
             .and_then(|id| reg.get(&id))
             .map(|handle| {
-                let is_restarting = handle.core.lock().state.current.is_unavailable();
+                // #2465: operated (hook-primary) state so a stale Restarting screen that a
+                // fresh hook has already moved past no longer spuriously blocks an inject.
+                // `is_unavailable` = Crashed|Restarting; Crashed is a non-decisive screen the
+                // gate keeps raw, so only a false-Restarting is corrected. Lock scoped + dropped
+                // before `from_handle` to preserve the single-acquisition ordering.
+                let is_restarting = {
+                    let core = handle.core.lock();
+                    crate::daemon::shadow::operated_state(
+                        core.state.current,
+                        core.observed_status.as_ref(),
+                    )
+                    .is_unavailable()
+                };
                 (agent::InjectTarget::from_handle(handle), is_restarting)
             })
     };

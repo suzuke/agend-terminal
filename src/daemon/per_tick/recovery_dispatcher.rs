@@ -283,6 +283,9 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                     recovery_stage_state: core.health.recovery_stage_state,
                     last_stage1_fired_at: core.health.last_stage1_fired_at,
                     recovery_restart_count: core.health.recovery_restart_count,
+                    // KEEP-RAW (#2465): the recovery dispatcher is a health-state machine — feeding it
+                    // the promoted/observed state could let a stale/false 'Active' hook MASK a genuinely
+                    // stuck agent and skip its recovery escalation. Do NOT migrate to operated_state.
                     agent_state: core.state.current,
                     silent: core.state.last_output.elapsed(),
                     silent_productive: core.state.productive_silence(),

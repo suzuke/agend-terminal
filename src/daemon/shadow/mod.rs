@@ -83,6 +83,32 @@ pub fn operated_dispatch_enabled() -> bool {
     enabled() && std::env::var("AGEND_OBSERVED_DISPATCH").as_deref() != Ok("0")
 }
 
+/// #2465: the OPERATED state a daemon DECISION consumer should act on — the Shadow
+/// Observer's high-confidence correction of the raw screen heuristic when
+/// operated-dispatch is ON and a §5 correction applies (the SAME shared
+/// [`gate::gated_override`] the pane badge and the snapshot writer use, so deciders can
+/// never diverge — #1493 class), else `raw`. `AGEND_OBSERVED_DISPATCH=0` (or the observer
+/// kill-switch) ⇒ `raw`, byte-identical to pre-#2413. The single source of precedence for
+/// every (B) decision consumer (SRL retry arm/clear, poll_reminder idle filter, reclaim
+/// eligibility, API inject guard) so a hook-confirmed state that the screen mis-scrapes
+/// (e.g. ApiError-as-RateLimited read as Idle) is no longer ignored. NEVER reads or writes
+/// `State::current`: callers pass the raw heuristic in, so the reducer's screen input stays
+/// vterm-only and a promoted state can't feed back into classification (the #2413
+/// cycle-proof invariant). Health/recovery deciders deliberately do NOT use this — they must
+/// see raw to catch a stuck agent a stale 'Active' hook would mask (the inverse failure).
+pub fn operated_state(
+    raw: crate::state::AgentState,
+    observed: Option<&reducer::ObservedStatus>,
+) -> crate::state::AgentState {
+    if operated_dispatch_enabled() {
+        observed
+            .and_then(|s| gate::gated_override(raw, s))
+            .unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
 /// The per-daemon unix socket the hooks emit to. One socket for the daemon; the
 /// token attributes each frame to its agent.
 pub fn socket_path(home: &Path) -> PathBuf {

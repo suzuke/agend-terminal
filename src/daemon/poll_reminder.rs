@@ -41,7 +41,15 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
     let idle_names: Vec<String> = {
         let reg = agent::lock_registry(registry);
         reg.values()
-            .filter(|handle| handle.core.lock().state.current == AgentState::Idle)
+            // #2465: operated (hook-primary) state — a screen that mis-scrapes Idle while
+            // a fresh hook proves the agent is mid-turn no longer gets a poll nudge it
+            // shouldn't. A correction never flips TO idle, so a genuinely idle agent is
+            // unaffected; raw==operated ⇒ byte-identical to pre-#2465.
+            .filter(|handle| {
+                let c = handle.core.lock();
+                crate::daemon::shadow::operated_state(c.state.current, c.observed_status.as_ref())
+                    == AgentState::Idle
+            })
             .map(|handle| handle.name.to_string())
             .collect()
     };
