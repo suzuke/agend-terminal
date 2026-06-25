@@ -12,9 +12,12 @@
 //! ALL of: (a) `authority ∈ {Hook, Stream}` — a live lifecycle / event-stream plane, not
 //! the `Screen` baseline and not a low-confidence `Inferred` reconcile; (b) `confidence ∈
 //! {Confirmed, Strong}` — freshness is already implied (the reducer only labels a fresh
-//! observer plane this high); (c) the raw screen is NOT itself a GATE screen (`Approval` /
-//! `RateLimited`) — a human approval prompt or a rate-limit banner is authoritative and must
-//! NEVER be masked by an observed override (the operator/daemon must always see it); and
+//! observer plane this high); (c) the raw screen is not a HARD gate screen — `Approval`
+//! (human prompt), `UsageLimit` (user quota), and user `RateLimit` are authoritative and must
+//! NEVER be masked (the operator/daemon must always see them). #2470 narrowed this: a raw
+//! `ServerRateLimit` MAY be superseded, because a stale SRL banner that lingers in the tail while
+//! the agent has provably resumed (the reducer's `resumed_post_srl`) otherwise pins the badge —
+//! so it falls through to (d) and is overridden only by a fresh post-SRL Hook/Stream Active; and
 //! (d) the observed state genuinely DISAGREES with the raw screen baseline at the coarse
 //! level (the §5 correction predicate via [`screen_as_observed`]), so an agreeing-but-vaguer
 //! observed state never DOWNGRADES a more-specific raw state. `None` otherwise → the consumer
@@ -258,7 +261,11 @@ mod tests {
             Some(AgentState::Active),
             "a fresh post-SRL Hook Active must supersede a stale ServerRateLimit badge"
         );
-        let stream_tool = status(ObservedState::ToolUse, Authority::Stream, Confidence::Strong);
+        let stream_tool = status(
+            ObservedState::ToolUse,
+            Authority::Stream,
+            Confidence::Strong,
+        );
         assert_eq!(
             gated_override(AgentState::ServerRateLimit, &stream_tool),
             Some(AgentState::Active),
@@ -273,7 +280,11 @@ mod tests {
         );
         // A still-RateLimited observed (current limit, e.g. open hook window) → (d) coarse-agreement
         // → keep SRL (never mis-clear a genuine current limit).
-        let still_rl = status(ObservedState::RateLimited, Authority::Hook, Confidence::Strong);
+        let still_rl = status(
+            ObservedState::RateLimited,
+            Authority::Hook,
+            Confidence::Strong,
+        );
         assert_eq!(
             gated_override(AgentState::ServerRateLimit, &still_rl),
             None,
