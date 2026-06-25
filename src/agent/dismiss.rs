@@ -246,6 +246,49 @@ pub fn try_prepared_dismiss_dialog(
     false
 }
 
+/// #2473: states in which the agent is BLOCKED on an interactive modal that a
+/// configured `dismiss_pattern` keystroke can clear — workspace-trust prompt,
+/// update menu, tool-approval. The PTY read loop re-arms its dismiss scan for a
+/// frame in one of these states even after the startup latch has fired (see
+/// [`dismiss_scan_armed`]).
+pub(crate) fn is_dismissible_prompt_state(state: crate::state::AgentState) -> bool {
+    use crate::state::AgentState;
+    matches!(
+        state,
+        AgentState::PermissionPrompt | AgentState::InteractivePrompt | AgentState::AwaitingOperator
+    )
+}
+
+/// #2473: is the dismiss matcher ARMED for this rendered frame? (Cooldown — the
+/// rate-limit guard after a fired dismiss — is checked separately at the call
+/// site, so this stays a pure two-input arming decision plus the new-frame gate.)
+///
+/// `scan_enabled` is the STARTUP latch: it begins true (the backend ships
+/// dismiss patterns) and the read loop clears it once the agent settles
+/// (`Idle || has_productive_output()`), so a backend trust/update modal is only
+/// scanned during the launch window — the secondary defense (alongside the
+/// anchored regex) against auto-pressing a key on conversation text that merely
+/// quotes the modal phrase (#996, the 37-event fixup-lead false-positive class).
+///
+/// The bug (#2473): agy paints an "Antigravity CLI" startup banner that trips
+/// the latch BEFORE its "Do you trust this folder?" modal renders — and
+/// `has_productive_output()` is monotonic, so once tripped the latch never
+/// re-opens. The matcher therefore never scanned the modal and every fresh agy
+/// spawn hung at `prev_state=permission` awaiting an operator.
+///
+/// Fix: a `prompt_blocked` frame (the agent is in a state a `dismiss_pattern`
+/// targets — see [`is_dismissible_prompt_state`]) re-arms the scan even past the
+/// latch. This is false-positive-safe: ordinary conversation that quotes the
+/// phrase does not put the agent into PermissionPrompt/InteractivePrompt, and the
+/// keystroke only fires when the anchored backend regex ALSO matches the frame.
+pub(crate) fn dismiss_scan_armed(
+    scan_enabled: bool,
+    prompt_blocked: bool,
+    state_changed: bool,
+) -> bool {
+    state_changed && (scan_enabled || prompt_blocked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +485,120 @@ Should we add a dismiss_pattern?
              this is the surface that produced today's 37 false-positives on fixup-lead. \
              The fix is the keystroke (`\\r`, non-destructive), pinned in backend tests."
         );
+    }
+
+    // ── #2473: dismiss-scan re-arm on prompt-blocked states ──────────────
+    //
+    // Root cause: the read loop's startup latch (`dismiss_scan_enabled`) is
+    // cleared once the agent settles (`Idle || has_productive_output()`), and
+    // `has_productive_output()` is MONOTONIC. agy paints an "Antigravity CLI"
+    // banner that trips the latch BEFORE its "Do you trust this folder?" modal
+    // renders, so the matcher never scanned the modal — every fresh agy spawn
+    // hung at `prev_state=permission`. Fix: a `prompt_blocked` frame re-arms the
+    // scan past the latch. Two orthogonal defenses must BOTH hold (the DUAL
+    // reviewers' #996 boundary): the anchored regex gates "content looks like a
+    // modal", the state-gate (`dismiss_scan_armed`) gates "the timing is a real
+    // modal". The tests below cover BOTH directions of BOTH layers.
+
+    /// #2473 POSITIVE: the real agy trust modal. The startup latch is already
+    /// OFF (the banner settled the agent), but the agent is in PermissionPrompt,
+    /// so the scan RE-ARMS and the anchored regex matches the live grid → Enter
+    /// fires. This is the exact production path that was dead.
+    #[test]
+    fn agy_trust_modal_rearms_and_fires_when_prompt_blocked_2473() {
+        use crate::state::AgentState;
+        // Real agy modal rendered through VTerm (cursor `>` marker, col 0).
+        let mut vt = crate::vterm::VTerm::new(120, 30);
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(" Do you trust the contents of this folder?\r\n\r\n".as_bytes());
+        vt.process(" > Yes, I trust this folder\r\n".as_bytes());
+        vt.process("   No, exit\r\n".as_bytes());
+        let screen = vt.tail_lines(30);
+        // agy preset dismiss regex == claude's (backend.rs:642).
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
+        // Latch OFF (startup banner already tripped it) but state is PermissionPrompt.
+        let armed = dismiss_scan_armed(
+            /* scan_enabled */ false,
+            is_dismissible_prompt_state(AgentState::PermissionPrompt),
+            /* state_changed */ true,
+        );
+        assert!(
+            armed,
+            "#2473: a PermissionPrompt frame must re-arm dismiss even past the startup latch"
+        );
+        assert!(
+            armed && try_dismiss_dialog("agy", &screen, &test_writer(), &patterns),
+            "#2473: the re-armed scan must match the real agy trust modal and fire Enter. \
+             Screen:\n{screen}"
+        );
+    }
+
+    /// #2473 NEGATIVE (#996 regression): the SAME `> Yes, I trust` phrase, but as
+    /// conversation content — the agent is Idle/Active (NOT a prompt modal) and
+    /// the latch is off. The anchored regex (content layer) WOULD match, but the
+    /// state-gate (timing layer) refuses to arm → the matcher is never called,
+    /// so no Enter. This is precisely the false-positive case the DUAL reviewers
+    /// construct; both layers must hold.
+    #[test]
+    fn quoted_trust_phrase_in_non_prompt_state_does_not_rearm_996() {
+        use crate::state::AgentState;
+        let screen = "\
+[user] Filing #995 — the agy trust prompt shows:
+> Yes, I trust this folder
+  No, exit
+[claude] checking the dismiss_pattern now
+";
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
+        // Content layer: the anchored regex DOES match the quoted phrase ...
+        assert!(
+            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+            "precondition: the anchored regex matches the quoted phrase (content-layer FP surface)"
+        );
+        // ... but the timing layer refuses to arm: latch off + non-prompt state.
+        for s in [AgentState::Idle, AgentState::Active] {
+            assert!(
+                !dismiss_scan_armed(false, is_dismissible_prompt_state(s), true),
+                "#996: {s:?} + latched-off must NOT re-arm — no scan, no Enter, \
+                 despite the matching phrase on screen"
+            );
+        }
+    }
+
+    /// #2473: the arming-decision matrix + the state classification, both
+    /// directions. Pins which states re-arm (exactly those a `dismiss_pattern`
+    /// targets) and the frame/latch gating.
+    #[test]
+    fn dismiss_scan_arming_matrix_2473() {
+        use crate::state::AgentState::*;
+        // Startup window: latch ON + a new frame → armed.
+        assert!(dismiss_scan_armed(true, false, true));
+        // No new frame (dedup hit) → never armed, even if prompt-blocked — a
+        // cursor-blink redraw that doesn't change the dewrapped tail must not rescan.
+        assert!(!dismiss_scan_armed(true, true, false));
+        assert!(!dismiss_scan_armed(false, true, false));
+        // Steady-state after startup: latch off + non-prompt → off.
+        assert!(!dismiss_scan_armed(false, false, true));
+        // Latch off + prompt-blocked → RE-ARMED (#2473 core).
+        assert!(dismiss_scan_armed(false, true, true));
+        // Exactly the states a dismiss_pattern targets re-arm; nothing else does.
+        for s in [PermissionPrompt, InteractivePrompt, AwaitingOperator] {
+            assert!(is_dismissible_prompt_state(s), "{s:?} must re-arm dismiss");
+        }
+        for s in [
+            Idle,
+            Active,
+            Starting,
+            Hang,
+            RateLimit,
+            ServerRateLimit,
+            UsageLimit,
+            Crashed,
+        ] {
+            assert!(
+                !is_dismissible_prompt_state(s),
+                "{s:?} must NOT re-arm dismiss (would reopen the #996 false-positive surface)"
+            );
+        }
     }
 
     #[test]

@@ -18,7 +18,10 @@ use std::sync::Arc;
 mod dismiss;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
-use dismiss::{prepare_dismiss_patterns, try_prepared_dismiss_dialog, PreparedDismissPattern};
+use dismiss::{
+    dismiss_scan_armed, is_dismissible_prompt_state, prepare_dismiss_patterns,
+    try_prepared_dismiss_dialog, PreparedDismissPattern,
+};
 
 pub mod deleting;
 
@@ -1795,7 +1798,7 @@ fn ephemeral_pty_read_loop(
                 // Feed VTerm + state detection under one lock — the SAME disjoint
                 // field-borrow block as `pty_read_loop`, MINUS the broadcast (no
                 // subscribers). Kept byte-identical to avoid state-detection drift.
-                let (screen, state_changed, dismiss_latch_off) = {
+                let (screen, state_changed, dismiss_latch_off, prompt_blocked) = {
                     let mut c = core.lock();
                     let AgentCore { vterm, state, .. } = &mut *c;
                     vterm.process(data);
@@ -1803,17 +1806,19 @@ fn ephemeral_pty_read_loop(
                     let screen = vterm.tail_lines_dewrapped(rows);
                     let state_changed =
                         state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+                    let cur = state.get_state();
                     let dismiss_latch_off = state_changed
-                        && (state.get_state() == crate::state::AgentState::Idle
-                            || state.has_productive_output());
-                    (screen, state_changed, dismiss_latch_off)
+                        && (cur == crate::state::AgentState::Idle || state.has_productive_output());
+                    // #2473: re-arm dismiss for a prompt-blocked frame even past
+                    // the startup latch (kept in sync with `pty_read_loop`).
+                    let prompt_blocked = is_dismissible_prompt_state(cur);
+                    (screen, state_changed, dismiss_latch_off, prompt_blocked)
                 };
 
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
-                if dismiss_scan_enabled
-                    && state_changed
+                if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
                     && !in_cooldown
                     && try_prepared_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns)
                 {
@@ -2124,7 +2129,7 @@ fn pty_read_loop(
                 // post-render means we match what the user actually sees —
                 // Ink-style TUIs that draw char-by-char with cursor positioning
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
-                let (screen, state_changed, dismiss_latch_off) = {
+                let (screen, state_changed, dismiss_latch_off, prompt_blocked) = {
                     let mut c = core.lock();
                     // Disjoint field borrows so the lazy-fg closure may read
                     // `vterm` while `state` is borrowed mutably (both fields of
@@ -2152,18 +2157,21 @@ fn pty_read_loop(
                     let screen = vterm.tail_lines_dewrapped(rows);
                     let state_changed =
                         state.feed_with_lazy_fg(&screen, || vterm.tail_lines_with_fg(rows).1);
+                    let cur = state.get_state();
                     let dismiss_latch_off = state_changed
-                        && (state.get_state() == crate::state::AgentState::Idle
-                            || state.has_productive_output());
+                        && (cur == crate::state::AgentState::Idle || state.has_productive_output());
+                    // #2473: a prompt-blocked frame re-arms the dismiss scan even
+                    // past the startup latch — agy's banner trips the latch before
+                    // its trust modal renders. See `dismiss_scan_armed`.
+                    let prompt_blocked = is_dismissible_prompt_state(cur);
                     broadcast_pty_output(subscribers, data, &mut dropped_chunks, name);
-                    (screen, state_changed, dismiss_latch_off)
+                    (screen, state_changed, dismiss_latch_off, prompt_blocked)
                 };
 
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
-                if dismiss_scan_enabled
-                    && state_changed
+                if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
                     && !in_cooldown
                     && try_prepared_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns)
                 {
