@@ -394,8 +394,8 @@ impl AgentRuntime {
         // which would mis-clear a still-rate-limited agent once the latch expires. `last_progress_ms`
         // is advanced only by lifecycle/progress evidence (see `ingest`), so a banner with only stale
         // progress + late TokenUsage stays RateLimited.
-        let progress_fresh =
-            self.last_progress_ms > 0 && now_ms.saturating_sub(self.last_progress_ms) <= HOOK_FRESHNESS_MS;
+        let progress_fresh = self.last_progress_ms > 0
+            && now_ms.saturating_sub(self.last_progress_ms) <= HOOK_FRESHNESS_MS;
         let resumed_post_srl = progress_fresh && self.episode_open && !hook_rate_limit_current;
         let rate_limited =
             hook_rate_limit_current || (screen == ScreenSignal::RateLimited && !resumed_post_srl);
@@ -932,8 +932,8 @@ mod tests {
             EvidenceKind::RateLimited { retry_at_ms: None },
             2_000,
         )); // latch set @ 2_000
-        // A LATE accounting-only TokenUsage advances last_observer_ms (props observer_fresh) but
-        // is NOT progress and does NOT clear the latch.
+            // A LATE accounting-only TokenUsage advances last_observer_ms (props observer_fresh) but
+            // is NOT progress and does NOT clear the latch.
         rt.ingest(&Evidence::stream(
             EvidenceKind::TokenUsage {
                 input: 10,
