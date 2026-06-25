@@ -397,7 +397,16 @@ impl PerTickHandler for ReclaimHandler {
             for handle in reg.values() {
                 let name = handle.name.as_str().to_string();
                 let core = handle.core.lock();
-                let state = core.state.current;
+                // #2465: routed through operated_state for single-source consistency (#1493) —
+                // INERT here today (no behavioral change). The observer never promotes TO
+                // UsageLimit, gate(c) keeps a raw usage / rate-limit screen authoritative, and
+                // Idle/Active share reclaim-eligibility, so the UsageLimit trigger is unchanged;
+                // it would only diverge for a cross-coarse Hook/Stream correction. (poll_reminder
+                // is the one consumer in this PR that sees a real behavioral change.)
+                let state = crate::daemon::shadow::operated_state(
+                    core.state.current,
+                    core.observed_status.as_ref(),
+                );
                 let quota = matches!(
                     core.health.current_reason,
                     Some(crate::health::BlockedReason::QuotaExceeded)

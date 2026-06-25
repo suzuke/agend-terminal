@@ -83,6 +83,41 @@ pub fn operated_dispatch_enabled() -> bool {
     enabled() && std::env::var("AGEND_OBSERVED_DISPATCH").as_deref() != Ok("0")
 }
 
+/// #2465: the OPERATED state a daemon DECISION consumer should act on — the Shadow
+/// Observer's high-confidence correction of the raw screen heuristic when
+/// operated-dispatch is ON and a §5 correction applies (the SAME shared
+/// [`gate::gated_override`] the pane badge and the snapshot writer use, so deciders can
+/// never diverge — #1493 class), else `raw`. `AGEND_OBSERVED_DISPATCH=0` (or the observer
+/// kill-switch) ⇒ `raw`, byte-identical to pre-#2413. The single source of precedence for
+/// the (B) decision consumers that DO route through it — the snapshot writer, the
+/// `poll_reminder` idle filter, `reclaim` eligibility, and the API inject guard — so a fresh
+/// high-confidence Hook/Stream correction (e.g. a screen mis-scraped Idle while the agent is
+/// actually mid-turn) is no longer ignored. NEVER reads or writes `State::current`: callers
+/// pass the raw heuristic in, so the reducer's screen input stays vterm-only and a promoted
+/// state can't feed back into classification (the #2413 cycle-proof invariant).
+///
+/// Deliberately NOT used by (so this list is the auditable scope of the routing):
+/// - **the SRL retry arm/clear** (`supervisor.rs`) — it still gates on raw `core.state.current`.
+///   claude hooks never emit `RateLimited` (`evidence.rs` — a `StopFailure` maps to
+///   `TurnEnded`/`ApiError`, the API plane owns rate-limit), so `observed` carries NO rate-limit
+///   signal to route there; migrating it would be inert for the ApiError-as-rate-limit stuck
+///   case (operated stays Idle). That real fix is the follow-up #2466.
+/// - **the health/recovery deciders** (hang_detection / watchdog / recovery_dispatcher /
+///   respawn_watchdog) — they must see raw to catch a stuck agent a stale 'Active' hook would
+///   mask (the inverse failure; each carries a `// KEEP-RAW (#2465)` rationale at its call site).
+pub fn operated_state(
+    raw: crate::state::AgentState,
+    observed: Option<&reducer::ObservedStatus>,
+) -> crate::state::AgentState {
+    if operated_dispatch_enabled() {
+        observed
+            .and_then(|s| gate::gated_override(raw, s))
+            .unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
 /// The per-daemon unix socket the hooks emit to. One socket for the daemon; the
 /// token attributes each frame to its agent.
 pub fn socket_path(home: &Path) -> PathBuf {

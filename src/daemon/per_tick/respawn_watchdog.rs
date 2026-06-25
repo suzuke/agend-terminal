@@ -214,6 +214,9 @@ impl PerTickHandler for RespawnWatchdogHandler {
                 if core.health.state == HealthState::Paused {
                     continue;
                 }
+                // KEEP-RAW (#2465): respawn-stuck detection is a recovery safety net — feeding it the
+                // promoted/observed state could let a stale/false 'Active' hook MASK a genuinely stuck
+                // (never-resumed) agent and suppress its respawn. Do NOT migrate to operated_state.
                 let state = core.state.current;
                 let since_elapsed = core.state.since.elapsed();
                 let silent = core.state.last_output.elapsed();

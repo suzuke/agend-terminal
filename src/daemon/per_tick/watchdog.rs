@@ -53,6 +53,9 @@ impl PerTickHandler for WatchdogHandler {
             let screen = core.vterm.tail_lines(rows);
             // bughunt2: pass the live AgentState so run_watchdog_pass can
             // auto-clear a stale rate-limit/quota latch on recovery.
+            // KEEP-RAW (#2465): the watchdog is a health/recovery safety net — feeding it the
+            // promoted/observed state could let a stale/false 'Active' hook MASK a genuinely
+            // stuck agent. Do NOT migrate to operated_state.
             let current_state = core.state.current;
             crate::daemon::watchdog::run_watchdog_pass(
                 ctx.home,
