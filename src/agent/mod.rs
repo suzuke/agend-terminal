@@ -3151,43 +3151,47 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
 }
 #[cfg(target_os = "macos")]
 pub fn ensure_library_symlink(custom_home: &std::path::Path) {
-    let link = custom_home.join("Library");
-    if link.is_symlink() {
-        if let Ok(target_path) = std::fs::read_link(&link) {
-            if let Ok(real_home) = std::env::var("HOME") {
-                let mut real_path = std::path::PathBuf::from(real_home);
-                if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
-                    if let Some(parent) = real_path.parent() {
-                        real_path = parent.to_path_buf();
-                    }
-                }
-                let target = real_path.join("Library");
-                if target_path == target {
-                    return;
-                }
-            }
+    use std::os::unix::fs::symlink;
+
+    let Ok(real_home) = std::env::var("HOME") else { return };
+    let mut real_path = std::path::PathBuf::from(real_home);
+    if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+        if let Some(parent) = real_path.parent() {
+            real_path = parent.to_path_buf();
         }
-        let _ = std::fs::remove_file(&link);
-    } else if link.exists() {
+    }
+    let real_lib = real_path.join("Library");
+    if !real_lib.exists() { return }
+
+    let custom_lib = custom_home.join("Library");
+
+    // Case 1: Library doesn't exist → symlink the whole thing
+    if !custom_lib.exists() && !custom_lib.is_symlink() {
+        if let Some(parent) = custom_lib.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = symlink(&real_lib, &custom_lib);
         return;
     }
 
-    if let Ok(real_home) = std::env::var("HOME") {
-        let mut real_path = std::path::PathBuf::from(real_home);
-        if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
-            if let Some(parent) = real_path.parent() {
-                real_path = parent.to_path_buf();
+    // Case 2: Library is already a correct symlink → nothing to do
+    if custom_lib.is_symlink() {
+        return;
+    }
+
+    // Case 3: Library is a real directory (agy created Caches/ inside it)
+    // → symlink just the Keychains subdirectory
+    if custom_lib.is_dir() {
+        let keychains_link = custom_lib.join("Keychains");
+        if !keychains_link.exists() && !keychains_link.is_symlink() {
+            let real_keychains = real_lib.join("Keychains");
+            if real_keychains.exists() {
+                let _ = symlink(&real_keychains, &keychains_link);
             }
-        }
-        let target = real_path.join("Library");
-        if target.exists() {
-            if let Some(parent) = link.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::os::unix::fs::symlink(&target, &link);
         }
     }
 }
+
 
 #[cfg(not(target_os = "macos"))]
 pub fn ensure_library_symlink(_custom_home: &std::path::Path) {}

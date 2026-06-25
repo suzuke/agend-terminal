@@ -2987,3 +2987,69 @@ fn test_ensure_library_symlink_macos() {
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
+#[test]
+#[cfg(target_os = "macos")]
+fn test_ensure_library_symlink_real_dir_macos() {
+    let temp_dir = std::env::temp_dir().join(format!("ensure-symlink-dir-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create a real directory for Library
+    let custom_lib = temp_dir.join("Library");
+    std::fs::create_dir_all(&custom_lib).unwrap();
+
+    super::ensure_library_symlink(&temp_dir);
+
+    // custom_lib should still be a directory (Case 3)
+    assert!(custom_lib.is_dir() && !custom_lib.is_symlink());
+
+    // keychains_link should be a symlink (if the real Keychains exists)
+    let keychains_link = custom_lib.join("Keychains");
+    
+    // Let's resolve real_path and real_lib
+    if let Ok(real_home) = std::env::var("HOME") {
+        let mut real_path = std::path::PathBuf::from(real_home);
+        if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+            if let Some(parent) = real_path.parent() {
+                real_path = parent.to_path_buf();
+            }
+        }
+        let real_keychains = real_path.join("Library").join("Keychains");
+        if real_keychains.exists() {
+            assert!(keychains_link.is_symlink());
+            if let Ok(target) = std::fs::read_link(&keychains_link) {
+                assert_eq!(target, real_keychains);
+            } else {
+                panic!("Keychains path is not a resolved link");
+            }
+        }
+    }
+
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_ensure_library_symlink_existing_symlink_macos() {
+    let temp_dir = std::env::temp_dir().join(format!("ensure-symlink-exist-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create a symlink pointing somewhere else
+    let custom_lib = temp_dir.join("Library");
+    let dummy_target = temp_dir.join("Dummy");
+    std::fs::create_dir_all(&dummy_target).unwrap();
+    std::os::unix::fs::symlink(&dummy_target, &custom_lib).unwrap();
+
+    super::ensure_library_symlink(&temp_dir);
+
+    // In Case 2: Library 已是 symlink → 不動
+    // So custom_lib should still point to dummy_target
+    assert!(custom_lib.is_symlink());
+    let target = std::fs::read_link(&custom_lib).unwrap();
+    assert_eq!(target, dummy_target);
+
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+
