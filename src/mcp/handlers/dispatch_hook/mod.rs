@@ -499,22 +499,22 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // scan_existing_branch_binding) key on binding.json, NOT the worktree path,
     // so this swap leaves concurrency serialized exactly as before.
     let workspace_b = crate::worktree_pool::workspace_as_worktree_enabled(target);
-    let map_lease_err = |msg: String| {
-        // stringly-allow: the lease layer returns an anyhow string; this is the
-        // SINGLE boundary that classifies it into the typed `ErrorCode`. Consumers
-        // (e.g. worktree.rs bind_self) dispatch on `err.code`, not the message.
-        let code = if msg.contains("E4.5") {
+    // Build a lease-reject DispatchError from a PRE-classified `protected` flag +
+    // message. The two lease sinks classify differently: the typed `lease` path
+    // uses `LeaseError::is_protected_branch()` (a variant check — finding D+H, no
+    // stringly probe); the workspace-prepare path still returns an anyhow string,
+    // classified by `contains("E4.5")` at its call site (`bind_self` dispatches on
+    // `err.code`, not the message).
+    let lease_err = |protected: bool, msg: String| DispatchError {
+        message: msg.clone(),
+        code: if protected {
             ErrorCode::ProtectedBranch
         } else {
             ErrorCode::LeaseConflict
-        };
-        DispatchError {
-            message: msg.clone(),
-            code,
-            stage: Stage::WorktreeLeaseConflict,
-            fetch_attempted,
-            raw: Some(msg),
-        }
+        },
+        stage: Stage::WorktreeLeaseConflict,
+        fetch_attempted,
+        raw: Some(msg),
     };
     let wt_path = if let Some(wt) = reuse_live_worktree {
         wt // #2158 partial-skip: reuse verbatim — NO lease/`sync_worktree_to_head` reset (wipe)
@@ -522,28 +522,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
         // backed up before --force) → in-place checkout. Encapsulated helper.
         crate::worktree_pool::prepare_workspace_worktree(home, target, &source_repo, branch)
-            .map_err(map_lease_err)?
+            .map_err(|m| lease_err(m.contains("E4.5"), m))?
     } else {
         // Legacy: lease a fresh per-branch worktree. Lease errors REJECT (Q2 §3.3).
-        // #D+H: lease now returns a TYPED `LeaseError`; classify its variants into
-        // the dispatch `ErrorCode` directly (same mapping the stringly
-        // `map_lease_err` produced: E4.5 → ProtectedBranch, else → LeaseConflict).
-        let lease =
-            crate::worktree_pool::lease(home, &source_repo, target, branch).map_err(|e| {
-                let code = match e {
-                    crate::worktree_pool::LeaseError::ProtectedBranch(_) => {
-                        ErrorCode::ProtectedBranch
-                    }
-                    crate::worktree_pool::LeaseError::CreateFailed(_) => ErrorCode::LeaseConflict,
-                };
-                DispatchError {
-                    message: e.to_string(),
-                    code,
-                    stage: Stage::WorktreeLeaseConflict,
-                    fetch_attempted,
-                    raw: Some(e.to_string()),
-                }
-            })?;
+        // #D+H: lease returns a TYPED `LeaseError` — classify by variant, not string.
+        let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)
+            .map_err(|e| lease_err(e.is_protected_branch(), e.to_string()))?;
         // Clean empty "init" commits left by kiro-cli session checkpoints.
         // Best-effort: failure is non-fatal. #789 silent `.ok()` semantic.
         let _ = clean_empty_init_commits(&lease.path).ok();

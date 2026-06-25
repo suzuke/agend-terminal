@@ -37,6 +37,14 @@ pub enum LeaseError {
     /// `worktree::create` failed (not a git repo / invalid name / git worktree add / checkout).
     CreateFailed(String),
 }
+impl LeaseError {
+    /// `true` only for the E4.5 protected-branch variant — the dispatch boundary
+    /// maps this to a distinct `ErrorCode` (vs the generic lease conflict), via a
+    /// TYPED variant check rather than a stringly `msg.contains("E4.5")`.
+    pub fn is_protected_branch(&self) -> bool {
+        matches!(self, LeaseError::ProtectedBranch(_))
+    }
+}
 impl std::fmt::Display for LeaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
