@@ -160,6 +160,16 @@ pub struct AgentRuntime {
     waiting_since_ms: u64,
     /// Absolute epoch-ms the rate-limit clears (from `RateLimited.retry_at_ms`), if any.
     rate_limited_until_ms: Option<u64>,
+    /// #2470 (r6): "currently rate-limited" latch from a `RateLimited` EVIDENCE, independent of the
+    /// `retry_at_ms` timestamp. opencode emits `RateLimited{retry_at_ms: None}` per retry
+    /// (opencode.rs `session.status{retry}`), so the `rate_limited_until_ms > now` window alone
+    /// MISSES a live opencode rate-limit. Set on any `RateLimited` evidence, CLEARED by any newer
+    /// lifecycle/progress evidence (turn/tool/responding/idle) — i.e. a rate-limit stays "current"
+    /// until a fresh recovery signal supersedes it, so a mid-retry agent is NEVER mis-cleared.
+    rate_limit_active: bool,
+    /// Epoch-ms of the newest `RateLimited` evidence — bounds `rate_limit_active` to the observer
+    /// freshness window (a long-silent latch expires → screen baseline takes over, as elsewhere).
+    last_rate_limit_evidence_ms: u64,
     /// Newest real-time OBSERVER-plane evidence timestamp (`Hook` for claude, `Stream` for
     /// codex) — drives the freshness fallback. #2413 Phase D generalized this from Hook-only
     /// so the codex rollout (`Stream`) plane gets parity; claude has ONLY `Hook`, so its
@@ -193,6 +203,16 @@ impl AgentRuntime {
         {
             self.last_observer_ms = ev.at_ms;
             self.last_observer_authority = Some(ev.authority);
+        }
+        // #2470 (r6): a `RateLimited` evidence latches "currently rate-limited"; ANY other
+        // lifecycle/progress evidence (turn/tool/responding/idle/approval) is a NEWER recovery
+        // signal that supersedes it. `TokenUsage` is accounting-only (no lifecycle meaning) and
+        // must NOT count as recovery.
+        if !matches!(
+            ev.kind,
+            EvidenceKind::RateLimited { .. } | EvidenceKind::TokenUsage { .. }
+        ) {
+            self.rate_limit_active = false;
         }
         match &ev.kind {
             EvidenceKind::TurnStarted => {
@@ -229,6 +249,10 @@ impl AgentRuntime {
             }
             EvidenceKind::RateLimited { retry_at_ms } => {
                 self.rate_limited_until_ms = *retry_at_ms;
+                // #2470 (r6): latch "currently rate-limited" even when `retry_at_ms` is None
+                // (opencode's retry status) — the window check alone would miss it.
+                self.rate_limit_active = true;
+                self.last_rate_limit_evidence_ms = ev.at_ms;
             }
             EvidenceKind::Responding => {
                 self.last_responding_ms = ev.at_ms;
@@ -333,15 +357,24 @@ impl AgentRuntime {
         // `episode_open == false` since StopFailure→close_episode) stays RateLimited. The gate
         // (shadow::gate) keeps UsageLimit / Approval authoritative regardless — only the
         // ServerRateLimit *raw* is allowed to be superseded by this resumed-active observed.
-        let hook_rate_limit_current = self
+        let hook_rate_limit_window = self
             .rate_limited_until_ms
             .is_some_and(|until| until > now_ms);
+        // #2470 (r6): a fresh `RateLimited` EVIDENCE latch is ALSO a current limit — covers
+        // opencode's `retry_at_ms: None` retry status the window check misses. Bounded to the
+        // observer freshness window AND cleared by any newer recovery signal (see `ingest`), so a
+        // mid-retry agent stays RateLimited but a genuinely-resumed one (newer turn/output) does not.
+        let rate_limit_evidence_current = self.rate_limit_active
+            && now_ms.saturating_sub(self.last_rate_limit_evidence_ms) <= HOOK_FRESHNESS_MS;
+        let hook_rate_limit_current = hook_rate_limit_window || rate_limit_evidence_current;
         let resumed_post_srl = observer_fresh && self.episode_open && !hook_rate_limit_current;
         let rate_limited =
             hook_rate_limit_current || (screen == ScreenSignal::RateLimited && !resumed_post_srl);
         if rate_limited {
+            // A hook/stream-confirmed limit is labeled with its observer plane; a screen-only
+            // banner is `Screen`.
             let auth = if hook_rate_limit_current {
-                Authority::Hook
+                self.last_observer_authority.unwrap_or(Authority::Hook)
             } else {
                 Authority::Screen
             };
@@ -822,6 +855,38 @@ mod tests {
         rt.ingest(&hook(EvidenceKind::ApprovalRequired, 1_050));
         let s = rt.observe(ScreenSignal::Working, &live_busy(), 1_100);
         assert_eq!(s.state, ObservedState::WaitingForUser);
+    }
+
+    /// #2470 (r6 finding): an opencode mid-retry emits `RateLimited{retry_at_ms: None}`
+    /// (session.status{retry}) while a turn is still open — a CURRENT limit that must NOT be
+    /// mis-cleared as a "stale SRL the agent moved past". The window check
+    /// (`rate_limited_until_ms > now`) alone misses the None case; the `rate_limit_active` latch
+    /// catches it, and only a NEWER recovery signal supersedes it. NEUTER: drop the latch from
+    /// `hook_rate_limit_current` and the first assert flips to Active (mis-clear) → RED.
+    #[test]
+    fn opencode_retry_rate_limit_not_mis_cleared_2470() {
+        // Turn opened (Stream plane), then rate-limited and RETRYING (retry_at None); episode open.
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::stream(EvidenceKind::TurnStarted, 1_000));
+        rt.ingest(&Evidence::stream(
+            EvidenceKind::RateLimited { retry_at_ms: None },
+            1_100,
+        ));
+        let s = rt.observe(ScreenSignal::RateLimited, &live_busy(), 1_200);
+        assert_eq!(
+            s.state,
+            ObservedState::RateLimited,
+            "#2470 r6: a mid-retry opencode (RateLimited retry_at=None + open episode) must NOT be mis-cleared"
+        );
+
+        // Recovery: a NEWER progress signal (Responding) supersedes the latch → reconciles to active.
+        rt.ingest(&Evidence::stream(EvidenceKind::Responding, 1_300));
+        let s = rt.observe(ScreenSignal::RateLimited, &live_busy(), 1_400);
+        assert_ne!(
+            s.state,
+            ObservedState::RateLimited,
+            "#2470: a NEWER recovery signal supersedes the rate-limit latch (no longer current)"
+        );
     }
 
     /// `since_ms` is stable while the state holds, and resets when it changes.
