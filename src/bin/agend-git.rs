@@ -220,6 +220,29 @@ fn main() {
                 );
                 std::process::exit(1);
             }
+            // #2379 S3: deny a push that could write a protected ref (hardcode main|master ∪
+            // the signed policy.toml override) — across the WHOLE push surface: explicit
+            // refspec dest, `--all`/`--mirror` (push all heads), wildcard dest, and a
+            // no-refspec push under `push.default=matching`. See `push_protected_violation`.
+            // Shim-layer defense-in-depth (the remote's branch protection is the primary
+            // gate); fail-closed (`load_protected_refs`). A normal push of the agent's own
+            // branch is untouched.
+            if let Some(reason) = push_protected_violation(
+                &args,
+                &load_protected_refs(&home),
+                push_default_is_matching(&worktree),
+            ) {
+                emit_deny_error(subcommand, &reason, &agent, Some(&binding));
+                write_git_event_typed(
+                    &home,
+                    &agent,
+                    subcommand,
+                    "deny_protected_ref",
+                    None,
+                    Some(&reason),
+                );
+                std::process::exit(1);
+            }
             // #883: best-effort pre-push cleanup of empty `init`
             // heartbeat commits. Failure is logged + we still pass
             // through to real `git push` — cleanup MUST NOT block
@@ -1915,6 +1938,199 @@ fn push_trust_root_denylist_violation(worktree: &str) -> Option<String> {
     }
 }
 
+// ── #2379 S3: protected-ref push deny (policy.toml override) ─────────────
+
+/// The ALWAYS-protected refs — the hardcode floor an operator override can only ADD to
+/// (tighten-only), never shrink. Mirrors `is_protected_ref` (kept in sync with the
+/// lib-side E4.5 guard).
+const HARDCODE_PROTECTED_REFS: &[&str] = &["main", "master"];
+
+/// The protected-ref set this invocation enforces: the hardcode floor (`main`/`master`)
+/// PLUS the operator's `$AGEND_HOME/policy.toml` `protected_refs` override — but ONLY
+/// when the file is present, HMAC-verified (hygiene, mirrors `read_binding`'s sidecar),
+/// and parses. **Fail-closed, never less safe than the hardcode floor:**
+/// - missing policy.toml → hardcode floor only (the default),
+/// - tampered / unsigned sidecar → hardcode floor only (override ignored),
+/// - unparseable array → hardcode floor only (override ignored).
+///
+/// The override is additive-only, so the floor is always denied regardless. HMAC is
+/// hygiene, NOT a security boundary (a same-uid agent could re-sign — #1653 ceiling).
+fn load_protected_refs(home: &str) -> Vec<String> {
+    let mut refs: Vec<String> = HARDCODE_PROTECTED_REFS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let path = PathBuf::from(home).join("policy.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return refs; // missing → hardcode floor (the common default)
+    };
+    let tag =
+        std::fs::read_to_string(PathBuf::from(home).join("policy.toml.sig")).unwrap_or_default();
+    if !integrity_core::verify(Path::new(home), content.as_bytes(), &tag) {
+        return refs; // tampered / unsigned → fail-closed (override ignored)
+    }
+    refs.extend(parse_protected_refs(&content));
+    refs
+}
+
+/// MVP hand-parse of `protected_refs = ["a", "b"]` from policy.toml. The shim builds
+/// STANDALONE (the `toml` crate is `tray`-gated; prod must not depend on it — same
+/// convention as `codex_trust_directory`), and the MVP needs only a flat string array.
+/// Locates the `protected_refs` key, captures its `[ … ]` body (single- or multi-line),
+/// and collects the `"…"`-quoted entries. Anything malformed (no key / `=` / `[` / a
+/// missing `]`) yields an empty list → fail-closed to the hardcode floor. Glob patterns
+/// (`release/*`) are a follow-up — MVP is exact-match.
+fn parse_protected_refs(content: &str) -> Vec<String> {
+    let Some(key) = content.find("protected_refs") else {
+        return Vec::new();
+    };
+    let after_key = &content[key..];
+    let Some(eq) = after_key.find('=') else {
+        return Vec::new();
+    };
+    let after_eq = &after_key[eq + 1..];
+    let Some(open) = after_eq.find('[') else {
+        return Vec::new();
+    };
+    let body = &after_eq[open + 1..];
+    let Some(close) = body.find(']') else {
+        return Vec::new(); // unterminated array → fail-closed
+    };
+    extract_quoted(&body[..close])
+}
+
+/// Collect every `"…"`-quoted substring (no escape handling — refs don't contain escaped
+/// quotes at MVP). An unterminated final quote stops the scan (fail-toward-fewer).
+fn extract_quoted(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('"') {
+        let after = &rest[start + 1..];
+        match after.find('"') {
+            Some(end) => {
+                out.push(after[..end].to_string());
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// The remote DESTINATION ref each `git push` positional would write, normalized for
+/// matching: drop the leading `+` force marker, take the segment after the last `:` (the
+/// refspec dest), and strip a `refs/heads/` prefix. Flags (`-…`) are skipped; the remote
+/// name is harmless (it just won't match a protected ref). Covers `HEAD:main`,
+/// `+HEAD:main`, `:main` (delete), `--delete main`, `HEAD:refs/heads/main`, and a bare
+/// `main`; leaves a normal `feat/x` / `HEAD` push untouched.
+fn push_dest_refs(args: &[String]) -> Vec<String> {
+    args.iter()
+        .skip(1) // "push"
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| {
+            let a = a.strip_prefix('+').unwrap_or(a);
+            let dest = a.rsplit(':').next().unwrap_or(a);
+            dest.strip_prefix("refs/heads/").unwrap_or(dest).to_string()
+        })
+        .collect()
+}
+
+/// #2379 S3: a `git push` is DENIED iff it could write a protected ref. COMPREHENSIVE over
+/// the push surface (r6: a positional-only parse let `--all`/`--mirror` slip through).
+/// Returns an actionable deny reason, or `None` to allow:
+/// - **`--all` / `--mirror`** (+ unambiguous abbreviations) push EVERY local head incl.
+///   protected ones → deny (a bound agent must push an explicit refspec of its OWN branch);
+/// - an **explicit refspec** whose DEST is a protected ref (exact, case-insensitive) → deny;
+/// - a **wildcard** refspec dest (`refs/heads/*`) could write a protected ref → deny
+///   (conservative — a bound agent pushes its explicit branch; glob-vs-protected refinement
+///   is a follow-up);
+/// - a **no-refspec** push (`git push` / `git push <remote>`) targets the CURRENT branch
+///   under the modern `push.default` (simple/current/upstream) = a bound agent's
+///   non-protected assigned branch (cross-branch deny) → allow; EXCEPT the deprecated
+///   `push.default=matching`, which would ALSO push a local `main`/`master` → deny.
+///
+/// `--tags` is TAGS-ONLY (`refs/tags/*`, never a branch) regardless of push.default, so it
+/// is exempt even from the matching deny (r6 dry-run: `git push --tags` under matching pushes
+/// only tags). `--follow-tags` is NOT exempt: it pushes the would-be-pushed BRANCHES *plus*
+/// tags, so under `push.default=matching` it pushes the matching heads incl. `main`
+/// (empirically confirmed via dry-run) → it correctly hits the matching deny. Force flags
+/// (`-f`/`--force-with-lease`/`+`) change HOW not WHAT — the refspec is still parsed above.
+/// Shim-layer defense-in-depth — the remote's branch protection is the primary gate.
+fn push_protected_violation(
+    args: &[String],
+    protected: &[String],
+    push_default_matching: bool,
+) -> Option<String> {
+    if let Some(flag) = args.iter().skip(1).find(|a| is_bulk_push_flag(a)) {
+        return Some(format!(
+            "`{flag}` pushes ALL local refs (including protected ones) — push an explicit \
+             refspec of your own task branch instead, not all refs at once"
+        ));
+    }
+    for dest in push_dest_refs(args) {
+        if dest.contains('*') {
+            return Some(format!(
+                "wildcard refspec dest `{dest}` could write a protected ref — push an \
+                 explicit, single-ref refspec instead"
+            ));
+        }
+        if protected.iter().any(|p| p.eq_ignore_ascii_case(&dest)) {
+            return Some(format!(
+                "protected ref — pushing to '{dest}' is denied (shim-layer guard; the \
+                 remote's branch protection is the primary gate). Push your own task branch \
+                 and open a PR; do NOT push directly to a protected ref."
+            ));
+        }
+    }
+    if push_default_matching && !has_explicit_refspec(args) && !is_tags_only_push(args) {
+        return Some(
+            "push.default=matching with no explicit refspec would push every same-named \
+             branch (including a local protected ref) — set push.default=current/simple, or \
+             push an explicit refspec of your own task branch"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// `--tags` makes the push TAGS-ONLY (`refs/tags/*`), regardless of `push.default` — so it is
+/// exempt from the matching deny. Deliberately matches ONLY `--tags`, NOT `--follow-tags`
+/// (which also pushes the would-be-pushed branches → under matching pushes `main`).
+fn is_tags_only_push(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| a == "--tags")
+}
+
+/// `--all` / `--mirror`, INCLUDING git's unambiguous long-option abbreviations (`--mir`,
+/// `--al`, …). Errs toward deny (#2027 flag-form lesson): an ambiguous prefix (`--a`, `--m`)
+/// also matches — git itself rejects those, so denying them costs nothing. `--tags` /
+/// `--follow-tags` / force flags do NOT match (they don't push a protected branch).
+fn is_bulk_push_flag(arg: &str) -> bool {
+    match arg.strip_prefix("--") {
+        Some(name) if !name.is_empty() => "all".starts_with(name) || "mirror".starts_with(name),
+        _ => false,
+    }
+}
+
+/// Whether the push names an EXPLICIT refspec (≥2 positionals after `push` — a remote AND a
+/// refspec). With 0–1 positionals (no-arg, or just a remote) the ref is resolved from
+/// `push.default` + the current branch instead.
+fn has_explicit_refspec(args: &[String]) -> bool {
+    args.iter().skip(1).filter(|a| !a.starts_with('-')).count() >= 2
+}
+
+/// True iff the worktree's effective `push.default` is the (deprecated) `matching` mode —
+/// the one value where a no-refspec push writes MORE than the current branch. Unset → git's
+/// built-in `simple` → false. Best-effort real-git read (read-only); any failure → false.
+fn push_default_is_matching(worktree: &str) -> bool {
+    let git = resolve_real_git();
+    Command::new(&git)
+        .env("AGEND_GIT_SHIM_DEPTH", (shim_depth() + 1).to_string())
+        .args(["-C", worktree, "config", "--get", "push.default"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "matching")
+        .unwrap_or(false)
+}
+
 // ── Exec ────────────────────────────────────────────────────────────────
 
 fn exec_with_conflict_guidance(
@@ -2178,7 +2394,7 @@ impl Disposition {
 /// advisory); `disposition_for_covers_all_emitted_event_types_2379` pins every real type.
 fn disposition_for(event_type: &str) -> Disposition {
     match event_type {
-        "deny" | "deny_trust_root" => Disposition::Deny,
+        "deny" | "deny_trust_root" | "deny_protected_ref" => Disposition::Deny,
         "cwd_worktree_drift" | "git_conflict" => Disposition::Warn,
         "post_merge_cleanup_exempt" => Disposition::Info,
         _ => Disposition::Deny,
@@ -3069,6 +3285,7 @@ mod tests {
         // — add it here AND in disposition_for.
         assert_eq!(disposition_for("deny"), Disposition::Deny);
         assert_eq!(disposition_for("deny_trust_root"), Disposition::Deny);
+        assert_eq!(disposition_for("deny_protected_ref"), Disposition::Deny);
         assert_eq!(disposition_for("cwd_worktree_drift"), Disposition::Warn);
         assert_eq!(disposition_for("git_conflict"), Disposition::Warn);
         assert_eq!(
@@ -3146,6 +3363,266 @@ mod tests {
         );
         assert_eq!(v["subcommand"], "rebase");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2379 S3: protected-ref push deny (policy.toml override) ─────────
+
+    fn vargs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn home_s3(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("agend-git-s3-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        // The shared integrity key (signer + verifier read it).
+        std::fs::write(p.join(".config-integrity-key"), [7u8; 32]).unwrap();
+        p
+    }
+
+    fn write_policy(home: &std::path::Path, body: &str, signed: bool) {
+        std::fs::write(home.join("policy.toml"), body).unwrap();
+        if signed {
+            let tag = integrity_core::sign_for_test(home, body.as_bytes());
+            std::fs::write(home.join("policy.toml.sig"), tag).unwrap();
+        }
+    }
+
+    #[test]
+    fn push_dest_refs_normalizes_refspec_targets_s3() {
+        assert_eq!(
+            push_dest_refs(&vargs(&["push", "origin", "HEAD:main"])),
+            vec!["origin", "main"]
+        );
+        // force markers (+ prefix) + refs/heads/ prefix + delete (:ref) all normalize.
+        assert_eq!(
+            push_dest_refs(&vargs(&["push", "origin", "+HEAD:refs/heads/main"])),
+            vec!["origin", "main"]
+        );
+        assert_eq!(
+            push_dest_refs(&vargs(&["push", "origin", ":master"])),
+            vec!["origin", "master"]
+        );
+        // flags skipped; a normal task-branch push leaves a non-protected dest.
+        assert_eq!(
+            push_dest_refs(&vargs(&["push", "--force", "-u", "origin", "feat/x"])),
+            vec!["origin", "feat/x"]
+        );
+        assert!(push_dest_refs(&vargs(&["push"])).is_empty());
+    }
+
+    #[test]
+    fn push_protected_violation_explicit_refspec_s3() {
+        let p = vargs(&["main", "master", "release-1.0"]);
+        let denied = |a: &[&str]| push_protected_violation(&vargs(a), &p, false);
+        // explicit protected dest → deny (message names the ref).
+        assert!(denied(&["push", "origin", "HEAD:main"])
+            .unwrap()
+            .contains("main"));
+        // override-added ref → deny.
+        assert!(denied(&["push", "origin", "HEAD:release-1.0"])
+            .unwrap()
+            .contains("release-1.0"));
+        // case-insensitive (mirrors is_protected_ref's Main→main fold).
+        assert!(denied(&["push", "origin", "HEAD:Main"]).is_some());
+        // delete a protected ref (`:main`) → deny.
+        assert!(denied(&["push", "origin", ":main"]).is_some());
+        // the agent's OWN task branch is allowed (zero regression to normal pushes).
+        assert!(denied(&["push", "-u", "origin", "feat/x"]).is_none());
+        assert!(denied(&["push"]).is_none());
+        assert!(denied(&["push", "origin"]).is_none());
+    }
+
+    #[test]
+    fn push_protected_violation_bulk_and_wildcard_forms_s3() {
+        // r6's bypass: `--all`/`--mirror` (and abbreviations) push EVERY local head — must
+        // deny regardless of positionals. RM: drop the is_bulk_push_flag branch → RED.
+        let p = vargs(&["main", "master"]);
+        let denied = |a: &[&str]| push_protected_violation(&vargs(a), &p, false);
+        assert!(denied(&["push", "origin", "--all"]).is_some());
+        assert!(denied(&["push", "--mirror", "origin"]).is_some());
+        assert!(denied(&["push", "--all"]).is_some());
+        // unambiguous abbreviations git accepts.
+        assert!(denied(&["push", "origin", "--mir"]).is_some());
+        assert!(denied(&["push", "origin", "--al"]).is_some());
+        // wildcard refspec that could write a protected ref → deny.
+        assert!(denied(&["push", "origin", "refs/heads/*:refs/heads/*"]).is_some());
+        assert!(denied(&["push", "origin", "+HEAD:refs/heads/*"]).is_some());
+        // safe-by-shape: --tags pushes refs/tags/*, never a protected BRANCH → allowed.
+        assert!(denied(&["push", "--tags", "origin"]).is_none());
+        // --atomic is not a bulk flag (shares no prefix with all/mirror).
+        assert!(denied(&["push", "--atomic", "origin", "feat/x"]).is_none());
+    }
+
+    #[test]
+    fn push_protected_violation_push_default_matching_s3() {
+        // no-refspec push under the DEPRECATED push.default=matching pushes every same-named
+        // branch (incl. a local protected ref) → deny. simple/current (matching=false) →
+        // allow (only the current/assigned branch). RM: drop the matching branch → first RED.
+        let p = vargs(&["main", "master"]);
+        assert!(push_protected_violation(&vargs(&["push"]), &p, true).is_some());
+        assert!(push_protected_violation(&vargs(&["push", "origin"]), &p, true).is_some());
+        // an EXPLICIT refspec governs even under matching → only that dest matters.
+        assert!(
+            push_protected_violation(&vargs(&["push", "origin", "feat/x"]), &p, true).is_none()
+        );
+        // not matching → no-refspec push is safe (current branch only).
+        assert!(push_protected_violation(&vargs(&["push"]), &p, false).is_none());
+        // r6: `--tags` is TAGS-ONLY (refs/tags/*) even under matching → MUST be allowed
+        // (the previous cut wrongly denied it). RM: drop the is_tags_only_push exemption → RED.
+        assert!(
+            push_protected_violation(&vargs(&["push", "--tags", "origin"]), &p, true).is_none()
+        );
+        assert!(push_protected_violation(&vargs(&["push", "--tags"]), &p, true).is_none());
+        // `--follow-tags` is NOT tags-only — under matching it pushes the matching branches
+        // (incl. main, verified by dry-run) → MUST stay denied (no over-exemption).
+        assert!(
+            push_protected_violation(&vargs(&["push", "--follow-tags", "origin"]), &p, true)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn push_head_main_denied_by_hardcode_floor_even_without_policy_s3() {
+        // THE core deny: with NO policy.toml, `push origin HEAD:main` is still denied by the
+        // hardcode floor; a normal task-branch push is allowed. RM: neuter
+        // push_protected_violation, OR load_protected_refs drop the floor → RED.
+        let h = home_s3("e2e");
+        let protected = load_protected_refs(h.to_str().unwrap());
+        assert!(push_protected_violation(
+            &vargs(&["push", "origin", "HEAD:main"]),
+            &protected,
+            false
+        )
+        .is_some());
+        assert!(push_protected_violation(
+            &vargs(&["push", "-u", "origin", "feat/x"]),
+            &protected,
+            false
+        )
+        .is_none());
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    #[test]
+    fn is_bulk_push_flag_matches_all_mirror_not_others_s3() {
+        for f in ["--all", "--mirror", "--al", "--mir", "--a", "--m"] {
+            assert!(is_bulk_push_flag(f), "{f} must be a bulk-push flag");
+        }
+        for f in [
+            "--atomic",
+            "--tags",
+            "--follow-tags",
+            "--force",
+            "-f",
+            "--",
+            "origin",
+            "HEAD:x",
+        ] {
+            assert!(!is_bulk_push_flag(f), "{f} must NOT be a bulk-push flag");
+        }
+    }
+
+    #[test]
+    fn push_default_is_matching_reads_config_s3() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-git-s3pd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .unwrap();
+        };
+        git(&["init"]);
+        let wt = dir.to_str().unwrap();
+        // unset → git's built-in `simple` → false.
+        assert!(!push_default_is_matching(wt));
+        // the deprecated bulk mode → true.
+        git(&["config", "push.default", "matching"]);
+        assert!(push_default_is_matching(wt));
+        // a safe mode → false.
+        git(&["config", "push.default", "current"]);
+        assert!(!push_default_is_matching(wt));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_protected_refs_fail_closed_s3() {
+        // missing policy.toml → hardcode floor only (the common default).
+        let h = home_s3("missing");
+        assert_eq!(
+            load_protected_refs(h.to_str().unwrap()),
+            vargs(&["main", "master"])
+        );
+        std::fs::remove_dir_all(&h).ok();
+
+        // present + SIGNED + valid → override ADDED (tighten-only).
+        let h = home_s3("signed");
+        write_policy(&h, "protected_refs = [\"release-1.0\"]\n", true);
+        let got = load_protected_refs(h.to_str().unwrap());
+        assert!(got.contains(&"main".to_string()) && got.contains(&"release-1.0".to_string()));
+        std::fs::remove_dir_all(&h).ok();
+
+        // present but UNSIGNED → fail-closed (override ignored, floor remains).
+        let h = home_s3("unsigned");
+        write_policy(&h, "protected_refs = [\"release-1.0\"]\n", false);
+        let got = load_protected_refs(h.to_str().unwrap());
+        assert!(
+            !got.contains(&"release-1.0".to_string()) && got.contains(&"main".to_string()),
+            "unsigned override must be ignored, floor preserved"
+        );
+        std::fs::remove_dir_all(&h).ok();
+
+        // signed then TAMPERED (sig no longer matches) → fail-closed.
+        let h = home_s3("tampered");
+        write_policy(&h, "protected_refs = [\"release-1.0\"]\n", true);
+        std::fs::write(h.join("policy.toml"), "protected_refs = [\"sneaky\"]\n").unwrap();
+        let got = load_protected_refs(h.to_str().unwrap());
+        assert!(
+            !got.contains(&"sneaky".to_string()) && got.contains(&"main".to_string()),
+            "tampered override must be ignored, floor preserved"
+        );
+        std::fs::remove_dir_all(&h).ok();
+
+        // signed but CORRUPT array (unterminated) → fail-closed to floor only.
+        let h = home_s3("corrupt");
+        write_policy(&h, "protected_refs = [ not valid\n", true);
+        assert_eq!(
+            load_protected_refs(h.to_str().unwrap()),
+            vargs(&["main", "master"])
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    #[test]
+    fn parse_protected_refs_handles_array_forms_s3() {
+        assert_eq!(
+            parse_protected_refs("protected_refs = [\"main\", \"release-1\"]"),
+            vargs(&["main", "release-1"])
+        );
+        // multi-line + trailing comma.
+        assert_eq!(
+            parse_protected_refs("protected_refs = [\n  \"a\",\n  \"b\",\n]"),
+            vargs(&["a", "b"])
+        );
+        // other keys + a comment before the key.
+        assert_eq!(
+            parse_protected_refs("# policy\nother = 1\nprotected_refs = [\"x\"]\n"),
+            vargs(&["x"])
+        );
+        assert!(parse_protected_refs("other = [\"y\"]").is_empty()); // no key
+        assert!(parse_protected_refs("protected_refs = [\"a\"").is_empty()); // unterminated
+        assert!(parse_protected_refs("protected_refs = []").is_empty()); // empty array
     }
 
     // ----- #778 Option 3 — canonical-worktree leniency for unbound -----
