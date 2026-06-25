@@ -316,13 +316,31 @@ impl AgentRuntime {
             );
         }
 
-        // (P1) Rate-limited: hook `RateLimited` window still open, or the screen says so.
-        let rate_limited = self
+        // Observer-plane freshness: a Hook/Stream episode within the window is the real-time
+        // signal. Computed here (ahead of P1) because the #2470 stale-SRL reconcile needs it.
+        // If no Hook/Stream evidence is fresh, the observer plane is stale and the screen
+        // baseline wins downstream. (#2413 Phase D: generalized from Hook-only to {Hook|Stream}.)
+        let observer_fresh = now_ms.saturating_sub(self.last_observer_ms) <= HOOK_FRESHNESS_MS
+            && self.last_observer_ms > 0;
+
+        // (P1) Rate-limited: a HOOK-confirmed retry window still open, or the screen says so —
+        // EXCEPT a STALE ServerRateLimit banner the agent has already moved past. #2470:
+        // `resumed_post_srl` = a fresh OPEN observer episode proves a NEW turn started after the
+        // (screen-only) banner, so the banner is stale → yield so the Active family (P3) reports the
+        // real thinking/active and the badge stops lying [ServerRateLimit]. NOT cleared: a
+        // HOOK-confirmed window (`rate_limited_until_ms` in the future) is a CURRENT limit; and a
+        // screen banner with NO fresh episode (a genuinely stuck/failed turn has
+        // `episode_open == false` since StopFailure→close_episode) stays RateLimited. The gate
+        // (shadow::gate) keeps UsageLimit / Approval authoritative regardless — only the
+        // ServerRateLimit *raw* is allowed to be superseded by this resumed-active observed.
+        let hook_rate_limit_current = self
             .rate_limited_until_ms
-            .is_some_and(|until| until > now_ms)
-            || screen == ScreenSignal::RateLimited;
+            .is_some_and(|until| until > now_ms);
+        let resumed_post_srl = observer_fresh && self.episode_open && !hook_rate_limit_current;
+        let rate_limited =
+            hook_rate_limit_current || (screen == ScreenSignal::RateLimited && !resumed_post_srl);
         if rate_limited {
-            let auth = if matches!(self.rate_limited_until_ms, Some(u) if u > now_ms) {
+            let auth = if hook_rate_limit_current {
                 Authority::Hook
             } else {
                 Authority::Screen
@@ -342,12 +360,6 @@ impl AgentRuntime {
             };
             return (ObservedState::WaitingForUser, auth, conf);
         }
-
-        // Observer-plane freshness: if no Hook/Stream evidence in the window, the real-time
-        // observer plane is stale — defer to the screen baseline (Weak), the conservative
-        // fallback. (#2413 Phase D: generalized from Hook-only to {Hook|Stream}.)
-        let observer_fresh = now_ms.saturating_sub(self.last_observer_ms) <= HOOK_FRESHNESS_MS
-            && self.last_observer_ms > 0;
 
         // (P3/P4/P5) Active family — only if an episode/tool is open AND liveness does
         // NOT contradict it (the phantom-stuck decay). If it DOES contradict, fall to Idle.
@@ -766,14 +778,38 @@ mod tests {
         );
     }
 
-    /// Precedence: rate-limit outranks an open episode; approval outranks tool-use.
+    /// Precedence (#2470-updated): a HOOK-confirmed rate-limit window outranks an open episode
+    /// (a CURRENT limit), but a SCREEN-only rate-limit banner YIELDS to a fresh post-SRL episode
+    /// (a stale banner the resumed agent moved past); approval outranks tool-use.
     #[test]
     fn precedence_orders() {
-        // RateLimited > everything: open episode + screen rate-limited.
+        // HOOK rate-limit window > open episode: a confirmed window (retry_at in the future) is a
+        // CURRENT limit and is NOT cleared by a fresh turn.
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&hook(
+            EvidenceKind::RateLimited {
+                retry_at_ms: Some(9_000),
+            },
+            1_000,
+        ));
+        rt.ingest(&hook(EvidenceKind::TurnStarted, 1_050));
+        let s = rt.observe(ScreenSignal::RateLimited, &live_busy(), 1_100);
+        assert_eq!(
+            s.state,
+            ObservedState::RateLimited,
+            "a current hook rate-limit window outranks an open episode"
+        );
+
+        // #2470: a SCREEN-only rate-limit banner with a fresh open episode (no hook window) is
+        // STALE — the agent resumed — so it yields to the Active family (stops the stuck badge).
         let mut rt = AgentRuntime::default();
         rt.ingest(&hook(EvidenceKind::TurnStarted, 1_000));
         let s = rt.observe(ScreenSignal::RateLimited, &live_busy(), 1_100);
-        assert_eq!(s.state, ObservedState::RateLimited);
+        assert_ne!(
+            s.state,
+            ObservedState::RateLimited,
+            "#2470: a stale screen-only SRL banner yields to a fresh post-SRL episode"
+        );
 
         // WaitingForUser > ToolUse: a tool span is open but an approval is pending.
         let mut rt = AgentRuntime::default();

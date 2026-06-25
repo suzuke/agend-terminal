@@ -87,10 +87,22 @@ fn observed_to_agent_state(state: ObservedState) -> Option<AgentState> {
 /// sites, but the gate itself reads nothing mutable).
 pub(crate) fn gated_override(raw: AgentState, status: &ObservedStatus) -> Option<AgentState> {
     let screen = screen_signal(raw);
-    // (c) A raw GATE screen is authoritative — never let an observed override mask a human
-    // approval prompt or a rate-limit banner (also blocks a stale observed=Active from
-    // hiding a raw that just transitioned to Approval under the reducer's snapshot).
-    if matches!(screen, ScreenSignal::Approval | ScreenSignal::RateLimited) {
+    // (c) A raw Approval screen is ALWAYS authoritative — a human approval gate must never be
+    // masked by an observed override (also blocks a stale observed=Active from hiding a raw that
+    // just transitioned to Approval under the reducer's snapshot). Approval-hook reliability is
+    // unverifiable in-fleet (claude runs --dangerously-skip-permissions → prompts never occur), and
+    // hiding a pending approval is worse than over-reporting it, so this stays hard (#2470).
+    if matches!(screen, ScreenSignal::Approval) {
+        return None;
+    }
+    // (c') #2470: a RateLimited screen is authoritative too, EXCEPT a STALE `ServerRateLimit` banner
+    // the agent has provably moved past. ONLY the `ServerRateLimit` raw may be superseded — UsageLimit
+    // (user quota) and user `RateLimit` stay authoritative (operator must see them; not a "resumed"
+    // semantic). Even for ServerRateLimit the override still requires the (a)/(b)/(d) checks below:
+    // a CURRENT hook rate-limit window or a no-fresh-episode banner stays `RateLimited` in `status`
+    // → fails the (d) coarse-disagreement check → kept; only the reducer's #2470 `resumed_post_srl`
+    // (a fresh post-SRL Hook/Stream episode) yields an Active `status` that passes and overrides.
+    if matches!(screen, ScreenSignal::RateLimited) && !matches!(raw, AgentState::ServerRateLimit) {
         return None;
     }
     // (a) + (b) high-confidence real-time observer plane only.
@@ -205,10 +217,12 @@ mod tests {
         assert_eq!(gated_override(AgentState::Active, &s), None);
     }
 
-    /// P2 composition invariant (t-…5060-11): a raw GATE screen (`Approval` / `RateLimited`)
-    /// is NEVER masked by an override — for EVERY gate-class raw state, even a maximally
-    /// confident Hook status pointing elsewhere returns `None` (keep the raw gate). This is
-    /// the pin that the dispatch/operator can always see a pending approval or rate-limit.
+    /// P2 composition invariant (t-…5060-11), narrowed by #2470: these gate-class raws are NEVER
+    /// masked — even a maximally confident Hook Active returns `None`. `ServerRateLimit` was REMOVED
+    /// from this set (#2470: a stale SRL banner may be superseded by a fresh post-SRL Hook/Stream
+    /// Active — see `server_rate_limit_overridden_only_by_fresh_hook_active`); Approval family +
+    /// user `RateLimit` + `UsageLimit` stay hard so dispatch/operator always sees a pending
+    /// approval or a genuine quota/rate limit.
     #[test]
     fn gate_screen_is_never_overridden() {
         let gate_raws = [
@@ -216,7 +230,6 @@ mod tests {
             AgentState::InteractivePrompt,
             AgentState::AwaitingOperator,
             AgentState::RateLimit,
-            AgentState::ServerRateLimit,
             AgentState::UsageLimit,
         ];
         // The most "override-prone" status: highest confidence, active-family, disagreeing.
@@ -228,6 +241,44 @@ mod tests {
                 "a gate screen ({raw:?}) must never be masked by an observed override"
             );
         }
+    }
+
+    /// #2470: `ServerRateLimit` is the ONE gate-class raw a fresh high-confidence post-SRL
+    /// Hook/Stream Active MAY supersede (the reducer's `resumed_post_srl` yields that Active when a
+    /// new turn opened after a stale banner) — so the badge stops pinning [ServerRateLimit]. But a
+    /// screen-authority / still-RateLimited observed must NOT override → a genuinely-current limit
+    /// stays visible. NEUTER: revert the gate (c') split (RateLimited returns None for all raws) and
+    /// the first assert goes RED.
+    #[test]
+    fn server_rate_limit_overridden_only_by_fresh_hook_active() {
+        // Resumed: a fresh high-confidence Hook/Stream Active supersedes the stale SRL banner.
+        let hook_active = status(ObservedState::Active, Authority::Hook, Confidence::Strong);
+        assert_eq!(
+            gated_override(AgentState::ServerRateLimit, &hook_active),
+            Some(AgentState::Active),
+            "a fresh post-SRL Hook Active must supersede a stale ServerRateLimit badge"
+        );
+        let stream_tool = status(ObservedState::ToolUse, Authority::Stream, Confidence::Strong);
+        assert_eq!(
+            gated_override(AgentState::ServerRateLimit, &stream_tool),
+            Some(AgentState::Active),
+            "Stream-plane parity (codex)"
+        );
+        // Screen-authority observed (no real-time observer plane, e.g. agy) → keep SRL.
+        let screen_active = status(ObservedState::Active, Authority::Screen, Confidence::Strong);
+        assert_eq!(
+            gated_override(AgentState::ServerRateLimit, &screen_active),
+            None,
+            "a screen-authority observed must NOT clear a ServerRateLimit"
+        );
+        // A still-RateLimited observed (current limit, e.g. open hook window) → (d) coarse-agreement
+        // → keep SRL (never mis-clear a genuine current limit).
+        let still_rl = status(ObservedState::RateLimited, Authority::Hook, Confidence::Strong);
+        assert_eq!(
+            gated_override(AgentState::ServerRateLimit, &still_rl),
+            None,
+            "a current (RateLimited) observed must NOT clear the ServerRateLimit"
+        );
     }
 
     /// #1493 composition: drive the REAL reducer (not a hand-built status) and confirm the
@@ -263,6 +314,92 @@ mod tests {
         assert!(
             gated_override(AgentState::Idle, &s).is_some(),
             "a real mid-API false-idle must promote at an idle raw"
+        );
+    }
+
+    /// #2470 load-bearing (REAL reducer + gate end-to-end): the stale-ServerRateLimit-badge fix.
+    /// Drives `AgentRuntime` so the reducer's `resumed_post_srl` and the gate's (c') split are both
+    /// exercised on real `observe()` output — not hand-built statuses.
+    #[test]
+    fn stale_server_rate_limit_reconcile_real_reducer_2470() {
+        let live = crate::daemon::shadow::reducer::Liveness {
+            api_in_flight: true,
+            productive_silent_ms: 0,
+            child_alive: true,
+        };
+
+        // (1) RESUMED: turn hit a 529 (StopFailure → episode closed), then a NEW turn started —
+        //     agent is working again while the SRL banner is still in the tail. Reducer yields the
+        //     stale RateLimited → Active; gate promotes it at a ServerRateLimit raw → badge=Active.
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::hook(EvidenceKind::TurnStarted, 1_000));
+        rt.ingest(&Evidence::hook(
+            EvidenceKind::TurnEnded {
+                stop_reason: Some("failure".into()),
+            },
+            1_100,
+        ));
+        rt.ingest(&Evidence::hook(EvidenceKind::TurnStarted, 1_200)); // resumed
+        let s = rt.observe(ScreenSignal::RateLimited, &live, 1_300);
+        assert_ne!(
+            s.state,
+            ObservedState::RateLimited,
+            "a fresh post-SRL turn must yield the stale RateLimited screen"
+        );
+        assert_eq!(
+            gated_override(AgentState::ServerRateLimit, &s),
+            Some(AgentState::Active),
+            "#2470: resumed agent's badge must show Active, not the stale ServerRateLimit"
+        );
+
+        // (2) STUCK (no fresh episode): turn failed and never resumed (episode_open == false).
+        //     Reducer keeps RateLimited; gate keeps the raw ServerRateLimit (no mis-clear).
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::hook(EvidenceKind::TurnStarted, 1_000));
+        rt.ingest(&Evidence::hook(
+            EvidenceKind::TurnEnded {
+                stop_reason: Some("failure".into()),
+            },
+            1_100,
+        ));
+        let s = rt.observe(ScreenSignal::RateLimited, &live, 1_200);
+        assert_eq!(
+            s.state,
+            ObservedState::RateLimited,
+            "a failed turn with no resume must stay RateLimited"
+        );
+        assert_eq!(
+            gated_override(AgentState::ServerRateLimit, &s),
+            None,
+            "#2470: a genuinely-stuck SRL must NOT be cleared"
+        );
+
+        // (3) CURRENT hook rate-limit window open + an episode → still RateLimited (NOT cleared by
+        //     a resumed episode, because the hook itself confirms a live limit).
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::hook(
+            EvidenceKind::RateLimited {
+                retry_at_ms: Some(9_000),
+            },
+            1_000,
+        ));
+        rt.ingest(&Evidence::hook(EvidenceKind::TurnStarted, 1_100));
+        let s = rt.observe(ScreenSignal::RateLimited, &live, 1_200);
+        assert_eq!(
+            s.state,
+            ObservedState::RateLimited,
+            "an open hook rate-limit window stays RateLimited even with an episode"
+        );
+
+        // (4) UsageLimit raw (user quota): even though the reducer yields Active (it only sees the
+        //     collapsed RateLimited signal), the gate keeps UsageLimit authoritative → badge stays.
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::hook(EvidenceKind::TurnStarted, 1_200));
+        let s = rt.observe(ScreenSignal::RateLimited, &live, 1_300);
+        assert_eq!(
+            gated_override(AgentState::UsageLimit, &s),
+            None,
+            "#2470: UsageLimit (user quota) must NEVER be superseded — operator must see it"
         );
     }
 
