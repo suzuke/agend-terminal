@@ -342,7 +342,7 @@ fn collect_rows(
 /// (`<home>/worktrees/<name>/…`). Worktree subdirs are enumerated live; merged
 /// sessions whose worktree was already pruned still attribute via the
 /// `<home>/worktrees/<name>` prefix match in `attribute`.
-fn instance_roots(home: &Path) -> Vec<(String, Vec<PathBuf>)> {
+pub(crate) fn instance_roots(home: &Path) -> Vec<(String, Vec<PathBuf>)> {
     let fleet =
         crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).unwrap_or_default();
     let workspace = crate::paths::workspace_dir(home);
@@ -487,6 +487,80 @@ pub(crate) fn estimate_agy_context_pct_in(home: &Path) -> Option<f32> {
     let pct = tokens / 1_048_576.0;
 
     Some(pct.clamp(0.0, 1.0))
+}
+
+fn url_encode(s: &str) -> String {
+    let mut encoded = String::new();
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(b as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    encoded
+}
+
+/// Estimate Grok's context usage percentage in range 0.0..1.0
+pub(crate) fn estimate_grok_context_pct_in(cwd: &Path) -> Option<f32> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let encoded_cwd = url_encode(cwd.to_str()?);
+    let sessions_dir = home.join(".grok").join("sessions").join(encoded_cwd);
+    if !sessions_dir.exists() {
+        return None;
+    }
+
+    let mut newest_session = None;
+    let mut newest_time = String::new();
+    let entries = std::fs::read_dir(&sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let summary_path = path.join("summary.json");
+        if !summary_path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&summary_path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        if let Some(last_active) = json.get("last_active_at").and_then(|v| v.as_str()) {
+            if last_active > newest_time.as_str() {
+                newest_time = last_active.to_string();
+                newest_session = Some(path);
+            }
+        }
+    }
+
+    let session_dir = newest_session?;
+    let updates_path = session_dir.join("updates.jsonl");
+    if !updates_path.exists() {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(&updates_path).ok()?;
+    let mut max_tokens = 0u64;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(params) = v.get("params") {
+                if let Some(meta) = params.get("_meta") {
+                    if let Some(tokens) = meta.get("totalTokens").and_then(|t| t.as_u64()) {
+                        if tokens > max_tokens {
+                            max_tokens = tokens;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(max_tokens as f32 / 200_000.0)
 }
 
 /// Testable core of [`estimate_context_pct`]: injected projects dir + roots.
@@ -2246,6 +2320,61 @@ mod context_estimate_tests {
         let pct = estimate_agy_context_pct_in(&home).expect("agy estimate succeeded via parent fallback");
         let expected = 25600.0 / 1_048_576.0;
         assert!((pct - expected).abs() < 1e-5, "Agy estimate: got {pct}, expected {expected}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_estimate_grok_context_pct() {
+        let original_home = std::env::var_os("HOME");
+        let home_path = tmp("grok-est-home");
+        std::env::set_var("HOME", &home_path);
+
+        let cwd = Path::new("/Users/neo/my-project");
+        let encoded_cwd = url_encode(cwd.to_str().unwrap());
+        let sessions_dir = home_path.join(".grok").join("sessions").join(&encoded_cwd);
+
+        // Create two session folders: one older, one newer
+        let session1_dir = sessions_dir.join("session-uuid-1");
+        let session2_dir = sessions_dir.join("session-uuid-2");
+        std::fs::create_dir_all(&session1_dir).unwrap();
+        std::fs::create_dir_all(&session2_dir).unwrap();
+
+        // Write summary.json for session 1 (older)
+        let summary1 = serde_json::json!({
+            "last_active_at": "2026-06-25T01:00:00.000Z"
+        });
+        std::fs::write(session1_dir.join("summary.json"), summary1.to_string()).unwrap();
+
+        // Write updates.jsonl for session 1 with 150,000 tokens
+        let updates1 = vec![
+            serde_json::json!({"params": {"_meta": {"totalTokens": 100000}}}).to_string(),
+            serde_json::json!({"params": {"_meta": {"totalTokens": 150000}}}).to_string(),
+        ].join("\n");
+        std::fs::write(session1_dir.join("updates.jsonl"), updates1).unwrap();
+
+        // Write summary.json for session 2 (newer)
+        let summary2 = serde_json::json!({
+            "last_active_at": "2026-06-25T02:00:00.000Z"
+        });
+        std::fs::write(session2_dir.join("summary.json"), summary2.to_string()).unwrap();
+
+        // Write updates.jsonl for session 2 with 20,000 tokens (0.1 context fraction)
+        let updates2 = vec![
+            serde_json::json!({"params": {"_meta": {"totalTokens": 10000}}}).to_string(),
+            serde_json::json!({"params": {"_meta": {"totalTokens": 20000}}}).to_string(),
+        ].join("\n");
+        std::fs::write(session2_dir.join("updates.jsonl"), updates2).unwrap();
+
+        let pct = estimate_grok_context_pct_in(cwd).unwrap();
+        // 20000 / 200000 = 0.1
+        assert!((pct - 0.1).abs() < 1e-5, "Grok estimate: got {pct}, expected 0.1");
+
+        // Restore original HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }
 

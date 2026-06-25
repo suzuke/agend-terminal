@@ -1509,6 +1509,15 @@ impl StateTracker {
                     if let Some(pct) = crate::token_cost::estimate_agy_context_pct_in(home_path) {
                         return Some((pct * 100.0, self.context_provider));
                     }
+                } else if self.backend_name == "grok" {
+                    let roots = crate::token_cost::instance_roots(home_path);
+                    if let Some((_, paths)) = roots.into_iter().find(|(name, _)| name == &self.instance_name) {
+                        if let Some(cwd) = paths.first() {
+                            if let Some(pct) = crate::token_cost::estimate_grok_context_pct_in(cwd) {
+                                return Some((pct * 100.0, self.context_provider));
+                            }
+                        }
+                    }
                 } else if let Some(pct) = crate::token_cost::estimate_context_pct(home_path, &self.instance_name) {
                     return Some((pct, self.context_provider));
                 }

@@ -489,7 +489,7 @@ fn grok_profile() -> BackendProfile {
         },
         initial_state: AgentState::Starting,
         context_pattern: None,
-        context_provider: ContextProvider::Unavailable,
+        context_provider: ContextProvider::TranscriptEstimate { confidence: 0.7 },
         input_line_markers: &["❯"],
     }
 }
@@ -533,6 +533,7 @@ mod context_pattern_tests {
         assert!(!has(&Backend::Codex));
         assert!(!has(&Backend::OpenCode));
         assert!(!has(&Backend::Agy));
+        assert!(!has(&Backend::GrokCli));
         assert!(!has(&Backend::Shell));
         assert!(!has(&Backend::Raw("x".into())));
     }
@@ -547,6 +548,10 @@ mod context_pattern_tests {
         assert_eq!(
             provider(&Backend::Agy),
             ContextProvider::TranscriptEstimate { confidence: 0.55 }
+        );
+        assert_eq!(
+            provider(&Backend::GrokCli),
+            ContextProvider::TranscriptEstimate { confidence: 0.7 }
         );
         assert_eq!(provider(&Backend::Shell), ContextProvider::Unavailable);
         assert_eq!(
