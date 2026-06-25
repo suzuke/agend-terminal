@@ -43,9 +43,10 @@ impl PerTickHandler for SnapshotRotationHandler {
                     // handoff / reply deciders read via snapshot.json. #2465: the shared
                     // `operated_state` helper promotes the raw screen heuristic to the
                     // Shadow Observer's HIGH-CONFIDENCE correction (the SAME shared gate the
-                    // pane badge + the SRL/poll_reminder/reclaim/inject deciders use, so they
-                    // can never diverge — #1493 class) when ON and a correction applies; else
-                    // raw. Supersedes the #1523 `authoritative_state` claude-hook-only POC.
+                    // pane badge + the poll_reminder/reclaim/inject deciders use, so they can
+                    // never diverge — #1493 class) when ON and a correction applies; else raw.
+                    // (The SRL retry arm is deliberately NOT a consumer — see `operated_state`.)
+                    // Supersedes the #1523 `authoritative_state` claude-hook-only POC.
                     let raw = c.state.get_state();
                     let agent_state =
                         crate::daemon::shadow::operated_state(raw, c.observed_status.as_ref());
