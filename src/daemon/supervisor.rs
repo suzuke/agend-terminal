@@ -1640,6 +1640,34 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
     matches!(state, AgentState::Idle)
 }
 
+/// #2466: the WORK-TURN 529 arm predicate — the looser signal the dev-3 incident proved
+/// fired. A claude work-turn that hits an ApiError/529 latches `blocked_reason==RateLimit`
+/// (via the watchdog's gate-free `classify_pty_output`) and leaves a `throttle_hint` token on
+/// screen, yet the StateTracker `AgentState` stays Idle (the #1769 positional defeat) so the
+/// strict `state==ServerRateLimit` arm never fires. This predicate lets the retry arm latch
+/// that case, GUARDED against false-positives:
+/// - `blocked_rl` (primary, lead-vetted) — classify matched a real RATE-LIMIT error pattern,
+///   not a generic ApiError; `QuotaExceeded` is a distinct variant, so user quota is excluded.
+/// - `has_throttle_hint` — corroborating throttle token still on screen.
+/// - `!recovered && !self_cleared` — the agent is not awake/progressing. `recovered` =
+///   `recovered_within(RECOVERY_SILENCE)`, so `!recovered` already encodes the productive-silence
+///   requirement AND preserves the never-produced fresh-agent edge (a just-spawned agent that
+///   immediately 529s still arms — an explicit silence threshold would wrongly block it).
+/// - `!has_expectation` — single-ownership: a daemon recovery-turn expectation is owned by the
+///   (future) expectation-keyed 529-recovery path, never double-armed here (#2466 boundary).
+///
+/// StopFailure-hook corroboration is deliberately NOT required (hooks are best-effort/droppable,
+/// and would re-introduce a false-negative); it only adds confidence when present (claude).
+fn work_turn_throttle_arm(
+    blocked_rl: bool,
+    has_throttle_hint: bool,
+    recovered: bool,
+    self_cleared: bool,
+    has_expectation: bool,
+) -> bool {
+    blocked_rl && has_throttle_hint && !recovered && !self_cleared && !has_expectation
+}
+
 /// #1470 (re-scoped slice, credit @cheerc): notify an agent's team
 /// orchestrator, via its INBOX, that the transient-error auto-retry has been
 /// exhausted. This is the agent-inbox path (not operator Telegram), so it does
@@ -1960,13 +1988,25 @@ pub(crate) fn process_error_recovery(
             // produced (`last_productive_output == None`) is NOT recovery, so it
             // latches + injects normally (the fresh-agent edge the creation stamp
             // used to mis-suppress). `productive_silence` is for the log only.
-            let (state, recovered, self_cleared, has_throttle_hint, productive_silence) = {
+            let (state, recovered, self_cleared, has_throttle_hint, blocked_rl, productive_silence) = {
                 let mut core = handle.core.lock();
                 // KEEP-RAW (#2465): the SRL retry arm reads raw core.state.current. claude hooks
                 // never emit RateLimited (a StopFailure → ApiError, the API plane owns rate-limit),
                 // so operated_state would be inert here; the true ApiError-as-rate-limit SRL fix is
-                // tracked in #2466, out of this PR's scope.
+                // #2466 (the work-turn looser-signal arm below).
                 let state = core.state.current;
+                // #2466: the watchdog's LOOSER rate-limit latch — `classify_pty_output` matched a
+                // throttle banner (it runs `detect_with_match` WITHOUT the StateTracker's #919
+                // red-anchor / #1769 positional gates), so this can be `RateLimit` even when the raw
+                // `state` reads Idle (the dev-3 work-turn 529 shape). This is the signal that DID
+                // fire in the incident; the loose arm below consults it. Read BEFORE the
+                // `ServerRateLimit` set below so it reflects the watchdog latch, not our own write
+                // (which only happens on the strict `state==ServerRateLimit` branch anyway).
+                // Excludes `QuotaExceeded` (user quota) by construction — that is a distinct variant.
+                let blocked_rl = matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::RateLimit { .. })
+                );
                 let recovered = core.state.recovered_within(RECOVERY_SILENCE);
                 // #2232: ground-truth recovery latch the agent set by self-clearing
                 // its rate-limit block via the MCP `clear_blocked_reason` action.
@@ -2002,7 +2042,14 @@ pub(crate) fn process_error_recovery(
                     // (cross-episode), mirroring `clears_server_rate_limit_retry`.
                     core.health.rate_limit_self_cleared = false;
                 }
-                (state, recovered, self_cleared, has_hint, productive_silence)
+                (
+                    state,
+                    recovered,
+                    self_cleared,
+                    has_hint,
+                    blocked_rl,
+                    productive_silence,
+                )
             };
 
             // ── #t-26795 SRL hook-override (operator-reported sticky-screen flap) ──
@@ -2047,6 +2094,22 @@ pub(crate) fn process_error_recovery(
                 }
             }
 
+            // #2466: the WORK-TURN 529 looser-signal arm (see `work_turn_throttle_arm`). When the
+            // strict `state==ServerRateLimit` did NOT latch (the #1769 positional defeat → screen
+            // reads Idle) but the watchdog's gate-free classify still flagged a throttle
+            // (`blocked_rl`) corroborated by a screen throttle token, latch the SAME retry track so
+            // a work-turn 529 auto-retries instead of hanging. Threaded as an `|| loose_arm` into
+            // the arm branch below so the Idle-clear branch (`clears_server_rate_limit_retry`) only
+            // fires when this is FALSE — arm and clear stay synchronized on one signal (no same-tick
+            // fight). `has_expectation` keeps this disjoint from the expectation-keyed recovery path.
+            let loose_arm = work_turn_throttle_arm(
+                blocked_rl,
+                has_throttle_hint,
+                recovered,
+                self_cleared,
+                crate::daemon::recovery_shadow::has_expectation(name),
+            );
+
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
             // gated on the agent being FRESHLY observed in ServerRateLimit — not on a
@@ -2088,10 +2151,21 @@ pub(crate) fn process_error_recovery(
                         "ServerRateLimit retry cleared — agent recovered"
                     );
                 }
-            } else if state == AgentState::ServerRateLimit {
+            } else if state == AgentState::ServerRateLimit || loose_arm {
                 let track = retry_tracks.entry(name.to_string()).or_insert_with(|| {
                     let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
-                    tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry (Phase A)");
+                    tracing::info!(
+                        agent = %name,
+                        delay_secs = delay.as_secs(),
+                        // #2466: distinguish the strict screen-classified SRL from the work-turn
+                        // 529 caught by the looser blocked_reason+throttle_hint signal.
+                        trigger = if state == AgentState::ServerRateLimit {
+                            "server_rate_limit"
+                        } else {
+                            "work_turn_throttle"
+                        },
+                        "rate-limit retry scheduled (Phase A)"
+                    );
                     RateLimitRetry {
                         retry_count: 0,
                         next_retry_at: now + delay,
