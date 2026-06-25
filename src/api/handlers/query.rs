@@ -41,10 +41,11 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // blocked and its free-text annotation (previously internal-only).
                     c.health.current_reason.as_ref().map(|r| r.to_string()),
                     c.health.current_note.clone(),
-                    // Context% telemetry: resolved usage + producing source.
-                    // Absent = honestly unknown; context_provider says whether
-                    // the backend has a trustworthy passive signal at all.
+                    // Context% telemetry: resolved usage + producing source
+                    // ("statusline" = agent's own footer, "transcript" = token-cost
+                    // estimate for codex/grok/agy). Absent = honestly unknown.
                     c.state.resolved_context(Some(ctx.home)),
+                    // #2439: the backend's context-telemetry CAPABILITY. Always present.
                     c.state.context_provider(),
                     // #2413 Phase 1: out-of-path API-activity signal, read under the
                     // SAME lock as agent_state so a consumer can reconcile the two
@@ -53,8 +54,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     c.api_activity.last_active_epoch_ms,
                     // #2413 Phase B: the reducer's fused status, read under the SAME
                     // lock as agent_state so a consumer can diff them atomically (the
-                    // observed-vs-raw diff IS the quantification). None unless the
-                    // per-tick reduce ran under AGEND_SHADOW_OBSERVER=1.
+                    // observed-vs-raw diff IS the quantification). None only if the per-tick
+                    // reduce didn't run (default-ON; off under AGEND_SHADOW_OBSERVER=0).
                     c.observed_status.clone(),
                 )
             };

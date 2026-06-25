@@ -158,11 +158,32 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 /// the flag on. The fix is symmetric to #1694(a): the reducer driver now runs in app mode
 /// (un-allowlisted), and `run_app` starts the hook-event socket server (`shadow::start`)
 /// alongside the api-activity probe. Flag-OFF by default ⇒ zero behaviour change.
-const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump"];
+/// Per-tick handlers ALWAYS allowlisted out of app-standalone (unconditional skips).
+/// `thread_dump` is an env-gated diagnostic not needed in the interactive TUI.
+///
+/// #2413 PR-B (#1720-class fix): `snapshot_rotation` was REMOVED from this list — see
+/// [`app_snapshot_rotation_enabled`]. The live daemon runs `run_app`, never `run_core`, so
+/// allowlisting `snapshot_rotation` out meant the live daemon NEVER wrote `<home>/snapshot.json`
+/// (it was weeks-stale), and `dispatch_idle` / inbox / handoff / reply — which read it — all
+/// operated on stale state. Same #1720 class already fixed for `recovery_dispatcher` (#1694a)
+/// and `shadow_observe` (#2413 Phase B). It now runs in app mode by default, reversible via the
+/// `AGEND_APP_SNAPSHOT=0` kill-switch.
+const APP_TICK_ALLOWLIST: &[&str] = &["thread_dump"];
+
+/// #2413 PR-B: whether app-standalone runs `snapshot_rotation` (writes `snapshot.json` every
+/// tick). **Default ON** — the #1720-class fix so the live daemon's snapshot-reading deciders
+/// (dispatch_idle / inbox / handoff / reply) see CURRENT state. The `AGEND_APP_SNAPSHOT=0`
+/// kill-switch restores the pre-PR-B behaviour (allowlisted out — no app-mode snapshot write),
+/// a reversible escape hatch since flipping the whole snapshot plane stale→live is a behaviour
+/// change with a broad blast radius.
+fn app_snapshot_rotation_enabled() -> bool {
+    std::env::var("AGEND_APP_SNAPSHOT").as_deref() != Ok("0")
+}
 
 /// Build the per-tick handler set app-standalone runs: the shared
-/// `build_default_handlers` minus `APP_TICK_ALLOWLIST`. Extracted so the
-/// completeness invariant can compare it against the full daemon set.
+/// `build_default_handlers` minus `APP_TICK_ALLOWLIST` (and minus `snapshot_rotation` only when
+/// the `AGEND_APP_SNAPSHOT=0` kill-switch is set). Extracted so the completeness invariant can
+/// compare it against the full daemon set.
 ///
 /// #1694(a): `crash_tx` here is a throwaway sender (its receiver is dropped), so
 /// `stage2_dispatch_available = false` — `RecoveryDispatcherHandler` now RUNS
@@ -173,7 +194,18 @@ fn app_tick_handlers(
 ) -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
     let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
     let mut handlers = crate::daemon::build_default_handlers(crash_tx, false, daemon_binary_stale);
-    handlers.retain(|h| !APP_TICK_ALLOWLIST.contains(&h.name()));
+    let skip_snapshot = !app_snapshot_rotation_enabled();
+    handlers.retain(|h| {
+        let name = h.name();
+        if APP_TICK_ALLOWLIST.contains(&name) {
+            return false;
+        }
+        // #2413 PR-B: snapshot_rotation runs by default; the kill-switch skips it.
+        if skip_snapshot && name == "snapshot_rotation" {
+            return false;
+        }
+        true
+    });
     handlers
 }
 
@@ -408,8 +440,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
         // only other caller), so without this the whole Shadow Observer plane was dead in
         // production (observed_status null on every agent under the flag — #1720/#685
-        // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op unless
-        // `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ zero behaviour change). Owner-only
+        // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
+        // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
         // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
         // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
         // detached accept loop that exits with the process; the stale socket is cleared on
@@ -421,6 +453,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // source dead in production. Read-only tail of ~/.codex/sessions; no-op unless the
         // flag is on (flag-OFF default ⇒ zero behaviour change).
         crate::daemon::shadow::rollout::spawn(Arc::clone(&registry), home.clone());
+        // #2413 opencode plane: SSE `/event` observer source (Stream plane). Owner-only +
+        // app-mode-wired for the SAME #2434 reason as rollout above — the live fleet daemon
+        // is app mode, so gating it run_core-only would leave opencode agents' observer
+        // source dead in production. Subscribes to each opencode agent's embedded server
+        // (port injected at spawn); no-op unless the flag is on (flag-OFF ⇒ zero change).
+        crate::daemon::shadow::opencode::spawn(Arc::clone(&registry), home.clone());
+        // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/*.jsonl (Stream plane).
+        // Owner-only + app-mode-wired for the SAME #2434 reason as rollout/opencode above —
+        // gating it run_core-only would leave kiro agents' observer source dead in the
+        // app-mode live daemon. No-op unless the flag is on (flag-OFF ⇒ zero change).
+        crate::daemon::shadow::kiro::spawn(Arc::clone(&registry), home.clone());
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
@@ -2166,9 +2209,14 @@ mod tests {
                 .collect();
 
         // Positive: every non-allowlisted daemon handler must run in app.
+        // #2413 PR-B: `snapshot_rotation` is CONDITIONALLY run (default-ON, kill-switched by
+        // `AGEND_APP_SNAPSHOT=0`), so it is exempt from the "must always run" check regardless
+        // of the ambient env — its default-on + reversibility is pinned separately by
+        // `snapshot_rotation_runs_in_app_mode_by_default_1720`.
         let missing: Vec<&str> = all
             .difference(&app)
             .filter(|n| !APP_TICK_ALLOWLIST.contains(n))
+            .filter(|n| **n != "snapshot_rotation")
             .copied()
             .collect();
         assert!(
@@ -2237,6 +2285,230 @@ mod tests {
         );
     }
 
+    /// #2413 PR-B (#1720-class fix): `snapshot_rotation` must RUN in app mode BY DEFAULT so
+    /// the live daemon writes `snapshot.json` every tick (it was allowlisted out → weeks-stale
+    /// → dispatch_idle/inbox/handoff/reply read stale state). Reversible: `AGEND_APP_SNAPSHOT=0`
+    /// restores the allowlisted-out behaviour. Pins both the default-on and the kill-switch.
+    #[test]
+    #[serial_test::serial(app_snapshot_killswitch)]
+    fn snapshot_rotation_runs_in_app_mode_by_default_1720() {
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("AGEND_APP_SNAPSHOT", v),
+                    None => std::env::remove_var("AGEND_APP_SNAPSHOT"),
+                }
+            }
+        }
+        let _g = EnvGuard(std::env::var("AGEND_APP_SNAPSHOT").ok());
+        let names = |stale| {
+            app_tick_handlers(stale)
+                .iter()
+                .map(|h| h.name())
+                .collect::<Vec<_>>()
+        };
+
+        // Default (unset) → snapshot_rotation RUNS in app mode.
+        std::env::remove_var("AGEND_APP_SNAPSHOT");
+        assert!(
+            names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .contains(&"snapshot_rotation"),
+            "snapshot_rotation must RUN in app mode by default (#1720 live-fix)"
+        );
+        assert!(
+            !APP_TICK_ALLOWLIST.contains(&"snapshot_rotation"),
+            "snapshot_rotation must NOT be unconditionally allowlisted out (#1720 live-fix)"
+        );
+
+        // Kill-switch `=0` → reverts to the old allowlisted-out behaviour.
+        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
+        assert!(
+            !names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .contains(&"snapshot_rotation"),
+            "AGEND_APP_SNAPSHOT=0 must restore the allowlisted-out behaviour (no app snapshot write)"
+        );
+    }
+
+    /// #2413 PR-B (#1720 live-fix) — END-TO-END verification on a /tmp home, driving the REAL
+    /// app-mode handler set + real `snapshot.json` + real `dispatch_idle` gate. The
+    /// operator-evidence proof of (a)(b)(c) with the `AGEND_APP_SNAPSHOT` on/off contrast:
+    ///   (a) app mode WRITES `snapshot.json` with the PROMOTED operated state (it was
+    ///       allowlisted out → weeks-stale → all snapshot readers saw stale state);
+    ///   (b) at a REAL false-idle (raw screen Idle + a high-confidence Active
+    ///       `observed_status`), `dispatch_idle` does NOT mis-fire — whereas a stale/raw
+    ///       `idle` snapshot WOULD — and the shared busy-gate `agent_is_busy`
+    ///       (inbox/handoff/reply) reads the agent as BUSY;
+    ///   (c) `AGEND_APP_SNAPSHOT=0` reverts (app does not write) — the reversible escape hatch.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shadow_observer)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn pr_b_end_to_end_operated_state_app_mode_1720() {
+        use crate::daemon::dispatch_idle;
+        use crate::daemon::shadow::evidence::{Authority, Confidence};
+        use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
+        use crate::snapshot::{agent_is_busy, agent_state_of, AgentSnapshot};
+
+        struct G(&'static str, Option<String>);
+        impl Drop for G {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _g = (
+            G(
+                "AGEND_SHADOW_OBSERVER",
+                std::env::var("AGEND_SHADOW_OBSERVER").ok(),
+            ),
+            G(
+                "AGEND_OBSERVED_DISPATCH",
+                std::env::var("AGEND_OBSERVED_DISPATCH").ok(),
+            ),
+            G(
+                "AGEND_APP_SNAPSHOT",
+                std::env::var("AGEND_APP_SNAPSHOT").ok(),
+            ),
+        );
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+        std::env::remove_var("AGEND_OBSERVED_DISPATCH"); // default-ON
+        std::env::remove_var("AGEND_APP_SNAPSHOT"); // default-ON
+
+        let home = std::env::temp_dir().join(format!("agend-pr-b-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+
+        // A false-idle agent: raw screen Idle (mk_test_handle default) + a high-confidence
+        // Active observed_status (the mid-API false-idle the reducer produces live).
+        let id = crate::types::InstanceId::default();
+        let handle = crate::agent::mk_test_handle("victim", id);
+        handle.core.lock().observed_status = Some(ObservedStatus {
+            state: ObservedState::Active,
+            authority: Authority::Hook,
+            confidence: Confidence::Strong,
+            evidence: vec![],
+            since_ms: 0,
+        });
+        let registry: crate::agent::AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
+                (id, handle),
+            ])));
+        let externals: crate::agent::ExternalRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let stale = || Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Run ONLY the app-set's snapshot_rotation handler (proves it IS in the real app set
+        // AND that running it writes snapshot.json). Returns whether the app set contained it.
+        let run_app_snapshot = || {
+            let ctx = crate::daemon::per_tick::TickContext {
+                home: &home,
+                registry: &registry,
+                externals: &externals,
+                configs: &configs,
+            };
+            let mut ran = false;
+            for h in app_tick_handlers(stale()) {
+                if h.name() == "snapshot_rotation" {
+                    h.run(&ctx);
+                    ran = true;
+                }
+            }
+            ran
+        };
+
+        // ══ (a)+(b): ON (default) — app writes snapshot.json with the PROMOTED operated state ══
+        assert!(
+            run_app_snapshot(),
+            "(a) app mode runs snapshot_rotation by default (un-allowlisted)"
+        );
+        assert_eq!(
+            agent_state_of(&home, "victim").as_deref(),
+            Some("active"),
+            "(a)+(b) app mode wrote snapshot.json with the PROMOTED operated state (false-idle → active)"
+        );
+        assert!(
+            agent_is_busy(&home, "victim"),
+            "(b) the shared busy-gate (inbox/handoff/reply) reads the false-idle agent as BUSY"
+        );
+
+        // (b) dispatch_idle: drive the real scan_and_emit on a past-threshold pending dispatch.
+        // Isolate the agent_state gate from the silence gate by holding silence > threshold, so
+        // ONLY agent_state decides suppress-vs-fire.
+        let save_snap = |state: &str| {
+            crate::snapshot::save(
+                &home,
+                &[AgentSnapshot {
+                    name: "victim".to_string(),
+                    backend_command: "claude".to_string(),
+                    args: vec![],
+                    working_dir: None,
+                    submit_key: "\r".to_string(),
+                    health_state: "healthy".to_string(),
+                    agent_state: state.to_string(),
+                    silent_secs: 9_999,
+                    output_silent_secs: 9_999,
+                }],
+            );
+        };
+        let make_overdue = |corr: &str| -> String {
+            let did =
+                dispatch_idle::record_dispatch(&home, "lead", "victim", Some(corr), "task", 60)
+                    .expect("recorded pending dispatch");
+            let p = dispatch_idle::pending_path(&home, &did);
+            let mut v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            v["issued_at"] =
+                serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+            v["status"] = serde_json::json!("pending");
+            v["not_working_streak"] = serde_json::json!(0);
+            crate::store::atomic_write(&p, serde_json::to_string(&v).unwrap().as_bytes()).unwrap();
+            did
+        };
+        let status_of = |did: &str| -> String {
+            dispatch_idle::list_pending(&home)
+                .into_iter()
+                .find(|d| d.dispatch_id == *did)
+                .map(|d| format!("{:?}", d.status))
+                .unwrap_or_else(|| "DELETED".into())
+        };
+
+        // Promoted "active" → SUPPRESSED across DEBOUNCE+margin scans (never mis-fires).
+        save_snap("active");
+        let did_ok = make_overdue("corr-suppress");
+        for _ in 0..5 {
+            dispatch_idle::scan_and_emit(&home);
+        }
+        assert_eq!(
+            status_of(&did_ok),
+            "Pending",
+            "(b) dispatch_idle SUPPRESSED on the promoted false-idle — did NOT mis-fire"
+        );
+
+        // Contrast: a stale/raw "idle" snapshot (the pre-#1720-fix behaviour) → FIRES (Exceeded).
+        save_snap("idle");
+        let did_fire = make_overdue("corr-fire");
+        for _ in 0..5 {
+            dispatch_idle::scan_and_emit(&home);
+        }
+        assert_eq!(
+            status_of(&did_fire),
+            "Exceeded",
+            "(b-baseline) a stale 'idle' snapshot MIS-FIRES (the bug PR-B fixes for the live daemon)"
+        );
+
+        // ══ (c): AGEND_APP_SNAPSHOT=0 reverts — app does NOT write the snapshot ══
+        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
+        assert!(
+            !run_app_snapshot(),
+            "(c) AGEND_APP_SNAPSHOT=0 reverts: app mode does NOT run snapshot_rotation"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #2413 Phase B live-fix companion: the reducer driver is useless without the
     /// hook-event SOCKET SERVER feeding its buffer, and `shadow::start` is the only thing
     /// that binds it. `run_core` already calls it; this source-pins that `run_app` does
@@ -2270,20 +2542,397 @@ mod tests {
     /// daemon is `run_app`, so gating `rollout::spawn` to run_core-only would leave codex
     /// agents' observer source dead in production (their `observed_status` would never get
     /// Stream evidence). Production-region scan only (the assert literal lives in the test
-    /// module below — #2434's vacuous-pin lesson). REVERSE-MUTATION verified: deleting the
-    /// real `rollout::spawn(...)` call from run_app turns this RED.
+    /// module below — #2434's vacuous-pin lesson). Production-region scan, **comments
+    /// stripped** (#2447 r6 helper) so a commented-out call does NOT satisfy the pin.
+    /// REVERSE-MUTATION verified: both DELETING and COMMENTING-OUT the real
+    /// `rollout::spawn(...)` call in run_app turn this RED.
     #[test]
     fn run_app_wires_codex_rollout_tailer_2413() {
         let source = std::fs::read_to_string("src/app/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
+        let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
-            prod.contains("crate::daemon::shadow::rollout::spawn("),
+            prod_code.contains("crate::daemon::shadow::rollout::spawn("),
             "run_app must spawn the codex rollout-tail observer in the PRODUCTION region \
-             (#2413 Phase D) — gating it run_core-only would leave codex agents' Stream \
-             observer dead in the app-mode live daemon. No \
-             'crate::daemon::shadow::rollout::spawn(' before the #[cfg(test)] cutoff"
+             (#2413 Phase D) — gating it run_core-only (or commenting it out) would leave codex \
+             agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+             'crate::daemon::shadow::rollout::spawn(' (comments + string-literal contents masked) before the \
+             #[cfg(test)] cutoff"
+        );
+    }
+
+    /// #2413 opencode plane: the opencode SSE `/event` observer source (Stream plane) must
+    /// be started in app mode too — SAME #2434 reasoning as the rollout tailer above. The
+    /// live fleet daemon is `run_app`, so gating `opencode::spawn` to run_core-only would
+    /// leave opencode agents' observer source dead in production. Production-region scan,
+    /// **comments stripped** (#2447 r6 helper) so a commented-out call does NOT satisfy the
+    /// pin. REVERSE-MUTATION verified: both DELETING and COMMENTING-OUT the real
+    /// `opencode::spawn(...)` call in run_app turn this RED.
+    #[test]
+    fn run_app_wires_opencode_sse_observer_2413() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
+        let prod_code = strip_comments_and_blank_strings(prod);
+        assert!(
+            prod_code.contains("crate::daemon::shadow::opencode::spawn("),
+            "run_app must spawn the opencode SSE observer in the PRODUCTION region \
+             (#2413 opencode plane) — gating it run_core-only (or commenting it out) would leave \
+             opencode agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+             'crate::daemon::shadow::opencode::spawn(' (comments + string-literal contents masked) before the \
+             #[cfg(test)] cutoff"
+        );
+    }
+
+    /// Strip `//` line + `/* */` block comments from Rust source so a wiring-pin
+    /// contains-check can't be satisfied by a COMMENTED-OUT call (#2447 r6: the raw
+    /// contains() was vacuous — commenting the production call left the text present and the
+    /// pin still passed, the exact #2434 dead-wiring class it must catch).
+    ///
+    /// **String-literal-aware** (#2447 r6 round-2): a `//` or `/*` INSIDE a string / char /
+    /// raw-string literal is NOT a comment and is preserved verbatim — so e.g. a
+    /// `"http://x"` URL or a `"/* x */"` payload on a line cannot make the stripper eat the
+    /// rest of that line (a false-RED for the pin). Handles `"..."` (with `\` escapes),
+    /// `'...'` char literals (escape + simple; lifetimes like `'a` are left as-is), and raw
+    /// strings `r"..."` / `r#"..."#` / `br"..."` (hash-count matched, no escapes). Unicode-
+    /// correct. Shared so the codex/opencode app-pins can adopt it (follow-up).
+    fn strip_rust_comments(src: &str) -> String {
+        let s: Vec<char> = src.chars().collect();
+        let n = s.len();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < n {
+            let c = s[i];
+            // line comment → skip to (but keep) the newline.
+            if c == '/' && i + 1 < n && s[i + 1] == '/' {
+                i += 2;
+                while i < n && s[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // block comment → skip to `*/`.
+            if c == '/' && i + 1 < n && s[i + 1] == '*' {
+                i += 2;
+                while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                continue;
+            }
+            // raw string `r"..."` / `r#"..."#` / `br"..."` — copy verbatim (no escapes;
+            // close on `"` + the same number of `#`).
+            if c == 'r' || (c == 'b' && i + 1 < n && s[i + 1] == 'r') {
+                let r_pos = if c == 'b' { i + 1 } else { i };
+                let mut k = r_pos + 1;
+                let mut hashes = 0;
+                while k < n && s[k] == '#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && s[k] == '"' {
+                    for ch in &s[i..=k] {
+                        out.push(*ch);
+                    }
+                    i = k + 1;
+                    loop {
+                        if i >= n {
+                            break;
+                        }
+                        if s[i] == '"' {
+                            let mut h = 0;
+                            while i + 1 + h < n && h < hashes && s[i + 1 + h] == '#' {
+                                h += 1;
+                            }
+                            if h == hashes {
+                                for ch in &s[i..i + 1 + hashes] {
+                                    out.push(*ch);
+                                }
+                                i += 1 + hashes;
+                                break;
+                            }
+                        }
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                // not a raw string (plain identifier starting with r/b) → fall through.
+            }
+            // normal / byte string `"..."` — copy verbatim, honoring `\` escapes.
+            if c == '"' {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    if s[i] == '\\' && i + 1 < n {
+                        out.push(s[i]);
+                        out.push(s[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    out.push(s[i]);
+                    let closing = s[i] == '"';
+                    i += 1;
+                    if closing {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // char literal `'x'` / `'\n'` (vs a lifetime `'a`, left as a normal char).
+            if c == '\'' {
+                if i + 1 < n && s[i + 1] == '\\' {
+                    // escape char literal: `'`, `\`, escaped-char, …, `'`.
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    i += 2;
+                    if i < n {
+                        out.push(s[i]); // the escaped char (covers `'\''`)
+                        i += 1;
+                    }
+                    while i < n && s[i] != '\'' {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    if i < n {
+                        out.push(s[i]); // closing `'`
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 2 < n && s[i + 2] == '\'' {
+                    // simple char literal `'x'` (x may be `"` / `/`, must not start a string).
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    out.push(s[i + 2]);
+                    i += 3;
+                    continue;
+                }
+                // lifetime / stray `'` → normal char.
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// Replace the CONTENTS of every string / raw-string literal with spaces (delimiters
+    /// kept) in ALREADY-comment-free Rust source; char literals are passed through verbatim
+    /// (they can't hold a multi-char needle, but must be consumed so a `"` inside `'"'`
+    /// doesn't mis-start a string scan). Sibling of [`strip_rust_comments`] used only by the
+    /// wiring pins via [`strip_comments_and_blank_strings`].
+    ///
+    /// #2450 reviewer-6: comment-stripping alone left the pins **string-literal-blind** — a
+    /// needle hidden in a string (`let _ = "…::spawn(";`) survived the strip, so the pin's
+    /// `contains()` still falsely passed (the exact #2434 dead-wiring vacuity, just relocated
+    /// from a comment into a string). Blanking string interiors closes that: the only place
+    /// the needle survives is an ACTIVE code call.
+    fn blank_string_contents(src: &str) -> String {
+        let s: Vec<char> = src.chars().collect();
+        let n = s.len();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < n {
+            let c = s[i];
+            // raw string `r"..."` / `r#"..."#` / `br"..."` — blank interior, keep delimiters.
+            if c == 'r' || (c == 'b' && i + 1 < n && s[i + 1] == 'r') {
+                let r_pos = if c == 'b' { i + 1 } else { i };
+                let mut k = r_pos + 1;
+                let mut hashes = 0;
+                while k < n && s[k] == '#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && s[k] == '"' {
+                    for ch in &s[i..=k] {
+                        out.push(*ch); // opening `r#"` delimiter, verbatim
+                    }
+                    i = k + 1;
+                    loop {
+                        if i >= n {
+                            break;
+                        }
+                        if s[i] == '"' {
+                            let mut h = 0;
+                            while i + 1 + h < n && h < hashes && s[i + 1 + h] == '#' {
+                                h += 1;
+                            }
+                            if h == hashes {
+                                for ch in &s[i..i + 1 + hashes] {
+                                    out.push(*ch); // closing `"#`, verbatim
+                                }
+                                i += 1 + hashes;
+                                break;
+                            }
+                        }
+                        out.push(' '); // blank one interior char
+                        i += 1;
+                    }
+                    continue;
+                }
+                // not a raw string (identifier starting with r/b) → fall through.
+            }
+            // normal / byte string `"..."` — blank interior (honor `\` escapes), keep quotes.
+            if c == '"' {
+                out.push('"');
+                i += 1;
+                while i < n {
+                    if s[i] == '\\' && i + 1 < n {
+                        out.push(' ');
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                    if s[i] == '"' {
+                        out.push('"');
+                        i += 1;
+                        break;
+                    }
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // char literal `'x'` / `'\n'` — pass through verbatim (consume so a `"` inside a
+            // char literal can't start a string scan); a lifetime `'a` is a normal char.
+            if c == '\'' {
+                if i + 1 < n && s[i + 1] == '\\' {
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    i += 2;
+                    if i < n {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    while i < n && s[i] != '\'' {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    if i < n {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 2 < n && s[i + 2] == '\'' {
+                    out.push(s[i]);
+                    out.push(s[i + 1]);
+                    out.push(s[i + 2]);
+                    i += 3;
+                    continue;
+                }
+                // lifetime / stray `'` → normal char.
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// The wiring-pin matcher: strip comments AND blank string-literal contents, so a
+    /// `…::spawn(` needle counts ONLY when it is an ACTIVE code call — not commented out
+    /// (#2447) and not hidden in a string literal (#2450 reviewer-6). Composition of the two
+    /// proven passes; `strip_rust_comments` body is left untouched.
+    fn strip_comments_and_blank_strings(src: &str) -> String {
+        blank_string_contents(&strip_rust_comments(src))
+    }
+
+    /// #2450 reviewer-6 regression: the wiring-pin matcher must treat a `…::spawn(` needle as
+    /// PRESENT only when it is ACTIVE code — not in a comment (#2447) and not hidden inside a
+    /// string / raw-string literal (#2450). Pins reviewer-6's exact false-green break-probe.
+    #[test]
+    fn strip_comments_and_blank_strings_masks_string_and_comment_needles() {
+        let needle = "crate::daemon::shadow::rollout::spawn(";
+        // ACTIVE code call → still present (must NOT false-kill the real wiring).
+        assert!(strip_comments_and_blank_strings(&format!("    {needle}x);")).contains(needle));
+        // reviewer-6 break-probe: needle hidden in a NORMAL string literal → masked.
+        assert!(
+            !strip_comments_and_blank_strings(&format!("let _p = \"{needle}\";")).contains(needle)
+        );
+        // needle hidden in a RAW string literal → masked.
+        assert!(
+            !strip_comments_and_blank_strings(&format!("let _p = r#\"{needle}\"#;"))
+                .contains(needle)
+        );
+        // needle in a comment → masked (the comment-strip pass still applies).
+        assert!(!strip_comments_and_blank_strings(&format!("// {needle}\n")).contains(needle));
+        // string-literal-AWARE preserved: a `"http://x"` URL must not eat the rest of its
+        // line, so real code after it survives (no false-RED).
+        assert!(
+            strip_comments_and_blank_strings("let u = \"http://x\"; keep_me();")
+                .contains("keep_me()")
+        );
+    }
+
+    /// #2447 r6 round-2: `strip_rust_comments` must strip REAL comments yet preserve
+    /// `//` / `/*` that live inside string / char / raw-string literals (else a `"http://x"`
+    /// URL would false-strip its line → a vacuity-fix that introduces a false-RED). Covers
+    /// r6's requested cases.
+    #[test]
+    fn strip_rust_comments_is_string_literal_aware() {
+        // Real comments ARE stripped.
+        assert!(!strip_rust_comments("keep // dropme\n").contains("dropme"));
+        let blk = strip_rust_comments("alpha /* dropme */ omega");
+        assert!(!blk.contains("dropme") && blk.contains("alpha") && blk.contains("omega"));
+        // `//` inside a normal string is NOT a comment.
+        assert!(strip_rust_comments(r#"let u = "http://example.com/a";"#)
+            .contains("http://example.com/a"));
+        // `/* */` inside a string is preserved.
+        assert!(strip_rust_comments(r#"let s = "/* not a comment */";"#)
+            .contains("/* not a comment */"));
+        // raw string content (incl. `//`) is preserved.
+        assert!(strip_rust_comments(r##"let r = r#"// not comment"#;"##).contains("// not comment"));
+        // a quote/slash inside a CHAR literal must not start a string / a comment.
+        assert!(strip_rust_comments(r#"let c = '"'; live_after_quote();"#)
+            .contains("live_after_quote()"));
+        assert!(
+            strip_rust_comments("let c = '/'; live_after_slash();").contains("live_after_slash()")
+        );
+        // escaped-quote char literal `'\''` must not desync the scanner.
+        assert!(
+            strip_rust_comments(r"let c = '\''; live_after_esc();").contains("live_after_esc()")
+        );
+        // a real trailing line comment AFTER an in-string `//` is still stripped.
+        let mixed = strip_rust_comments("let u = \"a//b\"; keep(); // dropme\n");
+        assert!(mixed.contains("a//b") && mixed.contains("keep()") && !mixed.contains("dropme"));
+        // the pin's own case: active call survives; commented-out does not.
+        assert!(
+            strip_rust_comments("    crate::daemon::shadow::kiro::spawn(x);")
+                .contains("crate::daemon::shadow::kiro::spawn(")
+        );
+        assert!(
+            !strip_rust_comments("    // crate::daemon::shadow::kiro::spawn(x);")
+                .contains("crate::daemon::shadow::kiro::spawn(")
+        );
+    }
+
+    /// #2413 kiro plane: the kiro session-tail observer source (Stream plane) must be
+    /// started in app mode too — SAME #2434 reasoning as rollout/opencode above. The live
+    /// fleet daemon is `run_app`, so gating `kiro::spawn` to run_core-only would leave kiro
+    /// agents' observer source dead in production. Production-region scan, **comments
+    /// stripped** so a commented-out call does NOT satisfy the pin. REVERSE-MUTATION
+    /// verified (#2447 r6): both DELETING and COMMENTING-OUT the real `kiro::spawn(...)`
+    /// call in run_app turn this RED.
+    #[test]
+    fn run_app_wires_kiro_session_tailer_2413() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        // Strip comments FIRST: a commented-out call must not pass the pin (r6 vacuity fix).
+        let prod_code = strip_comments_and_blank_strings(prod);
+        assert!(
+            prod_code.contains("crate::daemon::shadow::kiro::spawn("),
+            "run_app must spawn the kiro session-tail observer in the PRODUCTION region \
+             (#2413 kiro plane) — gating it run_core-only (or commenting it out) would leave \
+             kiro agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+             'crate::daemon::shadow::kiro::spawn(' (comments + string-literal contents masked) before the \
+             #[cfg(test)] cutoff"
         );
     }
 

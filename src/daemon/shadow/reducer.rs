@@ -17,7 +17,8 @@
 //! Evidence and [`AgentRuntime::observe`] derives the status from the current screen +
 //! liveness snapshot. Both are pure over their inputs (no globals) so the whole state
 //! machine is unit-testable without a daemon; the per-tick driver (OUT OF SCOPE here)
-//! supplies the snapshot under one `core.lock()`. Runs only under `AGEND_SHADOW_OBSERVER`.
+//! supplies the snapshot under one `core.lock()`. Runs whenever the Shadow Observer is
+//! enabled (default-ON; gated off by the `AGEND_SHADOW_OBSERVER=0` kill-switch).
 
 // The whole reducer surface (ObservedStatus / AgentRuntime / ScreenSignal / Liveness +
 // ObservedState::coarse) is now consumed by the Phase-B per-tick driver

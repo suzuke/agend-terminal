@@ -1,8 +1,8 @@
 //! #2413 Shadow Observer — Phase B per-tick driver.
 //!
 //! The reducer ([`crate::daemon::shadow::reducer`]) is a pure state machine; this
-//! handler is the per-tick glue that feeds it. Each tick (when
-//! `AGEND_SHADOW_OBSERVER=1`) it, per managed agent:
+//! handler is the per-tick glue that feeds it. Each tick (default-ON; skipped only under
+//! the `AGEND_SHADOW_OBSERVER=0` kill-switch) it, per managed agent:
 //!   1. snapshots the screen baseline (`agent_state` → [`ScreenSignal`]) + the cheap
 //!      out-of-path liveness ([`Liveness`]: `api_in_flight` / productive-silence /
 //!      child-alive) under one `core.lock()`;
@@ -20,7 +20,8 @@
 use super::{PerTickHandler, TickContext};
 use crate::agent::AgentCore;
 use crate::daemon::shadow;
-use crate::daemon::shadow::reducer::{Liveness, ObservedState, ScreenSignal};
+use crate::daemon::shadow::gate;
+use crate::daemon::shadow::reducer::{Liveness, ScreenSignal};
 use crate::state::AgentState;
 use crate::sync_audit::CoreMutex;
 use std::sync::Arc;
@@ -77,55 +78,21 @@ impl PerTickHandler for ShadowObserveHandler {
                     productive_silent_ms: c.state.productive_silence().as_millis() as u64,
                     child_alive: *child_alive,
                 };
-                (raw_state, screen_signal(raw_state), live)
+                (raw_state, gate::screen_signal(raw_state), live)
             };
             let status = shadow::observe(name, screen, &live, now_ms);
             log_correction(name, raw_state, screen, &status, &live);
-            core.lock().observed_status = Some(status);
+            // #2413 (A): publish the GATED badge override into the lock-free mirror the
+            // render snapshot reads (Some ⇒ a high-confidence correction the badge shows;
+            // None ⇒ render keeps the raw state). Computed BEFORE `status` moves into
+            // `observed_status`. Both writes land under ONE core.lock; `publish_observed`
+            // touches only the separate atomic, NEVER `current` (cycle-proof). Same shared
+            // gate the operated snapshot (B) uses, so badge + dispatch can never diverge.
+            let badge = gate::gated_override(raw_state, &status);
+            let mut c = core.lock();
+            c.observed_status = Some(status);
+            c.state.publish_observed(badge);
         }
-    }
-}
-
-/// Map the 18-variant screen-scrape [`AgentState`] into the reducer's coarse
-/// [`ScreenSignal`] buckets. Exhaustive (no wildcard) ON PURPOSE: a future `AgentState`
-/// variant forces a compile error here so the map can never silently miss a state.
-fn screen_signal(s: AgentState) -> ScreenSignal {
-    match s {
-        AgentState::Idle => ScreenSignal::Idle,
-        // Actively rendering work (incl. boot/respawn churn, treated as working).
-        AgentState::ToolUse
-        | AgentState::Thinking
-        | AgentState::Starting
-        | AgentState::Restarting => ScreenSignal::Working,
-        // A human gate.
-        AgentState::PermissionPrompt
-        | AgentState::InteractivePrompt
-        | AgentState::AwaitingOperator => ScreenSignal::Approval,
-        AgentState::RateLimit | AgentState::ServerRateLimit | AgentState::UsageLimit => {
-            ScreenSignal::RateLimited
-        }
-        // Non-decisive for the liveness reconcile (it only fires on `Idle`). A genuinely
-        // crashed agent is caught by `child_alive=false`, not by the screen chrome.
-        AgentState::Hang
-        | AgentState::GitConflict
-        | AgentState::ContextFull
-        | AgentState::AuthError
-        | AgentState::ApiError
-        | AgentState::ModelUnsupported
-        | AgentState::Crashed => ScreenSignal::Other,
-    }
-}
-
-/// The coarse [`ObservedState`] the raw screen-scrape ALONE would report — the baseline
-/// the reducer is measured against (§5 quantification). `None` for a non-decisive screen
-/// (`Other`), which the reducer never claims to "correct" (no meaningful baseline).
-fn screen_as_observed(screen: ScreenSignal) -> Option<ObservedState> {
-    match screen {
-        ScreenSignal::Idle => Some(ObservedState::Idle),
-        ScreenSignal::Working => Some(ObservedState::Active),
-        ScreenSignal::Approval => Some(ObservedState::WaitingForUser),
-        ScreenSignal::RateLimited => Some(ObservedState::RateLimited),
-        ScreenSignal::Other => None,
     }
 }
 
@@ -143,7 +110,7 @@ fn log_correction(
     status: &crate::daemon::shadow::reducer::ObservedStatus,
     live: &Liveness,
 ) {
-    let Some(screen_state) = screen_as_observed(screen) else {
+    let Some(screen_state) = gate::screen_as_observed(screen) else {
         return; // non-decisive screen → no baseline to correct
     };
     if screen_state != status.state.coarse() {
@@ -182,13 +149,14 @@ mod tests {
 
     /// Set `AGEND_SHADOW_OBSERVER`, run a closure, then restore the prior value. Paired
     /// with `#[serial(shadow_observer)]` so the process-global env flip can't leak into a
-    /// parallel test reading `shadow::enabled()`.
+    /// parallel test reading `shadow::enabled()`. Since the plane is now **default-ON**, the
+    /// OFF case must set the explicit `=0` kill-switch (an unset/removed var is now ON).
     fn with_flag<T>(on: bool, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("AGEND_SHADOW_OBSERVER").ok();
         if on {
             std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
         } else {
-            std::env::remove_var("AGEND_SHADOW_OBSERVER");
+            std::env::set_var("AGEND_SHADOW_OBSERVER", "0");
         }
         let out = f();
         match prev {
@@ -294,91 +262,76 @@ mod tests {
         shadow::forget_agent(&name);
     }
 
+    /// Representative confirm-first: flag-ON, a buffered `TurnStarted` (episode open) +
+    /// a live child + an Idle screen ⇒ the mid-API false-idle correction is GATED and
+    /// PUBLISHED into the lock-free `published_observed` mirror the render badge reads.
+    /// This is the end-to-end pin that the correction actually reaches render, not just
+    /// `observed_status`.
     #[test]
-    fn screen_signal_maps_every_bucket() {
-        assert_eq!(screen_signal(AgentState::Idle), ScreenSignal::Idle);
-        assert_eq!(screen_signal(AgentState::ToolUse), ScreenSignal::Working);
-        assert_eq!(screen_signal(AgentState::Thinking), ScreenSignal::Working);
-        assert_eq!(screen_signal(AgentState::Starting), ScreenSignal::Working);
-        assert_eq!(
-            screen_signal(AgentState::PermissionPrompt),
-            ScreenSignal::Approval
+    #[serial(shadow_observer)]
+    fn flag_on_publishes_badge_override_to_mirror() {
+        let home = std::env::temp_dir();
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+        let (registry, core, name, _reader) = one_agent_registry("shadow-badge-on");
+
+        let token = shadow::new_session_token().unwrap();
+        shadow::register(&token, &name);
+        shadow::push(
+            &name,
+            Evidence::hook(
+                EvidenceKind::TurnStarted,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            ),
         );
-        assert_eq!(
-            screen_signal(AgentState::InteractivePrompt),
-            ScreenSignal::Approval
+
+        with_flag(true, || {
+            let ctx = ctx_for(&home, &registry, &externals, &configs);
+            ShadowObserveHandler::new().run(&ctx);
+        });
+
+        let byte = core
+            .lock()
+            .state
+            .published_observed_handle()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let badge = AgentState::from_observed_u8(byte);
+        assert!(
+            matches!(badge, Some(AgentState::Active)),
+            "mid-API false-idle correction must reach the lock-free badge mirror, got {badge:?}"
         );
-        assert_eq!(
-            screen_signal(AgentState::AwaitingOperator),
-            ScreenSignal::Approval
-        );
-        assert_eq!(
-            screen_signal(AgentState::RateLimit),
-            ScreenSignal::RateLimited
-        );
-        assert_eq!(
-            screen_signal(AgentState::ServerRateLimit),
-            ScreenSignal::RateLimited
-        );
-        assert_eq!(
-            screen_signal(AgentState::UsageLimit),
-            ScreenSignal::RateLimited
-        );
-        assert_eq!(screen_signal(AgentState::Crashed), ScreenSignal::Other);
-        assert_eq!(screen_signal(AgentState::GitConflict), ScreenSignal::Other);
-        assert_eq!(screen_signal(AgentState::Hang), ScreenSignal::Other);
+        shadow::forget_agent(&name);
     }
 
+    /// Flag-OFF: the handler early-returns, so the badge mirror stays at the no-override
+    /// sentinel (render falls back to the raw state) — byte-identical to pre-#2413.
     #[test]
-    fn screen_as_observed_baseline_buckets() {
-        assert_eq!(
-            screen_as_observed(ScreenSignal::Idle),
-            Some(ObservedState::Idle)
-        );
-        assert_eq!(
-            screen_as_observed(ScreenSignal::Working),
-            Some(ObservedState::Active)
-        );
-        assert_eq!(
-            screen_as_observed(ScreenSignal::Approval),
-            Some(ObservedState::WaitingForUser)
-        );
-        assert_eq!(
-            screen_as_observed(ScreenSignal::RateLimited),
-            Some(ObservedState::RateLimited)
-        );
-        // A non-decisive screen has no baseline the reducer can "correct".
-        assert_eq!(screen_as_observed(ScreenSignal::Other), None);
-    }
+    #[serial(shadow_observer)]
+    fn flag_off_leaves_badge_mirror_at_sentinel() {
+        let home = std::env::temp_dir();
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+        let (registry, core, name, _reader) = one_agent_registry("shadow-badge-off");
 
-    /// The §5 correction predicate, deterministically: the two headline wins the live
-    /// quantification counts. (a) mid-API false-idle — screen Idle but a fresh hook
-    /// episode + a live socket ⇒ Active ⇒ Idle≠Active ⇒ counts as a correction.
-    /// (b) approval-vs-idle — hook ApprovalRequired but screen reads Idle ⇒ WaitingForUser
-    /// ⇒ correction. (c) control — steady tool-use agrees with the screen ⇒ NOT a
-    /// correction (no false-active regression).
-    #[test]
-    fn correction_predicate_flags_false_idle_and_approval_not_steady() {
-        let is_correction = |screen: ScreenSignal, observed: ObservedState| {
-            screen_as_observed(screen).is_some_and(|b| b != observed.coarse())
-        };
-        // (a) false-idle caught.
-        assert!(is_correction(ScreenSignal::Idle, ObservedState::Active));
-        assert!(is_correction(ScreenSignal::Idle, ObservedState::ToolUse));
-        // (b) approval split out of idle.
-        assert!(is_correction(
-            ScreenSignal::Idle,
-            ObservedState::WaitingForUser
-        ));
-        // (c) steady states agree → no correction (no regression).
-        assert!(!is_correction(
-            ScreenSignal::Working,
-            ObservedState::ToolUse
-        ));
-        assert!(!is_correction(ScreenSignal::Idle, ObservedState::Idle));
-        assert!(!is_correction(
-            ScreenSignal::Approval,
-            ObservedState::WaitingForUser
-        ));
+        let token = shadow::new_session_token().unwrap();
+        shadow::register(&token, &name);
+        shadow::push(&name, Evidence::hook(EvidenceKind::TurnStarted, 1_000));
+
+        with_flag(false, || {
+            let ctx = ctx_for(&home, &registry, &externals, &configs);
+            ShadowObserveHandler::new().run(&ctx);
+        });
+
+        let byte = core
+            .lock()
+            .state
+            .published_observed_handle()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            AgentState::from_observed_u8(byte),
+            None,
+            "flag-OFF ⇒ no badge override published ⇒ mirror stays at the sentinel"
+        );
+        shadow::forget_agent(&name);
     }
 }

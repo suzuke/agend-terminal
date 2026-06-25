@@ -136,7 +136,7 @@ mod tests {
         assert_eq!(resp["ok"], true, "{resp}");
         let snap = crate::daemon::hook_shadow::snapshot_for("hooked").expect("recorded");
         assert_eq!(snap.last_event, "PreToolUse");
-        assert_eq!(snap.derived_state, Some(crate::state::AgentState::ToolUse));
+        assert_eq!(snap.derived_state, Some(crate::state::AgentState::Active));
 
         // Missing event name → honest error, nothing recorded for that call.
         let bad = handle_hook_event(&json!({"name": "hooked"}), &ctx);

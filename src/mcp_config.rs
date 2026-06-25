@@ -416,7 +416,143 @@ fn configure_agy(working_dir: &Path, instance_name: Option<&str>) -> Result<()> 
     // re-discovers from the config just written.
     clear_agy_mcp_cache();
 
+    // #2413 Phase D (agy shadow plane): inject per-workspace lifecycle hooks into
+    // `.agents/hooks.json` — agy/Antigravity's hook config (NEVER touches the
+    // global `~/.gemini`, scope rule honored). Same flag gate as claude
+    // (`configure_claude`); needs an instance name for the session↔agent
+    // attribution embedded in the hook command. RE-spike (t-…39100-6) proved these
+    // per-workspace hooks fire live mid-turn.
+    if std::env::var("AGEND_HOOK_STATE_POC").as_deref() == Ok("1")
+        || crate::daemon::shadow::enabled()
+    {
+        if let Some(name) = instance_name {
+            let hooks_path = working_dir.join(".agents").join("hooks.json");
+            upsert_agy_state_hooks(&hooks_path, name)?;
+        }
+    }
+
     tracing::debug!(path = %path.display(), "configured agy MCP (.agents/)");
+    Ok(())
+}
+
+/// #2413 Phase D: upsert observe-only lifecycle-hook reporters into agy's
+/// per-workspace `.agents/hooks.json` (agy/Antigravity hook config; the global
+/// `~/.gemini` is NEVER touched — scope rule). Each command hook runs the shared
+/// `hook-event` reporter with an explicit `--event` carrying the CLAUDE-COMPATIBLE
+/// name the shadow server already maps, so Evidence + the reducer are reused
+/// UNCHANGED:
+///   PreInvocation→UserPromptSubmit(TurnStarted), Stop→Stop(TurnEnded→idle).
+///
+/// Agy has NO tool-granularity hooks: only `PreInvocation` (per model step) and
+/// `Stop` ever fire. The earlier `PreTool→PreToolUse` / `PostTool→PostToolUse`
+/// mappings were dead and have been removed — empirically confirmed (t-…93090-0):
+/// a live probe registering EVERY candidate tool-hook key (PreTool/PostTool/
+/// PreToolUse/PostToolUse/OnToolStart/OnToolEnd/PreToolHooks/PostToolHooks) plus
+/// controls, driven through a real tool call, fired ONLY PreInvocation /
+/// PostInvocation / Stop; the live dogfood (agy-probe) likewise emitted
+/// UserPromptSubmit/Stop and ZERO tool events while the screen showed ToolUse. So
+/// only the two hooks agy actually fires are wired (busy/idle is fully covered;
+/// tool granularity is unavailable on agy, unlike kiro's session-tail observer).
+///
+/// Merge-preserving + idempotent + self-healing: our reporter is identified by
+/// its reserved `name` ("agend-shadow") AND command shape — NOT a bare command
+/// substring, so an operator hook that merely MENTIONS the marker text is never
+/// stripped (#2451 data-loss fix). Every re-configure first drops our prior
+/// reporter from ALL events (so retiring a mapping — e.g. the old PreTool/PostTool
+/// — also removes the dead reporter it once wrote, leaving no dangling no-op),
+/// prunes any event left empty, then re-installs on the live map; operator hooks
+/// are preserved. The reporter always exits 0 (observe-only — never blocks agy's
+/// turn) and the socket write fast-fails when the per-session socket is absent
+/// (shadow off), so this is spawn-safe.
+fn upsert_agy_state_hooks(path: &Path, instance_name: &str) -> Result<()> {
+    // (agy event name, claude-compatible event the shadow server maps). Only the
+    // two hooks agy actually fires — see fn doc (t-…93090-0: no tool granularity).
+    const EVENT_MAP: &[(&str, &str)] = &[("PreInvocation", "UserPromptSubmit"), ("Stop", "Stop")];
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "agend-terminal".to_string());
+    let marker = "hook-event --instance";
+    let our_name = "agend-shadow";
+    // PRECISE ownership: an entry is ours ONLY if it carries our reserved `name`
+    // AND our command shape. Using the command substring alone (the bug #2451
+    // reviewer-6 caught) would delete an operator hook whose command merely
+    // mentions the marker text — a data-loss false positive. We stamp `our_name`
+    // on every entry we write, so name-based matching cleans retired reporters
+    // (PreTool/PostTool from older code) without ever touching operator hooks.
+    let is_ours = |e: &serde_json::Value| {
+        e.get("name").and_then(|n| n.as_str()) == Some(our_name)
+            && e.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains(marker))
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                // Fail-CLOSED (same contract as upsert_state_hooks): back up the
+                // corrupt file (rename-first) and refuse to silently clobber it.
+                let backup = path.with_extension(format!(
+                    "corrupt.{}",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                if !crate::store::backup_corrupt_file(path, &backup) {
+                    anyhow::bail!(
+                        "malformed agy hooks at {} and its backup failed; refusing to overwrite (original preserved)",
+                        path.display()
+                    );
+                }
+                tracing::warn!(
+                    path = %path.display(), backup = %backup.display(), error = %e,
+                    "malformed agy hooks.json, backed up corrupt file and starting fresh"
+                );
+                json!({})
+            }
+        }
+    } else {
+        json!({})
+    };
+    if !config.is_object() {
+        config = json!({});
+    }
+    if !config.get("hooks").map(|h| h.is_object()).unwrap_or(false) {
+        config["hooks"] = json!({});
+    }
+    let hooks = config["hooks"]
+        .as_object_mut()
+        .expect("hooks set to object above");
+    // Idempotent + self-healing: drop OUR prior reporter (precise `is_ours`) from
+    // EVERY event — so retiring a mapping (e.g. the PreTool/PostTool tool hooks
+    // agy never fired) also removes the now-dead reporter it once wrote, instead
+    // of leaving a dangling no-op. Operator hooks (not is_ours) are kept verbatim.
+    for v in hooks.values_mut() {
+        if let Some(list) = v.as_array_mut() {
+            list.retain(|e| !is_ours(e));
+        }
+    }
+    // Prune events left empty by the strip (an empty hook list carries no meaning);
+    // operator events keep their entries and survive untouched.
+    hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
+    for (agy_event, claude_event) in EVENT_MAP {
+        let command = format!("{exe} hook-event --instance {instance_name} --event {claude_event}");
+        let our_entry = json!({ "name": our_name, "command": command });
+        let arr = hooks
+            .entry((*agy_event).to_string())
+            .or_insert_with(|| json!([]));
+        if !arr.is_array() {
+            *arr = json!([]);
+        }
+        arr.as_array_mut()
+            .expect("event value set to array above")
+            .push(our_entry);
+    }
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(path, body.as_bytes())?;
     Ok(())
 }
 
@@ -1458,6 +1594,110 @@ mod hook_state_poc_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// #2413 Phase D (agy): the agy hooks upsert writes per-workspace
+    /// `.agents/hooks.json` with agy's OWN event keys mapped to the
+    /// CLAUDE-compatible `--event` the shadow server already understands (so
+    /// Evidence + reducer are reused unchanged). Agy has no tool-granularity hooks
+    /// (t-…93090-0: live probe + dogfood — see fn doc), so only the two it fires
+    /// are wired: PreInvocation→UserPromptSubmit, Stop→Stop. Merge-preserving,
+    /// idempotent, and self-healing (a stale agend-shadow reporter under a RETIRED
+    /// key — the old PreTool/PostTool — is stripped on re-configure) while ownership
+    /// is PRECISE (name=="agend-shadow", not a bare command substring), so an
+    /// operator hook that merely mentions the marker text in its command survives
+    /// (#2451 data-loss fix). Reverse-mutation: break EVENT_MAP (e.g.
+    /// PreInvocation→"X") → the `--event UserPromptSubmit` assert fails; emit a
+    /// claude KEY (PreToolUse) → the agy-key lookup + "no claude key" assert fail;
+    /// drop the global strip/prune → the stale-PreTool self-heal assert fails;
+    /// widen ownership back to the command substring → the operator-mentions-marker
+    /// preserve assert fails.
+    #[test]
+    fn upsert_agy_state_hooks_maps_events_merges_and_is_idempotent() {
+        let dir = tmp("agy-hooks");
+        let path = dir.join(".agents").join("hooks.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Pre-existing: operator hook under a shared event (Stop) + a foreign
+        // event (SessionStart, with a 2nd operator hook whose COMMAND mentions the
+        // marker but whose NAME is not ours — reviewer-6 #2451 data-loss
+        // counterexample, MUST survive) + a STALE agend-shadow reporter under a
+        // RETIRED key (PreTool, as older code wrote) that self-healing must strip.
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "Stop": [{"name": "user-bell", "command": "say done"}],
+                    "SessionStart": [
+                        {"name": "user-greet", "command": "echo hi"},
+                        {"name": "operator-mentions-marker",
+                         "command": "printf 'hook-event --instance is documented here'"},
+                    ],
+                    "PreTool": [{"name": "agend-shadow",
+                                 "command": "/x hook-event --instance old --event PreToolUse"}],
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        upsert_agy_state_hooks(&path, "agent-x").unwrap();
+        upsert_agy_state_hooks(&path, "agent-x").unwrap(); // idempotent re-run
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        for (agy_ev, claude_ev) in [("PreInvocation", "UserPromptSubmit"), ("Stop", "Stop")] {
+            let arr = cfg["hooks"][agy_ev]
+                .as_array()
+                .unwrap_or_else(|| panic!("event {agy_ev} present"));
+            let ours: Vec<_> = arr
+                .iter()
+                .filter(|e| {
+                    e["command"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("hook-event --instance"))
+                })
+                .collect();
+            assert_eq!(ours.len(), 1, "{agy_ev}: exactly one of ours after re-run");
+            let cmd = ours[0]["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("--instance agent-x"),
+                "{agy_ev}: instance embedded"
+            );
+            assert!(
+                cmd.contains(&format!("--event {claude_ev}")),
+                "{agy_ev} → --event {claude_ev}; got {cmd}"
+            );
+        }
+        // Merge-preserving: operator + foreign entries survive.
+        let stop = cfg["hooks"]["Stop"].as_array().unwrap();
+        assert!(
+            stop.iter().any(|e| e["command"] == "say done"),
+            "operator Stop hook preserved"
+        );
+        assert_eq!(cfg["hooks"]["SessionStart"][0]["command"], "echo hi");
+        // #2451 data-loss fix: an operator hook whose COMMAND mentions the marker
+        // but whose NAME is not ours MUST survive (ownership is name-based, not a
+        // command substring). reviewer-6's counterexample, locked in.
+        let ss = cfg["hooks"]["SessionStart"].as_array().unwrap();
+        assert!(
+            ss.iter().any(|e| e["name"] == "operator-mentions-marker"),
+            "operator hook mentioning the marker text in its command must be preserved"
+        );
+        // No tool granularity: PreTool/PostTool are not mapped, and the stale
+        // agend-shadow reporter under the retired PreTool key is self-healed away
+        // (its only entry was ours → stripped → the empty event pruned).
+        assert!(
+            cfg["hooks"].get("PreTool").is_none() && cfg["hooks"].get("PostTool").is_none(),
+            "retired tool-hook keys absent (dead mapping removed + stale entry self-healed)"
+        );
+        // agy config must use AGY event KEYS, never claude's.
+        assert!(
+            cfg["hooks"].get("PreToolUse").is_none()
+                && cfg["hooks"].get("UserPromptSubmit").is_none(),
+            "agy hooks.json must key on agy events (PreInvocation), not claude's"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// #hook-state-poc: flag OFF (default) → configure_claude writes NO hooks
     /// key at all — zero behavior change without AGEND_HOOK_STATE_POC=1.
     /// The flag is now deployed FLEET-WIDE (the shadow experiment), so the
@@ -1465,22 +1705,34 @@ mod hook_state_poc_tests {
     /// AGEND_RESTART_HANDOFF fix in #1964 (a fleet agent's inherited env must
     /// not flip the contract under test).
     #[test]
-    #[serial_test::serial(hook_state_poc)] // #2014: shares AGEND_HOOK_STATE_POC with hook_shadow's env test
+    // #2014: shares AGEND_HOOK_STATE_POC with hook_shadow's env test. Also serialized
+    // against `shadow_observer` because this test now drives the AGEND_SHADOW_OBSERVER=0
+    // kill-switch (the plane is default-ON since the graduate), which other shadow tests
+    // also flip.
+    #[serial_test::serial(hook_state_poc, shadow_observer)]
     fn hooks_not_injected_without_flag() {
-        // Serialize the process-global env flip; restore before asserting so
-        // a panic can't leak the cleared flag to other tests. The named serial
-        // group above coordinates this with hook_shadow's promotion env test
-        // (which mutates the SAME var); the local mutex is the in-module backstop.
+        // Serialize the process-global env flips; restore before asserting so a panic can't
+        // leak them to other tests. The serial groups + local mutex coordinate the shared
+        // AGEND_HOOK_STATE_POC / AGEND_SHADOW_OBSERVER vars across tests.
         static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("AGEND_HOOK_STATE_POC").ok();
         std::env::remove_var("AGEND_HOOK_STATE_POC");
+        // The Shadow Observer is now default-ON, and its `|| shadow::enabled()` gate also
+        // drives hook injection — so prove the no-hooks path with BOTH flags off: the
+        // explicit `=0` kill-switch (an absent var would now mean ON).
+        let prev_shadow = std::env::var("AGEND_SHADOW_OBSERVER").ok();
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "0");
 
         let dir = tmp("flag-off");
         // configure_claude needs a git repo; it git-inits itself.
         let result = configure_claude(&dir, Some("agent-y"));
         if let Some(v) = prev {
             std::env::set_var("AGEND_HOOK_STATE_POC", v);
+        }
+        match prev_shadow {
+            Some(v) => std::env::set_var("AGEND_SHADOW_OBSERVER", v),
+            None => std::env::remove_var("AGEND_SHADOW_OBSERVER"),
         }
         result.unwrap();
         let cfg: serde_json::Value = serde_json::from_str(

@@ -74,13 +74,13 @@ pub fn agent_state_of(home: &Path, agent_name: &str) -> Option<String> {
         .map(|a| a.agent_state)
 }
 
-/// #1513: is the agent mid-generation (Thinking/ToolUse) per the latest
+/// #1513: is the agent mid-generation (`Active`) per the latest
 /// snapshot? Fail-OPEN (returns false on a missing snapshot/agent) so a stale or
 /// absent snapshot never starves the notification queue — the MAX_DEFER cap is
-/// the backstop. Matches `AgentState::display_name` (`thinking` / `tool_use`).
+/// the backstop. Matches `AgentState::display_name` (`active`).
 pub fn agent_is_busy(home: &Path, agent_name: &str) -> bool {
     agent_state_of(home, agent_name)
-        .map(|s| matches!(s.as_str(), "thinking" | "tool_use"))
+        .map(|s| s.as_str() == "active")
         .unwrap_or(false)
 }
 

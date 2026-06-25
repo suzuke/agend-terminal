@@ -56,6 +56,26 @@ pub struct RuntimeConfig {
     /// `default_true` also fills the field for configs written before it existed.
     #[serde(default = "default_true")]
     pub copy_on_select: bool,
+    /// dim-unfocused (t-…50430): when true (DEFAULT), every NON-focused pane's content is
+    /// blended toward the (dark) terminal background so the focused pane stands out at a
+    /// glance — a cross-terminal focus aid that does NOT rely on the terminal-dependent
+    /// `Modifier::DIM`. Read live by `render_pane`; toggle via the `config` MCP tool /
+    /// `:set dim_unfocused_panes on|off`. `default_true` also fills it for configs written
+    /// before it existed (additive — no schema bump).
+    #[serde(default = "default_true")]
+    pub dim_unfocused_panes: bool,
+    /// #2413 (A): when true (DEFAULT), the pane state badge shows the Shadow
+    /// Observer's HIGH-CONFIDENCE correction (`observed_status`, gated to
+    /// Hook/Stream + Confirmed/Strong) in place of the raw screen-scrape — e.g. an
+    /// agent mid-API-call that renders `[Idle]` shows `[Thinking]`, an approval gate
+    /// shows `[AwaitingOperator]`. Weak / screen-only backends keep the raw state
+    /// (the gate can't fire), so this never regresses them. `false` keeps every
+    /// badge on the raw screen state. The `AGEND_SHADOW_OBSERVER=0` kill-switch
+    /// disables the whole observer (and so this) regardless. Read live by
+    /// `render::build_agent_state_snapshot`; toggle via `:set observed_badge on|off`.
+    /// `default_true` also fills the field for configs written before it existed.
+    #[serde(default = "default_true")]
+    pub observed_badge: bool,
     /// #2090: origin-aware long-task progress reporting mode. `0` = off
     /// (DEFAULT — zero behaviour change).
     ///
@@ -117,6 +137,8 @@ impl Default for RuntimeConfig {
             idle_watchdog_enabled: true,
             show_pane_state: true,
             copy_on_select: true,
+            dim_unfocused_panes: true,
+            observed_badge: true,
             progress_mode: 0,
             schema_version: RuntimeConfig::CURRENT,
         }
@@ -263,6 +285,23 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use on/off)")),
             };
         }
+        "dim_unfocused_panes" => {
+            // operator-facing UX toggle — accept on/off alongside true/false/1/0.
+            config.dim_unfocused_panes = match value {
+                "true" | "1" | "on" => true,
+                "false" | "0" | "off" => false,
+                _ => return Err(format!("invalid boolean: {value} (use on/off)")),
+            };
+        }
+        "observed_badge" => {
+            // #2413 (A): operator-facing badge-correction toggle — accept on/off
+            // alongside true/false/1/0.
+            config.observed_badge = match value {
+                "true" | "1" | "on" => true,
+                "false" | "0" | "off" => false,
+                _ => return Err(format!("invalid boolean: {value} (use on/off)")),
+            };
+        }
         "progress_mode" => {
             let m: i64 = value
                 .parse()
@@ -316,6 +355,8 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "idle_watchdog_enabled" => Ok(config.idle_watchdog_enabled.to_string()),
         "show_pane_state" => Ok(config.show_pane_state.to_string()),
         "copy_on_select" => Ok(config.copy_on_select.to_string()),
+        "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
+        "observed_badge" => Ok(config.observed_badge.to_string()),
         "progress_mode" => Ok(config.progress_mode.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
@@ -467,6 +508,28 @@ mod tests {
         assert_eq!(get_key("copy_on_select").unwrap(), "true");
         // Garbage value rejected (not silently coerced).
         assert!(set(&dir, "copy_on_select", "maybe").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2413 (A): `observed_badge` defaults ON (the operator sees observer-corrected
+    /// badges by default) and toggles via on/off (and true/false/1/0), persisting
+    /// across reload. Garbage rejected.
+    #[test]
+    #[serial(runtime_config)]
+    fn observed_badge_default_on_and_toggleable_via_on_off() {
+        assert!(
+            RuntimeConfig::default().observed_badge,
+            "observed_badge must default ON"
+        );
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-obsbadge");
+        std::fs::create_dir_all(&dir).ok();
+        set(&dir, "observed_badge", "off").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("observed_badge").unwrap(), "false");
+        set(&dir, "observed_badge", "on").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("observed_badge").unwrap(), "true");
+        assert!(set(&dir, "observed_badge", "maybe").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

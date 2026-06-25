@@ -22,6 +22,11 @@ use crate::backend::Backend;
 use std::time::Duration;
 
 /// Behavioral state inference result.
+// Sprint 27 PR-A silence-based shadow probe: the live consumer
+// (`state::record_shadow_telemetry`) was retired with the rest of the
+// `behavioral_shadow` scaffolding; the inference layer is kept (exercised by the
+// tests below) for a potential Phase-2 promotion of silence → state.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BehavioralSignal {
     /// PTY output silent beyond threshold → likely thinking/processing.
@@ -45,9 +50,14 @@ impl std::fmt::Display for BehavioralSignal {
 /// Per-backend behavioral calibration constants.
 #[derive(Debug, Clone, Copy)]
 pub struct BehavioralConfig {
+    // Read only by `infer_from_silence` (silence-based shadow probe), whose live
+    // consumer was retired with the `behavioral_shadow` scaffolding; populated by
+    // the `backend_profile` tables and kept for a potential Phase-2 promotion.
     /// Silence duration before inferring "thinking" (ms).
+    #[allow(dead_code)]
     pub silence_thinking_ms: u64,
     /// Silence duration before inferring "idle" (ms).
+    #[allow(dead_code)]
     pub silence_idle_ms: u64,
 }
 
@@ -71,6 +81,10 @@ pub fn config_for(backend: &Backend) -> BehavioralConfig {
 }
 
 /// Infer behavioral signal from silence duration.
+// Sprint 27 PR-A: the live caller (`state::record_shadow_telemetry`) was retired
+// with the `behavioral_shadow` scaffolding; retained (and exercised by the tests
+// below) as the silence-inference primitive for a potential Phase-2 promotion.
+#[allow(dead_code)]
 pub fn infer_from_silence(config: &BehavioralConfig, silence: Duration) -> BehavioralSignal {
     let silence_ms = silence.as_millis() as u64;
     if silence_ms >= config.silence_idle_ms {
@@ -79,114 +93,6 @@ pub fn infer_from_silence(config: &BehavioralConfig, silence: Duration) -> Behav
         BehavioralSignal::SilenceThinking
     } else {
         BehavioralSignal::None
-    }
-}
-
-/// Shadow-mode telemetry: log behavioral signal alongside regex state.
-/// In shadow mode this is observability only — no state change.
-pub fn log_shadow_telemetry(
-    instance: &str,
-    backend: &str,
-    regex_state: &str,
-    behavioral: BehavioralSignal,
-) {
-    if behavioral != BehavioralSignal::None {
-        tracing::debug!(
-            target: "behavioral_shadow",
-            instance,
-            backend,
-            regex_state,
-            behavioral = %behavioral,
-            "behavioral shadow: signal detected"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Divergence dashboard — accumulates behavioral vs regex state comparisons
-// ---------------------------------------------------------------------------
-
-/// Per-backend divergence counter for shadow-mode telemetry.
-#[derive(Debug, Default)]
-pub struct DivergenceStats {
-    pub total_ticks: u64,
-    pub agree: u64,
-    pub diverge: u64,
-}
-
-impl DivergenceStats {}
-
-/// Global divergence accumulator — keyed by backend name.
-static DIVERGENCE: parking_lot::Mutex<Option<std::collections::HashMap<String, DivergenceStats>>> =
-    parking_lot::Mutex::new(None);
-
-/// Record a tick where behavioral and regex states are compared.
-///
-/// ## TWO divergence axes — do NOT conflate (survey 04 §6 recurrence guard)
-///
-/// This is the **silence×regex** axis (Sprint 27 shadow probe): it compares the
-/// silence-based `BehavioralSignal` (`thinking`/`idle`, produced by
-/// `infer_from_silence`) against the regex-detected screen state, and accumulates
-/// per-backend agree/diverge counts in `DivergenceStats`. `record_divergence` is
-/// invoked from the live state tracker (`state/mod.rs`); its *reader*,
-/// `divergence_report`, is retained but unconsumed in production (the
-/// `state-divergence-report` CLI was removed — operator decision
-/// `d-20260507155456191111-0`).
-///
-/// This is a DIFFERENT axis from the **heuristic×hook** divergence telemetry in
-/// `crate::daemon::divergence_telemetry` (the #1523 phase-2 prerequisite), which
-/// compares the raw screen *heuristic* state against the *hook-authoritative*
-/// state, with a per-state-pair breakdown (`disagree_pairs`) this older
-/// agree/diverge counter lacks.
-///
-/// survey 04 §6 mistakenly treated THIS (silence×regex) telemetry as #1523
-/// phase-2 material — it is not, and the two must not be wired together. #1523
-/// phase-2 work (promoting hang/recovery/watchdog/conflict_notify deciders from
-/// heuristic → hook) must use `crate::daemon::divergence_telemetry`, NOT this:
-/// silence-vs-regex measures the behavioral *shadow probe*; heuristic-vs-hook
-/// measures the #1523 *decider flip*. (Removing this unused silence×regex data
-/// layer is a separate decision that needs operator sign-off —
-/// dead-code-may-be-roadmap — not part of documenting the distinction.)
-pub fn record_divergence(backend: &str, behavioral: BehavioralSignal, regex_state: &str) {
-    let mut guard = DIVERGENCE.lock();
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    let stats = map.entry(backend.to_string()).or_default();
-    stats.total_ticks += 1;
-    // Divergence: behavioral says thinking/idle but regex says something else
-    let behavioral_implies = match behavioral {
-        BehavioralSignal::SilenceThinking => "thinking",
-        BehavioralSignal::SilenceIdle => "idle",
-        BehavioralSignal::None => regex_state, // no signal = agree by default
-    };
-    if behavioral_implies == regex_state {
-        stats.agree += 1;
-    } else {
-        stats.diverge += 1;
-    }
-}
-
-/// Wave 1 CLI consolidation: the standalone `state-divergence-report`
-/// CLI surface was removed (operator audit decision
-/// `d-20260507155456191111-0`). Data layer kept intact — future API
-/// endpoint or daemon-side consumer can re-expose if needed.
-#[allow(dead_code)] // used by tests; data layer retained for future API
-pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
-    let guard = DIVERGENCE.lock();
-    match guard.as_ref() {
-        Some(map) => map
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    DivergenceStats {
-                        total_ticks: v.total_ticks,
-                        agree: v.agree,
-                        diverge: v.diverge,
-                    },
-                )
-            })
-            .collect(),
-        None => Vec::new(),
     }
 }
 
@@ -565,11 +471,11 @@ pub fn infer_productivity_with_match(
     (ProductivitySignal::NoSignal, None)
 }
 
-/// Shadow-mode telemetry for productive-output signals. Parallels
-/// `log_shadow_telemetry` (silence-side) — shares the `behavioral_shadow`
-/// tracing target so dashboards / log queries pick up both signal kinds.
-/// Per Delta 1 (decision `d-20260513235514013631-0`), Sprint 27 call sites
-/// untouched; this is an additive function not a refactor.
+/// Shadow-mode telemetry for productive-output signals. Emits on the
+/// `behavioral_shadow` tracing target so dashboards / log queries pick up the
+/// productive-output signal kind. Per Delta 1 (decision
+/// `d-20260513235514013631-0`), Sprint 27 call sites untouched; this is an
+/// additive function not a refactor.
 pub fn log_productivity_telemetry(
     instance: &str,
     backend: &str,
@@ -682,133 +588,6 @@ mod tests {
         );
     }
 
-    /// M2+M4 e2e: feed fixture → sleep past silence threshold → feed again
-    /// → capture behavioral_shadow telemetry via tracing subscriber.
-    #[test]
-    fn fixture_replay_claude_thinking_emits_behavioral_telemetry() {
-        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let buf_w = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || {
-                struct W(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-                impl std::io::Write for W {
-                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                        self.0.lock().extend_from_slice(b);
-                        Ok(b.len())
-                    }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                W(buf_w.clone())
-            })
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let fixture = std::fs::read("tests/fixtures/state-replay/claude-thinking.raw").unwrap();
-        let mut tracker = crate::state::StateTracker::new(Some(&Backend::ClaudeCode));
-        tracker.set_instance_name("test-fixture");
-        tracker.feed(&String::from_utf8_lossy(&fixture));
-        std::thread::sleep(Duration::from_millis(2100));
-        tracker.feed("_");
-        drop(_guard);
-        let output = String::from_utf8(buf.lock().clone()).unwrap();
-        assert!(
-            output.contains("silence_thinking"),
-            "expected silence_thinking after 2.1s silence, got: {}",
-            if output.is_empty() {
-                "(empty)".to_string()
-            } else {
-                output[..output.len().min(300)].to_string()
-            }
-        );
-    }
-
-    /// Helper: e2e behavioral telemetry capture for a fixture.
-    fn e2e_fixture_behavioral(file: &str, backend: &Backend) {
-        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let buf_w = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || {
-                struct W(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-                impl std::io::Write for W {
-                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                        self.0.lock().extend_from_slice(b);
-                        Ok(b.len())
-                    }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                W(buf_w.clone())
-            })
-            .with_ansi(false)
-            .finish();
-        let path = format!("tests/fixtures/state-replay/{file}");
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let fixture = std::fs::read(&path).unwrap();
-        let mut tracker = crate::state::StateTracker::new(Some(backend));
-        tracker.set_instance_name("test-e2e");
-        tracker.feed(&String::from_utf8_lossy(&fixture));
-        std::thread::sleep(Duration::from_millis(3100));
-        tracker.feed("_");
-        drop(_guard);
-        let output = String::from_utf8(buf.lock().clone()).unwrap();
-        assert!(
-            output.contains("silence_thinking"),
-            "fixture {file} expected silence_thinking, got: {}",
-            if output.is_empty() {
-                "(empty)"
-            } else {
-                &output[..output.len().min(200)]
-            }
-        );
-    }
-
-    #[test]
-    fn e2e_kiro_thinking() {
-        e2e_fixture_behavioral("kiro-thinking.raw", &Backend::KiroCli);
-    }
-    #[test]
-    fn e2e_codex_thinking() {
-        e2e_fixture_behavioral("codex-thinking.raw", &Backend::Codex);
-    }
-    #[test]
-    fn e2e_opencode_thinking() {
-        e2e_fixture_behavioral("opencode-thinking.raw", &Backend::OpenCode);
-    }
-    // Sprint 27 PR-B: extend e2e to all 13 fixtures
-    #[test]
-    fn e2e_claude_tooluse() {
-        e2e_fixture_behavioral("claude-tooluse.raw", &Backend::ClaudeCode);
-    }
-    #[test]
-    fn e2e_claude_perm() {
-        e2e_fixture_behavioral("claude-perm.raw", &Backend::ClaudeCode);
-    }
-    #[test]
-    fn e2e_codex_tooluse() {
-        e2e_fixture_behavioral("codex-tooluse.raw", &Backend::Codex);
-    }
-    #[test]
-    fn e2e_codex_update() {
-        e2e_fixture_behavioral("codex-update.raw", &Backend::Codex);
-    }
-    #[test]
-    fn e2e_codex_perm() {
-        e2e_fixture_behavioral("codex-perm.raw", &Backend::Codex);
-    }
-    #[test]
-    fn e2e_kiro_tooluse() {
-        e2e_fixture_behavioral("kiro-tooluse.raw", &Backend::KiroCli);
-    }
-    #[test]
-    fn e2e_opencode_tooluse() {
-        e2e_fixture_behavioral("opencode-tooluse.raw", &Backend::OpenCode);
-    }
-
     #[test]
     fn fixture_replay_claude_tooluse() {
         replay_fixture("claude-tooluse.raw", &Backend::ClaudeCode);
@@ -871,79 +650,6 @@ mod tests {
         );
     }
 
-    /// M4: Verify log_shadow_telemetry emits a tracing event with
-    /// the behavioral signal in the message.
-    #[test]
-    fn shadow_telemetry_emits_tracing_event() {
-        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let buf_w = buf.clone();
-
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || {
-                struct W(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-                impl std::io::Write for W {
-                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                        self.0.lock().extend_from_slice(b);
-                        Ok(b.len())
-                    }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                W(buf_w.clone())
-            })
-            .finish();
-
-        let signal = infer_from_silence(
-            &config_for(&Backend::ClaudeCode),
-            Duration::from_millis(3000),
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            log_shadow_telemetry("test-agent", "claude-code", "idle", signal);
-        });
-
-        let output = String::from_utf8(buf.lock().clone()).unwrap();
-        assert!(
-            output.contains("silence_thinking"),
-            "expected 'silence_thinking' in tracing output, got: {output}"
-        );
-    }
-
-    /// M4: Verify None signal does NOT emit any tracing event.
-    #[test]
-    fn shadow_telemetry_skips_none_signal() {
-        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
-        let buf_w = buf.clone();
-
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || {
-                struct W(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-                impl std::io::Write for W {
-                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                        self.0.lock().extend_from_slice(b);
-                        Ok(b.len())
-                    }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        Ok(())
-                    }
-                }
-                W(buf_w.clone())
-            })
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
-            log_shadow_telemetry("test-agent", "claude-code", "idle", BehavioralSignal::None);
-        });
-
-        let output = String::from_utf8(buf.lock().clone()).unwrap();
-        assert!(
-            !output.contains("behavioral shadow"),
-            "None signal should not emit, got: {output}"
-        );
-    }
-
     /// M4: StateTracker must expose has_behavioral_config() — fails to
     /// compile when state.rs behavioral fields are absent (RED state).
     #[test]
@@ -952,45 +658,6 @@ mod tests {
         assert!(
             tracker.has_behavioral_config(),
             "StateTracker must have behavioral_config for managed backends"
-        );
-    }
-
-    // --- Sprint 27 PR-B: divergence dashboard tests ---
-
-    #[test]
-    fn divergence_record_and_report() {
-        // Record some ticks
-        record_divergence(
-            "test-backend",
-            BehavioralSignal::SilenceThinking,
-            "thinking",
-        );
-        record_divergence("test-backend", BehavioralSignal::SilenceThinking, "idle"); // diverge
-        record_divergence("test-backend", BehavioralSignal::None, "idle"); // agree (None = no signal)
-
-        let report = divergence_report();
-        let entry = report.iter().find(|(k, _)| k == "test-backend");
-        assert!(entry.is_some(), "report must contain test-backend");
-        let (_, stats) = entry.unwrap();
-        assert!(stats.total_ticks >= 3, "must have at least 3 ticks");
-        assert!(stats.diverge >= 1, "must have at least 1 divergence");
-    }
-
-    #[test]
-    fn divergence_e2e_through_state_tracker() {
-        // Feed a fixture through StateTracker → divergence accumulator should record
-        let fixture = std::fs::read("tests/fixtures/state-replay/claude-thinking.raw").unwrap();
-        let mut tracker = crate::state::StateTracker::new(Some(&Backend::ClaudeCode));
-        tracker.set_instance_name("test-divergence");
-        tracker.feed(&String::from_utf8_lossy(&fixture));
-        std::thread::sleep(Duration::from_millis(2200));
-        tracker.feed("_");
-
-        let report = divergence_report();
-        let entry = report.iter().find(|(k, _)| k == "claude");
-        assert!(
-            entry.is_some(),
-            "divergence report must contain claude after feed"
         );
     }
 

@@ -188,7 +188,7 @@ pub fn productive_silence_exceeds(agent_state: AgentState, silent_productive: Du
         | AgentState::InteractivePrompt
         | AgentState::AwaitingOperator => false,
         AgentState::Starting => silent_productive > Duration::from_secs(120),
-        AgentState::Thinking | AgentState::ToolUse => silent_productive > Duration::from_secs(600),
+        AgentState::Active => silent_productive > Duration::from_secs(600),
         _ => silent_productive > Duration::from_secs(120),
     }
 }
@@ -905,7 +905,7 @@ impl HealthTracker {
             //   last_heartbeat_at_ms > 0 AND heartbeat_age_ms < silent.as_millis(),
             //   state != Hung
             // POST: state = Hung, check_hang returns true (first detection only)
-            // FP vector: F39 — stale AgentState::Thinking pattern in vterm scrollback;
+            // FP vector: F39 — stale AgentState::Active pattern in vterm scrollback;
             //   bounded by LATCHED_STATE_EXPIRY (30s) but not perfectly.
             // FN vector: F9 grey failure — same shape as §Entry.E1.
             // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E2
@@ -1457,7 +1457,7 @@ mod tests {
         // First post-restart Hung detection (E1: silent past threshold + input
         // pending past heartbeat). Must KEEP the rehydrated anchor.
         let entered = h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1496,7 +1496,7 @@ mod tests {
         // 1) Enter Hung → anchor set; the snapshot carries it.
         let mut h = HealthTracker::new();
         assert!(h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1530,7 +1530,7 @@ mod tests {
         // 4) A later, unrelated Hung episode anchors FRESH (≈now) → not yet due,
         //    so no false immediate escalation (the bug had it fire at once).
         assert!(after.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1619,14 +1619,14 @@ mod tests {
     fn test_hang_thinking_long_timeout() {
         let mut h = HealthTracker::new();
         assert!(!h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(100),
             Duration::from_secs(0),
             1_000_000,
             0
         )); // 100s < 600s
         assert!(h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1654,8 +1654,7 @@ mod tests {
         for s in [
             AgentState::Idle,
             AgentState::Idle,
-            AgentState::Thinking,
-            AgentState::ToolUse,
+            AgentState::Active,
             AgentState::Hang,
             AgentState::AwaitingOperator,
             AgentState::Crashed,
@@ -1738,7 +1737,7 @@ mod tests {
         });
         // Thinking + 700s silence would normally trigger hang
         assert!(!h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1750,7 +1749,7 @@ mod tests {
         h.clear_blocked_reason();
         h.set_blocked_reason(BlockedReason::QuotaExceeded);
         assert!(!h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1760,7 +1759,7 @@ mod tests {
         h.clear_blocked_reason();
         h.set_blocked_reason(BlockedReason::AwaitingOperator);
         assert!(!h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1771,7 +1770,7 @@ mod tests {
         h.clear_blocked_reason();
         h.set_blocked_reason(BlockedReason::PermissionPrompt);
         assert!(h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1842,23 +1841,23 @@ mod tests {
             Duration::from_secs(119)
         ));
         assert!(productive_silence_exceeds(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(601)
         ));
         assert!(!productive_silence_exceeds(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(599)
         ));
         // Ready/Idle merge: `Idle` is now EXEMPT from the Hung floor (it absorbed
         // the old `Ready` catch-all path → Idle's `=> false`). An idle agent is
         // legitimately quiet — never silence-Hung. A genuinely-stalling ACTIVE
-        // agent still hangs via the ToolUse/Thinking 600s threshold.
+        // agent still hangs via the Active 600s threshold.
         assert!(!productive_silence_exceeds(
             AgentState::Idle,
             Duration::from_secs(121)
         ));
         assert!(productive_silence_exceeds(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(601)
         ));
     }
@@ -1870,7 +1869,7 @@ mod tests {
             retry_after_secs: None,
         });
         assert!(!h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1879,7 +1878,7 @@ mod tests {
 
         h.clear_blocked_reason();
         assert!(h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1930,7 +1929,7 @@ mod tests {
 
         // check_hang should still fire (no reason set)
         assert!(h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1954,7 +1953,7 @@ mod tests {
         );
         // check_hang should be suppressed
         assert!(!h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1973,7 +1972,7 @@ mod tests {
         assert!(h.current_reason.is_none());
         // check_hang still works normally
         assert!(h.check_hang(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             1_000_000,
@@ -1996,7 +1995,7 @@ mod tests {
     // Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1) — IdleLong vs Hung
     // discriminator tests. Closes operator 04:00 UTC false-alarm pattern.
     //
-    // Ready/Idle merge: these mechanism tests carry `AgentState::ToolUse` (an
+    // Ready/Idle merge: these mechanism tests carry `AgentState::Active` (an
     // active agent that genuinely silence-exceeds at the 600s threshold), NOT
     // `Idle`. `Idle` is now EXEMPT from the Hung floor (`productive_silence_exceeds
     // => false`), so it short-circuits to Healthy before reaching this
@@ -2037,7 +2036,7 @@ mod tests {
         let mut h = HealthTracker::new();
         // last_input_at_ms past last_heartbeat_at_ms by > 5s grace.
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700), // > 120s threshold
             Duration::from_secs(0),   // F9: productive-silence — recent
             10_000,                   // input delivered at T+10s
@@ -2054,7 +2053,7 @@ mod tests {
         // mark IdleLong (no escalation) and return false.
         let mut h = HealthTracker::new();
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700), // > 120s threshold
             Duration::from_secs(0),   // F9: productive-silence — recent
             0,                        // no input ever delivered
@@ -2075,7 +2074,7 @@ mod tests {
         // → no input pending → IdleLong (NOT Hung).
         let mut h = HealthTracker::new();
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0), // F9: productive-silence — recent
             0,                      // input at T+0
@@ -2108,7 +2107,7 @@ mod tests {
         // Healthy so future cron consumers don't see stale IdleLong.
         let mut h = HealthTracker::new();
         h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             0,
@@ -2117,7 +2116,7 @@ mod tests {
         assert_eq!(h.state, HealthState::IdleLong);
         // Activity resumes → silence < threshold.
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(30),
             Duration::from_secs(0),
             0,
@@ -2137,7 +2136,7 @@ mod tests {
         // the grace window. Must NOT flag Hung — within grace.
         let mut h = HealthTracker::new();
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0), // F9: productive-silence — recent
             5_000,                  // input
@@ -2149,7 +2148,7 @@ mod tests {
         );
         // delta = 5_001 > grace → Hung
         let result2 = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             5_001,
@@ -2165,7 +2164,7 @@ mod tests {
         // avoid duplicate escalation).
         let mut h = HealthTracker::new();
         assert!(h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             10_000,
@@ -2174,7 +2173,7 @@ mod tests {
         assert_eq!(h.state, HealthState::Hung);
         // Same conditions next tick → no re-escalation.
         assert!(!h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0),
             10_000,
@@ -2196,7 +2195,7 @@ mod tests {
         let now = crate::daemon::heartbeat_pair::now_ms();
         // Heartbeat very recent (1s ago), no input pending, PTY silent 180s.
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700), // > 120s threshold
             Duration::from_secs(0),   // F9: productive-silence — recent
             0,                        // no input pending
@@ -2218,7 +2217,7 @@ mod tests {
         // `heartbeat_fresh` (age < silent) is false → no F1 Hung cross-check).
         let now = crate::daemon::heartbeat_pair::now_ms();
         let result = h.check_hang(
-            AgentState::ToolUse,
+            AgentState::Active,
             Duration::from_secs(700),
             Duration::from_secs(0), // F9: productive-silence — recent
             0,                      // no input pending
@@ -2291,7 +2290,7 @@ mod tests {
         with_f9_gate(false, || {
             let mut h = HealthTracker::new();
             let result = h.check_hang(
-                AgentState::Thinking,
+                AgentState::Active,
                 Duration::from_secs(60),  // silent < 600s threshold
                 Duration::from_secs(700), // silent_productive > 600s
                 0,
@@ -2318,7 +2317,7 @@ mod tests {
         with_f9_gate(true, || {
             let mut h = HealthTracker::new();
             let result = h.check_hang(
-                AgentState::Thinking,
+                AgentState::Active,
                 Duration::from_secs(60),  // silent < 600s threshold
                 Duration::from_secs(700), // silent_productive > 600s
                 10_000,                   // input pending past heartbeat
@@ -2341,7 +2340,7 @@ mod tests {
             let mut h = HealthTracker::new();
             // silent path exceeds; productive-silence is fresh.
             let result = h.check_hang(
-                AgentState::Thinking,
+                AgentState::Active,
                 Duration::from_secs(700), // silent > 600s threshold
                 Duration::from_secs(0),   // silent_productive recent
                 10_000,

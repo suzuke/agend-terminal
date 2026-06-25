@@ -36,7 +36,6 @@ pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
-pub(crate) mod divergence_telemetry;
 pub(crate) mod ephemeral_reap;
 pub(crate) mod external_liveness;
 pub(crate) mod gc_tick;
@@ -67,7 +66,6 @@ pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use context_alert::ContextAlertHandler;
 pub(crate) use context_handoff::ContextHandoffHandler;
-pub(crate) use divergence_telemetry::DivergenceTelemetryHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use gc_tick::GcTickHandler;
@@ -311,6 +309,7 @@ pub(crate) fn mock_live_agent_no_context(
         pty_writer,
         pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
         published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
         core,
         child: Arc::new(parking_lot::Mutex::new(child)),
         submit_key: "\r".to_string(),

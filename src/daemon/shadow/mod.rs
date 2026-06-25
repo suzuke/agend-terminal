@@ -13,10 +13,14 @@
 //!    consumes;
 //! 4. runs the socket event server ([`start`]).
 //!
-//! Spike discipline: prove hook→evidence under the native TUI + no global touch. No
-//! reducer. `flag default OFF` via `AGEND_SHADOW_OBSERVER=1`.
+//! Now **default ON** (graduated after all 5 backends live-verified) — additive only
+//! (`observed_status` is written beside, never drives, `agent_state`). Disable with the
+//! `AGEND_SHADOW_OBSERVER=0` kill-switch.
 
 pub mod evidence;
+pub(crate) mod gate;
+pub mod kiro;
+pub mod opencode;
 pub mod reducer;
 pub mod rollout;
 
@@ -57,10 +61,61 @@ pub struct ShadowFrame {
     pub tool_name: Option<String>,
 }
 
-/// `true` when the Shadow Observer local plane is enabled (`AGEND_SHADOW_OBSERVER=1`).
-/// Default OFF — zero behavior change for every existing spawn.
+/// `true` when the Shadow Observer is enabled. **Default ON** — graduated after all 5
+/// backends (claude/codex/opencode/kiro hook-or-stream, agy screen) were live-verified.
+/// Disabled ONLY by the explicit `AGEND_SHADOW_OBSERVER=0` kill-switch; an absent var,
+/// `=1`, or any other value ⇒ ON. The plane stays purely additive (`observed_status` is
+/// written beside `agent_state`, never drives fleet behaviour), so default-ON is safe; the
+/// `=0` kill-switch is byte-identical to the old default-OFF (no observer tick, no observer
+/// thread spawns, no spawn-env injection).
 pub fn enabled() -> bool {
-    std::env::var("AGEND_SHADOW_OBSERVER").as_deref() == Ok("1")
+    std::env::var("AGEND_SHADOW_OBSERVER").as_deref() != Ok("0")
+}
+
+/// #2413 (B): `true` when the observer's correction may drive the OPERATED snapshot state
+/// (`agent_state` in `snapshot.json` → the dispatch_idle / inbox / handoff / reply
+/// deciders). **Default ON**, disabled by the explicit `AGEND_OBSERVED_DISPATCH=0`
+/// kill-switch — independent of the badge (A): B changes daemon BEHAVIOUR, A only pixels,
+/// so they must be separately reversible. The promotion ALSO requires [`enabled`] (no
+/// observer ⇒ no `observed_status` to promote), so flipping `AGEND_SHADOW_OBSERVER=0`
+/// disables B too. `=0` is byte-identical to pre-#2413 (snapshot writes the raw heuristic).
+pub fn operated_dispatch_enabled() -> bool {
+    enabled() && std::env::var("AGEND_OBSERVED_DISPATCH").as_deref() != Ok("0")
+}
+
+/// #2465: the OPERATED state a daemon DECISION consumer should act on — the Shadow
+/// Observer's high-confidence correction of the raw screen heuristic when
+/// operated-dispatch is ON and a §5 correction applies (the SAME shared
+/// [`gate::gated_override`] the pane badge and the snapshot writer use, so deciders can
+/// never diverge — #1493 class), else `raw`. `AGEND_OBSERVED_DISPATCH=0` (or the observer
+/// kill-switch) ⇒ `raw`, byte-identical to pre-#2413. The single source of precedence for
+/// the (B) decision consumers that DO route through it — the snapshot writer, the
+/// `poll_reminder` idle filter, `reclaim` eligibility, and the API inject guard — so a fresh
+/// high-confidence Hook/Stream correction (e.g. a screen mis-scraped Idle while the agent is
+/// actually mid-turn) is no longer ignored. NEVER reads or writes `State::current`: callers
+/// pass the raw heuristic in, so the reducer's screen input stays vterm-only and a promoted
+/// state can't feed back into classification (the #2413 cycle-proof invariant).
+///
+/// Deliberately NOT used by (so this list is the auditable scope of the routing):
+/// - **the SRL retry arm/clear** (`supervisor.rs`) — it still gates on raw `core.state.current`.
+///   claude hooks never emit `RateLimited` (`evidence.rs` — a `StopFailure` maps to
+///   `TurnEnded`/`ApiError`, the API plane owns rate-limit), so `observed` carries NO rate-limit
+///   signal to route there; migrating it would be inert for the ApiError-as-rate-limit stuck
+///   case (operated stays Idle). That real fix is the follow-up #2466.
+/// - **the health/recovery deciders** (hang_detection / watchdog / recovery_dispatcher /
+///   respawn_watchdog) — they must see raw to catch a stuck agent a stale 'Active' hook would
+///   mask (the inverse failure; each carries a `// KEEP-RAW (#2465)` rationale at its call site).
+pub fn operated_state(
+    raw: crate::state::AgentState,
+    observed: Option<&reducer::ObservedStatus>,
+) -> crate::state::AgentState {
+    if operated_dispatch_enabled() {
+        observed
+            .and_then(|s| gate::gated_override(raw, s))
+            .unwrap_or(raw)
+    } else {
+        raw
+    }
 }
 
 /// The per-daemon unix socket the hooks emit to. One socket for the daemon; the
@@ -108,6 +163,9 @@ pub fn forget_agent(agent: &str) {
     tokens().lock().retain(|_, a| a != agent);
     buffer().lock().remove(agent);
     runtimes().lock().remove(agent);
+    // #2413 opencode plane: drop the injected observer port so a same-name respawn
+    // re-registers a fresh one and the supervisor stops the dead subscription.
+    opencode::forget_port(agent);
 }
 
 // ── per-agent evidence buffer ────────────────────────────────────────────────────
@@ -317,6 +375,30 @@ mod tests {
     use super::evidence::EvidenceKind;
     use super::*;
     use serial_test::serial;
+
+    /// The Shadow Observer graduated to **default-ON**: `enabled()` is true unless the
+    /// explicit `AGEND_SHADOW_OBSERVER=0` kill-switch is set. Pins BOTH the default-ON
+    /// behaviour (confirm-first ①) and the `=0`-only opt-out (confirm-first ②) — an absent
+    /// var, `=1`, or any other value ⇒ ON; only `=0` ⇒ OFF.
+    #[test]
+    #[serial(shadow_observer)]
+    fn enabled_is_default_on_with_zero_kill_switch() {
+        let prev = std::env::var("AGEND_SHADOW_OBSERVER").ok();
+        std::env::remove_var("AGEND_SHADOW_OBSERVER");
+        assert!(enabled(), "absent var ⇒ default-ON");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+        assert!(enabled(), "=1 ⇒ ON");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "");
+        assert!(enabled(), "empty value ⇒ ON (only =0 disables)");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "yes");
+        assert!(enabled(), "arbitrary value ⇒ ON");
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "0");
+        assert!(!enabled(), "=0 kill-switch ⇒ OFF");
+        match prev {
+            Some(v) => std::env::set_var("AGEND_SHADOW_OBSERVER", v),
+            None => std::env::remove_var("AGEND_SHADOW_OBSERVER"),
+        }
+    }
 
     /// End-to-end over the REAL unix socket transport: a client (the hook emit) writes
     /// one token-authenticated frame line; the server's `handle_conn` reads it, ingests,

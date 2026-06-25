@@ -623,7 +623,7 @@ mod tests {
         write_fleet(&home);
         seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
 
-        seed_snapshot(&home, "reviewer", "tool_use"); // busy → skip
+        seed_snapshot(&home, "reviewer", "active"); // busy → skip
         let nudged = run_watchdog(
             &home,
             &chrono::Utc::now(),

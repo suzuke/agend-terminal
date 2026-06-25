@@ -321,7 +321,8 @@ fn same_agent_re_dispatch_idempotent() {
         r2.err()
     );
 
-    // Binding should exist with new task_id.
+    // #2158 partial-skip: the live same-(source_repo, branch) re-dispatch REUSES the
+    // worktree (no reset) but STILL refreshes the binding, so task_id updates to T-2.
     let binding = crate::paths::runtime_dir(&home)
         .join("agent-x")
         .join("binding.json");
@@ -3326,6 +3327,298 @@ fn ensure_branch_exists_refresh_uses_origin_not_from_ref_remote_2047() {
         sha_b,
         "EXISTS-path refresh must advance the work branch via ORIGIN (its push \
          remote), not from_ref's upstream — else #869 reopens on forks"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #2158: skip-lease-on-live-binding (2026-06-25 production data-loss fix) ──────
+
+/// The worktree path recorded in an agent's binding.json.
+fn binding_worktree(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+    let p = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
+    std::path::PathBuf::from(v["worktree"].as_str().expect("worktree path in binding"))
+}
+
+/// (a) THE partial-skip regression test for the 2026-06-25 data-loss, with BOTH halves
+/// of the #2158 contract + a dual reverse-mutation:
+///   1. data protection — a re-dispatch (`branch=`) to an agent ALREADY live-bound to
+///      that branch must NOT reset its worktree; uncommitted work survives. RM: force
+///      the normal lease path (drop the reuse) → the reuse-path `sync_worktree_to_head`
+///      (`reset --hard` + `clean -fd`) wipes the untracked file → RED. (the incident
+///      shape that wiped an uncommitted PR-B.)
+///   2. metadata refresh — the partial-skip STILL runs `bind_full`, so `binding.task_id`
+///      bumps to the new dispatch (T-2). r6: that field DRIVES task_progress CI push /
+///      auto_release lease+CAS / ci_watch correlation, so a bare no-op stranded T-1. RM:
+///      make the reuse path early-return (skip bind_full) → task_id stays T-1 → RED.
+#[test]
+fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-wip-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-wip");
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-wip", "T-1", "feat/wip", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+    let wt = binding_worktree(&home, "agent-wip");
+    assert!(wt.exists(), "first dispatch created the worktree");
+
+    // The incident shape: uncommitted work = a NEW untracked file (like PR-B's gate.rs).
+    let wip = wt.join("UNCOMMITTED_WORK.rs");
+    std::fs::write(&wip, "// precious uncommitted work\n").expect("write WIP");
+
+    // Lead sends GO (kind=task, branch=) to the already-live-bound agent → re-dispatch.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-wip", "T-2", "feat/wip", None);
+    assert!(
+        r2.is_ok(),
+        "re-dispatch to a LIVE same-branch binding must be an idempotent OK: {r2:?}"
+    );
+
+    // (1) data protection: the worktree was reused, not reset.
+    assert!(
+        wip.exists(),
+        "#2158: re-dispatch to a LIVE same-branch binding MUST NOT reset the worktree — \
+         uncommitted work was wiped pre-fix"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wip).unwrap(),
+        "// precious uncommitted work\n",
+        "uncommitted content intact after the re-dispatch"
+    );
+    // (2) metadata refresh: bind_full still ran on the reused worktree → task_id is T-2.
+    assert_eq!(
+        binding_task_id(&home, "agent-wip").as_deref(),
+        Some("T-2"),
+        "#2158 partial-skip: the reuse path STILL refreshes binding.task_id (r6: it drives \
+         task_progress / auto_release / ci_watch) — a bare no-op stranded T-1"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (b) #2115 PRESERVED: the skip is gated on a PRESENT binding. With binding.json CLEARED
+/// (what `release_worktree` does) but the worktree dir surviving as dirty residue (the
+/// #869-ref-advance / prior-lease shape), a re-dispatch must NOT skip — it re-leases, and
+/// `worktree::create`'s reuse-path `sync_worktree_to_head` STILL scrubs the residue. Proves
+/// the #2158 skip does not over-fire onto a released binding.
+#[test]
+fn dispatch_reuse_after_binding_cleared_still_resets_dirty_2115_preserved_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-reuse-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-reuse");
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-1", "feat/reuse", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+    let wt = binding_worktree(&home, "agent-reuse");
+    assert!(wt.exists());
+
+    // Pollution residue the #2115 reuse-reset is meant to scrub.
+    let pollution = wt.join("STALE_POLLUTION.txt");
+    std::fs::write(&pollution, "stale residue\n").expect("write pollution");
+
+    // RELEASE the binding via the REAL clear path (`unbind` removes binding.json + the
+    // HMAC sidecar AND clears the in-memory binding INDEX `binding::read` consults first),
+    // but KEEP the dirty worktree dir at the reuse path — the "binding released, residue
+    // survives" state (the #869-ref-advance shape; `release_full` would also remove the
+    // dir). This is the precise gate: a cleared binding ⇒ `binding::read` → None ⇒ the
+    // #2158 skip CANNOT fire.
+    crate::binding::unbind(&home, "agent-reuse");
+    assert!(
+        crate::binding::read(&home, "agent-reuse").is_none(),
+        "unbind must clear the binding (file + index) so binding::read returns None"
+    );
+
+    // Re-dispatch same branch → binding::read None → #2158 skip does NOT fire → lease →
+    // worktree::create reuses the surviving dir → sync_worktree_to_head resets + cleans it.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-2", "feat/reuse", None);
+    assert!(r2.is_ok(), "reuse re-dispatch must succeed: {r2:?}");
+
+    assert!(
+        !pollution.exists(),
+        "#2115 preserved: a true REUSE (binding released + dirty residue) MUST still reset — \
+         the #2158 skip must not over-fire on an absent binding"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (c) first-bind (no existing binding) → normal lease, zero regression: the #2158
+/// early-return only triggers on an existing same-branch binding.
+#[test]
+fn dispatch_first_bind_leases_normally_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-first-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-first");
+
+    let r = super::dispatch_auto_bind_lease(&home, "agent-first", "T-1", "feat/first", None);
+    assert!(r.is_ok(), "first-bind must lease normally: {r:?}");
+    let wt = binding_worktree(&home, "agent-first");
+    assert!(
+        wt.exists(),
+        "first-bind created the worktree (no skip on a fresh agent — zero regression)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The `source_repo` value recorded in an agent's binding.json.
+fn binding_source_repo(home: &std::path::Path, agent: &str) -> Option<String> {
+    let p = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
+    v["source_repo"].as_str().map(str::to_string)
+}
+
+/// The `task_id` value recorded in an agent's binding.json.
+fn binding_task_id(home: &std::path::Path, agent: &str) -> Option<String> {
+    let p = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).expect("read binding")).expect("parse");
+    v["task_id"].as_str().map(str::to_string)
+}
+
+/// A second standalone git repo with an `origin/main` ref so `ensure_branch_exists`
+/// resolves on the cross-repo fall-through. Mirrors `setup_test_repo`'s git setup but
+/// does NOT touch fleet.yaml — the dispatch carries the source_repo via override.
+fn init_extra_repo(path: &std::path::Path) {
+    std::fs::create_dir_all(path).ok();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
+    };
+    git(&["init", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "init",
+    ]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "file:///dev/null/agend-fixture-no-derive",
+    ]);
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !sha.is_empty() {
+        git(&["update-ref", "refs/remotes/origin/main", &sha]);
+    }
+}
+
+/// (d) #2158 r6: the skip is keyed on `(source_repo, branch)`, NOT branch alone. The
+/// worktree path (`worktree::worktree_path`) is repo-independent, so a re-dispatch with
+/// the SAME branch name but a DIFFERENT source_repo must NOT skip — it must rebind to the
+/// new repo. Pre-fix (branch-only skip) it false-skipped and stranded the stale
+/// `binding.source_repo`. Reverse-mutation: drop the `same_source_repo` term in
+/// `live_binding::can_skip_lease_for_live_binding` and this goes RED — the skip fires and
+/// `binding.source_repo` stays repo-a.
+#[test]
+fn dispatch_same_branch_different_source_repo_must_not_skip_2158() {
+    let home = std::env::temp_dir().join(format!("agend-2158-srcrepo-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let repo_a = setup_test_repo(&home, "agent-x"); // fleet.yaml: agent-x → repo_a
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/shared", None);
+    assert!(r1.is_ok(), "first lease (repo-a) must succeed: {r1:?}");
+    assert_eq!(
+        binding_source_repo(&home, "agent-x").as_deref(),
+        Some(repo_a.display().to_string().as_str()),
+        "precondition: first bind recorded source_repo = repo-a"
+    );
+
+    // A DIFFERENT source_repo, SAME branch name → must fall through to rebind, not skip.
+    let repo_b = home.join("repo-b");
+    init_extra_repo(&repo_b);
+    let r2 = super::dispatch_auto_bind_lease_with_source(
+        &home,
+        "agent-x",
+        "T-2",
+        "feat/shared",
+        None,
+        Some(&repo_b),
+    );
+    assert!(
+        r2.is_ok(),
+        "cross-repo re-dispatch must rebind, not skip: {r2:?}"
+    );
+
+    assert_eq!(
+        binding_source_repo(&home, "agent-x").as_deref(),
+        Some(repo_b.display().to_string().as_str()),
+        "#2158 r6: same branch + different source_repo MUST NOT skip — binding.source_repo \
+         must update to repo-b (the branch-only skip stranded the stale repo-a pre-fix)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (e) #2158 r4: the partial-skip's OWN failure path must not data-loss. When `bind_full`
+/// FAILS on a REUSED live worktree, the rollback must NOT `worktree remove --force` it —
+/// that would wipe the very uncommitted work #2158 protects (the no-op version returned
+/// before this rollback; partial-skip opened the path). Reverse-mutation: revert the
+/// `reused` guard in mod.rs (so the reuse falls into the `else { worktree remove --force }`)
+/// → this goes RED (the live worktree + WIP are deleted).
+#[cfg(unix)]
+#[test]
+fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::temp_dir().join(format!("agend-2158-rbfail-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-rb");
+
+    // First dispatch succeeds → live worktree + binding (in the in-memory index).
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-rb", "T-1", "feat/rb", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+    let wt = binding_worktree(&home, "agent-rb");
+    let wip = wt.join("UNCOMMITTED_WORK.rs");
+    std::fs::write(&wip, "// precious uncommitted work\n").expect("write WIP");
+
+    // Make runtime/agent-rb read-only so the SECOND bind_full's atomic_write fails — the
+    // in-memory binding index still resolves the reuse, so we exercise the REUSE rollback.
+    let runtime_agent = crate::paths::runtime_dir(&home).join("agent-rb");
+    let mut perm = std::fs::metadata(&runtime_agent).unwrap().permissions();
+    perm.set_mode(0o555);
+    std::fs::set_permissions(&runtime_agent, perm.clone()).unwrap();
+
+    // Re-dispatch same (source_repo, branch) → reuse detected → bind_full fails → rollback.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-rb", "T-2", "feat/rb", None);
+    assert!(
+        r2.is_err(),
+        "bind_full failure on the reuse path must surface as Err (#1324)"
+    );
+
+    // Restore perms before the assertions + cleanup.
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&runtime_agent, perm).unwrap();
+
+    // THE assertion: the reused LIVE worktree + its uncommitted work survive the rollback.
+    assert!(
+        wt.exists() && wip.exists(),
+        "#2158 r4: bind_full failure on a REUSED worktree MUST NOT remove the agent's live \
+         tree — `worktree remove --force` here would wipe uncommitted work"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wip).unwrap(),
+        "// precious uncommitted work\n",
+        "uncommitted content intact after the reuse-path bind_full rollback"
     );
     std::fs::remove_dir_all(&home).ok();
 }

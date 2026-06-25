@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 /// Agent runtime state, ordered by priority (highest last).
 ///
 /// `#[repr(u8)]`: the discriminant (declaration order, `Starting = 0` …
-/// `Restarting = 17`) is mirrored into a lock-free `AtomicU8` so the TUI render
+/// `Restarting = 16`) is mirrored into a lock-free `AtomicU8` so the TUI render
 /// snapshot can read agent state WITHOUT taking `core.lock()` (see
 /// [`StateTracker::published_handle`] + `render::build_agent_state_snapshot`).
 /// [`AgentState::from_u8`] is the inverse; a roundtrip unit test pins them so a
@@ -41,13 +41,15 @@ pub enum AgentState {
     /// routed as raw PTY keystrokes (not inbox-wrapped) via INJECT_RAW.
     AwaitingOperator,
     Idle,
-    ToolUse,
-    Thinking,
+    /// The agent is actively working — thinking or running a tool. (Merged from
+    /// the former `Thinking` + `ToolUse`: no production decision distinguished
+    /// them, and the hook-evidence layer keeps tool granularity separately.)
+    Active,
     /// Startup stalled on a backend-specific modal that blocks normal use
     /// (e.g. codex `Update available!` menu). Distinct from
     /// `PermissionPrompt` so operators can tell "CLI waiting for an OK on
     /// an update menu" from "CLI asking whether to Allow a tool invocation".
-    /// Higher than `Thinking` because real work cannot progress until the
+    /// Higher than `Active` because real work cannot progress until the
     /// modal is dismissed; lower than `PermissionPrompt` because formal
     /// authorization flows take precedence when both match.
     InteractivePrompt,
@@ -82,6 +84,13 @@ pub enum AgentState {
     Restarting,
 }
 
+/// #2413 (A): the "no badge override" sentinel for the Shadow Observer's lock-free
+/// badge-override mirror (`StateTracker::published_observed`). NOT a valid
+/// `AgentState` discriminant (the enum has 17 variants, 0–16), so it can never
+/// collide with a real state byte. When the mirror holds this, the render snapshot
+/// falls back to the raw `published` state.
+pub const OBSERVED_NONE: u8 = u8::MAX;
+
 impl AgentState {
     /// Inverse of the `#[repr(u8)]` discriminant: reconstruct the state from the
     /// byte published into the lock-free `AtomicU8` mirror. Unknown bytes (never
@@ -94,22 +103,31 @@ impl AgentState {
             1 => Self::Hang,
             2 => Self::AwaitingOperator,
             3 => Self::Idle,
-            4 => Self::ToolUse,
-            5 => Self::Thinking,
-            6 => Self::InteractivePrompt,
-            7 => Self::PermissionPrompt,
-            8 => Self::GitConflict,
-            9 => Self::ContextFull,
-            10 => Self::RateLimit,
-            11 => Self::ServerRateLimit,
-            12 => Self::UsageLimit,
-            13 => Self::AuthError,
-            14 => Self::ApiError,
-            15 => Self::ModelUnsupported,
-            16 => Self::Crashed,
-            17 => Self::Restarting,
+            4 => Self::Active,
+            5 => Self::InteractivePrompt,
+            6 => Self::PermissionPrompt,
+            7 => Self::GitConflict,
+            8 => Self::ContextFull,
+            9 => Self::RateLimit,
+            10 => Self::ServerRateLimit,
+            11 => Self::UsageLimit,
+            12 => Self::AuthError,
+            13 => Self::ApiError,
+            14 => Self::ModelUnsupported,
+            15 => Self::Crashed,
+            16 => Self::Restarting,
             _ => Self::Idle,
         }
+    }
+
+    /// #2413 (A): decode the Shadow Observer BADGE-override mirror byte. The
+    /// per-tick `shadow_observe` driver stores [`OBSERVED_NONE`] when no
+    /// high-confidence correction applies (→ `None`, render falls back to the raw
+    /// `published` state) or a real `AgentState` discriminant when a correction
+    /// should override the badge. Checked against the sentinel BEFORE `from_u8` so
+    /// the sentinel can never be misread as `Idle`.
+    pub fn from_observed_u8(v: u8) -> Option<AgentState> {
+        (v != OBSERVED_NONE).then(|| AgentState::from_u8(v))
     }
 
     /// GO-NARROW 6 states that trigger orchestrator notify on transition.
@@ -135,8 +153,7 @@ impl AgentState {
             // (priority 3 was `Ready`, collapsed into `Idle` — gap is harmless;
             // priorities are an ordering, not a contiguous index.)
             Self::Idle => 4,
-            Self::ToolUse => 5,
-            Self::Thinking => 6,
+            Self::Active => 6,
             Self::InteractivePrompt => 7,
             Self::PermissionPrompt => 8,
             // Phase A Piece-1: GitConflict shares priority 8 with
@@ -184,8 +201,7 @@ impl AgentState {
             Self::Hang => "hang",
             Self::AwaitingOperator => "awaiting_operator",
             Self::Idle => "idle",
-            Self::ToolUse => "tool_use",
-            Self::Thinking => "thinking",
+            Self::Active => "active",
             Self::InteractivePrompt => "interactive_prompt",
             Self::PermissionPrompt => "permission",
             Self::GitConflict => "git_conflict",
@@ -233,6 +249,17 @@ pub struct StateTracker {
     /// ordering is sufficient: it carries no other memory, and the render path
     /// already tolerates ≤1-frame staleness (it re-snapshots every draw).
     published: Arc<AtomicU8>,
+    /// #2413 (A): lock-free mirror of the Shadow Observer's gated BADGE override —
+    /// the coarse `AgentState` the render snapshot should show INSTEAD of `published`,
+    /// but ONLY when a high-confidence observer-plane correction applies (gated by
+    /// the per-tick `shadow_observe` driver — see `badge_override`). Holds
+    /// [`OBSERVED_NONE`] (no override → render uses raw `published`) until a
+    /// correction is published, and is reset to it whenever the correction lapses.
+    /// SEPARATE from `published` ON PURPOSE: the reducer's screen input is `current`
+    /// (vterm-only) and is NEVER read from this mirror, so a corrected badge can
+    /// never feed back into classification (#2413 cycle-proof). Read lock-free via
+    /// [`StateTracker::published_observed_handle`]; written only by `publish_observed`.
+    published_observed: Arc<AtomicU8>,
     pub(crate) since: Instant,
     pub last_output: Instant,
     /// F9 (#685 sub-task 4): `Some(t)` only when `infer_productivity()` returned
@@ -396,15 +423,6 @@ pub struct StateTracker {
     /// re-grabbed AFTER the agent recovered) from a same-state continuous
     /// re-scan. Telemetry-only.
     non_srl_since_last_srl: bool,
-    /// #2100/#2115 fire-once latch for the `#1562`/`#1808` unclassified-throttle
-    /// side-log. The feed-level hash-dedup is DELIBERATELY bypassed for a
-    /// throttle-hint screen ([`Self::apply_hash_dedup_gate`]), so without this a
-    /// STATIC unclassified-throttle pane appends a JSONL record (and re-fires the
-    /// `#1808-srl-detect-miss` WARN) on every PTY read. Keyed on the colored tail
-    /// hash, which is stable across the cursor/clock re-renders that flip the
-    /// full-screen hash; cleared when the pane leaves the throttle-miss shape so a
-    /// genuine recurrence re-logs once.
-    last_unclassified_throttle_sig: Option<u64>,
     /// #2086 dedup latch: `line_hash` of the stuck-SRL error line for which the
     /// `#2086-srl-keep-latched` WARN last fired. A genuinely stuck SRL has a
     /// working spinner ticking below it that flips the screen hash every feed, so
@@ -425,11 +443,6 @@ pub struct StateTracker {
     /// SRL incident on the same line after recovery re-logs once; the `#1809`
     /// cross-cycle→Idle behavioral fix stays OUTSIDE this dedup.
     last_srl_phantom_warn_sig: Option<(u64, bool)>,
-    /// #1523 Phase 0 (shadow): fire-once latch for the turn-completion sentinel
-    /// telemetry — `hash` of the last side-logged sentinel observation, so a
-    /// static frame holding the token isn't re-logged every feed (mirrors the
-    /// retired `last_hardwrap_miss_sig`). Telemetry-only; never gates behavior.
-    last_turn_sentinel_sig: Option<u64>,
 }
 
 /// #1527: one recorded `current` transition, captured at the mutation site so
@@ -488,8 +501,6 @@ const ERROR_TAIL_SCAN_LINES: usize = 15;
 const HARD_WRAP_TAIL_LINES: usize = 40;
 
 fn recent_screen_tail(screen_text: &str, n: usize) -> String {
-    #[cfg(test)]
-    RECENT_SCREEN_TAIL_CALLS.with(|c| c.set(c.get() + 1));
     let lines: Vec<&str> = screen_text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
@@ -499,29 +510,6 @@ fn tail_recent_lines(tail: &str, n: usize) -> String {
     let lines: Vec<&str> = tail.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
-}
-
-// Per-test-thread tail-scan counter. The libtest harness runs each `#[test]` on
-// its OWN thread, so a thread-local (vs the former process-global AtomicUsize)
-// isolates the count per test: a parallel `cargo test` run no longer leaks a
-// sibling test's `recent_screen_tail` calls into another test's assertion (the
-// `changed_frames_..._bound_tail_scans` flake — green single-threaded, red under
-// CI's parallel Check). The `reset()` each test runs at its start also keeps it
-// correct under `--test-threads=1` (one thread reused across tests). `#[cfg(test)]`
-// only — no prod footprint (the increment in `recent_screen_tail` is gated too).
-#[cfg(test)]
-thread_local! {
-    static RECENT_SCREEN_TAIL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_recent_screen_tail_call_count() {
-    RECENT_SCREEN_TAIL_CALLS.with(|c| c.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn recent_screen_tail_call_count() -> usize {
-    RECENT_SCREEN_TAIL_CALLS.with(|c| c.get())
 }
 
 /// Context% telemetry: rows scanned from the bottom of the screen for the
@@ -614,103 +602,6 @@ fn hash_screen(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
-}
-
-/// #1523 Phase 0: is the turn-completion sentinel shadow enabled? Default-OFF
-/// (matches the codebase env-flag idiom, e.g. `AGEND_PRODUCTIVE_GATE`). When
-/// off, neither the instruction directive nor the telemetry is active, so a
-/// default fleet sees ZERO behaviour change (the fail-open invariant).
-pub(crate) fn turn_sentinel_shadow_enabled() -> bool {
-    std::env::var("AGEND_TURN_SENTINEL_SHADOW")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// #1523 Phase 0: the per-agent sentinel nonce, derived deterministically from
-/// the agent name. Deriving (rather than persisting a random value) lets the
-/// instruction writer and the daemon detector compute the SAME token
-/// independently — no plumbed/persisted state, so it survives restart with no
-/// staleness surface (cf. the in-mem-reset-on-restart bug class). It is an
-/// attribution tag, not a secret; per-turn freshness comes from the detector's
-/// dedup latch, not from the nonce.
-pub(crate) fn turn_sentinel_nonce(name: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    // Low 32 bits as fixed-width hex → an 8-char nonce → 29-char token
-    // (`=====AGEND-DONE:xxxxxxxx=====`), comfortably under the #2090 ~35-char
-    // hard-wrap threshold so the marker stays on one line.
-    format!("{:08x}", hasher.finish() & 0xffff_ffff)
-}
-
-/// #1523 Phase 0: turn-completion token delimiters. `=====` (not `<…>`): the
-/// #2243 DuDuClaw lesson is that angle-bracket markers can be mangled by an
-/// agent's own markdown/HTML rendering, which would conflate "agent did not
-/// emit" with "delimiter was rewritten" and poison the Phase-0 emit/compliance
-/// data (r2 #2297). The prefix is shared by the detector fast-path so it can't
-/// drift from the token.
-const TURN_SENTINEL_PREFIX: &str = "=====AGEND-DONE:";
-const TURN_SENTINEL_SUFFIX: &str = "=====";
-
-/// #1523 Phase 0: the exact in-band token for an agent's turn-completion
-/// sentinel. The single source of truth — the instruction directive embeds this
-/// exact string and the shadow detector scans for it, so the two never drift.
-pub(crate) fn turn_sentinel_token(name: &str) -> String {
-    format!(
-        "{TURN_SENTINEL_PREFIX}{}{TURN_SENTINEL_SUFFIX}",
-        turn_sentinel_nonce(name)
-    )
-}
-
-/// #1523 Phase 0: pure classification of a screen `tail` against an agent's
-/// turn-completion `token`. Separated from the I/O method so the echo /
-/// source-view FP heuristics (the sharpest risk — the instruction file itself
-/// carries the token) are unit-testable without env or home redirection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TurnSentinelObs {
-    /// The agent's token is present anywhere in the tail (raw or de-wrapped).
-    token_seen: bool,
-    /// The token sits on the final non-empty line — the shape of a genuine
-    /// turn-end emission (vs. embedded in earlier output).
-    on_last_line: bool,
-    /// Looks like an instruction-echo / source-view rather than a real emit:
-    /// directive prose co-occurs, or the token is not the last line.
-    suspected_echo: bool,
-    /// Coarse leak proxy: token embedded as content (not a clean final-line
-    /// emit) and not obviously a directive echo — e.g. a file being viewed.
-    leak_signal: bool,
-}
-
-fn observe_turn_sentinel(tail: &str, token: &str) -> TurnSentinelObs {
-    // Also scan a de-wrapped (newline-stripped) copy so a hard-wrapped token
-    // (split mid-string across rows) still matches.
-    let dewrapped: String = tail.chars().filter(|c| *c != '\n').collect();
-    let token_seen = tail.contains(token) || dewrapped.contains(token);
-    if !token_seen {
-        return TurnSentinelObs {
-            token_seen: false,
-            on_last_line: false,
-            suspected_echo: false,
-            leak_signal: false,
-        };
-    }
-    let on_last_line = tail
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .is_some_and(|l| l.contains(token));
-    // The directive that injects the token uses these exact phrases; their
-    // presence means the instruction file / system prompt is on screen.
-    let directive_echo = tail.contains("Turn-completion signal")
-        || tail.contains("never persisted content")
-        || tail.contains("print this exact marker");
-    let suspected_echo = directive_echo || !on_last_line;
-    let leak_signal = !on_last_line && !directive_echo;
-    TurnSentinelObs {
-        token_seen,
-        on_last_line,
-        suspected_echo,
-        leak_signal,
-    }
 }
 
 /// #1955: the (bottom-most) screen line containing `matched` — the UsageLimit
@@ -860,28 +751,6 @@ fn first_occurrence_span(screen_text: &str, matched: &str, fg: &[CellFg]) -> Vec
         .unwrap_or_default()
 }
 
-/// #1562 self-capture instrument.
-///
-/// Distinctive, **low-FP** server-throttle / transient-error phrases drawn from
-/// the `ServerRateLimit` pattern set (`patterns.rs`). Used by the diagnostic
-/// side-log to detect "a known throttle phrase is on screen but the classifier
-/// did NOT land on a retryable state" — the exact in-the-wild miss #1562 is
-/// chasing. Deliberately a SUBSET of the regex alternations: only multi-word,
-/// prose-unlikely phrases are listed (bare `overloaded` / `429` / `api_error`
-/// are omitted because they're the HIGH_FP tokens that fire on dialectic prose,
-/// which would make this instrument noisy). Cheap `str::contains` only.
-const THROTTLE_DIAG_PHRASES: &[&str] = &[
-    "temporarily limiting requests",
-    "Overloaded errors",
-    "overloaded_error",
-    "Rate limited. Quick retry",
-    "rate_limit_error",
-    "API rate limited",
-    "API Error: 5",
-    "API Error: Request rejected (429)",
-    "hit a rate limit",
-];
-
 /// #SRL-phase2: cheap raw single-token pre-filter for the hash-dedup blind-spot
 /// bypass. A settled (static) stuck-SRL pane has an unchanged screen hash, so
 /// `feed_with_fg`'s dedup would skip detection forever and it never recovers. We
@@ -913,142 +782,6 @@ const THROTTLE_HINT_TOKENS: &[&str] = &[
 
 pub(crate) fn screen_has_throttle_hint(screen_text: &str) -> bool {
     THROTTLE_HINT_TOKENS.iter().any(|t| screen_text.contains(t))
-}
-
-/// #1562: rows of the live tail captured into the diagnostic record. Matches
-/// the `ERROR_TAIL_SCAN_LINES` horizon so the captured context lines up with
-/// the bottom-N window the error gates actually look at.
-const UNCLASSIFIED_TAIL_LINES: usize = ERROR_TAIL_SCAN_LINES;
-
-/// #1562: states for which a server-throttle phrase IS the expected
-/// classification (the auto-retry path already handles them). When the
-/// classifier lands on one of these, the throttle phrase is correctly
-/// recognized → nothing to diagnose → no side-log (keeps the instrument
-/// low-noise). Anything else + a throttle phrase = the miss we want captured.
-fn is_throttle_retryable_state(state: AgentState) -> bool {
-    matches!(
-        state,
-        AgentState::ServerRateLimit
-            | AgentState::RateLimit
-            | AgentState::ApiError
-            | AgentState::ContextFull
-    )
-}
-
-/// #1562: a minimal SGR escape for a rendered [`CellFg`]. Reconstructs enough
-/// ANSI to make the captured tail re-renderable in a terminal so an operator
-/// can SEE whether the throttle line was red — the color-anchor hypothesis is
-/// the whole point of #1562's capture. Exact non-red hues are lossy (the vterm
-/// classifier collapses all reds into `CellFg::Red`), but the red/not-red
-/// signal — the only thing the anchor predicate keys on — is preserved exactly.
-fn sgr_for(c: CellFg) -> &'static str {
-    match c {
-        CellFg::Red => "\x1b[31m",
-        CellFg::Default | CellFg::Named => "\x1b[39m",
-        // Indexed / Rgb are non-red (the classifier already mapped reds to
-        // `Red`); a generic "other color" marker is enough for the diagnostic.
-        CellFg::Indexed(_) | CellFg::Rgb(_, _, _) => "\x1b[39m",
-    }
-}
-
-/// #1562: reconstruct the last `n` lines of `screen_text` WITH ANSI color, using
-/// the per-cell `fg` mask (aligned 1:1 with `screen_text.chars()`, see
-/// `char_span`). The result is a colored, re-renderable tail for the side-log.
-/// When `fg` is empty (text-only callers) every cell maps to Default → the tail
-/// is captured without color, which is correct (no color was supplied).
-fn ansi_colored_tail(screen_text: &str, fg: &[CellFg], n: usize) -> String {
-    // Pair each char with its rendered fg, splitting on newlines (the '\n'
-    // itself carries no cell).
-    let mut lines: Vec<Vec<(char, CellFg)>> = vec![Vec::new()];
-    for (i, ch) in screen_text.chars().enumerate() {
-        if ch == '\n' {
-            lines.push(Vec::new());
-        } else {
-            let color = fg.get(i).copied().unwrap_or(CellFg::Default);
-            lines
-                .last_mut()
-                .expect("non-empty by construction")
-                .push((ch, color));
-        }
-    }
-    let start = lines.len().saturating_sub(n);
-    let mut out = String::new();
-    for line in &lines[start..] {
-        let mut cur: Option<CellFg> = None;
-        for &(ch, color) in line {
-            if cur != Some(color) {
-                out.push_str(sgr_for(color));
-                cur = Some(color);
-            }
-            out.push(ch);
-        }
-        out.push_str("\x1b[0m");
-        out.push('\n');
-    }
-    out
-}
-
-/// #1562: the pure decision behind the self-capture instrument — no IO, no env.
-///
-/// Returns `Some(raw_tail)` (ANSI-colored, last [`UNCLASSIFIED_TAIL_LINES`]
-/// rows) iff ALL hold:
-/// 1. a known throttle phrase ([`THROTTLE_DIAG_PHRASES`]) is on screen,
-/// 2. `current` is NOT a retryable throttle state
-///    ([`is_throttle_retryable_state`]) — i.e. the classifier MISSED it, and
-/// 3. the phrase is in the LIVE bottom-N tail (not just scrolled-up scrollback).
-///
-/// `None` otherwise. The order is chosen so the common no-phrase case
-/// fast-rejects on a single allocation-free `str::contains` scan.
-/// Returns `Some((raw_tail, wrap_split))`. `wrap_split` is true when the phrase
-/// was found ONLY after whitespace-flattening — i.e. it is LINE-WRAPPED across
-/// rows in `screen_text`. Since the detection feed already de-wraps alacritty
-/// soft-wraps (#1808 Phase 1), a phrase still wrap-split here means the wrap is
-/// a hard `\n` (Ink-emitted layout) the de-wrap cannot merge → the signal that
-/// the Phase 2 flattened-tail fallback is required for this backend's render.
-fn unclassified_throttle_tail(
-    current: AgentState,
-    screen_text: &str,
-    fg: &[CellFg],
-    tail: &str,
-) -> Option<(String, bool)> {
-    // Fast reject (no allocation on the common path): no known throttle phrase
-    // contiguously on screen. #1808 — the original `contains`-only check was
-    // BLIND to a line-wrapped phrase (the exact reason the live narrow-pane SRL
-    // miss captured nothing), so on a contiguous miss also try a
-    // whitespace-flattened view (every whitespace run incl. `\n` → one space) so
-    // a wrapped "temporarily\nlimiting\nrequests" still matches.
-    let raw_hit = THROTTLE_DIAG_PHRASES
-        .iter()
-        .copied()
-        .find(|p| screen_text.contains(p));
-    let phrase = match raw_hit {
-        Some(p) => p,
-        None => {
-            let flat = screen_text.split_whitespace().collect::<Vec<_>>().join(" ");
-            THROTTLE_DIAG_PHRASES
-                .iter()
-                .copied()
-                .find(|p| flat.contains(p))?
-        }
-    };
-    let wrap_split = raw_hit.is_none();
-    // Classifier landed on a retryable state → throttle phrase was correctly
-    // recognized (auto-retry handles it). Nothing to diagnose → no noise.
-    if is_throttle_retryable_state(current) {
-        return None;
-    }
-    // Require the phrase in the LIVE bottom-N tail — a copy that only survives
-    // in scrolled-up scrollback is stale, not a current miss. Check the
-    // flattened tail too so a wrapped live error still qualifies.
-    let tail = tail_recent_lines(tail, UNCLASSIFIED_TAIL_LINES);
-    let tail_flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !tail.contains(phrase) && !tail_flat.contains(phrase) {
-        return None;
-    }
-    Some((
-        ansi_colored_tail(screen_text, fg, UNCLASSIFIED_TAIL_LINES),
-        wrap_split,
-    ))
 }
 
 /// #SRL-phase2: hard-wrap detection fallback. Ink word-wraps a long
@@ -1303,6 +1036,10 @@ impl StateTracker {
             // Seed the lock-free mirror with the same initial state (record_set
             // keeps it in lockstep thereafter).
             published: Arc::new(AtomicU8::new(initial_state as u8)),
+            // #2413 (A): badge-override mirror starts with no correction; the render
+            // snapshot uses the raw `published` state until the shadow driver
+            // publishes a high-confidence correction.
+            published_observed: Arc::new(AtomicU8::new(OBSERVED_NONE)),
             since: Instant::now(),
             last_output: Instant::now(),
             last_productive_output: None,
@@ -1352,18 +1089,15 @@ impl StateTracker {
             usage_limit_expired_sig: None,
             srl_consecutive_rematch: 0,
             non_srl_since_last_srl: false,
-            last_unclassified_throttle_sig: None,
             last_srl_keep_latched_sig: None,
             last_srl_phantom_warn_sig: None,
-            last_turn_sentinel_sig: None,
         }
     }
 
     /// Construct a tracker for a NAMED agent — the production path. The name is
-    /// required for per-agent telemetry: in particular the #1523 turn-completion
-    /// sentinel derives this agent's token from its name (see
-    /// [`turn_sentinel_token`]), so an unnamed tracker would compute the wrong
-    /// token and the shadow log would never fire. Prefer this over `new` +
+    /// required for per-agent telemetry attribution (e.g. the state-detection
+    /// tracing fields and shadow side-logs are keyed on it), so an unnamed
+    /// tracker would emit unattributed records. Prefer this over `new` +
     /// `set_instance_name` at every real spawn site so the name can't be
     /// forgotten (r6 #2297: the inline `StateTracker::new` left it empty in prod).
     pub fn for_agent(backend: Option<&Backend>, name: &str) -> Self {
@@ -1433,11 +1167,11 @@ impl StateTracker {
     }
 
     /// If detected state is `PermissionPrompt` but a fresh heartbeat exists,
-    /// override to `Thinking` — the agent is alive and the PTY pattern is a
+    /// override to `Active` — the agent is alive and the PTY pattern is a
     /// false positive (A5 fix, design §4.3).
     fn gate_on_heartbeat(&self, detected: AgentState) -> AgentState {
         if detected == AgentState::PermissionPrompt && self.is_heartbeat_fresh() {
-            AgentState::Thinking
+            AgentState::Active
         } else {
             detected
         }
@@ -1526,6 +1260,11 @@ impl StateTracker {
         None
     }
 
+    /// The backend's context-telemetry capability for the LIST `context_provider`
+    /// field (#2439). Returns the stored provider set by the backend profile —
+    /// `StatusLine` (claude/kiro), `TranscriptEstimate` (codex/grok/agy), or
+    /// `Unavailable`. Unlike `context_source`/`context_pct` (absent without a fresh
+    /// reading), this is ALWAYS available.
     pub fn context_provider(&self) -> crate::backend_profile::ContextProvider {
         self.context_provider
     }
@@ -1550,7 +1289,7 @@ impl StateTracker {
     ///
     /// Heartbeat gate (A5 fix): after pattern detection, if the detected
     /// state is `PermissionPrompt` but a fresh MCP heartbeat exists, the
-    /// detection is overridden to `Thinking` — the agent is alive and the
+    /// detection is overridden to `Active` — the agent is alive and the
     /// PTY pattern is a false positive.
     ///
     /// Text-only entry point: delegates to [`feed_with_fg`] with an empty
@@ -1625,10 +1364,6 @@ impl StateTracker {
     /// The caller MUST have already passed the hash-dedup gate (gate 1) for this
     /// `screen_text`; entering here re-runs detection unconditionally.
     fn feed_after_dedup(&mut self, screen_text: &str, fg: &[CellFg]) {
-        // Sprint 27 shadow-mode: capture silence duration BEFORE updating
-        // last_output, so we measure time since previous feed (not current).
-        let silence_since_last_feed = self.last_output.elapsed();
-
         self.last_output = Instant::now();
 
         if let Some(patterns) = self.patterns {
@@ -1728,9 +1463,8 @@ impl StateTracker {
                 self.non_srl_since_last_srl = true;
                 // CR-2026-06-14 t-43: the SRL fire-once WARN latches
                 // (`last_srl_keep_latched_sig` #2086 / `last_srl_phantom_warn_sig`
-                // #1808) are SET-ONLY — unlike `last_unclassified_throttle_sig`,
-                // which clears when the pane leaves the throttle-miss shape so a
-                // recurrence re-logs once. Mirror that here: on a GENUINE recovery
+                // #1808) are otherwise SET-ONLY, so a recurrence on the same line
+                // would never re-log. Clear them here: on a GENUINE recovery
                 // (recent productive output) drop both latches so a 2nd SRL
                 // incident on the SAME error line — after the agent really
                 // recovered — re-logs once instead of being silently suppressed.
@@ -1747,23 +1481,8 @@ impl StateTracker {
             }
         }
 
-        // #1562 self-capture instrument: pure-additive diagnostic. If a known
-        // server-throttle phrase is on screen but the classifier did NOT land
-        // on a retryable state, side-log the colored tail so the in-the-wild
-        // miss can be diagnosed. Zero behavior change (runs AFTER classify,
-        // never touches `self.current`/retry).
-        let recent_tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
-        self.capture_unclassified_throttle(screen_text, fg, &recent_tail);
-
-        // #1523 Phase 0: in-band turn-completion sentinel shadow telemetry.
-        // Default-OFF (flag-gated); when on, side-logs this agent's token sighting
-        // for measurement. Runs AFTER classify, never touches `self.current`.
-        self.capture_turn_sentinel_shadow(screen_text, &recent_tail);
-
-        // Instrumentation 2 — Sprint 27 shadow-mode behavioral telemetry.
-        self.record_shadow_telemetry(silence_since_last_feed);
-
         // F9 (#685 sub-task 4): productive-output detection (zero behavior).
+        let recent_tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
         self.detect_productive_output(&recent_tail);
     }
 
@@ -1795,27 +1514,6 @@ impl StateTracker {
             self.last_screen_hash = Some(hash);
             self.scan_context_pct(screen_text);
             false
-        }
-    }
-
-    /// Instrumentation — Sprint 27 shadow-mode: log behavioral signal alongside
-    /// regex state. Zero state change — telemetry only. Phase 2 (Sprint 28+)
-    /// promotes behavioral to tiebreaker/primary.
-    fn record_shadow_telemetry(&self, silence_since_last_feed: Duration) {
-        if let Some(ref config) = self.behavioral_config {
-            let signal = crate::behavioral::infer_from_silence(config, silence_since_last_feed);
-            crate::behavioral::log_shadow_telemetry(
-                &self.instance_name,
-                &self.backend_name,
-                self.current.display_name(),
-                signal,
-            );
-            // Sprint 27 PR-B: accumulate divergence stats for dashboard
-            crate::behavioral::record_divergence(
-                &self.backend_name,
-                signal,
-                self.current.display_name(),
-            );
         }
     }
 
@@ -2456,164 +2154,6 @@ impl StateTracker {
         );
     }
 
-    /// #1562 self-capture instrument — a pure-additive diagnostic side-log.
-    ///
-    /// When a known server-throttle / transient-error phrase
-    /// ([`THROTTLE_DIAG_PHRASES`]) is visible in the live tail but the
-    /// classifier did NOT land on a retryable state
-    /// ([`is_throttle_retryable_state`]), append one JSONL record to
-    /// `<agend-home>/unclassified_errors.jsonl`:
-    /// `{ts, backend, classified_state, raw_tail}`, where `raw_tail` carries
-    /// ANSI color (reconstructed from `fg`) so the color-anchor hypothesis
-    /// (#1562: did the throttle line render red?) can be checked from the log.
-    ///
-    /// Invariants:
-    /// - **Zero behavior change** — runs after classify, never touches
-    ///   `self.current`, retry, or any timer; failures are swallowed.
-    /// - **Cheap** — fast-rejects on a `str::contains` scan (no allocation) when
-    ///   no throttle phrase is present, which is the overwhelming common case.
-    /// - **Low-noise** — fires only on phrase-present + classified-non-retryable
-    ///   + phrase-in-live-tail (a scrolled-up scrollback echo is ignored).
-    fn capture_unclassified_throttle(&mut self, screen_text: &str, fg: &[CellFg], tail: &str) {
-        let Some((raw_tail, wrap_split)) =
-            unclassified_throttle_tail(self.current, screen_text, fg, tail)
-        else {
-            // Left the throttle-miss shape — drop the latch so a later recurrence
-            // of the same screen logs once again (#2100/#2115).
-            self.last_unclassified_throttle_sig = None;
-            return;
-        };
-        // #2100/#2115 fire-once latch: `apply_hash_dedup_gate` bypasses the
-        // feed-level screen hash-dedup for throttle-hint screens, so a STATIC
-        // unclassified-throttle pane would otherwise append a record (and re-fire
-        // the WARN below) on every PTY read. Key on the colored tail — stable
-        // across the cursor/clock re-renders that flip the full-screen hash.
-        let sig = hash_screen(&raw_tail);
-        if self.last_unclassified_throttle_sig == Some(sig) {
-            return;
-        }
-        self.last_unclassified_throttle_sig = Some(sig);
-        // #1808 Phase-1 upstream instrument: a server-throttle phrase is on a
-        // LIVE non-retryable screen — the detection miss that left agents stuck.
-        // When `wrap_split` (phrase matched only after whitespace-flatten), the
-        // de-wrap of soft-wraps did NOT merge it → the wrap is a hard `\n` (Ink
-        // layout) → WARN with the FULL escaped screen_text so the next real SRL
-        // event is captured verbatim and we can confirm soft-vs-hard wrap before
-        // building the Phase 2 fallback. Contiguous misses (wrap_split=false) are
-        // the already-understood prose-FP class (correctly suppressed by the
-        // line-scoped content anchor) → kept to the JSONL sidecar only, no WARN
-        // noise. Both this WARN and the append are bounded to once per distinct
-        // screen by the `last_unclassified_throttle_sig` latch above — the
-        // feed-level hash-dedup does NOT bound it (it is bypassed for throttle
-        // screens, and a spinner/clock tick would churn the screen hash; #2115).
-        if wrap_split {
-            let escaped = screen_text.escape_debug().to_string();
-            tracing::warn!(
-                target: "state_detection",
-                agent = %self.instance_name,
-                backend = %self.backend_name,
-                tag = "#1808-srl-detect-miss",
-                classified_state = %self.current.display_name(),
-                wrap_split,
-                screen_text = %escaped,
-                "SRL/throttle phrase present only when whitespace-flattened (hard `\\n` line-wrap) but classifier did NOT latch a retryable state — capturing full screen_text for soft-vs-hard wrap diagnosis (#1808 Phase 2 signal)"
-            );
-        }
-        let record = serde_json::json!({
-            "ts": chrono::Utc::now().to_rfc3339(),
-            "backend": self.backend_name,
-            "classified_state": self.current.display_name(),
-            "wrap_split": wrap_split,
-            "raw_tail": raw_tail,
-            "screen_text": screen_text,
-        });
-        let path = crate::home_dir().join("unclassified_errors.jsonl");
-        if let Err(e) = append_jsonl(&path, &record) {
-            // Diagnostic must never affect behavior — log and move on.
-            tracing::debug!(
-                target: "state_detection",
-                agent = %self.instance_name,
-                error = %e,
-                "#1562: failed to append unclassified-throttle diagnostic"
-            );
-        }
-    }
-
-    /// #1523 Phase 0: turn-completion sentinel shadow telemetry.
-    ///
-    /// When `AGEND_TURN_SENTINEL_SHADOW=1`, hook-less agents are instructed to
-    /// print `<<<AGEND-DONE:{nonce}>>>` as the final line when a turn finishes
-    /// (see [`turn_sentinel_token`]). This side-logs whether THIS agent's token
-    /// is on screen alongside the heuristic classification, so emit-rate /
-    /// false-emit (instruction-echo / source-view) / leak can be measured before
-    /// any production reliance in Phase 1. The daemon takes NO action on the
-    /// signal in Phase 0 — this only ever ADDS corroboration, never subtracts.
-    ///
-    /// Invariants (mirror the retired `capture_hardwrap_miss_shadow`):
-    /// - **Zero behaviour change** — runs after classify, never touches
-    ///   `self.current`, retry, or any timer; failures are swallowed. Gated OFF
-    ///   by default (flag absent → early return → byte-identical classification).
-    /// - **Cheap** — fast-rejects on a `str::contains` for the fixed prefix
-    ///   before building the per-agent token or allocating a tail.
-    /// - **Fire-once** — a static token-bearing frame logs once via the
-    ///   `last_turn_sentinel_sig` latch (the feed-level hash-dedup already drops
-    ///   unchanged frames; this guards token frames whose hash churns).
-    fn capture_turn_sentinel_shadow(&mut self, screen_text: &str, tail: &str) {
-        if !turn_sentinel_shadow_enabled() || self.instance_name.is_empty() {
-            return;
-        }
-        // Cheap fast-path: the marker prefix is fixed; bail before building the
-        // per-agent token or allocating a tail if it is nowhere on screen.
-        if !screen_text.contains(TURN_SENTINEL_PREFIX) {
-            self.last_turn_sentinel_sig = None;
-            return;
-        }
-        let token = turn_sentinel_token(&self.instance_name);
-        let obs = observe_turn_sentinel(tail, &token);
-        if !obs.token_seen {
-            // Some OTHER agent's token (or a malformed marker) is on screen — not
-            // ours. Drop the latch and skip (never attribute another agent's emit).
-            self.last_turn_sentinel_sig = None;
-            return;
-        }
-        // Consistency: a real emission means the agent just finished → the
-        // heuristic should independently read Idle. Disagreement is the
-        // corroboration value we want to measure.
-        let consistent = matches!(self.current, AgentState::Idle);
-        // Fire-once latch keyed on the token-bearing tail + derived flags so a
-        // static pane logs once, not every churned-hash frame.
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        tail.hash(&mut h);
-        obs.on_last_line.hash(&mut h);
-        obs.suspected_echo.hash(&mut h);
-        let sig = h.finish();
-        if self.last_turn_sentinel_sig == Some(sig) {
-            return;
-        }
-        self.last_turn_sentinel_sig = Some(sig);
-        let record = serde_json::json!({
-            "ts": chrono::Utc::now().to_rfc3339(),
-            "backend": self.backend_name,
-            "agent": self.instance_name,
-            "token_seen": obs.token_seen,
-            "on_last_line": obs.on_last_line,
-            "existing_state": self.current.display_name(),
-            "consistent": consistent,
-            "suspected_echo": obs.suspected_echo,
-            "leak_signal": obs.leak_signal,
-        });
-        let path = crate::home_dir().join("turn_sentinel_shadow.jsonl");
-        if let Err(e) = append_jsonl(&path, &record) {
-            // Diagnostic must never affect behavior — log and move on.
-            tracing::debug!(
-                target: "state_detection",
-                agent = %self.instance_name,
-                error = %e,
-                "#1523 Phase 0 shadow: failed to append turn-sentinel diagnostic"
-            );
-        }
-    }
-
     /// Fallback when the screen changed but no pattern matched.
     ///
     /// Active-state markers (Thinking "esc to cancel", ToolUse tool banners)
@@ -2641,7 +2181,7 @@ impl StateTracker {
         // stop rendering mid-operation even when the agent is still
         // working, so a brief latch is fine but holding beyond
         // LATCHED_STATE_EXPIRY is almost always stale.
-        let short_expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
+        let short_expiring = matches!(self.current, AgentState::Active);
         if short_expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
             self.transition(AgentState::Idle);
             return;
@@ -2700,6 +2240,27 @@ impl StateTracker {
     /// atomic `record_set` writes, so reads always observe the latest transition.
     pub fn published_handle(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.published)
+    }
+
+    /// #2413 (A): clone the lock-free badge-override handle (sibling of
+    /// [`published_handle`]). The render snapshot reads it without `core.lock()` to
+    /// show a high-confidence Shadow Observer correction in place of the raw state.
+    pub fn published_observed_handle(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.published_observed)
+    }
+
+    /// #2413 (A): publish the Shadow Observer's gated BADGE override into the
+    /// lock-free mirror the render snapshot reads. `Some(state)` ⇒ a high-confidence
+    /// observer correction the badge should show; `None` ⇒ no override (stores
+    /// [`OBSERVED_NONE`] so render falls back to the raw `published` state). The
+    /// per-tick driver calls this EVERY tick so a lapsed correction is cleared.
+    /// Takes `&self` (the atomic is interior-mutable) and NEVER touches `current` —
+    /// the cycle-proof invariant: a corrected badge can't feed back into the
+    /// reducer's screen input (which reads `current`, not this mirror). Relaxed: a
+    /// standalone value, ≤1-frame render staleness is already tolerated.
+    pub fn publish_observed(&self, badge: Option<AgentState>) {
+        let byte = badge.map_or(OBSERVED_NONE, |s| s as u8);
+        self.published_observed.store(byte, Ordering::Relaxed);
     }
 
     /// Time since the agent last produced PRODUCTIVE output, for the silence-based
@@ -2855,17 +2416,17 @@ impl StateTracker {
                 // #1005 Phase A2: oscillation guard. Suppress priority-up
                 // back into the SAME self-expiring latched state we just
                 // left briefly. This is the
-                // `ToolUse(2s) → Idle(2s) → ToolUse(2s)` bounce that
+                // `Active(2s) → Idle(2s) → Active(2s)` bounce that
                 // keeps `since` recent and blocks `LATCHED_STATE_EXPIRY`
                 // (30s) from firing (Scenario C of §F39). Scoped to
-                // {Thinking, ToolUse} — the exact set
+                // `Active` — the exact set
                 // `maybe_expire_latched_state` targets. Operator-driven
                 // dialogs (InteractivePrompt / PermissionPrompt) and
                 // error states are deliberately OUT of scope: those
                 // have legitimate re-entry semantics (operator dismiss
                 // then re-prompt) and their own recovery paths.
                 let now = Instant::now();
-                let guard_applies = matches!(new_state, AgentState::Thinking | AgentState::ToolUse);
+                let guard_applies = matches!(new_state, AgentState::Active);
                 if guard_applies {
                     if let Some((prev_target, prev_at)) = self.last_priority_up_into {
                         let bouncing_to_same = prev_target == new_state;

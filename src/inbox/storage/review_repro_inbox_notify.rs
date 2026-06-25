@@ -1,9 +1,8 @@
 //! Verification/reproduction tests for the `inbox-notify` review batch.
 //!
-//! These tests encode the CORRECT expected behavior and FAIL (red) against the
-//! current buggy code, so they prove the bug is caught; they PASS (green) once
-//! the fix lands. Each is `#[ignore]`d so CI stays green until then — remove the
-//! `#[ignore]` after the corresponding fix to confirm.
+//! These tests encode the CORRECT expected behavior and PASS (green) on current
+//! code (the cited fixes have landed); they run un-ignored as live regression
+//! guards.
 //!
 //! Attached to `src/inbox/storage.rs`; private/`pub(super)`/`pub(crate)` items
 //! are reached through `super::`.

@@ -196,9 +196,7 @@ fn classify_branch(
     let silence_exceeds = match agent_state {
         crate::state::AgentState::Idle => false,
         crate::state::AgentState::Starting => silent > Duration::from_secs(120),
-        crate::state::AgentState::Thinking | crate::state::AgentState::ToolUse => {
-            silent > Duration::from_secs(600)
-        }
+        crate::state::AgentState::Active => silent > Duration::from_secs(600),
         _ => silent > Duration::from_secs(120),
     };
     let productive_exceeds = productive_silence_exceeds(agent_state, silent_productive);
@@ -285,6 +283,9 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                     recovery_stage_state: core.health.recovery_stage_state,
                     last_stage1_fired_at: core.health.last_stage1_fired_at,
                     recovery_restart_count: core.health.recovery_restart_count,
+                    // KEEP-RAW (#2465): the recovery dispatcher is a health-state machine — feeding it
+                    // the promoted/observed state could let a stale/false 'Active' hook MASK a genuinely
+                    // stuck agent and skip its recovery escalation. Do NOT migrate to operated_state.
                     agent_state: core.state.current,
                     silent: core.state.last_output.elapsed(),
                     silent_productive: core.state.productive_silence(),
@@ -852,12 +853,12 @@ mod tests {
 
     #[test]
     fn classify_thinking_uses_higher_threshold() {
-        // Thinking + ToolUse get 600s threshold (sub-task 1 audit
+        // Active gets the 600s threshold (sub-task 1 audit
         // §Entry.E1 PRE). Silent 500s + productive_silence 500s on
-        // Thinking → anomaly (neither exceeds), even though both >
+        // Active → anomaly (neither exceeds), even though both >
         // 120s default.
         let branch = classify_branch(
-            AgentState::Thinking,
+            AgentState::Active,
             Duration::from_secs(500),
             Duration::from_secs(500),
         );

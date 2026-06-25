@@ -43,10 +43,6 @@ const USAGE_LIMIT_EXPIRY: Duration = Duration::from_secs(30 * 60);
 /// Per-task reclaim cap. Beyond this, auto-reclaim stops and the operator is
 /// escalated (a task that keeps landing on usage-limited agents needs a human).
 const RECLAIM_CAP: u32 = 3;
-/// If a reclaimed agent is observed recovered within this window after reclaim,
-/// record a `collision` instrument line — empirical input to the Phase 2
-/// lease-epoch go/no-go (was the 10min grace too aggressive?).
-const COLLISION_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// AgentState classes that are transient / self-healing / operator-gated and must
 /// NEVER be reclaimed even if a stale `QuotaExceeded` reason lingers. (`IdleLong`
@@ -94,10 +90,6 @@ fn tracking_path(home: &Path) -> std::path::PathBuf {
     home.join("reclaim_tracking.json")
 }
 
-fn instrument_path(home: &Path) -> std::path::PathBuf {
-    home.join("reclaim_instrument.jsonl")
-}
-
 /// Persistent reclaim bookkeeping (survives restarts; the cap must, since the
 /// reassignment churn it bounds spans many handler runs).
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -106,20 +98,6 @@ struct ReclaimTracking {
     task_reclaim_count: std::collections::HashMap<String, u32>,
     /// task_ids already escalated at the cap (fire-once operator escalation).
     capped_escalated: Vec<String>,
-    /// agent → last reclaim time (RFC3339) — anchors the collision instrument.
-    last_reclaim_at: std::collections::HashMap<String, String>,
-}
-
-/// Append one structured instrument line (best-effort; never panics).
-fn instrument(home: &Path, line: serde_json::Value) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(instrument_path(home))
-    {
-        let _ = writeln!(f, "{line}");
-    }
 }
 
 pub(crate) struct ReclaimHandler {
@@ -179,7 +157,7 @@ fn reclaim_if_eligible(
     if !should_reclaim(state, quota_exceeded, recovered, remaining, RECLAIM_GRACE) {
         return 0;
     }
-    do_reclaim(home, latch, agent, remaining, now)
+    do_reclaim(home, latch, agent, remaining)
 }
 
 /// #2127 Phase 2: re-route the reclaimed agent's pending inbox dispatches by
@@ -193,12 +171,7 @@ fn reclaim_if_eligible(
 /// entries after notifying (fire-once — next scan re-routes nothing). Returns
 /// (rerouted, escalated). MUST run BEFORE `do_reclaim`'s board-task cascade, which
 /// removes the board-task dispatch_tracking entries.
-fn reroute_dispatches(
-    home: &Path,
-    agent: &str,
-    blocked: &HashSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> (usize, usize) {
+fn reroute_dispatches(home: &Path, agent: &str, blocked: &HashSet<String>) -> (usize, usize) {
     // DP4: atomically take+remove the pending dispatches in ONE locked RMW —
     // fire-once and race-free (no snapshot-then-remove window where a concurrent
     // dispatch is removed without being notified). Notify the returned entries
@@ -268,16 +241,6 @@ fn reroute_dispatches(
             }
         }
     }
-    instrument(
-        home,
-        serde_json::json!({
-            "ts": now.to_rfc3339(),
-            "event": "inbox_reroute",
-            "agent": agent,
-            "rerouted": rerouted,
-            "escalated": escalated,
-        }),
-    );
     tracing::warn!(
         agent,
         rerouted,
@@ -293,7 +256,6 @@ fn do_reclaim(
     latch: &super::inbox_stuck::AlertLatch,
     agent: &str,
     remaining: Duration,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> usize {
     let board = crate::task_events::replay(home).unwrap_or_default();
     let owned: Vec<crate::task_events::TaskId> = board
@@ -331,16 +293,6 @@ fn do_reclaim(
                 board = %board_project,
                 "#2127 reclaim cross-board skip (fail-closed): agent not authorized on task's board"
             );
-            instrument(
-                home,
-                serde_json::json!({
-                    "ts": now.to_rfc3339(),
-                    "event": "cross_board_skip",
-                    "agent": agent,
-                    "task": tid.0,
-                    "board": board_project,
-                }),
-            );
         }
     }
     if agent_tasks.is_empty() {
@@ -367,8 +319,6 @@ fn do_reclaim(
                 t.task_reclaim_count.insert(tid.0.clone(), count + 1);
                 to_reclaim.push(tid.clone());
             }
-            t.last_reclaim_at
-                .insert(agent.to_string(), now.to_rfc3339());
         },
     );
 
@@ -406,10 +356,6 @@ fn do_reclaim(
             &msg,
             false,
         );
-        instrument(
-            home,
-            serde_json::json!({"ts": now.to_rfc3339(), "event": "cap_escalated", "agent": agent, "task": tid}),
-        );
     }
 
     if reclaimed > 0 {
@@ -419,16 +365,6 @@ fn do_reclaim(
         // unread pile the inbox-stuck watchdog will legitimately re-alert next
         // cadence — that is the P2 surface, not a regression.
         latch.lock().remove(agent);
-        instrument(
-            home,
-            serde_json::json!({
-                "ts": now.to_rfc3339(),
-                "event": "reclaim",
-                "agent": agent,
-                "tasks": reclaimed,
-                "remaining_secs": remaining.as_secs(),
-            }),
-        );
         tracing::warn!(
             agent,
             reclaimed,
@@ -437,49 +373,6 @@ fn do_reclaim(
         );
     }
     reclaimed
-}
-
-/// For agents that were reclaimed and have since recovered (no longer eligible),
-/// record a `collision` instrument line if recovery happened within
-/// `COLLISION_WINDOW` of the reclaim, then clear the marker (fire-once).
-fn process_collisions(
-    home: &Path,
-    recovered_agents: &[String],
-    now: chrono::DateTime<chrono::Utc>,
-) {
-    if recovered_agents.is_empty() || !tracking_path(home).exists() {
-        return;
-    }
-    let mut collisions: Vec<(String, i64)> = Vec::new();
-    let _ = crate::store::with_json_state::<ReclaimTracking, _, _>(&tracking_path(home), |t| {
-        for agent in recovered_agents {
-            if let Some(ts) = t.last_reclaim_at.get(agent) {
-                if let Ok(reclaimed_at) = chrono::DateTime::parse_from_rfc3339(ts) {
-                    let age = now.signed_duration_since(reclaimed_at.with_timezone(&chrono::Utc));
-                    if age.to_std().map(|d| d < COLLISION_WINDOW).unwrap_or(false) {
-                        collisions.push((agent.clone(), age.num_seconds()));
-                    }
-                }
-                t.last_reclaim_at.remove(agent); // fire-once
-            }
-        }
-    });
-    for (agent, secs) in collisions {
-        instrument(
-            home,
-            serde_json::json!({
-                "ts": now.to_rfc3339(),
-                "event": "collision",
-                "agent": agent,
-                "recovered_after_secs": secs,
-            }),
-        );
-        tracing::warn!(
-            agent,
-            recovered_after_secs = secs,
-            "#2127 reclaim collision: agent recovered shortly after reclaim (grace data for Phase 2)"
-        );
-    }
 }
 
 impl PerTickHandler for ReclaimHandler {
@@ -495,9 +388,7 @@ impl PerTickHandler for ReclaimHandler {
         // Snapshot per-agent signals under the locks, then DROP them before any
         // task/store file IO (avoids holding the registry/core lock across the
         // #1617 lock-while-blocking class).
-        let recovery_window = crate::state::SERVER_RATE_LIMIT_RECOVERY_SILENCE;
         let mut eligible: Vec<(String, AgentState, bool)> = Vec::new();
-        let mut recovered_agents: Vec<String> = Vec::new();
         // #2127 P2: the set of usage-limit/blocked agents this tick — a dispatcher
         // in this set has a dead inbox, so re-route escalates instead (DP3).
         let mut blocked: HashSet<String> = HashSet::new();
@@ -506,18 +397,24 @@ impl PerTickHandler for ReclaimHandler {
             for handle in reg.values() {
                 let name = handle.name.as_str().to_string();
                 let core = handle.core.lock();
-                let state = core.state.current;
+                // #2465: routed through operated_state for single-source consistency (#1493) —
+                // INERT here today (no behavioral change). The observer never promotes TO
+                // UsageLimit, gate(c) keeps a raw usage / rate-limit screen authoritative, and
+                // Idle/Active share reclaim-eligibility, so the UsageLimit trigger is unchanged;
+                // it would only diverge for a cross-coarse Hook/Stream correction. (poll_reminder
+                // is the one consumer in this PR that sees a real behavioral change.)
+                let state = crate::daemon::shadow::operated_state(
+                    core.state.current,
+                    core.observed_status.as_ref(),
+                );
                 let quota = matches!(
                     core.health.current_reason,
                     Some(crate::health::BlockedReason::QuotaExceeded)
                 );
-                let recovered = core.state.recovered_within(recovery_window);
                 drop(core);
                 if (state == AgentState::UsageLimit || quota) && !is_excluded_state(state) {
                     blocked.insert(name.clone());
                     eligible.push((name, state, quota));
-                } else if recovered {
-                    recovered_agents.push(name);
                 }
             }
         }
@@ -526,9 +423,9 @@ impl PerTickHandler for ReclaimHandler {
             // (do_reclaim's cascade removes the board-task dispatch_tracking entries
             // this needs to snapshot). Covers dispatches the agent already claimed
             // AND ones still unclaimed in its inbox.
-            reroute_dispatches(ctx.home, &name, &blocked, now);
-            // Phase 1 board-task reclaim. recovered=false here: an eligible agent
-            // that had recovered would have gone to `recovered_agents`.
+            reroute_dispatches(ctx.home, &name, &blocked);
+            // Phase 1 board-task reclaim. recovered=false: an eligible agent is
+            // blocked (usage_limit), not mid-recovery.
             reclaim_if_eligible(
                 ctx.home,
                 &self.work_stuck_latch,
@@ -539,7 +436,6 @@ impl PerTickHandler for ReclaimHandler {
                 now,
             );
         }
-        process_collisions(ctx.home, &recovered_agents, now);
     }
 }
 
@@ -913,11 +809,10 @@ mod tests {
     /// (DP4 fire-once).
     #[test]
     fn p2_reroute_notifies_dispatcher_and_removes_entry() {
-        let now = chrono::Utc::now();
         let home = tmp_home("p2-notify");
         seed_dispatch(&home, "lead", "dev-x", Some("t-1"), "pending"); // task
         seed_dispatch(&home, "lead", "dev-x", None, "pending"); // query-style
-        let (rerouted, escalated) = reroute_dispatches(&home, "dev-x", &HashSet::new(), now);
+        let (rerouted, escalated) = reroute_dispatches(&home, "dev-x", &HashSet::new());
         assert_eq!(
             (rerouted, escalated),
             (2, 0),
@@ -951,7 +846,6 @@ mod tests {
     /// operator-only fallback. This asserts the routing TARGET, not just a count.)
     #[test]
     fn p2_reroute_blocked_dispatcher_escalates_to_orchestrator() {
-        let now = chrono::Utc::now();
         let home = tmp_home("p2-blocked-orch");
         // fleet team: dispatcher `lead` is a member; orchestrator is `boss` (≠ lead).
         std::fs::write(
@@ -962,7 +856,7 @@ mod tests {
         seed_dispatch(&home, "lead", "dev-y", Some("t-2"), "pending");
         let mut blocked = HashSet::new();
         blocked.insert("lead".to_string());
-        let (rerouted, escalated) = reroute_dispatches(&home, "dev-y", &blocked, now);
+        let (rerouted, escalated) = reroute_dispatches(&home, "dev-y", &blocked);
         assert_eq!(
             (rerouted, escalated),
             (0, 1),
@@ -993,12 +887,11 @@ mod tests {
     /// dead inbox stays empty.
     #[test]
     fn p2_reroute_blocked_dispatcher_no_team_falls_back_to_operator() {
-        let now = chrono::Utc::now();
         let home = tmp_home("p2-blocked-noteam");
         seed_dispatch(&home, "lead", "dev-z", Some("t-9"), "pending");
         let mut blocked = HashSet::new();
         blocked.insert("lead".to_string());
-        let (rerouted, escalated) = reroute_dispatches(&home, "dev-z", &blocked, now);
+        let (rerouted, escalated) = reroute_dispatches(&home, "dev-z", &blocked);
         assert_eq!(
             (rerouted, escalated),
             (0, 1),
@@ -1015,13 +908,12 @@ mod tests {
     /// at all → no-op (byte-identical when nothing is pending).
     #[test]
     fn p2_reroute_skips_terminal_and_noops_when_empty() {
-        let now = chrono::Utc::now();
         let home = tmp_home("p2-terminal");
         seed_dispatch(&home, "lead", "dev-t", Some("t-3"), "no_report_expected");
-        let (rr, esc) = reroute_dispatches(&home, "dev-t", &HashSet::new(), now);
+        let (rr, esc) = reroute_dispatches(&home, "dev-t", &HashSet::new());
         assert_eq!((rr, esc), (0, 0), "terminal dispatch is not re-routed");
         // A target with no dispatches at all → no-op.
-        let (rr2, esc2) = reroute_dispatches(&home, "nobody", &HashSet::new(), now);
+        let (rr2, esc2) = reroute_dispatches(&home, "nobody", &HashSet::new());
         assert_eq!((rr2, esc2), (0, 0));
         std::fs::remove_dir_all(&home).ok();
     }

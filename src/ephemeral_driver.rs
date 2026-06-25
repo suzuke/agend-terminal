@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn oracle_nonidle_nonerror_fails() {
         // Stopped mid-work (e.g. wall-TTL while Thinking) → not a clean terminal Idle.
-        assert!(!oracle_success(AgentState::Thinking, true));
+        assert!(!oracle_success(AgentState::Active, true));
     }
 
     // ─────────────── grew measure (nonblank delta) + chrome strip ───────────────
@@ -607,21 +607,15 @@ mod tests {
         // Post-inject lull (Idle) — must not be mistaken for the end.
         assert_eq!(d.observe(AgentState::Idle, 0), TurnDecision::Continue);
         // Work starts.
-        assert_eq!(d.observe(AgentState::Thinking, 250), TurnDecision::Continue);
-        assert_eq!(d.observe(AgentState::Thinking, 500), TurnDecision::Continue);
+        assert_eq!(d.observe(AgentState::Active, 250), TurnDecision::Continue);
+        assert_eq!(d.observe(AgentState::Active, 500), TurnDecision::Continue);
         // A mid-turn Idle BLIP at 750ms…
         assert_eq!(d.observe(AgentState::Idle, 750), TurnDecision::Continue);
         // …only ~1s of "held" Idle, still under the 3s window — NOT the end…
         assert_eq!(d.observe(AgentState::Idle, 1_750), TurnDecision::Continue);
         // …then work resumes (the blip ends) — held-Idle clock resets.
-        assert_eq!(
-            d.observe(AgentState::Thinking, 2_000),
-            TurnDecision::Continue
-        );
-        assert_eq!(
-            d.observe(AgentState::ToolUse, 2_500),
-            TurnDecision::Continue
-        );
+        assert_eq!(d.observe(AgentState::Active, 2_000), TurnDecision::Continue);
+        assert_eq!(d.observe(AgentState::Active, 2_500), TurnDecision::Continue);
         // Real turn end: Idle starts at 3_000 and holds.
         assert_eq!(d.observe(AgentState::Idle, 3_000), TurnDecision::Continue);
         // Held < 3s → still continue (would have wrongly fired if the blip leaked).
@@ -648,7 +642,7 @@ mod tests {
     #[test]
     fn debounce_short_circuits_on_error_class() {
         let mut d = TurnEndDetector::new(TURN_DEBOUNCE_MS);
-        assert_eq!(d.observe(AgentState::Thinking, 100), TurnDecision::Continue);
+        assert_eq!(d.observe(AgentState::Active, 100), TurnDecision::Continue);
         assert_eq!(
             d.observe(AgentState::UsageLimit, 200),
             TurnDecision::ErrorClass
@@ -659,7 +653,7 @@ mod tests {
     #[test]
     fn debounce_clean_turn_ends_after_held_idle() {
         let mut d = TurnEndDetector::new(TURN_DEBOUNCE_MS);
-        assert_eq!(d.observe(AgentState::Thinking, 0), TurnDecision::Continue);
+        assert_eq!(d.observe(AgentState::Active, 0), TurnDecision::Continue);
         assert_eq!(d.observe(AgentState::Idle, 1_000), TurnDecision::Continue);
         assert_eq!(d.observe(AgentState::Idle, 3_999), TurnDecision::Continue);
         assert_eq!(d.observe(AgentState::Idle, 4_000), TurnDecision::TurnEnded);

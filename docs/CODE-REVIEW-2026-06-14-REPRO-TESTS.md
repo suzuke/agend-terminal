@@ -1,5 +1,7 @@
 # agend-terminal Review 驗證測試 — 對照表
 
+> ⚠ **SUPERSEDED(2026-06-25,#2455 / PR #2458)**：本表是 **2026-06-14 的時點快照**。經 #2455 zombie-`#[ignore]` 稽核後,下列 repro 測試已分別 **解開 `#[ignore]`(轉為 live regression guard)** 或 **刪除(WONTFIX)**。因此 **下方的 `#[ignore]` / 🔴 RED 狀態與「如何執行」的跑測指令可能已不適用**——對已刪除的測試,照指令跑會得到 `no test target`。逐筆現況以 **PR #2458** 為準;本快照保留作歷史記錄,不應再當作可執行的 inventory。
+
 - **日期**：2026-06-14
 - **分支**：`test/review-repro-2026-06-14`（worktree: `.worktrees/review-repro`，從 `origin/main`@`66dcbf6`）
 - **對應 review**：`docs/CODE-REVIEW-2026-06-14.md` 的 105 條發現
@@ -57,7 +59,7 @@ cargo test --bin agend-terminal review_repro -- --ignored --no-fail-fast
 - **需要的架構改動**：Truly demonstrating UNBOUNDED growth behaviorally needs repeated cross-boot index loss with the on-disk append-only file surviving between losses — the simple in-process repro self-heals after the first repair (lookup then hits O(1)). The robust fix is architectural: dedupe on read or compact task_index.jsonl so repeated repairs cannot accumulate. The static guard (unconditional repair must gain a dedup/existence guard) is the interim verification; a behavioral growth test becomes deterministic once the index has a compaction/dedup seam to observe.
 
 ### R5. [xcut-security] Same-user process holding api.cookie gains full operator authority (defense-in-depth note)
-- **過渡守門測試**：`operator_connection_uses_kernel_verified_peer_credential_xcut_security`（`tests/review_xcut_security_2.rs`）
+- **過渡守門測試**：⚫ **已刪除(WONTFIX,decision `d-20260615162503510062-0`;#2458)** — ~~operator_connection_uses_kernel_verified_peer_credential_xcut_security（tests/review_xcut_security_2.rs)~~：same-user trust model 屬 by-design,此 guard 經裁定不再維護,**已非可執行測試**(照「如何執行」跑會回 `no test target`)。
 - **需要的架構改動**：This is `info`/documented as the intentional same-user trust model, and the runtime gap is genuinely not closable without an architecture change: `check_operation_allowed(method, params, state)` does not even RECEIVE a peer credential, and TCP loopback (the current transport) has no OS peer-UID mechanism. The structural fix is to (1) switch the operator/CLI transport to a Unix domain socket and read `SO_PEERCRED`/`getpeereid` at accept time (or on Windows verify the peer process owner), (2) thread that kernel-verified credential into `check_operation_allowed` and require it (not the self-reported handshake `pid`) for the direct-method `return Ok(())` operator branch, and (3) keep cookie hygiene (never log/print the cookie; the Cookie type is already `[u8;32]`, never Display-formatted). Until that lands, this source-scanning guard pins the precise defect (self-reported pid + no verified credential) and is the mandated interim test.
 
 ## 全部對照表（finding → 測試 → 狀態）
@@ -167,5 +169,5 @@ cargo test --bin agend-terminal review_repro -- --ignored --no-fail-fast
 | 101 | xcut-concurrency | static-invariant | 🔴 RED | `atomic_write_fsyncs_parent_dir_after_rename_xcut_concurrency` | `tests/review_xcut_concurrency_2.rs` |
 | 102 | xcut-concurrency | static-invariant | 🔴 RED | `ci_poller_bounds_detached_spawn_with_inflight_guard_xcut_concurrency` | `tests/review_xcut_concurrency_3.rs` |
 | 103 | xcut-security | behavioral-unit | 🔴 RED | `validate_branch_rejects_leading_dot_and_git_invalid_refs_xcut_security` | `src/agent_ops/review_repro_xcut_security.rs` |
-| 104 | xcut-security | redesign-required | 🔴 RED | `operator_connection_uses_kernel_verified_peer_credential_xcut_security` | `tests/review_xcut_security_2.rs` |
+| 104 | xcut-security | redesign-required | ⚫ DELETED (WONTFIX) | ~~operator_connection_uses_kernel_verified_peer_credential_xcut_security~~（已刪,`d-20260615162503510062-0`） | ~~tests/review_xcut_security_2.rs~~（已刪,#2458） |
 | 105 | xcut-security | static-invariant | 🔴 RED | `quickstart_does_not_embed_bot_token_in_telegram_url_xcut_security` | `tests/review_xcut_security_1.rs` |

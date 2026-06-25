@@ -156,7 +156,7 @@ fn permission_prompt_also_expires_to_ready() {
 fn tool_use_still_uses_short_expiry() {
     // Regression guard against accidentally widening the short
     // expiry — Thinking / ToolUse should still drop at 30 s.
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 31);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 31);
     t.tick();
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -181,12 +181,12 @@ fn active_to_passive_needs_hold() {
     let backend = Backend::ClaudeCode;
 
     // Thinking held for only 1s — transition to Idle should NOT happen
-    let mut t = tracker_at(&backend, AgentState::Thinking, 1);
+    let mut t = tracker_at(&backend, AgentState::Active, 1);
     t.transition(AgentState::Idle);
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 
     // Thinking held for 3s (>= 2s active hold) — transition to Idle SHOULD happen
-    let mut t = tracker_at(&backend, AgentState::Thinking, 3);
+    let mut t = tracker_at(&backend, AgentState::Active, 3);
     t.transition(AgentState::Idle);
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -213,8 +213,8 @@ fn higher_priority_instant() {
 
     // Idle → Thinking: higher priority, should transition immediately even at 0s
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::Thinking);
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    t.transition(AgentState::Active);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 // ── #1005 Phase A2: oscillation guard ─────────────────────────────────
@@ -238,8 +238,8 @@ fn oscillation_guard_suppresses_quick_bounce_to_same_active_state() {
     // Step 1: legitimate Idle → ToolUse priority-up (first entry,
     // guard unarmed). Guard records `(ToolUse, t0)` on success.
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
-    assert_eq!(t.get_state(), AgentState::ToolUse);
+    t.transition(AgentState::Active);
+    assert_eq!(t.get_state(), AgentState::Active);
     assert!(t.last_priority_up_into.is_some());
 
     // Step 2: ToolUse held 3s (≥ 2s active min_hold). Pattern
@@ -253,7 +253,7 @@ fn oscillation_guard_suppresses_quick_bounce_to_same_active_state() {
     // Guard MUST suppress the priority-up — operator sees tracker
     // settle in Idle instead of bouncing back into ToolUse.
     t.since = Instant::now() - Duration::from_secs(1);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(
         t.get_state(),
         AgentState::Idle,
@@ -271,16 +271,16 @@ fn oscillation_guard_does_not_suppress_legitimate_re_entry() {
     let backend = Backend::ClaudeCode;
 
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     // Held 3s, then natural drop to Idle
     t.since = Instant::now() - Duration::from_secs(3);
     t.transition(AgentState::Idle);
     // Held Idle for ≥ 5s — legitimate work pause
     t.since = Instant::now() - Duration::from_secs(6);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(
         t.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "#1005 A2: priority-up after ≥ 5s lower-state hold is legitimate, must fire"
     );
 }
@@ -295,42 +295,26 @@ fn oscillation_guard_does_not_suppress_after_window() {
     let backend = Backend::ClaudeCode;
 
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     // Manually age the priority-up record past the window
     let stale = Instant::now() - Duration::from_secs(35);
-    t.last_priority_up_into = Some((AgentState::ToolUse, stale));
+    t.last_priority_up_into = Some((AgentState::Active, stale));
     // Drop to Idle, hold briefly, try priority-up again
     t.current = AgentState::Idle;
     t.since = Instant::now() - Duration::from_secs(1);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(
         t.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "#1005 A2: stale priority-up record (>30s old) must not suppress new re-entry"
     );
 }
 
-/// Phase A2 cross-state independence: a priority-up to a DIFFERENT
-/// active state isn't a bounce — bouncing between Thinking and
-/// ToolUse is legitimate task progression, not oscillation.
-#[test]
-#[serial_test::serial]
-fn oscillation_guard_does_not_suppress_different_active_state() {
-    let backend = Backend::ClaudeCode;
-
-    let mut t = tracker_at(&backend, AgentState::Idle, 0);
-    t.transition(AgentState::ToolUse);
-    t.since = Instant::now() - Duration::from_secs(3);
-    t.transition(AgentState::Idle);
-    t.since = Instant::now() - Duration::from_secs(1);
-    // Different active state — Thinking, not ToolUse
-    t.transition(AgentState::Thinking);
-    assert_eq!(
-        t.get_state(),
-        AgentState::Thinking,
-        "#1005 A2: priority-up to a DIFFERENT active state must not be suppressed"
-    );
-}
+// Phase A2 cross-state independence test REMOVED in the Thinking+ToolUse→Active
+// merge: it asserted that bouncing between the (then-distinct) Thinking and ToolUse
+// active states was legitimate progression, not oscillation. With both collapsed
+// into the single `Active` state that distinction no longer exists — re-entering
+// `Active` from `Active` IS the bounce the guard suppresses, so the scenario is gone.
 
 /// Phase A2 multi-tick simulation: the #1005 issue's actual cycle
 /// pattern. Without the guard, this loop sticks at ToolUse forever
@@ -344,23 +328,23 @@ fn oscillation_guard_multi_cycle_settles_in_idle() {
     let mut t = tracker_at(&backend, AgentState::Idle, 0);
 
     // Cycle 1: Idle → ToolUse → Idle (each leg held briefly)
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     t.since = Instant::now() - Duration::from_secs(2);
     t.transition(AgentState::Idle);
     t.since = Instant::now() - Duration::from_secs(2);
 
     // Cycle 2: try to re-enter ToolUse (bounce) — must be suppressed
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 2 bounce");
 
     // Cycle 3: more attempts — still suppressed while within window
     t.since = Instant::now() - Duration::from_secs(2);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 3 bounce");
 
     // Cycle 4: still in window — still suppressed
     t.since = Instant::now() - Duration::from_secs(2);
-    t.transition(AgentState::ToolUse);
+    t.transition(AgentState::Active);
     assert_eq!(t.get_state(), AgentState::Idle, "cycle 4 bounce");
 }
 
@@ -377,7 +361,7 @@ fn opencode_tilde_dash_ing_matches_tooluse() {
     t.feed("~ Reading file...");
     assert_eq!(
         t.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "#1005 A2: opencode in-flight `~ Reading…` banner must match ToolUse"
     );
 }
@@ -432,10 +416,10 @@ fn unchanged_screen_does_not_reset_last_output() {
 #[test]
 fn same_state_no_timer_reset() {
     let backend = Backend::ClaudeCode;
-    let mut t = tracker_at(&backend, AgentState::Thinking, 10);
+    let mut t = tracker_at(&backend, AgentState::Active, 10);
     let since_before = t.since;
     // Re-transition to same state — should be no-op
-    t.transition(AgentState::Thinking);
+    t.transition(AgentState::Active);
     assert_eq!(t.since, since_before);
 }
 
@@ -446,7 +430,7 @@ fn feed_fallback_expires_thinking_after_threshold() {
     // Thinking held past LATCHED_STATE_EXPIRY (30s) with no pattern
     // matching on the current screen must drop to Ready so a vanished
     // spinner cannot latch the tracker.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 31);
+    let mut t = tracker_at(&Backend::Agy, AgentState::Active, 31);
     // Fresh screen content that matches no pattern for agy.
     t.feed("some unrelated output that matches nothing");
     assert_eq!(t.get_state(), AgentState::Idle);
@@ -456,14 +440,14 @@ fn feed_fallback_expires_thinking_after_threshold() {
 fn feed_fallback_does_not_expire_before_threshold() {
     // Under the threshold Thinking must stay — legitimate thinking can
     // run for tens of seconds with a quiet but still-active spinner.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 10);
+    let mut t = tracker_at(&Backend::Agy, AgentState::Active, 10);
     t.feed("some unrelated output that matches nothing");
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
 fn feed_fallback_expires_tooluse_after_threshold() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 35);
     t.feed("no tool banner, no ready footer visible here");
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -486,7 +470,7 @@ fn feed_fallback_does_not_expire_fresh_permission_prompt() {
 fn tick_expires_stale_tool_use_without_feed() {
     // ToolUse held > 30s with no PTY output. tick() must expire it
     // to Ready without requiring feed() (which needs new screen text).
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 35);
     t.tick();
     assert_eq!(t.get_state(), AgentState::Idle);
 }
@@ -494,9 +478,9 @@ fn tick_expires_stale_tool_use_without_feed() {
 #[test]
 fn tick_does_not_expire_fresh_tool_use() {
     // ToolUse held < 30s should NOT be expired by tick().
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 10);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 10);
     t.tick();
-    assert_eq!(t.get_state(), AgentState::ToolUse);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -512,7 +496,7 @@ fn tick_does_not_expire_fresh_permission_prompt() {
 #[test]
 fn tick_called_twice_still_expires() {
     // Verify tick() works on repeated calls (no hash-based early return).
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 35);
     t.tick();
     assert_eq!(t.get_state(), AgentState::Idle);
     // Second tick on Ready is a no-op (Ready is not expiring).
@@ -606,14 +590,14 @@ fn feed_fallback_gated_by_hash_dedup() {
     // tracker has been latched forever — the hash dedup short-circuits
     // feed() before detection runs. Feed the same no-match text twice;
     // only the first call can possibly trigger the fallback path.
-    let mut t = tracker_at(&Backend::Agy, AgentState::Thinking, 31);
+    let mut t = tracker_at(&Backend::Agy, AgentState::Active, 31);
     t.feed("no marker");
     // Tracker already dropped to Ready on the first feed. Reset to
     // Thinking to exercise the dedup-gate specifically.
-    t.current = AgentState::Thinking;
+    t.current = AgentState::Active;
     t.since = Instant::now() - Duration::from_secs(31);
     t.feed("no marker"); // same text → hash dedup → early return
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -652,14 +636,14 @@ fn idle_never_hangs() {
 fn thinking_hang_600s() {
     let mut h = HealthTracker::new();
     assert!(!h.check_hang(
-        AgentState::Thinking,
+        AgentState::Active,
         Duration::from_secs(599),
         Duration::from_secs(0),
         1_000_000,
         0
     ));
     assert!(h.check_hang(
-        AgentState::Thinking,
+        AgentState::Active,
         Duration::from_secs(601),
         Duration::from_secs(0),
         1_000_000,
@@ -674,7 +658,7 @@ fn claude_tooluse_spinner_match() {
     let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
     // Real claude format: spinner glyph + space + tool name
     let detected = patterns.detect("⠋ Read file.txt");
-    assert_eq!(detected, Some(AgentState::ToolUse));
+    assert_eq!(detected, Some(AgentState::Active));
 }
 
 #[test]
@@ -690,7 +674,7 @@ fn claude_tooluse_record_glyph_completion_does_not_fire_per_1005() {
     let detected = patterns.detect("⏺ Write(/tmp/claude-perm-test.txt)");
     assert_ne!(
         detected,
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "#1005: `⏺ Write` completion banner must NOT fire ToolUse"
     );
 }
@@ -776,7 +760,7 @@ fn claude_tooluse_ing_verb_match() {
     ] {
         assert_eq!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "expected ToolUse for {sample:?}"
         );
     }
@@ -821,7 +805,7 @@ fn idle_detection() {
 
 #[test]
 fn context_full_instant_transition() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 0);
     t.feed("compacting context");
     assert_eq!(t.get_state(), AgentState::ContextFull);
 }
@@ -837,7 +821,7 @@ fn auth_error_instant_transition() {
 
 #[test]
 fn permission_prompt_higher_than_thinking() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 0);
     // PermissionPrompt (priority 8) > Thinking (priority 6) — instant.
     // #1546: trigger via the chrome footer (the new anchor), not bare "Allow once".
     t.feed("Esc to cancel · Tab to amend");
@@ -846,7 +830,7 @@ fn permission_prompt_higher_than_thinking() {
 
 #[test]
 fn set_restarting_transitions_state() {
-    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Active, 5);
     t.set_restarting();
     assert_eq!(t.get_state(), AgentState::Restarting);
 }
@@ -860,7 +844,7 @@ fn error_state_is_error() {
     assert!(AgentState::ApiError.is_error());
     assert!(AgentState::Crashed.is_error());
     assert!(AgentState::Restarting.is_error());
-    assert!(!AgentState::Thinking.is_error());
+    assert!(!AgentState::Active.is_error());
     assert!(!AgentState::Idle.is_error());
     assert!(!AgentState::Starting.is_error());
 }
@@ -918,8 +902,7 @@ fn set_awaiting_operator_noop_from_non_starting() {
     for s in [
         AgentState::Idle,
         AgentState::Idle,
-        AgentState::Thinking,
-        AgentState::ToolUse,
+        AgentState::Active,
         AgentState::AwaitingOperator,
         AgentState::Crashed,
     ] {
@@ -1154,8 +1137,8 @@ fn recovery_notice_not_armed_for_unrelated_transitions() {
     let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
     st.current = AgentState::Idle;
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
-    st.transition(AgentState::Thinking);
-    assert_eq!(st.get_state(), AgentState::Thinking);
+    st.transition(AgentState::Active);
+    assert_eq!(st.get_state(), AgentState::Active);
     st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
     st.transition(AgentState::Idle);
     assert_eq!(st.get_state(), AgentState::Idle);
@@ -1245,7 +1228,7 @@ fn codex_tooluse_past_tense_title_does_not_fire_per_1005() {
     for sample in ["• Explored", "• Edited", "• Ran"] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: codex past-tense title `{sample}` is completion record — must NOT fire ToolUse"
         );
     }
@@ -1274,7 +1257,7 @@ fn codex_tooluse_continuation_line_does_not_fire_per_1005() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: codex `└` continuation `{sample}` is completion record — must NOT fire ToolUse"
         );
     }
@@ -1296,7 +1279,7 @@ fn codex_tooluse_apply_patch_completion_does_not_fire_per_1005_rc1() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005 RC1: codex `apply_patch` completion / error surface must NOT fire ToolUse: {sample:?}"
         );
     }
@@ -1304,22 +1287,20 @@ fn codex_tooluse_apply_patch_completion_does_not_fire_per_1005_rc1() {
 
 #[test]
 fn codex_tooluse_does_not_false_positive_on_spinner_or_narration() {
-    // `• Working (...)` is the spinner; `• I'm reading ...` is
-    // assistant narration. Neither should fire ToolUse — pattern
-    // must only match the Explored/Edited/Ran titles and the `└`
-    // continuation line. (Codex Thinking pattern is `Thinking`
-    // which never matches the literal `Working` spinner, so these
-    // lines simply fall through to lower-priority matches or None.)
+    // `• I'm reading ...` is assistant narration: it must NOT match the
+    // tool-title pattern (`Explored/Edited/Ran` titles / the `└` continuation),
+    // so it falls through to lower-priority matches or None.
+    //
+    // (Thinking+ToolUse→Active merge: the former `• Working (...)` spinner
+    // assertion is GONE — it only proved the spinner fired the old `Thinking`
+    // producer rather than the old `ToolUse` title producer. With both collapsed
+    // into `Active`, the `Working|esc to interrupt` spinner legitimately IS
+    // `Active` and the distinction it pinned no longer exists.)
     let patterns = StatePatterns::for_backend(&Backend::Codex);
     assert_ne!(
-        patterns.detect("• Working (1s • esc to interrupt)"),
-        Some(AgentState::ToolUse),
-        "`• Working` spinner must not fire ToolUse"
-    );
-    assert_ne!(
         patterns.detect("• I'm reading README.md from the repo root"),
-        Some(AgentState::ToolUse),
-        "narration `• I'm reading ...` must not fire ToolUse"
+        Some(AgentState::Active),
+        "narration `• I'm reading ...` must not fire the tool-title Active pattern"
     );
 }
 
@@ -1390,7 +1371,7 @@ fn kiro_tooluse_banner_does_not_fire_per_1005() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: kiro `●` completion banner must NOT fire ToolUse: {sample:?}"
         );
     }
@@ -1405,7 +1386,7 @@ fn kiro_tooluse_legacy_internal_names_still_match() {
     for sample in ["execute_bash", "fs_read", "fs_write"] {
         assert_eq!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "expected ToolUse for {sample:?}"
         );
     }
@@ -1420,7 +1401,7 @@ fn pipeline_kiro_thinking_via_vterm() {
     drive(&mut vt, &mut st, b"ask a question or describe a task\r\n");
     assert_eq!(st.get_state(), AgentState::Idle);
     drive(&mut vt, &mut st, b"Kiro is working\r\n");
-    assert_eq!(st.get_state(), AgentState::Thinking);
+    assert_eq!(st.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -1458,7 +1439,7 @@ fn pipeline_opencode_thinking_via_vterm() {
         &mut st,
         b"\xe2\x96\xa0\xe2\xac\x9d\xe2\xac\x9d\xe2\xac\x9d\xe2\xac\x9d  esc interrupt   tab agents\r\n",
     );
-    assert_eq!(st.get_state(), AgentState::Thinking);
+    assert_eq!(st.get_state(), AgentState::Active);
 }
 
 #[test]
@@ -1494,7 +1475,7 @@ fn opencode_tooluse_in_flight_banner_still_fires() {
     ] {
         assert_eq!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "in-flight banner `{sample}` must fire ToolUse"
         );
     }
@@ -1515,7 +1496,7 @@ fn opencode_tooluse_completed_banner_does_not_fire_per_1005() {
     ] {
         assert_ne!(
             patterns.detect(sample),
-            Some(AgentState::ToolUse),
+            Some(AgentState::Active),
             "#1005: opencode `→` completion banner must NOT fire ToolUse: {sample:?}"
         );
     }
@@ -1597,8 +1578,11 @@ fn parse_state(name: &str) -> AgentState {
         "awaiting_operator" => AgentState::AwaitingOperator,
         "ready" => AgentState::Idle,
         "idle" => AgentState::Idle,
-        "tool_use" => AgentState::ToolUse,
-        "thinking" => AgentState::Thinking,
+        // Thinking + ToolUse merged into Active. The legacy fixture state names
+        // (`thinking`/`tool_use`) still parse to `Active` — they always denoted the
+        // same coarse "working" bucket (see the manifest's own "treats thinking and
+        // tool_use identically as working" notes), so the corpus needs no relabel.
+        "active" | "tool_use" | "thinking" => AgentState::Active,
         "interactive_prompt" => AgentState::InteractivePrompt,
         "permission" => AgentState::PermissionPrompt,
         "git_conflict" => AgentState::GitConflict,
@@ -1822,7 +1806,7 @@ fn corpus_measurement_smoke_f9_marker_signals() {
 fn heartbeat_fresh_overrides_permission_prompt() {
     // Pin 1 — A5 incident scenario: agent has fresh heartbeat, PTY
     // shows permission pattern → must NOT latch PermissionPrompt.
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::KiroCli, AgentState::Active, 5);
     t.update_heartbeat(Duration::from_secs(10)); // 10s ago = fresh
     t.feed("shell requires approval");
     assert_ne!(
@@ -1830,14 +1814,14 @@ fn heartbeat_fresh_overrides_permission_prompt() {
         AgentState::PermissionPrompt,
         "fresh heartbeat must suppress PermissionPrompt"
     );
-    assert_eq!(t.get_state(), AgentState::Thinking);
+    assert_eq!(t.get_state(), AgentState::Active);
 }
 
 #[test]
 fn stale_heartbeat_allows_permission_prompt() {
     // Pin 2 — stale heartbeat: agent silent for 200s, PTY shows
     // permission pattern → must latch PermissionPrompt normally.
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::KiroCli, AgentState::Active, 5);
     t.update_heartbeat(Duration::from_secs(200)); // 200s ago > 120s
     t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
@@ -1846,7 +1830,7 @@ fn stale_heartbeat_allows_permission_prompt() {
 #[test]
 fn no_heartbeat_allows_permission_prompt() {
     // Pin 3 — no heartbeat ever: default behavior preserved.
-    let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+    let mut t = tracker_at(&Backend::KiroCli, AgentState::Active, 5);
     // last_heartbeat is None by default
     t.feed("shell requires approval");
     assert_eq!(t.get_state(), AgentState::PermissionPrompt);
@@ -1922,7 +1906,7 @@ fn claude_spinner_verb_triggers_thinking() {
     drive(&mut vt, &mut st, b"\xe2\x9c\xbb Cogitating\xe2\x80\xa6\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "claude spinner verb 'Cogitating' must trigger Thinking"
     );
 }
@@ -1937,7 +1921,7 @@ fn claude_thought_for_triggers_thinking() {
     drive(&mut vt, &mut st, b"thought for 12s\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "claude 'thought for Ns' must trigger Thinking"
     );
 }
@@ -1952,7 +1936,7 @@ fn kiro_working_triggers_thinking() {
     drive(&mut vt, &mut st, b"Kiro is working\r\n  esc to cancel\r\n");
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "kiro 'Kiro is working' must trigger Thinking"
     );
 }
@@ -1971,7 +1955,7 @@ fn codex_working_triggers_thinking() {
     );
     assert_eq!(
         st.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "codex 'Working' or 'esc to interrupt' must trigger Thinking"
     );
 }
@@ -1983,7 +1967,7 @@ fn kiro_literal_thinking_in_chat_does_not_trigger() {
     let detected = patterns.detect("The agent was Thinking about the problem");
     assert_ne!(
         detected,
-        Some(AgentState::Thinking),
+        Some(AgentState::Active),
         "literal 'Thinking' in chat must not trigger Thinking on kiro"
     );
 }
@@ -2004,18 +1988,18 @@ fn claude_tool_banner_at_line_start_triggers_tooluse() {
     let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
     assert_ne!(
         patterns.detect("⏺ Bash(echo hi)"),
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "#1005: completion banner `⏺ Bash` is historical, not active — must NOT fire ToolUse"
     );
     assert_ne!(
         patterns.detect("⏺ Read(README.md)"),
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "#1005: completion banner `⏺ Read` is historical, not active — must NOT fire ToolUse"
     );
     // Glyph + -ing verb = in-flight progress (still active).
     assert_eq!(
         patterns.detect("● Listing files..."),
-        Some(AgentState::ToolUse),
+        Some(AgentState::Active),
         "completion glyph + in-flight `-ing` verb = active progress, must fire ToolUse"
     );
 }
@@ -2034,7 +2018,7 @@ fn claude_chat_with_glyph_does_not_trigger_tooluse() {
     );
     assert_ne!(
         st.get_state(),
-        AgentState::ToolUse,
+        AgentState::Active,
         "chat content with glyph + distant tool name must NOT trigger ToolUse"
     );
 }
@@ -2297,7 +2281,7 @@ fn contextfull_narrow_wrap_not_rescued_2090() {
     );
 }
 
-/// strip CSI/SGR escapes to recover the plain screen_text from an ansi_colored_tail.
+/// strip CSI/SGR escapes to recover the plain screen_text from an ANSI-colored tail.
 fn strip_ansi_2089(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -2455,7 +2439,7 @@ fn usagelimit_banner_guard_2090() {
 }
 
 /// #2090 P2 (RED→GREEN, real §3.9 capture): the narrow-pane usage-limit banner
-/// from the live hardwrap_miss shadow — "You've hit your weekly limit · resets 4am"
+/// — "You've hit your weekly limit · resets 4am" captured from a live narrow pane —
 /// hard-wrapped across rows with the idle `❯` below, so single-line detect lands
 /// Idle. The flatten+guard rescue must recover UsageLimit. Pre-fix (no rescue) the
 /// agent read Idle while actually quota-blocked.
@@ -4034,7 +4018,7 @@ fn retry_storm_recovered_below_error_lands_on_working_state_1768() {
     );
     assert_eq!(
         t.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "#1768: it lands on the working state the marker indicates"
     );
 }
@@ -4117,7 +4101,7 @@ fn usage_limit_recovered_below_error_lands_on_working_state_1777() {
     );
     assert_eq!(
         t.get_state(),
-        AgentState::Thinking,
+        AgentState::Active,
         "#1777: it lands on the working state the marker indicates"
     );
 }
@@ -4255,18 +4239,18 @@ fn in_error_line_matches_corpus_errors_rejects_prose_step1() {
 #[test]
 fn record_set_buffers_transitions_fifo_then_drains() {
     let mut st = StateTracker::new(None); // starts Ready
-    st.record_set(AgentState::Thinking);
+    st.record_set(AgentState::Active);
     st.record_set(AgentState::Idle);
     let (recs, dropped) = st.drain_pending_transitions();
     assert_eq!(dropped, 0);
     assert_eq!(recs.len(), 2);
     assert_eq!(
         (recs[0].from, recs[0].to),
-        (AgentState::Idle, AgentState::Thinking)
+        (AgentState::Idle, AgentState::Active)
     );
     assert_eq!(
         (recs[1].from, recs[1].to),
-        (AgentState::Thinking, AgentState::Idle)
+        (AgentState::Active, AgentState::Idle)
     );
     assert!(!recs[0].ts.is_empty(), "ts must be captured at record time");
     assert!(
@@ -4318,7 +4302,7 @@ fn pending_transitions_bounded_drops_oldest() {
     let overflow = 5usize;
     for i in 0..(StateTracker::PENDING_TRANSITIONS_CAP + overflow) {
         let s = if i % 2 == 0 {
-            AgentState::Thinking
+            AgentState::Active
         } else {
             AgentState::Idle
         };
@@ -4528,7 +4512,7 @@ fn modal_prompt_above_live_tail_still_detected_1518() {
     assert!(
         matches!(
             st.get_state(),
-            AgentState::PermissionPrompt | AgentState::Thinking
+            AgentState::PermissionPrompt | AgentState::Active
         ),
         "#1518: a modal above the live tail must still be detected (full-screen, not bottom-N bounded), got {:?}",
         st.get_state()
@@ -4554,7 +4538,7 @@ fn claude_thinking_anchor_is_verb_agnostic_1541() {
         st.feed(frame);
         assert_eq!(
             st.get_state(),
-            AgentState::Thinking,
+            AgentState::Active,
             "#1541: unlisted-verb spinner {frame:?} must fire Thinking"
         );
     }
@@ -4572,7 +4556,7 @@ fn claude_thinking_anchor_rejects_prose_and_completion_1541() {
         st.feed(frame);
         assert_ne!(
             st.get_state(),
-            AgentState::Thinking,
+            AgentState::Active,
             "#1541: {frame:?} must NOT be misread as Thinking"
         );
     }
@@ -4587,7 +4571,7 @@ fn claude_thinking_anchor_does_not_cross_backends_1541() {
         let detected = StatePatterns::for_backend(&backend).detect(claude_frame);
         assert_ne!(
             detected,
-            Some(AgentState::Thinking),
+            Some(AgentState::Active),
             "#1541: claude sparkle anchor must not fire Thinking on {backend:?}"
         );
     }
@@ -4729,129 +4713,6 @@ fn anchor_suppress_warn_deduped_across_ticks() {
             ))
         }
     });
-}
-
-// ── #1562 self-capture instrument ───────────────────────────────────
-//
-// Pure-additive diagnostic: when a known server-throttle phrase is on
-// screen but the classifier did NOT land on a retryable state, side-log
-// the (ANSI-colored) tail. These pin the three behaviors the lead spec
-// names — phrase + non-retryable → logged; classified ServerRateLimit →
-// skipped (no noise); no phrase → skipped — plus the scrollback gate and
-// the color reconstruction (the color-anchor diagnostic point).
-
-const THROTTLE_SCREEN: &str = "\
-some preamble line\n\
-Server is temporarily limiting requests (not your usage limit)\n\
-the agent kept going after the throttle\n";
-
-#[test]
-fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
-    // Throttle phrase present, classifier landed on Ready (the in-the-wild
-    // miss — e.g. anchor suppressed it / wording drifted) → capture.
-    let tail = recent_screen_tail(THROTTLE_SCREEN, HARD_WRAP_TAIL_LINES);
-    let captured = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[], &tail);
-    let (tail, wrap_split) =
-        captured.expect("throttle phrase + non-retryable state must be captured");
-    assert!(
-        tail.contains("temporarily limiting requests"),
-        "captured tail must carry the throttle line, got: {tail:?}"
-    );
-    assert!(
-        !wrap_split,
-        "a contiguous (un-wrapped) phrase must NOT be flagged wrap_split"
-    );
-}
-
-/// #1808: the instrument was BLIND to a LINE-WRAPPED throttle phrase because it
-/// only did a contiguous `str::contains` — the exact reason the live narrow-pane
-/// SRL miss captured nothing. A phrase split by hard `\n` (Ink-style layout) must
-/// now be captured AND flagged `wrap_split` (the Phase 2 soft-vs-hard signal).
-#[test]
-fn unclassified_throttle_captures_hard_wrapped_phrase_with_wrap_split_flag() {
-    // Phrase split across rows by `\n` the way an app word-wrap emits it — NOT
-    // contiguous, so the old `contains` check missed it entirely.
-    let screen = "⏺ API Error:\ntemporarily limiting\nrequests (not your\nusage limit)\n";
-    let tail = recent_screen_tail(screen, HARD_WRAP_TAIL_LINES);
-    let captured = unclassified_throttle_tail(AgentState::Idle, screen, &[], &tail);
-    let (_tail, wrap_split) =
-        captured.expect("a hard-`\\n`-wrapped throttle phrase must still be captured (#1808)");
-    assert!(
-        wrap_split,
-        "a phrase found only after whitespace-flatten must be flagged wrap_split (hard-wrap signal)"
-    );
-}
-
-#[test]
-fn unclassified_throttle_skipped_when_classified_serverratelimit() {
-    // Classifier correctly recognized the throttle (auto-retry handles it)
-    // → nothing to diagnose → no side-log (keeps the instrument low-noise).
-    for state in [
-        AgentState::ServerRateLimit,
-        AgentState::RateLimit,
-        AgentState::ApiError,
-        AgentState::ContextFull,
-    ] {
-        let tail = recent_screen_tail(THROTTLE_SCREEN, HARD_WRAP_TAIL_LINES);
-        assert!(
-            unclassified_throttle_tail(state, THROTTLE_SCREEN, &[], &tail).is_none(),
-            "classified retryable state {state:?} must NOT be side-logged"
-        );
-    }
-}
-
-#[test]
-fn unclassified_throttle_skipped_without_phrase() {
-    // No known throttle phrase on screen → never logged, regardless of state.
-    let screen = "claude ready\n❯ awaiting input\n";
-    let tail = recent_screen_tail(screen, HARD_WRAP_TAIL_LINES);
-    assert!(unclassified_throttle_tail(AgentState::Idle, screen, &[], &tail).is_none());
-    assert!(unclassified_throttle_tail(AgentState::Thinking, screen, &[], &tail).is_none());
-}
-
-#[test]
-fn unclassified_throttle_skipped_when_phrase_only_in_scrollback() {
-    // Throttle phrase scrolled up past the live bottom-N tail (the agent has
-    // moved on) → stale, not a current miss → not logged.
-    let mut screen =
-        String::from("Server is temporarily limiting requests (not your usage limit)\n");
-    for i in 0..(UNCLASSIFIED_TAIL_LINES + 5) {
-        screen.push_str(&format!("post-recovery output line {i}\n"));
-    }
-    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
-    assert!(
-        unclassified_throttle_tail(AgentState::Idle, &screen, &[], &tail).is_none(),
-        "a throttle phrase only surviving in scrollback must NOT be logged"
-    );
-}
-
-#[test]
-fn ansi_colored_tail_marks_red_cells_and_aligns_past_newline() {
-    // fg is 1:1 with screen_text.chars() INCLUDING the '\n' separator (vterm
-    // emits a Default entry for it). Verify red cells reconstruct \x1b[31m and
-    // that alignment survives a newline.
-    // chars:  o k \n b a d   (indices 0..=5)
-    let screen = "ok\nbad";
-    let fg = vec![
-        CellFg::Default, // o
-        CellFg::Default, // k
-        CellFg::Default, // \n
-        CellFg::Red,     // b
-        CellFg::Red,     // a
-        CellFg::Default, // d
-    ];
-    let out = ansi_colored_tail(screen, &fg, 5);
-    assert!(
-        out.contains("\x1b[31mba"),
-        "red cells must emit SGR 31: {out:?}"
-    );
-    assert!(
-        out.contains("ok"),
-        "earlier (non-red) line must still render: {out:?}"
-    );
-    // Empty fg (text-only callers): tail captured without color, no panic.
-    let plain = ansi_colored_tail(screen, &[], 5);
-    assert!(plain.contains("bad") && !plain.contains("\x1b[31m"));
 }
 
 #[test]
@@ -5439,259 +5300,6 @@ fn parse_usage_limit_release_forms_1955() {
     );
 }
 
-// ── #1523 Phase 0: turn-completion sentinel (shadow) ───────────────────
-
-#[test]
-fn turn_sentinel_nonce_is_deterministic_and_eight_hex() {
-    let a = turn_sentinel_nonce("fixup-dev");
-    let b = turn_sentinel_nonce("fixup-dev");
-    assert_eq!(
-        a, b,
-        "nonce must be stable for the same agent (recomputable)"
-    );
-    assert_eq!(a.len(), 8, "nonce is fixed 8-char hex: {a}");
-    assert!(
-        a.chars().all(|c| c.is_ascii_hexdigit()),
-        "nonce must be hex: {a}"
-    );
-    assert_ne!(
-        turn_sentinel_nonce("fixup-dev"),
-        turn_sentinel_nonce("fixup-reviewer-2"),
-        "distinct agents should (overwhelmingly) get distinct nonces"
-    );
-}
-
-#[test]
-fn turn_sentinel_token_shape_is_single_source_and_safe() {
-    // The instructions.rs directive embeds `turn_sentinel_token(name)` verbatim,
-    // so this single source of truth pins the shape. #2243 DuDuClaw: use `=====`
-    // delimiters, NOT angle brackets an agent's renderer might mangle.
-    let token = turn_sentinel_token("fixup-dev");
-    assert!(
-        token.starts_with("=====AGEND-DONE:") && token.ends_with("====="),
-        "token uses ===== delimiters: {token}"
-    );
-    assert!(
-        !token.contains('<') && !token.contains('>'),
-        "token must avoid mangle-prone <…> delimiters: {token}"
-    );
-    assert!(
-        token.contains(&turn_sentinel_nonce("fixup-dev")),
-        "token carries this agent's nonce: {token}"
-    );
-    assert!(
-        token.len() < 35,
-        "token must dodge the #2090 hard-wrap: {token}"
-    );
-}
-
-#[test]
-fn observe_turn_sentinel_distinguishes_emit_echo_leak() {
-    let token = turn_sentinel_token("agent-x");
-
-    // Genuine emission: token alone on the final non-empty line.
-    let emit = observe_turn_sentinel(&format!("did the work\n{token}\n"), &token);
-    assert!(emit.token_seen && emit.on_last_line);
-    assert!(!emit.suspected_echo, "clean last-line emit is not an echo");
-    assert!(!emit.leak_signal);
-
-    // Source-view / instruction echo: directive prose co-occurs on screen.
-    let echo = observe_turn_sentinel(
-        &format!("## Turn-completion signal (AgEnD)\nprint this exact marker\n    {token}\n"),
-        &token,
-    );
-    assert!(
-        echo.token_seen && echo.suspected_echo,
-        "directive prose → echo"
-    );
-
-    // Leak proxy: token embedded mid-screen (not last line), no directive prose.
-    let leak = observe_turn_sentinel(&format!("file.txt:\n{token}\nmore text below\n"), &token);
-    assert!(leak.token_seen && !leak.on_last_line);
-    assert!(leak.suspected_echo, "non-last-line token is suspect");
-    assert!(leak.leak_signal, "embedded non-directive token flags leak");
-
-    // Another agent's token is not attributed to us.
-    let other = observe_turn_sentinel("=====AGEND-DONE:deadbeef=====\n", &token);
-    assert!(!other.token_seen, "only OUR exact token counts");
-
-    // Hard-wrapped token (split across rows) still matches via de-wrap.
-    let mid = token.len() / 2;
-    let wrapped = format!("output\n{}\n{}\n", &token[..mid], &token[mid..]);
-    assert!(
-        observe_turn_sentinel(&wrapped, &token).token_seen,
-        "de-wrapped scan must reassemble a hard-wrapped token"
-    );
-}
-
-#[test]
-fn turn_sentinel_capture_never_touches_state() {
-    // Fail-open invariant: capture runs post-classify and must NEVER move
-    // `self.current`. With the shadow flag OFF (the default) it early-returns;
-    // this pins, classifier-independently, that the wiring cannot perturb the
-    // classification. (The flag-ON path is checked in the env test below.)
-    let token = turn_sentinel_token("zb-agent");
-    let mut t = StateTracker::new(Some(&Backend::OpenCode));
-    t.set_instance_name("zb-agent");
-    t.current = AgentState::Thinking;
-    let screen = format!("done\n{token}");
-    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
-    t.capture_turn_sentinel_shadow(&screen, &tail);
-    assert_eq!(
-        t.current,
-        AgentState::Thinking,
-        "capture must never change the classified state"
-    );
-}
-
-/// Shared lock for the sentinel env-flag tests below — they all flip the same
-/// process-global `AGEND_HOME` / `AGEND_TURN_SENTINEL_SHADOW`, so they must
-/// serialize against EACH OTHER (a per-fn mutex would not), even under an
-/// in-process test runner. (CI uses nextest's process-per-test, but this keeps
-/// `cargo test` honest too.)
-static SENTINEL_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[test]
-fn changed_frames_with_sentinel_shadow_off_bound_tail_scans() {
-    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-
-    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
-    std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW");
-
-    let mut t = StateTracker::new(Some(&Backend::OpenCode));
-    t.set_instance_name("scan-bound-agent");
-
-    reset_recent_screen_tail_call_count();
-    for n in 0..5 {
-        t.feed(&format!(
-            "  ┃\n  ┃  Build · DeepSeek V4 Pro OpenCode Go\n\nchanged {n}\ntemporarily limiting requests\nAsk anything"
-        ));
-    }
-    let tail_scans = recent_screen_tail_call_count();
-
-    match prev_flag {
-        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
-        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
-    }
-
-    assert_eq!(
-        tail_scans, 10,
-        "changed-frame post-classify probes should share one recent tail; this fixture also pays one classifier tail per frame"
-    );
-}
-
-#[test]
-fn turn_sentinel_shadow_logs_record_when_on_without_changing_state() {
-    // Serialize the process-global env flips; restore on the way out so a panic
-    // can't leak them to other tests (mirrors the MED-5 convention).
-    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-
-    let home = std::env::temp_dir().join(format!("agend-sentinel-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("mk temp home");
-    let prev_home = std::env::var("AGEND_HOME").ok();
-    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
-    std::env::set_var("AGEND_HOME", &home);
-    std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
-
-    let token = turn_sentinel_token("on-agent");
-
-    // Drive the full feed → classify → capture WIRING (proves capture is
-    // actually called from feed_with_fg, not just unit-tested in isolation).
-    let mut t = StateTracker::new(Some(&Backend::OpenCode));
-    t.set_instance_name("on-agent");
-    t.current = AgentState::Thinking;
-    t.feed(&format!("all done now\n{token}"));
-    // Zero-behaviour even with the flag ON: a direct re-capture must not move
-    // the state (the heuristic owns `current`, the sentinel only side-logs).
-    t.current = AgentState::Thinking;
-    let screen = format!("again\n{token}");
-    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
-    t.capture_turn_sentinel_shadow(&screen, &tail);
-    let with_state = t.current;
-
-    let log = home.join("turn_sentinel_shadow.jsonl");
-    let contents = std::fs::read_to_string(&log).unwrap_or_default();
-
-    // Restore env BEFORE asserting so a failure can't leak the flags.
-    match prev_home {
-        Some(v) => std::env::set_var("AGEND_HOME", v),
-        None => std::env::remove_var("AGEND_HOME"),
-    }
-    match prev_flag {
-        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
-        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
-    }
-    std::fs::remove_dir_all(&home).ok();
-
-    let line = contents
-        .lines()
-        .last()
-        .expect("a shadow record must be appended when the flag is on");
-    let rec: serde_json::Value = serde_json::from_str(line).expect("valid json record");
-    assert_eq!(rec["agent"], "on-agent");
-    assert_eq!(rec["token_seen"], true);
-    assert_eq!(rec["on_last_line"], true, "emission is on the last line");
-    assert_eq!(rec["suspected_echo"], false, "clean emit is not an echo");
-    assert!(rec["existing_state"].is_string());
-    // Zero behaviour even with the flag ON: capture did not move the state.
-    assert_eq!(
-        with_state,
-        AgentState::Thinking,
-        "capture must not change classification even when shadow is on"
-    );
-}
-
-#[test]
-fn turn_sentinel_fires_for_prod_constructed_tracker_2297() {
-    // r6 #2297 regression: the live daemon builds the tracker via
-    // `StateTracker::for_agent` (the agent/mod.rs spawn site). If that path stops
-    // naming the tracker, `instance_name` is empty → the detector derives the
-    // WRONG token → the shadow log NEVER fires in prod (Phase-0 measurement is
-    // dead-on-arrival). The sibling tests all call `set_instance_name` manually
-    // and so MASK this. This one builds the tracker the PRODUCTION way — via
-    // `for_agent`, with NO manual setter — so a wiring regression re-surfaces.
-    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-
-    let home = std::env::temp_dir().join(format!("agend-sentinel-prod-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("mk temp home");
-    let prev_home = std::env::var("AGEND_HOME").ok();
-    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
-    std::env::set_var("AGEND_HOME", &home);
-    std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
-
-    // The token the agent is instructed to emit (derived from its name).
-    let token = turn_sentinel_token("prod-agent");
-    // Build the tracker the PROD way — named at construction, no manual setter.
-    let mut t = StateTracker::for_agent(Some(&Backend::OpenCode), "prod-agent");
-    t.feed(&format!("finished\n{token}"));
-
-    let log = home.join("turn_sentinel_shadow.jsonl");
-    let contents = std::fs::read_to_string(&log).unwrap_or_default();
-
-    match prev_home {
-        Some(v) => std::env::set_var("AGEND_HOME", v),
-        None => std::env::remove_var("AGEND_HOME"),
-    }
-    match prev_flag {
-        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
-        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
-    }
-    std::fs::remove_dir_all(&home).ok();
-
-    let line = contents.lines().last().expect(
-        "prod-constructed tracker must fire the shadow log — an empty instance_name would kill it",
-    );
-    let rec: serde_json::Value = serde_json::from_str(line).expect("valid json record");
-    assert_eq!(
-        rec["agent"], "prod-agent",
-        "record attributed to the named agent"
-    );
-    assert_eq!(
-        rec["token_seen"], true,
-        "the agent's name-derived token was detected via the prod path"
-    );
-}
-
 // ── #perf-R1: lazy-fg gate — unchanged frames skip the fg colour-mask build ──
 //
 // The PTY hot path (agent/mod.rs `pty_read_loop`) used to build the full
@@ -5872,8 +5480,7 @@ fn agentstate_u8_roundtrip() {
         AgentState::Hang,
         AgentState::AwaitingOperator,
         AgentState::Idle,
-        AgentState::ToolUse,
-        AgentState::Thinking,
+        AgentState::Active,
         AgentState::InteractivePrompt,
         AgentState::PermissionPrompt,
         AgentState::GitConflict,
@@ -5922,6 +5529,71 @@ fn published_mirror_tracks_current_through_record_set() {
         published.load(Ordering::Relaxed),
         AgentState::Restarting as u8,
         "record_set must store the new discriminant into the published mirror"
+    );
+}
+
+/// #2413 (A): the badge-override mirror encode/decode. `publish_observed(Some(s))`
+/// stores `s`'s discriminant (decodes back to `Some(s)`); `publish_observed(None)`
+/// stores the [`crate::state::OBSERVED_NONE`] sentinel (decodes to `None` → render
+/// uses the raw state). The sentinel is NOT a real discriminant, so it can never be
+/// misread as a state.
+#[test]
+fn observed_mirror_encode_decode_roundtrip() {
+    use std::sync::atomic::Ordering;
+    let t = StateTracker::new(None);
+    let observed = t.published_observed_handle();
+    // Default: no correction published yet ⇒ sentinel ⇒ None.
+    assert_eq!(
+        AgentState::from_observed_u8(observed.load(Ordering::Relaxed)),
+        None,
+        "fresh tracker has no badge override"
+    );
+    // A published correction roundtrips.
+    for s in [
+        AgentState::Active,
+        AgentState::AwaitingOperator,
+        AgentState::RateLimit,
+    ] {
+        t.publish_observed(Some(s));
+        assert_eq!(
+            AgentState::from_observed_u8(observed.load(Ordering::Relaxed)),
+            Some(s),
+            "publish_observed(Some({s:?})) must roundtrip"
+        );
+    }
+    // Clearing the correction returns to the sentinel.
+    t.publish_observed(None);
+    assert_eq!(
+        AgentState::from_observed_u8(observed.load(Ordering::Relaxed)),
+        None,
+        "publish_observed(None) clears the override"
+    );
+}
+
+/// #2413 (A) cycle-proof invariant: `publish_observed` writes ONLY the separate
+/// badge mirror and NEVER `current` — so a corrected badge can never feed back into
+/// the reducer's screen input (which reads `current`). Drive a correction far from
+/// the real state and assert `current` (and its own published mirror) are untouched.
+#[test]
+fn publish_observed_never_mutates_current() {
+    use std::sync::atomic::Ordering;
+    let mut t = StateTracker::new(None); // Idle
+    t.set_restarting(); // current = Restarting (via record_set)
+    let current_before = t.get_state();
+    let published_before = t.published_handle().load(Ordering::Relaxed);
+
+    // Publish a wildly different badge override.
+    t.publish_observed(Some(AgentState::Active));
+
+    assert_eq!(
+        t.get_state(),
+        current_before,
+        "publish_observed must not change `current`"
+    );
+    assert_eq!(
+        t.published_handle().load(Ordering::Relaxed),
+        published_before,
+        "publish_observed must not touch the raw `published` mirror"
     );
 }
 
@@ -6012,5 +5684,68 @@ fn codex_auth_pattern_drops_generic_api_key_token() {
         t2.get_state(),
         AgentState::AuthError,
         "a real codex auth error must still detect"
+    );
+}
+
+// ───────────────────────── #2439 context provider telemetry ─────────────────────────
+
+/// #2439: `context_provider` is DERIVED from statusline-pattern presence (not a
+/// stored per-backend field), so backends that read a context statusline report
+/// `StatusLine` and the rest report `Unavailable`. This is the realized mapping a
+/// LIST consumer sees.
+#[test]
+fn context_provider_derived_from_statusline_pattern_presence() {
+    use crate::backend_profile::ContextProvider;
+    // Backends that declare a context_pattern (→ context_regex is_some) read a
+    // statusline percent.
+    for backend in [Backend::ClaudeCode, Backend::KiroCli] {
+        let t = StateTracker::new(Some(&backend));
+        assert_eq!(
+            t.context_provider(),
+            ContextProvider::StatusLine,
+            "{backend:?} reads a statusline context% → StatusLine"
+        );
+        assert_eq!(t.context_provider().source_name(), "statusline");
+    }
+    // Backends with no passive context signal derive Unavailable — a silent null
+    // becomes an explicit, honest "unavailable".
+    for backend in [
+        Backend::Codex,
+        Backend::OpenCode,
+        Backend::Agy,
+        Backend::Shell,
+        Backend::Raw("/opt/whatever".to_string()),
+    ] {
+        let t = StateTracker::new(Some(&backend));
+        assert_eq!(
+            t.context_provider(),
+            ContextProvider::Unavailable,
+            "{backend:?} has no statusline pattern → Unavailable"
+        );
+        assert_eq!(t.context_provider().source_name(), "unavailable");
+    }
+}
+
+/// #2439 CONTRACT: adding `context_provider` must NOT change the existing LIST
+/// `context_source` value — external dashboards key off `"pattern"`. After a real
+/// statusline reading, `resolved_context` still reports `"pattern"` while the new
+/// `context_provider` reports the typed `statusline` capability alongside it.
+#[test]
+fn context_source_stays_pattern_while_context_provider_is_statusline() {
+    use crate::backend_profile::ContextProvider;
+    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+    t.feed("ctx used: 42%");
+    let (pct, source) = t
+        .resolved_context()
+        .expect("a fresh statusline reading resolves");
+    assert!((pct - 42.0).abs() < f32::EPSILON, "parsed percent: {pct}");
+    assert_eq!(
+        source, "pattern",
+        "context_source must stay \"pattern\" (external-dashboard contract)"
+    );
+    assert_eq!(
+        t.context_provider(),
+        ContextProvider::StatusLine,
+        "the new typed capability coexists with the unchanged context_source"
     );
 }

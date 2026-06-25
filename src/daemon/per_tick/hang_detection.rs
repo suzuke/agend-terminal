@@ -75,6 +75,9 @@ impl PerTickHandler for HangDetectionHandler {
                 let mut core = handle.core.lock();
                 core.health.maybe_decay(process_alive);
                 let was_hung = core.health.state == crate::health::HealthState::Hung;
+                // KEEP-RAW (#2465): health/recovery must see the raw screen state — feeding the
+                // promoted/observed state could let a stale/false 'Active' hook MASK a genuinely
+                // stuck agent (the inverse of the SRL false-idle bug). Do NOT migrate to operated_state.
                 let agent_state = core.state.current;
                 let silent = core.state.last_output.elapsed();
                 // F9 (#685 sub-task 4): productive-silence reads the new

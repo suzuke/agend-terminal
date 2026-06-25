@@ -1,8 +1,7 @@
 //! Review-repro tests (SCOPEKEY: tasks) attached to `src/task_events.rs`.
 //!
-//! Each test encodes the CORRECT expected behavior so it is RED against the
-//! current (buggy) code and GREEN once the cited finding is fixed. Each test is
-//! `#[ignore]`d until its cited finding is fixed, then un-ignored to confirm GREEN.
+//! Each test encodes the CORRECT expected behavior and is GREEN on current code
+//! (the cited findings are fixed); they run un-ignored as live regression guards.
 
 #![allow(clippy::expect_used)]
 

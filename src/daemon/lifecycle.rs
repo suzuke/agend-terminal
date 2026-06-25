@@ -350,6 +350,7 @@ mod tests {
             pty_writer,
             pty_master,
             published_state: crate::agent::published_state_of(&core),
+            published_observed: crate::agent::published_observed_of(&core),
             core,
             child: Arc::new(Mutex::new(child)),
             submit_key: "\r".to_string(),

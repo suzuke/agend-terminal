@@ -1330,6 +1330,10 @@ fn tick(
             // lock drops (CR-2026-06-14 concurrency).
             waiting_on_heartbeat_stale = !core.state.is_heartbeat_fresh();
 
+            // KEEP-RAW (#2465): the AuthError stability / escalation gate reads raw
+            // core.state.current. operated_state is inert here anyway (AuthError maps to the
+            // gate's non-decisive 'Other' screen, which is never overridden), and this is a
+            // recovery/escalation decider that must see raw. See `operated_state` docstring.
             let agent_state = core.state.current;
             // #1523: capture how long AuthError has been continuously held (state
             // age) for the post-lock stability gate. `Some` iff currently in
@@ -1958,6 +1962,10 @@ pub(crate) fn process_error_recovery(
             // used to mis-suppress). `productive_silence` is for the log only.
             let (state, recovered, self_cleared, has_throttle_hint, productive_silence) = {
                 let mut core = handle.core.lock();
+                // KEEP-RAW (#2465): the SRL retry arm reads raw core.state.current. claude hooks
+                // never emit RateLimited (a StopFailure → ApiError, the API plane owns rate-limit),
+                // so operated_state would be inert here; the true ApiError-as-rate-limit SRL fix is
+                // tracked in #2466, out of this PR's scope.
                 let state = core.state.current;
                 let recovered = core.state.recovered_within(RECOVERY_SILENCE);
                 // #2232: ground-truth recovery latch the agent set by self-clearing
@@ -2730,7 +2738,7 @@ mod tests {
         assert!(!AgentState::InteractivePrompt.is_notify_error_class());
         assert!(!AgentState::Idle.is_notify_error_class());
         assert!(!AgentState::Idle.is_notify_error_class());
-        assert!(!AgentState::ToolUse.is_notify_error_class());
+        assert!(!AgentState::Active.is_notify_error_class());
         assert!(!AgentState::Starting.is_notify_error_class());
     }
 
@@ -2790,7 +2798,7 @@ mod tests {
             "empty drain → no reaction"
         );
         assert!(
-            reactions_from_transitions(&[tr(AgentState::Idle, AgentState::ToolUse)]).is_empty(),
+            reactions_from_transitions(&[tr(AgentState::Idle, AgentState::Active)]).is_empty(),
             "net change to a non-error state → no reaction"
         );
     }
@@ -3099,8 +3107,7 @@ instances:
     fn awaiting_gate_non_prompt_state_never_escalates() {
         for s in [
             crate::state::AgentState::Idle,
-            crate::state::AgentState::Thinking,
-            crate::state::AgentState::ToolUse,
+            crate::state::AgentState::Active,
         ] {
             assert!(
                 !awaiting_escalation_allowed(
@@ -3917,6 +3924,7 @@ instances:
         core.lock().state.current = state;
         // Direct `.current` write bypasses record_set, so sync the lock-free mirror.
         let published_state = core.lock().state.published_handle();
+        let published_observed = core.lock().state.published_observed_handle();
         published_state.store(state as u8, std::sync::atomic::Ordering::Relaxed);
         let handle = crate::agent::AgentHandle {
             id: crate::types::InstanceId::default(),
@@ -3926,6 +3934,7 @@ instances:
             pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
             core,
             published_state,
+            published_observed,
             child: Arc::new(parking_lot::Mutex::new(child)),
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
@@ -4958,11 +4967,10 @@ instances:
             super::clears_server_rate_limit_retry(Idle),
             "#1713: terminal-recovery state Idle must clear the retry track"
         );
-        // Everything else — incl mid-work Thinking/ToolUse and every waiting/error
+        // Everything else — incl mid-work Active and every waiting/error
         // state — must NOT clear.
         for s in [
-            Thinking,
-            ToolUse,
+            Active,
             ServerRateLimit,
             RateLimit,
             ApiError,
@@ -5839,11 +5847,8 @@ instances:
     /// observation continues it.
     #[test]
     fn thinking_transient_keeps_track_and_progress_1713() {
-        let (home, registry, _r) = one_agent_registry(
-            "ag",
-            crate::state::AgentState::Thinking,
-            "1713-thinking-keep",
-        );
+        let (home, registry, _r) =
+            one_agent_registry("ag", crate::state::AgentState::Active, "1713-thinking-keep");
         let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
         // next_retry_at = now (DUE) — proves a due track still does NOT inject when
         // the fresh state is Thinking (the gate is state, not merely the timer).

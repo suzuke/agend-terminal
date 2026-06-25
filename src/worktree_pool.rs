@@ -27,22 +27,59 @@ pub struct WorktreeLease {
     pub path: PathBuf,
 }
 
+/// Typed failure modes of [`lease`] (arch-review finding D+H): replaces the
+/// stringly error + the silent `Ok`-on-bind-failure. The dispatch boundary
+/// matches these variants instead of `msg.contains("E4.5")`.
+#[derive(Debug)]
+pub enum LeaseError {
+    /// E4.5: `branch` is a protected ref (main/master/…) — never leasable.
+    ProtectedBranch(String),
+    /// `worktree::create` failed (not a git repo / invalid name / git worktree add / checkout).
+    CreateFailed(String),
+}
+impl LeaseError {
+    /// `true` only for the E4.5 protected-branch variant — the dispatch boundary
+    /// maps this to a distinct `ErrorCode` (vs the generic lease conflict), via a
+    /// TYPED variant check rather than a stringly `msg.contains("E4.5")`.
+    pub fn is_protected_branch(&self) -> bool {
+        matches!(self, LeaseError::ProtectedBranch(_))
+    }
+}
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeaseError::ProtectedBranch(m) | LeaseError::CreateFailed(m) => write!(f, "{m}"),
+        }
+    }
+}
+impl std::error::Error for LeaseError {}
+
 /// Lease a worktree for an agent + branch. Creates if needed, tags as daemon-managed.
 /// Rejects `main` branch per E4.5 enforcement.
+///
+/// Returns the worktree path only — it does NOT write binding.json. The binding
+/// (with worktree + source-repo paths) is written by the authoritative caller
+/// AFTER leasing (dispatch's checked `bind_full` + reused-aware rollback —
+/// arch-review finding D+H). `source_repo` is still required to create the
+/// worktree, but is persisted into the binding by the caller, not here.
 pub fn lease(
     home: &Path,
     source_repo: &Path,
     agent: &str,
     branch: &str,
-) -> Result<WorktreeLease, String> {
-    crate::agent_ops::ensure_not_protected(branch)?;
+) -> Result<WorktreeLease, LeaseError> {
+    crate::agent_ops::ensure_not_protected(branch).map_err(LeaseError::ProtectedBranch)?;
 
     // Create worktree using existing infrastructure. Sprint 57 Wave 4
     // (#546 Item 4): the new external layout requires `home` to
     // resolve the canonical path `$AGEND_HOME/worktrees/<agent>/<branch>/`.
     let info = match crate::worktree::create(home, source_repo, agent, Some(branch)) {
         Some(info) => info,
-        None => return Err(format!("failed to create worktree for {agent}@{branch}")),
+        None => {
+            return Err(LeaseError::CreateFailed(format!(
+                "failed to create worktree for {agent}@{branch}"
+            )))
+        }
     };
 
     // #1137: marker is now written inside worktree::create() immediately
@@ -56,17 +93,6 @@ pub fn lease(
             chrono::Utc::now().to_rfc3339()
         ),
     );
-
-    // Write full binding with worktree + source-repo paths.
-    // source_repo persistence (P0-X r1): release_full reads this back to run
-    // `git worktree remove --force` from the owning repo's cwd, which
-    // prevents stale registry entries that would block re-lease.
-    // #2158 GR1: internal lease bind — not an agent self-claim, no operator notify.
-    if let Err(e) =
-        crate::binding::bind_full(home, agent, "", branch, &info.path, source_repo, false)
-    {
-        tracing::warn!(%agent, %branch, error = %e, "lease: bind_full failed — worktree created but binding missing");
-    }
 
     Ok(WorktreeLease {
         agent: agent.to_string(),
@@ -3329,13 +3355,55 @@ mod tests {
         dir
     }
 
+    /// Lease + bind — finding D+H: `lease` no longer writes binding.json (the
+    /// authoritative caller binds AFTER leasing). Tests that exercise `release`/
+    /// `release_full` need a binding present, so this helper simulates dispatch's
+    /// pre-build bind (the production `bind_full` that now solely owns binding).
+    fn lease_bound(home: &Path, repo: &Path, agent: &str, branch: &str) -> WorktreeLease {
+        let l = lease(home, repo, agent, branch).expect("lease");
+        crate::binding::bind_full(home, agent, "", branch, &l.path, repo, false)
+            .expect("bind_full (simulates the authoritative caller)");
+        l
+    }
+
     #[test]
     fn lease_main_branch_rejected() {
         let home = tmp_home("main-reject");
         let repo = tmp_repo("main-reject-repo");
         let result = lease(&home, &repo, "agent-1", "main");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("E4.5"));
+        assert!(matches!(
+            result.unwrap_err(),
+            LeaseError::ProtectedBranch(_)
+        ));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Finding D+H load-bearing: `lease` returns DISTINCT typed variants — a
+    /// protected ref is `ProtectedBranch`, a `worktree::create` failure is
+    /// `CreateFailed`. Reverse-mutation guard: collapsing both arms to one
+    /// variant (or back to a `String`) breaks the dispatch-boundary match.
+    #[test]
+    fn lease_returns_typed_protected_and_propagates_errors() {
+        let home = tmp_home("typed-err");
+        let repo = tmp_repo("typed-err-repo");
+
+        // E4.5 protected ref → ProtectedBranch (message preserves "E4.5").
+        match lease(&home, &repo, "agent-t", "main") {
+            Err(LeaseError::ProtectedBranch(m)) => assert!(m.contains("E4.5"), "msg: {m}"),
+            other => panic!("expected ProtectedBranch, got {other:?}"),
+        }
+
+        // A non-protected but invalid branch name (`..` fails validate_branch)
+        // makes `worktree::create` return None → CreateFailed (NOT ProtectedBranch).
+        match lease(&home, &repo, "agent-t", "feat..bad") {
+            Err(LeaseError::CreateFailed(m)) => {
+                assert!(m.contains("feat..bad"), "msg names the target: {m}")
+            }
+            other => panic!("expected CreateFailed, got {other:?}"),
+        }
+
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
@@ -3394,7 +3462,7 @@ mod tests {
     fn p0x_release_full_happy_path_removes_worktree_and_binding() {
         let home = tmp_home("p0x-happy");
         let repo = tmp_repo("p0x-happy-repo");
-        let l = lease(&home, &repo, "agent-h", "feat/happy").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-h", "feat/happy");
         // Pre-condition: lease created both binding + worktree.
         assert!(l.path.exists(), "pre: worktree must exist");
         assert!(crate::binding::read(&home, "agent-h").is_some());
@@ -3423,7 +3491,7 @@ mod tests {
     fn dry_run_release_preserves_worktree_and_binding_t21() {
         let home = tmp_home("t21-dry-run");
         let repo = tmp_repo("t21-dry-run-repo");
-        let l = lease(&home, &repo, "agent-dry", "feat/keep").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-dry", "feat/keep");
         assert!(l.path.exists(), "pre: worktree must exist");
         assert!(crate::binding::read(&home, "agent-dry").is_some());
 
@@ -3467,7 +3535,7 @@ mod tests {
         // false + "no binding"` error (that encoded the bug this fixes).
         let home = tmp_home("p0x-idem");
         let repo = tmp_repo("p0x-idem-repo");
-        lease(&home, &repo, "agent-i", "feat/idem").expect("lease");
+        lease_bound(&home, &repo, "agent-i", "feat/idem");
         let r1 = release_full(&home, "agent-i", false);
         assert!(r1.released, "first call must release");
         assert!(
@@ -3518,7 +3586,7 @@ mod tests {
         // "still remove binding (partial cleanup ok)".
         let home = tmp_home("p0x-missing-wt");
         let repo = tmp_repo("p0x-missing-wt-repo");
-        let l = lease(&home, &repo, "agent-mw", "feat/mw").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-mw", "feat/mw");
         // Manually remove the worktree dir behind the daemon's back, but
         // leave the binding pointing at the now-stale path.
         std::fs::remove_dir_all(&l.path).ok();
@@ -3624,7 +3692,7 @@ mod tests {
         // remove --force` from the owning repo's cwd. Registry must be clean.
         let home = tmp_home("p0x-registry-happy");
         let repo = tmp_repo("p0x-registry-happy-repo");
-        let _l = lease(&home, &repo, "agent-r", "feat/registry").expect("lease");
+        let _l = lease_bound(&home, &repo, "agent-r", "feat/registry");
 
         let outcome = release_full(&home, "agent-r", false);
         assert!(outcome.released);
@@ -3650,7 +3718,7 @@ mod tests {
         // assertion. Restore → PASS.
         let home = tmp_home("p0x-registry-prune");
         let repo = tmp_repo("p0x-registry-prune-repo");
-        let l = lease(&home, &repo, "agent-rm", "feat/prune").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-rm", "feat/prune");
 
         // Simulate the leak: yank the worktree dir behind git's back.
         std::fs::remove_dir_all(&l.path).ok();
@@ -3691,7 +3759,7 @@ mod tests {
         // a leased agent + worktree gets fully cleaned up via the MCP layer.
         let home = tmp_home("p0x-prod-smoke");
         let repo = tmp_repo("p0x-prod-smoke-repo");
-        let l = lease(&home, &repo, "agent-prod", "feat/prod").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-prod", "feat/prod");
         assert!(l.path.exists());
 
         let result = crate::mcp::handlers::worktree_test_release(
@@ -4009,7 +4077,7 @@ mod tests {
         // immediately. Rollback criteria documented in PR #931 body.
         let home = tmp_home("931-persist-multi");
         let repo = tmp_repo("931-persist-multi-repo");
-        let l = lease(&home, &repo, "dev", "feat-track-x").expect("lease");
+        let l = lease_bound(&home, &repo, "dev", "feat-track-x");
         assert!(l.path.exists(), "pre: worktree must exist");
 
         let auto_watch = write_ci_watch(&home, "owner/repo", "feat-track-x", &["dev", "lead"]);
@@ -4454,7 +4522,7 @@ mod tests {
         let home = tmp_home("611-merged");
         let repo = tmp_repo("611-merged-repo");
         // Lease creates the branch + worktree.
-        let l = lease(&home, &repo, "agent-611m", "feat/merged").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-611m", "feat/merged");
         // Add a commit on the feature branch via the worktree.
         std::process::Command::new("git")
             .args([
@@ -4520,7 +4588,7 @@ mod tests {
         let home = tmp_home("611-unmerged");
         let repo = tmp_repo("611-unmerged-repo");
         // Lease creates the branch + worktree.
-        let l = lease(&home, &repo, "agent-611u", "feat/unmerged").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-611u", "feat/unmerged");
         // Add a commit on the feature branch (not merged into main).
         std::process::Command::new("git")
             .args([
@@ -4567,7 +4635,7 @@ mod tests {
     fn release_full_absent_worktree_merged_branch_cleaned_up() {
         let home = tmp_home("1249-absent-merged");
         let repo = tmp_repo("1249-absent-merged-repo");
-        let l = lease(&home, &repo, "agent-1249m", "feat/absent-merged").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-1249m", "feat/absent-merged");
         std::process::Command::new("git")
             .args([
                 "-c",
@@ -4632,7 +4700,7 @@ mod tests {
     fn release_full_absent_worktree_unmerged_branch_preserved() {
         let home = tmp_home("1249-absent-unmerged");
         let repo = tmp_repo("1249-absent-unmerged-repo");
-        let l = lease(&home, &repo, "agent-1249u", "feat/absent-unmerged").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-1249u", "feat/absent-unmerged");
         std::process::Command::new("git")
             .args([
                 "-c",
@@ -4685,7 +4753,7 @@ mod tests {
         let home = tmp_home("611-dryrun");
         let repo = tmp_repo("611-dryrun-repo");
         // Lease creates the branch + worktree.
-        let l = lease(&home, &repo, "agent-611d", "feat/dryrun").expect("lease");
+        let l = lease_bound(&home, &repo, "agent-611d", "feat/dryrun");
         // Add a commit and merge into main.
         std::process::Command::new("git")
             .args([
@@ -4783,7 +4851,7 @@ mod tests {
 
         // Lease a worktree in the clone (binds source_repo=source); merge state
         // is irrelevant — the fetch runs BEFORE the merge check.
-        let _l = lease(&home, &source, "agent-t7", "feat/t7").expect("lease");
+        let _l = lease_bound(&home, &source, "agent-t7", "feat/t7");
 
         let before = refs_remotes(&source);
         assert!(
@@ -4842,7 +4910,7 @@ mod tests {
             .output()
             .unwrap();
         // Lease a different branch
-        let _l = lease(&home, &repo, "agent-x", "feat/daemon-task").expect("lease");
+        let _l = lease_bound(&home, &repo, "agent-x", "feat/daemon-task");
         let outcome = release_full(&home, "agent-x", false);
         assert!(outcome.released);
         // Unrelated branch must still exist

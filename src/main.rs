@@ -44,6 +44,7 @@ mod github_token;
 mod headless;
 mod health;
 mod identity;
+mod image_paste;
 mod inbox;
 mod instance_monitor;
 mod instructions;
@@ -169,6 +170,26 @@ fn emit_shadow_frame(payload: &serde_json::Value) {
 #[cfg(not(unix))]
 fn emit_shadow_frame(_payload: &serde_json::Value) {}
 
+/// #2413 Phase D: resolve the hook event name for backends whose hook payload
+/// omits `hook_event_name`. agy's `.agents/hooks.json` command hooks pass the
+/// (claude-compatible) event via `--event`; claude carries it in stdin and
+/// passes no `--event`. The override fills the field ONLY when stdin omits a
+/// non-empty `hook_event_name`, so claude is byte-identical. Pure (no I/O) for
+/// unit-testability.
+fn apply_hook_event_override(v: &mut serde_json::Value, event: Option<String>) {
+    let Some(ev) = event else { return };
+    if v.get("hook_event_name")
+        .and_then(|x| x.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        return; // stdin already carries the event (claude) — leave it.
+    }
+    if !v.is_object() {
+        *v = serde_json::json!({});
+    }
+    v["hook_event_name"] = serde_json::Value::String(ev);
+}
+
 fn load_dotenv() {
     let env_path = home_dir().join(".env");
     if !env_path.exists() {
@@ -289,6 +310,14 @@ enum Commands {
         /// session↔agent attribution without a session-id map).
         #[arg(long)]
         instance: String,
+        /// #2413 Phase D (agy): explicit claude-compatible event name for
+        /// backends whose hook payload does NOT carry `hook_event_name`
+        /// (agy/Antigravity `.agents/hooks.json` command hooks). When set, it
+        /// SUPPLIES `hook_event_name` only if stdin lacks it — so the socket
+        /// server's existing event→Evidence mapping is reused unchanged. Claude
+        /// omits this flag (its stdin payload already carries the event).
+        #[arg(long)]
+        event: Option<String>,
     },
     /// Send input to an agent
     Inject {
@@ -855,7 +884,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Commands::HookEvent { instance }) => {
+        Some(Commands::HookEvent { instance, event }) => {
             // Observe-only contract: NEVER block the agent — exit 0 on every
             // path, keep stdout empty (stderr is fine; hooks ignore it on 0).
             let mut payload = String::new();
@@ -865,7 +894,10 @@ fn main() -> anyhow::Result<()> {
             let _ = std::io::stdin()
                 .take(64 * 1024)
                 .read_to_string(&mut payload);
-            let v: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            let mut v: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            // #2413 Phase D (agy): agy's `.agents/hooks.json` command hooks carry
+            // the event via `--event` (their stdin payload has no `hook_event_name`).
+            apply_hook_event_override(&mut v, event);
             let req = serde_json::json!({
                 "method": api::method::HOOK_EVENT,
                 "params": {
@@ -1387,6 +1419,40 @@ fn list_running_agents(home: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2413 Phase D (agy): `--event` supplies `hook_event_name` ONLY when the
+    /// stdin payload omits a non-empty one — so agy (payload lacks it) gets the
+    /// claude-compatible event, while claude (carries it in stdin, no `--event`)
+    /// is byte-identical. Reverse-mutation: drop the absence-guard → claude's v3
+    /// would be overwritten to "PreToolUse" and the assert fails.
+    #[test]
+    fn apply_hook_event_override_fills_only_when_absent() {
+        use serde_json::json;
+        // agy: stdin lacks hook_event_name → --event supplies it.
+        let mut v = json!({"conversationId": "abc", "invocationNum": 1});
+        apply_hook_event_override(&mut v, Some("PreToolUse".into()));
+        assert_eq!(v["hook_event_name"], "PreToolUse");
+        // claude: stdin has it, no --event → unchanged.
+        let mut v2 = json!({"hook_event_name": "Stop"});
+        apply_hook_event_override(&mut v2, None);
+        assert_eq!(v2["hook_event_name"], "Stop");
+        // stdin event WINS even if --event is somehow present (claude unaffected).
+        let mut v3 = json!({"hook_event_name": "Stop"});
+        apply_hook_event_override(&mut v3, Some("PreToolUse".into()));
+        assert_eq!(v3["hook_event_name"], "Stop");
+        // empty stdin event == absent → filled.
+        let mut v4 = json!({"hook_event_name": ""});
+        apply_hook_event_override(&mut v4, Some("Stop".into()));
+        assert_eq!(v4["hook_event_name"], "Stop");
+        // non-object stdin (null/garbage) → coerced to object carrying the event.
+        let mut v5 = json!(null);
+        apply_hook_event_override(&mut v5, Some("Stop".into()));
+        assert_eq!(v5["hook_event_name"], "Stop");
+        // no override + no stdin event → stays absent (no-op).
+        let mut v6 = json!({"x": 1});
+        apply_hook_event_override(&mut v6, None);
+        assert!(v6.get("hook_event_name").is_none());
+    }
 
     #[test]
     fn home_dir_default() {

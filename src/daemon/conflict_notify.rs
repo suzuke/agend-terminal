@@ -715,7 +715,7 @@ mod tests {
                 working_dir: None,
                 submit_key: "\r".to_string(),
                 health_state: "healthy".to_string(),
-                agent_state: "thinking".to_string(),
+                agent_state: "active".to_string(),
                 silent_secs: 0,
                 output_silent_secs: 0,
             }],

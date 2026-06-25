@@ -1,13 +1,12 @@
 //! Verification/reproduction tests for the state-capture review batch.
 //!
-//! Each `#[ignore]`d test encodes the CORRECT post-fix behavior so it is RED
-//! against the current buggy code and GREEN once the fix lands. Remove the
-//! `#[ignore]` after the corresponding fix to confirm.
+//! Each test encodes the CORRECT post-fix behavior and is GREEN on current code
+//! (the cited fixes have landed); they run un-ignored as live regression guards.
 //!
 //! Attached as an in-module submodule of `crate::state` so it can drive the
 //! private `StateTracker` fields/methods (`context_regex`, `instance_name`,
-//! `scan_context_pct`, the post-classify `capture_unclassified_throttle` side
-//! log) directly — these are not part of the thin `lib`/`main` surface.
+//! `scan_context_pct`, the SRL phantom/keep-latched WARN dedup latches)
+//! directly — these are not part of the thin `lib`/`main` surface.
 
 use super::*;
 use crate::backend::Backend;
@@ -69,79 +68,6 @@ const SGR_RESET: &str = "\x1b[0m";
 /// Full Claude-Code SRL line; its `Server is temporarily limiting requests`
 /// substring matches the ServerRateLimit regex.
 const SRL_LINE: &str = "API Error: Server is temporarily limiting requests (not your usage limit)";
-
-// ── Finding #1 — unbounded growth of unclassified_errors.jsonl ──────────────
-//
-// `capture_unclassified_throttle` has NO per-record dedup latch; it relies on
-// the feed-level hash-dedup, which is DELIBERATELY bypassed when a throttle
-// hint is on screen and the tracker is not already throttle-latched. A pane
-// that statically DISPLAYS a throttle phrase while the classifier lands on a
-// non-retryable state therefore appends a FULL-screen JSONL record on every
-// PTY read of the SAME screen — unbounded file growth.
-
-// #[serial]: this test mutates the process-global `AGEND_HOME` env var
-// (set_var below). The sibling `state::tests` AGEND_HOME tests are already
-// `#[serial]`; without joining that serial group this test races them on the
-// shared env var under parallel `cargo test` (writes scatter across homes →
-// nondeterministic record count), which surfaced as a flaky Coverage-job RED.
-#[test]
-#[serial_test::serial]
-fn unclassified_throttle_static_screen_logs_once_not_per_tick() {
-    // Isolate the on-disk sidecar to a throwaway HOME so we don't touch the
-    // operator's real $AGEND_HOME/unclassified_errors.jsonl.
-    let home = std::env::temp_dir().join(format!(
-        "agend_state_capture_f1_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&home).expect("create temp home");
-    std::env::set_var("AGEND_HOME", &home);
-    let path = home.join("unclassified_errors.jsonl");
-    let _ = std::fs::remove_file(&path);
-
-    let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
-    t.current = AgentState::Idle;
-    t.instance_name = "f1".into();
-
-    // A throttle DIAG phrase ("Overloaded errors") sits in prose — it carries
-    // the throttle HINT token "Overloaded" (so the hash-dedup bypass fires) but
-    // is NOT an error-line shape, so the classifier stays on a non-retryable
-    // state. The screen is byte-identical across feeds → identical hash → the
-    // ONLY reason it re-enters the feed body is the throttle-hint bypass.
-    let screen = "Assistant: I should explain. Overloaded errors are transient; just retry.\n❯ ";
-    for _ in 0..6 {
-        t.feed(screen);
-    }
-
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
-    // Count ONLY this test's own records (matched by its distinctive screen
-    // text). `capture_unclassified_throttle` writes to the PROCESS-GLOBAL
-    // `AGEND_HOME`-derived path, so any concurrently-running feed()-driven test
-    // can append to this same file while our `set_var` is in effect — filtering
-    // by our screen makes the assertion immune to that cross-test pollution
-    // (the #[serial] marker prevents it among serial tests; this covers any
-    // non-serial feeder too).
-    let records = contents
-        .lines()
-        .filter(|l| l.contains("Overloaded errors are transient"))
-        .count();
-    let _ = std::fs::remove_file(&path);
-
-    // r6 nit#3: assert EXACTLY one, not `<= 1`. The fire-once contract is "log
-    // once per distinct screen" — `<= 1` also passes when the throttle hint logs
-    // ZERO times, which would silently hide a regression that stops logging the
-    // incident at all. `== 1` pins both directions (fires, and only once).
-    assert_eq!(
-        records, 1,
-        "#1 resource-leak: a STATIC unclassified-throttle screen fed 6× appended \
-         {records} JSONL records to unclassified_errors.jsonl (expected exactly one \
-         per distinct screen — the per-signature fire-once latch must log once, not \
-         per-tick and not zero)."
-    );
-}
 
 // ── Finding #2 — #2086-srl-keep-latched WARN re-fires every feed ────────────
 //
@@ -271,9 +197,9 @@ fn srl_phantom_consecutive_rematch_warn_dedups_on_static_throttle() {
 
 // ── CR-2026-06-14 t-43 — SRL phantom WARN latch is SET-ONLY ──────────────────
 //
-// `last_srl_phantom_warn_sig` (and `last_srl_keep_latched_sig`) are set once and
-// NEVER reset — unlike `last_unclassified_throttle_sig`, which clears when the
-// pane leaves the throttle-miss shape so a recurrence re-logs once. Consequently
+// `last_srl_phantom_warn_sig` (and `last_srl_keep_latched_sig`) were originally
+// set once and NEVER reset, so a recurrence on the same line could never re-log.
+// Consequently
 // a SECOND, genuinely-distinct SRL incident on the SAME error line — separated
 // by a real recovery (productive output) — is silently suppressed (WARN
 // swallowed), losing the telemetry for the new stuck episode. The fix clears the

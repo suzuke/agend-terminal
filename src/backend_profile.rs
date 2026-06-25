@@ -27,20 +27,27 @@ use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
 use crate::state::AgentState;
 use std::sync::OnceLock;
 
-/// Source-of-truth capability for context% telemetry.
+/// Whether a backend can passively report context-window usage — surfaced as the
+/// LIST `context_provider` telemetry field (#2439). When `StatusLine`, derived from
+/// the presence of a statusline `context_pattern`; when `TranscriptEstimate`, from
+/// our token-cost estimator (codex/grok/agy). Unlike `context_source`/`context_pct`
+/// (absent without a fresh reading), this is ALWAYS reported.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ContextProvider {
-    /// The backend renders a stable status/footer line that reports context use.
+    /// The backend renders a status/footer line we can read a context% from (it
+    /// declares a `context_pattern`): Claude, Kiro.
     StatusLine,
-    /// Reserved for a calibrated transcript-token estimator. Callers must treat
-    /// this as lower confidence than [`ContextProvider::StatusLine`].
-    #[allow(dead_code)]
+    /// A calibrated transcript-token estimator. Lower confidence than StatusLine.
     TranscriptEstimate { confidence: f32 },
-    /// The backend has no trustworthy passive context signal.
+    /// The backend exposes no trustworthy passive context signal: Codex, OpenCode,
+    /// Agy, and the shell/raw fallbacks. Its `context_pct` is honestly absent
+    /// rather than a guess.
     Unavailable,
 }
 
 impl ContextProvider {
+    /// Stable LIST/telemetry string. CONTRACT: external dashboards key off these
+    /// values — do not rename without coordinating consumers.
     pub fn source_name(self) -> &'static str {
         match self {
             ContextProvider::StatusLine => "statusline",
@@ -160,8 +167,8 @@ fn agy_profile() -> BackendProfile {
                 AgentState::PermissionPrompt,
                 r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
             ),
-            (AgentState::ToolUse, r"●\s+[A-Z][a-zA-Z]+\("),
-            (AgentState::Thinking, r"esc to cancel"),
+            (AgentState::Active, r"●\s+[A-Z][a-zA-Z]+\("),
+            (AgentState::Active, r"esc to cancel"),
             (AgentState::Idle, r"\? for shortcuts"),
             (AgentState::Idle, r"Antigravity CLI|Type your message"),
         ],
@@ -218,8 +225,8 @@ fn kirocli_profile() -> BackendProfile {
                 AgentState::GitConflict,
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
-            (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
-            (AgentState::Thinking, r"Kiro is working|esc to cancel"),
+            (AgentState::Active, r"execute_bash|fs_read|fs_write"),
+            (AgentState::Active, r"Kiro is working|esc to cancel"),
             (
                 AgentState::Idle,
                 r"\d+%\s*$|ask a question or describe a task",
@@ -279,10 +286,10 @@ fn opencode_profile() -> BackendProfile {
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
             (
-                AgentState::ToolUse,
+                AgentState::Active,
                 r"✱\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b|~\s+(Reading|Writing|Editing|Searching|Listing|Globbing|Grepping)\b",
             ),
-            (AgentState::Thinking, r"esc interrupt"),
+            (AgentState::Active, r"esc interrupt"),
             (
                 AgentState::PermissionPrompt,
                 r"Update Available|Skip\s+Confirm",
@@ -357,7 +364,7 @@ fn codex_profile() -> BackendProfile {
                 AgentState::GitConflict,
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
-            (AgentState::Thinking, r"Working|esc to interrupt"),
+            (AgentState::Active, r"Working|esc to interrupt"),
             (AgentState::Idle, r"›"),
             (AgentState::Idle, r"OpenAI Codex|gpt-.*left"),
         ],
@@ -439,11 +446,11 @@ fn claudecode_profile() -> BackendProfile {
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
             ),
             (
-                AgentState::ToolUse,
+                AgentState::Active,
                 r"(?m)^(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)|[✓●⏺]\s+(?:Listing|Reading|Writing|Searching|Editing))\b",
             ),
             (
-                AgentState::Thinking,
+                AgentState::Active,
                 r"(?i)[✻✢✶✳✽*·]\s*\w+\x{2026}|\w+\x{2026}\s*\((?:\d+[smh]|running )|thought for [0-9]+s",
             ),
             (AgentState::Idle, r"❯"),
@@ -470,10 +477,8 @@ fn grok_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
             (AgentState::AuthError, r"(?i)not.authenticated|sign.in.to.grok|grok.login"),
-            // ToolUse: Braille spinner present
-            (AgentState::ToolUse, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"),
-            // Thinking: same spinner (Grok doesn't distinguish)
-            (AgentState::Thinking, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"),
+            // Active: Braille spinner present (Grok uses same spinner for both tool-use and thinking)
+            (AgentState::Active, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"),
             // Idle: "Grok Build" only appears in bottom status at idle
             (AgentState::Idle, r"Grok Build"),
         ],
@@ -625,7 +630,7 @@ mod opencode_resumed_idle_2020 {
         let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
         assert_eq!(
             patterns.detect(&working),
-            Some(AgentState::Thinking),
+            Some(AgentState::Active),
             "statusline must not outrank the working marker"
         );
     }

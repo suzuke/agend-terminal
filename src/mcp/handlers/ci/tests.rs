@@ -922,6 +922,11 @@ fn checkout_bind_true_idempotent_when_already_bound_1494() {
     // dispatch hook does before the agent claims.
     let lease = crate::worktree_pool::lease(&home, &source, agent, "feat/1494")
         .expect("dispatch pre-build lease must succeed");
+    // lease no longer binds (finding D+H); the authoritative caller binds —
+    // simulate dispatch's pre-build bind here so the #1494 idempotent re-bind
+    // short-circuit finds the existing same-branch binding.
+    crate::binding::bind_full(&home, agent, "", "feat/1494", &lease.path, &source, false)
+        .expect("dispatch pre-build bind_full");
     let dispatch_path = lease.path.clone();
     assert!(dispatch_path.exists(), "pre-built worktree must exist");
 

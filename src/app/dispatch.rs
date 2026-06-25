@@ -373,8 +373,38 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 Err(e) => tracing::warn!(error = %e, "toggle copy-on-select failed"),
             }
         }
+        // #2435: paste a clipboard image into the focused pane's agent. This arm
+        // is COMPILE-FORCED — the match is exhaustive (no `_` catch-all), so the
+        // app surface cannot silently drop the feature (#2434/#2438 mode-mismatch
+        // class). Production passes the real clipboard capture; tests inject a
+        // synthetic one (see `paste_image`).
+        Action::PasteImage => paste_image(ctx, crate::image_paste::capture_clipboard_image),
     }
     out
+}
+
+/// Capture a clipboard image (via `capture`) and inject its `[AGEND-IMAGE-PASTE]`
+/// marker into the focused pane — the `app`-mode half of #2435.
+///
+/// `capture` is a dependency-injection seam: production passes
+/// [`crate::image_paste::capture_clipboard_image`] (reads the real GUI
+/// clipboard); tests pass a synthetic capture so the keybind → marker →
+/// focused-pane wiring is provable through this REAL `app` path WITHOUT a GUI
+/// clipboard (which headless CI lacks). A capture `Err` (no image / unreachable
+/// clipboard) logs and no-ops, so a mis-paste never disrupts the session.
+fn paste_image<F>(ctx: &mut DispatchCtx<'_>, capture: F)
+where
+    F: FnOnce() -> anyhow::Result<(std::path::PathBuf, String)>,
+{
+    match capture() {
+        Ok((path, marker)) => {
+            tracing::info!(target: "image_paste", path = %path.display(), "image paste → focused pane (app)");
+            super::write_to_focused(ctx.home, ctx.layout, ctx.registry, marker.as_bytes());
+        }
+        Err(e) => {
+            tracing::warn!(target: "image_paste", error = %e, "image paste failed (no clipboard image?)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -573,6 +603,87 @@ mod tests {
         assert!(
             pane.selection.is_some(),
             "#84662: nothing-to-copy is not a completed copy → highlight unchanged"
+        );
+    }
+
+    // #2435: representative app-mode WIRING test — the focused pane's
+    // `last_input_at` (set by Pane::write_input) is the observable proving the
+    // marker flowed through the REAL app path (paste_image → write_to_focused →
+    // write_input), not just attach. The clipboard read is mocked via the
+    // injected capture so this runs in headless CI. The full real-clipboard path
+    // (arboard get_image on an actual GUI clipboard image) has NO committed test —
+    // headless CI has no clipboard — and is verified manually on a real desktop
+    // (see the `crate::image_paste` module doc).
+    fn focused_last_input_some(ctx: &DispatchCtx<'_>) -> bool {
+        ctx.layout
+            .active_tab()
+            .expect("active tab")
+            .root()
+            .find_pane(1)
+            .expect("focused pane")
+            .last_input_at
+            .is_some()
+    }
+
+    #[test]
+    fn paste_image_injects_marker_into_focused_pane() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), test_pane(1, "a")));
+        layout.active = 0;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        assert!(!focused_last_input_some(&ctx), "precondition: no input yet");
+
+        // Drive the REAL app paste path with a synthetic capture (clipboard mocked).
+        paste_image(&mut ctx, || {
+            Ok((
+                std::path::PathBuf::from("/tmp/agend_paste_test.png"),
+                "[AGEND-IMAGE-PASTE] /tmp/agend_paste_test.png\n".to_string(),
+            ))
+        });
+
+        assert!(
+            focused_last_input_some(&ctx),
+            "#2435: paste_image must inject the marker into the focused pane (app-mode wiring live)"
+        );
+    }
+
+    #[test]
+    fn paste_image_capture_err_is_graceful_noop() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), test_pane(1, "a")));
+        layout.active = 0;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        // A capture failure (no clipboard image) must NOT inject and must NOT panic.
+        paste_image(&mut ctx, || Err(anyhow::anyhow!("no image in clipboard")));
+
+        assert!(
+            !focused_last_input_some(&ctx),
+            "#2435: a failed clipboard capture injects nothing"
         );
     }
 }

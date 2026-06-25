@@ -19,8 +19,7 @@ pub fn state_color(state: AgentState) -> Color {
         AgentState::Starting => Color::White,
         AgentState::AwaitingOperator => Color::Indexed(214),
         AgentState::Idle => Color::DarkGray,
-        AgentState::Thinking => Color::Yellow,
-        AgentState::ToolUse => Color::Blue,
+        AgentState::Active => Color::Yellow,
         AgentState::InteractivePrompt => Color::Indexed(214),
         AgentState::PermissionPrompt => Color::Magenta,
         // Phase A Piece-1: GitConflict shares the magenta band with
@@ -36,6 +35,131 @@ pub fn state_color(state: AgentState) -> Color {
         // other error states.
         AgentState::ModelUnsupported => Color::Red,
         AgentState::Hang | AgentState::Crashed | AgentState::Restarting => Color::Red,
+    }
+}
+
+// ── dim non-focused panes (t-…50430, version b) ────────────────────────────────────────
+//
+// Blend every cell of a NON-focused pane's content toward the (dark) terminal background so
+// the focused pane stands out. RGB blend (not `Modifier::DIM`, which is terminal-dependent
+// and weak) → guaranteed visible + cross-terminal consistent. Applied as a post-render
+// per-cell buffer rewrite, mirroring the selection-highlight loop in `render_pane`.
+
+/// Fraction each non-focused cell's colours move toward the terminal background. 0.5 = a
+/// clear "dimmed" look that stays readable (white text → mid-grey). Tunable.
+const DIM_BLEND: f32 = 0.5;
+/// Assumed terminal background (dark) — the blend target. agend fleet terminals are dark;
+/// blending toward black makes non-focused content recede uniformly.
+const TERM_BG_RGB: (u8, u8, u8) = (0, 0, 0);
+/// Assumed default foreground for a `Reset` fg cell (the dominant case — most terminal text
+/// uses the default fg). Resolving it lets that text actually dim, not just the rarer
+/// explicitly-coloured cells.
+const TERM_FG_RGB: (u8, u8, u8) = (204, 204, 204);
+
+/// Linear blend of `c` a `factor` of the way toward `target` (per channel).
+fn blend_rgb(c: (u8, u8, u8), target: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
+    let f = factor.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    (
+        lerp(c.0, target.0),
+        lerp(c.1, target.1),
+        lerp(c.2, target.2),
+    )
+}
+
+/// Resolve a 256-colour index to RGB (standard xterm palette: 0-15 system, 16-231 the
+/// 6×6×6 cube, 232-255 the grayscale ramp).
+fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+    const SYS: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => SYS[i as usize],
+        16..=231 => {
+            let i = i - 16;
+            let conv = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (conv(i / 36), conv((i % 36) / 6), conv(i % 6))
+        }
+        232..=255 => {
+            let v = 8 + (i - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// Resolve a ratatui [`Color`] to RGB for blending. `is_fg` decides how `Reset` resolves:
+/// a `Reset` fg is the terminal's default foreground (so it can dim), while a `Reset` bg is
+/// already the terminal background (the blend target) → `None`, leave it untouched.
+fn color_to_rgb(c: Color, is_fg: bool) -> Option<(u8, u8, u8)> {
+    Some(match c {
+        Color::Reset => {
+            if is_fg {
+                TERM_FG_RGB
+            } else {
+                return None;
+            }
+        }
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => indexed_rgb(i),
+        Color::Black => (0, 0, 0),
+        Color::Red => (128, 0, 0),
+        Color::Green => (0, 128, 0),
+        Color::Yellow => (128, 128, 0),
+        Color::Blue => (0, 0, 128),
+        Color::Magenta => (128, 0, 128),
+        Color::Cyan => (0, 128, 128),
+        Color::Gray => (192, 192, 192),
+        Color::DarkGray => (128, 128, 128),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (0, 0, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+    })
+}
+
+/// Dim one colour toward the terminal background, or leave it unchanged when it is already
+/// the background (a `Reset` bg).
+fn dim_color(c: Color, is_fg: bool) -> Color {
+    match color_to_rgb(c, is_fg) {
+        Some(rgb) => {
+            let (r, g, b) = blend_rgb(rgb, TERM_BG_RGB, DIM_BLEND);
+            Color::Rgb(r, g, b)
+        }
+        None => c,
+    }
+}
+
+/// Blend every cell in `inner` toward the terminal background — the version-b dim for a
+/// non-focused pane. Per-cell buffer rewrite (same shape as the selection-highlight loop).
+/// Takes `&mut Buffer` (not `&mut Frame`) so it is directly unit-testable with
+/// `Buffer::empty`; the call site passes `frame.buffer_mut()`.
+fn dim_pane_content(buf: &mut ratatui::buffer::Buffer, inner: Rect) {
+    for y in inner.y..inner.y.saturating_add(inner.height) {
+        for x in inner.x..inner.x.saturating_add(inner.width) {
+            let cell = &mut buf[(x, y)];
+            let fg = dim_color(cell.fg, true);
+            let bg = dim_color(cell.bg, false);
+            cell.set_fg(fg);
+            cell.set_bg(bg);
+        }
     }
 }
 
@@ -237,6 +361,12 @@ fn build_agent_state_snapshot(
     registry: &AgentRegistry,
 ) -> HashMap<String, AgentState> {
     let reg = agent::lock_registry(registry);
+    // #2413 (A): show the Shadow Observer's high-confidence badge correction in place
+    // of the raw screen state, unless the operator turned it off (`:set observed_badge
+    // off`) or the whole observer is killed (`AGEND_SHADOW_OBSERVER=0`). Computed ONCE
+    // per frame (not per pane); both reads are cheap but neither belongs in the loop.
+    let show_observed =
+        crate::runtime_config::get().observed_badge && crate::daemon::shadow::enabled();
     let mut snapshot = HashMap::new();
     for tab in &layout.tabs {
         for id in tab.root().pane_ids() {
@@ -245,19 +375,8 @@ fn build_agent_state_snapshot(
                     snapshot
                         .entry(pane.agent_name.to_string())
                         .or_insert_with(|| {
-                            // Read the lock-free published mirror — NO core.lock().
-                            // Under the boot PTY flood the per-agent core lock is
-                            // held 2–6 ms by each `pty_read_loop` feed; taking it
-                            // here (once per pane, every frame) made the render
-                            // snapshot wait up to ~10 ms and starved input. The
-                            // AtomicU8 is written in lockstep by `record_set`.
                             reg.get(&pane.instance_id)
-                                .map(|h| {
-                                    AgentState::from_u8(
-                                        h.published_state
-                                            .load(std::sync::atomic::Ordering::Relaxed),
-                                    )
-                                })
+                                .map(|h| observed_or_raw_state(h, show_observed))
                                 .unwrap_or(AgentState::Idle)
                         });
                 }
@@ -265,6 +384,26 @@ fn build_agent_state_snapshot(
         }
     }
     snapshot
+}
+
+/// #2413 (A): the badge state for one agent — the Shadow Observer's high-confidence
+/// correction (`published_observed`) when `show_observed` AND a correction is published,
+/// else the raw screen-scrape state (`published_state`).
+///
+/// Both reads are lock-free `Relaxed` `AtomicU8` loads — NO `core.lock()`. Under the
+/// boot PTY flood the per-agent core lock is held 2–6 ms by each `pty_read_loop` feed;
+/// taking it here (once per pane, every frame) made the render snapshot wait up to
+/// ~10 ms and starved input. Both atomics are written in lockstep by their writers
+/// (`record_set` for `published_state`; the per-tick `shadow_observe` driver for
+/// `published_observed`), so the render path stays contention-free.
+fn observed_or_raw_state(h: &agent::AgentHandle, show_observed: bool) -> AgentState {
+    use std::sync::atomic::Ordering::Relaxed;
+    if show_observed {
+        if let Some(corrected) = AgentState::from_observed_u8(h.published_observed.load(Relaxed)) {
+            return corrected;
+        }
+    }
+    AgentState::from_u8(h.published_state.load(Relaxed))
 }
 
 pub fn render(
@@ -696,6 +835,13 @@ fn render_pane(
         }
     }
 
+    // Dim a NON-focused pane's content (version b) so the focused pane stands out at a
+    // glance. Toggle: runtime_config.dim_unfocused_panes (default ON). Zoomed mode draws
+    // only the focused pane, so `!focused` naturally skips it — no special case needed.
+    if !focused && crate::runtime_config::get().dim_unfocused_panes {
+        dim_pane_content(frame.buffer_mut(), inner);
+    }
+
     if focused {
         let (cursor_line, cursor_col) = cursor;
         let max_x = inner.x + inner.width.saturating_sub(1);
@@ -940,7 +1086,7 @@ mod tests {
         for (state, want) in [
             (AgentState::ServerRateLimit, "[ServerRateLimit]"),
             (AgentState::PermissionPrompt, "[PermissionPrompt]"),
-            (AgentState::Thinking, "[Thinking]"),
+            (AgentState::Active, "[Active]"),
             (AgentState::Idle, "[Idle]"),
         ] {
             let segments = pane_title_segments(&pane, Style::default(), state, true);
@@ -955,11 +1101,8 @@ mod tests {
     #[test]
     fn state_color_returns_distinct_colors_for_key_states() {
         let idle = state_color(AgentState::Idle);
-        let thinking = state_color(AgentState::Thinking);
-        let tool_use = state_color(AgentState::ToolUse);
-        assert_ne!(idle, thinking, "idle vs thinking must differ");
-        assert_ne!(thinking, tool_use, "thinking vs tool_use must differ");
-        assert_ne!(idle, tool_use, "idle vs tool_use must differ");
+        let active = state_color(AgentState::Active);
+        assert_ne!(idle, active, "idle vs active must differ");
     }
 
     #[test]
@@ -1462,6 +1605,36 @@ mod tests {
         // spun up with the env set.
     }
 
+    /// #2413 (A): the badge picks the Shadow Observer correction over the raw state
+    /// ONLY when `show_observed` AND a correction is published; otherwise the raw
+    /// `published_state` wins. Pins all three branches of `observed_or_raw_state` —
+    /// the lock-free read the render snapshot uses. `#[cfg(unix)]` (mk_test_handle).
+    #[cfg(unix)]
+    #[test]
+    fn observed_or_raw_state_prefers_correction_only_when_enabled() {
+        let id = crate::types::InstanceId::default();
+        let handle = crate::agent::mk_test_handle("agent", id);
+        // Raw screen state = Restarting (via record_set); a published badge override.
+        handle.core.lock().state.set_restarting();
+        handle
+            .core
+            .lock()
+            .state
+            .publish_observed(Some(AgentState::Active));
+
+        // Toggle ON ⇒ the high-confidence correction wins.
+        assert_eq!(observed_or_raw_state(&handle, true), AgentState::Active);
+        // Toggle OFF ⇒ the raw state wins (operator opted out / observer killed).
+        assert_eq!(
+            observed_or_raw_state(&handle, false),
+            AgentState::Restarting
+        );
+
+        // No correction published (sentinel) ⇒ raw state even when enabled.
+        handle.core.lock().state.publish_observed(None);
+        assert_eq!(observed_or_raw_state(&handle, true), AgentState::Restarting);
+    }
+
     /// Regression for the post-#2346 residual freeze: the per-frame render state
     /// snapshot must read each agent's state via the lock-free published mirror,
     /// NOT `core.lock()`. Under the boot PTY flood the core lock is held multi-ms
@@ -1807,5 +1980,113 @@ mod tests {
             );
         }
         drop(txs);
+    }
+
+    // ── dim non-focused panes (version b) ──────────────────────────────────────────────
+
+    /// blend-fn + colour-resolution determinism, incl. the confirm-first readability point
+    /// (a dimmed default-fg cell is a clearly-visible mid-grey, not black).
+    #[test]
+    fn dim_blend_and_color_resolution_are_deterministic() {
+        // RGB blend toward black at 0.5 = halfway (rounded).
+        assert_eq!(
+            blend_rgb((204, 204, 204), TERM_BG_RGB, 0.5),
+            (102, 102, 102)
+        );
+        assert_eq!(
+            blend_rgb((255, 255, 255), TERM_BG_RGB, 0.5),
+            (128, 128, 128)
+        );
+        assert_eq!(blend_rgb((200, 100, 50), TERM_BG_RGB, 0.5), (100, 50, 25));
+        assert_eq!(blend_rgb((10, 20, 30), TERM_BG_RGB, 0.0), (10, 20, 30)); // factor 0 = identity
+
+        // Named/Indexed/Reset → RGB resolution.
+        assert_eq!(color_to_rgb(Color::White, true), Some((255, 255, 255)));
+        assert_eq!(color_to_rgb(Color::Blue, true), Some((0, 0, 128)));
+        assert_eq!(color_to_rgb(Color::Indexed(0), true), Some((0, 0, 0)));
+        assert_eq!(
+            color_to_rgb(Color::Indexed(15), true),
+            Some((255, 255, 255))
+        );
+        assert_eq!(color_to_rgb(Color::Indexed(196), true), Some((255, 0, 0)));
+        assert_eq!(color_to_rgb(Color::Indexed(232), true), Some((8, 8, 8)));
+        assert_eq!(
+            color_to_rgb(Color::Indexed(255), true),
+            Some((238, 238, 238))
+        );
+        // Reset fg resolves to the assumed default fg (so the dominant text dims); Reset bg
+        // is already the background → None (left untouched).
+        assert_eq!(color_to_rgb(Color::Reset, true), Some(TERM_FG_RGB));
+        assert_eq!(color_to_rgb(Color::Reset, false), None);
+
+        // dim_color end-to-end.
+        assert_eq!(
+            dim_color(Color::Rgb(200, 100, 50), true),
+            Color::Rgb(100, 50, 25)
+        );
+        assert_eq!(dim_color(Color::Reset, false), Color::Reset); // bg untouched
+                                                                  // confirm-first: default text dims to a visible mid-grey, NOT black/invisible.
+        let dimmed_default = dim_color(Color::Reset, true);
+        assert_eq!(dimmed_default, Color::Rgb(102, 102, 102));
+        assert_ne!(
+            dimmed_default,
+            Color::Rgb(0, 0, 0),
+            "must stay readable, not vanish"
+        );
+    }
+
+    /// Buffer wiring (models a 2-pane layout): `dim_pane_content` blends ONLY the region it
+    /// is given (the non-focused pane's inner rect), leaving every other cell — i.e. the
+    /// focused pane, which never receives the call — byte-identical. Mirrors how `render_pane`
+    /// calls it solely under `!focused`.
+    #[test]
+    fn dim_pane_content_blends_only_the_nonfocused_region() {
+        use ratatui::buffer::Buffer;
+        // Two side-by-side 5×3 pane regions: left = focused (x 0..5), right = non-focused.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        for y in 0..3u16 {
+            for x in 0..10u16 {
+                buf[(x, y)].set_fg(Color::White);
+                buf[(x, y)].set_bg(Color::Reset);
+            }
+        }
+        // One non-focused cell carries an explicit coloured bg to exercise the bg path.
+        buf[(7, 1)].set_bg(Color::Blue);
+
+        let nonfocused = Rect::new(5, 0, 5, 3);
+        dim_pane_content(&mut buf, nonfocused);
+
+        // Focused (left) region: untouched.
+        for y in 0..3u16 {
+            for x in 0..5u16 {
+                assert_eq!(
+                    buf[(x, y)].fg,
+                    Color::White,
+                    "focused fg unchanged at {x},{y}"
+                );
+                assert_eq!(
+                    buf[(x, y)].bg,
+                    Color::Reset,
+                    "focused bg unchanged at {x},{y}"
+                );
+            }
+        }
+        // Non-focused (right) region: fg blended toward black; Reset bg left as-is.
+        for y in 0..3u16 {
+            for x in 5..10u16 {
+                assert_eq!(
+                    buf[(x, y)].fg,
+                    Color::Rgb(128, 128, 128),
+                    "non-focused fg blended at {x},{y}"
+                );
+            }
+        }
+        assert_eq!(
+            buf[(5, 0)].bg,
+            Color::Reset,
+            "Reset bg stays the terminal background"
+        );
+        // The explicit Blue bg blended toward black.
+        assert_eq!(buf[(7, 1)].bg, Color::Rgb(0, 0, 64), "coloured bg dimmed");
     }
 }

@@ -71,10 +71,11 @@ fn next_seq() -> u64 {
 /// per distinctly-named agent ever seen, and a same-name redeploy inherits the
 /// prior instance's last observation. Called from `full_delete_instance`.
 ///
-/// Deliberately lifecycle-keyed, NOT an age-out sweep: the #1523 `ToolUse`
-/// snapshot is allowed to outlive [`HOOK_FRESHNESS`] (event-pair closed, no
-/// clock backstop), so an age-based `.retain` would wrongly demote a
-/// long-running tool — eviction keys on agent deletion instead.
+/// Deliberately lifecycle-keyed, NOT an age-out sweep: the #1523 open-tool
+/// snapshot (`last_event == "PreToolUse"`) is allowed to outlive
+/// [`HOOK_FRESHNESS`] (event-pair closed, no clock backstop), so an age-based
+/// `.retain` would wrongly demote a long-running tool — eviction keys on agent
+/// deletion instead.
 pub(crate) fn forget(name: &str) {
     store().lock().remove(name);
 }
@@ -106,20 +107,25 @@ pub enum HookResolution {
 /// unmapped observations resolve `Stale` (fall back to heuristic) — a
 /// boot-time `Starting` is never carried as the current state hours later.
 ///
-/// #1523 (decision d-20260611051442661249-0): `ToolUse` is the ONE EXCEPTION —
-/// it is EVENT-PAIR-closed, not freshness-bounded. `PreToolUse` opens the tool;
-/// only the NEXT hook event (`PostToolUse`→Thinking / `Stop`→Idle) closes it, by
-/// OVERWRITING this snapshot. So while the snapshot still reads `ToolUse`, the
-/// tool is genuinely still running — a long (>HOOK_FRESHNESS) tool must NOT be
-/// demoted back to the screen heuristic, which is exactly the #1985 nudge class
-/// the promotion exists to fix. A crashed-mid-tool agent (no closing event ever)
-/// is reaped by the liveness watchdog independently, so leaving `ToolUse` open is
-/// safe; the bound is the event, not the clock.
+/// #1523 (decision d-20260611051442661249-0): an open TOOL is the ONE EXCEPTION —
+/// it is EVENT-PAIR-closed, not freshness-bounded. The exception now keys on the
+/// OPENING EVENT (`last_event == "PreToolUse"`), NOT the derived state: post the
+/// `Thinking`/`ToolUse`→`Active` merge the state can no longer distinguish a
+/// tool-open from thinking, but only `PreToolUse` ever set the old `ToolUse`, so
+/// keying on the event is exactly equivalent. `PreToolUse` opens the tool; only
+/// the NEXT hook event (`PostToolUse`→Active / `Stop`→Idle) closes it, by
+/// OVERWRITING this snapshot. So while the snapshot's `last_event` is still
+/// `PreToolUse`, the tool is genuinely still running — a long (>HOOK_FRESHNESS)
+/// tool must NOT be demoted back to the screen heuristic, which is exactly the
+/// #1985 nudge class the promotion exists to fix. A crashed-mid-tool agent (no
+/// closing event ever) is reaped by the liveness watchdog independently, so
+/// leaving the open tool fresh is safe; the bound is the event, not the clock.
 ///
 /// NO CLOCK BACKSTOP (reviewer-2 #2014, accepted as documented): a dropped
 /// `PostToolUse` and a legitimately-long tool are INDISTINGUISHABLE in state —
-/// both read heuristic-Idle + hook-ToolUse, which is exactly the shape the
-/// promotion protects. Adding a max-age clock bound would re-admit the #1985
+/// both read heuristic-Idle + a hook snapshot whose `last_event` is `PreToolUse`,
+/// which is exactly the shape the promotion protects. Adding a max-age clock bound
+/// would re-admit the #1985
 /// failure mode (a long tool demoted to a false idle-nudge) to "fix" a much
 /// narrower one. The mitigation chain instead: `Stop` fires at every turn end
 /// (so a double-drop — both PostToolUse AND Stop lost — is very narrow),
@@ -142,11 +148,14 @@ pub fn resolved_state_for(name: &str) -> HookResolution {
 /// [`record_event`] can tear — pairing generation-A's `at_ms` with generation-B's
 /// resolved state.
 fn resolve_snapshot(snap: &HookShadow) -> HookResolution {
-    use crate::state::AgentState;
     let age_ms = now_ms().saturating_sub(snap.at_ms);
     match snap.derived_state {
-        // ToolUse: valid until the PostToolUse/Stop event overwrites it (above).
-        Some(AgentState::ToolUse) => HookResolution::Fresh(AgentState::ToolUse),
+        // #1523/#1985: a tool stays active EVENT-PAIR-closed — `PreToolUse` opens it and
+        // only the next event (PostToolUse/Stop) closes it by overwriting this snapshot,
+        // so a long (>HOOK_FRESHNESS) tool must NOT freshness-stale. Keyed on the opening
+        // EVENT (not the now-merged Active state): only `PreToolUse` ever set the old
+        // `derived_state == ToolUse`, so this is exactly equivalent post-merge.
+        Some(state) if snap.last_event == "PreToolUse" => HookResolution::Fresh(state),
         Some(state) if age_ms <= HOOK_FRESHNESS.as_millis() as u64 => HookResolution::Fresh(state),
         _ => HookResolution::Stale,
     }
@@ -159,7 +168,7 @@ fn resolve_snapshot(snap: &HookShadow) -> HookResolution {
 /// was last consumed (forward progress → the agent is executing), so a sticky
 /// screen-scraped `ServerRateLimit` is stale and the retry must not fire.
 ///
-/// ACTIVE = `{ToolUse, Thinking}` only. `Idle` is deliberately EXCLUDED: a fresh
+/// ACTIVE = `Active` only. `Idle` is deliberately EXCLUDED: a fresh
 /// `Idle` is the turn-ENDED / prior-turn signal (ambiguous w.r.t. a brand-new SRL),
 /// and idle-recovery is already covered by the supervisor's productive-output
 /// `recovered` gate — so this stays the narrow "agent is provably mid-work" signal.
@@ -176,7 +185,7 @@ pub fn fresh_active_hook_seq(name: &str) -> Option<u64> {
     // seq paired with gen-B state).
     let snap = snapshot_for(name)?;
     match resolve_snapshot(&snap) {
-        HookResolution::Fresh(AgentState::ToolUse | AgentState::Thinking) => Some(snap.seq),
+        HookResolution::Fresh(AgentState::Active) => Some(snap.seq),
         _ => None,
     }
 }
@@ -202,51 +211,15 @@ pub fn is_promoted(backend_command: &str) -> bool {
     promotion_enabled() && crate::backend::Backend::parse_str(backend_command).has_state_hooks()
 }
 
-/// #1523 PROMOTION (phased v1): the authoritative `AgentState` written to the
-/// daemon's per-tick SNAPSHOT (`snapshot.json`).
-///
-/// When the flag is on AND `backend_command` is a STRONG (hook-instrumented)
-/// backend, a `Fresh` hook resolution WINS over the screen `heuristic`;
-/// `Stale`/`Unknown` (or flag-off / a non-hook backend) fall back to `heuristic`
-/// — **byte-identical** to pre-promotion. Hooks ENHANCE; the heuristic remains
-/// the complete fallback path, so a backend without hooks (or a stale window) is
-/// never worse off than before.
-///
-/// SCOPE (reviewer-2 #2014): this promotes the SNAPSHOT-scoped consumers — the
-/// #1985 nudge surface: `dispatch_idle`, the pane-state badge, and anything that
-/// reads `agent_state_of` / `snapshot.json`. It is NOT yet a global chokepoint.
-/// Several per-tick deciders read the RAW screen heuristic
-/// (`core.state.get_state()`) directly and are UNCHANGED in v1: supervisor
-/// reactions (#1946), hang detection, the recovery dispatcher, the idle /
-/// anti-stall watchdog, `conflict_notify`, and the `query` / `list` API (live
-/// registry read).
-/// Promoting those raw read sites is #1523 epic **phase-2** (post-soak). The
-/// worst snapshot-vs-raw divergence is independently bounded by the #1999
-/// throttle-gate and health-gating, so the phased boundary is safe for v1.
-pub fn authoritative_state(
-    backend_command: &str,
-    name: &str,
-    heuristic: crate::state::AgentState,
-) -> crate::state::AgentState {
-    authoritative_state_inner(promotion_enabled(), backend_command, name, heuristic)
-}
-
-/// Promotion core, split out so tests exercise the flag/backend/freshness logic
-/// without mutating the process-global `AGEND_HOOK_STATE_POC` env var.
-fn authoritative_state_inner(
-    enabled: bool,
-    backend_command: &str,
-    name: &str,
-    heuristic: crate::state::AgentState,
-) -> crate::state::AgentState {
-    if !enabled || !crate::backend::Backend::parse_str(backend_command).has_state_hooks() {
-        return heuristic;
-    }
-    match resolved_state_for(name) {
-        HookResolution::Fresh(state) => state,
-        HookResolution::Stale | HookResolution::Unknown => heuristic,
-    }
-}
+// #2413 (B): the #1523 `authoritative_state` SNAPSHOT promotion (claude-hook-only,
+// `AGEND_HOOK_STATE_POC`-gated POC) was REMOVED here — superseded by the multi-backend
+// Shadow Observer `observed_status` promotion at the snapshot chokepoint
+// (`per_tick/snapshot.rs`, gated by `shadow::operated_dispatch_enabled` + the shared
+// `shadow::gate`). The rest of this module's hook-shadow STORE stays LIVE: it feeds
+// supervisor hang/recovery (`fresh_active_hook_seq`/`latest_hook_seq`/`record_event`),
+// `inject_delivery` (`last_user_prompt_submit_for`), `recovery_shadow`/`divergence_telemetry`
+// (`resolved_state_for`), and `hook_event` (`is_promoted`) — so `AGEND_HOOK_STATE_POC`,
+// `promotion_enabled`, and `is_promoted` are intentionally KEPT (they are not the dead POC).
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -257,8 +230,8 @@ fn now_ms() -> u64 {
 
 /// Map a hook event to the `AgentState` it evidences. Derivations follow the
 /// empirically-verified event semantics:
-/// - `UserPromptSubmit` → Thinking (turn started)
-/// - `PreToolUse` → ToolUse; `PostToolUse` → Thinking (between tools)
+/// - `UserPromptSubmit` → Active (turn started)
+/// - `PreToolUse` → Active (tool open); `PostToolUse` → Active (between tools)
 /// - `Stop` → Idle (turn ended; the `idle_prompt` Notification re-confirms)
 /// - `Notification(permission_prompt)` → PermissionPrompt
 /// - `Notification(idle_prompt)` → Idle
@@ -281,9 +254,9 @@ pub fn derive_state(
     use crate::state::AgentState;
     match hook_event_name {
         "SessionStart" => Some(AgentState::Starting),
-        "UserPromptSubmit" => Some(AgentState::Thinking),
-        "PreToolUse" => Some(AgentState::ToolUse),
-        "PostToolUse" => Some(AgentState::Thinking),
+        "UserPromptSubmit" => Some(AgentState::Active),
+        "PreToolUse" => Some(AgentState::Active),
+        "PostToolUse" => Some(AgentState::Active),
         "Stop" => Some(AgentState::Idle),
         "Notification" => match notification_type {
             Some("permission_prompt") => Some(AgentState::PermissionPrompt),
@@ -355,7 +328,7 @@ pub(crate) fn set_user_prompt_submit_for_test(name: &str, ms: u64) {
     let mut guard = store().lock();
     let entry = guard.entry(name.to_string()).or_insert(HookShadow {
         last_event: "UserPromptSubmit".to_string(),
-        derived_state: Some(crate::state::AgentState::Thinking),
+        derived_state: Some(crate::state::AgentState::Active),
         at_ms: ms,
         last_user_prompt_submit_ms: Some(ms),
         seq: next_seq(),
@@ -377,20 +350,20 @@ mod tests {
     use serial_test::serial;
 
     /// #t-26795: `fresh_active_hook_seq` returns a seq ONLY for a fresh ACTIVE hook
-    /// (ToolUse/Thinking). Idle (turn-ended) is excluded; an aged-out Thinking is
-    /// Stale → None; ToolUse never stales (event-pair). Absent → None.
+    /// (`Active`). Idle (turn-ended) is excluded; an aged-out non-tool Active hook is
+    /// Stale → None; an open tool (`PreToolUse`) never stales (event-pair). Absent → None.
     #[test]
     #[serial]
     fn fresh_active_hook_seq_active_only() {
         record_event("fah-tooluse", "PreToolUse", None);
         assert!(
             fresh_active_hook_seq("fah-tooluse").is_some(),
-            "ToolUse is active"
+            "an open tool is active"
         );
         record_event("fah-thinking", "PostToolUse", None);
         assert!(
             fresh_active_hook_seq("fah-thinking").is_some(),
-            "Thinking is active"
+            "a between-tools Active hook is active"
         );
         record_event("fah-idle", "Stop", None);
         assert!(
@@ -405,7 +378,7 @@ mod tests {
         backdate_for_test("fah-stale", HOOK_FRESHNESS.as_millis() as u64 + 1000);
         assert!(
             fresh_active_hook_seq("fah-stale").is_none(),
-            "a Thinking hook aged past freshness → Stale → None"
+            "a non-tool Active hook aged past freshness → Stale → None"
         );
     }
 
@@ -423,7 +396,7 @@ mod tests {
         let snap = snapshot_for("f3-consistency").expect("recorded");
         assert_eq!(
             resolve_snapshot(&snap),
-            HookResolution::Fresh(AgentState::ToolUse),
+            HookResolution::Fresh(AgentState::Active),
             "pure resolver maps the cloned snapshot"
         );
         assert_eq!(
@@ -435,7 +408,7 @@ mod tests {
 
     #[test]
     fn derive_map_covers_the_fragile_band() {
-        assert_eq!(derive_state("PreToolUse", None), Some(AgentState::ToolUse));
+        assert_eq!(derive_state("PreToolUse", None), Some(AgentState::Active));
         assert_eq!(
             derive_state("Notification", Some("permission_prompt")),
             Some(AgentState::PermissionPrompt)
@@ -447,7 +420,7 @@ mod tests {
         assert_eq!(derive_state("Stop", None), Some(AgentState::Idle));
         assert_eq!(
             derive_state("UserPromptSubmit", None),
-            Some(AgentState::Thinking)
+            Some(AgentState::Active)
         );
         // Unknown notification types stay unmapped (recorded, not derived).
         assert_eq!(derive_state("Notification", Some("auth_success")), None);
@@ -481,128 +454,72 @@ mod tests {
 
     // ── #1523 promotion §3.9 ────────────────────────────────────────────
 
-    /// ToolUse is EVENT-PAIR-closed: a long tool (PreToolUse, then no event past
-    /// HOOK_FRESHNESS) stays Fresh(ToolUse) — NOT demoted to the heuristic (the
-    /// #1985 nudge class). Only PostToolUse/Stop closes it (by overwriting).
+    /// An open tool is EVENT-PAIR-closed: a long tool (`PreToolUse`, then no event
+    /// past HOOK_FRESHNESS) stays Fresh(Active) — NOT demoted to the heuristic (the
+    /// #1985 nudge class). The never-stale exception keys on `last_event ==
+    /// "PreToolUse"`. Only PostToolUse/Stop closes it (by overwriting).
     #[test]
     fn long_tool_stays_tooluse_past_freshness() {
         record_event("longtool", "PreToolUse", None);
         backdate_for_test("longtool", HOOK_FRESHNESS.as_millis() as u64 + 600_000); // +10min past window
         assert_eq!(
             resolved_state_for("longtool"),
-            HookResolution::Fresh(AgentState::ToolUse),
-            "a long tool stays ToolUse until PostToolUse/Stop — never freshness-stale"
+            HookResolution::Fresh(AgentState::Active),
+            "a long tool stays Active until PostToolUse/Stop — never freshness-stale"
         );
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "longtool", AgentState::Idle),
-            AgentState::ToolUse,
-            "the still-open tool wins over a (wrong) heuristic"
-        );
-        // PostToolUse closes the pair (→ Thinking; freshness applies again).
+        // PostToolUse closes the pair (last_event no longer PreToolUse → freshness applies).
         record_event("longtool", "PostToolUse", None);
         assert_eq!(
             resolved_state_for("longtool"),
-            HookResolution::Fresh(AgentState::Thinking)
+            HookResolution::Fresh(AgentState::Active)
         );
     }
 
-    /// §3.9: flag OFF → byte-identical to the heuristic, even with a fresh hook.
+    /// state-merge (Thinking+ToolUse→Active) — pins the SRL-recovery freshness
+    /// CONTRAST the `resolve_snapshot` re-key must preserve. Post-merge a tool-open
+    /// AND a prompt-submit derive the SAME `Active`, so the never-freshness-stale
+    /// exception keys on the OPENING EVENT (`last_event == "PreToolUse"`), NOT the
+    /// now-ambiguous state: a long TOOL stays Fresh+active (the supervisor's
+    /// `fresh_active_hook_seq` keeps suppressing a stale screen-SRL — the #1985
+    /// class), while a long THINKING (UserPromptSubmit, no closing event) stales so
+    /// the heuristic falls back in. Reverse-mutation: drop the `last_event ==
+    /// "PreToolUse"` arm → the long-tool assertions go RED (event-key is load-bearing).
     #[test]
-    fn flag_off_is_byte_identical_to_heuristic() {
-        record_event("flagoff", "UserPromptSubmit", None); // → Thinking, fresh
+    fn long_active_freshness_keys_on_tool_open_event_not_merged_state() {
+        // (a) long TOOL — PreToolUse opener aged well past the window → stays Fresh(Active).
+        record_event("la-tool", "PreToolUse", None);
+        backdate_for_test("la-tool", HOOK_FRESHNESS.as_millis() as u64 + 600_000);
         assert_eq!(
-            authoritative_state_inner(false, "claude", "flagoff", AgentState::Idle),
-            AgentState::Idle,
-            "flag off must return the heuristic verbatim"
+            resolved_state_for("la-tool"),
+            HookResolution::Fresh(AgentState::Active),
+            "a long tool (PreToolUse opener) must NOT freshness-stale (#1985, event-pair-closed)"
+        );
+        assert!(
+            fresh_active_hook_seq("la-tool").is_some(),
+            "the long tool must stay an active SRL-recovery signal (feeds the supervisor floor)"
+        );
+        // (b) long THINKING — same merged `Active`, same age, but UserPromptSubmit
+        // (no tool-open, no closing event) → Stale. Distinguished ONLY by last_event.
+        record_event("la-think", "UserPromptSubmit", None);
+        backdate_for_test("la-think", HOOK_FRESHNESS.as_millis() as u64 + 600_000);
+        assert_eq!(
+            resolved_state_for("la-think"),
+            HookResolution::Stale,
+            "a long thinking (no tool-open) must freshness-stale — heuristic falls back in"
+        );
+        assert!(
+            fresh_active_hook_seq("la-think").is_none(),
+            "a staled thinking hook is not a fresh-active SRL-recovery signal"
         );
     }
 
-    /// §3.9: flag ON + STRONG backend + Fresh hook → the hook state is authoritative.
-    #[test]
-    fn claude_fresh_hook_wins_over_heuristic() {
-        record_event("claude-fresh", "UserPromptSubmit", None); // → Thinking, fresh
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "claude-fresh", AgentState::Idle),
-            AgentState::Thinking,
-            "a fresh hook state wins over the heuristic"
-        );
-    }
-
-    /// §3.9: flag ON + STRONG backend but STALE hook → fall back to the heuristic.
-    #[test]
-    fn stale_hook_falls_back_to_heuristic() {
-        record_event("claude-stale", "SessionStart", None); // → Starting
-        backdate_for_test("claude-stale", HOOK_FRESHNESS.as_millis() as u64 + 1_000);
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "claude-stale", AgentState::Idle),
-            AgentState::Idle,
-            "a stale hook state falls back to the heuristic (the floor)"
-        );
-    }
-
-    /// §3.9: a non-STRONG backend (no hooks fire) always uses the heuristic. In
-    /// v1 only claude is strong — agy is heuristic-only (configure_agy injects no
-    /// hooks; production-verified 0 events).
-    #[test]
-    fn backend_strength_gates_promotion() {
-        record_event("codex-agent", "UserPromptSubmit", None); // → Thinking, fresh
-        assert_eq!(
-            authoritative_state_inner(true, "codex", "codex-agent", AgentState::Idle),
-            AgentState::Idle,
-            "codex is not a hook backend — heuristic only"
-        );
-        // agy is NOT strong in v1 — even a (manually-injected) hook is ignored.
-        record_event("agy-agent", "UserPromptSubmit", None);
-        assert_eq!(
-            authoritative_state_inner(true, "agy", "agy-agent", AgentState::Idle),
-            AgentState::Idle,
-            "agy is heuristic-only in v1 (no hook injection)"
-        );
-        // claude IS strong — its fresh hook wins.
-        record_event("claude-agent", "UserPromptSubmit", None);
-        assert_eq!(
-            authoritative_state_inner(true, "claude", "claude-agent", AgentState::Idle),
-            AgentState::Thinking,
-            "claude is the v1 STRONG backend"
-        );
-    }
-
-    /// §3.9 probe-6 (reviewer-2 #2014): the REAL env-gate wiring — the public
-    /// `authoritative_state` resolves the flag through `promotion_enabled()`
-    /// reading `AGEND_HOOK_STATE_POC`. `#[serial]` + an RAII guard handle the
-    /// process-global env var (restored even on panic).
-    #[test]
-    #[serial(hook_state_poc)] // shares the AGEND_HOOK_STATE_POC env with mcp_config's flag test
-    fn env_flag_gates_promotion_end_to_end() {
-        struct EnvGuard(Option<String>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("AGEND_HOOK_STATE_POC", v),
-                    None => std::env::remove_var("AGEND_HOOK_STATE_POC"),
-                }
-            }
-        }
-        let _guard = EnvGuard(std::env::var("AGEND_HOOK_STATE_POC").ok());
-
-        record_event("env-claude", "UserPromptSubmit", None); // → Thinking, fresh
-
-        // Flag unset → heuristic (the byte-identical path), via the real gate.
-        std::env::remove_var("AGEND_HOOK_STATE_POC");
-        assert_eq!(
-            authoritative_state("claude", "env-claude", AgentState::Idle),
-            AgentState::Idle,
-            "flag unset → heuristic (real env gate)"
-        );
-
-        // Flag = 1 → the fresh claude hook wins, through promotion_enabled().
-        std::env::set_var("AGEND_HOOK_STATE_POC", "1");
-        assert_eq!(
-            authoritative_state("claude", "env-claude", AgentState::Idle),
-            AgentState::Thinking,
-            "flag=1 → the fresh claude hook wins via the real env gate"
-        );
-    }
+    // #2413 (B): the `authoritative_state` / `authoritative_state_inner` promotion tests
+    // (`flag_off_is_byte_identical_to_heuristic`, `claude_fresh_hook_wins_over_heuristic`,
+    // `stale_hook_falls_back_to_heuristic`, `backend_strength_gates_promotion`,
+    // `env_flag_gates_promotion_end_to_end`) were REMOVED with the functions they tested —
+    // the #1523 snapshot promotion is superseded by the Shadow Observer gate (see the
+    // removal note above `is_promoted`). The hook-shadow STORE tests (`resolved_state_for`,
+    // freshness, `record_event`, `is_promoted`) remain — that infra is still live.
 
     /// Refinement round 1: `PreCompact` is TRANSIENT — recorded (event
     /// visible) but mapped to NO persistent state (the ContextFull-vs-Thinking
@@ -624,17 +541,17 @@ mod tests {
         record_event("compact-test", "UserPromptSubmit", None);
         assert_eq!(
             resolved_state_for("compact-test"),
-            HookResolution::Fresh(AgentState::Thinking)
+            HookResolution::Fresh(AgentState::Active)
         );
     }
 
     #[test]
     fn record_and_snapshot_roundtrip() {
         let derived = record_event("shadow-test-agent", "PreToolUse", None);
-        assert_eq!(derived, Some(AgentState::ToolUse));
+        assert_eq!(derived, Some(AgentState::Active));
         let snap = snapshot_for("shadow-test-agent").expect("recorded");
         assert_eq!(snap.last_event, "PreToolUse");
-        assert_eq!(snap.derived_state, Some(AgentState::ToolUse));
+        assert_eq!(snap.derived_state, Some(AgentState::Active));
         assert!(snap.at_ms > 0);
         assert!(snapshot_for("never-seen").is_none());
     }

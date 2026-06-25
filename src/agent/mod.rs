@@ -41,8 +41,8 @@ pub struct AgentCore {
     /// with confidence/authority + decay/liveness backstop). Purely ADDITIVE —
     /// it NEVER rewrites `agent_state`; a consumer diffs the two under this same
     /// `core.lock()` (that diff IS the quantification). `None` until the first
-    /// per-tick reduce under `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ stays
-    /// `None`, zero behaviour change). Written by `per_tick::shadow_observe`.
+    /// per-tick reduce (default-ON; stays `None` only under the
+    /// `AGEND_SHADOW_OBSERVER=0` kill-switch). Written by `per_tick::shadow_observe`.
     pub(crate) observed_status: Option<crate::daemon::shadow::reducer::ObservedStatus>,
 }
 
@@ -76,6 +76,12 @@ pub struct AgentHandle {
     /// stops contending with the PTY-feed producer that holds the core lock under
     /// the boot output flood. Aliases the same `AtomicU8` `record_set` writes.
     pub(crate) published_state: Arc<std::sync::atomic::AtomicU8>,
+    /// #2413 (A): lock-free clone of the core's badge-override mirror
+    /// (`StateTracker::published_observed_handle`). Read alongside `published_state`
+    /// in `render::build_agent_state_snapshot` so the badge can show a high-confidence
+    /// Shadow Observer correction WITHOUT `core.lock()`. Holds the no-override
+    /// sentinel ([`crate::state::OBSERVED_NONE`]) until the shadow driver publishes one.
+    pub(crate) published_observed: Arc<std::sync::atomic::AtomicU8>,
     pub(crate) child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     pub(crate) submit_key: String,
     pub(crate) inject_prefix: String,
@@ -102,6 +108,15 @@ pub(crate) fn published_state_of(
     core: &Arc<CoreMutex<AgentCore>>,
 ) -> Arc<std::sync::atomic::AtomicU8> {
     core.lock().state.published_handle()
+}
+
+/// #2413 (A): clone an agent's lock-free badge-override mirror from its core (the
+/// sibling of [`published_state_of`]). Lets `render::build_agent_state_snapshot`
+/// read the Shadow Observer's gated correction without `core.lock()`.
+pub(crate) fn published_observed_of(
+    core: &Arc<CoreMutex<AgentCore>>,
+) -> Arc<std::sync::atomic::AtomicU8> {
+    core.lock().state.published_observed_handle()
 }
 
 // #1441: keyed by stable InstanceId (UUID), NOT name. Live-process identity
@@ -831,12 +846,13 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("AGEND_HOME", h);
     }
 
-    // #2413 Shadow Observer — LOCAL plane (flag default-OFF via AGEND_SHADOW_OBSERVER).
+    // #2413 Shadow Observer — LOCAL plane (default-ON; `AGEND_SHADOW_OBSERVER=0` disables).
     // Inject a per-session unix-socket path + a freshly-minted 256-bit token scoped to
-    // THIS spawned claude, so its lifecycle hooks emit token-authenticated evidence to
-    // the daemon WITHOUT touching `~/.claude` global. claude-only (the hook-bearing
-    // backend). Set AFTER env_clear (like AGEND_INSTANCE_NAME) so isolation can't drop
-    // it; the hook subprocess inherits both vars from claude's env.
+    // THIS spawned backend, so its lifecycle hooks emit token-authenticated evidence to
+    // the daemon WITHOUT touching the backend's global config. Hook-bearing backends only
+    // (`has_state_hooks()` = claude + agy #2413 Phase D). Set AFTER env_clear (like
+    // AGEND_INSTANCE_NAME) so isolation can't drop it; the hook subprocess inherits both
+    // vars from the backend's env (claude `.claude` hooks / agy `.agents/hooks.json`).
     if crate::daemon::shadow::enabled()
         && detected_backend
             .as_ref()
@@ -992,6 +1008,25 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         // the env covers resume where the config side could not. Keep BOTH:
         // config as the documented belt, env as the resume-proof suspenders.
         cmd.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+    }
+
+    // #2413 opencode plane: when the Shadow Observer is ON, inject `--port N` (an
+    // OS-allocated free port) so opencode's embedded HTTP server is reachable on a KNOWN
+    // port for the SSE `/event` observer to subscribe (opencode is client-server; its TUI
+    // embeds the server). flag-OFF (or any non-opencode backend) → `should_inject` is
+    // false → NOTHING is added → the launch command is byte-identical to today (the
+    // load-bearing flag-OFF safety, regression-pinned in `shadow::opencode` tests). An
+    // alloc failure → skip injection (the agent spawns un-observed, never broken). The
+    // injected port is registered so the observer supervisor knows where to subscribe.
+    if crate::daemon::shadow::opencode::should_inject(
+        detected_backend.as_ref(),
+        crate::daemon::shadow::enabled(),
+    ) {
+        if let Some(port) = crate::daemon::shadow::opencode::alloc_port() {
+            cmd.arg("--port");
+            cmd.arg(port.to_string());
+            crate::daemon::shadow::opencode::register_port(name, port);
+        }
     }
 
     // Add agend-terminal binary + $AGEND_HOME/bin (shim) to PATH.
@@ -1297,6 +1332,7 @@ pub fn spawn_agent(
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
                 published_state: published_state_of(&core),
+                published_observed: published_observed_of(&core),
                 core: Arc::clone(&core),
                 child: Arc::clone(&child_arc),
                 submit_key: submit_key.to_string(),
@@ -3131,6 +3167,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         observed_status: None,
     }));
     let published_state = core.lock().state.published_handle();
+    let published_observed = core.lock().state.published_observed_handle();
     AgentHandle {
         id,
         name: name.to_string().into(),
@@ -3139,6 +3176,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         pty_master,
         core,
         published_state,
+        published_observed,
         child: Arc::new(Mutex::new(child)),
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),

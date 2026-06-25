@@ -109,18 +109,18 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
                         tracing::info!("detached");
                         break;
                     }
-                    // Ctrl+B i — paste image from clipboard
+                    // Ctrl+B i — paste a clipboard image into the attached agent
+                    // (#2435). Shares the surface-agnostic core with app mode.
                     if code == KeyCode::Char('i') && modifiers.is_empty() {
-                        match paste_image_from_clipboard() {
-                            Ok(path) => {
-                                let msg = format!("[AGEND-IMAGE-PASTE: {}]\n", path.display());
-                                tracing::info!(path = %path.display(), "image paste injected");
-                                if bridge.send_input(msg.as_bytes()).is_err() {
+                        match crate::image_paste::capture_clipboard_image() {
+                            Ok((path, marker)) => {
+                                tracing::info!(target: "image_paste", path = %path.display(), "image paste → agent (attach)");
+                                if bridge.send_input(marker.as_bytes()).is_err() {
                                     break;
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "image paste failed — no image in clipboard?");
+                                tracing::warn!(target: "image_paste", error = %e, "image paste failed (no clipboard image?)");
                             }
                         }
                         continue;

@@ -52,7 +52,6 @@ fn repro_tmp_home(tag: &str) -> PathBuf {
 }
 
 #[test]
-#[ignore = "channel-LOW-2: already-fixed fidelity check (real topics.json path); green now"]
 fn inject_provenance_failure_leaves_real_topic_registry_untouched_channel() {
     use crate::channel::telegram::topic_registry::{
         load_topic_registry, register_topic, topic_registry_path,
