@@ -310,20 +310,26 @@ fn normalize(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Compare top-level fn bodies between two source strings. Returns
-/// `(divergent, identical)` sorted name lists for fn present in both.
-///
-/// Passing an empty string (e.g. when a file has been deleted) yields
-/// an empty fn set for that side, so no intersection is possible and
-/// both returned vectors are empty — a "trivial pass" for the caller.
+/// Compare top-level fn bodies between two source strings (string-input
+/// convenience used by the synthetic unit tests). Delegates to
+/// [`compare_fn_maps`].
 fn compare_fns_from_sources(ops_src: &str, handlers_src: &str) -> (Vec<String>, Vec<String>) {
-    let ops_fns = extract_top_level_fns(ops_src);
-    let handlers_fns = extract_top_level_fns(handlers_src);
+    compare_fn_maps(
+        &extract_top_level_fns(ops_src),
+        &extract_top_level_fns(handlers_src),
+    )
+}
 
+/// Core comparison over two `name → body` maps. Returns `(divergent, identical)`
+/// sorted name lists for fn present in BOTH maps (divergent = same name, bodies
+/// differ; identical = same name, byte-identical body = dedup hazard).
+fn compare_fn_maps(
+    ops_fns: &HashMap<String, String>,
+    handlers_fns: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
     let mut divergent: Vec<String> = Vec::new();
     let mut identical: Vec<String> = Vec::new();
-
-    for (name, ops_body) in &ops_fns {
+    for (name, ops_body) in ops_fns {
         if let Some(h_body) = handlers_fns.get(name) {
             if ops_body == h_body {
                 identical.push(name.clone());
@@ -332,7 +338,101 @@ fn compare_fns_from_sources(ops_src: &str, handlers_src: &str) -> (Vec<String>, 
             }
         }
     }
+    divergent.sort();
+    identical.sort();
+    (divergent, identical)
+}
 
+/// #2452: cheap, raw-string-SAFE scan of every `.rs` under `dir` for top-level fn
+/// NAMES → the file that defines each. Name-only (per column-0 line via
+/// `detect_fn_name`; NO body extraction), so it never trips the parser's
+/// raw-string fail-loud panic on unrelated handler fn (issue #28). The handlers
+/// entrypoint `mod.rs` holds almost no impl — the real handlers live in sibling
+/// `src/mcp/handlers/*.rs` (+ the `ci/` subtree); scanning only `mod.rs` made the
+/// ops∩handlers intersection EMPTY, so the drift assert could never fail (vacuous).
+///
+/// IO errors (a missing/renamed dir or unreadable file) PANIC rather than
+/// silently yielding an empty set — a path that drifts out from under the guard
+/// must FAIL it, not turn it permanently green (issue #2452 fix #2; replaces the
+/// old `unwrap_or_default()` that let a deleted file degrade to a trivial pass).
+/// Over-approximation (e.g. a `fn` line inside a block comment) is harmless: the
+/// body-compare in [`compare_ops_to_handler_tree`] re-parses with the precise
+/// extractor and drops any name that isn't a real top-level fn.
+fn scan_tree_fn_names(dir: &Path) -> HashMap<String, std::path::PathBuf> {
+    let mut names: HashMap<String, std::path::PathBuf> = HashMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = std::fs::read_dir(&d).unwrap_or_else(|e| {
+            panic!(
+                "#2452 dual-track guard: cannot read handlers dir {} ({e}). A moved/renamed \
+                 handlers tree must FAIL this guard, not silently pass.",
+                d.display()
+            )
+        });
+        for entry in rd {
+            let path = entry
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "#2452 dual-track guard: dir entry error under {} ({e})",
+                        d.display()
+                    )
+                })
+                .path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "#2452 dual-track guard: cannot read {} ({e})",
+                        path.display()
+                    )
+                });
+                for line in src.lines() {
+                    if let Some(name) = detect_fn_name(line) {
+                        names
+                            .entry(name.to_string())
+                            .or_insert_with(|| path.clone());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// #2452: compare `ops_fns` (name→body) against the handler tree under `dir`
+/// WITHOUT body-parsing every handler fn — phase 1 is the raw-string-safe
+/// name-only [`scan_tree_fn_names`]; phase 2 body-parses ONLY the (rare) handler
+/// file(s) defining a name also present in ops. So today's empty intersection
+/// parses zero handler bodies (no raw-string panic), while a re-introduced
+/// dual-track fn is body-compared and flagged. Returns sorted
+/// `(divergent, identical)`.
+fn compare_ops_to_handler_tree(
+    ops_fns: &HashMap<String, String>,
+    dir: &Path,
+) -> (Vec<String>, Vec<String>) {
+    let handler_names = scan_tree_fn_names(dir);
+    let mut divergent: Vec<String> = Vec::new();
+    let mut identical: Vec<String> = Vec::new();
+    for (name, ops_body) in ops_fns {
+        if let Some(file) = handler_names.get(name) {
+            let h_src = std::fs::read_to_string(file).unwrap_or_else(|e| {
+                panic!(
+                    "#2452 dual-track guard: cannot read {} ({e})",
+                    file.display()
+                )
+            });
+            // Precise re-parse of just the sharing file (drops name-scan
+            // over-approximations that aren't real top-level fn).
+            if let Some(h_body) = extract_top_level_fns(&h_src).get(name) {
+                if h_body == ops_body {
+                    identical.push(name.clone());
+                } else {
+                    divergent.push(name.clone());
+                }
+            }
+        }
+    }
     divergent.sort();
     identical.sort();
     (divergent, identical)
@@ -340,31 +440,35 @@ fn compare_fns_from_sources(ops_src: &str, handlers_src: &str) -> (Vec<String>, 
 
 #[test]
 fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
-    // Task #12 deleted `src/ops.rs`; the canonical single-source module is now
-    // `src/agent_ops.rs` (the Option C consolidation target). Repointed here so
-    // the guard stays live for the current architecture — previously it read
-    // the deleted `src/ops.rs`, which `unwrap_or_default()` turned into a
-    // permanent empty-source trivial pass (issue: the guard had silently gone
-    // vacuous). Compared against the handlers entrypoint `mod.rs`.
+    // #2452: the canonical single-source module is `src/agent_ops.rs` (Task #12
+    // successor to the deleted `src/ops.rs`, the Option C consolidation target).
+    // The handlers side is the WHOLE `src/mcp/handlers/` subtree — impls live in
+    // sibling modules (+ the `ci/` subtree), NOT just `mod.rs`. The prior guard
+    // scanned only `mod.rs`, whose fn-name set has an EMPTY intersection with
+    // `agent_ops.rs` → `assert!(divergent.is_empty())` could never fail (vacuous,
+    // false confidence). It also used `unwrap_or_default()`, so deleting/moving a
+    // file degraded to a permanent trivial pass.
     //
-    // `unwrap_or_default()` (not `.expect()`) so a future reorg that deletes
-    // either file cannot crash the test. A missing file → empty source → 0
-    // top-level fn → no possible intersection → trivial pass. Detection remains
-    // active for whichever file still exists; when both exist behavior is
-    // unchanged. (Handlers are now split across sub-modules; a future
-    // enhancement could scan the whole `src/mcp/handlers/` tree, not just mod.rs.)
+    // Fix: scan the real dual-track surface (`compare_ops_to_handler_tree` —
+    // raw-string-safe name scan of the whole tree + lazy body-compare of only the
+    // shared names) and `expect()` the canonical ops module — a missing/renamed
+    // path now FAILS the guard loudly instead of going silently green. Today's
+    // intersection is legitimately empty (Option C consolidated the known
+    // dual-track fn), so this passes; if a fn is re-introduced into both tracks,
+    // the guard now CATCHES it — proven by `tree_scan_detects_drift_across_subtree`.
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let ops_src =
-        std::fs::read_to_string(Path::new(manifest).join("src/agent_ops.rs")).unwrap_or_default();
-    let handlers_src = std::fs::read_to_string(Path::new(manifest).join("src/mcp/handlers/mod.rs"))
-        .unwrap_or_default();
-
-    let (divergent, identical) = compare_fns_from_sources(&ops_src, &handlers_src);
+    let ops_src = std::fs::read_to_string(Path::new(manifest).join("src/agent_ops.rs")).expect(
+        "#2452 dual-track guard: src/agent_ops.rs must exist (canonical ops module); \
+         a moved/renamed file must FAIL this guard, not silently pass",
+    );
+    let ops_fns = extract_top_level_fns(&ops_src);
+    let (divergent, identical) =
+        compare_ops_to_handler_tree(&ops_fns, &Path::new(manifest).join("src/mcp/handlers"));
 
     if !identical.is_empty() {
         eprintln!(
             "WARNING: dual-track DEDUP HAZARD — fn shared (byte-identical) between \
-             src/agent_ops.rs and src/mcp/handlers/mod.rs:\n  {}\n\
+             src/agent_ops.rs and src/mcp/handlers/**:\n  {}\n\
              Consolidate into `crate::agent_ops` before bodies diverge \
              (Task #9 Option C precedent).",
             identical.join(", ")
@@ -373,7 +477,7 @@ fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
 
     assert!(
         divergent.is_empty(),
-        "dual-track DRIFT between src/agent_ops.rs and src/mcp/handlers/mod.rs — these fn \
+        "dual-track DRIFT between src/agent_ops.rs and src/mcp/handlers/** — these fn \
          share a name but their bodies differ, indicating silent divergence:\n  {}\n\n\
          Fix: consolidate into `crate::agent_ops` (single source of truth). \
          Root cause reference: 2026-04-14 `cleanup_working_dir` Kiro drift \
@@ -383,15 +487,87 @@ fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
 }
 
 #[test]
-fn handles_missing_ops_rs_gracefully() {
-    // Defensive pin: if a future reorg removes `src/ops.rs` (Task #12
-    // relocation is the immediate trigger; any future collapse would
-    // behave the same), the detector must treat the missing side as
-    // an empty source and report no drift — not panic.
+fn tree_scan_detects_drift_across_subtree() {
+    // #2452 NON-VACUITY PROOF (reverse-mutation): feed the REAL tree scanner a
+    // synthetic handlers subtree where a fn shares a name with an ops fn but its
+    // body DIFFERS — the guard MUST fire (divergent non-empty). The drifting fn
+    // lives in a NESTED dir to prove the recursive walk reaches it. Then make the
+    // bodies identical → no drift, but a dedup hazard. This pins that the guard is
+    // load-bearing: if dual-track drift is ever re-introduced, `extract_tree_fns`
+    // + `compare_fn_maps` catch it (the exact property the old mod.rs-only scan
+    // could never exercise).
+    let base = std::env::temp_dir().join(format!(
+        "agend-dual-track-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let nested = base.join("ci"); // nested module dir — exercises recursion
+    std::fs::create_dir_all(&nested).expect("mk temp handlers subtree");
+    std::fs::write(
+        base.join("mod.rs"),
+        "pub fn unrelated_entrypoint() {\n    let _ = 0;\n}\n",
+    )
+    .expect("write temp mod.rs");
+    std::fs::write(
+        nested.join("merge.rs"),
+        "pub fn cleanup_working_dir() {\n    let _ = 999;\n}\n",
+    )
+    .expect("write temp nested merge.rs");
+
+    // Drift: ops body differs from the nested handler body → MUST be caught.
+    let ops_drift = "pub fn cleanup_working_dir() {\n    let _ = 1;\n}\n";
+    let (divergent, _) = compare_ops_to_handler_tree(&extract_top_level_fns(ops_drift), &base);
+    assert!(
+        divergent.contains(&"cleanup_working_dir".to_string()),
+        "tree scan MUST catch a drifting fn defined in a NESTED handler module \
+         (the guard is vacuous otherwise); got divergent={divergent:?}"
+    );
+
+    // Reverse mutation: identical bodies → no drift, surfaces as a dedup hazard.
+    let ops_same = "pub fn cleanup_working_dir() {\n    let _ = 999;\n}\n";
+    let (divergent2, identical2) =
+        compare_ops_to_handler_tree(&extract_top_level_fns(ops_same), &base);
+    assert!(
+        divergent2.is_empty(),
+        "identical bodies must NOT report drift; got {divergent2:?}"
+    );
+    assert!(
+        identical2.contains(&"cleanup_working_dir".to_string()),
+        "identical cross-track fn must surface as a dedup hazard; got {identical2:?}"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+#[should_panic(expected = "#2452 dual-track guard")]
+fn missing_handlers_dir_fails_loudly() {
+    // #2452 fix #2: a missing/renamed handlers tree must FAIL the guard (panic),
+    // NOT silently yield an empty set → trivial pass (the old `unwrap_or_default`
+    // failure mode). Point the scan at a non-existent dir and assert it panics.
+    let bogus = std::env::temp_dir().join(format!(
+        "agend-dual-track-missing-{}-does-not-exist",
+        std::process::id()
+    ));
+    let _ = scan_tree_fn_names(&bogus);
+}
+
+#[test]
+fn empty_source_yields_no_false_drift() {
+    // PURE-COMPARATOR property: an empty source string has zero top-level fn, so
+    // no name can intersect → no drift, no dedup hazard. This pins the comparator
+    // core, NOT a file-missing contract.
     //
-    // This test hits the pure helper directly (no filesystem) so it
-    // fails loudly if someone removes the graceful fallback from the
-    // integration test above.
+    // ⚠ #2452: the integration test no longer treats a MISSING FILE as "empty →
+    // trivial pass" — it `expect()`s `src/agent_ops.rs` and `extract_tree_fns`
+    // panics on a missing/unreadable handlers tree (see
+    // `missing_handlers_dir_fails_loudly`). A path that drifts out from under the
+    // guard now FAILS it loudly instead of going silently green. This test only
+    // asserts the comparator's empty-INPUT handling (so synthetic empty sides in
+    // the unit tests above don't produce phantom drift).
 
     // Both sources empty — trivially no intersection.
     let (div, ident) = compare_fns_from_sources("", "");
