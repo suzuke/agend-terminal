@@ -1640,6 +1640,40 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
     matches!(state, AgentState::Idle)
 }
 
+/// #2466: the WORK-TURN 529 arm predicate — the looser signal the dev-3 incident proved
+/// fired. A claude work-turn that hits an ApiError/529 latches `blocked_reason==RateLimit`
+/// (via the watchdog's gate-free `classify_pty_output`) and leaves a `throttle_hint` token on
+/// screen, yet the StateTracker `AgentState` stays Idle (the #1769 positional defeat) so the
+/// strict `state==ServerRateLimit` arm never fires. This predicate lets the retry arm latch
+/// that case, GUARDED against false-positives:
+/// - `blocked_rl` (primary, lead-vetted) — classify matched a real RATE-LIMIT error pattern,
+///   not a generic ApiError; `QuotaExceeded` is a distinct variant, so user quota is excluded.
+/// - `has_throttle_hint` — corroborating throttle token still on screen.
+/// - `!recovered && !self_cleared` — the agent is not awake/progressing. `recovered` =
+///   `recovered_within(RECOVERY_SILENCE)`, so `!recovered` already encodes the productive-silence
+///   requirement AND preserves the never-produced fresh-agent edge (a just-spawned agent that
+///   immediately 529s still arms — an explicit silence threshold would wrongly block it).
+///
+/// SINGLE-OWNERSHIP (decision d-20260625052109609105-0): there is NO live production recovery-arm
+/// today — `recovery_shadow` is a measure-only Phase-0 shadow that takes no action — so there is
+/// no episode for this work-turn arm to double-own. The boundary vs the (future) expectation-keyed
+/// 529-recovery is deliberately NOT enforced here: gating on `recovery_shadow`'s expectation map
+/// would let the `AGEND_RECOVERY_SHADOW=1` MEASURE-ONLY flag suppress this production arm — and a
+/// never-cleared expectation could permanently block arming — violating the shadow's zero-behavior
+/// invariant (r6 #2469). When dev-2 promotes 529-recovery to active it will carve the boundary
+/// with a PRODUCTION signal, not the shadow telemetry.
+///
+/// StopFailure-hook corroboration is deliberately NOT required (hooks are best-effort/droppable,
+/// and would re-introduce a false-negative); it only adds confidence when present (claude).
+fn work_turn_throttle_arm(
+    blocked_rl: bool,
+    has_throttle_hint: bool,
+    recovered: bool,
+    self_cleared: bool,
+) -> bool {
+    blocked_rl && has_throttle_hint && !recovered && !self_cleared
+}
+
 /// #1470 (re-scoped slice, credit @cheerc): notify an agent's team
 /// orchestrator, via its INBOX, that the transient-error auto-retry has been
 /// exhausted. This is the agent-inbox path (not operator Telegram), so it does
@@ -1960,13 +1994,25 @@ pub(crate) fn process_error_recovery(
             // produced (`last_productive_output == None`) is NOT recovery, so it
             // latches + injects normally (the fresh-agent edge the creation stamp
             // used to mis-suppress). `productive_silence` is for the log only.
-            let (state, recovered, self_cleared, has_throttle_hint, productive_silence) = {
+            let (state, recovered, self_cleared, has_throttle_hint, blocked_rl, productive_silence) = {
                 let mut core = handle.core.lock();
                 // KEEP-RAW (#2465): the SRL retry arm reads raw core.state.current. claude hooks
                 // never emit RateLimited (a StopFailure → ApiError, the API plane owns rate-limit),
                 // so operated_state would be inert here; the true ApiError-as-rate-limit SRL fix is
-                // tracked in #2466, out of this PR's scope.
+                // #2466 (the work-turn looser-signal arm below).
                 let state = core.state.current;
+                // #2466: the watchdog's LOOSER rate-limit latch — `classify_pty_output` matched a
+                // throttle banner (it runs `detect_with_match` WITHOUT the StateTracker's #919
+                // red-anchor / #1769 positional gates), so this can be `RateLimit` even when the raw
+                // `state` reads Idle (the dev-3 work-turn 529 shape). This is the signal that DID
+                // fire in the incident; the loose arm below consults it. Read BEFORE the
+                // `ServerRateLimit` set below so it reflects the watchdog latch, not our own write
+                // (which only happens on the strict `state==ServerRateLimit` branch anyway).
+                // Excludes `QuotaExceeded` (user quota) by construction — that is a distinct variant.
+                let blocked_rl = matches!(
+                    core.health.current_reason,
+                    Some(crate::health::BlockedReason::RateLimit { .. })
+                );
                 let recovered = core.state.recovered_within(RECOVERY_SILENCE);
                 // #2232: ground-truth recovery latch the agent set by self-clearing
                 // its rate-limit block via the MCP `clear_blocked_reason` action.
@@ -2002,7 +2048,14 @@ pub(crate) fn process_error_recovery(
                     // (cross-episode), mirroring `clears_server_rate_limit_retry`.
                     core.health.rate_limit_self_cleared = false;
                 }
-                (state, recovered, self_cleared, has_hint, productive_silence)
+                (
+                    state,
+                    recovered,
+                    self_cleared,
+                    has_hint,
+                    blocked_rl,
+                    productive_silence,
+                )
             };
 
             // ── #t-26795 SRL hook-override (operator-reported sticky-screen flap) ──
@@ -2047,6 +2100,18 @@ pub(crate) fn process_error_recovery(
                 }
             }
 
+            // #2466: the WORK-TURN 529 looser-signal arm (see `work_turn_throttle_arm`). When the
+            // strict `state==ServerRateLimit` did NOT latch (the #1769 positional defeat → screen
+            // reads Idle) but the watchdog's gate-free classify still flagged a throttle
+            // (`blocked_rl`) corroborated by a screen throttle token, latch the SAME retry track so
+            // a work-turn 529 auto-retries instead of hanging. Threaded as an `|| loose_arm` into
+            // the arm branch below so the Idle-clear branch (`clears_server_rate_limit_retry`) only
+            // fires when this is FALSE — arm and clear stay synchronized on one signal (no same-tick
+            // fight). Single-ownership vs the future 529-recovery is left to a PRODUCTION signal
+            // (not the measure-only recovery_shadow); see `work_turn_throttle_arm`.
+            let loose_arm =
+                work_turn_throttle_arm(blocked_rl, has_throttle_hint, recovered, self_cleared);
+
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
             // gated on the agent being FRESHLY observed in ServerRateLimit — not on a
@@ -2088,10 +2153,21 @@ pub(crate) fn process_error_recovery(
                         "ServerRateLimit retry cleared — agent recovered"
                     );
                 }
-            } else if state == AgentState::ServerRateLimit {
+            } else if state == AgentState::ServerRateLimit || loose_arm {
                 let track = retry_tracks.entry(name.to_string()).or_insert_with(|| {
                     let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
-                    tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry (Phase A)");
+                    tracing::info!(
+                        agent = %name,
+                        delay_secs = delay.as_secs(),
+                        // #2466: distinguish the strict screen-classified SRL from the work-turn
+                        // 529 caught by the looser blocked_reason+throttle_hint signal.
+                        trigger = if state == AgentState::ServerRateLimit {
+                            "server_rate_limit"
+                        } else {
+                            "work_turn_throttle"
+                        },
+                        "rate-limit retry scheduled (Phase A)"
+                    );
                     RateLimitRetry {
                         retry_count: 0,
                         next_retry_at: now + delay,
@@ -3975,6 +4051,212 @@ instances:
         );
         assert_eq!(tracks["test-agent"].retry_count, 0);
         assert!(!tracks["test-agent"].exhausted);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─────────────────── #2466 work-turn 529 looser-signal arm ───────────────────
+
+    /// PURE truth table for the work-turn throttle arm predicate. The arm fires ONLY with the
+    /// full conjunction; dropping any guard (the primary `blocked_rl`, the `throttle_hint`
+    /// corroboration, or the `!recovered`/`!self_cleared` liveness) must turn it off. NEUTER for
+    /// the integration arm below.
+    #[test]
+    fn work_turn_throttle_arm_truth_table_2466() {
+        // Full conjunction → arm.
+        assert!(
+            super::work_turn_throttle_arm(true, true, false, false),
+            "blocked_rl + throttle_hint + !recovered + !self_cleared → arm"
+        );
+        // Each guard is load-bearing.
+        assert!(
+            !super::work_turn_throttle_arm(false, true, false, false),
+            "no blocked_reason=RateLimit (a bare throttle-token mention) → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, false, false, false),
+            "no throttle hint on screen → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, true, true, false),
+            "recovered (productive output) → must NOT arm"
+        );
+        assert!(
+            !super::work_turn_throttle_arm(true, true, false, true),
+            "self_cleared (agent awake) → must NOT arm"
+        );
+    }
+
+    /// LOAD-BEARING (the dev-3 incident, real path through `process_error_recovery`): a work-turn
+    /// hit a 529/ApiError — the StateTracker `AgentState` reads Idle (the #1769 positional defeat)
+    /// but the watchdog's gate-free `classify_pty_output` latched `blocked_reason=RateLimit` and a
+    /// throttle banner is still on screen. The retry arm MUST latch a track (so a `continue` retry
+    /// fires) instead of leaving the agent hung. NEUTER: drop `|| loose_arm` from the arm branch →
+    /// state=Idle falls straight to the Idle-clear branch → no track → RED.
+    #[test]
+    fn work_turn_529_arms_retry_via_looser_signal_2466() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("wt529-arm");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        // state=Idle (NOT ServerRateLimit — the strict arm can't fire), but the looser signals
+        // that the dev-3 incident proved fired: blocked_reason=RateLimit (watchdog/classify) and a
+        // throttle banner on screen (screen_has_throttle_hint).
+        let (handle, _reader) = mock_agent_handle("wt529", crate::state::AgentState::Idle);
+        {
+            let mut core = handle.core.lock();
+            core.health
+                .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            core.vterm
+                .process(b"\r\nAPI Error: Server is temporarily limiting requests\r\n");
+        }
+        registry.lock().insert(handle.id, handle);
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        assert!(
+            tracks.contains_key("wt529"),
+            "#2466: a work-turn 529 (Idle + blocked_reason=RateLimit + throttle_hint) must arm the retry track via the looser signal"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// FP guard (real path): the loose arm must require BOTH the primary `blocked_reason=RateLimit`
+    /// AND the throttle-hint corroboration. An Idle agent with only one of the two must NOT arm —
+    /// a bare ApiError or a mere prose mention of a throttle token cannot trigger a `continue` spam.
+    #[test]
+    fn work_turn_529_partial_signal_does_not_arm_2466() {
+        let home = tmp_home("wt529-fp");
+
+        // (a) throttle hint on screen but NO blocked_reason=RateLimit (classify did not match a
+        //     real rate-limit error — just a token in prose) → must NOT arm.
+        {
+            let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+            let (handle, _r) = mock_agent_handle("fp-no-blocked", crate::state::AgentState::Idle);
+            handle
+                .core
+                .lock()
+                .vterm
+                .process(b"\r\ndiscussing the 429 limiting error in an RCA\r\n");
+            registry.lock().insert(handle.id, handle);
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                past_boot_grace(),
+            );
+            assert!(
+                !tracks.contains_key("fp-no-blocked"),
+                "#2466 FP: throttle token without blocked_reason=RateLimit must NOT arm"
+            );
+        }
+
+        // (b) blocked_reason=RateLimit but NO throttle hint on screen (banner scrolled off) →
+        //     must NOT arm (corroboration absent).
+        {
+            let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+            let (handle, _r) = mock_agent_handle("fp-no-hint", crate::state::AgentState::Idle);
+            handle
+                .core
+                .lock()
+                .health
+                .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            registry.lock().insert(handle.id, handle);
+            super::process_error_recovery(
+                &home,
+                &registry,
+                &mut tracks,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+                past_boot_grace(),
+            );
+            assert!(
+                !tracks.contains_key("fp-no-hint"),
+                "#2466 FP: blocked_reason=RateLimit without a screen throttle hint must NOT arm"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ARM/CLEAR SYNC (real path): once the throttle signal is gone (blocked_reason cleared) the
+    /// loose arm goes false, so the Idle-clear branch reclaims the track — the work-turn track does
+    /// NOT linger forever. Proves the #4 synchronization: `clears` only fires when `loose_arm` is
+    /// false, so a still-throttled Idle stays armed but a genuinely-cleared Idle clears.
+    #[test]
+    fn work_turn_529_clears_when_throttle_signal_gone_2466() {
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = tmp_home("wt529-clear");
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+
+        let (handle, _reader) = mock_agent_handle("wt529c", crate::state::AgentState::Idle);
+        {
+            let mut core = handle.core.lock();
+            core.health
+                .set_blocked_reason(crate::health::BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            core.vterm
+                .process(b"\r\nAPI Error: Server is temporarily limiting requests\r\n");
+        }
+        let id = handle.id;
+        registry.lock().insert(id, handle);
+
+        // First pass arms the track.
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        assert!(tracks.contains_key("wt529c"), "work-turn 529 armed");
+
+        // The throttle lifts: clear the watchdog latch → blocked_rl false → loose_arm false.
+        registry
+            .lock()
+            .get(&id)
+            .expect("handle present")
+            .core
+            .lock()
+            .health
+            .clear_blocked_reason();
+
+        super::process_error_recovery(
+            &home,
+            &registry,
+            &mut tracks,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            past_boot_grace(),
+        );
+        assert!(
+            !tracks.contains_key("wt529c"),
+            "#2466: once the throttle latch clears, the Idle-clear branch reclaims the work-turn track (arm/clear synchronized)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
