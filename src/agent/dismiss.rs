@@ -47,6 +47,12 @@ pub struct PreparedDismissPattern {
     literal_hint: String,
     regex: std::sync::Arc<regex::Regex>,
     key_seq: Vec<u8>,
+    /// #2473: may this pattern fire on a POST-latch re-arm (the agent is in a
+    /// dismissible-prompt state but the startup latch is already off)? True only
+    /// for workspace-trust prompts; a runtime-approval pattern (claude
+    /// `Yes, proceed`) is false so it never auto-acts a real mid-session
+    /// permission modal. Derived from [`REARM_PAST_LATCH_TRUST_HINTS`].
+    rearm_past_latch: bool,
 }
 
 /// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
@@ -118,6 +124,24 @@ fn dismiss_literal_hint(pattern: &str) -> &str {
         .unwrap_or(pattern)
 }
 
+/// #2473: literal hints of the WORKSPACE-TRUST dismiss patterns — the ONLY class
+/// permitted to RE-ARM past the startup latch (see `try_prepared_dismiss_dialog`'s
+/// `trust_class_only`). The agy + claude folder-trust prompts both render the
+/// literal `Yes, I trust`; everything else (claude `Yes, proceed` runtime
+/// approval, update menus, kiro/codex prompts) stays startup-window-only.
+///
+/// This is the SINGLE audit point for "what may a daemon auto-keystroke on a
+/// post-latch prompt modal". r6's PR #2474 finding: without this scoping, the
+/// re-arm fired claude `Yes, proceed` (↑↑Enter) on a real mid-session tool-
+/// approval modal — stealing the operator's decision. A new trust prompt that
+/// must survive the latch is added here by its literal hint, deliberately, in
+/// one place.
+const REARM_PAST_LATCH_TRUST_HINTS: &[&str] = &["Yes, I trust"];
+
+fn is_rearm_past_latch_hint(literal_hint: &str) -> bool {
+    REARM_PAST_LATCH_TRUST_HINTS.contains(&literal_hint)
+}
+
 pub fn prepare_dismiss_patterns(
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> Vec<PreparedDismissPattern> {
@@ -125,9 +149,11 @@ pub fn prepare_dismiss_patterns(
         .iter()
         .filter_map(|(pattern, key_seq)| {
             let regex = compile_dismiss_regex(pattern)?;
+            let literal_hint = dismiss_literal_hint(pattern).to_string();
             Some(PreparedDismissPattern {
                 pattern: pattern.clone(),
-                literal_hint: dismiss_literal_hint(pattern).to_string(),
+                rearm_past_latch: is_rearm_past_latch_hint(&literal_hint),
+                literal_hint,
                 regex,
                 key_seq: key_seq.clone(),
             })
@@ -143,14 +169,22 @@ pub fn try_dismiss_dialog(
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> bool {
     let prepared = prepare_dismiss_patterns(dismiss_patterns);
-    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared)
+    // Default callers (tests + the `try_dismiss_dialog` seam) get the full
+    // startup-window scan (`trust_class_only = false`).
+    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared, false)
 }
 
+/// `trust_class_only` (#2473): when true, only WORKSPACE-TRUST-class patterns
+/// (`rearm_past_latch`) are considered — used on a POST-latch re-arm so a
+/// runtime-approval pattern (claude `Yes, proceed`) can never auto-act a real
+/// mid-session permission modal. The startup-window scan passes false (full
+/// list, unchanged behavior). See [`REARM_PAST_LATCH_TRUST_HINTS`].
 pub fn try_prepared_dismiss_dialog(
     name: &str,
     screen: &str,
     pty_writer: &PtyWriter,
     dismiss_patterns: &[PreparedDismissPattern],
+    trust_class_only: bool,
 ) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -160,6 +194,11 @@ pub fn try_prepared_dismiss_dialog(
     }
 
     for pattern in dismiss_patterns {
+        // #2473: on a post-latch re-arm, skip everything but workspace-trust
+        // patterns — never fire runtime-approval (`Yes, proceed`) off the latch.
+        if trust_class_only && !pattern.rearm_past_latch {
+            continue;
+        }
         if !pattern.literal_hint.is_empty() && !screen.contains(&pattern.literal_hint) {
             continue;
         }
@@ -244,6 +283,49 @@ pub fn try_prepared_dismiss_dialog(
     }
 
     false
+}
+
+/// #2473: states in which the agent is BLOCKED on an interactive modal that a
+/// configured `dismiss_pattern` keystroke can clear — workspace-trust prompt,
+/// update menu, tool-approval. The PTY read loop re-arms its dismiss scan for a
+/// frame in one of these states even after the startup latch has fired (see
+/// [`dismiss_scan_armed`]).
+pub(crate) fn is_dismissible_prompt_state(state: crate::state::AgentState) -> bool {
+    use crate::state::AgentState;
+    matches!(
+        state,
+        AgentState::PermissionPrompt | AgentState::InteractivePrompt | AgentState::AwaitingOperator
+    )
+}
+
+/// #2473: is the dismiss matcher ARMED for this rendered frame? (Cooldown — the
+/// rate-limit guard after a fired dismiss — is checked separately at the call
+/// site, so this stays a pure two-input arming decision plus the new-frame gate.)
+///
+/// `scan_enabled` is the STARTUP latch: it begins true (the backend ships
+/// dismiss patterns) and the read loop clears it once the agent settles
+/// (`Idle || has_productive_output()`), so a backend trust/update modal is only
+/// scanned during the launch window — the secondary defense (alongside the
+/// anchored regex) against auto-pressing a key on conversation text that merely
+/// quotes the modal phrase (#996, the 37-event fixup-lead false-positive class).
+///
+/// The bug (#2473): agy paints an "Antigravity CLI" startup banner that trips
+/// the latch BEFORE its "Do you trust this folder?" modal renders — and
+/// `has_productive_output()` is monotonic, so once tripped the latch never
+/// re-opens. The matcher therefore never scanned the modal and every fresh agy
+/// spawn hung at `prev_state=permission` awaiting an operator.
+///
+/// Fix: a `prompt_blocked` frame (the agent is in a state a `dismiss_pattern`
+/// targets — see [`is_dismissible_prompt_state`]) re-arms the scan even past the
+/// latch. This is false-positive-safe: ordinary conversation that quotes the
+/// phrase does not put the agent into PermissionPrompt/InteractivePrompt, and the
+/// keystroke only fires when the anchored backend regex ALSO matches the frame.
+pub(crate) fn dismiss_scan_armed(
+    scan_enabled: bool,
+    prompt_blocked: bool,
+    state_changed: bool,
+) -> bool {
+    state_changed && (scan_enabled || prompt_blocked)
 }
 
 #[cfg(test)]
@@ -442,6 +524,202 @@ Should we add a dismiss_pattern?
              this is the surface that produced today's 37 false-positives on fixup-lead. \
              The fix is the keystroke (`\\r`, non-destructive), pinned in backend tests."
         );
+    }
+
+    // ── #2473: dismiss-scan re-arm on prompt-blocked states ──────────────
+    //
+    // Root cause: the read loop's startup latch (`dismiss_scan_enabled`) is
+    // cleared once the agent settles (`Idle || has_productive_output()`), and
+    // `has_productive_output()` is MONOTONIC. agy paints an "Antigravity CLI"
+    // banner that trips the latch BEFORE its "Do you trust this folder?" modal
+    // renders, so the matcher never scanned the modal — every fresh agy spawn
+    // hung at `prev_state=permission`. Fix: a `prompt_blocked` frame re-arms the
+    // scan past the latch. Two orthogonal defenses must BOTH hold (the DUAL
+    // reviewers' #996 boundary): the anchored regex gates "content looks like a
+    // modal", the state-gate (`dismiss_scan_armed`) gates "the timing is a real
+    // modal". The tests below cover BOTH directions of BOTH layers.
+
+    /// #2473 POSITIVE: the real agy trust modal. The startup latch is already
+    /// OFF (the banner settled the agent), but the agent is in PermissionPrompt,
+    /// so the scan RE-ARMS and the anchored regex matches the live grid → Enter
+    /// fires. This is the exact production path that was dead.
+    #[test]
+    fn agy_trust_modal_rearms_and_fires_when_prompt_blocked_2473() {
+        use crate::state::AgentState;
+        // Real agy modal rendered through VTerm (cursor `>` marker, col 0).
+        let mut vt = crate::vterm::VTerm::new(120, 30);
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(" Do you trust the contents of this folder?\r\n\r\n".as_bytes());
+        vt.process(" > Yes, I trust this folder\r\n".as_bytes());
+        vt.process("   No, exit\r\n".as_bytes());
+        let screen = vt.tail_lines(30);
+        // agy preset dismiss regex == claude's (backend.rs:642).
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
+        // Latch OFF (startup banner already tripped it) but state is PermissionPrompt.
+        let armed = dismiss_scan_armed(
+            /* scan_enabled */ false,
+            is_dismissible_prompt_state(AgentState::PermissionPrompt),
+            /* state_changed */ true,
+        );
+        assert!(
+            armed,
+            "#2473: a PermissionPrompt frame must re-arm dismiss even past the startup latch"
+        );
+        // Fire through the ACTUAL post-latch re-arm path (`trust_class_only=true`):
+        // agy `Yes, I trust` IS workspace-trust-class, so it still fires.
+        let prepared = prepare_dismiss_patterns(&patterns);
+        assert!(
+            armed && try_prepared_dismiss_dialog("agy", &screen, &test_writer(), &prepared, true),
+            "#2473: the re-armed (trust-class-only) scan must match the real agy trust modal \
+             and fire Enter. Screen:\n{screen}"
+        );
+    }
+
+    /// #2473 NEGATIVE (r6 blocking finding on PR #2474): a POST-latch re-arm must
+    /// NOT fire claude's RUNTIME-APPROVAL pattern `Yes, proceed` (↑↑Enter) — that
+    /// would auto-act a real mid-session permission modal (also classified
+    /// PermissionPrompt) and steal the operator's decision. Only workspace-trust
+    /// (`Yes, I trust`) may re-arm. Uses the REAL claude preset so a future preset
+    /// edit that re-introduces the footgun trips this test.
+    #[test]
+    fn claude_yes_proceed_not_rearmed_past_latch_2473_r6() {
+        let claude_patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        let prepared = prepare_dismiss_patterns(&claude_patterns);
+
+        // A real claude runtime tool-approval modal (the operator's call).
+        let mut vt = crate::vterm::VTerm::new(120, 30);
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(" Bash command\r\n   rm -rf build/\r\n\r\n".as_bytes());
+        vt.process(" > Yes, proceed\r\n".as_bytes());
+        vt.process("   No, and tell Claude what to do differently\r\n".as_bytes());
+        vt.process(" Esc to cancel · Enter to confirm\r\n".as_bytes());
+        let screen = vt.tail_lines(30);
+
+        // Post-latch re-arm (trust_class_only=true): `Yes, proceed` is NOT
+        // trust-class → skipped → returns false. A false return is authoritative
+        // "did not fire": the keystroke write happens ONLY inside the matched-fire
+        // block, which a false return never enters — so no `\x1b[A\x1b[A\r`.
+        assert!(
+            !try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, true),
+            "#2473 r6: `Yes, proceed` (runtime approval) must NOT re-arm past the latch. \
+             Screen:\n{screen}"
+        );
+
+        // Sanity: in the STARTUP window (trust_class_only=false) the SAME pattern
+        // DOES match — proving it is the re-arm GATE that blocks it, not the regex.
+        assert!(
+            try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, false),
+            "sanity: in the startup window `Yes, proceed` still matches (gate, not regex, blocks re-arm)"
+        );
+    }
+
+    /// #2473 (r6): pin the trust-class classification on the REAL presets — agy +
+    /// claude `Yes, I trust` re-arm; claude `Yes, proceed` does not; claude has
+    /// exactly one re-arm-eligible pattern.
+    #[test]
+    fn rearm_past_latch_classification_2473() {
+        let agy = prepare_dismiss_patterns(&[(
+            r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust".to_string(),
+            b"\r".to_vec(),
+        )]);
+        assert!(agy[0].rearm_past_latch, "agy `Yes, I trust` is trust-class");
+
+        let proceed = prepare_dismiss_patterns(&[(
+            r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed".to_string(),
+            b"\x1b[A\x1b[A\r".to_vec(),
+        )]);
+        assert!(
+            !proceed[0].rearm_past_latch,
+            "`Yes, proceed` (runtime approval) is NOT trust-class"
+        );
+
+        let claude: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        let trust_count = prepare_dismiss_patterns(&claude)
+            .iter()
+            .filter(|p| p.rearm_past_latch)
+            .count();
+        assert_eq!(
+            trust_count, 1,
+            "claude must have exactly ONE re-arm-eligible (workspace-trust) dismiss pattern"
+        );
+    }
+
+    /// #2473 NEGATIVE (#996 regression): the SAME `> Yes, I trust` phrase, but as
+    /// conversation content — the agent is Idle/Active (NOT a prompt modal) and
+    /// the latch is off. The anchored regex (content layer) WOULD match, but the
+    /// state-gate (timing layer) refuses to arm → the matcher is never called,
+    /// so no Enter. This is precisely the false-positive case the DUAL reviewers
+    /// construct; both layers must hold.
+    #[test]
+    fn quoted_trust_phrase_in_non_prompt_state_does_not_rearm_996() {
+        use crate::state::AgentState;
+        let screen = "\
+[user] Filing #995 — the agy trust prompt shows:
+> Yes, I trust this folder
+  No, exit
+[claude] checking the dismiss_pattern now
+";
+        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
+        // Content layer: the anchored regex DOES match the quoted phrase ...
+        assert!(
+            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+            "precondition: the anchored regex matches the quoted phrase (content-layer FP surface)"
+        );
+        // ... but the timing layer refuses to arm: latch off + non-prompt state.
+        for s in [AgentState::Idle, AgentState::Active] {
+            assert!(
+                !dismiss_scan_armed(false, is_dismissible_prompt_state(s), true),
+                "#996: {s:?} + latched-off must NOT re-arm — no scan, no Enter, \
+                 despite the matching phrase on screen"
+            );
+        }
+    }
+
+    /// #2473: the arming-decision matrix + the state classification, both
+    /// directions. Pins which states re-arm (exactly those a `dismiss_pattern`
+    /// targets) and the frame/latch gating.
+    #[test]
+    fn dismiss_scan_arming_matrix_2473() {
+        use crate::state::AgentState::*;
+        // Startup window: latch ON + a new frame → armed.
+        assert!(dismiss_scan_armed(true, false, true));
+        // No new frame (dedup hit) → never armed, even if prompt-blocked — a
+        // cursor-blink redraw that doesn't change the dewrapped tail must not rescan.
+        assert!(!dismiss_scan_armed(true, true, false));
+        assert!(!dismiss_scan_armed(false, true, false));
+        // Steady-state after startup: latch off + non-prompt → off.
+        assert!(!dismiss_scan_armed(false, false, true));
+        // Latch off + prompt-blocked → RE-ARMED (#2473 core).
+        assert!(dismiss_scan_armed(false, true, true));
+        // Exactly the states a dismiss_pattern targets re-arm; nothing else does.
+        for s in [PermissionPrompt, InteractivePrompt, AwaitingOperator] {
+            assert!(is_dismissible_prompt_state(s), "{s:?} must re-arm dismiss");
+        }
+        for s in [
+            Idle,
+            Active,
+            Starting,
+            Hang,
+            RateLimit,
+            ServerRateLimit,
+            UsageLimit,
+            Crashed,
+        ] {
+            assert!(
+                !is_dismissible_prompt_state(s),
+                "{s:?} must NOT re-arm dismiss (would reopen the #996 false-positive surface)"
+            );
+        }
     }
 
     #[test]
