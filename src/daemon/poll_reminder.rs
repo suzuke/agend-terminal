@@ -341,6 +341,126 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Restore an env var to its pre-test value on drop. The shadow-observer tests mutate
+    /// `AGEND_SHADOW_OBSERVER` / `AGEND_OBSERVED_DISPATCH` process-globally, so they run
+    /// `#[serial_test::serial(shadow_observer)]` (same group as the snapshot operated-state
+    /// test) to avoid racing other readers of those vars.
+    struct EnvGuard(&'static str, Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    fn guard_shadow_env() -> (EnvGuard, EnvGuard) {
+        (
+            EnvGuard(
+                "AGEND_SHADOW_OBSERVER",
+                std::env::var("AGEND_SHADOW_OBSERVER").ok(),
+            ),
+            EnvGuard(
+                "AGEND_OBSERVED_DISPATCH",
+                std::env::var("AGEND_OBSERVED_DISPATCH").ok(),
+            ),
+        )
+    }
+
+    /// #2465 regression (REAL path): an agent whose raw screen scrapes Idle but a FRESH
+    /// high-confidence Hook proves it is Active (the mid-API false-idle shape) must NOT be
+    /// poll-nudged — `collect_poll_reminders` now reads the operated (hook-primary) state via
+    /// `operated_state`, so a genuinely-busy agent mis-scraped idle is no longer pestered.
+    /// The `AGEND_OBSERVED_DISPATCH=0` kill-switch restores the raw-Idle reminder byte-for-byte.
+    ///
+    /// SCOPE (#2465): proves false-idle→consumer routing only. It deliberately does NOT model
+    /// the dev-3 ApiError-as-ratelimit stuck incident — claude hooks never emit RateLimited, so
+    /// that case has no observed signal to route and is a separate (SRL-arm) follow-up fix.
+    #[test]
+    #[serial_test::serial(shadow_observer)]
+    fn false_idle_corrected_by_hook_suppresses_poll_reminder() {
+        use crate::daemon::shadow::evidence::{Authority, Confidence};
+        use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
+
+        let _env = guard_shadow_env();
+        let home = tmp_home("false-idle-suppress");
+        let agent = "false-idle-agent";
+        seed_unread(&home, agent, 3);
+        let registry = mock_registry(agent, AgentState::Idle);
+        // Attach a fresh high-confidence Hook=Active correction; raw screen stays Idle.
+        for handle in registry.lock().values() {
+            handle.core.lock().observed_status = Some(ObservedStatus {
+                state: ObservedState::Active,
+                authority: Authority::Hook,
+                confidence: Confidence::Strong,
+                evidence: vec![],
+                since_ms: 0,
+            });
+        }
+
+        // operated-dispatch ON (default): operated = Active ⇒ not idle ⇒ no reminder.
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+        std::env::remove_var("AGEND_OBSERVED_DISPATCH");
+        reset_dedup(agent);
+        let v = collect_poll_reminders(&home, &registry);
+        assert!(
+            v.is_empty(),
+            "false-idle agent (hook=Active) must NOT be poll-nudged, got: {v:?}"
+        );
+
+        // Kill-switch: raw Idle wins ⇒ reminder returns (byte-identical to pre-#2465).
+        std::env::set_var("AGEND_OBSERVED_DISPATCH", "0");
+        reset_dedup(agent);
+        let v = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            v.len(),
+            1,
+            "AGEND_OBSERVED_DISPATCH=0 restores raw-Idle reminder"
+        );
+        assert_eq!(v[0].0, agent);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2465 gate firewall: a SCREEN-authority observed correction — the only plane a
+    /// hook/stream-less backend (e.g. agy) ever has — can NEVER satisfy the high-confidence
+    /// override gate, so the raw Idle stands and the agent is still nudged. Zero regression
+    /// for screen-only backends, by construction.
+    #[test]
+    #[serial_test::serial(shadow_observer)]
+    fn screen_authority_observed_does_not_suppress_poll_reminder() {
+        use crate::daemon::shadow::evidence::{Authority, Confidence};
+        use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
+
+        let _env = guard_shadow_env();
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+        std::env::remove_var("AGEND_OBSERVED_DISPATCH");
+
+        let home = tmp_home("screen-no-suppress");
+        let agent = "screen-obs-agent";
+        seed_unread(&home, agent, 2);
+        let registry = mock_registry(agent, AgentState::Idle);
+        for handle in registry.lock().values() {
+            handle.core.lock().observed_status = Some(ObservedStatus {
+                state: ObservedState::Active,
+                authority: Authority::Screen, // weak/screen-only plane — the agy shape
+                confidence: Confidence::Strong,
+                evidence: vec![],
+                since_ms: 0,
+            });
+        }
+        reset_dedup(agent);
+        let v = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            v.len(),
+            1,
+            "screen-authority observed must NOT override raw Idle (screen-only backends unaffected)"
+        );
+        assert_eq!(v[0].0, agent);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn test_collect_poll_reminders_dedupes_same_count() {
         let home = tmp_home("collect-dedup");

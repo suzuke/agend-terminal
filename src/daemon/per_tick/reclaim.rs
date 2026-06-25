@@ -401,8 +401,10 @@ impl PerTickHandler for ReclaimHandler {
                 // usage-limit screen authoritative (and the observer never promotes TO
                 // UsageLimit), so the UsageLimit-reclaim trigger is unchanged in the common
                 // case; the helper only corrects a false-idle that masks a busy agent.
-                let state =
-                    crate::daemon::shadow::operated_state(core.state.current, core.observed_status.as_ref());
+                let state = crate::daemon::shadow::operated_state(
+                    core.state.current,
+                    core.observed_status.as_ref(),
+                );
                 let quota = matches!(
                     core.health.current_reason,
                     Some(crate::health::BlockedReason::QuotaExceeded)
