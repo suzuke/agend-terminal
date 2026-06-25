@@ -182,6 +182,13 @@ pub struct AgentRuntime {
     last_observer_authority: Option<Authority>,
     /// Newest `Responding` evidence — distinguishes the `Responding` refinement.
     last_responding_ms: u64,
+    /// #2470 (r6 round-3): newest REAL-PROGRESS evidence — a lifecycle signal that proves the
+    /// agent actually advanced (TurnStarted / ToolStarted / ToolEnded / Responding / PromptReady /
+    /// TurnEnded). EXCLUDES `TokenUsage` (accounting-only) and `RateLimited` (the thing we're
+    /// reconciling against). `resumed_post_srl` keys on THIS, not the generic `last_observer_ms`:
+    /// a `TokenUsage` props `last_observer_ms` without any real progress, which would otherwise
+    /// mis-clear a still-rate-limited agent once the rate-limit latch expires (r6 repro).
+    last_progress_ms: u64,
     /// Stable-`since` bookkeeping: the last derived state + when it was entered.
     last_state: Option<ObservedState>,
     last_state_since_ms: u64,
@@ -213,6 +220,21 @@ impl AgentRuntime {
             EvidenceKind::RateLimited { .. } | EvidenceKind::TokenUsage { .. }
         ) {
             self.rate_limit_active = false;
+        }
+        // #2470 (r6 round-3): track REAL-PROGRESS freshness separately from `last_observer_ms`.
+        // Only a genuine lifecycle/progress signal advances it — NOT `TokenUsage` (accounting,
+        // which would otherwise prop `observer_fresh` and mis-clear a still-rate-limited agent
+        // after the latch expires) and NOT `RateLimited` (the state we reconcile against).
+        if matches!(
+            ev.kind,
+            EvidenceKind::TurnStarted
+                | EvidenceKind::ToolStarted { .. }
+                | EvidenceKind::ToolEnded
+                | EvidenceKind::Responding
+                | EvidenceKind::PromptReady
+                | EvidenceKind::TurnEnded { .. }
+        ) {
+            self.last_progress_ms = ev.at_ms;
         }
         match &ev.kind {
             EvidenceKind::TurnStarted => {
@@ -367,7 +389,14 @@ impl AgentRuntime {
         let rate_limit_evidence_current = self.rate_limit_active
             && now_ms.saturating_sub(self.last_rate_limit_evidence_ms) <= HOOK_FRESHNESS_MS;
         let hook_rate_limit_current = hook_rate_limit_window || rate_limit_evidence_current;
-        let resumed_post_srl = observer_fresh && self.episode_open && !hook_rate_limit_current;
+        // #2470 (r6 round-3): "resumed" requires REAL-PROGRESS freshness, NOT the generic observer
+        // freshness — a `TokenUsage` props `last_observer_ms` (accounting) without any real progress,
+        // which would mis-clear a still-rate-limited agent once the latch expires. `last_progress_ms`
+        // is advanced only by lifecycle/progress evidence (see `ingest`), so a banner with only stale
+        // progress + late TokenUsage stays RateLimited.
+        let progress_fresh =
+            self.last_progress_ms > 0 && now_ms.saturating_sub(self.last_progress_ms) <= HOOK_FRESHNESS_MS;
+        let resumed_post_srl = progress_fresh && self.episode_open && !hook_rate_limit_current;
         let rate_limited =
             hook_rate_limit_current || (screen == ScreenSignal::RateLimited && !resumed_post_srl);
         if rate_limited {
@@ -886,6 +915,39 @@ mod tests {
             s.state,
             ObservedState::RateLimited,
             "#2470: a NEWER recovery signal supersedes the rate-limit latch (no longer current)"
+        );
+    }
+
+    /// #2470 (r6 round-3 repro): a LATE `TokenUsage` (accounting-only) props `observer_fresh` but is
+    /// NOT real progress. After the rate-limit latch's freshness window expires, a still-rate-limited
+    /// agent emitting only TokenUsage must STAY RateLimited — not be mis-cleared to Active. The fix
+    /// keys `resumed_post_srl` on `last_progress_ms` (lifecycle-only): here the only progress was the
+    /// stale TurnStarted, so progress is NOT fresh → kept. NEUTER: key resume on `observer_fresh`
+    /// again → the late TokenUsage props it → flips to Active → RED.
+    #[test]
+    fn token_usage_does_not_prop_resume_after_latch_expiry_2470() {
+        let mut rt = AgentRuntime::default();
+        rt.ingest(&Evidence::stream(EvidenceKind::TurnStarted, 1_000)); // last_progress_ms = 1_000
+        rt.ingest(&Evidence::stream(
+            EvidenceKind::RateLimited { retry_at_ms: None },
+            2_000,
+        )); // latch set @ 2_000
+        // A LATE accounting-only TokenUsage advances last_observer_ms (props observer_fresh) but
+        // is NOT progress and does NOT clear the latch.
+        rt.ingest(&Evidence::stream(
+            EvidenceKind::TokenUsage {
+                input: 10,
+                output: 20,
+            },
+            500_000,
+        ));
+        // Observe JUST after the rate-limit latch's freshness window expires.
+        let now = 2_000 + HOOK_FRESHNESS_MS + 1;
+        let s = rt.observe(ScreenSignal::RateLimited, &live_busy(), now);
+        assert_eq!(
+            s.state,
+            ObservedState::RateLimited,
+            "#2470 r6: a late TokenUsage must NOT prop a resume — a still-rate-limited agent stays RateLimited"
         );
     }
 
