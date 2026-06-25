@@ -2049,10 +2049,13 @@ fn push_dest_refs(args: &[String]) -> Vec<String> {
 ///   non-protected assigned branch (cross-branch deny) → allow; EXCEPT the deprecated
 ///   `push.default=matching`, which would ALSO push a local `main`/`master` → deny.
 ///
-/// Safe-by-shape (NOT denied): `--tags`/`--follow-tags` push `refs/tags/*`, never a
-/// protected BRANCH; force flags (`-f`/`--force-with-lease`/`+`) change HOW not WHAT (the
-/// refspec is still parsed above). Shim-layer defense-in-depth — the remote's branch
-/// protection is the primary gate.
+/// `--tags` is TAGS-ONLY (`refs/tags/*`, never a branch) regardless of push.default, so it
+/// is exempt even from the matching deny (r6 dry-run: `git push --tags` under matching pushes
+/// only tags). `--follow-tags` is NOT exempt: it pushes the would-be-pushed BRANCHES *plus*
+/// tags, so under `push.default=matching` it pushes the matching heads incl. `main`
+/// (empirically confirmed via dry-run) → it correctly hits the matching deny. Force flags
+/// (`-f`/`--force-with-lease`/`+`) change HOW not WHAT — the refspec is still parsed above.
+/// Shim-layer defense-in-depth — the remote's branch protection is the primary gate.
 fn push_protected_violation(
     args: &[String],
     protected: &[String],
@@ -2079,7 +2082,7 @@ fn push_protected_violation(
             ));
         }
     }
-    if push_default_matching && !has_explicit_refspec(args) {
+    if push_default_matching && !has_explicit_refspec(args) && !is_tags_only_push(args) {
         return Some(
             "push.default=matching with no explicit refspec would push every same-named \
              branch (including a local protected ref) — set push.default=current/simple, or \
@@ -2088,6 +2091,13 @@ fn push_protected_violation(
         );
     }
     None
+}
+
+/// `--tags` makes the push TAGS-ONLY (`refs/tags/*`), regardless of `push.default` — so it is
+/// exempt from the matching deny. Deliberately matches ONLY `--tags`, NOT `--follow-tags`
+/// (which also pushes the would-be-pushed branches → under matching pushes `main`).
+fn is_tags_only_push(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| a == "--tags")
 }
 
 /// `--all` / `--mirror`, INCLUDING git's unambiguous long-option abbreviations (`--mir`,
@@ -3458,6 +3468,18 @@ mod tests {
         );
         // not matching → no-refspec push is safe (current branch only).
         assert!(push_protected_violation(&vargs(&["push"]), &p, false).is_none());
+        // r6: `--tags` is TAGS-ONLY (refs/tags/*) even under matching → MUST be allowed
+        // (the previous cut wrongly denied it). RM: drop the is_tags_only_push exemption → RED.
+        assert!(
+            push_protected_violation(&vargs(&["push", "--tags", "origin"]), &p, true).is_none()
+        );
+        assert!(push_protected_violation(&vargs(&["push", "--tags"]), &p, true).is_none());
+        // `--follow-tags` is NOT tags-only — under matching it pushes the matching branches
+        // (incl. main, verified by dry-run) → MUST stay denied (no over-exemption).
+        assert!(
+            push_protected_violation(&vargs(&["push", "--follow-tags", "origin"]), &p, true)
+                .is_some()
+        );
     }
 
     #[test]
