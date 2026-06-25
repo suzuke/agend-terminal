@@ -1820,7 +1820,16 @@ fn ephemeral_pty_read_loop(
                     .unwrap_or(false);
                 if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
                     && !in_cooldown
-                    && try_prepared_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns)
+                    && try_prepared_dismiss_dialog(
+                        name,
+                        &screen,
+                        pty_writer,
+                        dismiss_patterns,
+                        // #2473 (r6): a post-latch re-arm (scan_enabled==false,
+                        // armed only via prompt_blocked) scans ONLY workspace-
+                        // trust patterns — never runtime-approval `Yes, proceed`.
+                        !dismiss_scan_enabled,
+                    )
                 {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
@@ -2173,7 +2182,16 @@ fn pty_read_loop(
                     .unwrap_or(false);
                 if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
                     && !in_cooldown
-                    && try_prepared_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns)
+                    && try_prepared_dismiss_dialog(
+                        name,
+                        &screen,
+                        pty_writer,
+                        dismiss_patterns,
+                        // #2473 (r6): a post-latch re-arm (scan_enabled==false,
+                        // armed only via prompt_blocked) scans ONLY workspace-
+                        // trust patterns — never runtime-approval `Yes, proceed`.
+                        !dismiss_scan_enabled,
+                    )
                 {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));

@@ -47,6 +47,12 @@ pub struct PreparedDismissPattern {
     literal_hint: String,
     regex: std::sync::Arc<regex::Regex>,
     key_seq: Vec<u8>,
+    /// #2473: may this pattern fire on a POST-latch re-arm (the agent is in a
+    /// dismissible-prompt state but the startup latch is already off)? True only
+    /// for workspace-trust prompts; a runtime-approval pattern (claude
+    /// `Yes, proceed`) is false so it never auto-acts a real mid-session
+    /// permission modal. Derived from [`REARM_PAST_LATCH_TRUST_HINTS`].
+    rearm_past_latch: bool,
 }
 
 /// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
@@ -118,6 +124,24 @@ fn dismiss_literal_hint(pattern: &str) -> &str {
         .unwrap_or(pattern)
 }
 
+/// #2473: literal hints of the WORKSPACE-TRUST dismiss patterns — the ONLY class
+/// permitted to RE-ARM past the startup latch (see `try_prepared_dismiss_dialog`'s
+/// `trust_class_only`). The agy + claude folder-trust prompts both render the
+/// literal `Yes, I trust`; everything else (claude `Yes, proceed` runtime
+/// approval, update menus, kiro/codex prompts) stays startup-window-only.
+///
+/// This is the SINGLE audit point for "what may a daemon auto-keystroke on a
+/// post-latch prompt modal". r6's PR #2474 finding: without this scoping, the
+/// re-arm fired claude `Yes, proceed` (↑↑Enter) on a real mid-session tool-
+/// approval modal — stealing the operator's decision. A new trust prompt that
+/// must survive the latch is added here by its literal hint, deliberately, in
+/// one place.
+const REARM_PAST_LATCH_TRUST_HINTS: &[&str] = &["Yes, I trust"];
+
+fn is_rearm_past_latch_hint(literal_hint: &str) -> bool {
+    REARM_PAST_LATCH_TRUST_HINTS.contains(&literal_hint)
+}
+
 pub fn prepare_dismiss_patterns(
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> Vec<PreparedDismissPattern> {
@@ -125,9 +149,11 @@ pub fn prepare_dismiss_patterns(
         .iter()
         .filter_map(|(pattern, key_seq)| {
             let regex = compile_dismiss_regex(pattern)?;
+            let literal_hint = dismiss_literal_hint(pattern).to_string();
             Some(PreparedDismissPattern {
                 pattern: pattern.clone(),
-                literal_hint: dismiss_literal_hint(pattern).to_string(),
+                rearm_past_latch: is_rearm_past_latch_hint(&literal_hint),
+                literal_hint,
                 regex,
                 key_seq: key_seq.clone(),
             })
@@ -143,14 +169,22 @@ pub fn try_dismiss_dialog(
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> bool {
     let prepared = prepare_dismiss_patterns(dismiss_patterns);
-    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared)
+    // Default callers (tests + the `try_dismiss_dialog` seam) get the full
+    // startup-window scan (`trust_class_only = false`).
+    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared, false)
 }
 
+/// `trust_class_only` (#2473): when true, only WORKSPACE-TRUST-class patterns
+/// (`rearm_past_latch`) are considered — used on a POST-latch re-arm so a
+/// runtime-approval pattern (claude `Yes, proceed`) can never auto-act a real
+/// mid-session permission modal. The startup-window scan passes false (full
+/// list, unchanged behavior). See [`REARM_PAST_LATCH_TRUST_HINTS`].
 pub fn try_prepared_dismiss_dialog(
     name: &str,
     screen: &str,
     pty_writer: &PtyWriter,
     dismiss_patterns: &[PreparedDismissPattern],
+    trust_class_only: bool,
 ) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -160,6 +194,11 @@ pub fn try_prepared_dismiss_dialog(
     }
 
     for pattern in dismiss_patterns {
+        // #2473: on a post-latch re-arm, skip everything but workspace-trust
+        // patterns — never fire runtime-approval (`Yes, proceed`) off the latch.
+        if trust_class_only && !pattern.rearm_past_latch {
+            continue;
+        }
         if !pattern.literal_hint.is_empty() && !screen.contains(&pattern.literal_hint) {
             continue;
         }
@@ -526,10 +565,92 @@ Should we add a dismiss_pattern?
             armed,
             "#2473: a PermissionPrompt frame must re-arm dismiss even past the startup latch"
         );
+        // Fire through the ACTUAL post-latch re-arm path (`trust_class_only=true`):
+        // agy `Yes, I trust` IS workspace-trust-class, so it still fires.
+        let prepared = prepare_dismiss_patterns(&patterns);
         assert!(
-            armed && try_dismiss_dialog("agy", &screen, &test_writer(), &patterns),
-            "#2473: the re-armed scan must match the real agy trust modal and fire Enter. \
+            armed && try_prepared_dismiss_dialog("agy", &screen, &test_writer(), &prepared, true),
+            "#2473: the re-armed (trust-class-only) scan must match the real agy trust modal \
+             and fire Enter. Screen:\n{screen}"
+        );
+    }
+
+    /// #2473 NEGATIVE (r6 blocking finding on PR #2474): a POST-latch re-arm must
+    /// NOT fire claude's RUNTIME-APPROVAL pattern `Yes, proceed` (↑↑Enter) — that
+    /// would auto-act a real mid-session permission modal (also classified
+    /// PermissionPrompt) and steal the operator's decision. Only workspace-trust
+    /// (`Yes, I trust`) may re-arm. Uses the REAL claude preset so a future preset
+    /// edit that re-introduces the footgun trips this test.
+    #[test]
+    fn claude_yes_proceed_not_rearmed_past_latch_2473_r6() {
+        let claude_patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        let prepared = prepare_dismiss_patterns(&claude_patterns);
+
+        // A real claude runtime tool-approval modal (the operator's call).
+        let mut vt = crate::vterm::VTerm::new(120, 30);
+        vt.process(b"\x1b[2J\x1b[H");
+        vt.process(" Bash command\r\n   rm -rf build/\r\n\r\n".as_bytes());
+        vt.process(" > Yes, proceed\r\n".as_bytes());
+        vt.process("   No, and tell Claude what to do differently\r\n".as_bytes());
+        vt.process(" Esc to cancel · Enter to confirm\r\n".as_bytes());
+        let screen = vt.tail_lines(30);
+
+        // Post-latch re-arm (trust_class_only=true): `Yes, proceed` is NOT
+        // trust-class → skipped → returns false. A false return is authoritative
+        // "did not fire": the keystroke write happens ONLY inside the matched-fire
+        // block, which a false return never enters — so no `\x1b[A\x1b[A\r`.
+        assert!(
+            !try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, true),
+            "#2473 r6: `Yes, proceed` (runtime approval) must NOT re-arm past the latch. \
              Screen:\n{screen}"
+        );
+
+        // Sanity: in the STARTUP window (trust_class_only=false) the SAME pattern
+        // DOES match — proving it is the re-arm GATE that blocks it, not the regex.
+        assert!(
+            try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, false),
+            "sanity: in the startup window `Yes, proceed` still matches (gate, not regex, blocks re-arm)"
+        );
+    }
+
+    /// #2473 (r6): pin the trust-class classification on the REAL presets — agy +
+    /// claude `Yes, I trust` re-arm; claude `Yes, proceed` does not; claude has
+    /// exactly one re-arm-eligible pattern.
+    #[test]
+    fn rearm_past_latch_classification_2473() {
+        let agy = prepare_dismiss_patterns(&[(
+            r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust".to_string(),
+            b"\r".to_vec(),
+        )]);
+        assert!(agy[0].rearm_past_latch, "agy `Yes, I trust` is trust-class");
+
+        let proceed = prepare_dismiss_patterns(&[(
+            r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed".to_string(),
+            b"\x1b[A\x1b[A\r".to_vec(),
+        )]);
+        assert!(
+            !proceed[0].rearm_past_latch,
+            "`Yes, proceed` (runtime approval) is NOT trust-class"
+        );
+
+        let claude: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
+            .preset()
+            .dismiss_patterns
+            .iter()
+            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+            .collect();
+        let trust_count = prepare_dismiss_patterns(&claude)
+            .iter()
+            .filter(|p| p.rearm_past_latch)
+            .count();
+        assert_eq!(
+            trust_count, 1,
+            "claude must have exactly ONE re-arm-eligible (workspace-trust) dismiss pattern"
         );
     }
 
