@@ -17,6 +17,7 @@
 //! (`observed_status` is written beside, never drives, `agent_state`). Disable with the
 //! `AGEND_SHADOW_OBSERVER=0` kill-switch.
 
+pub mod agy;
 pub mod evidence;
 pub(crate) mod gate;
 pub mod kiro;

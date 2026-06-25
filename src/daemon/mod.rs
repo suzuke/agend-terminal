@@ -1401,6 +1401,9 @@ fn build_tick_infrastructure(
     // shared buffer (attribution via the <uuid>.json sidecar cwd). No-op under
     // AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434 lesson).
     crate::daemon::shadow::kiro::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
+    // #2413 agy plane: read-only tail of transcript.jsonl → Evidence → shared buffer.
+    // No-op under AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434 lesson).
+    crate::daemon::shadow::agy::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a

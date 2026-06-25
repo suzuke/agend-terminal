@@ -5735,13 +5735,13 @@ fn context_source_stays_pattern_while_context_provider_is_statusline() {
     use crate::backend_profile::ContextProvider;
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     t.feed("ctx used: 42%");
-    let (pct, source) = t
-        .resolved_context()
+    let (pct, provider) = t
+        .resolved_context(None)
         .expect("a fresh statusline reading resolves");
     assert!((pct - 42.0).abs() < f32::EPSILON, "parsed percent: {pct}");
     assert_eq!(
-        source, "pattern",
-        "context_source must stay \"pattern\" (external-dashboard contract)"
+        provider, ContextProvider::StatusLine,
+        "context_source must stay StatusLine"
     );
     assert_eq!(
         t.context_provider(),

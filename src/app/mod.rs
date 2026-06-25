@@ -464,6 +464,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // gating it run_core-only would leave kiro agents' observer source dead in the
         // app-mode live daemon. No-op unless the flag is on (flag-OFF ⇒ zero change).
         crate::daemon::shadow::kiro::spawn(Arc::clone(&registry), home.clone());
+        // #2413 agy plane: read-only tail of transcript.jsonl (Stream plane).
+        // Owner-only + app-mode-wired for the SAME #2434 reason as rollout/opencode/kiro above.
+        // No-op unless the flag is on (flag-OFF ⇒ zero change).
+        crate::daemon::shadow::agy::spawn(Arc::clone(&registry), home.clone());
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
@@ -2933,6 +2937,19 @@ mod tests {
              kiro agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
              'crate::daemon::shadow::kiro::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
+        );
+    }
+
+    #[test]
+    fn run_app_wires_agy_session_tailer_2413() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        let prod_code = strip_comments_and_blank_strings(prod);
+        assert!(
+            prod_code.contains("crate::daemon::shadow::agy::spawn("),
+            "run_app must spawn the agy session-tail observer in the PRODUCTION region"
         );
     }
 
