@@ -525,8 +525,25 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             .map_err(map_lease_err)?
     } else {
         // Legacy: lease a fresh per-branch worktree. Lease errors REJECT (Q2 §3.3).
-        let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)
-            .map_err(map_lease_err)?;
+        // #D+H: lease now returns a TYPED `LeaseError`; classify its variants into
+        // the dispatch `ErrorCode` directly (same mapping the stringly
+        // `map_lease_err` produced: E4.5 → ProtectedBranch, else → LeaseConflict).
+        let lease =
+            crate::worktree_pool::lease(home, &source_repo, target, branch).map_err(|e| {
+                let code = match e {
+                    crate::worktree_pool::LeaseError::ProtectedBranch(_) => {
+                        ErrorCode::ProtectedBranch
+                    }
+                    crate::worktree_pool::LeaseError::CreateFailed(_) => ErrorCode::LeaseConflict,
+                };
+                DispatchError {
+                    message: e.to_string(),
+                    code,
+                    stage: Stage::WorktreeLeaseConflict,
+                    fetch_attempted,
+                    raw: Some(e.to_string()),
+                }
+            })?;
         // Clean empty "init" commits left by kiro-cli session checkpoints.
         // Best-effort: failure is non-fatal. #789 silent `.ok()` semantic.
         let _ = clean_empty_init_commits(&lease.path).ok();

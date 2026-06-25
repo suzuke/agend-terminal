@@ -1143,6 +1143,11 @@ mod tests {
         let dir = tmp_home("fr-real-lease");
         let repo = setup_git_repo_marker_ignored(&dir);
         let lease = crate::worktree_pool::lease(&dir, &repo, "dev-real", "feat/x").expect("lease");
+        // lease no longer binds (finding D+H); the authoritative caller binds —
+        // simulate dispatch's pre-build bind so the force-reclaim path has a
+        // binding to clear (verified by the post-condition below).
+        crate::binding::bind_full(&dir, "dev-real", "", "feat/x", &lease.path, &repo, false)
+            .expect("bind_full");
         assert!(
             crate::binding::read(&dir, "dev-real").is_some(),
             "pre: bound"
