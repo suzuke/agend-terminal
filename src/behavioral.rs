@@ -288,6 +288,7 @@ pub enum MarkerCacheId {
     /// — renamed from `Gemini` when Gemini was retired. Values unchanged.
     Agy,
     OpenCode,
+    Grok,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +383,15 @@ pub(crate) const OPENCODE_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^→\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b",
 ];
 
+pub(crate) const GROK_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    "◆",
+    "❯",
+    "Thought",
+];
+
 /// Build a `LazyLock<Vec<Regex>>` from a static markers slice. Each
 /// marker is compiled with the `(?m)` multiline flag so `^` anchors at
 /// line starts inside the rendered screen.
@@ -407,6 +417,8 @@ static AGY_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| compile_markers(AGY_PRODUCTIVE_MARKERS));
 static OPENCODE_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| compile_markers(OPENCODE_PRODUCTIVE_MARKERS));
+static GROK_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(GROK_PRODUCTIVE_MARKERS));
 
 /// Get productivity config for a backend. Each managed backend uses its
 /// own per-backend MARKERS list + cache id; Shell/Raw fall back to the
@@ -452,6 +464,7 @@ pub fn infer_productivity(
         Some(MarkerCacheId::Codex) => Some(&CODEX_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::Agy) => Some(&AGY_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::OpenCode) => Some(&OPENCODE_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Grok) => Some(&GROK_PRODUCTIVE_REGEXES),
         None => None,
     };
     match cached_regexes {
@@ -521,6 +534,7 @@ pub fn infer_productivity_with_match(
         Some(MarkerCacheId::Codex) => Some(&CODEX_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::Agy) => Some(&AGY_PRODUCTIVE_REGEXES),
         Some(MarkerCacheId::OpenCode) => Some(&OPENCODE_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Grok) => Some(&GROK_PRODUCTIVE_REGEXES),
         None => None,
     };
     if let Some(regexes) = cached_regexes {
@@ -1220,6 +1234,20 @@ mod tests {
         assert_eq!(config.cache_id, Some(MarkerCacheId::OpenCode));
         // `→ Read foo.toml` — OpenCode completion glyph.
         let signal = infer_productivity(&config, "→ Read foo.toml\n", stale_heartbeat());
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn grok_markers_match_completion() {
+        let config = config_for_productivity(&Backend::GrokCli);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::Grok));
+        // `◆ Done` — Grok completion marker.
+        let signal = infer_productivity(&config, "◆ Done\n", stale_heartbeat());
         assert!(matches!(
             signal,
             ProductivitySignal::Productive {

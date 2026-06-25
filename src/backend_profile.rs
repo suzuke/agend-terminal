@@ -105,6 +105,7 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
     static OPENCODE: OnceLock<BackendProfile> = OnceLock::new();
     static CODEX: OnceLock<BackendProfile> = OnceLock::new();
     static CLAUDE: OnceLock<BackendProfile> = OnceLock::new();
+    static GROK: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
     // identically (empty patterns, default behavioral, generic productivity, Idle).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
@@ -114,6 +115,7 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
         Backend::OpenCode => OPENCODE.get_or_init(opencode_profile),
         Backend::Codex => CODEX.get_or_init(codex_profile),
         Backend::ClaudeCode => CLAUDE.get_or_init(claudecode_profile),
+        Backend::GrokCli => GROK.get_or_init(grok_profile),
         Backend::Shell | Backend::Raw(_) => EMPTY.get_or_init(empty_profile),
     }
 }
@@ -463,6 +465,35 @@ fn claudecode_profile() -> BackendProfile {
         initial_state: AgentState::Starting,
     }
 }
+
+fn grok_profile() -> BackendProfile {
+    BackendProfile {
+        patterns: vec![
+            (AgentState::AuthError, r"(?i)not.authenticated|sign.in.to.grok|grok.login"),
+            // ToolUse: Braille spinner present
+            (AgentState::ToolUse, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"),
+            // Thinking: same spinner (Grok doesn't distinguish)
+            (AgentState::Thinking, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"),
+            // Idle: "Grok Build" only appears in bottom status at idle
+            (AgentState::Idle, r"Grok Build"),
+        ],
+        behavioral: BehavioralConfig {
+            silence_thinking_ms: 3000,
+            silence_idle_ms: 8000,
+        },
+        productivity: ProductivityConfig {
+            markers: crate::behavioral::GROK_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Grok),
+        },
+        initial_state: AgentState::Starting,
+        context_pattern: None,
+        context_provider: ContextProvider::Unavailable,
+        input_line_markers: &["❯"],
+    }
+}
+
 
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
 /// productivity, Idle initial state).

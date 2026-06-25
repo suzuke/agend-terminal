@@ -12,6 +12,7 @@ pub enum Backend {
     KiroCli,
     Codex,
     OpenCode,
+    GrokCli,
     // #1580: `Gemini` retired (gemini-cli sunset 2026-06-18). Its successor `Agy`
     // (Google Antigravity CLI) remains and inherits the shared productivity
     // markers (renamed GEMINI_*→AGY_*).
@@ -47,6 +48,7 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
+            | Backend::GrokCli
             | Backend::Agy => true,
             Backend::Shell | Backend::Raw(_) => false,
         }
@@ -107,6 +109,7 @@ impl Backend {
                 "GOOGLE_APPLICATION_CREDENTIALS",
             ],
             Backend::KiroCli => &["KIRO_API_KEY"],
+            Backend::GrokCli => &["GROK_API_KEY", "XAI_API_KEY"],
             Backend::OpenCode => &[
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
@@ -130,6 +133,7 @@ impl Backend {
             "kiro-cli" | "kiro" => Backend::KiroCli,
             "codex" | "codex-cli" => Backend::Codex,
             "opencode" | "opencode-cli" => Backend::OpenCode,
+            "grok" | "grok-cli" => Backend::GrokCli,
             // #1580: "gemini"/"gemini-cli" retired → fall through to Raw.
             "agy" | "antigravity" | "antigravity-cli" => Backend::Agy,
             "shell" | "bash" | "zsh" | "sh" => Backend::Shell,
@@ -145,6 +149,7 @@ impl Backend {
             Backend::KiroCli => "kiro-cli",
             Backend::Codex => "codex",
             Backend::OpenCode => "opencode",
+            Backend::GrokCli => "grok",
             // #995: display name is the product short form `antigravity-cli`,
             // not the binary `agy`. Binary command remains `agy` (preset.command);
             // parse_str still accepts the "agy" alias for backward-compat with
@@ -174,7 +179,7 @@ impl Backend {
     /// test (codex-44cea9, 2026-06-10) surfaced this.
     pub fn input_prompt_marker(&self) -> Option<&'static str> {
         match self {
-            Backend::ClaudeCode => Some("❯"),
+            Backend::ClaudeCode | Backend::GrokCli => Some("❯"),
             Backend::Agy => Some(">"),
             _ => None,
         }
@@ -229,6 +234,7 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
+            | Backend::GrokCli
             | Backend::Agy => self.preset().command.to_string(),
             Backend::Shell => crate::shell_command(),
             Backend::Raw(path) => path.clone(),
@@ -646,6 +652,16 @@ impl Backend {
                 fleet_mcp_supported: true,
                 ..DEFAULTS
             },
+            Backend::GrokCli => BackendPreset {
+                command: "grok",
+                args: &[],
+                ready_pattern: "Grok Build|❯",
+                typed_inject: true,
+                instructions_path: "AGENTS.md",
+                instructions_shared: true,
+                ready_timeout_secs: 20,
+                ..DEFAULTS
+            },
             // Shell and Raw have no preset behavior. `command` is `""` as a
             // sentinel — callers that need the actual spawn path should use
             // [`Backend::command_string`], which resolves Shell to `$SHELL`
@@ -679,6 +695,8 @@ impl Backend {
             Some(Backend::Codex)
         } else if basename == "opencode" || basename.starts_with("opencode-") {
             Some(Backend::OpenCode)
+        } else if basename == "grok" || basename.starts_with("grok-") {
+            Some(Backend::GrokCli)
         } else if basename == "agy" || basename.starts_with("antigravity") {
             // #987: agy (binary name) + antigravity-cli (full product name).
             // basename match handles `/usr/local/bin/agy`; prefix match
@@ -698,6 +716,7 @@ impl Backend {
             Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
+            Backend::GrokCli,
             // #1580: Gemini retired; Agy (its successor) carries the Google engine.
             Backend::Agy,
         ]
@@ -773,6 +792,7 @@ impl Backend {
             Backend::Codex => Some("codex"),
             Backend::OpenCode => Some("opencode"),
             Backend::KiroCli => Some("kiro"),
+            Backend::GrokCli => Some("grok"),
             Backend::Agy => Some("agy"),
             Backend::Shell | Backend::Raw(_) => None,
         }
@@ -874,6 +894,7 @@ impl Backend {
             Backend::KiroCli => "1.29.6",
             Backend::Codex => "0.118.0",
             Backend::OpenCode => "1.4.0",
+            Backend::GrokCli => "1.0.0",
             Backend::Agy => "1.0.0",
             Backend::Shell | Backend::Raw(_) => "n/a",
         }
@@ -1440,6 +1461,7 @@ mod tests {
         assert!(Backend::KiroCli.preset().fleet_mcp_supported);
         assert!(Backend::Codex.preset().fleet_mcp_supported);
         assert!(Backend::OpenCode.preset().fleet_mcp_supported);
+        assert!(Backend::GrokCli.preset().fleet_mcp_supported);
         // #1547: Agy now loads the bridge via `<workspace>/.agents/mcp_config.json`
         // (official Customization Roots; configure_agy writes it). Was `false`
         // under #995 Bug 3 (agy ignored the old `.antigravitycli/` write).
@@ -1475,20 +1497,21 @@ mod tests {
             Backend::KiroCli,
             Backend::Codex,
             Backend::OpenCode,
+            Backend::GrokCli,
             Backend::Agy,
             Backend::Shell,
             Backend::Raw("/x".to_string()),
         ];
-        let submit_key = ["\r"; 7];
-        let inject_prefix = ["", "", "", "\r", "\r", "", ""];
-        let typed_inject = [false, false, true, true, true, false, false];
-        let quit_command = ["/exit", "/quit", "exit", "/exit", "/exit", "exit", "exit"];
-        let instructions_shared = [false, false, true, true, true, false, false];
-        let inject_on_ready = [false; 7];
-        let ready_timeout = [30u64, 30, 20, 45, 20, 10, 10];
-        let fresh_some = [false, false, true, false, false, false, false];
-        let fleet_mcp = [true, true, true, true, true, false, false];
-        let redraw = [false, true, false, false, false, false, false];
+        let submit_key = ["\r"; 8];
+        let inject_prefix = ["", "", "", "\r", "", "\r", "", ""];
+        let typed_inject = [false, false, true, true, true, true, false, false];
+        let quit_command = ["/exit", "/quit", "exit", "/exit", "exit", "/exit", "exit", "exit"];
+        let instructions_shared = [false, false, true, true, true, true, false, false];
+        let inject_on_ready = [false; 8];
+        let ready_timeout = [30u64, 30, 20, 45, 20, 20, 10, 10];
+        let fresh_some = [false, false, true, false, false, false, false, false];
+        let fleet_mcp = [true, true, true, true, true, true, false, false];
+        let redraw = [false, true, false, false, false, false, false, false];
         for (i, b) in backends.iter().enumerate() {
             let p = b.preset();
             assert_eq!(p.submit_key, submit_key[i], "submit_key {b:?}");
@@ -1625,6 +1648,7 @@ mod tests {
         assert_eq!(Backend::KiroCli.name(), "kiro-cli");
         assert_eq!(Backend::Codex.name(), "codex");
         assert_eq!(Backend::OpenCode.name(), "opencode");
+        assert_eq!(Backend::GrokCli.name(), "grok");
         // #995: agy display name is the product short form, not the binary.
         // The binary (`agy`) is exposed via preset().command instead.
         assert_eq!(Backend::Agy.name(), "antigravity-cli");
@@ -1632,11 +1656,9 @@ mod tests {
     }
 
     #[test]
-    fn all_backends_returns_five() {
-        // #987 bumped 5 → 6 with Backend::Agy (gemini-cli's successor); #1580
-        // drops back to 5 as gemini-cli is retired:
-        // ClaudeCode, KiroCli, Codex, OpenCode, Agy.
-        assert_eq!(Backend::all().len(), 5);
+    fn all_backends_returns_six() {
+        // ClaudeCode, KiroCli, Codex, OpenCode, GrokCli, Agy.
+        assert_eq!(Backend::all().len(), 6);
     }
 
     #[test]
@@ -1647,6 +1669,8 @@ mod tests {
         assert_eq!(Backend::parse_str("kiro"), Backend::KiroCli);
         assert_eq!(Backend::parse_str("codex"), Backend::Codex);
         assert_eq!(Backend::parse_str("opencode"), Backend::OpenCode);
+        assert_eq!(Backend::parse_str("grok"), Backend::GrokCli);
+        assert_eq!(Backend::parse_str("grok-cli"), Backend::GrokCli);
         // #1580: gemini retired — `gemini` now falls through to Raw, not a managed
         // backend.
         assert_eq!(
@@ -1660,6 +1684,7 @@ mod tests {
         // Case insensitive
         assert_eq!(Backend::parse_str("Claude"), Backend::ClaudeCode);
         assert_eq!(Backend::parse_str("AGY"), Backend::Agy);
+        assert_eq!(Backend::parse_str("Grok"), Backend::GrokCli);
         // Whitespace trim
         assert_eq!(Backend::parse_str("  claude  "), Backend::ClaudeCode);
     }

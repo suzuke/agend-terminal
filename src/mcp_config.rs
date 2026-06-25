@@ -687,8 +687,10 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
         Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
         Some(crate::backend::Backend::OpenCode) => configure_opencode(working_dir, instance_name),
         Some(crate::backend::Backend::Codex) => configure_codex(working_dir, instance_name),
-        // Non-preset backends (Shell, Raw) have no MCP wiring.
-        Some(crate::backend::Backend::Shell) | Some(crate::backend::Backend::Raw(_)) | None => {
+        Some(crate::backend::Backend::Shell)
+        | Some(crate::backend::Backend::GrokCli)
+        | Some(crate::backend::Backend::Raw(_))
+        | None => {
             return
         }
     };

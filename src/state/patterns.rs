@@ -193,6 +193,7 @@ impl StatePatterns {
         static CODEX: OnceLock<StatePatterns> = OnceLock::new();
         static OPENCODE: OnceLock<StatePatterns> = OnceLock::new();
         static AGY: OnceLock<StatePatterns> = OnceLock::new();
+        static GROK: OnceLock<StatePatterns> = OnceLock::new();
         static EMPTY: OnceLock<StatePatterns> = OnceLock::new();
 
         let lock = match backend {
@@ -201,6 +202,7 @@ impl StatePatterns {
             Backend::Codex => &CODEX,
             Backend::OpenCode => &OPENCODE,
             Backend::Agy => &AGY,
+            Backend::GrokCli => &GROK,
             Backend::Shell | Backend::Raw(_) => &EMPTY,
         };
         // #1580: every backend now routes through its co-located BackendProfile —

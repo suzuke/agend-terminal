@@ -48,6 +48,7 @@ pub const BACKEND_SKILL_DIRS: &[(&str, &str)] = &[
     ("codex", ".codex/skills"),
     ("opencode", ".opencode/skills"),
     ("kiro", ".kiro/skills"),
+    ("grok", ".grok/skills"),
     ("agy", ".agents/skills"),
 ];
 
