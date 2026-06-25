@@ -1330,6 +1330,10 @@ fn tick(
             // lock drops (CR-2026-06-14 concurrency).
             waiting_on_heartbeat_stale = !core.state.is_heartbeat_fresh();
 
+            // KEEP-RAW (#2465): the AuthError stability / escalation gate reads raw
+            // core.state.current. operated_state is inert here anyway (AuthError maps to the
+            // gate's non-decisive 'Other' screen, which is never overridden), and this is a
+            // recovery/escalation decider that must see raw. See `operated_state` docstring.
             let agent_state = core.state.current;
             // #1523: capture how long AuthError has been continuously held (state
             // age) for the post-lock stability gate. `Some` iff currently in
@@ -1958,6 +1962,10 @@ pub(crate) fn process_error_recovery(
             // used to mis-suppress). `productive_silence` is for the log only.
             let (state, recovered, self_cleared, has_throttle_hint, productive_silence) = {
                 let mut core = handle.core.lock();
+                // KEEP-RAW (#2465): the SRL retry arm reads raw core.state.current. claude hooks
+                // never emit RateLimited (a StopFailure → ApiError, the API plane owns rate-limit),
+                // so operated_state would be inert here; the true ApiError-as-rate-limit SRL fix is
+                // tracked in #2466, out of this PR's scope.
                 let state = core.state.current;
                 let recovered = core.state.recovered_within(RECOVERY_SILENCE);
                 // #2232: ground-truth recovery latch the agent set by self-clearing
