@@ -585,15 +585,47 @@ mod tests {
         seed_stale_delivering(&home, agent, 1, "report");
         crate::inbox::storage::reclaim_stale_delivering(&home);
 
-        // Restored count (1, kind-agnostic `unread_count`) EQUALS the last-notified
-        // count (1). The gate did NOT re-arm (report is a recognised non-obligation),
-        // so the dedup still holds 1 → no re-page. (Pre-fix: reclaim's unconditional
-        // re-arm cleared the dedup → re-page = the ~2h noise.)
+        let (unread, _) = crate::inbox::unread_count(&home, agent);
+        assert_eq!(
+            unread, 0,
+            "#2482: a stale delivered report must be settled, not restored to unread"
+        );
+        assert!(
+            matches!(
+                crate::inbox::describe_message(&home, "m-reclaim-report-agent-0", agent),
+                crate::inbox::MessageStatus::ReadAt(_, _)
+            ),
+            "#2482: delivered report should become terminal processed/read"
+        );
+
+        // With no restored unread rows, there is nothing for poll-reminder to re-page.
         let v = collect_poll_reminders(&home, &registry);
         assert!(
             v.is_empty(),
             "a reclaimed report (non-obligation) must NOT re-arm the poll-reminder: {v:?}"
         );
+
+        reset_dedup(agent);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reclaim_settles_non_obligation_update_2482() {
+        let home = tmp_home("reclaim-update-settle");
+        let agent = "reclaim-update-agent";
+        seed_stale_delivering(&home, agent, 1, "update");
+
+        crate::inbox::storage::reclaim_stale_delivering(&home);
+
+        let (unread, _) = crate::inbox::unread_count(&home, agent);
+        assert_eq!(
+            unread, 0,
+            "#2482: stale delivered update rows must not be restored to unread"
+        );
+        assert!(matches!(
+            crate::inbox::describe_message(&home, "m-reclaim-update-agent-0", agent),
+            crate::inbox::MessageStatus::ReadAt(_, _)
+        ));
 
         reset_dedup(agent);
         std::fs::remove_dir_all(&home).ok();
