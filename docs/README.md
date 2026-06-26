@@ -56,7 +56,7 @@ process notes are English-only.
 | Document | EN | 中文 | What it covers |
 |---|---|---|---|
 | Architecture | [EN](architecture.md) | [中文](architecture.zh-TW.md) | Daemon design, worktree pool, health monitor, channel lifecycle |
-| MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | All 30 agent-coordination MCP tools, by category |
+| MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | All 37 agent-coordination MCP tools, by category |
 | Environment Variables | [EN](env-vars.md) | [中文](env-vars.zh-TW.md) | Every `AGEND_*` variable and its effect |
 | Git Behavior | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | What the daemon changes in a spawned agent's git env |
 | Compatibility Policy | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | On-disk format stability guarantees under `$AGEND_HOME` |

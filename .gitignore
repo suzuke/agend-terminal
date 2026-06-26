@@ -36,3 +36,7 @@ arch-survey/
 .codex/
 .gemini/
 .opencode/
+
+# Tooling artifacts (not for version control)
+graphify-out/
+positive-threshold

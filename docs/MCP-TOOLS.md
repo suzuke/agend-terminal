@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (30 tools)
+# AgEnD MCP Tools Reference (37 tools)
 
 ## Action-based Tools
 
@@ -90,6 +90,11 @@ Replace an instance with a fresh one.
 - **instance**: instance to replace
 - reason
 
+### `restart_instance`
+Kill and restart an instance. Default mode `resume` preserves conversation state; `fresh` starts clean (like `replace_instance`).
+- **instance**: instance to restart
+- mode (resume / fresh), reason
+
 ### `list_instances`
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
 
@@ -121,6 +126,10 @@ Read visible text from a target instance's PTY scrollback (ANSI stripped).
 - **instance**: instance name
 - lines (default 100, max 10000)
 
+### `tui_screenshot`
+Capture the current TUI state as an SVG image. Only works in TUI mode (not daemon-only).
+- **Parameters**: None.
+
 ## Worktree & Binding
 
 ### `bind_self`
@@ -151,6 +160,30 @@ List Phase 4 GC candidates without deleting. Non-destructive.
 ### `task_sweep_config`
 Configure GitHub-PR auto-close sweep daemon.
 - repository, dry_run, pause
+
+### `ephemeral`
+Manage short-lived cross-backend ephemeral workers outside managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap.
+- **action**: spawn / list / reap
+- backend, workflow_id, parent, ttl_secs, token_budget, prompt, model, worker_id, all_stale
+
+### `watchdog`
+Fleet idle watchdog control. Actions: snooze, resume, status, ack. `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.
+- **action**: snooze / resume / status / ack
+- duration (e.g. `2h`, `30m`; clamped to max 4h)
+
+### `config`
+Runtime-mutable daemon configuration. Actions: get, set, list. (Available keys are derived from the daemon's runtime config and listed in the live tool description.)
+- **action**: get / set / list
+- key, value
+
+### `tokens`
+On-demand token usage + estimated USD cost from Claude Code + Codex session transcripts. Cost is an estimate; OpenCode/Kiro/Gemini are not yet covered.
+- **action**: summary / by_instance
+- group_by (instance / task), since (`24h` / `7d` / `90m` / `all`), instance
+
+### `mode`
+Read the operator availability/authority mode (read-only for agents). Setting the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI.
+- **action**: get
 
 ### `restart_daemon`
 

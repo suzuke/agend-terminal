@@ -19,7 +19,7 @@
 
 - **Fleet-as-code** — 一份 YAML 就宣告完每個 agent 的 backend、role、工作目錄與所屬 team。`agend-terminal start` 一次把整個 fleet 拉起來。
 - **5 種 backend** — Claude Code、Codex、Kiro、OpenCode、Antigravity CLI。換 backend 只要改一個欄位。
-- **內建 agent 協調** — agent 之間透過 30 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
+- **內建 agent 協調** — agent 之間透過 37 個 MCP 工具委派工作、互相查詢、廣播更新，不需要任何膠水程式碼。
 - **自動 git worktree 隔離** — 每個 agent 在自己的 worktree 裡工作。agent 之間不會有 merge 衝突，也不會意外互相污染。
 - **Crash 後自動復原並移交上下文** — agent 會自動重啟並接續原本的對話。內建指數退避、健康監控與 hung 偵測。
 - **遠端操控** — 透過多 pane 的 TUI、Telegram 或 Discord 操控整個 fleet，agent 需要你介入時會主動通知。
@@ -103,7 +103,7 @@ graph LR
 - [快速開始指南](docs/FEATURE-quickstart.zh-TW.md) — 首次啟動逐步教學
 - [Fleet 設定](docs/FEATURE-fleet.zh-TW.md) — `fleet.yaml` 參考
 - [CLI 參考](docs/CLI.zh-TW.md) — 所有子命令
-- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 30 個 agent 協調工具
+- [MCP 工具](docs/MCP-TOOLS.zh-TW.md) — 37 個 agent 協調工具
 - [已知問題](docs/KNOWN_ISSUES.zh-TW.md) — 刻意暫緩的項目；開 issue 前請先看
 - [**文件總索引**](docs/README.zh-TW.md) — 所有指南與參考文件的雙語地圖
 

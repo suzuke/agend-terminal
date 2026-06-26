@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（30 個工具）
+# AgEnD MCP Tools Reference — 工具參考（37 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -90,6 +90,11 @@
 - **instance**: 要取代的 instance
 - reason
 
+### `restart_instance`
+終止並重啟一個 instance。預設模式 `resume` 會保留對話狀態；`fresh` 則從乾淨狀態啟動（等同 `replace_instance`）。
+- **instance**: 要重啟的 instance
+- mode (resume / fresh), reason
+
 ### `list_instances`
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
 
@@ -121,6 +126,10 @@
 - **instance**: instance 名稱
 - lines（預設 100，最大 10000）
 
+### `tui_screenshot`
+將目前的 TUI 狀態擷取成 SVG 圖片。僅在 TUI 模式下可用（daemon-only 模式無效）。
+- **參數**：無。
+
 ## Worktree 與 Binding（Worktree & Binding）
 
 ### `bind_self`
@@ -151,6 +160,30 @@
 ### `task_sweep_config`
 設定 GitHub-PR 自動關閉的 sweep daemon。
 - repository, dry_run, pause
+
+### `ephemeral`
+管理短生命週期、跨 backend 的 ephemeral worker，獨立於受管理的簿記之外（無 roster／binding／worktree）。動作：spawn、list、reap。
+- **action**: spawn / list / reap
+- backend, workflow_id, parent, ttl_secs, token_budget, prompt, model, worker_id, all_stale
+
+### `watchdog`
+Fleet idle watchdog 控制。動作：snooze、resume、status、ack。`ack` 會抑制 fleet 警示，直到偵測到 ack 之後的 agent 活動後自動解除。
+- **action**: snooze / resume / status / ack
+- duration（例如 `2h`、`30m`；上限為 4h）
+
+### `config`
+執行期可變更的 daemon 設定。動作：get、set、list。（可用的設定 key 由 daemon 的 runtime config 推導，列於工具的即時描述中。）
+- **action**: get / set / list
+- key, value
+
+### `tokens`
+依需求統計 token 用量與估計的 USD 成本，來源為 Claude Code 與 Codex 的 session transcript。成本為估計值；OpenCode／Kiro／Gemini 尚未涵蓋。
+- **action**: summary / by_instance
+- group_by (instance / task), since（`24h` / `7d` / `90m` / `all`）, instance
+
+### `mode`
+讀取 operator 的可用性／授權模式（對 agent 為唯讀）。設定模式僅限 operator，透過 `agend-terminal mode <active|away|sleep>` CLI 操作。
+- **action**: get
 
 ### `restart_daemon`
 

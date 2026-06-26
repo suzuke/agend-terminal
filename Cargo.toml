@@ -3,11 +3,12 @@ name = "agend-terminal"
 version = "0.9.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 35 MCP tools"
+description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 37 MCP tools"
 license = "Apache-2.0"
 repository = "https://github.com/suzuke/agend-terminal"
 keywords = ["agent", "pty", "terminal", "mcp", "orchestration"]
 categories = ["command-line-utilities", "development-tools"]
+default-run = "agend-terminal"
 
 # Whitelist what ships on crates.io — everything not listed is excluded.
 # Keeps internal docs/scripts/test fixtures out of the published crate.

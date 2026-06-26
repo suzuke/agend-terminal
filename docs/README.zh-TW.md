@@ -55,7 +55,7 @@
 | 文件 | EN | 中文 | 內容 |
 |---|---|---|---|
 | 架構 | [EN](architecture.md) | [中文](architecture.zh-TW.md) | daemon 設計、worktree pool、健康監控、channel 生命週期 |
-| MCP 工具 | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | 全部 30 個 agent 協調 MCP 工具，依類別列出 |
+| MCP 工具 | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | 全部 37 個 agent 協調 MCP 工具，依類別列出 |
 | 環境變數 | [EN](env-vars.md) | [中文](env-vars.zh-TW.md) | 每一個 `AGEND_*` 變數與其作用 |
 | Git 行為 | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | daemon 對被啟動 agent 的 git 環境做了哪些修改 |
 | 相容性政策 | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | `$AGEND_HOME` 底下磁碟格式的穩定性保證 |
