@@ -7,6 +7,13 @@ pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &s
     if let Some(target) = args["instance"].as_str().filter(|s| !s.is_empty()) {
         return handle_describe_instance(home, &json!({"name": target}));
     }
+    // #2475: compact-by-default for routine polling. The API LIST response still
+    // carries full `observed_status.evidence` for dashboards / describe paths;
+    // the MCP `list_instances` read tool strips that evidence unless explicitly
+    // requested, because agents poll this often and the evidence array is noisy
+    // context ballast. Set `verbose:true` or `include_evidence:true` for detail.
+    let include_evidence = args["verbose"].as_bool().unwrap_or(false)
+        || args["include_evidence"].as_bool().unwrap_or(false);
     match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
         Ok(resp) => {
             if let Some(agents) = resp["result"]["agents"].as_array() {
@@ -23,15 +30,27 @@ pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &s
                         if name == instance_name {
                             info["is_self"] = json!(true);
                         }
+                        if !include_evidence {
+                            strip_observed_evidence(&mut info);
+                        }
                         info
                     })
                     .collect();
-                json!({"instances": instances})
+                json!({"instances": instances, "compact": !include_evidence})
             } else {
-                json!({"instances": list_agents()})
+                json!({"instances": list_agents(), "compact": true})
             }
         }
-        Err(_) => json!({"instances": list_agents()}),
+        Err(_) => json!({"instances": list_agents(), "compact": true}),
+    }
+}
+
+fn strip_observed_evidence(info: &mut Value) {
+    if let Some(obs) = info
+        .get_mut("observed_status")
+        .and_then(Value::as_object_mut)
+    {
+        obs.remove("evidence");
     }
 }
 
@@ -70,5 +89,36 @@ pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
             }
         }
         Err(e) => json!({"error": format!("API unavailable: {e}")}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strip_observed_evidence_drops_only_evidence_2475() {
+        let mut info = json!({
+            "name": "dev-1",
+            "agent_state": "idle",
+            "observed_status": {
+                "state": "Active",
+                "confidence": "Strong",
+                "evidence": [{"a": 1}, {"a": 2}, {"a": 3}]
+            }
+        });
+        strip_observed_evidence(&mut info);
+        let obs = &info["observed_status"];
+        assert!(obs["evidence"].is_null(), "evidence must be stripped");
+        assert_eq!(obs["state"], "Active", "non-evidence fields preserved");
+        assert_eq!(info["agent_state"], "idle");
+    }
+
+    #[test]
+    fn strip_observed_evidence_noop_without_observed_status_2475() {
+        let mut info = json!({"name": "dev-2", "agent_state": "idle"});
+        strip_observed_evidence(&mut info); // must not panic / must be inert
+        assert_eq!(info["name"], "dev-2");
     }
 }

@@ -8,6 +8,7 @@
 Manage task board. Actions: create, list, claim, done, update.
 - **action**: create / list / claim / done / update
 - title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration
+- `list` is **terse by default** (#2475): `description` / `result` are length-capped (~200 chars). Pass `verbose: true` for full text; response carries `terse: true` when capping fired.
 
 ### `decision`
 Manage decisions. Actions: post, list, update.
@@ -97,6 +98,7 @@ Kill and restart an instance. Default mode `resume` preserves conversation state
 
 ### `list_instances`
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
+- **compact by default** (#2475): each row drops the noisy `observed_status.evidence` trail. Pass `verbose: true` (or `include_evidence: true`) to include it.
 
 ### `set_display_name`
 Set your display name.

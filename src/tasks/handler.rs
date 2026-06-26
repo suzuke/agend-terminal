@@ -287,8 +287,13 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
     }
     // #2117 P1: the default/single-project response is byte-identical; the
     // fleet aggregate additionally tags each task with its project id.
+    // #2475: terse-by-default. Routine `task list` is the heaviest MCP read
+    // (one session hit the 60KB result cap). The bloat is the free-text
+    // `description`/`result` fields; truncate them by default and let callers
+    // opt into the full text with `verbose: true` (or fetch one task's detail).
+    let verbose = args["verbose"].as_bool().unwrap_or(false);
     if fleet_scope {
-        let tagged: Vec<Value> = filtered
+        let mut tagged: Vec<Value> = filtered
             .iter()
             .map(|t| {
                 let mut v = serde_json::to_value(t).unwrap_or(Value::Null);
@@ -298,16 +303,51 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
                 v
             })
             .collect();
+        if !verbose {
+            for v in &mut tagged {
+                terse_task_value(v);
+            }
+        }
         return serde_json::json!({
             "tasks": tagged,
             "filtered_default": filtered_default,
             "scope": "fleet",
+            "terse": !verbose,
         });
     }
+    let mut tasks: Vec<Value> = filtered
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+        .collect();
+    if !verbose {
+        for v in &mut tasks {
+            terse_task_value(v);
+        }
+    }
     serde_json::json!({
-        "tasks": filtered,
+        "tasks": tasks,
         "filtered_default": filtered_default,
+        "terse": !verbose,
     })
+}
+
+/// #2475: trim the heavy free-text fields of a serialized task for the
+/// terse-by-default `list` response. Structured fields (id/title/status/
+/// assignee/priority/timestamps/…) are kept intact, so the shape still
+/// deserializes; only `description` and `result` are length-capped with a
+/// marker that points at `verbose: true` for the full text.
+fn terse_task_value(v: &mut Value) {
+    const CAP: usize = 200;
+    let Some(obj) = v.as_object_mut() else { return };
+    for key in ["description", "result"] {
+        if let Some(Value::String(s)) = obj.get_mut(key) {
+            if s.chars().count() > CAP {
+                let kept: String = s.chars().take(CAP).collect();
+                let dropped = s.chars().count() - CAP;
+                *s = format!("{kept}… (+{dropped} chars; verbose=true for full)");
+            }
+        }
+    }
 }
 
 /// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task

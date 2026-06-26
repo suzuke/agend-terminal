@@ -1,3 +1,6 @@
+// #2475: the `task` tool's `json!` schema literal is large; raise the macro
+// recursion limit so adding a field doesn't overflow the default-128 expansion.
+#![recursion_limit = "256"]
 // #1630: `#[macro_use]` must precede every module that calls `persist_or_log!`,
 // so it leads the module list. Defines the macro for the whole bin crate.
 #[macro_use]

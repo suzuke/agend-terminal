@@ -82,8 +82,12 @@ pub(crate) fn def_inbox() -> Value {
 }
 
 pub(crate) fn def_list_instances() -> Value {
-    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance.",
-        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"}}}})
+    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
+    "inputSchema": {"type": "object", "properties": {
+        "instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"},
+        "verbose": {"type": "boolean", "description": "#2475: include the per-instance `observed_status.evidence` trail (omitted by default to keep routine polls small)."},
+        "include_evidence": {"type": "boolean", "description": "#2475: alias of `verbose` for this tool — include the `observed_status.evidence` trail."}
+    }}})
 }
 
 pub(crate) fn def_create_instance() -> Value {
@@ -216,6 +220,7 @@ pub(crate) fn def_task() -> Value {
             "status": {"type": "string", "enum": ["backlog", "open", "claimed", "in_progress", "in_review", "blocked", "verified", "done", "cancelled"]},
             "filter_assignee": {"type": "string", "description": "list: filter by assignee (alias: assignee)."}, "filter_status": {"type": "string", "description": "list: filter by status (alias: status)."}, "filter_tag": {"type": "string", "description": "Filter by tag (alias: tag)"}, "tag": {"type": "string", "description": "Alias of filter_tag (#2037)."}, "tags": {"type": "array", "items": {"type": "string"}, "description": "Task tags (for create/update)"},
             "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
+            "verbose": {"type": "boolean", "description": "#2475 list: default is TERSE — `description`/`result` are length-capped (~200 chars) to keep routine list calls small. Set true for the full text (or fetch a single task's detail). Response carries `terse: true` when capping fired."},
             "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
             "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
             "branch": {"type": "string", "description": "Git branch the implementer should work on"},
@@ -877,6 +882,7 @@ mod tests {
             ("task", "filter_tag", "tasks/handler.rs list filter"),
             ("task", "tags", "tasks/handler.rs create/update"),
             ("task", "include_history", "tasks/handler.rs list opt-in"),
+            ("task", "verbose", "tasks/handler.rs list full-text opt-in (#2475)"),
             ("task", "limit", "tasks/handler.rs list cap"),
             ("task", "due_at", "tasks/handler.rs create deadline"),
             ("task", "branch", "tasks/handler.rs create event"),

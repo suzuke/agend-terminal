@@ -660,6 +660,54 @@ fn can_mutate_task_string_compare_no_numeric_coerce() {
 }
 
 #[test]
+fn task_list_truncates_heavy_text_by_default_2475() {
+    let home = tmp_home("list-terse-2475");
+    let long_description = "d".repeat(260);
+    let created = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "large task",
+            "description": long_description,
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let long_result = "r".repeat(260);
+    handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "done", "id": id, "result": long_result}),
+    );
+
+    let terse = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "list", "filter_status": "done"}),
+    );
+    assert_eq!(terse["terse"], true);
+    let t = &terse["tasks"][0];
+    assert!(
+        t["description"].as_str().unwrap().contains("verbose=true"),
+        "description should be capped with an opt-in hint: {t}"
+    );
+    assert!(
+        t["result"].as_str().unwrap().contains("verbose=true"),
+        "result should be capped with an opt-in hint: {t}"
+    );
+
+    let verbose = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "list", "filter_status": "done", "verbose": true}),
+    );
+    assert_eq!(verbose["terse"], false);
+    assert_eq!(verbose["tasks"][0]["description"], long_description);
+    assert_eq!(verbose["tasks"][0]["result"], long_result);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_create_list_claim_done() {
     let home = tmp_home("crud");
     let r = handle(

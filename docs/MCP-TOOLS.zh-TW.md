@@ -8,6 +8,7 @@
 管理 task board。動作：create、list、claim、done、update。
 - **action**: create / list / claim / done / update
 - title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration
+- `list` 預設為**精簡模式**（#2475）：`description`／`result` 會限制長度（約 200 字）。傳 `verbose: true` 可取回完整文字；回應中的 `terse: true` 表示已套用精簡。
 
 ### `decision`
 管理 decision。動作：post、list、update。
@@ -97,6 +98,7 @@
 
 ### `list_instances`
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
+- 預設為 **compact**（#2475）：每列會移除雜訊較大的 `observed_status.evidence` trail。傳 `verbose: true`（或 `include_evidence: true`）可包含它。
 
 ### `set_display_name`
 設定你的顯示名稱。
