@@ -121,6 +121,13 @@ fn is_exempted_file(rel_path: &str) -> bool {
 /// Test-only file detection: files loaded via `#[cfg(test)] #[path = "file.rs"]`
 /// in a parent module are entirely test code and should be skipped.
 fn is_test_only_file(path: &Path) -> bool {
+    // Conventional `foo.rs` + `foo/tests.rs` split: a `tests.rs` submodule is
+    // entirely test code (declared `#[cfg(test)] mod tests;` in the owning
+    // module file one directory up — not a sibling, so the `#[path]` heuristic
+    // below can't see it). By Rust convention `tests.rs` is never production.
+    if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+        return true;
+    }
     let parent = match path.parent() {
         Some(p) => p,
         None => return false,
