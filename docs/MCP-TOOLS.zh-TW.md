@@ -127,6 +127,7 @@
 讀取目標 instance PTY scrollback 中的可見文字（已去除 ANSI）。
 - **instance**: instance 名稱
 - lines（預設 100，最大 10000）
+- `to_file: true`（#2478）會把完整 snapshot 寫到 `$AGEND_HOME/captures/`，tool 只回精簡摘要與路徑，避免診斷 dump 灌進 context。
 
 ### `tui_screenshot`
 將目前的 TUI 狀態擷取成 SVG 圖片。僅在 TUI 模式下可用（daemon-only 模式無效）。

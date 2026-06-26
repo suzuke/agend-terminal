@@ -152,11 +152,85 @@ pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
         &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": lines}}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+            // #2478: diagnostic-capture "summary, not context-flood" mode. A raw
+            // pane dump (hundreds of scrollback lines for a render investigation)
+            // is heavy context that lingers for the whole session. When
+            // `to_file:true`, write the full snapshot to a capture file and return
+            // only a compact summary (counts + head/tail preview + the path) so the
+            // agent can hexdump / inspect the file in scratch WITHOUT the full dump
+            // entering its context.
+            let full = resp["text"].as_str().unwrap_or("");
+            if args["to_file"].as_bool().unwrap_or(false) {
+                return pane_snapshot_to_file(home, target, full, args);
+            }
             json!({"ok": true, "text": resp["text"]})
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("pane_snapshot failed")}),
         Err(e) => json!({"error": format!("pane_snapshot: {e}")}),
     }
+}
+
+/// #2478: persist a full pane snapshot to `<home>/captures/` and return a compact
+/// summary instead of the raw dump. Keeps a heavy diagnostic capture out of the
+/// agent's context while preserving the full bytes on disk for opt-in inspection.
+fn pane_snapshot_to_file(home: &Path, target: &str, full: &str, args: &Value) -> Value {
+    let head_lines = args["head"].as_u64().unwrap_or(40) as usize;
+    let dir = home.join("captures");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        // Fall back to returning the text rather than losing the capture.
+        return json!({
+            "ok": true,
+            "text": full,
+            "warning": format!("to_file requested but captures dir unavailable: {e}"),
+        });
+    }
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let safe_target: String = target
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("pane-{safe_target}-{epoch_ms}.txt"));
+    if let Err(e) = std::fs::write(&path, full) {
+        return json!({
+            "ok": true,
+            "text": full,
+            "warning": format!("to_file requested but write failed: {e}"),
+        });
+    }
+    let all_lines: Vec<&str> = full.lines().collect();
+    let total_lines = all_lines.len();
+    let head: String = all_lines
+        .iter()
+        .take(head_lines)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail: String = all_lines
+        .iter()
+        .rev()
+        .take(5)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({
+        "ok": true,
+        "captured_to": path.display().to_string(),
+        "bytes": full.len(),
+        "lines": total_lines,
+        "head": head,
+        "tail": tail,
+        "note": "full capture written to file; read it (or hexdump in scratch) only if the summary is insufficient — kept out of context per #2478",
+    })
 }
 
 pub(super) fn handle_report_health(
@@ -236,3 +310,38 @@ pub(super) fn handle_clear_blocked_reason(home: &Path, args: &Value) -> Value {
 }
 
 // --- Private helpers (moved from mod.rs) ---
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod snapshot_file_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pane_snapshot_to_file_returns_summary_not_full_text_2478() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-pane-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let full = (0..80)
+            .map(|i| format!("line-{i:02}-{}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resp = pane_snapshot_to_file(&home, "dev/1", &full, &json!({"head": 3}));
+        assert_eq!(resp["ok"], true);
+        let path = resp["captured_to"].as_str().expect("path");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), full);
+        assert_eq!(resp["lines"], 80);
+        assert!(resp["head"].as_str().unwrap().contains("line-00"));
+        assert!(!resp["head"].as_str().unwrap().contains("line-10"));
+        assert!(
+            resp.get("text").is_none(),
+            "summary mode must not return full text"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

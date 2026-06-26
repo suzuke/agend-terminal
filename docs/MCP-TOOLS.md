@@ -127,6 +127,7 @@ Move an instance's pane into a different tab in the TUI.
 Read visible text from a target instance's PTY scrollback (ANSI stripped).
 - **instance**: instance name
 - lines (default 100, max 10000)
+- `to_file: true` (#2478) writes the full snapshot under `$AGEND_HOME/captures/` and returns only a compact summary + path, keeping diagnostic dumps out of context.
 
 ### `tui_screenshot`
 Capture the current TUI state as an SVG image. Only works in TUI mode (not daemon-only).

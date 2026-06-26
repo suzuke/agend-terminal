@@ -180,10 +180,12 @@ pub(crate) fn def_move_pane() -> Value {
 }
 
 pub(crate) fn def_pane_snapshot() -> Value {
-    json!({"name": "pane_snapshot", "description": "Read visible text from a target instance's PTY scrollback. Returns plain text (ANSI stripped). Default 100 lines, max 10000.",
+    json!({"name": "pane_snapshot", "description": "Read visible text from a target instance's PTY scrollback. Returns plain text (ANSI stripped). Default 100 lines, max 10000. #2478: pass to_file=true for diagnostic captures — full text is written under $AGEND_HOME/captures/ and the tool returns only a compact summary + path.",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to snapshot"},
-            "lines": {"type": "integer", "description": "Number of lines to return (default 100, max 10000)"}
+            "lines": {"type": "integer", "description": "Number of lines to return/capture (default 100, max 10000)"},
+            "to_file": {"type": "boolean", "description": "#2478: write the full snapshot to $AGEND_HOME/captures/ and return only a summary + file path, keeping the dump out of context."},
+            "head": {"type": "integer", "description": "#2478 to_file summary: number of leading lines to include in the returned preview (default 40)."}
         }, "required": ["instance"]}})
 }
 
