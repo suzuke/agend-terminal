@@ -320,6 +320,35 @@ pub fn primary_remote(repo_dir: &Path) -> String {
     }
 }
 
+/// #2481: scrub agent-session env that leaks into `cargo test` when the suite is
+/// run from inside an active agent shell (where `AGEND_INSTANCE_NAME` etc. are
+/// set). Without this, every bare `Command::new("git")` in a test inherits the
+/// agent env, so the `agend-git` shim treats the test as an operator command,
+/// strips its `-C <tmp>` override, and reroutes the call into the agent's BOUND
+/// worktree — leaving stray `init` commits (`t <t@t>`) on the real branch.
+///
+/// Runs once at test-binary LOAD, before any `#[test]` and while the process is
+/// still single-threaded — the only point where mutating process-global env is
+/// race-free (the reason `remove_var` is `unsafe`). This makes the documented
+/// `env -u AGEND_INSTANCE_NAME cargo test` workaround automatic + permanent, and
+/// fixes ALL ~200 naked git call sites at the root rather than per-site.
+#[cfg(test)]
+#[ctor::ctor]
+fn _scrub_agent_session_env_at_test_load_2481() {
+    // SAFETY: a `#[ctor]` runs before `main` on a single thread, so this
+    // process-global env mutation cannot race another thread.
+    unsafe {
+        for key in [
+            "AGEND_INSTANCE_NAME",
+            "AGEND_REAL_GIT",
+            "AGEND_GIT_BYPASS_AGENT",
+            "AGEND_GIT_BYPASS_UNTIL",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

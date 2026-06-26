@@ -9,6 +9,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 // --- Auto-prune pre-flight check tests (worktree.rs functions) ---
 // These test the git-level functions directly since they're in the binary.
 // The actual has_uncommitted_changes / remove_worktree are tested via
@@ -19,29 +21,11 @@
 fn git_status_porcelain_detects_dirty() {
     let dir = std::env::temp_dir().join(format!("agend-wt-dirty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["init", "-b", "main"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    common::git_isolated::git(&dir, &["init", "-b", "main"]);
+    common::git_isolated::git(&dir, &["commit", "--allow-empty", "-m", "init"]);
     std::fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
 
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["status", "--porcelain"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = common::git_isolated::git(&dir, &["status", "--porcelain"]);
     assert!(
         !output.stdout.is_empty(),
         "git status --porcelain must detect uncommitted file"
@@ -54,28 +38,10 @@ fn git_status_porcelain_detects_dirty() {
 fn git_status_porcelain_clean() {
     let dir = std::env::temp_dir().join(format!("agend-wt-clean-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["init", "-b", "main"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    common::git_isolated::git(&dir, &["init", "-b", "main"]);
+    common::git_isolated::git(&dir, &["commit", "--allow-empty", "-m", "init"]);
 
-    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
-    let output = std::process::Command::new("git")
-        .env("AGEND_GIT_BYPASS", "1")
-        .args(["status", "--porcelain"])
-        .current_dir(&dir)
-        .output()
-        .unwrap();
+    let output = common::git_isolated::git(&dir, &["status", "--porcelain"]);
     assert!(
         output.stdout.is_empty(),
         "clean repo must have empty git status --porcelain"

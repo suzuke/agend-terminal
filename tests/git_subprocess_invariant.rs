@@ -32,6 +32,12 @@
 //! grandfathered via per-site `// allow:` comments added when this
 //! invariant lands. Follow-up PRs can migrate them to
 //! `git_isolated::git()` incrementally.
+//!
+//! #2481 follow-up: unit tests in `src/` cannot use this `tests/common`
+//! helper, so `src/git_helpers.rs` also installs a test-binary-load `ctor`
+//! that scrubs agent-session git-shim env (`AGEND_INSTANCE_NAME`,
+//! `AGEND_REAL_GIT`, …) before any test starts. A source-scan invariant below
+//! pins that global safety net.
 
 use std::path::{Path, PathBuf};
 
@@ -251,6 +257,28 @@ fn invariant_passes_when_helper_module_used() {
         "helper-routed callers must surface zero violations, got: {violations:?}"
     );
     std::fs::remove_dir_all(&temp).ok();
+}
+
+#[test]
+fn test_binary_scrubs_agent_git_env_at_load_2481() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/git_helpers.rs");
+    let src = std::fs::read_to_string(&path).expect("read src/git_helpers.rs");
+    assert!(
+        src.contains("#[ctor::ctor]") && src.contains("_scrub_agent_session_env_at_test_load_2481"),
+        "#2481: src/git_helpers.rs must install a test-load ctor that scrubs \
+         agent-session env before any test can spawn `git`"
+    );
+    for key in [
+        "AGEND_INSTANCE_NAME",
+        "AGEND_REAL_GIT",
+        "AGEND_GIT_BYPASS_AGENT",
+        "AGEND_GIT_BYPASS_UNTIL",
+    ] {
+        assert!(
+            src.contains(&format!("\"{key}\"")),
+            "#2481: test-load git-env scrubber must remove {key}"
+        );
+    }
 }
 
 /// Synthesize a temporary tests-like dir scoped by tag. Used by
