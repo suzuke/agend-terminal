@@ -350,6 +350,50 @@ fn create_instance_persists_args_and_model_for_restart_parity_1858() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2477: create_instance accepts a symbolic `model_tier` and persists it so
+/// restart/boot resolution can map the tier through fleet.yaml `model_tiers`.
+/// It must not have to duplicate the concrete model into every spawned worker.
+#[test]
+fn create_instance_persists_model_tier_for_restart_parity_2477() {
+    let home = tmp_home("2477-model-tier");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "model_tiers:\n  cheap: sonnet\ninstances: {}\n",
+    )
+    .unwrap();
+
+    let spawn_fn = |_h: &Path, _req: &Value| -> anyhow::Result<Value> {
+        Ok(json!({"ok": true, "result": {}}))
+    };
+    let _ = spawn_single_instance_impl(
+        &home,
+        "spawner",
+        &json!({"name": "dev-tier", "backend": "claude", "model_tier": "cheap"}),
+        &spawn_fn,
+    );
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    let cfg = fleet
+        .instances
+        .get("dev-tier")
+        .expect("instance persisted to fleet.yaml");
+    assert_eq!(cfg.model_tier.as_deref(), Some("cheap"));
+    assert_eq!(
+        cfg.model, None,
+        "tier must not be eagerly copied into model"
+    );
+    assert_eq!(
+        fleet
+            .resolve_instance("dev-tier")
+            .expect("resolve")
+            .model
+            .as_deref(),
+        Some("sonnet"),
+        "restart/boot resolution must map model_tier through model_tiers"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2037 (6): explicit `name` + `team` with count>1/backends is ambiguous —
 /// loud error instead of the pre-#2037 silent rename to `<team>-N`.
 #[test]

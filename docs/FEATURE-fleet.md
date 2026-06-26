@@ -30,9 +30,18 @@ fleet.yaml lives at `$AGEND_HOME/fleet.yaml` (default `~/.agend-terminal/fleet.y
 # Default configuration (inherited by all instances)
 defaults:
   backend: claude
+  model_tier: cheap
   ready_pattern: "bypass permissions|❯"
   env:
     AGEND_PRODUCTIVE_GATE: "1"
+
+# Symbolic tiers let operators change concrete model IDs in one place (#2477)
+model_tiers:
+  cheap: sonnet
+  strong: opus
+role_model_tiers:
+  orchestrator: strong
+  implementer: cheap
 
 # Communication channel
 channel:
@@ -51,7 +60,7 @@ instances:
   lead:
     role: "Team lead — task decomposition and dispatch"
     backend: claude
-    model: opus
+    model_tier: strong
     working_directory: ~/Projects/my-app
     source_repo: ~/Projects/my-app
     worktree: false
@@ -89,11 +98,18 @@ All instances inherit settings from defaults. Individual instances can override 
 | `backend` | string | Backend name (claude / kiro-cli / codex / opencode / gemini / agy / shell) |
 | `command` | string | Custom command (overrides backend default) |
 | `args` | [string] | CLI argument list |
-| `model` | string | Model name (e.g., opus, sonnet) |
+| `model` | string | Concrete model name (e.g., opus, sonnet). Wins over `model_tier` |
+| `model_tier` | string | Symbolic tier from `model_tiers` (e.g., cheap / strong) for role/task cost policy (#2477) |
 | `ready_pattern` | string | Regex to determine when the agent is ready |
 | `env` | map | Environment variables (key-value pairs) |
 | `cols` | int | Terminal width (default 200) |
 | `rows` | int | Terminal height (default 50) |
+
+#### `model_tiers` and `role_model_tiers` — Model tier policy
+
+`model_tiers` maps a symbolic tier name to the concrete model string passed to the backend as `--model`. `role_model_tiers` applies a tier by typed `role_kind` when an instance does not set `model` or `model_tier` directly. Precedence is: instance `model` → instance `model_tier` → `role_model_tiers[role_kind]` → defaults `model` → defaults `model_tier`.
+
+This is additive and intended for #2477 cost control: dev/implementer agents can default to a cheaper tier while leads/orchestrators stay on a stronger tier.
 
 #### `instances` — Agent Instances
 
@@ -111,7 +127,8 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 | `repo` | string | GitHub `owner/repo` format. Used for CI watch, PR operations, etc. Auto-derived from `source_repo` git remote; this field is a manual override |
 | `worktree` | bool | `true` (default) = auto-create git worktree; `false` = skip |
 | `git_branch` | string | Custom worktree branch name (alias: `worktree_source`) |
-| `model` | string | Model override |
+| `model` | string | Concrete model override; wins over `model_tier` |
+| `model_tier` | string | Symbolic tier from `model_tiers`. If `model` is absent, resolves to a concrete backend model and is passed as `--model` |
 | `env` | map | Environment variables (merged with defaults; instance takes precedence) |
 | `cols` / `rows` | int | Terminal size override |
 | `ready_pattern` | string | Readiness regex override |

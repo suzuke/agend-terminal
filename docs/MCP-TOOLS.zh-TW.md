@@ -75,7 +75,7 @@
 ### `create_instance`
 建立 agent instance。支援同質團隊（count + backend）和異質團隊（backends 列表）。
 - **name**: instance 或團隊的基礎名稱
-- backend, model, args, branch, working_directory, task
+- backend, model, model_tier, args, branch, working_directory, task
 - team, count, backends, layout, target_pane
 
 ### `delete_instance`

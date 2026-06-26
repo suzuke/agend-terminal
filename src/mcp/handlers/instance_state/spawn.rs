@@ -162,6 +162,11 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         .and_then(|v| v.as_str())
         .filter(|m| !m.is_empty())
         .map(String::from);
+    let entry_model_tier: Option<String> = args
+        .get("model_tier")
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.is_empty())
+        .map(String::from);
     // #964: ADD fleet.yaml entry BEFORE the SPAWN RPC so the instance
     // exists when SPAWN runs. Pre-fix SPAWN-then-add ordering caused
     // silent failures.
@@ -175,6 +180,7 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         role: role.clone(),
         args: entry_args,
         model: entry_model,
+        model_tier: entry_model_tier,
         env: env_for_entry,
         topic_binding_mode: args
             .get("topic_binding")

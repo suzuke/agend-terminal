@@ -228,11 +228,26 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     // Model precedence: an explicit `--model` in args (create_instance
     // pre-formats it there) > `params.model` (deploy Phase 3 sends the
     // template's model on the wire — pre-#2038 this field was silently
-    // ignored) > the fleet entry's resolved model. push_model_arg enforces
+    // ignored) > the fleet entry's resolved model. `params.model_tier` is
+    // accepted for direct SPAWN callers, but persisted create/deploy paths
+    // usually resolve it through the fleet entry. push_model_arg enforces
     // the first tier by never duplicating an existing flag.
+    let fleet_config_for_model = std::cell::OnceCell::new();
+    let tier_model = params["model_tier"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .and_then(|tier| {
+            let fleet = fleet_config_for_model.get_or_init(|| {
+                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
+            });
+            fleet
+                .as_ref()
+                .and_then(|f| f.model_tiers.get(tier).map(String::as_str))
+        });
     if let Some(model) = params["model"]
         .as_str()
         .filter(|m| !m.is_empty())
+        .or(tier_model)
         .or_else(|| fleet_resolved.as_ref().and_then(|r| r.model.as_deref()))
     {
         crate::backend::Backend::push_model_arg(&mut args, command, model);

@@ -586,26 +586,24 @@ fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
         "the flock loser must exit NON-zero (failed to acquire the lock), got {loser:?}"
     );
     // MECHANISM PIN (codex #2088 — the test's whole point): the loser MUST have
-    // died from the `.daemon.lock` `try_lock` fail-fast, NOT any other exit
-    // reason — otherwise this test (which exists solely to pin the spike's
-    // double-bind risk) would pass on an unrelated loser crash. So this is
-    // MANDATORY (stderr non-empty) and asserts the EXACT production error:
-    //   - our authored prefix (bootstrap/mod.rs `acquire_daemon_lock`:
-    //     `another agend-terminal daemon is already running (lock held): {e}`),
-    //     emitted by NOTHING else, and
-    //   - fs4 1.1's `{e}` = `lock_contended_error()`, a crate-CONSTANT
-    //     `io::Error(WouldBlock, "try_lock failed because the operation would
-    //     block")` — identical on macOS and Linux (not an OS strerror), so the
-    //     full string is cross-platform stable.
+    // died from one of the two legitimate single-daemon fail-fast paths, NOT any
+    // unrelated crash. The race decides which path observes first:
+    //   - `.daemon.lock` contention in bootstrap::acquire_daemon_lock, or
+    //   - attached-daemon detection after the winner has published run/<pid>/.
+    // Both prove the same invariant this test exists to pin: no double-bind.
     eprintln!("[1814] flock-loser stderr: {loser_stderr:?}");
+    let lock_contended = loser_stderr.contains(
+        "another agend-terminal daemon is already running (lock held): \
+         try_lock failed because the operation would block",
+    );
+    let attached_existing = loser_stderr
+        .contains("another agend-terminal daemon is already running (pid ")
+        && loser_stderr.contains("run_dir ");
     assert!(
-        loser_stderr.contains(
-            "another agend-terminal daemon is already running (lock held): \
-             try_lock failed because the operation would block"
-        ),
-        "the flock loser MUST exit via the try_lock fail-fast with the exact production lock \
-         error (this is the test's sole purpose — proving the double-bind guard fired, not just \
-         that some process exited); stderr was: {loser_stderr:?}"
+        lock_contended || attached_existing,
+        "the flock loser MUST exit via a production single-daemon fail-fast path \
+         (lock contention or attached-daemon detection), not an unrelated crash; stderr was: \
+         {loser_stderr:?}"
     );
 }
 

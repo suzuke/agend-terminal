@@ -75,7 +75,7 @@ Download a file attachment (telegram multimedia). Returns local path.
 ### `create_instance`
 Create agent instance(s). Supports homogeneous teams (count + backend) and heterogeneous teams (backends list).
 - **name**: instance or team base name
-- backend, model, args, branch, working_directory, task
+- backend, model, model_tier, args, branch, working_directory, task
 - team, count, backends, layout, target_pane
 
 ### `delete_instance`

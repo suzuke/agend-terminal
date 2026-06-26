@@ -36,7 +36,6 @@ const GRANDFATHERED: &[(&str, usize)] = &[
     ("src/agent/mod.rs", 3216),
     ("src/vterm.rs", 3103),
     ("src/deployments.rs", 2806),
-    ("src/fleet/mod.rs", 2773),
 ];
 
 /// True for files allowed to be large because they are test code, not

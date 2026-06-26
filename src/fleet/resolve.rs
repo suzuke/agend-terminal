@@ -71,6 +71,47 @@ fn resolve_working_directory(inst: &super::InstanceConfig, name: &str) -> Option
     }))
 }
 
+fn resolve_tier_model(fleet: &super::FleetConfig, name: &str, tier: String) -> Option<String> {
+    match fleet.model_tiers.get(&tier) {
+        Some(model) if !model.is_empty() => Some(model.clone()),
+        _ => {
+            tracing::warn!(
+                instance = name,
+                tier = %tier,
+                "fleet.yaml model_tier has no matching non-empty model_tiers entry; no --model will be added"
+            );
+            None
+        }
+    }
+}
+
+fn resolve_model(
+    fleet: &super::FleetConfig,
+    inst: &super::InstanceConfig,
+    name: &str,
+) -> Option<String> {
+    if let Some(model) = inst.model.clone() {
+        return Some(model);
+    }
+
+    if let Some(tier) = inst.model_tier.clone().or_else(|| {
+        inst.role_kind
+            .and_then(|role| fleet.role_model_tiers.get(&role).cloned())
+    }) {
+        return resolve_tier_model(fleet, name, tier);
+    }
+
+    if let Some(model) = fleet.defaults.model.clone() {
+        return Some(model);
+    }
+
+    fleet
+        .defaults
+        .model_tier
+        .clone()
+        .and_then(|tier| resolve_tier_model(fleet, name, tier))
+}
+
 pub(super) fn resolve_instance(
     fleet: &super::FleetConfig,
     name: &str,
@@ -121,7 +162,7 @@ pub(super) fn resolve_instance(
             .and_then(|h| crate::channel::telegram::lookup_topic_for_instance(h, name))
             .or(inst.topic_id),
         git_branch: inst.git_branch.clone(),
-        model: inst.model.clone().or_else(|| defaults.model.clone()),
+        model: resolve_model(fleet, inst, name),
         worktree: inst.worktree,
         instructions: inst
             .instructions

@@ -34,9 +34,18 @@ fleet.yaml 位於 `$AGEND_HOME/fleet.yaml`（預設 `~/.agend-terminal/fleet.yam
 # 預設配置（所有 instance 繼承）
 defaults:
   backend: claude
+  model_tier: cheap
   ready_pattern: "bypass permissions|❯"
   env:
     AGEND_PRODUCTIVE_GATE: "1"
+
+# Symbolic tiers let operators change concrete model IDs in one place (#2477)
+model_tiers:
+  cheap: sonnet
+  strong: opus
+role_model_tiers:
+  orchestrator: strong
+  implementer: cheap
 
 # 通訊頻道
 channel:
@@ -55,7 +64,7 @@ instances:
   lead:
     role: "Team lead — task decomposition and dispatch"
     backend: claude
-    model: opus
+    model_tier: strong
     working_directory: ~/Projects/my-app
     source_repo: ~/Projects/my-app
     worktree: false
@@ -93,11 +102,18 @@ teams:
 | `backend` | string | Backend 名稱（claude / kiro-cli / codex / opencode / gemini / agy / shell） |
 | `command` | string | 自訂執行命令（覆蓋 backend 預設命令） |
 | `args` | [string] | CLI 參數列表 |
-| `model` | string | 模型名稱（如 opus、sonnet） |
+| `model` | string | 具體模型名稱（如 opus、sonnet）。優先於 `model_tier` |
+| `model_tier` | string | `model_tiers` 中的符號 tier（如 cheap / strong），用於角色/任務成本策略（#2477） |
 | `ready_pattern` | string | 正規表達式，用來判斷 agent 何時準備就緒 |
 | `env` | map | 環境變數（key-value 對） |
 | `cols` | int | 終端寬度（預設 200） |
 | `rows` | int | 終端高度（預設 50） |
+
+#### `model_tiers` 與 `role_model_tiers` — 模型 tier 策略
+
+`model_tiers` 將符號 tier 名稱映射到實際傳給 backend 的 `--model` 字串。當 instance 沒有直接設定 `model` 或 `model_tier` 時，`role_model_tiers` 可依 typed `role_kind` 套用 tier。優先序為：instance `model` → instance `model_tier` → `role_model_tiers[role_kind]` → defaults `model` → defaults `model_tier`。
+
+這是 #2477 的 additive 成本控制：dev/implementer 可預設使用較便宜 tier，lead/orchestrator 則使用較強 tier。
 
 #### `instances` — Agent 實例
 
@@ -115,7 +131,8 @@ teams:
 | `repo` | string | GitHub `owner/repo` 格式。用於 CI watch、PR 操作等。自動從 `source_repo` 的 git remote 推導，此欄位為手動覆蓋 |
 | `worktree` | bool | `true`（預設）= 自動建立 git worktree；`false` = 不建立 |
 | `git_branch` | string | 自訂 worktree 分支名稱（別名：`worktree_source`） |
-| `model` | string | 模型覆蓋 |
+| `model` | string | 具體模型覆蓋；優先於 `model_tier` |
+| `model_tier` | string | `model_tiers` 中的符號 tier。若未設定 `model`，會解析成具體模型後以 `--model` 傳給 backend |
 | `env` | map | 環境變數（與 defaults 合併，instance 優先） |
 | `cols` / `rows` | int | 終端尺寸覆蓋 |
 | `ready_pattern` | string | 就緒判斷正規表達式覆蓋 |

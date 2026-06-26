@@ -227,6 +227,7 @@ fn create_instance_entries(
                 github_login: yaml_str(inst_val, "github_login"),
                 args: template_args,
                 model: yaml_str(inst_val, "model"),
+                model_tier: yaml_str(inst_val, "model_tier"),
                 env: template_env,
                 ready_pattern: yaml_str(inst_val, "ready_pattern"),
                 command: yaml_str(inst_val, "command"),
@@ -1304,12 +1305,8 @@ templates:
     }
 
     #[test]
-    fn deploy_passes_all_six_params_simultaneously() {
-        // End-to-end pin: a template that declares all six new fields
-        // round-trips every one through fleet.yaml. Defends against a
-        // future regression where one passthrough is silently dropped
-        // (e.g. someone removes the template_args binding without
-        // updating the constructor).
+    fn deploy_passes_all_seven_params_simultaneously() {
+        // End-to-end pin: all passthrough fields round-trip through fleet.yaml.
         let home = tmp_home("all_six");
         let yaml = r#"
 templates:
@@ -1320,6 +1317,7 @@ templates:
         args:
           - --resume
         model: sonnet
+        model_tier: cheap
         env:
           API_KEY_VAR: KEY
         ready_pattern: "now ready"
@@ -1337,6 +1335,7 @@ templates:
         let inst = reloaded.instances.get("full-worker").expect("full-worker");
         assert_eq!(inst.args, vec!["--resume".to_string()]);
         assert_eq!(inst.model.as_deref(), Some("sonnet"));
+        assert_eq!(inst.model_tier.as_deref(), Some("cheap"));
         assert_eq!(inst.env.get("API_KEY_VAR").map(|s| s.as_str()), Some("KEY"));
         assert_eq!(inst.ready_pattern.as_deref(), Some("now ready"));
         assert_eq!(inst.command.as_deref(), Some("my-runner"));

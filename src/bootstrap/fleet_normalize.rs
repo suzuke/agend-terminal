@@ -116,6 +116,8 @@ mod tests {
                 backend: Some(Backend::ClaudeCode),
                 ..Default::default()
             },
+            model_tiers: Default::default(),
+            role_model_tiers: Default::default(),
             instances: Default::default(),
             teams: Default::default(),
             passthrough_env: Vec::new(),
