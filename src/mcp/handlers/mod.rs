@@ -155,7 +155,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         return value;
     }
 
-    // #694 BLOCK 2 fully migrated — all 30 advertised MCP tools flow
+    // #694 BLOCK 2 fully migrated — all registered MCP tools flow
     // through `dispatch::try_dispatch` above. The inline match is gone;
     // a reached-this-line tool name must be unregistered. (Defensive
     // catch-all — `every_advertised_tool_is_routed_somewhere` in
@@ -176,15 +176,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 /// `action` — those keep the full path rather than coupling this chokepoint to
 /// each tool's per-action semantics (the minority of read actions pay the IO).
 fn is_read_only_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "list_instances"
-            | "binding_state"
-            | "gc_dry_run"
-            | "tokens"
-            | "pane_snapshot"
-            | "tui_screenshot"
-    )
+    crate::mcp::registry::read_only_disk_skip(tool)
 }
 
 #[cfg(test)]

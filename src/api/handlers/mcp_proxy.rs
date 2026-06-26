@@ -24,46 +24,11 @@ pub(crate) const FAST_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const SLOW_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Fast read-only / atomic-flip tools (~5s). Every name is a registered MCP
-/// tool — `tool_timeout_keys_are_registered_tools` pins this against
-/// `registry::all()` so a consolidation/rename can't silently leave a stale
-/// (never-matching) entry here again.
-const FAST_TOOLS: &[&str] = &[
-    "inbox",
-    "list_instances",
-    "set_waiting_on",
-    "set_display_name",
-    "set_description",
-    "health",
-];
-
-/// Tools whose slowest action spawns a process / does network I/O (~60s).
-///
-/// #2050 W1.3①: `deployment` / `ci` / `repo` are the action-consolidated
-/// successors of the old `deploy_template` / `watch_ci` / `checkout_repo`
-/// names. Those stale names stopped matching after the consolidation, so these
-/// genuinely-long operations (deploy, CI watch, repo checkout/merge) were
-/// silently falling back to the 30s default — a false-timeout risk this fix
-/// closes. #1814: `restart_daemon` spawns a successor + runs a ≤30s Phase-1
-/// gate. `team` (create) spawns agents like `create_instance` (and mirrors the
-/// `method_wait_timeout` CREATE_TEAM 60s band).
-const SLOW_TOOLS: &[&str] = &[
-    "create_instance",
-    "replace_instance",
-    "restart_daemon",
-    "deployment",
-    "ci",
-    "repo",
-    "team",
-];
-
 pub(crate) fn tool_timeout(tool: &str) -> Duration {
-    if FAST_TOOLS.contains(&tool) {
-        FAST_TOOL_TIMEOUT
-    } else if SLOW_TOOLS.contains(&tool) {
-        SLOW_TOOL_TIMEOUT
-    } else {
-        DEFAULT_TOOL_TIMEOUT
+    match crate::mcp::registry::timeout_class(tool) {
+        crate::mcp::registry::ToolTimeoutClass::Fast => FAST_TOOL_TIMEOUT,
+        crate::mcp::registry::ToolTimeoutClass::Default => DEFAULT_TOOL_TIMEOUT,
+        crate::mcp::registry::ToolTimeoutClass::Slow => SLOW_TOOL_TIMEOUT,
     }
 }
 
@@ -94,28 +59,7 @@ pub(crate) fn tool_timeout(tool: &str) -> Duration {
 /// is keyed on the instance name (a repeat errors, no second spawn). `send` /
 /// `reply` / `decision`-post have NO natural key — they rely on this gate.
 fn is_side_effect_tool(tool: &str) -> bool {
-    !matches!(
-        tool,
-        // Pure reads — agent needs the result, repeat is harmless.
-        "inbox"
-            | "list_instances"
-            | "binding_state"
-            | "gc_dry_run"
-            | "mode"
-            | "tokens"
-            | "pane_snapshot"
-            | "tui_screenshot"
-            | "download_attachment"
-            // Idempotent mutations — a repeat converges to the same state.
-            | "set_waiting_on"
-            | "set_display_name"
-            | "set_description"
-            | "health"
-            | "bind_self"
-            | "release_worktree"
-            | "force_release_worktree"
-            | "ci"
-    )
+    crate::mcp::registry::side_effect_on_timeout(tool)
 }
 
 /// Stable hash of `(tool, args)` for the timeout instrument. NOT used for any
@@ -318,23 +262,19 @@ mod tests {
         assert_eq!(tool_timeout("unknown_tool"), Duration::from_secs(30));
     }
 
-    /// #2050 W1.3① coverage invariant: every tool the timeout map classifies
-    /// MUST be a registered MCP tool. This is the closure that prevents the
-    /// stale-name drift this PR fixed (`deploy_template`/`watch_ci`/
-    /// `checkout_repo`/`describe_*`/`list_*`/`react`/`report_health` had all
-    /// gone stale after consolidation, silently degrading their tools to the
-    /// 30s default). A future rename/removal now fails CI here instead.
+    /// #2050 W1.3① / P1 single-source follow-up: timeout classification is now
+    /// stored on the registered `ToolEntry` itself, so the old stale-name class
+    /// (FAST/SLOW lists naming removed tools) is structurally impossible. Keep a
+    /// lightweight invariant that every registered entry resolves through
+    /// `tool_timeout` without panicking.
     #[test]
-    fn tool_timeout_keys_are_registered_tools() {
-        use std::collections::HashSet;
-        let registered: HashSet<&str> =
-            crate::mcp::registry::all().iter().map(|t| t.name).collect();
-        for &t in FAST_TOOLS.iter().chain(SLOW_TOOLS.iter()) {
+    fn every_registered_tool_has_timeout_class() {
+        for entry in crate::mcp::registry::all() {
+            let timeout = tool_timeout(entry.name);
             assert!(
-                registered.contains(t),
-                "tool_timeout classifies '{t}' but it is not a registered MCP tool \
-                 (registry::all) — stale after a tool consolidation/rename? Update the \
-                 name (or add a documented retired-allowlist). #2050 W1.3①"
+                [FAST_TOOL_TIMEOUT, DEFAULT_TOOL_TIMEOUT, SLOW_TOOL_TIMEOUT].contains(&timeout),
+                "registered tool '{}' resolved to unexpected timeout {timeout:?}",
+                entry.name
             );
         }
     }
