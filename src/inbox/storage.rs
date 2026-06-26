@@ -1189,6 +1189,20 @@ fn kind_is_unknown(msg: &InboxMessage) -> bool {
     }
 }
 
+/// Recognised fire-and-forget *kinds* have no outstanding obligation once they
+/// were delivered once. If their turn never explicitly acked them, reclaim must
+/// settle them to `processed` instead of making them unread again; otherwise old
+/// `report`/`update` rows can loop forever through poll-reminder (#2482).
+///
+/// Plain `kind=None` rows intentionally stay outside this set: #2299's core
+/// anti-silent-loss guarantee still redelivers generic messages after a dead turn.
+fn known_non_obligation_kind(msg: &InboxMessage) -> bool {
+    matches!(
+        msg.kind.as_deref(),
+        Some("report" | "update" | "ci-watch" | "poll")
+    )
+}
+
 /// Sweep expired messages from all inbox files (#inbox-gc part b).
 ///
 /// Two-pass per inbox, both serialised under [`with_inbox_lock`]:
@@ -1331,7 +1345,8 @@ pub fn sweep_expired(home: &Path) {
 /// [`with_inbox_lock`], atomic tmp+rename write-back. For each reverted row it
 /// also `forget`s the `notification_dedup` entry (flagged `consumed` at the
 /// original delivering drain) so the re-inject isn't suppressed for the rest of
-/// the dedup window. Runs from `per_tick::inbox_maintenance` (60-tick).
+/// the dedup window. Recognised non-obligation *kinds* are terminally settled
+/// instead of reverted (#2482). Runs from `per_tick::inbox_maintenance` (60-tick).
 pub fn reclaim_stale_delivering(home: &Path) {
     let inbox_dir = home.join("inbox");
     let entries = match std::fs::read_dir(&inbox_dir) {
@@ -1361,6 +1376,7 @@ pub fn reclaim_stale_delivering(home: &Path) {
             let mut all: Vec<InboxMessage> = Vec::new();
             let mut preserved_forward: Vec<String> = Vec::new();
             let mut reverted: Vec<InboxMessage> = Vec::new();
+            let mut settled_non_obligations = 0usize;
             let mut changed = false;
             for line in content.lines() {
                 if line.trim().is_empty() {
@@ -1385,11 +1401,20 @@ pub fn reclaim_stale_delivering(home: &Path) {
                             })
                             .unwrap_or(true); // unparseable timestamp → reclaim (fail-safe)
                         if stale {
-                            msg.delivering_at = None; // → unread (re-deliverable)
+                            if known_non_obligation_kind(&msg) {
+                                // #2482: fire-and-forget rows (report/update/ci-watch/poll)
+                                // were already delivered once and have no actor blocked on them.
+                                // Reverting them to unread lets poll-reminder/drain resurrect old
+                                // completed-task chatter forever. Terminally settle instead.
+                                msg.read_at = Some(now.to_rfc3339());
+                                settled_non_obligations += 1;
+                            } else {
+                                // Collect the full reverted row: Phase 2 reads `id` (dedup
+                                // forget) + `kind`/`task_id`/`correlation_id` (re-nudge gate).
+                                msg.delivering_at = None; // → unread (re-deliverable)
+                                reverted.push(msg.clone());
+                            }
                             changed = true;
-                            // Collect the full reverted row: Phase 2 reads `id` (dedup
-                            // forget) + `kind`/`task_id`/`correlation_id` (re-nudge gate).
-                            reverted.push(msg.clone());
                         }
                     }
                 }
@@ -1423,6 +1448,14 @@ pub fn reclaim_stale_delivering(home: &Path) {
                         agent = %agent_name,
                         count = reverted.len(),
                         "reverted stale delivering rows to unread for re-delivery"
+                    );
+                }
+                if settled_non_obligations > 0 {
+                    tracing::info!(
+                        tag = "#2482-reclaim-settle",
+                        agent = %agent_name,
+                        count = settled_non_obligations,
+                        "settled stale delivering non-obligation rows to processed"
                     );
                 }
             }
