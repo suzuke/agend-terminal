@@ -65,6 +65,7 @@ pub mod operator_mode;
 mod paths;
 mod process;
 mod protocol;
+mod provider_detect;
 mod quickstart;
 mod render;
 mod reply_ledger;
@@ -594,6 +595,12 @@ enum SkillsAction {
 /// topic state diagnostic + optional cleanup.
 #[derive(Subcommand)]
 enum DoctorAction {
+    /// Diagnose Fugu/Sakana provider availability for the codex harness.
+    Providers {
+        /// Output format: `human` (default) or `json`.
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
     /// Diagnose telegram topic state (live / orphan).
     /// Pair with `--cleanup` to act on orphan entries (chat-mutating
     /// operations gated by bot's `can_manage_topics` permission).
@@ -1327,6 +1334,9 @@ fn main() -> anyhow::Result<()> {
             },
         },
         Some(Commands::Doctor { action: None }) => cli::run_doctor(&home)?,
+        Some(Commands::Doctor {
+            action: Some(DoctorAction::Providers { format }),
+        }) => cli::run_doctor_providers(&format)?,
         Some(Commands::Doctor {
             action:
                 Some(DoctorAction::Topics {

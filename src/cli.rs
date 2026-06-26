@@ -370,6 +370,43 @@ pub(crate) fn check_helper_staleness(home: &Path) -> String {
 // Backed by `crate::bootstrap::doctor_topics`.
 // ─────────────────────────────────────────────────────────────────
 
+/// Run provider diagnostics (currently Fugu/Sakana via codex) for `doctor providers`.
+pub fn run_doctor_providers(format: &str) -> anyhow::Result<()> {
+    let d = crate::provider_detect::detect_default();
+    if format == "json" {
+        let source = d.provider_source.as_ref().map(|p| p.display().to_string());
+        println!(
+            "{}",
+            serde_json::json!({
+                "fugu": {
+                    "status": d.status.as_str(),
+                    "codex_on_path": d.codex_on_path,
+                    "provider_source": source,
+                    "has_credential": d.has_credential,
+                    "models": d.models,
+                    "hints": d.hints,
+                }
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Provider diagnostics");
+    println!("  fugu: {}", d.status.as_str());
+    println!("    codex_on_path: {}", d.codex_on_path);
+    println!("    has_credential: {}", d.has_credential);
+    if let Some(source) = d.provider_source.as_ref() {
+        println!("    provider_source: {}", source.display());
+    }
+    if !d.models.is_empty() {
+        println!("    models: {}", d.models.join(", "));
+    }
+    for hint in &d.hints {
+        println!("    hint: {hint}");
+    }
+    Ok(())
+}
+
 /// Options surface for `cli::run_doctor_topics`. Mirrors the clap
 /// args at `Commands::Doctor { action: Some(DoctorAction::Topics { ... }) }`
 /// so the cli entry-point is a thin shim.
