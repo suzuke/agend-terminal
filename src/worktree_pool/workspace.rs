@@ -262,37 +262,6 @@ pub(crate) fn workspace_as_worktree_from_env(
     }
 }
 
-/// #2234 Phase 1c test seam: a THREAD-LOCAL (B)-flag override. Tests force the
-/// flag on/off for their OWN thread — `workspace_as_worktree_enabled` runs
-/// synchronously on the caller thread (dispatch / resolve_auto_worktree), so the
-/// override is observed there but is invisible to other tests' threads. This
-/// roots out the process-global `set_var` leak class (no serial-grouping needed).
-#[cfg(test)]
-pub(crate) mod workspace_worktree_test_seam {
-    use std::cell::Cell;
-    thread_local! {
-        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-    pub(crate) fn get() -> Option<bool> {
-        OVERRIDE.with(|c| c.get())
-    }
-    fn set(v: Option<bool>) {
-        OVERRIDE.with(|c| c.set(v));
-    }
-    /// RAII: force the flag for the current thread; restores on drop (incl. panic).
-    #[must_use]
-    pub(crate) struct ForceGuard;
-    pub(crate) fn force(enabled: bool) -> ForceGuard {
-        set(Some(enabled));
-        ForceGuard
-    }
-    impl Drop for ForceGuard {
-        fn drop(&mut self) {
-            set(None);
-        }
-    }
-}
-
 /// #2234 cure-(B): make the agent's per-agent workspace dir BE a daemon-managed
 /// worktree of `source_repo` (its `.git` a gitlink FILE), so the agent's cwd ==
 /// its bound worktree and the cwd<->worktree dual-truth disappears — while the
@@ -594,4 +563,35 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&ws);
     crate::instructions::ensure_project_root(&ws);
     Ok(())
+}
+
+/// #2234 Phase 1c test seam: a THREAD-LOCAL (B)-flag override. Tests force the
+/// flag on/off for their OWN thread — `workspace_as_worktree_enabled` runs
+/// synchronously on the caller thread (dispatch / resolve_auto_worktree), so the
+/// override is observed there but is invisible to other tests' threads. This
+/// roots out the process-global `set_var` leak class (no serial-grouping needed).
+#[cfg(test)]
+pub(crate) mod workspace_worktree_test_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub(crate) fn get() -> Option<bool> {
+        OVERRIDE.with(|c| c.get())
+    }
+    fn set(v: Option<bool>) {
+        OVERRIDE.with(|c| c.set(v));
+    }
+    /// RAII: force the flag for the current thread; restores on drop (incl. panic).
+    #[must_use]
+    pub(crate) struct ForceGuard;
+    pub(crate) fn force(enabled: bool) -> ForceGuard {
+        set(Some(enabled));
+        ForceGuard
+    }
+    impl Drop for ForceGuard {
+        fn drop(&mut self) {
+            set(None);
+        }
+    }
 }
