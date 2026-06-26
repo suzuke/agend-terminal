@@ -139,7 +139,7 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
 
     tracing::info!(agent = %crashed_name, ?delay, "respawning");
     let saved_health = {
-        let r = ctx.registry.lock();
+        let r = agent::lock_registry(&ctx.registry);
         r.get(&instance_id).map(|h| h.core.lock().health.clone())
     };
 

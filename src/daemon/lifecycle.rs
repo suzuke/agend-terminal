@@ -97,7 +97,7 @@ pub fn delete_transaction(
     // behaviour.
     let instance_id = crate::fleet::resolve_uuid(home, name);
     let child_arc = instance_id.and_then(|id| {
-        let reg = registry.lock();
+        let reg = crate::agent::lock_registry(registry);
         if let Some(h) = reg.get(&id) {
             h.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -132,7 +132,7 @@ pub fn delete_transaction(
 
     // Step 4: registry remove (after child exit confirmed or timeout).
     if let Some(id) = instance_id {
-        let mut reg = registry.lock();
+        let mut reg = crate::agent::lock_registry(registry);
         reg.remove(&id);
     }
 
@@ -226,7 +226,7 @@ impl<'r> Drop for SpawnRollback<'r> {
         // Rollback in reverse insertion order so observers can't see a
         // half-cleaned state with a child but no registry entry, etc.
         if let Some(id) = self.instance_id {
-            let mut reg = self.registry.lock();
+            let mut reg = crate::agent::lock_registry(self.registry);
             reg.remove(&id);
             drop(reg);
             drop_active_binding(&self.name);

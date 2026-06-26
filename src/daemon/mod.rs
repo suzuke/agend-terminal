@@ -886,7 +886,7 @@ fn handle_clean_exit(
     tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
     // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
     if let Some(id) = crate::fleet::resolve_uuid(home, name) {
-        registry.lock().remove(&id);
+        agent::lock_registry(registry).remove(&id);
     }
     configs.lock().remove(name);
 }
@@ -1650,7 +1650,7 @@ pub(crate) fn shutdown_sequence(
     // registry — if the agent is gone, they return silently instead of
     // sending crash events. This eliminates all shutdown race conditions.
     let agents_to_kill: Vec<_> = {
-        let mut reg = registry.lock();
+        let mut reg = agent::lock_registry(registry);
         reg.drain()
             .map(|(_id, handle)| (handle.name.to_string(), handle.child))
             .collect()

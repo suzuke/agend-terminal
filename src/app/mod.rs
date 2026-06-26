@@ -1503,7 +1503,7 @@ fn app_teardown(
         // per-agent `reap_ms` inside `terminate_agents_parallel`.
         let teardown_started = std::time::Instant::now();
         let agents: Vec<(String, crate::daemon::ChildHandle)> = {
-            let mut reg = registry.lock();
+            let mut reg = crate::agent::lock_registry(registry);
             reg.drain()
                 .map(|(_id, handle)| (handle.name.to_string(), handle.child))
                 .collect()
