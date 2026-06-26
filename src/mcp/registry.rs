@@ -470,4 +470,59 @@ mod tests {
             }
         }
     }
+
+    /// Parse the `### `name`` tool-section headers from a MCP-TOOLS doc body.
+    fn doc_tool_names(body: &str) -> std::collections::BTreeSet<String> {
+        body.lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("### ")?;
+                let inner = rest.strip_prefix('`')?;
+                let name = inner.split('`').next()?;
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    /// Extract the first run of ASCII digits from the doc's `# ... Reference ...`
+    /// title line (handles both EN `(37 tools)` and zh `（37 個工具）`).
+    fn doc_title_count(body: &str) -> Option<usize> {
+        let title = body
+            .lines()
+            .find(|l| l.starts_with("# ") && l.contains("Reference"))?;
+        let digits: String = title.chars().filter(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    }
+
+    /// Doc drift guard: `docs/MCP-TOOLS.md` (+ its zh-TW twin) must document
+    /// EXACTLY the tools in `ALL_TOOLS` — same set, same count — and the title's
+    /// stated tool count must equal `ALL_TOOLS.len()`. Adding a tool to the
+    /// registry without documenting it (or vice-versa) fails here, closing the
+    /// silent doc-vs-registry drift class (registry had 37, docs listed 30).
+    #[test]
+    fn docs_match_registry_tool_set() {
+        let registered: std::collections::BTreeSet<String> =
+            all().iter().map(|e| e.name.to_string()).collect();
+        let n = all().len();
+
+        for rel in ["docs/MCP-TOOLS.md", "docs/MCP-TOOLS.zh-TW.md"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            let documented = doc_tool_names(&body);
+            let missing: Vec<&String> = registered.difference(&documented).collect();
+            let extra: Vec<&String> = documented.difference(&registered).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "{rel} tool sections drifted from ALL_TOOLS.\n  missing (in registry, not documented): {missing:?}\n  extra (documented, not in registry): {extra:?}"
+            );
+
+            let title_count = doc_title_count(&body)
+                .unwrap_or_else(|| panic!("{rel}: could not parse tool count from title line"));
+            assert_eq!(
+                title_count, n,
+                "{rel}: title says {title_count} tools but ALL_TOOLS has {n}"
+            );
+        }
+    }
 }
