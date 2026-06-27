@@ -7,7 +7,7 @@
 //! Sprint 25 P1 F1: per-tool timeout overrides + request budget enforcement.
 
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use super::HandlerCtx;
 
@@ -115,13 +115,25 @@ fn timeout_response(tool: &str, timeout: Duration, content_key: u64) -> Value {
 /// Handle `mcp_tool` API method: proxy a tool call through the daemon
 /// where process-global state (ACTIVE_CHANNEL, heartbeat_pair, etc.)
 /// is available. Applies per-tool timeout.
-pub(crate) fn handle_mcp_tool(params: &Value, _ctx: &HandlerCtx) -> Value {
+pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
     let tool = match params["tool"].as_str() {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
     };
     let args = params["arguments"].clone();
     let instance = params["instance"].as_str().unwrap_or("").to_string();
+    let role_kind = match role_kind_for_instance(ctx.home, &instance, "tool call") {
+        Ok(role_kind) => role_kind,
+        Err(resp) => return resp,
+    };
+    if !crate::mcp::registry::tool_allowed_for_role(role_kind, tool) {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "tool call: '{tool}' is not allowed for instance '{instance}' with role_kind {role_kind:?}"
+            ),
+        });
+    }
     let timeout = tool_timeout(tool);
     handle_mcp_tool_inner(tool, args, instance, timeout, crate::mcp::execute_tool)
 }
@@ -180,47 +192,14 @@ fn handle_mcp_tool_inner(
 pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
     // #2344: subset off the typed `role_kind` (operator-declared), NOT the
     // free-text `role` description — the old exact-match against the prose role
-    // never hit, so every agent saw all 36 tools.
+    // never hit, so every agent saw the full tool surface.
     let inst = params
         .get("instance")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let role_kind = match inst {
-        // No instance (old bridge / non-agent caller) → default-all-open.
-        None => None,
-        Some(inst) => {
-            // #2344 (r6 #2367 reject + lead nuance): distinguish a MISSING fleet.yaml
-            // from a present-but-malformed one. The old `FleetConfig::load(..).ok()`
-            // collapsed BOTH to `None` → the full 36-tool surface, which let a typo'd
-            // `role_kind: supervisor` FAIL strict parse yet still advertise every tool
-            // — the D2 strict-deny hole r6 found.
-            let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
-            if !fleet_path.exists() {
-                // (1) No fleet.yaml at all — a common setup (dev / fresh / local
-                // shell). Stay ALL-OPEN; a blanket fail-closed would regress every
-                // no-fleet daemon.
-                None
-            } else {
-                match crate::fleet::FleetConfig::load(&fleet_path) {
-                    // (2) Present but FAILS to load (parse error / malformed
-                    // role_kind) → FAIL CLOSED. Surface the error loudly (operator
-                    // fixes the config); never silently advertise the full surface.
-                    Err(e) => {
-                        return json!({
-                            "ok": false,
-                            "error": format!(
-                                "tools/list: fleet.yaml is present but failed to load \
-                                 (refusing to advertise the full tool surface — fix the \
-                                 config): {e:#}"
-                            ),
-                        });
-                    }
-                    // (3) Loaded OK → the instance's role_kind. An unknown instance OR
-                    // an absent role_kind → all-open (the unchanged opt-in contract).
-                    Ok(fleet) => fleet.instances.get(inst).and_then(|i| i.role_kind),
-                }
-            }
-        }
+        .unwrap_or("");
+    let role_kind = match role_kind_for_instance(ctx.home, inst, "tools/list") {
+        Ok(role_kind) => role_kind,
+        Err(resp) => return resp,
     };
     // Default-all-open hot path: no instance / no fleet.yaml / undeclared role_kind
     // → the canonical full surface (also keeps `tool_definitions` the single
@@ -231,6 +210,50 @@ pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(rk) => crate::mcp::tools::tool_definitions_for_role(Some(rk)),
     };
     json!({ "ok": true, "result": result })
+}
+
+/// #2300 P1 / #2055: resolve the caller's typed role once for both advisory
+/// visibility (`tools/list`) and execution-time hard-deny (`tool call`).
+///
+/// Default-all-open stays deliberate: no instance, no fleet.yaml, unknown
+/// instance, or absent role_kind all return `Ok(None)`. A PRESENT but malformed
+/// fleet.yaml fails closed so a broken policy file cannot silently widen tools.
+fn role_kind_for_instance(
+    home: &Path,
+    instance: &str,
+    surface: &str,
+) -> Result<Option<crate::fleet::RoleKind>, Value> {
+    if instance.is_empty() {
+        return Ok(None);
+    }
+
+    // #2344 (r6 #2367 reject + lead nuance): distinguish a MISSING fleet.yaml
+    // from a present-but-malformed one. The old `FleetConfig::load(..).ok()`
+    // collapsed BOTH to `None` → the full tool surface, which let a typo'd
+    // `role_kind: supervisor` FAIL strict parse yet still advertise every tool
+    // — the D2 strict-deny hole r6 found.
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    if !fleet_path.exists() {
+        // No fleet.yaml at all — a common setup (dev / fresh / local shell).
+        // Stay ALL-OPEN; a blanket fail-closed would regress no-fleet daemons.
+        return Ok(None);
+    }
+
+    match crate::fleet::FleetConfig::load(&fleet_path) {
+        // Present but FAILS to load (parse error / malformed role_kind) → FAIL
+        // CLOSED. Surface the error loudly (operator fixes the config); never
+        // silently widen the advertised or executable surface.
+        Err(e) => Err(json!({
+            "ok": false,
+            "error": format!(
+                "{surface}: fleet.yaml is present but failed to load \
+                 (refusing to use the full tool surface — fix the config): {e:#}"
+            ),
+        })),
+        // Loaded OK → the instance's role_kind. Unknown instance OR absent
+        // role_kind → all-open (the unchanged opt-in contract).
+        Ok(fleet) => Ok(fleet.instances.get(instance).and_then(|i| i.role_kind)),
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +433,7 @@ mod tests {
 
     /// #2344 e2e: `handle_mcp_tools_list` subsets the surface for a fleet instance
     /// whose `role_kind` is a read/report role — the live path the MCP bridge hits.
-    /// A reviewer sees fewer than the full 36 tools; no instance → all-open.
+    /// A reviewer sees fewer than the full registry; no instance → all-open.
     #[test]
     fn tools_list_subsets_for_role_kind_reviewer() {
         let dir =
@@ -465,9 +488,98 @@ mod tests {
         std::env::temp_dir().join(format!("agend-mcp-toollist-{tag}-{}", std::process::id()))
     }
 
+    /// #2300 P1 / #2055: `tools/list` subsetting is not a security boundary by
+    /// itself. A restricted role must also be denied if it directly calls a
+    /// registered lifecycle/orchestration tool through the MCP proxy.
+    #[test]
+    fn tool_call_denies_hidden_tool_for_role_kind_reviewer() {
+        let dir = toollist_ctx_home("call-deny");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("fleet.yaml"),
+            "instances:\n  rev:\n    role_kind: reviewer\n    command: claude\n",
+        )
+        .expect("write fleet.yaml");
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+        };
+
+        let resp = handle_mcp_tool(
+            &json!({
+                "instance": "rev",
+                "tool": "create_instance",
+                "arguments": {}
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            resp["ok"], false,
+            "hidden registered tool must fail: {resp}"
+        );
+        let err = resp["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("create_instance") && err.contains("Reviewer"),
+            "denial should name the denied tool and typed role, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same fail-closed policy as `tools/list`: if fleet.yaml is present but
+    /// malformed, a tool call must not silently widen to full capability.
+    #[test]
+    fn tool_call_fails_closed_on_malformed_role_kind() {
+        let dir = toollist_ctx_home("call-bad");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("fleet.yaml"),
+            "instances:\n  bad:\n    role_kind: supervisor\n    command: claude\n",
+        )
+        .expect("write fleet.yaml");
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+        };
+
+        let resp = handle_mcp_tool(
+            &json!({
+                "instance": "bad",
+                "tool": "inbox",
+                "arguments": {}
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            resp["ok"], false,
+            "present-but-malformed fleet.yaml must fail closed, got: {resp}"
+        );
+        let err = resp["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("supervisor") || err.contains("role_kind") || err.contains("fleet"),
+            "error must explain the failure (bad value / role_kind / fleet), got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// #2344 D2 STRICT on the live bridge path (r6 #2367 reject): a fleet.yaml that
     /// is PRESENT but malformed (e.g. an unknown `role_kind`) must FAIL CLOSED in
-    /// `handle_mcp_tools_list` — NOT silently fall back to the full 36-tool surface
+    /// `handle_mcp_tools_list` — NOT silently fall back to the full tool surface
     /// (the old `.ok()` swallowed the parse error). Returns `ok: false` + an
     /// explanatory error, no `result.tools`, and does not panic.
     #[test]
