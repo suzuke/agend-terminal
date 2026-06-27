@@ -11,6 +11,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
+const FUGU_BACKEND_MENU_LABEL: &str = "[backend] Codex(Sakana)";
+
 /// Build menu items for new-tab selection.
 /// Fleet instances already running in the registry are excluded.
 pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> Vec<MenuItem> {
@@ -54,13 +56,13 @@ pub(super) fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> V
         }
     }
 
-    // #2441: one-click Fugu, only when the provider is detected available so the
-    // menu never offers a backend that can't actually launch.
+    // #2441: one-click Fugu via the codex harness. Present it as a backend
+    // variant, not a separate top-level menu class, so it sits with codex.
     if crate::provider_detect::detect_default().status
         == crate::provider_detect::FuguStatus::Available
     {
         items.push(MenuItem {
-            label: "[fugu] Fugu (codex/sakana)".to_string(),
+            label: FUGU_BACKEND_MENU_LABEL.to_string(),
             kind: MenuItemKind::Fugu,
         });
     }
@@ -218,5 +220,15 @@ pub(super) fn pane_from_menu_item(
                 crate::backend::SpawnMode::Resume,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fugu_menu_label_is_backend_style() {
+        assert_eq!(FUGU_BACKEND_MENU_LABEL, "[backend] Codex(Sakana)");
     }
 }
