@@ -5,10 +5,12 @@
 ## 動作型工具（Action-based Tools）
 
 ### `task`
-管理 task board。動作：create、list、claim、done、update。
-- **action**: create / list / claim / done / update
-- title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration
+管理 task board。動作：create、list、get、claim、done、update。
+- **action**: create / list / get / claim / done / update
+- title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration, fields
 - `list` 預設為**精簡模式**（#2475）：`description`／`result` 會限制長度（約 200 字）。傳 `verbose: true` 可取回完整文字；回應中的 `terse: true` 表示已套用精簡。
+- `list` 可傳 `fields: "minimal"`（#2475）只投影 id/title/status/assignee/priority；回應帶 `fields: "minimal"|"full"`。
+- `get`（#2475）以 `id`（別名 `task_id`）回傳單一任務的**完整**記錄 —— 搭配精簡 `list`，需要單筆完整內容時使用。
 
 ### `decision`
 管理 decision。動作：post、list、update。

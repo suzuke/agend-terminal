@@ -214,9 +214,9 @@ pub(crate) fn def_decision() -> Value {
 }
 
 pub(crate) fn def_task() -> Value {
-    json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update, sweep, health, activity, metadata_set, metadata_get. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
+    json!({"name": "task", "description": "Manage task board. Actions: create, list, get, claim, done, update, sweep, health, activity, metadata_set, metadata_get. #2475: `get` returns ONE task's FULL record by `id` (companion to the terse-by-default `list`); `list` accepts `fields:\"minimal\"` to project rows down to id/title/status/assignee/priority. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get"]},
+            "action": {"type": "string", "enum": ["create", "list", "get", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get"]},
             "title": {"type": "string"}, "description": {"type": "string"},
             "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
             "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string", "description": "Parent task ID for subtask composition (A is composed of B,C,D). Complementary to depends_on (execution order)."},
@@ -225,6 +225,7 @@ pub(crate) fn def_task() -> Value {
             "filter_assignee": {"type": "string", "description": "list: filter by assignee (alias: assignee)."}, "filter_status": {"type": "string", "description": "list: filter by status (alias: status)."}, "filter_tag": {"type": "string", "description": "Filter by tag (alias: tag)"}, "tag": {"type": "string", "description": "Alias of filter_tag (#2037)."}, "tags": {"type": "array", "items": {"type": "string"}, "description": "Task tags (for create/update)"},
             "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
             "verbose": {"type": "boolean", "description": "#2475 list: default is TERSE — `description`/`result` are length-capped (~200 chars) to keep routine list calls small. Set true for the full text (or fetch a single task's detail). Response carries `terse: true` when capping fired."},
+            "fields": {"type": "string", "enum": ["full", "minimal"], "description": "#2475 list: column projection. `minimal` keeps only id/title/status/assignee/priority (drops every other field) for the lightest routine poll; default `full` is unchanged. Response carries `fields: \"minimal\"|\"full\"`."},
             "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
             "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
             "branch": {"type": "string", "description": "Git branch the implementer should work on"},
@@ -887,6 +888,7 @@ mod tests {
             ("task", "tags", "tasks/handler.rs create/update"),
             ("task", "include_history", "tasks/handler.rs list opt-in"),
             ("task", "verbose", "tasks/handler.rs list full-text opt-in (#2475)"),
+            ("task", "fields", "tasks/handler.rs list minimal projection (#2475 Phase 2)"),
             ("task", "limit", "tasks/handler.rs list cap"),
             ("task", "due_at", "tasks/handler.rs create deadline"),
             ("task", "branch", "tasks/handler.rs create event"),

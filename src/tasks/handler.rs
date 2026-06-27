@@ -43,6 +43,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
     match action {
         "create" => handle_create(home, emitter, args),
         "list" => handle_list(home, instance_name, args),
+        "get" => handle_get(home, instance_name, args),
         "claim" => handle_claim(home, instance_name, emitter, args),
         "done" => handle_done(home, instance_name, emitter, args),
         "update" => handle_update(home, instance_name, emitter, args),
@@ -292,6 +293,11 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
     // `description`/`result` fields; truncate them by default and let callers
     // opt into the full text with `verbose: true` (or fetch one task's detail).
     let verbose = args["verbose"].as_bool().unwrap_or(false);
+    // #2475 Phase 2: opt-in column projection. `fields:"minimal"` keeps only the
+    // routing-relevant columns (id/title/status/assignee/priority) so a lead can
+    // poll the board for state without pulling every structured field into
+    // context. Default ("full") is unchanged — additive, non-breaking shape.
+    let minimal = args["fields"].as_str() == Some("minimal");
     if fleet_scope {
         let mut tagged: Vec<Value> = filtered
             .iter()
@@ -308,11 +314,17 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
                 terse_task_value(v);
             }
         }
+        if minimal {
+            for v in &mut tagged {
+                minimal_task_value(v);
+            }
+        }
         return serde_json::json!({
             "tasks": tagged,
             "filtered_default": filtered_default,
             "scope": "fleet",
             "terse": !verbose,
+            "fields": if minimal { "minimal" } else { "full" },
         });
     }
     let mut tasks: Vec<Value> = filtered
@@ -324,10 +336,16 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
             terse_task_value(v);
         }
     }
+    if minimal {
+        for v in &mut tasks {
+            minimal_task_value(v);
+        }
+    }
     serde_json::json!({
         "tasks": tasks,
         "filtered_default": filtered_default,
         "terse": !verbose,
+        "fields": if minimal { "minimal" } else { "full" },
     })
 }
 
@@ -347,6 +365,60 @@ fn terse_task_value(v: &mut Value) {
                 *s = format!("{kept}… (+{dropped} chars; verbose=true for full)");
             }
         }
+    }
+}
+
+/// #2475 Phase 2: project a serialized task down to the minimal routing columns
+/// for `fields:"minimal"` list calls. Whitelists id/title/status/assignee/
+/// priority (plus the fleet-scope `project` tag when present) and drops every
+/// other field. Opt-in only — the default list shape is unchanged, so existing
+/// callers that deserialize full `Task` rows are unaffected.
+fn minimal_task_value(v: &mut Value) {
+    const KEEP: &[&str] = &["id", "title", "status", "assignee", "priority", "project"];
+    let Some(obj) = v.as_object_mut() else { return };
+    obj.retain(|k, _| KEEP.contains(&k.as_str()));
+}
+
+/// #2475 Phase 2: single-task detail fetch. The terse-by-default `list` caps
+/// `description`/`result`; `get` is the companion that returns ONE task's FULL
+/// record by id, so a caller can pull the full text of just the task it cares
+/// about instead of re-listing the whole board with `verbose:true`. Resolves the
+/// task on the caller's current project board first, then falls back to scanning
+/// every board (the id may live elsewhere). Returns `{ "task": {...} }` or an
+/// `{ "error": ... }` when the id is absent.
+fn handle_get(home: &Path, caller: &str, args: &Value) -> Value {
+    let Some(id) = id_arg(args).map(str::to_string) else {
+        return serde_json::json!({"error": "missing 'id' (or 'task_id')"});
+    };
+    // Primary board: explicit `project`, else the caller's current project.
+    let project = args["project"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
+    let board = crate::task_events::board_root(home, &project);
+    let mut found = super::list_all_at(home, &board)
+        .into_iter()
+        .find(|t| t.id == id);
+    let mut found_project = found.as_ref().map(|_| project);
+    // Cross-board fallback: the id may live on another project's board.
+    if found.is_none() {
+        for (p, ts) in super::board_router::list_all_boards(home) {
+            if let Some(t) = ts.into_iter().find(|t| t.id == id) {
+                found_project = Some(p);
+                found = Some(t);
+                break;
+            }
+        }
+    }
+    match found {
+        Some(t) => {
+            let mut v = serde_json::to_value(&t).unwrap_or(Value::Null);
+            if let (Some(obj), Some(p)) = (v.as_object_mut(), found_project) {
+                obj.insert("project".to_string(), Value::String(p));
+            }
+            serde_json::json!({ "task": v })
+        }
+        None => serde_json::json!({"error": format!("task not found: {id}")}),
     }
 }
 
