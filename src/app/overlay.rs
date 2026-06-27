@@ -21,6 +21,9 @@ pub enum MenuItemKind {
     Shell,
     Backend(Backend),
     FleetInstance(String),
+    /// #2441: one-click Fugu (codex harness + isolated sakana CODEX_HOME).
+    /// Only surfaced when `provider_detect` reports the provider available.
+    Fugu,
 }
 
 pub(super) enum CloseTarget {

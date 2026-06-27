@@ -9,6 +9,7 @@ mod api_server;
 // `pub(super)` = app-only, so command EXECUTION is not widened.
 pub(crate) mod commands;
 mod dispatch;
+mod menu;
 mod mouse;
 mod overlay;
 mod pane_factory;
@@ -17,11 +18,11 @@ mod telegram_hooks;
 mod tui_events;
 mod tui_spawn;
 
+use menu::{build_menu_items, pane_from_menu_item};
 pub use overlay::{BoardView, DecisionMode, MenuItem, MenuItemKind, TaskBoardMode};
 pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
 
 use crate::agent::{self, AgentRegistry};
-use crate::backend::Backend;
 use crate::channel::TelegramStatus;
 use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
@@ -1527,166 +1528,6 @@ fn app_teardown(
     }
 }
 
-/// Build menu items for new-tab selection.
-/// Fleet instances already running in the registry are excluded.
-fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> Vec<MenuItem> {
-    let mut items = Vec::new();
-
-    // Collect already-running agent names
-    let running: Vec<String> = {
-        let reg = agent::lock_registry(registry);
-        reg.values().map(|h| h.name.to_string()).collect()
-    };
-
-    if let Ok(fleet) = crate::fleet::FleetConfig::load(fleet_path) {
-        let mut names = fleet.instance_names();
-        names.sort();
-        for name in names {
-            // Skip if exact name or deduped variant (name-1, name-2...) is running
-            let already_open = running
-                .iter()
-                .any(|r| r == &name || r.starts_with(&format!("{name}-")));
-            if already_open {
-                continue;
-            }
-            let label = if let Some(resolved) = fleet.resolve_instance(&name) {
-                format!("{name}  ({backend})", backend = resolved.backend_command)
-            } else {
-                name.clone()
-            };
-            items.push(MenuItem {
-                label: format!("[fleet] {label}"),
-                kind: MenuItemKind::FleetInstance(name),
-            });
-        }
-    }
-
-    for backend in Backend::all() {
-        if backend.is_installed() {
-            items.push(MenuItem {
-                label: format!("[backend] {}", backend.name()),
-                kind: MenuItemKind::Backend(backend.clone()),
-            });
-        }
-    }
-
-    items.push(MenuItem {
-        label: "[shell] bash".to_string(),
-        kind: MenuItemKind::Shell,
-    });
-
-    items
-}
-
-/// Create a pane from a menu item selection (shared by NewTab and Split handlers).
-#[allow(clippy::too_many_arguments)]
-fn pane_from_menu_item(
-    item: MenuItem,
-    fleet_path: &Path,
-    layout: &mut Layout,
-    registry: &AgentRegistry,
-    home: &Path,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam_channel::Sender<usize>,
-    name_counter: &mut HashMap<String, usize>,
-) -> Result<Pane> {
-    match item.kind {
-        MenuItemKind::Shell => {
-            let shell = crate::shell_command();
-            pane_factory::create_pane(
-                layout,
-                registry,
-                home,
-                "shell",
-                &shell,
-                &[],
-                crate::backend::SpawnMode::Fresh,
-                None,
-                &HashMap::new(),
-                "\r",
-                cols,
-                rows,
-                wakeup_tx,
-                name_counter,
-                pane_factory::SpawnIdentity::UnmanagedLocalShell,
-            )
-        }
-        MenuItemKind::Backend(backend) => {
-            let preset = backend.preset();
-            let inst_name = pane_factory::unique_fleet_name(home, preset.command);
-            // #966: TUI Backend menu (ctrl+b c) previously called
-            // `add_instance_to_yaml` directly, bypassing the topic-creation
-            // side effect that `handle_spawn` does. Now routes through
-            // `tui_spawn::add_instance_with_topic` so the channel topic is
-            // created + topic_id persisted to topics.json at TUI-spawn time.
-            if let Err(e) = tui_spawn::add_instance_with_topic(
-                home,
-                &inst_name,
-                &crate::fleet::InstanceYamlEntry {
-                    backend: Some(backend.name().to_string()),
-                    ..Default::default()
-                },
-            ) {
-                tracing::warn!(error = %e, "failed to write fleet.yaml");
-            }
-            // Resolve from fleet to get defaults merged
-            let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
-                pane_factory::create_pane_from_resolved(
-                    &inst_name,
-                    &resolved,
-                    layout,
-                    registry,
-                    home,
-                    cols,
-                    rows,
-                    wakeup_tx,
-                    name_counter,
-                    crate::backend::SpawnMode::Fresh,
-                )
-            } else {
-                // Preset args are added by spawn_agent; no need to compose here.
-                pane_factory::create_pane(
-                    layout,
-                    registry,
-                    home,
-                    &inst_name,
-                    preset.command,
-                    &[],
-                    crate::backend::SpawnMode::Fresh,
-                    None,
-                    &HashMap::new(),
-                    preset.submit_key,
-                    cols,
-                    rows,
-                    wakeup_tx,
-                    name_counter,
-                    pane_factory::SpawnIdentity::Managed,
-                )
-            }
-        }
-        MenuItemKind::FleetInstance(inst_name) => {
-            let fleet = crate::fleet::FleetConfig::load(fleet_path)?;
-            let resolved = fleet
-                .resolve_instance(&inst_name)
-                .ok_or_else(|| anyhow::anyhow!("fleet instance '{inst_name}' not found"))?;
-            pane_factory::create_pane_from_resolved(
-                &inst_name,
-                &resolved,
-                layout,
-                registry,
-                home,
-                cols,
-                rows,
-                wakeup_tx,
-                name_counter,
-                crate::backend::SpawnMode::Resume,
-            )
-        }
-    }
-}
-
 /// #1762: does this forwarded keystroke ENTER the agent's input buffer
 /// (text-composing), as opposed to NAVIGATE / CONTROL (arrows, F-keys, Esc,
 /// Ctrl-combos, Tab, Backspace)? Only composing input should mark a draft
@@ -1988,6 +1829,7 @@ fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
 
@@ -2129,7 +1971,9 @@ mod tests {
         let src = include_str!("mod.rs");
         let start = src.find("fn app_teardown(").expect("app_teardown present");
         let after = &src[start..];
-        let end = after.find("fn build_menu_items(").unwrap_or(after.len());
+        let end = after
+            .find("fn is_text_composing_input(")
+            .unwrap_or(after.len());
         let body = &after[..end];
 
         assert!(
