@@ -708,6 +708,108 @@ fn task_list_truncates_heavy_text_by_default_2475() {
 }
 
 #[test]
+fn task_get_returns_single_full_task_2475() {
+    let home = tmp_home("get-2475");
+    let long_description = "d".repeat(260);
+    let created = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "detailed task",
+            "description": long_description,
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let got = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    let t = &got["task"];
+    assert_eq!(t["id"], id);
+    assert_eq!(t["title"], "detailed task");
+    // get is FULL by design — the heavy field is NOT capped.
+    assert_eq!(t["description"], long_description);
+
+    // task_id alias works too.
+    let via_alias = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "get", "task_id": id}),
+    );
+    assert_eq!(via_alias["task"]["id"], id);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn task_get_missing_id_and_not_found_errors_2475() {
+    let home = tmp_home("get-missing-2475");
+    let no_id = handle(&home, "agent1", &serde_json::json!({"action": "get"}));
+    assert!(
+        no_id["error"].as_str().unwrap().contains("missing"),
+        "missing id must error: {no_id}"
+    );
+
+    let absent = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "get", "id": "t-does-not-exist"}),
+    );
+    assert!(
+        absent["error"].as_str().unwrap().contains("not found"),
+        "absent id must error: {absent}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn task_list_fields_minimal_projects_rows_2475() {
+    let home = tmp_home("list-minimal-2475");
+    let created = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "projected task",
+            "description": "some description text",
+            "assignee": "agent1",
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let listed = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({"action": "list", "fields": "minimal"}),
+    );
+    assert_eq!(listed["fields"], "minimal");
+    let row = &listed["tasks"][0];
+    // Kept columns.
+    assert_eq!(row["id"], id);
+    assert_eq!(row["title"], "projected task");
+    assert!(row.get("status").is_some());
+    assert_eq!(row["assignee"], "agent1");
+    assert!(row.get("priority").is_some());
+    // Dropped columns.
+    assert!(
+        row.get("description").is_none(),
+        "minimal projection must drop description: {row}"
+    );
+    assert!(
+        row.get("created_at").is_none(),
+        "minimal projection must drop created_at: {row}"
+    );
+
+    // Default list keeps the full shape.
+    let full = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+    assert_eq!(full["fields"], "full");
+    assert!(full["tasks"][0].get("description").is_some());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_create_list_claim_done() {
     let home = tmp_home("crud");
     let r = handle(
