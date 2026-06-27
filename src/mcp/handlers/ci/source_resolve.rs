@@ -35,17 +35,17 @@ pub(super) fn resolve_checkout_source_path(
     } else {
         // Non-absolute → MUST be a known agent name. A miss is fail-closed (#2158):
         // never fall back to resolving `source` as a relative path against the
-        // daemon cwd.
-        match crate::api::call(home, &json!({"method": crate::api::method::LIST}))
+        // daemon cwd. #2454 first slice: resolve this in-process from fleet.yaml
+        // instead of loopbacking through the API LIST endpoint just to read the same
+        // resolved instance working directory.
+        match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
-            .and_then(|r| {
-                r["result"]["agents"]
-                    .as_array()?
-                    .iter()
-                    .find(|a| a["name"].as_str() == Some(source))
-                    .and_then(|a| a["working_directory"].as_str().map(String::from))
+            .and_then(|fleet| {
+                fleet
+                    .resolve_instance(source)
+                    .and_then(|inst| inst.working_directory)
             }) {
-            Some(working_dir) => working_dir,
+            Some(working_dir) => working_dir.display().to_string(),
             None => {
                 return Err(json!({
                     "error": format!(
@@ -130,6 +130,48 @@ mod tests {
         assert_eq!(
             src_path, abs_str,
             "pre-canonical source string preserved for the caller"
+        );
+    }
+
+    /// #2454 first slice: agent-name source resolution no longer needs an MCP-to-API
+    /// socket loopback. fleet.yaml already owns the instance working_directory.
+    #[test]
+    fn agent_name_source_resolves_from_fleet_yaml_without_api_loopback_2454() {
+        let home =
+            std::env::temp_dir().join(format!("agend-source-resolve-agent-{}", std::process::id()));
+        let work = home.join("workspace").join("dev");
+        std::fs::create_dir_all(&work).expect("mkdir work");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!(
+                "instances:\n  dev:\n    backend: claude\n    working_directory: {}\n",
+                work.display()
+            ),
+        )
+        .expect("write fleet");
+
+        let (source_path, canonical) =
+            resolve_checkout_source_path(&home, "dev").expect("known agent name resolves");
+        assert_eq!(source_path, work.display().to_string());
+        assert_eq!(canonical, work.canonicalize().expect("canonical work"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Pin the architectural intent for #2454: this helper must not grow a new API socket
+    /// dependency while reducing MCP-to-API loopbacks incrementally.
+    #[test]
+    fn source_resolve_has_no_api_call_loopback_2454() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/mcp/handlers/ci/source_resolve.rs");
+        let body = std::fs::read_to_string(path).expect("read source_resolve.rs");
+        let production_body = body
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source has production body before tests");
+        assert!(
+            !production_body.contains("api::call"),
+            "source_resolve.rs must stay off MCP→API socket loopbacks"
         );
     }
 }
