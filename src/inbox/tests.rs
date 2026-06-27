@@ -834,6 +834,57 @@ fn test_drain_marks_delivering_then_implicit_ack_keeps_message() {
     fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn drain_auto_acks_daemon_notifications() {
+    for (kind, from, body) in [
+        (
+            "pr-merged",
+            "system:pr-state",
+            "[pr-merged] owner/repo@branch",
+        ),
+        ("ci-watch", "system:ci", "[ci-pass] owner/repo@branch"),
+    ] {
+        let home = tmp_home(&format!("drain-{kind}-auto-ack"));
+        let id = format!("m-{kind}");
+        enqueue(
+            &home,
+            "agent1",
+            msg().sender(from).text(body).kind(kind).id(&id).build(),
+        )
+        .ok();
+
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 1, "{kind} still surfaces to the agent");
+        assert_eq!(msgs[0].id.as_deref(), Some(id.as_str()));
+        assert!(
+            msgs[0].read_at.is_some(),
+            "fire-and-forget {kind} must be processed on first drain"
+        );
+        assert!(
+            msgs[0].delivering_at.is_none(),
+            "{kind} must not wait in delivering for a later ack"
+        );
+
+        let content = fs::read_to_string(inbox_path(&home, "agent1")).unwrap();
+        let persisted: InboxMessage =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(persisted.read_at.is_some());
+        assert!(persisted.delivering_at.is_none());
+        assert_eq!(
+            unread_count(&home, "agent1").0,
+            0,
+            "auto-acked notification must not drive poll-reminder unread count"
+        );
+
+        let second = drain(&home, "agent1");
+        assert!(
+            second.is_empty(),
+            "auto-acked {kind} must not be returned again"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // #2299 three-state delivery: unread → delivering → processed + reclaim-TTL.
 // ─────────────────────────────────────────────────────────────────────────
@@ -875,6 +926,39 @@ fn reclaim_redelivers_after_turn_death() {
     assert_eq!(redelivered[0].id.as_deref(), Some("m-stale"));
     assert!(redelivered[0].delivering_at.is_some());
     assert!(redelivered[0].read_at.is_none());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reclaim_settles_legacy_stale_pr_merged_delivering_row() {
+    let home = tmp_home("reclaim-pr-merged-settle");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("system:pr-state")
+            .text("[pr-merged] owner/repo@branch")
+            .kind("pr-merged")
+            .id("m-pr-merged-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    let post = drain(&home, "a");
+    assert!(
+        post.is_empty(),
+        "stale pr-merged notification must be settled, not re-delivered"
+    );
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    let persisted: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(persisted.read_at.is_some());
+    assert!(
+        persisted.delivering_at.is_some(),
+        "settle stamps read_at; delivering_at may remain as historical audit"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
