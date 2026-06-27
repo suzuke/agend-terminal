@@ -371,10 +371,55 @@ pub(crate) fn check_helper_staleness(home: &Path) -> String {
 // ─────────────────────────────────────────────────────────────────
 
 /// Run provider diagnostics (currently Fugu/Sakana via codex) for `doctor providers`.
-pub fn run_doctor_providers(format: &str) -> anyhow::Result<()> {
+pub fn run_doctor_providers(format: &str, probe: bool) -> anyhow::Result<()> {
     let d = crate::provider_detect::detect_default();
+    let probe_result = if probe {
+        if let Some(provider) = d.provider.as_ref() {
+            let cache_path =
+                crate::provider_detect::provider_probe_cache_path(&crate::home_dir(), d.descriptor);
+            let env_lookup = |name: &str| std::env::var(name).ok();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            Some(
+                rt.block_on(crate::provider_detect::probe_provider_models_fail_open(
+                    d.descriptor,
+                    provider,
+                    &env_lookup,
+                    &cache_path,
+                )),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if format == "json" {
         let source = d.provider_source.as_ref().map(|p| p.display().to_string());
+        let descriptor = d.descriptor;
+        let provider_descriptors: Vec<_> = crate::provider_detect::PROVIDER_DESCRIPTORS
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "base_url": p.base_url,
+                    "env_key": p.env_key,
+                    "wire_api": p.wire_api,
+                    "compatible_harnesses": p.compatible_harnesses,
+                    "probe_path": p.probe_path,
+                })
+            })
+            .collect();
+        let fixed_provider_backends: Vec<_> = crate::provider_detect::FIXED_PROVIDER_BACKENDS
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "backend": b.backend,
+                    "reason": b.reason,
+                })
+            })
+            .collect();
         println!(
             "{}",
             serde_json::json!({
@@ -385,14 +430,39 @@ pub fn run_doctor_providers(format: &str) -> anyhow::Result<()> {
                     "has_credential": d.has_credential,
                     "models": d.models,
                     "hints": d.hints,
-                }
+                    "descriptor": {
+                        "name": descriptor.name,
+                        "base_url": descriptor.base_url,
+                        "env_key": descriptor.env_key,
+                        "wire_api": descriptor.wire_api,
+                        "compatible_harnesses": descriptor.compatible_harnesses,
+                        "probe_path": descriptor.probe_path,
+                    },
+                    "probe": probe_result,
+                },
+                "provider_descriptors": provider_descriptors,
+                "fixed_provider_backends": fixed_provider_backends,
             })
         );
         return Ok(());
     }
 
     println!("Provider diagnostics");
+    println!(
+        "  declared provider descriptors: {}",
+        crate::provider_detect::PROVIDER_DESCRIPTORS.len()
+    );
     println!("  fugu: {}", d.status.as_str());
+    println!("    base_url: {}", d.descriptor.base_url);
+    println!("    env_key: {}", d.descriptor.env_key);
+    println!("    wire_api: {}", d.descriptor.wire_api);
+    println!(
+        "    compatible_harnesses: {}",
+        d.descriptor.compatible_harnesses.join(", ")
+    );
+    if let Some(path) = d.descriptor.probe_path {
+        println!("    probe_path: {path} (fail-open, cached; not on startup path)");
+    }
     println!("    codex_on_path: {}", d.codex_on_path);
     println!("    has_credential: {}", d.has_credential);
     if let Some(source) = d.provider_source.as_ref() {
@@ -401,8 +471,25 @@ pub fn run_doctor_providers(format: &str) -> anyhow::Result<()> {
     if !d.models.is_empty() {
         println!("    models: {}", d.models.join(", "));
     }
+    if probe {
+        if let Some(probe) = probe_result.as_ref() {
+            println!("    probe: {}", probe.status.as_str());
+            if !probe.models.is_empty() {
+                println!("    probe_models: {}", probe.models.join(", "));
+            }
+            if let Some(error) = probe.error.as_ref() {
+                println!("    probe_note: {error}");
+            }
+        } else {
+            println!("    probe: unknown (provider block unavailable)");
+        }
+    }
     for hint in &d.hints {
         println!("    hint: {hint}");
+    }
+    println!("  fixed-provider backends (outside provider axis):");
+    for b in crate::provider_detect::FIXED_PROVIDER_BACKENDS {
+        println!("    {}: {}", b.backend, b.reason);
     }
     Ok(())
 }

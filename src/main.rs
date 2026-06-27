@@ -600,6 +600,9 @@ enum DoctorAction {
         /// Output format: `human` (default) or `json`.
         #[arg(long, default_value = "human")]
         format: String,
+        /// Run the optional provider endpoint probe (`/models`). Cached and fail-open.
+        #[arg(long)]
+        probe: bool,
     },
     /// Diagnose telegram topic state (live / orphan).
     /// Pair with `--cleanup` to act on orphan entries (chat-mutating
@@ -1335,8 +1338,8 @@ fn main() -> anyhow::Result<()> {
         },
         Some(Commands::Doctor { action: None }) => cli::run_doctor(&home)?,
         Some(Commands::Doctor {
-            action: Some(DoctorAction::Providers { format }),
-        }) => cli::run_doctor_providers(&format)?,
+            action: Some(DoctorAction::Providers { format, probe }),
+        }) => cli::run_doctor_providers(&format, probe)?,
         Some(Commands::Doctor {
             action:
                 Some(DoctorAction::Topics {

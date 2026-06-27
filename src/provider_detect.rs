@@ -1,7 +1,8 @@
-//! Fugu / Sakana model-provider detection (#2441 slice 1).
+//! Model-provider detection (#2441).
 //!
-//! Decides whether the local environment is set up to run **Fugu** (the Sakana
-//! API model served through the `codex` harness) and reports one of three
+//! Decides whether the local environment is set up to run hosted model providers
+//! through compatible CLI harnesses. Fugu/Sakana is the first shipped descriptor
+//! and is served through the `codex` harness. Detection reports one of three
 //! states so callers (doctor, the Ctrl+B C quick-spawn menu, quickstart) can
 //! react without guessing:
 //!
@@ -22,10 +23,64 @@
 //! [`detect`] wrapper does the filesystem reads + env lookups.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Host that identifies the Sakana (Fugu) provider, matched against a
-/// provider block's `base_url`.
-const SAKANA_HOST: &str = "sakana.ai";
+/// First-class descriptor for API model providers (#2441). The harness axis
+/// remains PATH-detected (`compatible_harnesses`), while this descriptor captures
+/// the model-provider axis that is configured through a harness config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelProviderDescriptor {
+    pub name: &'static str,
+    pub base_url: &'static str,
+    pub env_key: &'static str,
+    pub wire_api: &'static str,
+    pub compatible_harnesses: &'static [&'static str],
+    pub probe_path: Option<&'static str>,
+    pub provider_id_hint: &'static str,
+    pub model_prefixes: &'static [&'static str],
+}
+
+impl ModelProviderDescriptor {
+    pub fn host(self) -> &'static str {
+        host_from_url(self.base_url)
+    }
+}
+
+/// Fugu/Sakana is the first declared provider (#2441).
+pub const FUGU_PROVIDER_DESCRIPTOR: ModelProviderDescriptor = ModelProviderDescriptor {
+    name: "fugu",
+    base_url: "https://api.sakana.ai/v1",
+    env_key: "SAKANA_API_KEY",
+    wire_api: "responses",
+    compatible_harnesses: &["codex"],
+    probe_path: Some("/models"),
+    provider_id_hint: "sakana",
+    model_prefixes: &["fugu"],
+};
+
+/// All hosted/API provider descriptors known to agend-terminal.
+pub const PROVIDER_DESCRIPTORS: &[ModelProviderDescriptor] = &[FUGU_PROVIDER_DESCRIPTOR];
+
+/// CLI backends whose provider is intentionally fixed, not base_url/env_key
+/// swappable under #2441. This is an explicit boundary of the provider axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedProviderBackend {
+    pub backend: &'static str,
+    pub reason: &'static str,
+}
+
+pub const FIXED_PROVIDER_BACKENDS: &[FixedProviderBackend] = &[
+    FixedProviderBackend {
+        backend: "kiro-cli",
+        reason: "fixed AWS endpoint / signed-auth shape, not bearer base_url-overridable",
+    },
+    FixedProviderBackend {
+        backend: "agy",
+        reason: "Google service-account/OAuth shape, not bearer base_url-overridable",
+    },
+];
+
+const DEFAULT_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Tri-state result of Fugu environment detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +103,43 @@ impl FuguStatus {
     }
 }
 
+/// Fail-open endpoint probe status. `Unknown` is deliberately non-fatal: network
+/// failures, auth service outages, malformed responses, or stale/no cache must
+/// not make a configured provider disappear from startup/menu detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProbeStatus {
+    Healthy,
+    Unhealthy,
+    Unknown,
+}
+
+impl ProviderProbeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderProbeStatus::Healthy => "healthy",
+            ProviderProbeStatus::Unhealthy => "unhealthy",
+            ProviderProbeStatus::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderProbeCache {
+    pub provider: String,
+    pub status: ProviderProbeStatus,
+    pub checked_at_unix_secs: u64,
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Full detection report. `provider_source` points at the config file that
 /// supplied the Sakana provider (or profile), for operator transparency.
 #[derive(Debug, Clone)]
 pub struct FuguDetection {
     pub status: FuguStatus,
+    pub descriptor: ModelProviderDescriptor,
     pub codex_on_path: bool,
     pub provider_source: Option<PathBuf>,
     pub has_credential: bool,
@@ -73,14 +160,34 @@ pub struct ProviderBlock {
     pub wire_api: Option<String>,
 }
 
+fn provider_block_matches_descriptor(
+    block: &ProviderBlock,
+    descriptor: ModelProviderDescriptor,
+) -> bool {
+    block.id.contains(descriptor.provider_id_hint)
+        || block
+            .base_url
+            .as_deref()
+            .map(|u| host_from_url(u).contains(descriptor.host()))
+            .unwrap_or(false)
+}
+
+fn host_from_url(url: &str) -> &str {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    without_scheme.split('/').next().unwrap_or(without_scheme)
+}
+
 /// Parse a codex `config.toml` body and return the first provider block that
-/// looks like Sakana/Fugu — either the section id contains `sakana` or its
-/// `base_url` host contains [`SAKANA_HOST`].
+/// matches `descriptor` — either the section id contains the descriptor's
+/// `provider_id_hint` or its `base_url` host matches the descriptor host.
 ///
 /// Lightweight line scanner (no `toml` production dependency): tracks the
 /// current `[section]` header and collects simple `key = "value"` pairs until
 /// the next header. Good enough for detection; values are unquoted leniently.
-pub fn find_sakana_provider(config_toml: &str) -> Option<ProviderBlock> {
+pub fn find_provider(
+    config_toml: &str,
+    descriptor: ModelProviderDescriptor,
+) -> Option<ProviderBlock> {
     let mut blocks: Vec<ProviderBlock> = Vec::new();
     let mut cur: Option<ProviderBlock> = None;
 
@@ -131,21 +238,25 @@ pub fn find_sakana_provider(config_toml: &str) -> Option<ProviderBlock> {
     }
     flush(&mut cur, &mut blocks);
 
-    blocks.into_iter().find(|b| {
-        b.id.contains("sakana")
-            || b.base_url
-                .as_deref()
-                .map(|u| u.contains(SAKANA_HOST))
-                .unwrap_or(false)
-    })
+    blocks
+        .into_iter()
+        .find(|b| provider_block_matches_descriptor(b, descriptor))
 }
 
-/// Does a codex profile body (`<name>.config.toml`) select the Sakana provider
-/// and/or the `fugu` model? Returns the referenced `model_catalog_json` path
-/// when present so the caller can resolve the model list.
-pub fn profile_targets_fugu(profile_toml: &str) -> Option<Option<String>> {
-    let mut provider_is_sakana = false;
-    let mut model_is_fugu = false;
+/// Back-compat helper for the first shipped provider.
+pub fn find_sakana_provider(config_toml: &str) -> Option<ProviderBlock> {
+    find_provider(config_toml, FUGU_PROVIDER_DESCRIPTOR)
+}
+
+/// Does a codex profile body (`<name>.config.toml`) select `descriptor` by
+/// provider id and/or model prefix? Returns the referenced `model_catalog_json`
+/// path when present so the caller can resolve the model list.
+pub fn profile_targets_provider(
+    profile_toml: &str,
+    descriptor: ModelProviderDescriptor,
+) -> Option<Option<String>> {
+    let mut provider_matches = false;
+    let mut model_matches = false;
     let mut catalog: Option<String> = None;
     for raw in profile_toml.lines() {
         let line = raw.trim();
@@ -155,18 +266,28 @@ pub fn profile_targets_fugu(profile_toml: &str) -> Option<Option<String>> {
         if let Some((k, v)) = line.split_once('=') {
             let val = unquote_toml(v.trim());
             match k.trim() {
-                "model_provider" => provider_is_sakana = val.contains("sakana"),
-                "model" => model_is_fugu = val.starts_with("fugu"),
+                "model_provider" => provider_matches = val.contains(descriptor.provider_id_hint),
+                "model" => {
+                    model_matches = descriptor
+                        .model_prefixes
+                        .iter()
+                        .any(|prefix| val.starts_with(prefix));
+                }
                 "model_catalog_json" => catalog = Some(val),
                 _ => {}
             }
         }
     }
-    if provider_is_sakana || model_is_fugu {
+    if provider_matches || model_matches {
         Some(catalog)
     } else {
         None
     }
+}
+
+/// Back-compat helper for the first shipped provider.
+pub fn profile_targets_fugu(profile_toml: &str) -> Option<Option<String>> {
+    profile_targets_provider(profile_toml, FUGU_PROVIDER_DESCRIPTOR)
 }
 
 /// Resolve whether a credential is usable from a provider's `env_key`, given an
@@ -180,17 +301,22 @@ pub fn credential_present(
     env_key: Option<&str>,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> bool {
-    let Some(env_key) = env_key else {
-        // No env_key declared → fall back to the conventional var name.
-        return env_lookup("SAKANA_API_KEY").is_some_and(|v| !v.is_empty());
-    };
+    credential_value(env_key, FUGU_PROVIDER_DESCRIPTOR.env_key, env_lookup).is_some()
+}
+
+fn credential_value(
+    env_key: Option<&str>,
+    default_env_key: &str,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let env_key = env_key.unwrap_or(default_env_key);
     if let Some((name, value)) = env_key.split_once('=') {
         if !value.trim().is_empty() {
-            return true; // inline credential
+            return Some(value.trim().to_string()); // inline credential
         }
-        return env_lookup(name.trim()).is_some_and(|v| !v.is_empty());
+        return env_lookup(name.trim()).filter(|v| !v.is_empty());
     }
-    env_lookup(env_key.trim()).is_some_and(|v| !v.is_empty())
+    env_lookup(env_key.trim()).filter(|v| !v.is_empty())
 }
 
 /// Parse a Fugu catalog (`fugu.json`) and return the model slugs that are
@@ -212,6 +338,139 @@ pub fn parse_catalog_models(catalog_json: &str) -> Vec<String> {
         })
         .filter_map(|m| m.get("slug").and_then(|s| s.as_str()).map(String::from))
         .collect()
+}
+
+/// Parse common `/models` response shapes. Supports the Fugu catalog shape
+/// (`models[].slug`) and OpenAI-compatible shape (`data[].id`).
+pub fn parse_probe_models(models_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(models_json) else {
+        return Vec::new();
+    };
+    if let Some(models) = v.get("data").and_then(|m| m.as_array()) {
+        return models
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|s| s.as_str()).map(String::from))
+            .collect();
+    }
+    if let Some(models) = v.get("models").and_then(|m| m.as_array()) {
+        return models
+            .iter()
+            .filter_map(|m| {
+                m.get("slug")
+                    .or_else(|| m.get("id"))
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+pub fn provider_probe_cache_path(home: &Path, descriptor: ModelProviderDescriptor) -> PathBuf {
+    home.join("provider-probes")
+        .join(format!("{}.json", descriptor.name))
+}
+
+pub fn probe_cache_is_fresh(cache: &ProviderProbeCache, now: SystemTime, ttl: Duration) -> bool {
+    let now_secs = unix_secs(now);
+    now_secs.saturating_sub(cache.checked_at_unix_secs) <= ttl.as_secs()
+}
+
+pub fn read_provider_probe_cache(
+    path: &Path,
+    now: SystemTime,
+    ttl: Duration,
+) -> Option<ProviderProbeCache> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let cache = serde_json::from_str::<ProviderProbeCache>(&body).ok()?;
+    probe_cache_is_fresh(&cache, now, ttl).then_some(cache)
+}
+
+pub fn write_provider_probe_cache(path: &Path, cache: &ProviderProbeCache) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(cache).map_err(std::io::Error::other)?;
+    std::fs::write(path, body)
+}
+
+/// Optional fail-open endpoint probe (#2441). This is intentionally NOT called
+/// from startup/menu detection: callers opt in from diagnostics/background
+/// refresh, provide a cache path, and treat `Unknown` as non-fatal.
+pub async fn probe_provider_models_fail_open(
+    descriptor: ModelProviderDescriptor,
+    provider: &ProviderBlock,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    cache_path: &Path,
+) -> ProviderProbeCache {
+    let now = SystemTime::now();
+    if let Some(cache) = read_provider_probe_cache(cache_path, now, DEFAULT_PROBE_TTL) {
+        return cache;
+    }
+
+    let Some(probe_path) = descriptor.probe_path else {
+        return ProviderProbeCache {
+            provider: descriptor.name.to_string(),
+            status: ProviderProbeStatus::Unknown,
+            checked_at_unix_secs: unix_secs(now),
+            models: Vec::new(),
+            error: Some("provider has no probe_path".to_string()),
+        };
+    };
+
+    let Some(key) = credential_value(provider.env_key.as_deref(), descriptor.env_key, env_lookup)
+    else {
+        return ProviderProbeCache {
+            provider: descriptor.name.to_string(),
+            status: ProviderProbeStatus::Unknown,
+            checked_at_unix_secs: unix_secs(now),
+            models: Vec::new(),
+            error: Some("credential unavailable for probe".to_string()),
+        };
+    };
+
+    let base = provider.base_url.as_deref().unwrap_or(descriptor.base_url);
+    let url = format!("{}{}", base.trim_end_matches('/'), probe_path);
+    let result = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let resp = client.get(url).bearer_auth(key).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    }
+    .await;
+
+    let cache = match result {
+        Ok((status, body)) if status.is_success() => ProviderProbeCache {
+            provider: descriptor.name.to_string(),
+            status: ProviderProbeStatus::Healthy,
+            checked_at_unix_secs: unix_secs(now),
+            models: parse_probe_models(&body),
+            error: None,
+        },
+        Ok((status, _)) => ProviderProbeCache {
+            provider: descriptor.name.to_string(),
+            status: ProviderProbeStatus::Unknown,
+            checked_at_unix_secs: unix_secs(now),
+            models: Vec::new(),
+            error: Some(format!("probe returned HTTP {status}")),
+        },
+        Err(e) => ProviderProbeCache {
+            provider: descriptor.name.to_string(),
+            status: ProviderProbeStatus::Unknown,
+            checked_at_unix_secs: unix_secs(now),
+            models: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    };
+    let _ = write_provider_probe_cache(cache_path, &cache);
+    cache
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// Strip surrounding single/double quotes from a TOML scalar value, dropping a
@@ -276,6 +535,7 @@ pub fn detect(
     codex_on_path: bool,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> FuguDetection {
+    let descriptor = FUGU_PROVIDER_DESCRIPTOR;
     let home = dirs::home_dir();
     let mut hints: Vec<String> = Vec::new();
 
@@ -283,6 +543,7 @@ pub fn detect(
         hints.push("codex CLI not found on PATH — install codex to run Fugu".to_string());
         return FuguDetection {
             status: FuguStatus::NotConfigured,
+            descriptor,
             codex_on_path,
             provider_source: None,
             has_credential: false,
@@ -352,6 +613,7 @@ pub fn detect(
         );
         return FuguDetection {
             status: FuguStatus::NotConfigured,
+            descriptor,
             codex_on_path,
             provider_source: None,
             has_credential: false,
@@ -384,6 +646,7 @@ pub fn detect(
 
     FuguDetection {
         status,
+        descriptor,
         codex_on_path,
         provider_source,
         has_credential,
@@ -493,6 +756,35 @@ mod tests {
     }
 
     #[test]
+    fn fugu_descriptor_matches_2441_acceptance() {
+        let d = FUGU_PROVIDER_DESCRIPTOR;
+        assert_eq!(d.name, "fugu");
+        assert_eq!(d.base_url, "https://api.sakana.ai/v1");
+        assert_eq!(d.env_key, "SAKANA_API_KEY");
+        assert_eq!(d.wire_api, "responses");
+        assert_eq!(d.compatible_harnesses, &["codex"]);
+        assert_eq!(d.probe_path, Some("/models"));
+        assert!(PROVIDER_DESCRIPTORS.iter().any(|p| p.name == "fugu"));
+    }
+
+    #[test]
+    fn fixed_provider_backends_are_explicitly_out_of_axis() {
+        let names: Vec<_> = FIXED_PROVIDER_BACKENDS.iter().map(|b| b.backend).collect();
+        assert!(names.contains(&"kiro-cli"));
+        assert!(names.contains(&"agy"));
+        assert!(FIXED_PROVIDER_BACKENDS
+            .iter()
+            .all(|b| b.reason.contains("not bearer base_url")));
+    }
+
+    #[test]
+    fn generic_descriptor_finds_provider_by_host() {
+        let cfg = "[model_providers.anything]\nbase_url = 'https://api.sakana.ai/v1'\n";
+        let b = find_provider(cfg, FUGU_PROVIDER_DESCRIPTOR).expect("block");
+        assert_eq!(b.id, "anything");
+    }
+
+    #[test]
     fn finds_sakana_block_by_id() {
         let cfg = "model = \"gpt-5.5\"\n\n[model_providers.sakana]\nname = \"Sakana API\"\n\
                    base_url = \"https://api.sakana.ai/v1\"\nenv_key = \"SAKANA_API_KEY=fish_abc\"\n\
@@ -566,6 +858,67 @@ mod tests {
     }
 
     #[test]
+    fn probe_models_parse_openai_and_catalog_shapes() {
+        let openai = r#"{"data":[{"id":"fugu"},{"id":"fugu-ultra"}]}"#;
+        assert_eq!(
+            parse_probe_models(openai),
+            vec!["fugu".to_string(), "fugu-ultra".to_string()]
+        );
+
+        let catalog = r#"{"models":[{"slug":"fugu"},{"id":"fugu-ultra"}]}"#;
+        assert_eq!(
+            parse_probe_models(catalog),
+            vec!["fugu".to_string(), "fugu-ultra".to_string()]
+        );
+    }
+
+    #[test]
+    fn probe_cache_respects_ttl() {
+        let cache = ProviderProbeCache {
+            provider: "fugu".to_string(),
+            status: ProviderProbeStatus::Healthy,
+            checked_at_unix_secs: 1_000,
+            models: vec!["fugu".to_string()],
+            error: None,
+        };
+        let fresh_at = UNIX_EPOCH + Duration::from_secs(1_590);
+        let stale_at = UNIX_EPOCH + Duration::from_secs(1_601);
+        assert!(probe_cache_is_fresh(
+            &cache,
+            fresh_at,
+            Duration::from_secs(600)
+        ));
+        assert!(!probe_cache_is_fresh(
+            &cache,
+            stale_at,
+            Duration::from_secs(600)
+        ));
+    }
+
+    #[test]
+    fn probe_cache_round_trips_json() {
+        let dir =
+            std::env::temp_dir().join(format!("agend-provider-probe-cache-{}", std::process::id()));
+        let path = provider_probe_cache_path(&dir, FUGU_PROVIDER_DESCRIPTOR);
+        let cache = ProviderProbeCache {
+            provider: "fugu".to_string(),
+            status: ProviderProbeStatus::Unknown,
+            checked_at_unix_secs: 42,
+            models: Vec::new(),
+            error: Some("fail-open".to_string()),
+        };
+        write_provider_probe_cache(&path, &cache).unwrap();
+        let loaded = read_provider_probe_cache(
+            &path,
+            UNIX_EPOCH + Duration::from_secs(43),
+            Duration::from_secs(600),
+        )
+        .expect("fresh cache");
+        assert_eq!(loaded, cache);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn detect_not_configured_without_codex() {
         let d = detect(&[], false, &no_env);
         assert_eq!(d.status, FuguStatus::NotConfigured);
@@ -636,6 +989,7 @@ mod tests {
     fn ensure_fugu_home_errors_without_provider() {
         let detection = FuguDetection {
             status: FuguStatus::ConfiguredNoCredential,
+            descriptor: FUGU_PROVIDER_DESCRIPTOR,
             codex_on_path: true,
             provider_source: None,
             has_credential: false,
