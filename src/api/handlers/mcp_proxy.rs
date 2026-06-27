@@ -135,7 +135,19 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         });
     }
     let timeout = tool_timeout(tool);
-    handle_mcp_tool_inner(tool, args, instance, timeout, crate::mcp::execute_tool)
+    let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
+        registry: ctx.registry.clone(),
+        externals: ctx.externals.clone(),
+    };
+    handle_mcp_tool_inner(
+        tool,
+        args,
+        instance,
+        timeout,
+        move |tool, args, instance| {
+            crate::mcp::execute_tool_with_runtime(tool, args, instance, runtime)
+        },
+    )
 }
 
 /// Inner proxy with an injectable executor + explicit timeout — the §3.9 test

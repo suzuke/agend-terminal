@@ -4,10 +4,18 @@
 //! without mutating state.
 
 use super::HandlerCtx;
-use crate::agent;
+use crate::agent::{self, AgentRegistry, ExternalRegistry};
 use serde_json::{json, Value};
 
 pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
+    list_response(ctx.home, ctx.registry, ctx.externals)
+}
+
+pub(crate) fn list_response(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    externals: &ExternalRegistry,
+) -> Value {
     // H9: snapshot each managed agent's fields UNDER the tier-1 registry lock,
     // then drop(reg) BEFORE the per-agent dispatch_idle disk I/O. The original
     // called `pending_for_instance` (→ `read_dir` + a `read_to_string` +
@@ -16,7 +24,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
     // N*M file reads/parses entirely under the lock — blocking every other API
     // handler, the supervisor tick, crash-respawn, hang-detection and the TUI
     // render path on disk contention. Mirrors the external-agent loop below.
-    let reg = agent::lock_registry(ctx.registry);
+    let reg = agent::lock_registry(registry);
     let snapshot: Vec<(String, Value)> = reg
         .values()
         .map(|handle| {
@@ -95,7 +103,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
     let mut agents: Vec<Value> = Vec::with_capacity(snapshot.len());
     for (name, mut entry) in snapshot {
         let (dispatched_waiting_for, pending_response_to) =
-            crate::daemon::dispatch_idle::pending_for_instance(ctx.home, &name);
+            crate::daemon::dispatch_idle::pending_for_instance(home, &name);
         if let Some(obj) = entry.as_object_mut() {
             obj.insert(
                 "dispatched_waiting_for".into(),
@@ -105,10 +113,10 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
         }
         agents.push(entry);
     }
-    let ext = agent::lock_external(ctx.externals);
+    let ext = agent::lock_external(externals);
     for (name, handle) in ext.iter() {
         let (dispatched_waiting_for, pending_response_to) =
-            crate::daemon::dispatch_idle::pending_for_instance(ctx.home, name);
+            crate::daemon::dispatch_idle::pending_for_instance(home, name);
         agents.push(json!({
             "name": name,
             "backend": handle.backend_command,

@@ -87,6 +87,7 @@ fn unwatch_uses_validated_caller_not_clear_all_mcp_ci_worktree() {
         args: &unwatch_args,
         instance_name: "lead",
         sender: &no_sender,
+        runtime: None,
     };
     let resp = crate::mcp::handlers::dispatch::try_dispatch("ci", &ctx)
         .expect("ci tool must be registered in the dispatch table");

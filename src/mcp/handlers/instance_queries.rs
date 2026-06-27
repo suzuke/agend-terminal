@@ -1,8 +1,14 @@
 use crate::agent_ops::{list_agents, merge_metadata};
+use crate::mcp::handlers::dispatch::RuntimeContext;
 use serde_json::{json, Value};
 use std::path::Path;
 
-pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &str) -> Value {
+pub(super) fn handle_list_instances_with_runtime(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     // If `instance` param is provided, return detailed info for that instance (replaces describe_instance)
     if let Some(target) = args["instance"].as_str().filter(|s| !s.is_empty()) {
         return handle_describe_instance(home, &json!({"name": target}));
@@ -14,34 +20,33 @@ pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &s
     // context ballast. Set `verbose:true` or `include_evidence:true` for detail.
     let include_evidence = args["verbose"].as_bool().unwrap_or(false)
         || args["include_evidence"].as_bool().unwrap_or(false);
-    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
-        Ok(resp) => {
-            if let Some(agents) = resp["result"]["agents"].as_array() {
-                let instances: Vec<Value> = agents
-                    .iter()
-                    .filter(|a| {
-                        let backend = a["backend"].as_str().unwrap_or("");
-                        crate::backend::Backend::from_command(backend).is_some()
-                    })
-                    .map(|a| {
-                        let mut info = a.clone();
-                        let name = a["name"].as_str().unwrap_or("");
-                        merge_metadata(home, name, &mut info);
-                        if name == instance_name {
-                            info["is_self"] = json!(true);
-                        }
-                        if !include_evidence {
-                            strip_observed_evidence(&mut info);
-                        }
-                        info
-                    })
-                    .collect();
-                json!({"instances": instances, "compact": !include_evidence})
-            } else {
-                json!({"instances": list_agents(), "compact": true})
-            }
-        }
-        Err(_) => json!({"instances": list_agents(), "compact": true}),
+    let Some(runtime) = runtime else {
+        return json!({"instances": list_agents(), "compact": true});
+    };
+    let resp = crate::api::list_response(home, &runtime.registry, &runtime.externals);
+    if let Some(agents) = resp["result"]["agents"].as_array() {
+        let instances: Vec<Value> = agents
+            .iter()
+            .filter(|a| {
+                let backend = a["backend"].as_str().unwrap_or("");
+                crate::backend::Backend::from_command(backend).is_some()
+            })
+            .map(|a| {
+                let mut info = a.clone();
+                let name = a["name"].as_str().unwrap_or("");
+                merge_metadata(home, name, &mut info);
+                if name == instance_name {
+                    info["is_self"] = json!(true);
+                }
+                if !include_evidence {
+                    strip_observed_evidence(&mut info);
+                }
+                info
+            })
+            .collect();
+        json!({"instances": instances, "compact": !include_evidence})
+    } else {
+        json!({"instances": list_agents(), "compact": true})
     }
 }
 
@@ -96,6 +101,8 @@ pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn strip_observed_evidence_drops_only_evidence_2475() {
@@ -120,5 +127,34 @@ mod tests {
         let mut info = json!({"name": "dev-2", "agent_state": "idle"});
         strip_observed_evidence(&mut info); // must not panic / must be inert
         assert_eq!(info["name"], "dev-2");
+    }
+
+    #[test]
+    fn list_instances_uses_runtime_registry_without_api_loopback_2454() {
+        let home = std::env::temp_dir().join(format!("agend-list-runtime-{}", std::process::id()));
+        let registry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let externals = Arc::new(parking_lot::Mutex::new(HashMap::from([(
+            "external-one".to_string(),
+            crate::agent::ExternalAgentHandle {
+                backend_command: "codex".to_string(),
+                pid: 4242,
+            },
+        )])));
+        let runtime = RuntimeContext {
+            registry,
+            externals,
+        };
+
+        let result =
+            handle_list_instances_with_runtime(&home, &json!({}), "caller", Some(&runtime));
+        let instances = result["instances"]
+            .as_array()
+            .expect("instances array from runtime path");
+        assert!(
+            instances
+                .iter()
+                .any(|agent| agent["name"].as_str() == Some("external-one")),
+            "runtime registry result should be returned without depending on the API socket: {result}"
+        );
     }
 }
