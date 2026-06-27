@@ -502,11 +502,19 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     continue;
                 }
                 budget_used += sz;
-                // #2299: unread → DELIVERING (not processed). read_at stays None
-                // until the agent acks (explicit `inbox ack` / implicit next-drain)
-                // or the reclaim-TTL resets it. A turn dying after this drain leaves
-                // the row `delivering` → reclaimed → re-delivered (no silent loss).
-                msg.delivering_at = Some(now.clone());
+                if auto_ack_on_drain_kind(&msg) {
+                    // Fire-and-forget notifications have no blocked sender and no
+                    // required reply. Return them to the agent once, but settle them
+                    // immediately so daemon restarts cannot resurrect completed
+                    // PR/CI/status chatter through the delivering reclaim path.
+                    msg.read_at = Some(now.clone());
+                } else {
+                    // #2299: unread → DELIVERING (not processed). read_at stays None
+                    // until the agent acks (explicit `inbox ack` / implicit next-drain)
+                    // or the reclaim-TTL resets it. A turn dying after this drain leaves
+                    // the row `delivering` → reclaimed → re-delivered (no silent loss).
+                    msg.delivering_at = Some(now.clone());
+                }
                 changed = true;
                 // #1888: a `ci-ready-for-action` handoff just transitioned to
                 // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
@@ -1176,30 +1184,48 @@ fn reclaim_renudge_worthy(home: &Path, msg: &InboxMessage) -> bool {
 /// every recognised non-obligation kind to `None`, so without this helper an
 /// unrecognised future kind would be indistinguishable from a non-obligation and
 /// silently dropped from the reclaim re-nudge. The known set mirrors the kinds the
-/// daemon emits today: `query` / `task` (obligations) + `report` / `update` /
-/// `ci-watch` / `poll` (non-obligations), plus a plain `kind=None`. Anything else →
-/// `true` (unknown → conservatively re-arm; failure mode = noise, never silent loss).
+/// daemon emits today: `query` / `task` (obligations) plus the
+/// [`known_fire_and_forget_kind`] set, plus a plain `kind=None`. Anything else
+/// → `true` (unknown → conservatively re-arm; failure mode = noise, never silent
+/// loss).
 fn kind_is_unknown(msg: &InboxMessage) -> bool {
     match msg.kind.as_deref() {
         None => false, // a plain message is a recognised non-obligation
-        Some(k) => !matches!(
-            k,
-            "query" | "task" | "report" | "update" | "ci-watch" | "poll"
-        ),
+        Some("query" | "task") => false,
+        Some(_) => !known_fire_and_forget_kind(msg),
     }
 }
 
 /// Recognised fire-and-forget *kinds* have no outstanding obligation once they
-/// were delivered once. If their turn never explicitly acked them, reclaim must
-/// settle them to `processed` instead of making them unread again; otherwise old
-/// `report`/`update` rows can loop forever through poll-reminder (#2482).
+/// were delivered once. Reclaim uses this for rows left in `delivering`;
+/// otherwise old `report`/`update`/`pr-merged` rows can loop forever through
+/// poll-reminder (#2482 / ghost pr-merged).
 ///
 /// Plain `kind=None` rows intentionally stay outside this set: #2299's core
 /// anti-silent-loss guarantee still redelivers generic messages after a dead turn.
-fn known_non_obligation_kind(msg: &InboxMessage) -> bool {
+fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
     matches!(
         msg.kind.as_deref(),
-        Some("report" | "update" | "ci-watch" | "poll")
+        Some(
+            "report"
+                | "update"
+                | "ci-watch"
+                | "ci-watch-stalled"
+                | "ci-watch-resumed"
+                | "poll"
+                | "pr-merged"
+        )
+    )
+}
+
+/// Daemon-originated notification kinds that are safe to settle on first drain.
+/// This is narrower than [`known_fire_and_forget_kind`]: peer `report`/`update`
+/// messages keep #2299's delivering/ack behavior on first drain, while pure
+/// daemon notifications avoid the restart/reclaim loop entirely.
+fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
+    matches!(
+        msg.kind.as_deref(),
+        Some("ci-watch" | "ci-watch-stalled" | "ci-watch-resumed" | "poll" | "pr-merged")
     )
 }
 
@@ -1401,11 +1427,11 @@ pub fn reclaim_stale_delivering(home: &Path) {
                             })
                             .unwrap_or(true); // unparseable timestamp → reclaim (fail-safe)
                         if stale {
-                            if known_non_obligation_kind(&msg) {
-                                // #2482: fire-and-forget rows (report/update/ci-watch/poll)
-                                // were already delivered once and have no actor blocked on them.
-                                // Reverting them to unread lets poll-reminder/drain resurrect old
-                                // completed-task chatter forever. Terminally settle instead.
+                            if known_fire_and_forget_kind(&msg) {
+                                // #2482: fire-and-forget rows were already delivered once
+                                // and have no actor blocked on them. Reverting them to
+                                // unread lets poll-reminder/drain resurrect old completed
+                                // PR/CI/status chatter forever. Terminally settle instead.
                                 msg.read_at = Some(now.to_rfc3339());
                                 settled_non_obligations += 1;
                             } else {
