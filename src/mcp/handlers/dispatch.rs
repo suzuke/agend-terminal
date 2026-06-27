@@ -41,6 +41,16 @@ pub(crate) struct HandlerCtx<'a> {
     pub args: &'a Value,
     pub instance_name: &'a str,
     pub sender: &'a Option<Sender>,
+    pub runtime: Option<&'a RuntimeContext>,
+}
+
+/// Optional daemon runtime state available only when MCP tools are executed
+/// through the in-process API `mcp_tool` path. Standalone bridge calls leave it
+/// absent and keep the legacy socket/fallback behavior.
+#[derive(Clone)]
+pub(crate) struct RuntimeContext {
+    pub registry: crate::agent::AgentRegistry,
+    pub externals: crate::agent::ExternalRegistry,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -184,11 +194,9 @@ macro_rules! action_adapter {
 // Flat adapters — one per simple (non-action-based) tool.
 // ---------------------------------------------------------------------
 
-adapter!(
-    dispatch_list_instances,
-    hai,
-    instance::handle_list_instances
-);
+pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_list_instances_with_runtime(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
+}
 adapter!(
     dispatch_create_instance,
     hai,
@@ -566,6 +574,7 @@ mod tests {
             args,
             instance_name: instance,
             sender: &EMPTY_SENDER,
+            runtime: None,
         }
     }
 

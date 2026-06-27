@@ -13,9 +13,11 @@ pub mod usage_stats;
 
 use serde_json::Value;
 
-/// Service boundary: single public entry point for MCP tool execution.
-/// API layer calls this instead of reaching into `handlers::handle_tool`
-/// directly, keeping timeout policy in API and execution in MCP.
-pub fn execute_tool(tool_name: &str, args: &Value, instance_name: &str) -> Value {
-    handlers::handle_tool(tool_name, args, instance_name)
+pub(crate) fn execute_tool_with_runtime(
+    tool_name: &str,
+    args: &Value,
+    instance_name: &str,
+    runtime: handlers::dispatch::RuntimeContext,
+) -> Value {
+    handlers::handle_tool_with_runtime(tool_name, args, instance_name, Some(runtime))
 }

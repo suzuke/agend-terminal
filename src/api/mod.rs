@@ -21,6 +21,14 @@ pub mod request_dedup;
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
+pub(crate) fn list_response(
+    home: &std::path::Path,
+    registry: &crate::agent::AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+) -> serde_json::Value {
+    handlers::query::list_response(home, registry, externals)
+}
+
 // ---------------------------------------------------------------------------
 // ApiNotifier — decouples api.rs from the TUI layer
 // ---------------------------------------------------------------------------
