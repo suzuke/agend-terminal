@@ -229,6 +229,18 @@ pub(crate) fn tool_subset_for_role(
     }
 }
 
+/// #2300 P1 / #2055: execution-time companion to [`tool_subset_for_role`].
+/// `tools/list` visibility alone is advisory; the daemon must also hard-deny a
+/// registered tool call that is hidden from the caller's typed role. Unknown
+/// tool names stay allowed here so the normal executor can return the existing
+/// unknown-tool error instead of turning typos into capability denials.
+pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, tool: &str) -> bool {
+    all().iter().all(|e| e.name != tool)
+        || tool_subset_for_role(role_kind)
+            .iter()
+            .any(|entry| entry.name == tool)
+}
+
 static ALL_TOOLS: [ToolEntry; 37] = [
     // ── Channel ──
     ToolEntry {
@@ -550,6 +562,30 @@ mod tests {
         assert!(
             r.len() < all().len(),
             "reviewer subset must be narrower than full"
+        );
+    }
+
+    #[test]
+    fn execution_capability_matches_visible_subset_without_changing_unknown_tools() {
+        assert!(
+            !tool_allowed_for_role(Some(RoleKind::Reviewer), "create_instance"),
+            "reviewer must be execution-denied for hidden registered lifecycle tools"
+        );
+        assert!(
+            tool_allowed_for_role(Some(RoleKind::Reviewer), "inbox"),
+            "reviewer must still execute visible workflow tools"
+        );
+        assert!(
+            tool_allowed_for_role(Some(RoleKind::Implementer), "create_instance"),
+            "full-capability roles stay all-open"
+        );
+        assert!(
+            tool_allowed_for_role(None, "create_instance"),
+            "absent role_kind stays default-all-open"
+        );
+        assert!(
+            tool_allowed_for_role(Some(RoleKind::Reviewer), "not_a_registered_tool"),
+            "unknown tool names should reach the executor's existing unknown-tool error"
         );
     }
 
