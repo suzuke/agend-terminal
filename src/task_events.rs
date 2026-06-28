@@ -1328,6 +1328,7 @@ where
 /// Returns `Ok(true)` if written, `Ok(false)` if SKIPPED because the task can no
 /// longer transition to Done (logged at info — the operator already holds the
 /// canonical terminal signal; not an error).
+#[allow(dead_code)]
 pub fn append_done_if_legal(
     home: &Path,
     instance: &InstanceName,

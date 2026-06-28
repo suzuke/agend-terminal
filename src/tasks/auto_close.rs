@@ -21,7 +21,8 @@ pub fn auto_close_on_report(
     if !correlation_id.starts_with("t-") {
         return Ok(false);
     }
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let board = super::board_router::board_for_task(home, correlation_id);
+    let state = crate::task_events::replay_at(&board).unwrap_or_default();
     let tid = crate::task_events::TaskId(correlation_id.to_string());
     let Some(record) = state.tasks.get(&tid) else {
         return Ok(false);
@@ -67,7 +68,7 @@ pub fn auto_close_on_report(
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
     let closed =
-        crate::task_events::append_done_if_legal(home, &emitter, correlation_id, vec![event])?;
+        crate::task_events::append_done_if_legal_at(&board, &emitter, correlation_id, vec![event])?;
     if closed {
         let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
     }
@@ -95,10 +96,14 @@ mod tests {
     }
 
     fn seed_claimed_task(home: &Path, task_id: &str, assignee: &str) {
+        seed_claimed_task_on_board(task_id, assignee, home);
+    }
+
+    fn seed_claimed_task_on_board(task_id: &str, assignee: &str, board: &Path) {
         let emitter = InstanceName::from("test:seed");
         let tid = TaskId(task_id.into());
-        crate::task_events::append_batch(
-            home,
+        crate::task_events::append_batch_at(
+            board,
             &emitter,
             vec![
                 TaskEvent::Created {
@@ -193,7 +198,11 @@ mod tests {
     }
 
     fn task_status(home: &Path, task_id: &str) -> Option<crate::task_events::TaskStatus> {
-        let state = crate::task_events::replay(home).unwrap();
+        task_status_on_board(task_id, home)
+    }
+
+    fn task_status_on_board(task_id: &str, board: &Path) -> Option<crate::task_events::TaskStatus> {
+        let state = crate::task_events::replay_at(board).unwrap();
         state.tasks.get(&TaskId(task_id.into())).map(|r| r.status)
     }
 
@@ -215,6 +224,40 @@ mod tests {
             task_status(&home, "t-1228-001"),
             Some(crate::task_events::TaskStatus::Done),
             "task status should be Done after auto-close"
+        );
+    }
+
+    #[test]
+    fn assignee_terminal_report_auto_closes_non_default_board_task_2498() {
+        let home = tmp_home("assignee_close_project");
+        let board = crate::task_events::board_root(&home, "proj-2498");
+        seed_claimed_task_on_board("t-2498-project", "dev-agent", &board);
+        super::super::board_router::record_task_project(&home, "t-2498-project", "proj-2498")
+            .expect("record project index");
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-2498-project",
+            "dev-agent",
+            "Task completed successfully",
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            closed,
+            "terminal assignee report should auto-close across project boards"
+        );
+        assert_eq!(
+            task_status_on_board("t-2498-project", &board),
+            Some(crate::task_events::TaskStatus::Done),
+            "task status should be Done on its non-default board after auto-close"
+        );
+        assert_eq!(
+            task_status(&home, "t-2498-project"),
+            None,
+            "auto-close must not create or mutate a default-board copy"
         );
     }
 
