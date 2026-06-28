@@ -233,7 +233,14 @@ pub(crate) fn dispatch_auto_bind_lease(
     repo: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
     dispatch_auto_bind_lease_with_source_and_chain(
-        home, target, task_id, branch, repo, None, None, None,
+        home,
+        target,
+        task_id,
+        branch,
+        repo,
+        None,
+        &[],
+        None,
         true, // #2158 GR1: dispatch entry → arm ci-watch
     )
 }
@@ -259,6 +266,7 @@ pub(crate) fn dispatch_auto_bind_lease(
 /// and the `ci/mod.rs` self-claim path) leave `next_after_ci` explicit-only now,
 /// so the helper became dead code. Role-based auto-handoff is a future follow-up
 /// (needs role infra), not a naming convention.
+#[allow(dead_code)]
 pub(crate) fn dispatch_auto_bind_lease_with_chain(
     home: &Path,
     target: &str,
@@ -267,6 +275,32 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
     repo: Option<&str>,
     next_after_ci: Option<&str>,
     // #1877: dual-review directive ("dual" iff the dispatch set second_reviewer).
+    review_class: Option<&str>,
+) -> Result<DispatchOutcome, DispatchError> {
+    let next_after_ci_targets = next_after_ci
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default();
+    dispatch_auto_bind_lease_with_source_and_chain(
+        home,
+        target,
+        task_id,
+        branch,
+        repo,
+        None,
+        &next_after_ci_targets,
+        review_class,
+        true, // #2158 GR1: dispatch entry (delegate/comms) → arm ci-watch
+    )
+}
+
+pub(crate) fn dispatch_auto_bind_lease_with_chain_targets(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    branch: &str,
+    repo: Option<&str>,
+    next_after_ci: &[String],
     review_class: Option<&str>,
 ) -> Result<DispatchOutcome, DispatchError> {
     dispatch_auto_bind_lease_with_source_and_chain(
@@ -278,7 +312,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
         None,
         next_after_ci,
         review_class,
-        true, // #2158 GR1: dispatch entry (delegate/comms) → arm ci-watch
+        true,
     )
 }
 
@@ -317,7 +351,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         branch,
         repo,
         source_repo_override,
-        None,
+        &[],
         None,
         false, // #2158 GR1: bind_self self-claim → do NOT silently arm ci-watch
     )
@@ -353,7 +387,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     branch: &str,
     repo: Option<&str>,
     source_repo_override: Option<&Path>,
-    next_after_ci: Option<&str>,
+    next_after_ci: &[String],
     // #1877: `review_class` (e.g. "dual" from a `second_reviewer=true` dispatch)
     // must reach the auto-armed watch — else the dual-review signal accepted at
     // the MCP boundary (comms.rs) silently evaporates and CI gates single review.

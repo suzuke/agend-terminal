@@ -246,13 +246,16 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             );
         } else {
             // #1877: second_reviewer → review_class="dual" on the auto-armed watch.
-            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
+            let next_after_ci = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
+                &args["next_after_ci"],
+            );
+            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain_targets(
                 home,
                 target,
                 task_id_val,
                 branch,
                 args["repository"].as_str(),
-                args["next_after_ci"].as_str(),
+                &next_after_ci,
                 if second_reviewer { Some("dual") } else { None },
             ) {
                 return json!({"ok": false, "error": format!("dispatch rejected: {e}")});

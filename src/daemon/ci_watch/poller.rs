@@ -1758,10 +1758,10 @@ async fn fan_out_notifications(
 
             let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
             let supersede_token = format!("ci-{}-{}", run_id, sha);
-            let action_target_on_success: Option<&str> = if conclusion == Some("success") {
-                state.next_after_ci.as_deref().filter(|s| !s.is_empty())
+            let action_targets_on_success = if conclusion == Some("success") {
+                state.next_after_ci_targets()
             } else {
-                None
+                Vec::new()
             };
             let fleet_cfg =
                 crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
@@ -1771,7 +1771,7 @@ async fn fan_out_notifications(
             // (the subscriber delivers via the shared `deliver_ci_watch`); a
             // non-pair "[ci-ended]" conclusion has no event kind → direct deliver.
             for sub in ctx.subscribers {
-                if action_target_on_success == Some(sub.as_str()) {
+                if action_targets_on_success.iter().any(|target| target == sub) {
                     continue;
                 }
                 // #1441: registry is UUID-keyed; resolve subscriber via fleet.yaml.
@@ -1928,8 +1928,9 @@ fn persist_watch_state(
             state.required_checks.as_deref(),
         ) == Some("success")
         {
-            match state.next_after_ci.as_deref().filter(|s| !s.is_empty()) {
-                Some(next) => {
+            let targets = state.next_after_ci_targets();
+            if !targets.is_empty() {
+                for next in targets {
                     let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
                     let pr_state = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch);
                     // #t-92758 P1(b): don't emit ci-ready for a merge-BLOCKED PR
@@ -1962,9 +1963,9 @@ fn persist_watch_state(
                             task_id,
                         );
                         persist_or_log!(
-                            crate::inbox::enqueue_with_idle_hint(ctx.home, next, msg),
+                            crate::inbox::enqueue_with_idle_hint(ctx.home, &next, msg),
                             "ci_watch_chain",
-                            next
+                            &next
                         );
                         // #1888 phase-2: track the handoff until RESOLUTION (report /
                         // PR terminal / target claims the branch), decoupled from the
@@ -1972,7 +1973,7 @@ fn persist_watch_state(
                         // it read within seconds and blinded the re-nudge).
                         crate::daemon::ci_handoff_track::record(
                             ctx.home,
-                            next,
+                            &next,
                             &repo_branch_key,
                             &chrono::Utc::now().to_rfc3339(),
                             // #2008: anchor the track to the head it was recorded for
@@ -1982,16 +1983,14 @@ fn persist_watch_state(
                         );
                     }
                 }
-                None if state.subscriber_names().is_empty() => {
-                    tracing::warn!(
-                        target: "ci_watch",
-                        repo = ctx.repo,
-                        branch = ctx.branch,
-                        "CI passed but watch has no next_after_ci AND no subscribers — \
-                         no one to notify (malformed watch); not dropping silently"
-                    );
-                }
-                None => {}
+            } else if state.subscriber_names().is_empty() {
+                tracing::warn!(
+                    target: "ci_watch",
+                    repo = ctx.repo,
+                    branch = ctx.branch,
+                    "CI passed but watch has no next_after_ci AND no subscribers — \
+                     no one to notify (malformed watch); not dropping silently"
+                );
             }
         }
 

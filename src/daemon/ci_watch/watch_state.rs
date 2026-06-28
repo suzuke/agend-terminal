@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subscriber {
@@ -105,8 +106,13 @@ pub struct WatchState {
     pub stalled_since_ms: Option<i64>,
 
     // Routing
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_after_ci: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_next_after_ci",
+        serialize_with = "serialize_next_after_ci",
+        skip_serializing_if = "next_after_ci_is_empty"
+    )]
+    pub next_after_ci: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,6 +192,71 @@ impl WatchState {
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .min()
     }
+
+    pub fn next_after_ci_targets(&self) -> Vec<String> {
+        self.next_after_ci.clone().unwrap_or_default()
+    }
+}
+
+pub(crate) fn normalize_next_after_ci(value: &Value) -> Vec<String> {
+    let mut out = match value {
+        Value::String(s) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.clone()]
+            }
+        }
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    };
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub(crate) fn next_after_ci_json(targets: &[String]) -> Option<Value> {
+    match targets {
+        [] => None,
+        [one] => Some(Value::String(one.clone())),
+        many => Some(Value::Array(
+            many.iter().map(|s| Value::String(s.clone())).collect(),
+        )),
+    }
+}
+
+fn next_after_ci_is_empty(targets: &Option<Vec<String>>) -> bool {
+    targets.as_ref().is_none_or(Vec::is_empty)
+}
+
+fn deserialize_next_after_ci<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let targets = value
+        .as_ref()
+        .map(normalize_next_after_ci)
+        .unwrap_or_default();
+    Ok((!targets.is_empty()).then_some(targets))
+}
+
+fn serialize_next_after_ci<S>(
+    targets: &Option<Vec<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match targets.as_deref().and_then(next_after_ci_json) {
+        Some(value) => value.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[cfg(test)]
@@ -241,7 +312,7 @@ mod tests {
         assert_eq!(ws.interval_secs, 120);
         assert_eq!(ws.last_run_id, Some(42));
         assert_eq!(ws.head_sha.as_deref(), Some("abc1234"));
-        assert_eq!(ws.next_after_ci.as_deref(), Some("reviewer"));
+        assert_eq!(ws.next_after_ci_targets(), vec!["reviewer"]);
         assert_eq!(ws.consecutive_skips, Some(0));
         assert_eq!(ws.stalled_notified, Some(false));
         assert!(ws.stalled_since_ms.is_none());
@@ -252,6 +323,21 @@ mod tests {
         assert_eq!(re_serialized["interval_secs"], 120);
         assert_eq!(re_serialized["last_run_id"], 42);
         assert_eq!(re_serialized["next_after_ci"], "reviewer");
+    }
+
+    #[test]
+    fn next_after_ci_array_round_trips() {
+        let json = serde_json::json!({
+            "repo": "owner/repo",
+            "next_after_ci": ["reviewer-b", "reviewer-a", "reviewer-a", ""],
+        });
+        let ws: WatchState = serde_json::from_value(json).unwrap();
+        assert_eq!(ws.next_after_ci_targets(), vec!["reviewer-a", "reviewer-b"]);
+        let re_serialized = serde_json::to_value(&ws).unwrap();
+        assert_eq!(
+            re_serialized["next_after_ci"],
+            serde_json::json!(["reviewer-a", "reviewer-b"])
+        );
     }
 
     #[test]
@@ -324,7 +410,7 @@ mod tests {
         let ws: WatchState = serde_json::from_value(json).unwrap();
         assert_eq!(ws.repo, "suzuke/agend-terminal");
         assert_eq!(ws.branch, "fix/1084-watchdog-snooze");
-        assert_eq!(ws.next_after_ci.as_deref(), Some("fixup-reviewer"));
+        assert_eq!(ws.next_after_ci_targets(), vec!["fixup-reviewer"]);
         assert_eq!(ws.task_id.as_deref(), Some("t-20260523144725263493-10"));
         let names = ws.subscriber_names();
         assert_eq!(names, vec!["fixup-dev"]);

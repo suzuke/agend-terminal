@@ -116,8 +116,11 @@ pub fn cleanup_watches_for_instance(home: &Path, instance: &str) -> usize {
             watch.instance = None;
             changed = true;
         }
-        if watch.next_after_ci.as_deref() == Some(instance) {
-            watch.next_after_ci = None;
+        let mut next_after_ci = watch.next_after_ci_targets();
+        let before_next = next_after_ci.len();
+        next_after_ci.retain(|target| target != instance);
+        if next_after_ci.len() != before_next {
+            watch.next_after_ci = (!next_after_ci.is_empty()).then_some(next_after_ci);
             changed = true;
         }
         if !changed {
@@ -125,7 +128,7 @@ pub fn cleanup_watches_for_instance(home: &Path, instance: &str) -> usize {
         }
 
         let (repo, branch) = (watch.repo.clone(), watch.branch.clone());
-        if watch.subscriber_names().is_empty() && watch.next_after_ci.is_none() {
+        if watch.subscriber_names().is_empty() && watch.next_after_ci_targets().is_empty() {
             remove_watch(home, &path, instance, &repo, &branch, "instance_deleted");
         } else if let Err(e) = crate::store::atomic_write(
             &path,
@@ -164,7 +167,7 @@ pub fn reassign_next_after_ci(home: &Path, task_id: &str, new_owner: Option<&str
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };
-    let new_val = new_owner.map(|s| s.to_string());
+    let new_val = new_owner.map(|s| vec![s.to_string()]);
     let mut affected = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -224,7 +227,7 @@ pub fn has_instance_anywhere(home: &Path, instance: &str) -> bool {
         };
         if watch.subscriber_names().iter().any(|s| s == instance)
             || watch.instance.as_deref() == Some(instance)
-            || watch.next_after_ci.as_deref() == Some(instance)
+            || watch.next_after_ci_targets().iter().any(|s| s == instance)
         {
             return true;
         }
@@ -499,7 +502,7 @@ mod tests {
         let ws = super::super::watch_state::WatchState {
             repo: "o/r".into(),
             branch: "feat".into(),
-            next_after_ci: Some("old-reviewer".into()),
+            next_after_ci: Some(vec!["old-reviewer".into()]),
             task_id: Some("t-x".into()),
             ..Default::default()
         };
@@ -513,7 +516,7 @@ mod tests {
         let path = ci_watches_dir(&home).join("w.json");
         let after: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after.next_after_ci.as_deref(), Some("new-reviewer"));
+        assert_eq!(after.next_after_ci_targets(), vec!["new-reviewer"]);
 
         // Non-matching task_id → no-op; orphan (None) → clear.
         assert_eq!(reassign_next_after_ci(&home, "t-other", Some("x")), 0);
@@ -541,7 +544,7 @@ mod tests {
             repo: "o/r".into(),
             branch: "feat".into(),
             subscribers: Some(vec![sub("doomed"), sub("alive")]),
-            next_after_ci: Some("doomed".into()),
+            next_after_ci: Some(vec!["doomed".into()]),
             ..Default::default()
         };
         write_watch(&home, "w", &ws);
@@ -566,7 +569,7 @@ mod tests {
             repo: "o/r".into(),
             branch: "feat".into(),
             subscribers: Some(vec![sub("doomed")]),
-            next_after_ci: Some("doomed".into()),
+            next_after_ci: Some(vec!["doomed".into()]),
             ..Default::default()
         };
         write_watch(&home, "w", &ws);

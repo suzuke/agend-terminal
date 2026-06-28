@@ -19,7 +19,7 @@ pub(super) fn arm(
     target: &str,
     repo: &str,
     branch: &str,
-    next_after_ci: Option<&str>,
+    next_after_ci: &[String],
     review_class: Option<&str>,
     task_id: &str,
 ) {
@@ -28,10 +28,10 @@ pub(super) fn arm(
     // Explicit-only since t-ci-ready-pr2 dropped the #1037 `<team>-reviewer`
     // name-derive; unset → no chain target (subscribers still get the informational
     // `[ci-pass]`, #1796).
-    let effective_next = next_after_ci.filter(|s| !s.is_empty()).map(String::from);
     let mut watch_args = json!({"repository": repo, "branch": branch});
-    if let Some(ref next) = effective_next {
-        watch_args["next_after_ci"] = json!(next);
+    if let Some(next_json) = crate::daemon::ci_watch::watch_state::next_after_ci_json(next_after_ci)
+    {
+        watch_args["next_after_ci"] = next_json;
     }
     // #1031: persist the dispatch task_id so the ci_check_repo emit can back-link the
     // `[ci-ready-for-action]` event to the originating dispatch (verdict correlation).
@@ -52,8 +52,8 @@ pub(super) fn arm(
     } else {
         tracing::info!(
             %target, repo, %branch,
-            next_after_ci = ?effective_next,
-            explicit = next_after_ci.is_some(),
+            next_after_ci = ?next_after_ci,
+            explicit = !next_after_ci.is_empty(),
             "dispatch auto-watch_ci"
         );
     }

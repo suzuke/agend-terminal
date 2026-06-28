@@ -648,6 +648,36 @@ fn handle_watch_ci_accepts_non_protected_branch() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn handle_watch_ci_accepts_multi_next_after_ci_targets_2502() {
+    let home = watch_test_home("multi-next-after-ci-2502");
+    let resp = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "owner/repo",
+            "branch": "feat/multi-next-after-ci",
+            "next_after_ci": ["reviewer-b", "reviewer-a", "reviewer-a", ""],
+        }),
+        "dev",
+    );
+    assert!(
+        resp["watching"].as_bool().unwrap_or(false),
+        "watching must succeed for array next_after_ci: {resp}"
+    );
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/multi-next-after-ci"),
+    );
+    let watch: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        watch["next_after_ci"],
+        serde_json::json!(["reviewer-a", "reviewer-b"]),
+        "next_after_ci array must persist all unique handoff targets"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ----------------------------------------------------------------------
 // #778 Option 1: `repo action=checkout bind:true` — atomic provision +
 // bind. Closes the chicken-and-egg surfaced by validation canary
