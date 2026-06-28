@@ -202,6 +202,19 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         "fetch_attempted": fetch_attempted,
                     });
                 }
+                let existing_task_id = existing
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !existing_task_id.is_empty() {
+                    return json!({
+                        "error": format!(
+                            "stale binding for branch '{branch}' points at a missing worktree - release first before checkout"
+                        ),
+                        "code": "stale_binding",
+                        "branch": branch,
+                    });
+                }
             }
         }
     }
