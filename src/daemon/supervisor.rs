@@ -371,6 +371,10 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             // #842: same eviction cadence for the bridge↔daemon idempotent-
             // retry dedup cache. Sibling sweep, same 10-min TTL window.
             crate::api::request_dedup::global().sweep_expired();
+            // Reply-to correlation: prune the sent-message ledger (14-day TTL +
+            // per-agent FIFO cap). Self-throttled to an hourly rewrite, so this
+            // 10s-cadence call is cheap on the off-ticks.
+            crate::sent_ledger::global(&home).maybe_gc(&home);
 
             // #1923 G4/G5: prune per-agent in-memory tracker state for agents no
             // longer in the registry (deleted / redeployed), mirroring the #1470
@@ -1404,6 +1408,7 @@ fn enqueue_reply_ledger_lead_escalation(
         attachments: vec![],
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
+        reply_target: None,
         superseded_by: None,
         from_id: None,
         broadcast_context: None,

@@ -669,7 +669,11 @@ fn send_from_agent_reply_errors_on_unbound_instance() {
     let result = crate::channel::Channel::send_from_agent(
         &ch,
         "unknown-agent",
-        crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+        crate::channel::AgentOutboundOp::Reply {
+            text: "hi".into(),
+            task_id: None,
+            correlation_id: None,
+        },
     );
     let err = result.expect_err("unbound instance must error");
     let err_msg = format!("{err}");
@@ -687,7 +691,11 @@ fn send_from_agent_blocked_by_outbound_gate() {
     let result = crate::channel::Channel::send_from_agent(
         &ch,
         "any-agent",
-        crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+        crate::channel::AgentOutboundOp::Reply {
+            text: "hi".into(),
+            task_id: None,
+            correlation_id: None,
+        },
     );
     let err = result.expect_err("unauthorized channel must reject");
     let err_msg = format!("{err}");

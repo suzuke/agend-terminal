@@ -329,6 +329,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     attachments: vec![],
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
+                    reply_target: None,
                     superseded_by: None,
                     from_id: None,
                     broadcast_context: None,
@@ -600,8 +601,15 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // AGEND_POINTER_ONLY_INJECT=1: all messages go inbox + hint (unchanged).
     let is_short = is_short_inject(&text, &attachments);
     let pointer_only = inbox::notify::pointer_only_inject();
+    // Reply-to correlation (block ④): a SHORT message that QUOTE-REPLIES a bot
+    // message must NOT take the PTY-only bypass — that path builds no
+    // InboxMessage, so the `reply_to` (and its sent_ledger correlation) would be
+    // dropped. Force it through the inbox-enqueue branch so the quote is
+    // captured + enriched. Plain short messages (no reply_to) keep the exact
+    // PTY-only inject behaviour (the #2293 arm_channel_turn path is untouched).
+    let has_reply_to = msg.reply_to_message().is_some();
 
-    if is_short && !pointer_only {
+    if is_short && !pointer_only && !has_reply_to {
         // #2293 progress-mirror fix: the inbox-drain path arms reply_to_channel +
         // the delivery obligation for channel messages, but this SHORT-message
         // PTY-inject path never drains — so without arming here the mirror's
@@ -609,6 +617,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         // short operator turns. Arm symmetrically with the drain path, BEFORE the
         // inject (username/text are borrowed here, then moved into the notify call).
         crate::reply_ledger::arm_channel_turn(
+            &home,
             &instance_name,
             crate::channel::ChannelKind::Telegram,
             None,
@@ -626,6 +635,26 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         );
     } else {
         let notify_attachments = attachments.clone();
+        // Reply-to correlation: if the operator quote-replied to a message the
+        // bot previously sent, resolve it via the sent_ledger to surface who
+        // sent it + its task context. Key is (quoted message_id, this chat_id) —
+        // Telegram message_ids repeat across chats. A miss (e.g. sent before a
+        // pre-ledger restart, or a non-bot quote) leaves `reply_target = None`;
+        // the agent still gets `in_reply_to_excerpt` (graceful degrade).
+        let reply_chat_id = msg.chat.id.0.to_string();
+        let reply_target = msg
+            .reply_to_message()
+            .and_then(|r| {
+                crate::sent_ledger::global(&home)
+                    .lookup(&r.id.0.to_string(), Some(reply_chat_id.as_str()))
+            })
+            .map(|e| crate::inbox::ReplyTargetContext {
+                sent_by_agent: e.agent,
+                task_id: e.task_id,
+                correlation_id: e.correlation_id,
+                excerpt: e.excerpt,
+                sent_ts: e.ts,
+            });
         let msg_obj = InboxMessage {
             schema_version: 0,
             id: None,
@@ -654,6 +683,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     .unwrap_or("unknown");
                 inbox::build_excerpt(text, author)
             }),
+            reply_target,
             superseded_by: None,
             from_id: None,
             broadcast_context: None,

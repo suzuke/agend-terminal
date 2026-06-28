@@ -21,7 +21,9 @@ pub mod storage;
 // Re-export public API surface so callers using `crate::inbox::X` continue to work.
 
 // Types
-pub use message::{BroadcastContext, ForceMeta, InboxMessage, MessageStatus, NotifySource};
+pub use message::{
+    BroadcastContext, ForceMeta, InboxMessage, MessageStatus, NotifySource, ReplyTargetContext,
+};
 
 // Disk health
 pub use disk::{check_disk_space, recover_half_writes};

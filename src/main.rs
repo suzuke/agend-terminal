@@ -76,6 +76,7 @@ mod runtime;
 pub mod runtime_config;
 mod schedules;
 mod scm;
+mod sent_ledger;
 mod service;
 mod shared_async;
 mod skills;

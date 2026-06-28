@@ -318,7 +318,7 @@ pub fn arm(
 /// an inbound channel message, in one call — independent of delivery path.
 ///
 /// #2293 progress-mirror fix: the mirror's active-turn gate reads `reply_to_channel`
-/// + `pending_user_turn`. The inbox-drain path (`inbox::storage`) sets both when a
+/// and `pending_user_turn`. The inbox-drain path (`inbox::storage`) sets both when a
 /// channel-tagged message is drained, but a SHORT operator message takes the
 /// PTY-inject path (`channel::telegram::inbound`) and never drains — so without
 /// arming there too, the gate's two fields stay `None`/absent and the mirror never
@@ -327,6 +327,7 @@ pub fn arm(
 /// bookkeeping fields, then `arm` the obligation).
 #[allow(clippy::too_many_arguments)]
 pub fn arm_channel_turn(
+    home: &Path,
     name: &str,
     channel: ChannelKind,
     inbound_msg_id: Option<String>,
@@ -343,7 +344,11 @@ pub fn arm_channel_turn(
         p.mirror_dispatched_for_turn = false;
         p.mirror_skip_until_next_turn = false;
     });
+    // #2622 (rebase): `arm` gained a leading `home` for the durable-discharge
+    // guard; thread it through so the short-message path arms identically to the
+    // drain path.
     arm(
+        home,
         name,
         channel,
         inbound_msg_id,
@@ -602,8 +607,15 @@ pub fn notify_operator_last_resort(
         |kind, agent, text| {
             crate::channel::lookup_channel_by_name(kind)
                 .map(|ch| {
-                    ch.send_from_agent(agent, crate::channel::AgentOutboundOp::Reply { text })
-                        .is_ok()
+                    ch.send_from_agent(
+                        agent,
+                        crate::channel::AgentOutboundOp::Reply {
+                            text,
+                            task_id: None,
+                            correlation_id: None,
+                        },
+                    )
+                    .is_ok()
                 })
                 .unwrap_or(false)
         },
@@ -989,9 +1001,11 @@ mod tests {
     #[test]
     fn arm_channel_turn_sets_reply_to_and_obligation_2293() {
         let n = "rl2293-armchannel";
+        let home = tmp_home("armchannel-2293");
         // The short-message PTY-inject path calls this instead of going through
         // the inbox-drain arming. After it, BOTH mirror-gate inputs must be set:
         arm_channel_turn(
+            &home,
             n,
             ChannelKind::Telegram,
             Some("m-short-1".into()),
