@@ -2673,6 +2673,50 @@ fn ci_pass_chain_target_gets_durable_inbox_entry() {
     );
 }
 
+#[test]
+fn ci_pass_multi_next_after_ci_targets_each_get_ready_2502() {
+    let dir = tmp_dir("2502-multi-next-after-ci");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let mut watch = watch_with_chain(None);
+    watch["next_after_ci"] = serde_json::json!(["reviewer-a", "reviewer-b"]);
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+    let provider = MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: 2502,
+        conclusion: Some("success".to_string()),
+        head_sha: "abc2502".to_string(),
+        url: "https://example/run/2502".to_string(),
+        name: String::new(),
+    }]);
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        &dir,
+        &watch_path,
+        serde_json::from_value(watch.clone()).unwrap(),
+        vec!["lead".to_string(), "dev".to_string()],
+        &registry,
+        &provider,
+    ))
+    .unwrap();
+
+    for reviewer in ["reviewer-a", "reviewer-b"] {
+        let messages = crate::inbox::drain(&dir, reviewer);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.text.contains("[ci-ready-for-action]")),
+            "{reviewer} must receive a durable [ci-ready-for-action] inbox entry; got: {messages:?}"
+        );
+    }
+}
+
 /// T3 (anti-regression for site 2's chain-target skip): the
 /// subscriber [ci-pass] loop must continue to SKIP an agent whose
 /// name appears in `next_after_ci`. Without this skip, the chain
