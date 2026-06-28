@@ -130,14 +130,16 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     .to_rfc3339());
     // Issue #650 + CR-2026-06-14: set on non-empty; explicit empty CLEARS the
     // stale handoff (re-arm with no chaining); absent leaves it untouched.
-    match args.get("next_after_ci").and_then(|v| v.as_str()) {
-        Some(next) if !next.is_empty() => watch["next_after_ci"] = json!(next),
-        Some(_) => {
+    if let Some(next_arg) = args.get("next_after_ci") {
+        let targets = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(next_arg);
+        if let Some(next_json) = crate::daemon::ci_watch::watch_state::next_after_ci_json(&targets)
+        {
+            watch["next_after_ci"] = next_json;
+        } else {
             if let Some(obj) = watch.as_object_mut() {
                 obj.remove("next_after_ci");
             }
         }
-        None => {}
     }
     // #1031: persist dispatch task_id when supplied (by
     // dispatch_auto_bind_lease) so the ci_check_repo emit site can
@@ -444,7 +446,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             // #1473 display gap: surface the stored CI-pass handoff target so
             // `ci action=status` shows it (previously omitted → operators
             // mis-read it as unset even when armed).
-            "next_after_ci": watch["next_after_ci"].as_str(),
+            "next_after_ci": watch.get("next_after_ci").cloned().unwrap_or(Value::Null),
         }));
     }
     let mut resp = json!({"watches": out});

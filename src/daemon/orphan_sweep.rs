@@ -101,9 +101,9 @@ fn unknown_watch_instances(home: &Path, known: &HashSet<String>) -> Vec<String> 
                     names.push(sub);
                 }
             }
-            if let Some(next) = watch.next_after_ci.as_deref() {
-                if !known.contains(next) {
-                    names.push(next.to_string());
+            for next in watch.next_after_ci_targets() {
+                if !known.contains(&next) {
+                    names.push(next);
                 }
             }
         }

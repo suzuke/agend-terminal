@@ -8,7 +8,7 @@
 //! only when team-orchestrator resolution actually CHANGED the target:
 //!   `if *sender == target && raw_target != target { return ...self-loop... }`
 //! A plain self-dispatch where `raw_target == resolved_target == sender`
-//! skips that guard, falls through to `dispatch_auto_bind_lease_with_chain`
+//! skips that guard, falls through to `dispatch_auto_bind_lease_with_source_and_chain`
 //! (which creates a worktree + writes a binding), and only THEN reaches the
 //! API SEND which rejects the self-send — leaving a leased worktree +
 //! binding for a dispatch that never delivered, with no rollback on this
@@ -37,7 +37,7 @@ fn comms_src() -> String {
 }
 
 /// Return the lines of `fn handle_delegate_task` up to (and excluding) the
-/// first `dispatch_auto_bind_lease_with_chain(` call — i.e. everything that
+/// first `dispatch_auto_bind_lease_with_source_and_chain(` call — i.e. everything that
 /// runs BEFORE the auto-bind/lease side effect. Comment/blank lines stripped.
 fn pre_auto_bind_lines() -> Vec<String> {
     let src = comms_src();
@@ -46,8 +46,10 @@ fn pre_auto_bind_lines() -> Vec<String> {
         .expect("fn handle_delegate_task not found");
     let region = &src[fn_start..];
     let auto_bind = region
-        .find("dispatch_auto_bind_lease_with_chain(")
-        .expect("dispatch_auto_bind_lease_with_chain call not found in handle_delegate_task");
+        .find("dispatch_auto_bind_lease_with_source_and_chain(")
+        .expect(
+            "dispatch_auto_bind_lease_with_source_and_chain call not found in handle_delegate_task",
+        );
     region[..auto_bind]
         .lines()
         .map(|l| l.trim().to_string())
@@ -77,7 +79,7 @@ fn self_dispatch_rejected_before_auto_bind_lease_mcp_dispatch_comms() {
         has_unconditional_self_reject,
         "handle_delegate_task leases + binds a worktree for a plain self-dispatch before the API \
          rejects the self-send (orphan worktree). The only `*sender == target` check before \
-         `dispatch_auto_bind_lease_with_chain` is gated behind `raw_target != target`, so a plain \
+         `dispatch_auto_bind_lease_with_source_and_chain` is gated behind `raw_target != target`, so a plain \
          self-dispatch (raw_target == resolved == sender) is NOT rejected pre-lease. Move an \
          unconditional `*sender == target` rejection ahead of the auto-bind."
     );
