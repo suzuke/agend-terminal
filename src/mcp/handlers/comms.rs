@@ -185,10 +185,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     // auto-bind/lease. The qualified guard above only fires when team-orchestrator
     // resolution COLLAPSED the target onto the sender; a plain self-dispatch
     // (raw_target == resolved == sender) skipped it and fell through to
-    // `dispatch_auto_bind_lease_with_chain` (which leases a worktree + writes a
-    // binding) before the API-layer self-send check rejected the send — orphaning
-    // the leased worktree with no rollback on this path. Reject unconditionally
-    // here so no lease happens for a dispatch the send would reject anyway.
+    // the dispatch auto-bind call (which leases a worktree + writes a binding)
+    // before the API-layer self-send check rejected the send — orphaning the
+    // leased worktree with no rollback on this path. Reject unconditionally here
+    // so no lease happens for a dispatch the send would reject anyway.
     if *sender == target {
         return json!({"error": "cannot delegate task to self — use a different instance"});
     }
