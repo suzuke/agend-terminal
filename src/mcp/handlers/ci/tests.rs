@@ -967,6 +967,56 @@ fn checkout_bind_true_idempotent_when_already_bound_1494() {
 
 #[test]
 #[cfg(unix)]
+fn checkout_bind_true_rejects_stale_dispatch_binding_2499() {
+    let home = p778_tmp_home("2499-stale");
+    let parent = p778_tmp_home("2499-stale-src");
+    let source = p778_setup_source_repo(&parent, "feat/2499");
+    let agent = "stale-dev";
+    let task_id = "t-2499";
+
+    let lease = crate::worktree_pool::lease(&home, &source, agent, "feat/2499")
+        .expect("dispatch pre-build lease must succeed");
+    crate::binding::bind_full(
+        &home,
+        agent,
+        task_id,
+        "feat/2499",
+        &lease.path,
+        &source,
+        false,
+    )
+    .expect("dispatch pre-build bind_full");
+
+    std::fs::remove_dir_all(&lease.path).expect("simulate missing dispatch worktree");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/2499",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("stale_binding"),
+        "#2499: stale dispatch binding must fail closed instead of rebinding with empty task_id: {resp}"
+    );
+    let binding = crate::binding::read(&home, agent).expect("binding remains for explicit release");
+    assert_eq!(
+        binding["task_id"].as_str(),
+        Some(task_id),
+        "#2499: failed checkout must not overwrite the dispatch task_id"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
 fn checkout_writes_event_log_success_and_error_1466() {
     // #1466: every checkout outcome — success AND error — must leave a
     // `worktree_checkout` event-log trace (observability for silent
