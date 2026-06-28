@@ -245,27 +245,10 @@ pub(crate) fn dispatch_auto_bind_lease(
     )
 }
 
-/// #931 Fix 2 (H5a): variant that propagates `next_after_ci` so the
-/// dispatch chain knowledge (e.g. lead → dev with `next_after_ci=reviewer`)
-/// lands on the auto-armed ci-watch and survives across bind cycles.
-///
-/// Pre-#931 the auto-watch path armed by `dispatch_auto_bind_lease` never
-/// set `next_after_ci`, so `[ci-ready-for-action]` only fired when a
-/// caller had explicitly called `ci action=watch ... next_after_ci=…`
-/// AFTER the auto-arm. The 4-in-a-row overnight stalls
-/// (#920/#925/#928/#929) were caused by this gap interacting with the
-/// release-time subscriber sweep — once the auto-armed watch was the
-/// sole subscription and got swept, the chain handoff vanished.
-///
-/// Callers: `comms.rs::handle_delegate_task` (kind=task dispatches that
-/// declare a workflow chain via `args["next_after_ci"]`).
-///
-/// t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the #1037
-/// `<team>-reviewer` name-derived `next_after_ci` auto-default
-/// (`derive_team_reviewer`) was DELETED. Both call sites (this auto-watch path
-/// and the `ci/mod.rs` self-claim path) leave `next_after_ci` explicit-only now,
-/// so the helper became dead code. Role-based auto-handoff is a future follow-up
-/// (needs role infra), not a naming convention.
+/// #931: test-facing singleton wrapper for explicit `next_after_ci` dispatch
+/// chains. Production `send` now normalizes string/array input and calls the
+/// unified source+chain entry directly; this wrapper remains for local tests.
+/// Role-based auto-handoff stays future work, not a naming convention.
 #[allow(dead_code)]
 pub(crate) fn dispatch_auto_bind_lease_with_chain(
     home: &Path,
@@ -291,28 +274,6 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
         &next_after_ci_targets,
         review_class,
         true, // #2158 GR1: dispatch entry (delegate/comms) → arm ci-watch
-    )
-}
-
-pub(crate) fn dispatch_auto_bind_lease_with_chain_targets(
-    home: &Path,
-    target: &str,
-    task_id: &str,
-    branch: &str,
-    repo: Option<&str>,
-    next_after_ci: &[String],
-    review_class: Option<&str>,
-) -> Result<DispatchOutcome, DispatchError> {
-    dispatch_auto_bind_lease_with_source_and_chain(
-        home,
-        target,
-        task_id,
-        branch,
-        repo,
-        None,
-        next_after_ci,
-        review_class,
-        true,
     )
 }
 

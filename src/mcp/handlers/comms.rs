@@ -249,14 +249,16 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             let next_after_ci = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
                 &args["next_after_ci"],
             );
-            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain_targets(
+            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain(
                 home,
                 target,
                 task_id_val,
                 branch,
                 args["repository"].as_str(),
+                None,
                 &next_after_ci,
                 if second_reviewer { Some("dual") } else { None },
+                true,
             ) {
                 return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
             }
