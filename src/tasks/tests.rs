@@ -744,6 +744,27 @@ fn task_get_returns_single_full_task_2475() {
 }
 
 #[test]
+fn metadata_set_rejects_oversized_value_audit2_005() {
+    let home = tmp_home("metadata-cap-2005");
+    let big = "x".repeat(70 * 1024); // exceeds the 64 KiB cap
+    let res = handle(
+        &home,
+        "agent1",
+        &serde_json::json!({
+            "action": "metadata_set",
+            "id": "t-irrelevant",
+            "metadata_key": "blob",
+            "metadata_value": big,
+        }),
+    );
+    assert_eq!(
+        res["code"], "metadata_value_too_large",
+        "oversized metadata_value must be rejected before it bloats the log: {res}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn task_get_missing_id_and_not_found_errors_2475() {
     let home = tmp_home("get-missing-2475");
     let no_id = handle(&home, "agent1", &serde_json::json!({"action": "get"}));

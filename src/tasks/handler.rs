@@ -1279,6 +1279,19 @@ fn handle_metadata_set(
     } else {
         return serde_json::json!({"error": "missing 'metadata_value'"});
     };
+    // AUDIT2-005: bound the value so a runaway blob can't bloat the append-only
+    // event log (every list/get replay deserializes it). Owner-ACL-scoped, so
+    // this is a belt-and-braces guard against an accidental huge value.
+    const MAX_METADATA_VALUE_BYTES: usize = 64 * 1024;
+    let value_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+    if value_len > MAX_METADATA_VALUE_BYTES {
+        return serde_json::json!({
+            "error": format!(
+                "metadata_value too large ({value_len} bytes > {MAX_METADATA_VALUE_BYTES} byte cap)"
+            ),
+            "code": "metadata_value_too_large"
+        });
+    }
     // #2117 P1: operate on the task's resolved board (default → home).
     let board = super::board_router::board_for_task(home, id);
     let record = match read_task_record_at(&board, id) {
