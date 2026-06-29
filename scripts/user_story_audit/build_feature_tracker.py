@@ -310,6 +310,8 @@ TEST_RESULTS: dict[str, tuple[str, str, str, str, str]] = {
     "US-CLI-018": ("Pass", "ERR-002 (minor/UX): bugreport writes bugreport-*.txt into CWD, not $AGEND_HOME — clutters whatever dir it is run from.", "Deferred", "Not Started", "Behaviour confirmed; redaction path present. Output-location UX noted, not yet changed."),
     "US-CLI-019": ("Pass", "", "N/A", "Pass", "completions bash/zsh/fish all produced non-empty scripts."),
     "US-CLI-017": ("Pass", "", "N/A", "Pass", "quickstart --unattended created fleet.yaml idempotently in empty AGEND_HOME."),
+    "US-CLI-010": ("Pass", "", "N/A", "Pass", "admin cleanup-branches dry-run listed merged branches (24 skipped, 0 deleted) without mutating."),
+    "US-CLI-016": ("Pass", "", "N/A", "Pass", "skills add/list/install/remove round-tripped; install created per-backend symlinks (.claude/.codex/.opencode/.kiro/.agents)."),
     # MCP tools exercised via agend-mcp-bridge stdio against the isolated daemon
     "US-MCP-001": ("Pass", "", "N/A", "Pass", "reply tool present; channel-bound (no active channel in test) — schema OK."),
     "US-MCP-003": ("Pass", "", "N/A", "Pass", "send returns proper error on self-send (use a different instance)."),
@@ -632,6 +634,8 @@ def build_workbook(rows: list[dict[str, str]]) -> None:
         ["RUN-003", AUDIT_DATE, "US-CLI-019/014/015/017/018", "fugu-0acdd8", "completions/service status/doctor providers/quickstart/bugreport", "Each command produces expected output", "All produced expected output; bugreport path UX noted", "Pass", "console capture"],
         ["RUN-004", AUDIT_DATE, "US-MCP-* (33 tools)", "fugu-0acdd8", "agend-mcp-bridge tools/list + tools/call for each MCP tool", "Tools dispatch and return valid payloads / proper errors", "37 tools listed; all exercised tools returned valid results (authority gating respected)", "Pass", "bridge stdio capture"],
         ["RUN-005", AUDIT_DATE, "US-CLI-013", "fugu-0acdd8", "verify --quick --json (post-fix, rebuilt release)", "instructions probe passes", "passed=5 failed=0; instructions=Pass", "Pass", "verify JSON output"],
+        ["RUN-006", AUDIT_DATE, "US-CLI-016", "fugu-0acdd8", "skills add/list/install/remove in isolated AGEND_HOME", "Skill round-trips + per-backend install", "Symlinks created at 5 backend paths; remove idempotent", "Pass", "console capture"],
+        ["RUN-007", AUDIT_DATE, "US-CLI-010", "fugu-0acdd8", "admin cleanup-branches (dry-run) against source repo", "Preview-only, no deletions", "24 branches evaluated, 0 deleted (dry-run); audit log written then cleaned", "Pass", "console capture"],
     ]
     sources = [
         ["Source Type", "Path", "Reason Used"],
