@@ -49,21 +49,56 @@ fn help_renders_known_subcommands() {
     );
 }
 
-/// `agend bugreport` with a valid temp AGEND_HOME produces output.
+/// `agend bugreport` with a valid temp AGEND_HOME produces output under
+/// AGEND_HOME/bugreports rather than littering the caller's current directory.
 #[test]
 fn bugreport_writes_with_valid_home() {
-    let home =
-        std::env::temp_dir().join(format!("agend-cli-smoke-bugreport-{}", std::process::id()));
+    let stamp = std::process::id();
+    let home = std::env::temp_dir().join(format!("agend-cli-smoke-bugreport-home-{stamp}"));
+    let cwd = std::env::temp_dir().join(format!("agend-cli-smoke-bugreport-cwd-{stamp}"));
     std::fs::create_dir_all(&home).ok();
+    std::fs::create_dir_all(&cwd).ok();
 
-    let output = cmd().env("AGEND_HOME", &home).arg("bugreport").assert();
+    let output = cmd()
+        .env("AGEND_HOME", &home)
+        .current_dir(&cwd)
+        .arg("bugreport")
+        .assert()
+        .success();
 
-    // bugreport may succeed or fail depending on system state,
-    // but must not panic (exit code 101 = panic)
-    let code = output.get_output().status.code().unwrap_or(-1);
-    assert_ne!(code, 101, "bugreport must not panic");
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let path = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Bug report saved to: "))
+        .map(std::path::PathBuf::from)
+        .expect("bugreport should print the saved report path");
+    assert!(
+        path.starts_with(home.join("bugreports")),
+        "bugreport should write under AGEND_HOME/bugreports, got {}",
+        path.display()
+    );
+    assert!(
+        path.exists(),
+        "bugreport output should exist at {}",
+        path.display()
+    );
+    let cwd_reports: Vec<_> = std::fs::read_dir(&cwd)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("bugreport-")
+        })
+        .collect();
+    assert!(
+        cwd_reports.is_empty(),
+        "bugreport should not write into cwd"
+    );
 
     std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&cwd).ok();
 }
 
 /// `agend bugreport` with nonexistent AGEND_HOME errors clearly.
