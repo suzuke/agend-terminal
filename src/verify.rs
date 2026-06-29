@@ -368,7 +368,12 @@ fn test_instructions(home: &Path) -> TestResult {
     std::fs::create_dir_all(&test_dir).ok();
 
     instructions::generate(&test_dir, "claude");
-    let claude_path = test_dir.join(".claude").join("rules").join("agend.md");
+    // Canonical Claude instructions path is `.claude/agend.md` (see
+    // `backend.rs` preset `instructions_path`). The legacy
+    // `.claude/rules/agend.md` location is intentionally migrated away /
+    // deleted by `migrate_claude_old_rules_file`, so probing it always
+    // reported `claude=false`.
+    let claude_path = test_dir.join(".claude").join("agend.md");
     let claude_ok = claude_path.exists() && {
         let c = std::fs::read_to_string(&claude_path).unwrap_or_default();
         ["reply", "send", "inbox", "v3-mcp"]
