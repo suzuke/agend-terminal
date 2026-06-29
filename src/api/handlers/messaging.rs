@@ -187,7 +187,13 @@ fn auto_create_task_if_needed(
     static AUTO_TASK_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
     let seq = AUTO_TASK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let id = format!("t-{ts}-{seq}");
+    // AUDIT2-011: include the pid, matching `tasks::handle_create`. `ts`+`seq` is
+    // only PROCESS-unique; two processes minting in the same microsecond would
+    // both produce `t-<ts>-0` and replay's `or_insert_with` silently drops the
+    // second Created. The three-segment `t-<ts>-<pid>-<seq>` form disambiguates
+    // across processes and is accepted by the `Closes t-…` marker regex/validators.
+    let pid = std::process::id();
+    let id = format!("t-{ts}-{pid}-{seq}");
     let event = crate::task_events::TaskEvent::Created {
         task_id: crate::task_events::TaskId(id.clone()),
         title,
