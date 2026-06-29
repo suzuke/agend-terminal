@@ -993,8 +993,10 @@ mod tests {
             env_key: Some("SAKANA_API_KEY".to_string()),
             wire_api: Some("responses".to_string()),
         };
-        let body =
-            render_fugu_profile_config(&provider, std::path::Path::new("/Users/x/.codex/fugu.json"));
+        let body = render_fugu_profile_config(
+            &provider,
+            std::path::Path::new("/Users/x/.codex/fugu.json"),
+        );
         let parsed: toml::Value = toml::from_str(&body).expect("profile is valid TOML");
         assert_eq!(parsed["model"].as_str(), Some("fugu"));
         assert_eq!(parsed["model_provider"].as_str(), Some("sakana"));
@@ -1017,8 +1019,10 @@ mod tests {
             env_key: Some("SAKANA_API_KEY=fish_inline".to_string()),
             wire_api: Some("responses".to_string()),
         };
-        let body =
-            render_fugu_profile_config(&provider, std::path::Path::new("/Users/x/.codex/fugu.json"));
+        let body = render_fugu_profile_config(
+            &provider,
+            std::path::Path::new("/Users/x/.codex/fugu.json"),
+        );
         assert!(!body.contains("[model_providers"));
         assert!(!body.contains("env_key"));
         assert!(!body.contains("fish_inline"));
@@ -1054,7 +1058,8 @@ mod tests {
 
     #[test]
     fn ensure_fugu_profile_writes_into_provider_home_and_is_idempotent() {
-        let home = std::env::temp_dir().join(format!("agend-fugu-profile-write-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("agend-fugu-profile-write-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).unwrap();
         let catalog = home.join("fugu.json");
