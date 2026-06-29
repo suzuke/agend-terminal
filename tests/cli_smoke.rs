@@ -133,6 +133,70 @@ fn bugreport_with_nonexistent_home_errors_clearly() {
     }
 }
 
+/// `connect` must not leave a stale external-agent registration if backend
+/// spawn fails after successful daemon registration.
+#[test]
+fn connect_failed_spawn_deregisters_external_agent() {
+    let stamp = std::process::id();
+    let home = std::env::temp_dir().join(format!("agend-cli-smoke-connect-home-{stamp}"));
+    let shell_dir = home.join("workspace/shell");
+    let ext_dir = home.join("workspace/ext");
+    std::fs::create_dir_all(&shell_dir).unwrap();
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!(
+            "defaults:\n  backend: claude\ninstances:\n  shell:\n    command: /bin/bash\n    working_directory: {}\n",
+            shell_dir.display()
+        ),
+    )
+    .unwrap();
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::cargo_bin("agend-terminal")
+                .expect("binary must exist")
+                .env("AGEND_HOME", &self.0)
+                .arg("stop")
+                .output();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(home.clone());
+
+    cmd()
+        .env("AGEND_HOME", &home)
+        .arg("start")
+        .assert()
+        .success();
+    std::thread::sleep(std::time::Duration::from_secs(4));
+
+    cmd()
+        .env("AGEND_HOME", &home)
+        .args([
+            "connect",
+            "badext",
+            "--backend",
+            "/no/such/backend",
+            "--working-dir",
+        ])
+        .arg(&ext_dir)
+        .assert()
+        .failure();
+
+    let list = cmd()
+        .env("AGEND_HOME", &home)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&list.get_output().stdout);
+    assert!(
+        !stdout.contains("badext"),
+        "failed connect must deregister stale external agent, got: {stdout}"
+    );
+}
+
 /// `agend completions` for each shell produces non-empty, distinct output.
 #[test]
 fn completions_emits_for_zsh_fish_bash() {
