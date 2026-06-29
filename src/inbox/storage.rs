@@ -384,6 +384,7 @@ pub fn mark_ci_watch_superseded(
             }
             f.sync_all()?;
             std::fs::rename(&tmp, path)?;
+            crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
         }
         Ok(())
     });
@@ -568,6 +569,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 }
                 f.sync_all()?;
                 std::fs::rename(&write_tmp, path)?;
+                crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
                 Ok(())
             })();
             if let Err(e) = result {
@@ -711,6 +713,7 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
                 }
                 f.sync_all()?;
                 std::fs::rename(&tmp, path)?;
+                crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
                 Ok(())
             })();
             if let Err(e) = r {
@@ -822,6 +825,7 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
                 }
                 f.sync_all()?;
                 std::fs::rename(&tmp, path)?;
+                crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
                 Ok(())
             })();
             if let Err(e) = r {
@@ -1044,6 +1048,7 @@ pub fn clear_compact(
                 }
                 f.sync_all()?;
                 std::fs::rename(&write_tmp, path)?;
+                crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
                 Ok(())
             })();
             if let Err(e) = r {

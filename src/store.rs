@@ -196,6 +196,25 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// AUDIT2-015: fsync the parent directory of `path` so a just-completed
+/// `rename(2)` durably flushes the new directory entry. A power-loss right after
+/// `rename` returns can otherwise lose the rename even when the file's own
+/// contents were fsync'd. Unix idiom; no-op on Windows (no clean std equivalent).
+/// Best-effort: used by callers that stream-write + fsync + rename in place and
+/// only need to close the directory-entry durability gap (vs. switching to the
+/// content-buffered [`atomic_write`]).
+#[cfg(unix)]
+pub fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn fsync_parent_dir(_path: &Path) {}
+
 /// Serialize `data` as pretty JSON and [`atomic_write`] it to `path`.
 pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(data)?;
