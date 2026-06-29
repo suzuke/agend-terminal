@@ -197,6 +197,37 @@ fn connect_failed_spawn_deregisters_external_agent() {
     );
 }
 
+/// `agend app` without a TTY must fail with a clean, actionable error rather
+/// than panicking (exit 101) and leaking raw terminal escape sequences.
+#[test]
+fn app_without_tty_errors_cleanly_not_panic() {
+    let stamp = std::process::id();
+    let home = std::env::temp_dir().join(format!("agend-cli-smoke-app-tty-{stamp}"));
+    std::fs::create_dir_all(&home).unwrap();
+
+    // assert_cmd pipes stdin/stdout (not a TTY), reproducing the headless case.
+    let output = cmd()
+        .env("AGEND_HOME", &home)
+        .arg("app")
+        .output()
+        .expect("run app");
+
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(code, 101, "app must not panic when stdout is not a TTY");
+    assert!(!output.status.success(), "app should fail without a TTY");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("TTY") || combined.contains("interactive terminal"),
+        "app must explain it needs a TTY, got: {combined}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// `agend completions` for each shell produces non-empty, distinct output.
 #[test]
 fn completions_emits_for_zsh_fish_bash() {
