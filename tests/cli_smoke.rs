@@ -135,6 +135,15 @@ fn bugreport_with_nonexistent_home_errors_clearly() {
 
 /// `connect` must not leave a stale external-agent registration if backend
 /// spawn fails after successful daemon registration.
+///
+/// `#[cfg(unix)]`: this is a heavy real-daemon integration test (spawns a daemon
+/// via `start`, then drives `connect`). The repo gates all such daemon-spawning
+/// integration tests to Unix (e.g. `tests/e2e_workflow.rs`, `tests/restart_smoke.rs`,
+/// `tests/ready_marker_invariants.rs`) because the daemon-spawn/teardown path hangs
+/// under the Windows nextest runner (observed: this test TIMED OUT at 120s on
+/// `windows-latest`). The fix it guards (`src/connect.rs` deregister-on-spawn-failure)
+/// is platform-independent and is exercised on the Linux/macOS CI legs.
+#[cfg(unix)]
 #[test]
 fn connect_failed_spawn_deregisters_external_agent() {
     let stamp = std::process::id();
