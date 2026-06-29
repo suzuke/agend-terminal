@@ -1506,7 +1506,9 @@ mod audit2_001_credential_gate_tests {
         assert!(host_receives_credentials("https://api.bitbucket.org"));
         // The whole point: an agent-supplied attacker host gets NO credential.
         assert!(!host_receives_credentials("https://attacker.example"));
-        assert!(!host_receives_credentials("https://api.github.com.evil.example"));
+        assert!(!host_receives_credentials(
+            "https://api.github.com.evil.example"
+        ));
         // userinfo trap — the real host is `attacker.example`, not github.
         assert!(!host_receives_credentials(
             "https://api.github.com@attacker.example/"

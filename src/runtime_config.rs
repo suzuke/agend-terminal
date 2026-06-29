@@ -241,7 +241,11 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // file is absent or corrupt. (The #1990 version guard below still refuses a
     // newer-schema file before any write.)
     let lock_path = home.join("runtime-config.json.lock");
-    let _lock = crate::store::acquire_file_lock(&lock_path);
+    // AUDIT2-012 (review): FAIL CLOSED if the lock can't be acquired — proceeding
+    // unlocked would silently re-open the cross-process lost-update this guard
+    // exists to prevent. Surface the error instead.
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| format!("runtime-config lock unavailable ({lock_path:?}): {e}"))?;
     let mut config = std::fs::read_to_string(home.join("runtime-config.json"))
         .ok()
         .and_then(|d| serde_json::from_str::<RuntimeConfig>(&d).ok())
@@ -463,8 +467,10 @@ mod tests {
 
         // Simulate ANOTHER process (e.g. the daemon) having written
         // progress_mode=2 to disk while THIS process's in-memory global is stale.
-        let mut on_disk = RuntimeConfig::default();
-        on_disk.progress_mode = 2;
+        let on_disk = RuntimeConfig {
+            progress_mode: 2,
+            ..RuntimeConfig::default()
+        };
         std::fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
         // This process sets a DIFFERENT key. With the disk-base read under the
@@ -479,6 +485,25 @@ mod tests {
         );
         assert!(!after.copy_on_select, "the just-set key must be applied");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn set_fails_closed_when_lock_unavailable_audit2_012() {
+        // `home` is a regular FILE, so `home.join("runtime-config.json.lock")`
+        // can't be created (ENOTDIR) and the lock cannot be acquired. set() must
+        // FAIL CLOSED (return Err), never proceed to write unlocked.
+        let home_file = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2012-isfile-{}",
+            std::process::id()
+        ));
+        std::fs::write(&home_file, b"x").unwrap();
+        let res = set(&home_file, "copy_on_select", "on");
+        assert!(
+            res.is_err(),
+            "set() must fail closed when the lock is unavailable, got: {res:?}"
+        );
+        std::fs::remove_file(&home_file).ok();
     }
 
     #[test]

@@ -1793,7 +1793,10 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
                 // AUDIT2-017: clamp to `max` before stepping down so a stale
                 // offset (history shrank under it) snaps back immediately rather
                 // than needing hundreds of `saturating_sub` steps to recover.
-                pane.scroll_offset = pane.scroll_offset.min(max).saturating_sub((-delta) as usize);
+                pane.scroll_offset = pane
+                    .scroll_offset
+                    .min(max)
+                    .saturating_sub((-delta) as usize);
             }
         }
     }

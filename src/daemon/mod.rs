@@ -1051,8 +1051,8 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             // and fleet resolve — a panic here would unwind out of `run_core` and
             // kill the whole daemon, escalating one agent's crash into a fleet-wide
             // outage (the supervisor dies). Catch it; the next event/tick recovers.
-            let exit_arm = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match exit_event {
+            let exit_arm =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match exit_event {
                     crate::agent::AgentExitEvent::CleanExit(ref name) => {
                         handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
                     }
@@ -1062,8 +1062,7 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                     crate::agent::AgentExitEvent::Crash(name) => {
                         crash_respawn::handle_crash_respawn(home, &name, &ctx);
                     }
-                }
-            }));
+                }));
             if let Err(payload) = exit_arm {
                 tracing::error!(
                     payload = %per_tick::panic_payload_str(&payload),

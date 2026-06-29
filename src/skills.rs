@@ -419,7 +419,11 @@ fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Re
     // lock makes the remove + repopulate atomic w.r.t. other builders.
     std::fs::create_dir_all(&stage_root)
         .with_context(|| format!("create stage root {}", stage_root.display()))?;
-    let _stage_lock = crate::store::acquire_file_lock(&stage_root.join(format!("{digest}.lock")));
+    // AUDIT2-013 (review): FAIL CLOSED if the per-digest lock can't be acquired —
+    // proceeding to remove/rebuild unlocked would re-open the same-digest race
+    // this guard prevents.
+    let _stage_lock = crate::store::acquire_file_lock(&stage_root.join(format!("{digest}.lock")))
+        .with_context(|| format!("acquire skills-stage lock for digest {digest}"))?;
     if stage.exists() {
         std::fs::remove_dir_all(&stage)
             .with_context(|| format!("clean stage {}", stage.display()))?;
