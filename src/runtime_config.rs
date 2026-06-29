@@ -231,6 +231,12 @@ fn fail_closed(is_startup: bool, reason: &str) {
 
 /// Set a single config key and persist to disk.
 pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
+    // AUDIT2-012: serialize the whole read-check-write under a cross-process file
+    // lock (so concurrent set() calls don't lost-update or race the #1990
+    // version check) and snapshot under it so a serialized predecessor's commit
+    // is visible.
+    let lock_path = home.join("runtime-config.json.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path);
     let mut config = get();
     match key {
         "dev_idle_threshold_secs" => {
@@ -338,7 +344,10 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // #1990: stamp the current schema version on every write.
     config.schema_version = RuntimeConfig::CURRENT;
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // AUDIT2-012: atomic tmp+rename (was a plain std::fs::write) so a crash mid
+    // write can't leave truncated JSON that reverts to DEFAULTS at next startup —
+    // which would silently flip watchdog / recovery / progress_mode gates.
+    crate::store::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
     Ok(serde_json::to_string(&config).unwrap_or_default())
 }
