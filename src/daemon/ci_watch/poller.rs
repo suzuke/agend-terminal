@@ -1930,30 +1930,49 @@ fn persist_watch_state(
         {
             let targets = state.next_after_ci_targets();
             if !targets.is_empty() {
-                for next in targets {
-                    let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
-                    let pr_state = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch);
-                    // #t-92758 P1(b): don't emit ci-ready for a merge-BLOCKED PR
-                    // (REJECTED verdict / Draft) — the chain target can't act on it,
-                    // so emitting only spawns a re-nudge loop. This handles the
-                    // reject-before-CI ordering; the evict in `pr_state::scanner`
-                    // handles the CI-green-then-reject ordering (#2297). The
-                    // predicate NEVER suppresses VERIFIED/green/None — the normal
-                    // "your turn" handoff stays live (is_ci_ready_merge_blocked iron
-                    // rule).
-                    if pr_state
-                        .as_ref()
-                        .is_some_and(crate::daemon::pr_state::is_ci_ready_merge_blocked)
-                    {
-                        tracing::info!(
-                            target: "ci_watch",
-                            repo = ctx.repo,
-                            branch = ctx.branch,
-                            "ci-ready suppressed — PR merge-blocked (REJECTED/Draft); no chain handoff, no track"
-                        );
-                    } else {
-                        let pr_number = pr_state.as_ref().map(|s| s.pr_number);
-                        let task_id = state.task_id.as_deref();
+                // The suppression decision is loop-INVARIANT (keyed on repo/branch/
+                // head, not the target), so load pr_state and decide ONCE rather than
+                // per target — multi-target (#2502) would otherwise re-load N times
+                // and log the suppression N times.
+                let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
+                let pr_state = crate::daemon::pr_state::load(ctx.home, ctx.repo, ctx.branch);
+                // #t-92758 P1(b): don't emit ci-ready for a merge-BLOCKED PR
+                // (REJECTED verdict / Draft) — the chain target can't act on it, so
+                // emitting only spawns a re-nudge loop. This handles the
+                // reject-before-CI ordering; the evict in `pr_state::scanner` handles
+                // the CI-green-then-reject ordering (#2297).
+                // #2502: ALSO suppress a PR already terminal (Merged / ClosedUnmerged)
+                // at the SAME head CI passed on — emitting "your turn" on a
+                // merged/closed PR is pure re-nudge noise. Head-GUARDED so a
+                // force-push / branch-reuse (terminal at a DIFFERENT head) still
+                // emits; #1314 freezes a terminal head_sha at the merge/close head,
+                // making the head match a reliable proxy.
+                // Both predicates fail OPEN (no sidecar / non-terminal / head
+                // mismatch → emit) and NEVER suppress VERIFIED/green — the normal
+                // "your turn" handoff stays live (is_ci_ready_merge_blocked iron
+                // rule).
+                let merge_blocked = pr_state
+                    .as_ref()
+                    .is_some_and(crate::daemon::pr_state::is_ci_ready_merge_blocked);
+                let terminal_at_head = pr_state.as_ref().is_some_and(|s| {
+                    crate::daemon::pr_state::is_ci_ready_terminal_at_head(s, &pr.current_sha)
+                });
+                if merge_blocked || terminal_at_head {
+                    tracing::info!(
+                        target: "ci_watch",
+                        repo = ctx.repo,
+                        branch = ctx.branch,
+                        reason = if merge_blocked {
+                            "merge_blocked"
+                        } else {
+                            "pr_terminal_same_head"
+                        },
+                        "ci-ready suppressed — PR not actionable; no chain handoff, no track"
+                    );
+                } else {
+                    let pr_number = pr_state.as_ref().map(|s| s.pr_number);
+                    let task_id = state.task_id.as_deref();
+                    for next in targets {
                         let msg = make_ci_ready_for_action_msg(
                             ctx.repo,
                             ctx.branch,
