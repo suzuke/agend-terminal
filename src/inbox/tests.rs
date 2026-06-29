@@ -843,6 +843,25 @@ fn drain_auto_acks_daemon_notifications() {
             "[pr-merged] owner/repo@branch",
         ),
         ("ci-watch", "system:ci", "[ci-pass] owner/repo@branch"),
+        // #2506: the pr-state FYI class — terminal (`pr-closed-unmerged`) and
+        // ready/verdict notifications are fire-and-forget like `pr-merged`; they
+        // were omitted from the #2493 allow-list and so kept nagging poll-reminder
+        // for an already-merged PR until a manual ack.
+        (
+            "pr-ready-for-merge",
+            "system:pr-state",
+            "[pr-ready-for-merge] owner/repo@branch",
+        ),
+        (
+            "pr-closed-unmerged",
+            "system:pr-state",
+            "[pr-closed-unmerged] owner/repo@branch",
+        ),
+        (
+            "review-verdict",
+            "system:pr-state",
+            "[review-verdict] owner/repo@branch: VERIFIED",
+        ),
     ] {
         let home = tmp_home(&format!("drain-{kind}-auto-ack"));
         let id = format!("m-{kind}");
