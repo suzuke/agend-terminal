@@ -1225,7 +1225,21 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
 fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
     matches!(
         msg.kind.as_deref(),
-        Some("ci-watch" | "ci-watch-stalled" | "ci-watch-resumed" | "poll" | "pr-merged")
+        Some(
+            "ci-watch"
+                | "ci-watch-stalled"
+                | "ci-watch-resumed"
+                | "poll"
+                // #2506: the rest of the pr-state FYI class. `pr-merged` was the
+                // only one #2493 listed; its siblings (terminal `pr-closed-unmerged`,
+                // plus `pr-ready-for-merge` / `review-verdict`) are the same
+                // fire-and-forget shape — once drained there is nothing to
+                // re-deliver — and were nagging poll-reminder for merged PRs.
+                | "pr-merged"
+                | "pr-closed-unmerged"
+                | "pr-ready-for-merge"
+                | "review-verdict"
+        )
     )
 }
 
