@@ -83,7 +83,7 @@ fn bugreport_writes_with_valid_home() {
         path.display()
     );
     let cwd_reports: Vec<_> = std::fs::read_dir(&cwd)
-        .unwrap()
+        .expect("read cwd dir")
         .flatten()
         .filter(|entry| {
             entry
@@ -141,8 +141,8 @@ fn connect_failed_spawn_deregisters_external_agent() {
     let home = std::env::temp_dir().join(format!("agend-cli-smoke-connect-home-{stamp}"));
     let shell_dir = home.join("workspace/shell");
     let ext_dir = home.join("workspace/ext");
-    std::fs::create_dir_all(&shell_dir).unwrap();
-    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::create_dir_all(&shell_dir).expect("create shell dir");
+    std::fs::create_dir_all(&ext_dir).expect("create ext dir");
     std::fs::write(
         home.join("fleet.yaml"),
         format!(
@@ -150,7 +150,7 @@ fn connect_failed_spawn_deregisters_external_agent() {
             shell_dir.display()
         ),
     )
-    .unwrap();
+    .expect("write fleet.yaml");
 
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
@@ -203,7 +203,7 @@ fn connect_failed_spawn_deregisters_external_agent() {
 fn app_without_tty_errors_cleanly_not_panic() {
     let stamp = std::process::id();
     let home = std::env::temp_dir().join(format!("agend-cli-smoke-app-tty-{stamp}"));
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&home).expect("create home dir");
 
     // assert_cmd pipes stdin/stdout (not a TTY), reproducing the headless case.
     let output = cmd()
