@@ -233,6 +233,13 @@ fn sensitive_env_keys_covers_known_dangerous() {
     assert!(is_sensitive_env_key("DYLD_INSERT_LIBRARIES"));
     assert!(is_sensitive_env_key("AGEND_HOME"));
     assert!(is_sensitive_env_key("AGEND_INSTANCE_NAME"));
+    // AUDIT2-004: interpreter-level code-injection vectors must also be blocked.
+    assert!(is_sensitive_env_key("NODE_OPTIONS"));
+    assert!(is_sensitive_env_key("GIT_SSH_COMMAND"));
+    assert!(is_sensitive_env_key("BASH_ENV"));
+    assert!(is_sensitive_env_key("PYTHONSTARTUP"));
+    assert!(is_sensitive_env_key("PERL5OPT"));
+    assert!(is_sensitive_env_key("RUBYOPT"));
 }
 
 #[test]
