@@ -396,6 +396,12 @@ TEST_RESULTS.update({
 })
 
 
+TEST_RESULTS.update({
+    "US-DOC-001": ("Pass", "", "N/A", "Pass", "attach/inject/list/kill/connect behaviours were exercised in isolated daemon smoke tests."),
+    "US-CLI-006": ("Pass", "ERR-004: failed connect registered an external agent before backend spawn and left a stale connected entry when spawn failed.", "Done", "Pass", "Fixed: connect deregisters external agent on spawn error; red regression test failed before impl and passes after fix; positive /usr/bin/true connect still passes."),
+    "US-CLI-021": ("Pass", "", "N/A", "Pass", "verify-push --claim-from-stdin --json with known 'deps unchanged' claim returned ok=true and Cargo.lock unchanged."),
+})
+
 def apply_test_results(rows: list[dict[str, str]]) -> None:
     for row in rows:
         res = TEST_RESULTS.get(row["Story ID"])
@@ -621,7 +627,7 @@ def build_workbook(rows: list[dict[str, str]]) -> None:
         ["Stories passing", sum(1 for r in rows if r["Test Status"] == "Pass")],
         ["Artifact-tool availability", "Unavailable in this environment; workbook emitted as OOXML using stdlib"],
         ["Test method", "Release binary + agend-mcp-bridge stdio driven against an isolated AGEND_HOME (live fleet untouched)"],
-        ["Loop status", "Inventory done; broad code/API/TUI testing done; 2 logistical/UX bugs fixed + retested; 21 stories remain untested or environment-gated"],
+        ["Loop status", "Inventory done; broad code/API/TUI testing done; 3 logistical/UX bugs fixed + retested; remaining stories are interactive/destructive/external-service/feature-gated"],
         [],
         ["Feature Area", "Story Count"],
     ] + [[area, count] for area, count in sorted(by_area.items())] + [
@@ -689,6 +695,8 @@ def build_workbook(rows: list[dict[str, str]]) -> None:
         ["RUN-009", AUDIT_DATE, "US-TUI-001..008", "fugu-0acdd8", "TUI unit/dispatcher tests", "Keyboard, mouse, overlay, command, layout, session, image-paste behaviours pass", "keybinds 19; commands 16; mouse 27; session 12; layout 59; tui_events 13; overlay 14; image_paste 9 all passed", "Pass", "cargo test --bin agend-terminal <filters>"],
         ["RUN-010", AUDIT_DATE, "US-DOC/SYS channel/config/worktree/task/daemon rows", "fugu-0acdd8", "Subsystem cargo-test batches", "Subsystem invariants pass", "channel 195; ci_watch 226; pr_state 91; worktree 238; binding 53; tasks 163; task_events 49; schedules 33; deployments 55; teams 34; health 53; daemon/per_tick/ticker/supervisor batches passed", "Pass", "cargo test --bin agend-terminal <filters>"],
         ["RUN-011", AUDIT_DATE, "US-SYS-011", "fugu-0acdd8", "agend-git safety tests", "Git shim safeguards pass", "85 passed", "Pass", "cargo test --bin agend-git"],
+        ["RUN-012", AUDIT_DATE, "US-CLI-006", "fugu-0acdd8", "connect bad backend red/green regression + positive connect smoke", "Failed backend spawn must not leave stale external agent; valid backend exits cleanly", "red test failed with badext listed; post-fix test passed; /usr/bin/true connect exited 0", "Pass", "cargo test --test cli_smoke connect_failed_spawn_deregisters_external_agent; manual isolated daemon smoke"],
+        ["RUN-013", AUDIT_DATE, "US-CLI-021", "fugu-0acdd8", "verify-push --claim-from-stdin --json", "Known claim grammar verifies against diff", "deps unchanged -> ok=true, Cargo.lock unchanged", "Pass", "target/debug/agend-terminal verify-push --base origin/main --head HEAD --claim-from-stdin --json"],
     ]
     sources = [
         ["Source Type", "Path", "Reason Used"],
