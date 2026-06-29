@@ -393,6 +393,37 @@ mod tests {
     ///
     /// Asserts the post-fix contract:
     /// - response carries `git_metadata_pruned: 1`
+    #[test]
+    fn force_release_denies_non_owner_non_orchestrator_audit2_002() {
+        let home = tmp_home("audit2_002_acl");
+        let (source_repo, _) = seed_disbanded_agent_with_git_metadata(&home, "victim", "feat/x");
+        let repo = source_repo.display().to_string();
+
+        // A peer that is neither the owner nor its orchestrator is denied.
+        let attacker = crate::identity::Sender::new("attacker");
+        let denied = handle_force_release_worktree(
+            &home,
+            &json!({"instance": "victim", "branch": "feat/x", "repository_path": repo}),
+            &attacker,
+        );
+        assert_eq!(
+            denied["code"], "not_owner_or_orchestrator",
+            "non-owner must be denied: {denied}"
+        );
+
+        // The owner itself is allowed (no ACL error).
+        let owner = crate::identity::Sender::new("victim");
+        let ok = handle_force_release_worktree(
+            &home,
+            &json!({"instance": "victim", "branch": "feat/x", "repository_path": repo}),
+            &owner,
+        );
+        assert_ne!(
+            ok["code"], "not_owner_or_orchestrator",
+            "owner must be allowed: {ok}"
+        );
+    }
+
     /// - response carries `git_metadata_repos` array of length 1
     /// - the source repo's `.git/worktrees/<agent>/` dir is gone
     #[test]

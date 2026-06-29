@@ -163,6 +163,32 @@ pub(crate) fn check_operation_allowed(
         );
     }
 
+    // AUDIT2-003: a handful of runtime-config keys are safety/observability gates
+    // — `progress_mode` (=1 mirrors the FULL assistant transcript off-box), and
+    // the watchdog / recovery / usage-limit toggles that govern the operator's
+    // visibility into (and auto-recovery of) a misbehaving agent. An agent must
+    // not flip these in ANY mode, fleet-wide, or it could silence the very alerts
+    // an injected agent would want silenced. Benign UI keys stay agent-settable.
+    if op == "config" && matches!(action, Some("set")) {
+        const OPERATOR_ONLY_CONFIG_KEYS: &[&str] = &[
+            "progress_mode",
+            "idle_watchdog_enabled",
+            "hang_auto_recovery_enabled",
+            "usage_limit_propagation_enabled",
+        ];
+        let key = params
+            .get("arguments")
+            .and_then(|a| a.get("key"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if OPERATOR_ONLY_CONFIG_KEYS.contains(&key) {
+            return Err(format!(
+                "config set '{key}' is operator-only (safety/observability gate); \
+                 agents cannot change it in any mode"
+            ));
+        }
+    }
+
     // Active = today's behavior (zero migration): agents unrestricted.
     if state.mode == OperatorMode::Active {
         return Ok(());
@@ -454,6 +480,31 @@ mod tests {
         assert!(
             check_operation_allowed("mcp_tool", &mcp("create_instance", "dev-2"), &st).is_ok(),
             "active mode = today's behavior, agent structural op allowed"
+        );
+    }
+
+    #[test]
+    fn agent_cannot_set_safety_config_keys_in_active_audit2_003() {
+        let active = OperatorModeState::default(); // Active = permissive default
+        let set_key = |key: &str| {
+            json!({"tool": "config", "instance": "dev-2",
+                   "arguments": {"action": "set", "key": key, "value": "1"}})
+        };
+        for key in [
+            "progress_mode",
+            "idle_watchdog_enabled",
+            "hang_auto_recovery_enabled",
+            "usage_limit_propagation_enabled",
+        ] {
+            assert!(
+                check_operation_allowed("mcp_tool", &set_key(key), &active).is_err(),
+                "config set '{key}' must be operator-only even in Active mode"
+            );
+        }
+        // A benign UI key stays agent-settable in Active mode.
+        assert!(
+            check_operation_allowed("mcp_tool", &set_key("copy_on_select"), &active).is_ok(),
+            "benign config key must remain agent-settable"
         );
     }
 

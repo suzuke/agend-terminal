@@ -44,7 +44,7 @@ mod gc;
 pub(crate) fn handle_force_release_worktree(
     home: &Path,
     args: &Value,
-    _sender: &Option<Sender>,
+    sender: &Option<Sender>,
 ) -> Value {
     let agent = match args["instance"].as_str() {
         Some(a) if !a.is_empty() => a,
@@ -56,6 +56,22 @@ pub(crate) fn handle_force_release_worktree(
     };
     if let Err(e) = crate::agent::validate_name(agent) {
         return json!({"error": e, "code": "invalid_agent"});
+    }
+    // AUDIT2-002: force-releasing (rebase + `git worktree remove --force`)
+    // discards the target's uncommitted work. Restrict it to the worktree's own
+    // agent or that agent's team orchestrator — an identified peer can no longer
+    // destroy another agent's worktree by naming it. An anonymous caller (no
+    // sender: operator-direct / standalone) keeps full authority.
+    if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
+        if caller != agent && !crate::teams::is_orchestrator_of(home, caller, agent) {
+            return json!({
+                "error": format!(
+                    "permission denied: '{caller}' cannot force-release '{agent}'s worktree \
+                     (only the owner or its team orchestrator may)"
+                ),
+                "code": "not_owner_or_orchestrator"
+            });
+        }
     }
     if !crate::agent_ops::validate_branch(branch) {
         return json!({
