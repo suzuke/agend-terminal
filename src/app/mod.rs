@@ -40,6 +40,23 @@ use std::sync::Arc;
 
 /// Run the terminal application.
 pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
+    // Fail fast with an actionable message when stdout/stdin is not a real
+    // terminal (piped, redirected, or run under a non-interactive harness).
+    // Without this guard `ratatui::init()` panics deep in terminal setup
+    // ("Device not configured") AND leaks raw mouse/alt-screen escape
+    // sequences to the captured stream. The TUI workbench needs a TTY; the
+    // headless control surface is `agend-terminal start`.
+    {
+        use std::io::IsTerminal as _;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "`agend-terminal app` requires an interactive terminal (TTY). \
+                 stdin/stdout is not a TTY here. Run it in a real terminal, or use \
+                 `agend-terminal start` for headless/daemon mode."
+            );
+        }
+    }
+
     // Redirect tracing to log file BEFORE ratatui takes over stderr.
     // Must happen before main.rs's tracing init — caller should skip init for App.
     let home = crate::home_dir();
