@@ -7,7 +7,8 @@
 | Binary | Purpose |
 |---|---|
 | `agend-terminal` | Main program — all features enter through here |
-| `agend-supervisor` | Frozen supervisor for daemon hot-upgrade + crash recovery (Unix only) |
+| `agend-git` | Git PATH shim for fleet worktrees — intercepts spawned agents' `git` (route / passthrough / deny) |
+| `agend-mcp-bridge` | MCP stdio ↔ daemon bridge — spawned per agent by the AI backend, not run directly |
 
 ## Startup Modes
 
@@ -28,13 +29,15 @@ Otherwise starts its own local fleet (owned mode).
 ### `agend-terminal start` — Headless daemon
 
 ```bash
-agend-terminal start [--fleet fleet.yaml] [--detached]
+agend-terminal start [--fleet fleet.yaml] [--foreground]
 ```
 
 Background service with no TUI. Reads fleet.yaml, manages agents,
 auto-respawns crashed agents, runs scheduler and CI watch.
 
-Use `--detached` to fork into background.
+Detached (backgrounded) by **default** — the foreground process exits once the
+daemon has published its run dir. Pass `--foreground` to keep it in the
+foreground (legacy blocking mode, e.g. under systemd/launchd or for debugging).
 
 **When to use:** Server deployments. CI/CD. Unattended fleet operation.
 
@@ -85,26 +88,24 @@ every start.
 **When to use:** You don't run this directly. It's started
 automatically when an AI agent needs to talk to the daemon.
 
-### `agend-supervisor` — Hot-upgrade supervisor
+### Daemon supervision & restart
 
-```bash
-agend-supervisor [--home ~/.agend-terminal]
-```
+There is **no separate `agend-supervisor` binary**. Supervision is in-process:
+the daemon runs its own supervisor (auto-respawn, health monitoring, hung
+detection — `src/daemon/supervisor.rs`). A graceful restart / binary reload is
+driven by the `restart_daemon` MCP tool (self-respawn: the daemon spawns a
+successor, health-gates it, then exits — #1814), or by the OS service manager
+when installed via `agend-terminal service install` (systemd / launchd / Task
+Scheduler). For an external keep-alive wrapper, see `docs/MCP-DAEMON-PROXY-CONTRACT.md`.
 
-Sits above the daemon. Manages daemon lifecycle: start, crash
-recovery, and zero-downtime binary upgrades.
-
-Upgrade flow: stage new binary → self-test → swap → monitor
-stability window → commit or rollback.
-
-**When to use:** Production environments where the daemon must
-survive binary upgrades without dropping agent sessions.
+**When to use:** run `agend-terminal service install` for OS-managed restart on
+crash/boot; call `restart_daemon` to reload after upgrading the binary.
 
 ## Architecture
 
 ```
-agend-supervisor (frozen binary, rarely upgraded)
-  └── agend-terminal start/daemon (headless, long-running)
+agend-terminal start (headless daemon, long-running; in-process supervisor)
+  └── (optional) OS service manager / restart_daemon self-respawn for restarts
         ├── Agent PTYs (managed by daemon)
         ├── MCP servers (one per agent, started by AI backends)
         ├── Telegram polling
@@ -215,21 +216,17 @@ See `docs/archived/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sp
 
 | Command | Purpose |
 |---|---|
-| `daemon <name:cmd>...` | Start daemon with explicit agent specs (no fleet.yaml) |
+| `start --agents <name:cmd>...` | Start daemon with explicit agent specs (no fleet.yaml; subsumes the former `daemon` subcommand) |
 | `list` / `ls` | List running agents |
 | `status` | Detailed agent status (state, health) |
 | `inject <name> <text>` | Inject text into an agent's PTY |
 | `kill <name>` | Kill a specific agent |
 | `connect <name>` | Connect an external agent to the daemon |
-| `fleet start/stop` | Batch start/stop from fleet.yaml |
 | `stop` | Stop the daemon |
 | `quickstart` | Interactive setup (detect backends, configure Telegram, generate fleet.yaml) |
-| `demo` | 30-second interactive demo of multi-agent orchestration |
 | `doctor` | Health check (verify installation, backends, connectivity) |
 | `bugreport` | Generate diagnostic report with logs and config |
-| `upgrade` | Trigger hot-upgrade (requires supervisor) |
-| `verify` | Full E2E verification |
-| `test [suite]` | Run built-in tests (mcp, attach, inbox, api, all) |
+| `verify [--quick]` | Full E2E verification (subsumes the former `test` subcommand) |
 | `capture` | Capture backend output (debugging) |
 | `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell) |
 | `admin cleanup-branches [--yes]` | Delete local branches whose PRs were merged (dry-run by default) |
@@ -243,24 +240,23 @@ All shortcuts use `Ctrl+B` as the prefix key (like tmux).
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+B n` | New tab (opens menu) |
-| `Ctrl+B 1-9` | Go to tab by number |
-| `Ctrl+B Tab` | Next tab |
-| `Ctrl+B Shift+Tab` | Previous tab |
+| `Ctrl+B c` | New tab (opens menu) |
+| `Ctrl+B n` / `Ctrl+B p` | Next / previous tab |
+| `Ctrl+B 0-9` | Go to tab by number |
 | `Ctrl+B l` | Last active tab |
+| `Ctrl+B &` | Close tab |
 | `Ctrl+B w` | List all tabs |
 
 ### Pane Management
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+B \|` | Split vertical |
-| `Ctrl+B -` | Split horizontal |
+| `Ctrl+B "` | Split horizontal (top/bottom) |
+| `Ctrl+B %` | Split vertical (left/right) |
 | `Ctrl+B arrows` | Focus pane (repeatable) |
 | `Ctrl+B o` | Cycle focus (repeatable) |
 | `Ctrl+B z` | Zoom/unzoom pane |
 | `Ctrl+B x` | Close pane |
-| `Ctrl+B X` | Close tab |
 
 ### Scrolling
 
@@ -278,7 +274,8 @@ All shortcuts use `Ctrl+B` as the prefix key (like tmux).
 | `Ctrl+B :` | Command palette |
 | `Ctrl+B ?` | Show keybindings help |
 | `Ctrl+B d` | Detach (exit TUI, daemon keeps running) |
-| `Ctrl+B m` | Toggle mirror mute (future: TUI channel mirror) |
+| `Ctrl+B t` / `Ctrl+B s` / `Ctrl+B m` / `Ctrl+B f` | Open task board (Tasks / Status / Monitor / Fleet view) |
+| `Ctrl+B D` | Pending-decisions board |
 | `Shift+Enter` | Newline without submit (requires terminal keyboard enhancement support) |
 | `Alt+Enter` | Newline without submit (same as Shift+Enter) |
 
