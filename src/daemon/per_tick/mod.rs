@@ -249,7 +249,7 @@ pub(crate) fn run_handlers_with_panic_guard(
 /// string. Mirrors `std::panic::panic_any` conventions: `String` and
 /// `&'static str` are the only payloads `panic!()` produces by
 /// default; other payloads fall through to a placeholder.
-fn panic_payload_str(payload: &Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_payload_str(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else if let Some(s) = payload.downcast_ref::<&'static str>() {

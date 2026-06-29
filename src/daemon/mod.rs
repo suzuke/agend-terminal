@@ -1046,16 +1046,30 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 }
                 continue;
             }
-            match exit_event {
-                crate::agent::AgentExitEvent::CleanExit(ref name) => {
-                    handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
+            // AUDIT2-007: isolate the crash-event arm the way per-tick handlers
+            // are (#1002). These do notify (telegram block_on), escalation_persist
+            // and fleet resolve — a panic here would unwind out of `run_core` and
+            // kill the whole daemon, escalating one agent's crash into a fleet-wide
+            // outage (the supervisor dies). Catch it; the next event/tick recovers.
+            let exit_arm = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match exit_event {
+                    crate::agent::AgentExitEvent::CleanExit(ref name) => {
+                        handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
+                    }
+                    crate::agent::AgentExitEvent::Stage2Restart(name) => {
+                        spawn_stage2_thread(home, &name, &ctx);
+                    }
+                    crate::agent::AgentExitEvent::Crash(name) => {
+                        crash_respawn::handle_crash_respawn(home, &name, &ctx);
+                    }
                 }
-                crate::agent::AgentExitEvent::Stage2Restart(name) => {
-                    spawn_stage2_thread(home, &name, &ctx);
-                }
-                crate::agent::AgentExitEvent::Crash(name) => {
-                    crash_respawn::handle_crash_respawn(home, &name, &ctx);
-                }
+            }));
+            if let Err(payload) = exit_arm {
+                tracing::error!(
+                    payload = %per_tick::panic_payload_str(&payload),
+                    "AUDIT2-007 crash-event handler panicked — daemon loop continues \
+                     (next event/tick recovers) instead of taking down the daemon"
+                );
             }
         }
 
