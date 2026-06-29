@@ -164,21 +164,27 @@ pub(super) fn pane_from_menu_item(
             }
         }
         MenuItemKind::Fugu => {
-            // Provision (idempotent) the isolated Fugu CODEX_HOME so a plain
-            // `codex` spawn defaults to the `fugu` model, then create the pane
-            // with `env.CODEX_HOME` pointed at it.
+            // Provision (idempotent) the Fugu Codex profile (`fugu.config.toml`)
+            // in the shared codex home, then create the pane sharing that home and
+            // selecting the profile via `codex -p fugu` (passed as per-instance
+            // args). Sharing ~/.codex reuses its provider block + auth.json — no
+            // isolated CODEX_HOME, no auth snapshot to drift. CODEX_HOME is set
+            // ONLY when the profile lives outside the default ~/.codex.
             let detection = crate::provider_detect::detect_default();
-            let codex_home = crate::provider_detect::ensure_fugu_codex_home(&detection)
-                .map_err(|e| anyhow::anyhow!("failed to provision Fugu CODEX_HOME: {e}"))?;
+            let codex_home = crate::provider_detect::ensure_fugu_profile(&detection)
+                .map_err(|e| anyhow::anyhow!("failed to provision Fugu profile: {e}"))?;
             let inst_name = pane_factory::unique_fleet_name(home, "fugu");
             let mut env = HashMap::new();
-            env.insert("CODEX_HOME".to_string(), codex_home.display().to_string());
+            if crate::provider_detect::default_codex_home().as_ref() != Some(&codex_home) {
+                env.insert("CODEX_HOME".to_string(), codex_home.display().to_string());
+            }
             if let Err(e) = tui_spawn::add_instance_with_topic(
                 home,
                 &inst_name,
                 &crate::fleet::InstanceYamlEntry {
                     backend: Some("codex".to_string()),
-                    env: Some(env),
+                    args: Some(vec!["-p".to_string(), "fugu".to_string()]),
+                    env: (!env.is_empty()).then_some(env),
                     ..Default::default()
                 },
             ) {
