@@ -293,13 +293,27 @@ pub fn promote_capture_into(
     let dest_dir = project_root
         .map(|r| r.join(PROMOTE_DEST_DIR))
         .unwrap_or_else(|| PathBuf::from(PROMOTE_DEST_DIR));
-    std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(format!("{scenario_name}.raw"));
-    std::fs::copy(capture_path, &dest)?;
 
     let manifest_path = project_root
         .map(|r| r.join(PROMOTE_MANIFEST_PATH))
         .unwrap_or_else(|| PathBuf::from(PROMOTE_MANIFEST_PATH));
+
+    // Fail BEFORE copying the .raw if the manifest is absent: the manifest is
+    // append-only curator data (never auto-created), so a missing one is an
+    // operator/cwd error. Copying first left an orphan `<scenario>.raw` with no
+    // manifest entry — a half-promoted state the replay harness would not
+    // discover yet `git status` would surface as stray.
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "manifest not found at {} — run `capture promote` from the project root \
+             (the MANIFEST.yaml is append-only curator data and is never auto-created)",
+            manifest_path.display()
+        );
+    }
+
+    std::fs::create_dir_all(&dest_dir)?;
+    std::fs::copy(capture_path, &dest)?;
 
     let recorded_on = meta
         .started_at
@@ -308,7 +322,12 @@ pub fn promote_capture_into(
         .unwrap_or(&meta.started_at)
         .to_string();
     let entry = format_manifest_entry(scenario_name, &meta.backend, &recorded_on, opts);
-    append_manifest_entry(&manifest_path, &entry)?;
+    if let Err(e) = append_manifest_entry(&manifest_path, &entry) {
+        // Roll back the copied .raw so a manifest-append failure does not leave a
+        // half-promoted orphan fixture behind.
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
 
     println!(
         "promoted: {} → {}  ({} bytes, backend={}, scenario_kind={})",
@@ -609,6 +628,38 @@ mod tests {
         assert!(
             dest.starts_with(tmp.join("tests/fixtures/state-replay")),
             "destination must be under tests/fixtures/state-replay/, got {}",
+            dest.display()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    #[serial(capture_env)]
+    fn promote_missing_manifest_errors_and_leaves_no_orphan_raw() {
+        // Regression: promote used to copy `<scenario>.raw` BEFORE appending to
+        // the manifest. With an absent manifest the append failed but the orphan
+        // `.raw` was left behind — a half-promoted state. Now promote must fail
+        // fast (manifest missing) and leave NO `.raw` behind.
+        let tmp = tmp_dir("promote-missing-manifest");
+        let (cap, _meta) = write_cap_fixture(&tmp, "codex", b"hello world");
+        let opts = PromoteOptions {
+            scenario_kind: PromoteScenarioKind::RealCapture,
+            expected_hung: None,
+            scenario_description: None,
+            auto_replay: false,
+        };
+        // No manifest pre-created under tmp on purpose.
+        let result = promote_capture_into(&cap, "orphan-check", &opts, Some(&tmp));
+        assert!(
+            result.is_err(),
+            "promote must error when manifest is missing"
+        );
+        let dest = tmp
+            .join("tests/fixtures/state-replay")
+            .join("orphan-check.raw");
+        assert!(
+            !dest.exists(),
+            "promote must NOT leave an orphan .raw when manifest append fails, found {}",
             dest.display()
         );
         std::fs::remove_dir_all(&tmp).ok();
