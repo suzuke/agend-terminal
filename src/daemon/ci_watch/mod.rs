@@ -13,6 +13,9 @@
 pub(crate) mod migration;
 mod poller;
 mod provider;
+// AUDIT2-001: re-exported so the `ci watch` MCP boundary can warn the operator
+// when an agent-supplied `ci_provider_url` host will NOT receive the forge token.
+pub(crate) use provider::host_receives_credentials;
 mod registry;
 mod sweep;
 pub(crate) mod watch_state;
