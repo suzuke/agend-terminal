@@ -416,6 +416,12 @@ pub struct HealthTracker {
     /// decrement the recovery counter. `None` means Stage 2 has never
     /// fired for this agent in the current daemon run.
     pub last_stage2_fired_at: Option<Instant>,
+    /// AUDIT2-008: timestamp of the last Stage-2 operator notification. The
+    /// stage-2 fire path notifies BEFORE `try_send`, and a persistently-full
+    /// `crash_tx` leaves the agent in `Stage2Eligible` so the fire path re-runs
+    /// every tick — without this backoff the operator gets a telegram every ~10s
+    /// per stuck agent. Notify at most once per `STAGE2_NOTIFY_BACKOFF`.
+    pub last_stage2_notify_at: Option<Instant>,
     /// `#685` sub-task 7c: timestamp of last Stage 3 escalation (the
     /// transition into `HealthState::Paused`). Reserved for the future
     /// operator-unpause sub-task — it will read this to display "Paused
@@ -514,6 +520,7 @@ impl HealthTracker {
             last_stage1_fired_at: None,
             recovery_restart_count: 0,
             last_stage2_fired_at: None,
+            last_stage2_notify_at: None,
             last_stage3_fired_at: None,
         }
     }
