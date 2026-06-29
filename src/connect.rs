@@ -126,7 +126,7 @@ pub fn run(
 
     // 10. Spawn backend process
     tracing::info!(%command, args = %args.join(" "), "starting backend");
-    let mut child = std::process::Command::new(&command)
+    let child_result = std::process::Command::new(&command)
         .args(&args)
         .current_dir(&work_dir)
         .env("AGEND_INSTANCE_NAME", name)
@@ -135,7 +135,20 @@ pub fn run(
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .spawn()?;
+        .spawn();
+    let mut child = match child_result {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = crate::api::call(
+                home,
+                &serde_json::json!({
+                    "method": crate::api::method::DEREGISTER_EXTERNAL,
+                    "params": { "name": name }
+                }),
+            );
+            return Err(e.into());
+        }
+    };
 
     // H1: async-signal-safe handler — set atomic flag only.
     // Main loop checks flag and performs cleanup outside signal context.
