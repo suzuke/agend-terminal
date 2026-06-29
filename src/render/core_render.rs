@@ -760,7 +760,10 @@ fn render_pane(
         };
     }
     let inner = content.rect();
-    let render_offset = pane.scroll_offset;
+    // AUDIT2-017: clamp to the current history depth so a stale offset (after
+    // alt-screen entry / zoom / resize / clear) renders the deepest available
+    // line instead of blank rows.
+    let render_offset = pane.clamped_scroll_offset();
     // The cursor source differs by render path (live VTerm vs off-thread
     // snapshot); capture it here so the focused-cursor block below stays shared.
     let cursor = if let Some(handle) = &pane.offthread {

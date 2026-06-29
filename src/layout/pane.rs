@@ -159,6 +159,16 @@ impl Pane {
         }
     }
 
+    /// AUDIT2-017: the scroll offset clamped to the CURRENT history depth.
+    /// `scroll_offset` is only re-clamped on an up-scroll, so when the scrollback
+    /// shrinks under it — entering the alt-screen (which has no scrollback), a
+    /// taller pane after zoom/resize, or the child clearing history — a stale
+    /// offset would index past the available lines and the renderer would paint
+    /// blank rows. Always clamp at the point of use.
+    pub fn clamped_scroll_offset(&self) -> usize {
+        self.scroll_offset.min(self.scroll_max())
+    }
+
     /// #offthread-mouse: whether the child terminal has enabled mouse reporting, for
     /// the mouse-forward gate. Off-thread the main-thread `vterm` is idle (processes
     /// no bytes → mode default → mouse OFF), so this reads the PARSER-stamped mode on
@@ -524,6 +534,21 @@ mod tests {
     /// `pane.vterm` (blank). Else the #1944 draft-protection gate reads an empty input
     /// box and clobbers a real unsent draft. NEUTER: revert the accessor body to
     /// `self.vterm.tail_lines*` → off-thread it returns blank → this RED.
+    #[test]
+    fn clamped_scroll_offset_clamps_stale_offset_audit2_017() {
+        // A fresh 10x10 vterm has no scrollback → scroll_max() == 0. A stale
+        // offset (left behind when history shrank under it) must clamp to the
+        // current depth so the renderer paints content, not blank rows.
+        let mut p = leaf(1, "a");
+        p.scroll_offset = 500;
+        assert_eq!(p.scroll_max(), 0, "no scrollback in a fresh vterm");
+        assert_eq!(
+            p.clamped_scroll_offset(),
+            0,
+            "stale offset clamps to the current history depth"
+        );
+    }
+
     #[test]
     fn tail_lines_offthread_reads_snapshot_not_idle_vterm() {
         let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
