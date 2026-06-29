@@ -42,6 +42,7 @@ and for sensitive `config`/`ci` parameters.
 - **Related issues:** none found open (NEW). Adjacent schema-audit lineage: #1502/#1505.
 
 ### AUDIT2-002 — Destructive worktree/lifecycle tools have no per-caller ownership ACL
+- **✅ RESOLVED** (conservative ACL + orchestrator exception, per operator decision; see Audit2 Tracker) — `force_release_worktree` and `delete_instance` now require an identified caller to be the target itself or its team orchestrator (`teams::is_orchestrator_of`); anonymous/operator-direct callers keep authority. `delete_instance` adapter threaded `ha`→`has` for the sender. Tests `force_release_denies_non_owner_non_orchestrator_audit2_002`, `delete_instance_denies_non_owner_non_orchestrator_audit2_002`; force_release 23 + instance_state 27 + handlers 119/89 green. **AUDIT2-002b (repo merge)** deferred — PR-merge has no instance-ownership model and is already CI-green-gated; a per-caller ACL there needs a clearer ownership definition.
 - **Severity:** Medium
 - **Component:** MCP `force_release_worktree`, `delete_instance`, `repo merge`
 - **Description:** `force_release_worktree` takes its **target** from `args["instance"]` and ignores
@@ -55,6 +56,7 @@ and for sensitive `config`/`ci` parameters.
 - **Related:** none open (NEW).
 
 ### AUDIT2-003 — Security/observability gates are agent-settable via `config set` in default mode
+- **✅ RESOLVED** (see Audit2 Tracker) — the operator gate now blocks agent `config set` of `progress_mode`, `idle_watchdog_enabled`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled` in **all** modes (like `mode set`); benign UI keys stay agent-settable. Test `agent_cannot_set_safety_config_keys_in_active_audit2_003`; operator_gate 14 green. (Narrow, surgical slice of the #1339 operator-mode root.)
 - **Severity:** Medium
 - **Component:** MCP `config` → `runtime_config`
 - **Description:** `config set` is correctly allowlisted (unknown keys rejected) — but the allowlist
@@ -68,6 +70,7 @@ and for sensitive `config`/`ci` parameters.
 - **Related:** none open (NEW).
 
 ### AUDIT2-004 — `SENSITIVE_ENV_KEYS` deny-list omits interpreter-injection vars
+- **✅ RESOLVED** (Low-Medium; see Audit2 Tracker) — added `NODE_OPTIONS`, `GIT_SSH_COMMAND`, `BASH_ENV`, `ENV`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`, `DYLD_FRAMEWORK_PATH`/`DYLD_FALLBACK_FRAMEWORK_PATH` to the spawn deny-list; extended `sensitive_env_keys_covers_known_dangerous`; agent env tests green.
 - **Severity:** Medium
 - **Component:** `src/agent/mod.rs` spawn env filtering + `create_instance`
 - **Description:** The deny-list **correctly** blocks `LD_PRELOAD`/`LD_*`/`DYLD_*`, but **misses**
@@ -81,6 +84,7 @@ and for sensitive `config`/`ci` parameters.
 - **Related:** lineage of credential-isolation work #1440.
 
 ### AUDIT2-005 — `task metadata_set` accepts unbounded JSON (record/log bloat)
+- **✅ RESOLVED** (see Audit2 Tracker) — `handle_metadata_set` rejects a `metadata_value` over a 64 KiB cap (`metadata_value_too_large`); test `metadata_set_rejects_oversized_value_audit2_005`; tasks 164 green.
 - **Severity:** Low
 - **Component:** `src/tasks/handler.rs`
 - **Description:** `handle_metadata_set` enforces presence + owner ACL but caps neither value size nor
@@ -113,6 +117,7 @@ fleet.
 - **Related:** mitigations already present (#1745 panic isolation + lock-drop-before-dispatch).
 
 ### AUDIT2-007 — Crash-event dispatch arm is NOT panic-isolated → daemon death
+- **✅ RESOLVED** (Low-Medium; see Audit2 Tracker) — wrapped the `AgentExitEvent` match in `catch_unwind`, mirroring the #1002 per-tick guard; a panic in crash/clean-exit/stage2 handling now logs and the loop continues instead of unwinding `run_core`. supervisor 99 + crash_respawn 4 green.
 - **Severity:** Medium
 - **Component:** `src/daemon/mod.rs` run_core
 - **Description:** Per-tick handlers run under `run_handlers_with_panic_guard` (`catch_unwind`,
@@ -124,6 +129,7 @@ fleet.
 - **Related:** asymmetry with the documented #1002 isolation.
 
 ### AUDIT2-008 — Recovery Stage-2 notify storm on a full crash channel
+- **✅ RESOLVED** (Low-Medium; see Audit2 Tracker) — added `HealthTracker::last_stage2_notify_at`; the stage-2 fire path now notifies at most once per 5-min backoff while stuck in `Stage2Eligible` (reset on a successful fire) instead of every ~10s tick. recovery_dispatcher 23 + health 53 green.
 - **Severity:** Medium
 - **Component:** `src/daemon/per_tick/recovery_dispatcher.rs`
 - **Description:** When the bounded(64) `crash_tx` channel is persistently full, `handle_stage2_fire`
@@ -156,6 +162,7 @@ fleet.
 - **Related:** prior context #1267 (CLOSED, "ci_watch dropped after CI failure — rerun requires manual re-subscribe"); #1859 (attempt tracking).
 
 ### AUDIT2-010 — Cron schedules double/multi-fire on DST fall-back, miss on spring-forward
+- **✅ RESOLVED** (fall-back storm; see Audit2 Tracker) — `is_due_in_tz` now bounds the window in UTC (`take_while(<=now_utc).any(>last_check_utc)`); fold-hour cron fires once per real occurrence (verified by standalone DST repro: 180→2 fires) instead of ~180×; test `ny_dst_fall_back_fold_hour_cron_does_not_storm_audit2_010`; cron_tick 30 + schedules 29 green. *Spring-forward skipped-hour miss left as-is (firing a non-existent local time is a separate behaviour choice).*
 - **Severity:** Medium
 - **Component:** `src/daemon/cron_tick.rs`
 - **Description:** `is_due_in_tz` bounds only the **upper** edge (`...take(1).any(|next| next <= now_local)`)
@@ -173,6 +180,7 @@ fleet.
 ## Group D — Correctness: ID minting & state-file atomicity
 
 ### AUDIT2-011 — Colliding task IDs at the un-audited `send(kind=task)` auto-create site → silent task loss
+- **✅ RESOLVED** (adjudicated **Low** — single-process daemon path, collision not currently reachable, but the inconsistency + false-green guard are real; see Audit2 Tracker) — `messaging.rs` now mints `t-<ts>-<pid>-<seq>` matching `handle_create`; the `task_id_has_process_unique_component_tasks` guard now covers **both** mint sites so a future multi-process regression fails the test. tasks::handler 27 + messaging 55 green.
 - **Severity:** High
 - **Component:** `src/api/handlers/messaging.rs` (auto-create), tasks event log
 - **Description:** The audited `task create` path mints a process-unique `t-{ts}-{pid}-{seq}` id, but
@@ -187,6 +195,7 @@ fleet.
 - **Related:** none open (NEW); same bug class as the fix that produced `handler.rs:78-85`.
 
 ### AUDIT2-012 — `runtime-config.json` is written non-atomically and unlocked
+- **✅ RESOLVED** (Low-Medium; see Audit2 Tracker) — `set()` now takes a cross-process file lock around the whole read-check-write and writes via `store::atomic_write` (tmp+rename); a crash can no longer leave truncated JSON that reverts to defaults, and concurrent sets serialize. runtime_config 15 green (incl. the #1990 version-check).
 - **Severity:** Medium
 - **Component:** `src/runtime_config.rs`
 - **Description:** `set()` writes with plain `std::fs::write` (not `store::atomic_write`) and holds no
@@ -199,6 +208,7 @@ fleet.
 - **Related:** #1576 (keep-last-good reload).
 
 ### AUDIT2-013 — Skills staging dir is shared by allowlist digest and rebuilt without a lock
+- **✅ RESOLVED** (Low-Medium; see Audit2 Tracker) — `stage_filtered_source` now takes a per-digest file lock around the remove/rebuild, so two concurrent same-allowlist installs serialize instead of B's `remove_dir_all` wiping A's half-built tree (the ENOENT boot-abort). Digest-keyed path + GC exclusion unchanged. skills 31 green.
 - **Severity:** Medium
 - **Component:** `src/skills.rs`
 - **Description:** `stage_filtered_source` builds at a path keyed **solely** by the allowlist digest
@@ -225,6 +235,7 @@ fleet.
 - **Related:** multi-board feature #2117.
 
 ### AUDIT2-015 — Missing parent-directory fsync in hand-rolled tmp+rename paths
+- **✅ RESOLVED** (Low-Medium; see Audit2 Tracker) — `inbox/disk.rs` recover-rewrite routed through `store::atomic_write` (dir-fsync included); added `store::fsync_parent_dir` (Unix; no-op on Windows) and called it after the hand-rolled renames in `inbox/storage.rs` (4 sites) and `task_events.rs`. inbox 176 + task_events 49 green.
 - **Severity:** Low (durability)
 - **Component:** `src/inbox/*`, `src/task_events.rs`
 - **Description:** Unlike `store::atomic_write` (which fsyncs the parent dir), the inbox module's
@@ -239,6 +250,7 @@ fleet.
 ## Group E — TUI state-machine correctness
 
 ### AUDIT2-016 — `close_tab` mis-points `active` when a tab left of active is removed
+- **✅ RESOLVED** (see Audit2 Tracker) — added `if self.active > idx { self.active -= 1 }` to `close_tab`; test `close_tab_left_of_active_keeps_focus_audit2_016`; layout suite 60 green.
 - **Severity:** Medium
 - **Component:** `src/layout/mod.rs`
 - **Description:** `close_tab(idx)` removes the tab and only fixes `active` when it ran past the end
@@ -253,6 +265,7 @@ fleet.
 - **Related:** none open (NEW).
 
 ### AUDIT2-017 — `scroll_offset` is never re-clamped when scrollback shrinks → blank pane
+- **✅ RESOLVED** (see Audit2 Tracker) — added `Pane::clamped_scroll_offset()`; render uses it (no blank rows), and the down-scroll branch clamps to `max` first (instant recovery); test `clamped_scroll_offset_clamps_stale_offset_audit2_017`; pane 17 + render 76 green.
 - **Severity:** Medium
 - **Component:** `src/app/mod.rs`, `src/vterm.rs`
 - **Description:** Up-scroll clamps `scroll_offset` to `scroll_max`, but render clamps only to
@@ -272,6 +285,7 @@ Shared root cause: **`docs/USAGE.md` is stale** (CLI.md / FEATURE-tui.md are mos
 severity individually, but they actively mislead first-run users.
 
 ### AUDIT2-018 — `USAGE.md` documents commands & a binary that don't exist
+- **✅ RESOLVED** (see Audit2 Tracker) — `USAGE.md`: removed the nonexistent `agend-supervisor` binary (replaced with real `agend-git`/`agend-mcp-bridge` + in-process-supervision section); dropped `demo`/`upgrade`/`fleet start-stop`/`daemon`/`test`, redirected `daemon`→`start --agents`, `test`→`verify --quick`; fixed `--detached`→`--foreground` (now default).
 - **Severity:** Medium (one item) / Low (rest)
 - **Component:** docs
 - **Description / Evidence:**
@@ -288,12 +302,14 @@ severity individually, but they actively mislead first-run users.
 - **Suggested fix:** rewrite `USAGE.md` to match the real surface (delete the dead commands/binary; point `daemon`→`start --agents`, `test`→`verify --quick`, `--detached`→default + `--foreground` opt-out).
 
 ### AUDIT2-019 — `USAGE.md` TUI keybinding table is wrong
+- **✅ RESOLVED** (see Audit2 Tracker) — synced the tab/pane keybind tables to `keybinds.rs`: new tab `c` (was `n`), next/prev `n`/`p` (was `Tab`/`Shift+Tab`), goto `0-9`, close tab `&` (was `X`), splits `"`/`%` (was `|`/`-`), and `m`→Monitor view (was "future mirror mute").
 - **Severity:** Low
 - **Component:** docs
 - **Evidence:** `docs/USAGE.md` vs `src/keybinds.rs`: `Ctrl+B n` listed as New tab (actually NextTab; new = `c`), `Ctrl+B Tab/Shift+Tab` (unbound), `Ctrl+B |`/`-` splits (unbound; real splits `"`/`%`), `Ctrl+B X` close tab (actually `&`; `x` = ClosePane), `Ctrl+B m` "future mirror mute" (actually ShowMonitor). `docs/CLI.md:27` and `docs/FEATURE-tui.md` are correct.
 - **Suggested fix:** sync the table to `keybinds.rs` or delete it and link to FEATURE-tui.md.
 
 ### AUDIT2-020 — Documented knobs that no code reads (silent no-ops)
+- **✅ RESOLVED** (env var; see Audit2 Tracker) — removed the dead `AGEND_TURN_SENTINEL_SHADOW` row (with its fabricated source citations) from `env-vars.md` and fixed the `AGEND_RECOVERY_SHADOW` sibling reference. *(task.duration sub-item was dropped during adjudication — `duration` is a real `watchdog` snooze param.)*
 - **Severity:** Low–Medium
 - **Component:** docs
 - **Evidence:**

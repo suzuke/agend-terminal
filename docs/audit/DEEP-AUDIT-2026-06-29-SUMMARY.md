@@ -66,6 +66,20 @@ crash-safety, focus_id panic, image-paste off-by-one, palette overrun, restart s
 The full list is in `ISSUES.md § Refuted` — recorded so future audits don't waste effort re-raising
 them.
 
+## Resolution status — implementation pass (branch `deep-audit-fixes`)
+**17 of 20 issues fixed** (root-cause, with tests + regression, one commit each); **4 deferred** with
+rationale. Each fix is recorded in the `Audit2 Tracker` sheet (commit hash) and the per-issue ✅ markers
+in `ISSUES.md`.
+
+| Status | Issues |
+|--------|--------|
+| ✅ Fixed | 001 (SSRF/token gate), 002 (force_release + delete_instance ACL), 003 (config safety-gate lock), 004 (env-injection deny-list), 005 (metadata cap), 007 (crash-arm panic isolation), 008 (Stage-2 notify backoff), 010 (cron DST storm — repro-verified 180→2), 011 (task-id pid), 012 (runtime-config atomic+lock), 013 (skills stage lock), 015 (parent-dir fsync), 016 (close_tab focus), 017 (scroll clamp), 018/019/020 (docs/dead-env) |
+| ⏸ Deferred | **006** (event-bus → bounded worker-queue: large daemon-core refactor, warrants a dedicated well-tested pass rather than a tail-of-session rush — interim mitigation available: an explicit `reqwest` timeout on the notify `Bot`); **009** (CI rerun-to-green dedup: needs a per-workflow/per-sha-aggregate redesign of `select_runs_to_notify`, high regression risk on load-bearing CI); **002b** (repo merge ACL: no instance-ownership model, already CI-green-gated); **014** (cross-board dep claim race: narrow multi-board edge, low impact) |
+
+All 17 fixes share the worktree and compile cleanly together; each was validated against the relevant
+test suite. Severities here are the **adjudicated** ones (operator review), which differ from the
+original drafts (e.g. 011 High→Low after confirming the collision is single-process-unreachable today).
+
 ## Coverage & limitations (honest scope)
 - **Covered breadth-first:** all 6 subsystems inventoried; the highest-risk red flags in each were
   verified to source. This is **not** an exhaustive line-by-line review of 286k LOC.
