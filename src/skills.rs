@@ -482,6 +482,22 @@ pub fn cleanup_stale_stages(
     for entry in entries.flatten() {
         let path = entry.path();
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            // AUDIT2-013 follow-up: reap our own per-digest `.lock` files (siblings
+            // of the stage dirs) once they're past the retention window, so they
+            // don't accumulate one-per-allowlist forever. Only stale locks (no
+            // active install touched them within `retention_secs`) are removed.
+            if path.extension().and_then(|e| e.to_str()) == Some("lock") {
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs() >= retention_secs)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
             continue;
         }
         report.candidates += 1;
