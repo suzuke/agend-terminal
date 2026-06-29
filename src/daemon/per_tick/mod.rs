@@ -245,6 +245,37 @@ pub(crate) fn run_handlers_with_panic_guard(
     }
 }
 
+/// AUDIT2-007: run the crash-event dispatch arm under the same panic guard the
+/// per-tick handlers get (#1002). `handle_clean_exit` / `spawn_stage2_thread` /
+/// `handle_crash_respawn` do telegram `block_on`, `escalation_persist` and fleet
+/// resolve — a panic there would unwind out of `run_core` and take down the whole
+/// daemon, escalating one agent's crash into a fleet-wide supervisor outage. Lives
+/// here (not in `daemon/mod.rs`) to keep that grandfathered file under its ceiling.
+pub(crate) fn dispatch_exit_event_guarded(
+    exit_event: crate::agent::AgentExitEvent,
+    home: &std::path::Path,
+    ctx: &super::DaemonContext,
+) {
+    use crate::agent::AgentExitEvent;
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match exit_event {
+        AgentExitEvent::CleanExit(ref name) => {
+            super::handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
+        }
+        AgentExitEvent::Stage2Restart(name) => {
+            super::spawn_stage2_thread(home, &name, ctx);
+        }
+        AgentExitEvent::Crash(name) => {
+            super::crash_respawn::handle_crash_respawn(home, &name, ctx);
+        }
+    }));
+    if let Err(payload) = guarded {
+        tracing::error!(
+            payload = %panic_payload_str(&payload),
+            "AUDIT2-007 crash-event handler panicked — daemon loop continues instead of dying"
+        );
+    }
+}
+
 /// Reduce a panic payload (`Box<dyn Any + Send>`) to a printable
 /// string. Mirrors `std::panic::panic_any` conventions: `String` and
 /// `&'static str` are the only payloads `panic!()` produces by
