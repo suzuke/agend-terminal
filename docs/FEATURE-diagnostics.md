@@ -150,10 +150,7 @@ agend-terminal bugreport
 
 ### Output location
 
-The report is written to:
-
-- the current working directory, if available
-- otherwise `AGEND_HOME`
+The report is written under `AGEND_HOME/bugreports/`, so diagnostic files stay with the daemon state instead of cluttering the operator's current working directory.
 
 The filename looks like this:
 

@@ -150,10 +150,7 @@ agend-terminal bugreport
 
 ### 輸出位置
 
-`bugreport` 會把檔案寫到：
-
-- 目前工作目錄
-- 如果目前工作目錄不可用，則退回 `AGEND_HOME`
+`bugreport` 會把檔案寫到 `AGEND_HOME/bugreports/`，讓診斷檔跟 daemon 狀態放在一起，不會散落在操作者目前所在的工作目錄。
 
 檔名格式：
 

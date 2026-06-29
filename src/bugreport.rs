@@ -5,9 +5,9 @@ use std::path::Path;
 pub fn run(home: &Path) -> anyhow::Result<()> {
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let filename = format!("bugreport-{timestamp}.txt");
-    let output_path = std::env::current_dir()
-        .unwrap_or_else(|_| home.to_path_buf())
-        .join(&filename);
+    let output_dir = bugreport_dir(home);
+    std::fs::create_dir_all(&output_dir)?;
+    let output_path = output_dir.join(&filename);
 
     let mut out = String::new();
 
@@ -166,6 +166,10 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn bugreport_dir(home: &Path) -> std::path::PathBuf {
+    home.join("bugreports")
+}
+
 fn section(out: &mut String, title: &str) {
     let sep = "=".repeat(60);
     out.push_str(&sep);
@@ -238,7 +242,13 @@ fn redact_secrets(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_secrets;
+    use super::{bugreport_dir, redact_secrets};
+
+    #[test]
+    fn bugreport_dir_lives_under_agend_home() {
+        let home = std::env::temp_dir().join("agend-bugreport-dir-test");
+        assert_eq!(bugreport_dir(&home), home.join("bugreports"));
+    }
 
     #[test]
     fn redacts_common_secret_keys_case_insensitive() {

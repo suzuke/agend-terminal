@@ -191,7 +191,7 @@ agend-terminal quickstart
 ```
 
 ### `bugreport`
-Generate a single text file with diagnostics, recent logs, and redacted config. Drops to current directory.
+Generate a single text file with diagnostics, recent logs, and redacted config. Writes under `AGEND_HOME/bugreports/`.
 
 ```
 agend-terminal bugreport

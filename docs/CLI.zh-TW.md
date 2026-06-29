@@ -191,7 +191,7 @@ agend-terminal quickstart
 ```
 
 ### `bugreport`
-產生一個單一文字檔，內含診斷資訊、近期日誌與已遮蔽（redacted）的設定。輸出到目前目錄。
+產生一個單一文字檔，內含診斷資訊、近期日誌與已遮蔽（redacted）的設定。輸出到 `AGEND_HOME/bugreports/`。
 
 ```
 agend-terminal bugreport
