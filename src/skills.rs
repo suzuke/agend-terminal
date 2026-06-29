@@ -409,7 +409,17 @@ fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Re
         digest_input.push('\n');
     }
     let digest = stage_digest(digest_input.as_bytes());
-    let stage = home.join(".skills-stage").join(&digest);
+    let stage_root = home.join(".skills-stage");
+    let stage = stage_root.join(&digest);
+    // AUDIT2-013: serialize same-digest installs under a per-digest lock. Without
+    // it, two concurrent installs with the same allowlist compute the same path,
+    // and B's `remove_dir_all` wipes A's half-built tree mid-copy — A's
+    // `copy_dir_recursive` then hits ENOENT and aborts A's boot with missing
+    // skills (`create_dir_all`'s EEXIST-is-Ok makes the collision silent). The
+    // lock makes the remove + repopulate atomic w.r.t. other builders.
+    std::fs::create_dir_all(&stage_root)
+        .with_context(|| format!("create stage root {}", stage_root.display()))?;
+    let _stage_lock = crate::store::acquire_file_lock(&stage_root.join(format!("{digest}.lock")));
     if stage.exists() {
         std::fs::remove_dir_all(&stage)
             .with_context(|| format!("clean stage {}", stage.display()))?;
