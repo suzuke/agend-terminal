@@ -1603,6 +1603,55 @@ fn inject_offload_queues_then_drops_on_full() {
     crate::daemon::delivery_worker::test_support::set_force_full(false);
 }
 
+/// AUDIT2-006 C: when the #1513 defer gate fires (the target agent is busy /
+/// recently typing), the cron offload variant returns `Deferred` from the
+/// SYNCHRONOUS prepare/gate phase and must NOT reach the delivery worker — the
+/// wake is durably enqueued on the caller thread instead. `#[serial]` because it
+/// sets the process-global `AGEND_HOME` that the gate reads.
+#[test]
+#[serial_test::serial]
+fn inject_offload_defers_without_touching_delivery_worker() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let id = C.fetch_add(1, Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!(
+        "agend-test-offload-defer-{}-{id}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::create_dir_all(&home);
+
+    let writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
+        Box::new(std::io::sink()) as Box<dyn Write + Send>
+    ));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: false,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core: readback_test_core(b""),
+    };
+
+    // The #1513 gate reads AGEND_HOME; a fresh typing record makes
+    // `operator_typing_recent` (hence `should_defer_direct_inject`) true.
+    std::env::set_var("AGEND_HOME", &home);
+    crate::notification_queue::record_input_activity(&home, "agentBusy");
+
+    let dispatch = inject_with_target_gated_offload(&target, "agentBusy", b"hi");
+    std::env::remove_var("AGEND_HOME");
+
+    // Deferred (durably enqueued synchronously) — NOT Queued/QueueFull, so the
+    // physical write never reached the delivery worker.
+    assert!(
+        matches!(dispatch, InjectDispatch::Deferred(_)),
+        "a busy/typing agent must defer (durable enqueue) without touching the \
+         delivery worker; got a queued/dropped dispatch instead"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ── #1912 readback-confirm inject (hermetic, VTerm-driven) ──────────────────
 
 /// #1912: build a throwaway core with a vterm pre-seeded with `feed` (simulating
