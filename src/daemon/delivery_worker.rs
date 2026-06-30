@@ -53,6 +53,16 @@ enum DeliveryJob {
     /// thread (see `channel::telegram::notify`). On terminal send failure the
     /// worker evicts that claim.
     TelegramSend(TelegramSendJob),
+    /// AUDIT2-006 C: a cron physical PTY inject. The prepare/gate phase (marker +
+    /// #1513 defer) already ran synchronously on the tick thread; the worker does
+    /// ONLY the physical write via the CAPTURED `InjectTarget`. It NEVER re-resolves
+    /// `agent` (a same-name redeploy must not receive a stale fire — `agent` is for
+    /// logging only).
+    CronInject {
+        target: crate::agent::InjectTarget,
+        agent: String,
+        text: Vec<u8>,
+    },
 }
 
 /// Payload for an offloaded Telegram send. Carries the already-resolved channel
@@ -119,6 +129,15 @@ fn dispatch(job: DeliveryJob) {
         DeliveryJob::TelegramSend(job) => {
             crate::channel::telegram::notify::send_telegram_job(job);
         }
+        DeliveryJob::CronInject {
+            target,
+            agent,
+            text,
+        } => {
+            if let Err(e) = crate::agent::inject_target_physical(&target, &text) {
+                tracing::debug!(agent = %agent, error = %e, "delivery_worker: cron inject failed");
+            }
+        }
     }
 }
 
@@ -142,6 +161,22 @@ pub(crate) fn enqueue_pty_wake(
 /// dedup claim so a later identical emit isn't suppressed for the whole TTL.
 pub(crate) fn enqueue_telegram_send(job: TelegramSendJob) -> Result<(), ()> {
     try_enqueue(DeliveryJob::TelegramSend(job))
+}
+
+/// AUDIT2-006 C: offload a cron physical PTY inject. The caller (cron) has already
+/// run the prepare/gate phase synchronously; `target` is the CAPTURED inject
+/// snapshot — the worker never re-resolves `agent` (logging only). Returns `Err(())`
+/// when the bounded queue is full, so the caller records `drop_queue_full`.
+pub(crate) fn enqueue_cron_inject(
+    target: crate::agent::InjectTarget,
+    agent: &str,
+    text: Vec<u8>,
+) -> Result<(), ()> {
+    try_enqueue(DeliveryJob::CronInject {
+        target,
+        agent: agent.to_string(),
+        text,
+    })
 }
 
 fn try_enqueue(job: DeliveryJob) -> Result<(), ()> {
@@ -169,12 +204,21 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static FORCE_FULL: AtomicBool = AtomicBool::new(false);
+    static FF_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Force every `try_enqueue` to behave as if the bounded queue were full,
     /// WITHOUT actually filling 256 slots — lets callers unit-test the drop /
     /// dedup-rollback paths deterministically.
     pub(crate) fn set_force_full(on: bool) {
         FORCE_FULL.store(on, Ordering::Relaxed);
+    }
+
+    /// Serialize tests that toggle [`set_force_full`]: `FORCE_FULL` is process-
+    /// global, so parallel test threads would otherwise corrupt each other's
+    /// expected queue state. Hold the returned guard across the whole
+    /// toggle→assert→reset window. Every force-full test MUST hold it.
+    pub(crate) fn force_full_guard() -> parking_lot::MutexGuard<'static, ()> {
+        FF_LOCK.lock()
     }
 
     pub(super) fn force_full() -> bool {
@@ -191,6 +235,7 @@ mod tests {
     /// drop (`Err`) rather than a stall.
     #[test]
     fn enqueue_is_nonblocking_and_drops_when_full() {
+        let _ff = test_support::force_full_guard();
         // Healthy queue: a PTY wake enqueues without blocking.
         test_support::set_force_full(false);
         assert!(

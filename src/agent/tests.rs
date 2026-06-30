@@ -1564,6 +1564,45 @@ fn inject_with_target_skips_deleted_agent_1146() {
     assert!(inject_with_target(&target, b"should be skipped").is_ok());
 }
 
+/// AUDIT2-006 C: the cron offload variant runs the prepare/gate phase
+/// synchronously (gate not triggered — `"agentA"` is never busy in a unit test, so
+/// it Proceeds) and offloads the physical write to the bounded delivery worker: a
+/// healthy queue → `Queued`, a full queue → `QueueFull`.
+#[test]
+fn inject_offload_queues_then_drops_on_full() {
+    let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
+    let writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
+        Box::new(std::io::sink()) as Box<dyn Write + Send>
+    ));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: false,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core: readback_test_core(b""),
+    };
+
+    crate::daemon::delivery_worker::test_support::set_force_full(false);
+    assert!(
+        matches!(
+            inject_with_target_gated_offload(&target, "agentA", b"hi"),
+            InjectDispatch::Queued
+        ),
+        "a healthy delivery queue must accept the cron inject (Queued)"
+    );
+
+    crate::daemon::delivery_worker::test_support::set_force_full(true);
+    assert!(
+        matches!(
+            inject_with_target_gated_offload(&target, "agentA", b"hi"),
+            InjectDispatch::QueueFull
+        ),
+        "a full delivery queue must drop the cron inject (QueueFull)"
+    );
+    crate::daemon::delivery_worker::test_support::set_force_full(false);
+}
+
 // ── #1912 readback-confirm inject (hermetic, VTerm-driven) ──────────────────
 
 /// #1912: build a throwaway core with a vterm pre-seeded with `feed` (simulating

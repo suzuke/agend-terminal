@@ -155,6 +155,15 @@ pub fn lock_external(
 mod sensitive_env;
 use sensitive_env::SENSITIVE_ENV_KEYS;
 
+// AUDIT2-006 C: cron PTY-inject offload — prepare/gate split + bounded-worker
+// offload sibling. Kept out of this (grandfathered) file to respect its LOC
+// ceiling; the child module reaches the private `inject_with_target` /
+// `daemon_auto_prefix` via `super::`.
+mod inject_offload;
+pub(crate) use inject_offload::{
+    inject_target_physical, inject_with_target_gated_offload, InjectDispatch,
+};
+
 /// Returns true if the env-var name is on the spawn-time deny-list.
 pub fn is_sensitive_env_key(key: &str) -> bool {
     SENSITIVE_ENV_KEYS
@@ -2763,55 +2772,14 @@ pub(crate) fn inject_with_target_gated(
     force: bool,
     auto_kind: Option<&str>,
 ) -> crate::error::Result<()> {
-    // #1769: daemon self-originated auto-injects carry an identifying marker so
-    // an orchestrator can distinguish them from real operator/peer input. The
-    // marker is prepended HERE (before both the deferred-enqueue and the direct
-    // inject) so the tag survives whichever delivery path runs. Worker semantics
-    // are unchanged — the inner payload + submit are preserved; only a leading
-    // text tag is added. `None` (operator relay / api INJECT / inbox — which
-    // already carry their own headers) injects verbatim.
-    let marked: Vec<u8>;
-    let text: &[u8] = match auto_kind {
-        Some(kind) => {
-            marked = [daemon_auto_prefix(kind).as_bytes(), text].concat();
-            &marked
-        }
-        None => text,
-    };
-    // #1513 PR-2: gate direct PTY injects like the notification path. Self-
-    // contained via AGEND_HOME; AGEND_HOME absent (non-daemon / unit test) →
-    // gate skipped.
-    if !force {
-        if let Ok(home) = std::env::var("AGEND_HOME") {
-            let home = std::path::Path::new(&home);
-            if crate::inbox::notify::should_defer_direct_inject(home, name) {
-                // Gated direct injects (cron / replay) are UTF-8 text wakes;
-                // enqueue ambient-class for the per-tick flush to drain once the
-                // pane settles (the flush re-injects via the api INJECT path,
-                // landing back here with force=true — byte-equivalent delivery).
-                // #1630: this enqueue IS the deferred-delivery path — if it
-                // fails the wake is lost outright. The fn returns Result and the
-                // callers handle it (e.g. daemon::replay logs "replay inject
-                // failed"), so propagate rather than swallow. anyhow→AgendError
-                // has no generic variant, so map through ApiError (message
-                // preserved via Display).
-                // #t-3558 P2: an AGEND-AUTO nudge (auto_kind set) routes through
-                // the coalescing enqueue so a non-draining agent can't stack
-                // identical same-kind retry nudges (keep-latest). Everything else
-                // keeps the plain ambient enqueue.
-                let text_str = String::from_utf8_lossy(text);
-                let enq = if auto_kind.is_some() {
-                    crate::notification_queue::enqueue_coalesced_auto(home, name, &text_str)
-                } else {
-                    crate::notification_queue::enqueue_classified(home, name, &text_str, false)
-                };
-                return enq.map_err(|e| {
-                    crate::error::AgendError::ApiError(format!("deferred enqueue: {e}"))
-                });
-            }
-        }
+    // AUDIT2-006 C: prepare/gate (marker + #1513 defer) is the shared synchronous
+    // phase (sole impl in `inject_offload`); this inline variant then does the
+    // physical write directly, byte-equivalent to before. Cron uses
+    // `inject_with_target_gated_offload` to offload that physical write instead.
+    match inject_offload::prepare_inject(name, text, force, auto_kind) {
+        inject_offload::InjectPrep::Deferred(result) => result,
+        inject_offload::InjectPrep::Proceed(marked) => inject_with_target(target, &marked),
     }
-    inject_with_target(target, text)
 }
 
 /// #1146: inner inject that works on a snapshot of fields rather than a
