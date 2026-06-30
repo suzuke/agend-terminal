@@ -165,14 +165,82 @@ fn is_stuck_resume(
         && silent > timeout
 }
 
+/// What the watchdog should do with one agent this tick — computed BEFORE any
+/// auto-Fresh decision so an auth-expired agent is routed away from the
+/// (useless-for-auth) restart ladder.
+#[derive(Debug, PartialEq, Eq)]
+enum Situation {
+    /// Nothing actionable this tick.
+    Ignore,
+    /// Claude authorization expired: exclude from auto-Fresh and page the
+    /// operator (fire-once). A respawn cannot fix auth — a fresh process is just
+    /// as unauthenticated — only the operator can re-authenticate.
+    AuthExpired,
+    /// A stuck `Resume`: eligible for the bounded auto-Fresh ladder.
+    StuckResume,
+}
+
+/// Pure classifier for one agent, so the auth-vs-stuck precedence is
+/// unit-testable without a registry. AUTH TAKES PRECEDENCE: it is recognised via
+/// the EXISTING detection (`backend_profile.rs` regex → `AgentState::AuthError`,
+/// red-anchor FP-guarded — we reuse that signal rather than re-implement loose
+/// string matching at this layer, so the FP boundary is inherited for free). It
+/// is gated to `Resume` to stay inside this watchdog's domain (the module force-
+/// restarts only `Resume` spawns) and disjoint from the supervisor's general
+/// AuthError flow. `AuthError` and `Starting/Restarting` are different
+/// `AgentState`s, so this never reclassifies a genuine stuck Resume.
+fn classify(
+    spawn_mode: SpawnMode,
+    state: AgentState,
+    since_elapsed: Duration,
+    silent: Duration,
+    timeout: Duration,
+) -> Situation {
+    if spawn_mode == SpawnMode::Resume && state == AgentState::AuthError {
+        return Situation::AuthExpired;
+    }
+    if is_stuck_resume(spawn_mode, state, since_elapsed, silent, timeout) {
+        return Situation::StuckResume;
+    }
+    Situation::Ignore
+}
+
+/// Fire-once-until-recovered latch resolver, pure for unit tests. Given the set
+/// of agents currently auth-expired this tick and the latch of already-paged
+/// names (mutated in place): clears the latch for any agent that recovered (no
+/// longer auth-expired) or left, then returns the newly-auth-expired agents to
+/// page now (and latches them). Net effect: each auth-expiry episode pages the
+/// operator exactly once, but a *later* re-expiry after recovery pages again.
+fn auth_notify_targets(auth_now: &HashSet<String>, latch: &mut HashSet<String>) -> Vec<String> {
+    // Forgive recovered/absent agents so a future re-expiry can page again.
+    latch.retain(|n| auth_now.contains(n));
+    // Page each newly-detected auth-expired agent once.
+    let mut to_notify = Vec::new();
+    for n in auth_now {
+        if latch.insert(n.clone()) {
+            to_notify.push(n.clone());
+        }
+    }
+    to_notify
+}
+
 pub(crate) struct RespawnWatchdogHandler {
     retries: Mutex<HashMap<String, RetryRecord>>,
+    /// Fire-once-until-recovered latch for the auth-expiry operator page. Holds
+    /// the names already paged this auth-expiry episode so a still-AuthError
+    /// agent (re-detected every tick) is not re-paged. Lives on the HANDLER
+    /// (daemon-lifetime); `auth_notify_targets` clears an entry when its agent
+    /// recovers (leaves AuthError) or leaves the registry, so a *later*
+    /// re-expiry pages again. Separate from `retries` because an auth-expired
+    /// agent is deliberately NOT on the auto-Fresh ladder.
+    auth_notified: Mutex<HashSet<String>>,
 }
 
 impl RespawnWatchdogHandler {
     pub(crate) fn new() -> Self {
         Self {
             retries: Mutex::new(HashMap::new()),
+            auth_notified: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -195,9 +263,10 @@ impl PerTickHandler for RespawnWatchdogHandler {
         // the full live name-set. No I/O / api::call under the lock — the
         // recovery work runs in phase 2 after the guard drops (lock-ordering /
         // #1593 deadlock-class discipline, mirroring recovery_dispatcher).
-        let (stuck, live): (Vec<String>, HashSet<String>) = {
+        let (stuck, auth, live): (Vec<String>, HashSet<String>, HashSet<String>) = {
             let reg = agent::lock_registry_tracked(ctx.registry, "respawn_watchdog");
             let mut stuck = Vec::new();
+            let mut auth = HashSet::new();
             let mut live = HashSet::new();
             for handle in reg.values() {
                 let name = handle.name.to_string();
@@ -221,21 +290,48 @@ impl PerTickHandler for RespawnWatchdogHandler {
                 let since_elapsed = core.state.since.elapsed();
                 let silent = core.state.last_output.elapsed();
                 drop(core);
-                if is_stuck_resume(
+                // Consult auth-expiry BEFORE the stuck/auto-Fresh decision: an
+                // AuthError agent must never be auto-Fresh'd (respawn can't
+                // re-authenticate) — route it to an actionable operator page
+                // instead, mirroring the `:214` Paused exclusion.
+                match classify(
                     spawn_mode,
                     state,
                     since_elapsed,
                     silent,
                     RESPAWN_STUCK_TIMEOUT,
                 ) {
-                    stuck.push(name);
+                    Situation::AuthExpired => {
+                        auth.insert(name);
+                    }
+                    Situation::StuckResume => {
+                        stuck.push(name);
+                    }
+                    Situation::Ignore => {}
                 }
             }
-            (stuck, live)
+            (stuck, auth, live)
         };
 
         // Forgive/evict stale retry records (agent recovered or left).
         self.gc_records(&stuck, &live);
+
+        // Auth-expiry pass (lock dropped): page the operator once per episode,
+        // never auto-Fresh. The latch is on the handler so a still-AuthError
+        // agent is not re-paged each tick.
+        let auth_targets = {
+            let mut latch = self.auth_notified.lock();
+            auth_notify_targets(&auth, &mut latch)
+        };
+        for name in &auth_targets {
+            crate::event_log::log(
+                ctx.home,
+                "respawn_watchdog_auth_expiry",
+                name,
+                "Claude auth expired on a resume — paged operator, skipped auto-Fresh",
+            );
+            notify_auth_expiry(name);
+        }
 
         // Phase 2 (lock dropped): decide + act per stuck agent.
         for name in &stuck {
@@ -382,6 +478,32 @@ fn notify_escalation(name: &str, attempts: u32) {
     );
 }
 
+/// Page the operator that an agent's Claude authorization has expired (detected
+/// via the existing `AgentState::AuthError`). Unlike a stuck Resume this is NOT
+/// auto-recoverable — a fresh respawn would be just as unauthenticated — so the
+/// watchdog deliberately SKIPS auto-Fresh and asks the operator to re-login.
+/// Mirrors `notify_escalation`'s Error-severity, Sleep-penetrating
+/// `notify_all_escalation_channels` path; fire-once via the `auth_notified`
+/// latch in `run`. Message names the only effective action (re-authenticate).
+fn notify_auth_expiry(name: &str) {
+    tracing::error!(
+        target: TARGET,
+        agent = %name,
+        "respawn-stuck watchdog: agent in AuthError on a Resume — Claude auth expired, paging operator (auto-Fresh skipped)"
+    );
+    let msg = format!(
+        "🔑 {name}: Claude 授權過期（偵測到 AuthError）。自動重啟無法修復授權，已略過 auto-Fresh —— \
+         只有操作者能重新登入。請在該 agent 的 pane 重新授權（執行 `claude` / `/login` 完成登入），\
+         授權後再 `restart_instance` resume 即可。"
+    );
+    crate::channel::notify_all_escalation_channels(
+        name,
+        crate::channel::NotifySeverity::Error,
+        &msg,
+        false,
+    );
+}
+
 /// Page the operator that a single auto-Fresh restart's SPAWN failed (agent
 /// likely gone), so a failed recovery is surfaced, not silently dropped.
 fn notify_restart_failed(name: &str) {
@@ -478,6 +600,144 @@ mod tests {
             Duration::from_secs(30),
             RESPAWN_STUCK_TIMEOUT,
         ));
+    }
+
+    // ── auth-expiry classification (route away from auto-Fresh) ─────────
+
+    #[test]
+    fn classify_auth_error_on_resume_is_auth_expired() {
+        // An AuthError agent spawned via Resume must be routed to the operator
+        // page, NOT the auto-Fresh ladder (respawn can't re-authenticate).
+        assert_eq!(
+            classify(
+                SpawnMode::Resume,
+                AgentState::AuthError,
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::AuthExpired
+        );
+    }
+
+    #[test]
+    fn classify_auth_error_takes_precedence_over_timing() {
+        // Even well within the stuck timeout, AuthError is auth-expiry — the
+        // timing gates are irrelevant once the auth signal is present.
+        assert_eq!(
+            classify(
+                SpawnMode::Resume,
+                AgentState::AuthError,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::AuthExpired
+        );
+    }
+
+    #[test]
+    fn classify_auth_error_non_resume_is_ignored_by_watchdog() {
+        // Gated to the watchdog's Resume domain (the supervisor's general
+        // AuthError flow owns non-Resume auth pages); a Fresh AuthError agent is
+        // not this handler's concern.
+        assert_eq!(
+            classify(
+                SpawnMode::Fresh,
+                AgentState::AuthError,
+                Duration::from_secs(120),
+                Duration::from_secs(120),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_stuck_resume_still_fires_no_regression() {
+        // The existing stuck-Resume behaviour is preserved: a non-auth stuck
+        // Resume still routes to the auto-Fresh ladder.
+        assert_eq!(
+            classify(
+                SpawnMode::Resume,
+                AgentState::Starting,
+                Duration::from_secs(61),
+                Duration::from_secs(61),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::StuckResume
+        );
+    }
+
+    #[test]
+    fn classify_healthy_and_slow_fresh_are_ignored() {
+        // An idle (healthy) agent and a slow-but-healthy Fresh boot are both
+        // left alone — no false auth page, no false auto-Fresh.
+        assert_eq!(
+            classify(
+                SpawnMode::Resume,
+                AgentState::Idle,
+                Duration::from_secs(600),
+                Duration::from_secs(600),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::Ignore
+        );
+        assert_eq!(
+            classify(
+                SpawnMode::Fresh,
+                AgentState::Starting,
+                Duration::from_secs(600),
+                Duration::from_secs(600),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::Ignore
+        );
+    }
+
+    // ── auth-expiry fire-once-until-recovered latch ─────────────────────
+
+    fn names(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn auth_latch_pages_each_agent_once_then_stays_silent() {
+        let mut latch = HashSet::new();
+        let auth = names(&["a", "b"]);
+        // First detection pages both (order-independent).
+        let mut first = auth_notify_targets(&auth, &mut latch);
+        first.sort();
+        assert_eq!(first, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(latch, names(&["a", "b"]));
+        // Still auth-expired next tick → no re-page.
+        let second = auth_notify_targets(&auth, &mut latch);
+        assert!(
+            second.is_empty(),
+            "fire-once: no re-page while still expired"
+        );
+        assert_eq!(latch, names(&["a", "b"]));
+    }
+
+    #[test]
+    fn auth_latch_clears_on_recovery_then_repages_on_reexpiry() {
+        let mut latch = names(&["a"]);
+        // "a" recovered (no longer auth-expired) → latch cleared, nothing paged.
+        let recovered = auth_notify_targets(&HashSet::new(), &mut latch);
+        assert!(recovered.is_empty());
+        assert!(latch.is_empty(), "recovered agent forgiven");
+        // Later re-expiry pages again (new episode).
+        let reexpiry = auth_notify_targets(&names(&["a"]), &mut latch);
+        assert_eq!(reexpiry, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn auth_latch_only_pages_newly_expired_agents() {
+        let mut latch = names(&["a"]); // "a" already paged
+        let now = names(&["a", "b"]); // "b" newly expired
+        let targets = auth_notify_targets(&now, &mut latch);
+        assert_eq!(targets, vec!["b".to_string()], "only the new one pages");
+        assert_eq!(latch, names(&["a", "b"]));
     }
 
     // ── bounded-retry / cooldown / fire-once-escalate state machine ──────
