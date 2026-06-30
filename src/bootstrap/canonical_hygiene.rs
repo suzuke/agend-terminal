@@ -60,16 +60,71 @@ pub enum CanonicalAction {
     StashAndSwitchToDefault,
 }
 
-/// Hygiene entry — discover distinct canonical repos from
-/// `config.instances[*].source_repo` and apply [`apply_to_canonical`]
-/// to each. Best-effort: any per-canonical failure is logged and
-/// skipped (the caller — boot or per-tick runtime — must never fail
-/// because hygiene couldn't shell out to git).
+/// A managed canonical repo found DIRTY on the default branch (non-ignored
+/// working-tree changes while HEAD is on `main`). Produced by
+/// [`apply_to_canonical`] as a pure value; the caller decides whether/how to
+/// notify (boot notifies once; the runtime tracker throttles by [`fingerprint`]).
 ///
-/// Called from two sites: `bootstrap/mod.rs` at daemon startup and
-/// `daemon/canonical_drift.rs` per-tick (5-min throttled cadence).
-pub(crate) fn run_hygiene(config: &crate::fleet::FleetConfig) {
+/// Strict policy (operator-chosen): under AgEnD management the canonical default
+/// branch must stay clean — agents and operators work in worktrees. We report
+/// "managed canonical is dirty", NOT "an agent did it"; we have no provenance, so
+/// the wording avoids attribution.
+///
+/// [`fingerprint`]: CanonicalDirtyReport::fingerprint
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalDirtyReport {
+    /// Canonical repo path (a `source_repo` from fleet.yaml).
+    pub path: std::path::PathBuf,
+    /// Raw `git status --porcelain` lines (non-ignored entries), original order,
+    /// preserved verbatim for the audit trail.
+    pub porcelain_lines: Vec<String>,
+    /// Stable, order-independent hash of the dirty set — the re-alert throttle
+    /// key. "Same WIP still dirty" yields the same fingerprint; a changed dirty
+    /// set yields a new one, so the throttle re-notifies immediately on change.
+    pub fingerprint: u64,
+}
+
+impl CanonicalDirtyReport {
+    fn from_status(path: &std::path::Path, porcelain: &str) -> Self {
+        let porcelain_lines: Vec<String> = porcelain
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        // Fingerprint over a SORTED copy so git's line ordering doesn't perturb
+        // the throttle key — only the actual set of changes matters.
+        let mut sorted = porcelain_lines.clone();
+        sorted.sort();
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            sorted.hash(&mut h);
+            h.finish()
+        };
+        Self {
+            path: path.to_path_buf(),
+            porcelain_lines,
+            fingerprint,
+        }
+    }
+}
+
+/// Hygiene entry — discover distinct canonical repos from
+/// `config.instances[*].source_repo`, apply [`apply_to_canonical`] to each, and
+/// return the set found dirty on the default branch (strict-policy L2 detection).
+/// Best-effort: any per-canonical failure is logged and skipped (the caller —
+/// boot or per-tick runtime — must never fail because hygiene couldn't shell out
+/// to git).
+///
+/// Called from two sites: `bootstrap/mod.rs` at daemon startup (notifies each
+/// report once) and `daemon/canonical_drift.rs` per-tick (throttles re-alerts by
+/// fingerprint). The HEAD-hygiene side effect (auto-switch/stash of a detached
+/// canonical) is unchanged — the dirty report is an orthogonal, additive output.
+pub(crate) fn run_hygiene_with_dirty_report(
+    config: &crate::fleet::FleetConfig,
+) -> Vec<CanonicalDirtyReport> {
     let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
+    let mut dirty = Vec::new();
     for (name, instance) in &config.instances {
         let Some(source_repo) = instance.source_repo.as_ref() else {
             continue;
@@ -86,8 +141,11 @@ pub(crate) fn run_hygiene(config: &crate::fleet::FleetConfig) {
             );
             continue;
         }
-        apply_to_canonical(&path);
+        if let Some(report) = apply_to_canonical(&path) {
+            dirty.push(report);
+        }
     }
+    dirty
 }
 
 /// Run the canonical-hygiene decision against a single canonical
@@ -99,17 +157,24 @@ pub(crate) fn run_hygiene(config: &crate::fleet::FleetConfig) {
 /// `emit_dirty_detached_warning` directly — no half-switch, no
 /// mutation, operator's WIP preserved).
 ///
-/// Best-effort: subprocess failures log a debug line and return; the
+/// Best-effort: subprocess failures log a debug line and return `None`; the
 /// daemon boot continues regardless.
-pub(crate) fn apply_to_canonical(canonical: &std::path::Path) {
-    let head_state = match git_capture(canonical, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-        Some(s) => s,
-        None => return,
-    };
-    let status = match git_capture(canonical, &["status", "--porcelain"]) {
-        Some(s) => s,
-        None => return,
-    };
+///
+/// L2 (strict policy): in ADDITION to the HEAD-state side effects, returns
+/// `Some(CanonicalDirtyReport)` when the canonical is on the default branch with a
+/// non-ignored dirty working tree — a worktree-discipline violation the caller
+/// surfaces to the operator. The HEAD action and the dirty report are orthogonal:
+/// `main + dirty` still maps to `NoOp` for the HEAD action (we never stash/switch
+/// the operator's branch), and detached states never produce a dirty report
+/// (their WIP is handled by the stash path).
+pub(crate) fn apply_to_canonical(canonical: &std::path::Path) -> Option<CanonicalDirtyReport> {
+    let head_state = git_capture(canonical, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    // `--untracked-files=normal` is explicit so a global `status.showUntrackedFiles=no`
+    // can't hide an untracked stray file (exactly the SESSION-HANDOFF-006.md class).
+    let status = git_capture(
+        canonical,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
     let working_tree_clean = status.is_empty();
     match decide_canonical_action(&head_state, working_tree_clean) {
         CanonicalAction::NoOp => {}
@@ -143,6 +208,17 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) {
         CanonicalAction::StashAndSwitchToDefault => {
             apply_stash_and_switch(canonical);
         }
+    }
+
+    // L2 (strict): a managed canonical on the default branch must stay clean. A
+    // non-ignored dirty tree here means someone wrote into the canonical working
+    // tree instead of a worktree — return a report so the caller notifies (with
+    // runtime re-alert throttling). Detached states are handled by the stash path
+    // above; they have `head_state != DEFAULT_BRANCH`, so they never surface here.
+    if head_state == DEFAULT_BRANCH && !working_tree_clean {
+        Some(CanonicalDirtyReport::from_status(canonical, &status))
+    } else {
+        None
     }
 }
 
@@ -248,6 +324,48 @@ fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &st
     );
     let source = crate::inbox::NotifySource::System("canonical_auto_stash");
     crate::inbox::notify_agent(&home, "general", &source, &text);
+}
+
+/// L2: notify the operator-mapped agent (`general`, per convention) that a managed
+/// canonical repo is DIRTY on the default branch, and record a structured audit
+/// event. Strict-policy wording surfaces the violation + the fix (use a worktree /
+/// move scratch out) WITHOUT attributing it to any agent — we have no provenance.
+/// The notification body is bounded (first `MAX_LINES` porcelain entries + a
+/// count); the full porcelain list goes to the event log for audit.
+pub(crate) fn notify_operator_of_canonical_dirty(report: &CanonicalDirtyReport) {
+    const MAX_LINES: usize = 10;
+    let home = crate::home_dir();
+    let total = report.porcelain_lines.len();
+    let mut body: String = report
+        .porcelain_lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|l| format!("\n  {l}"))
+        .collect();
+    if total > MAX_LINES {
+        body.push_str(&format!(
+            "\n  … (+{} more; full list in event log)",
+            total - MAX_LINES
+        ));
+    }
+    let text = format!(
+        "[system:canonical_dirty] Managed canonical repo `{path}` is DIRTY on \
+         {branch} ({total} non-ignored change(s)). Canonical repos must stay clean \
+         under AgEnD — work in a git worktree and move any scratch/handoff files \
+         OUT of the canonical tree.{body}\nInspect: git -C {path} status",
+        path = report.path.display(),
+        branch = DEFAULT_BRANCH,
+    );
+    let source = crate::inbox::NotifySource::System("canonical_dirty");
+    crate::inbox::notify_agent(&home, "general", &source, &text);
+
+    // Structured audit trail — full (unbounded) porcelain for forensic detail.
+    crate::event_log::log(
+        &home,
+        "canonical_dirty_detected",
+        &report.path.display().to_string(),
+        &report.porcelain_lines.join("; "),
+    );
 }
 
 /// Pure helper: shell out to git with `AGEND_GIT_BYPASS=1` (so we
@@ -460,8 +578,9 @@ mod tests {
         // Plant the index lock so `git stash push` cannot complete.
         std::fs::write(canonical.join(".git").join("index.lock"), "").unwrap();
 
-        // Drive apply. Must not panic; HEAD must remain detached.
-        apply_to_canonical(&canonical);
+        // Drive apply. Must not panic; HEAD must remain detached. (Detached →
+        // no default-branch dirty report; the stash path owns this WIP.)
+        let _ = apply_to_canonical(&canonical);
 
         let head_state = String::from_utf8(run(&["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
             .unwrap()
@@ -478,6 +597,97 @@ mod tests {
         assert!(
             !stash_ref.exists(),
             "stash ref must not exist when git stash push failed"
+        );
+
+        let _ = std::fs::remove_dir_all(&canonical);
+    }
+
+    /// L2 strict-policy detection (the SESSION-HANDOFF-006.md incident): a managed
+    /// canonical on `main` must report ANY non-ignored dirty state, while an
+    /// exactly-gitignored variant stays silent. Walks one repo through several
+    /// states asserting the dirty report at each.
+    #[test]
+    fn apply_to_canonical_reports_dirty_main_strict_l2() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let canonical = std::env::temp_dir().join(format!(
+            "agend-test-canonical-l2-dirty-{}-{id}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&canonical);
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&canonical)
+                .args(args)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command spawn")
+        };
+        assert!(run(&["init", "-q", "-b", "main"]).status.success());
+        // .gitignore ignores EXACTLY `SESSION-HANDOFF.md` (mirrors the real repo's
+        // exact-match ignore that the `-006` variant slipped past).
+        std::fs::write(canonical.join(".gitignore"), "SESSION-HANDOFF.md\n").unwrap();
+        std::fs::write(canonical.join("file.txt"), "initial\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success());
+        assert!(run(&["commit", "-q", "-m", "initial"]).status.success());
+
+        // 1. Clean main → no report.
+        assert!(
+            apply_to_canonical(&canonical).is_none(),
+            "clean main must not report dirty"
+        );
+
+        // 2. Only an exactly-gitignored file present → still no report (porcelain
+        //    excludes ignored entries).
+        std::fs::write(canonical.join("SESSION-HANDOFF.md"), "ignored handoff\n").unwrap();
+        assert!(
+            apply_to_canonical(&canonical).is_none(),
+            "an only-gitignored dirty file must NOT report (it can't pollute git)"
+        );
+
+        // 3. The incident: an untracked, NON-ignored stray → report includes it.
+        std::fs::write(canonical.join("SESSION-HANDOFF-006.md"), "stray on main\n").unwrap();
+        let report = apply_to_canonical(&canonical)
+            .expect("untracked non-ignored stray on main MUST report (the -006 incident)");
+        assert!(
+            report
+                .porcelain_lines
+                .iter()
+                .any(|l| l.contains("SESSION-HANDOFF-006.md")),
+            "report must carry the stray file's porcelain line"
+        );
+        assert!(
+            !report
+                .porcelain_lines
+                .iter()
+                .any(|l| l.contains("SESSION-HANDOFF.md\"") || l.ends_with("SESSION-HANDOFF.md")),
+            "the gitignored variant must NOT appear in the report"
+        );
+        let fp_untracked = report.fingerprint;
+
+        // 4. A tracked modification also alerts, with a DIFFERENT fingerprint.
+        std::fs::remove_file(canonical.join("SESSION-HANDOFF-006.md")).unwrap();
+        std::fs::write(canonical.join("file.txt"), "modified-on-main\n").unwrap();
+        let report2 =
+            apply_to_canonical(&canonical).expect("a tracked modification on main must report");
+        assert!(
+            report2
+                .porcelain_lines
+                .iter()
+                .any(|l| l.contains("file.txt")),
+            "report must carry the modified tracked file"
+        );
+        assert_ne!(
+            report2.fingerprint, fp_untracked,
+            "a different dirty set must yield a different fingerprint"
         );
 
         let _ = std::fs::remove_dir_all(&canonical);
