@@ -43,9 +43,10 @@ fn run_hook(home: &std::path::Path, stdin_json: &str) -> i32 {
     child.wait().unwrap().code().unwrap_or(-1)
 }
 
-fn tool_json(file_path: &std::path::Path) -> String {
+fn tool_json(tool_name: &str, file_path: &std::path::Path) -> String {
     format!(
-        r#"{{"tool_name":"Write","tool_input":{{"file_path":{:?}}}}}"#,
+        r#"{{"tool_name":{:?},"tool_input":{{"file_path":{:?}}}}}"#,
+        tool_name,
         file_path.to_string_lossy()
     )
 }
@@ -70,24 +71,43 @@ fn blocks_write_into_canonical_root_allows_worktree_and_fails_open() {
     // 1. Write INTO the canonical working tree (the SESSION-HANDOFF-006.md class) → blocked.
     let inside = canonical.join("SESSION-HANDOFF-006.md");
     assert_eq!(
-        run_hook(&tmp, &tool_json(&inside)),
+        run_hook(&tmp, &tool_json("Write", &inside)),
         2,
-        "a write inside a canonical root must be blocked (exit 2)"
+        "a Write inside a canonical root must be blocked (exit 2)"
+    );
+    // Edit + NotebookEdit are guarded too.
+    assert_eq!(
+        run_hook(&tmp, &tool_json("Edit", &inside)),
+        2,
+        "an Edit inside a canonical root must be blocked (exit 2)"
     );
 
     // 2. Write into a worktree (NOT under any canonical root) → allowed.
     let worktree_file = tmp.join("worktree").join("src").join("lib.rs");
     assert_eq!(
-        run_hook(&tmp, &tool_json(&worktree_file)),
+        run_hook(&tmp, &tool_json("Write", &worktree_file)),
         0,
         "a write outside every canonical root (a worktree) must be allowed (exit 0)"
     );
 
-    // 3. No roots file published → fail OPEN (advisory guard must not block).
+    // 3. NON-write tools are NOT guarded, even with a canonical file_path: the hook
+    //    is self-defending on tool_name, not reliant on the settings.json matcher.
+    assert_eq!(
+        run_hook(&tmp, &tool_json("Read", &inside)),
+        0,
+        "a Read of a canonical-root path must be allowed (only write tools are guarded)"
+    );
+    assert_eq!(
+        run_hook(&tmp, &tool_json("Grep", &inside)),
+        0,
+        "an unknown/non-write tool with a canonical file_path must be allowed"
+    );
+
+    // 4. No roots file published → fail OPEN (advisory guard must not block).
     let empty_home = tmp.join("empty-home");
     std::fs::create_dir_all(&empty_home).unwrap();
     assert_eq!(
-        run_hook(&empty_home, &tool_json(&inside)),
+        run_hook(&empty_home, &tool_json("Write", &inside)),
         0,
         "with no canonical-roots.json the hook must fail open (exit 0)"
     );

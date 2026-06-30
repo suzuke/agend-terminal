@@ -33,6 +33,11 @@ try:
     roots = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
+# Self-defending: only the file-WRITE tools are guarded. Read/Grep/Bash/etc. — and
+# any unknown tool — pass through untouched even if their payload carries a
+# canonical file_path. Do not rely on the settings.json matcher alone.
+if (data.get("tool_name") or "") not in ("Write", "Edit", "NotebookEdit"):
+    sys.exit(0)
 ti = data.get("tool_input") or {}
 fp = ti.get("file_path") or ti.get("notebook_path")
 if not fp:
