@@ -13,6 +13,7 @@ mod crash_respawn;
 pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
+pub(crate) mod delivery_worker;
 pub(crate) mod dispatch_idle;
 pub(crate) mod escalation_persist;
 pub(crate) mod event_bus;
