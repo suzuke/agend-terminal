@@ -1956,6 +1956,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
         }
         f.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        crate::store::fsync_parent_dir(&path); // AUDIT2-015: durable rename
         Ok(())
     })();
     if rewrite.is_ok() {

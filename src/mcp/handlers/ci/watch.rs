@@ -110,6 +110,19 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["ci_provider"] = json!(p);
     }
     if let Some(u) = args["ci_provider_url"].as_str() {
+        // AUDIT2-001: the daemon will refuse to send the forge token to an
+        // untrusted host. Surface that once, at subscribe time, so a legitimate
+        // self-hosted GHE/GitLab operator knows to allowlist the host rather
+        // than silently polling unauthenticated.
+        if !u.is_empty() && !crate::daemon::ci_watch::host_receives_credentials(u) {
+            tracing::warn!(
+                ci_provider_url = %u,
+                "ci watch: ci_provider_url host is not in the CI trusted-host \
+                 allowlist; the forge token will NOT be sent to it (prevents \
+                 token exfiltration). Set AGEND_CI_TRUSTED_HOSTS=<host> to allow \
+                 a self-hosted GHE/GitLab host."
+            );
+        }
         watch["ci_provider_url"] = json!(u);
     }
     watch["subscribers"] = json!(subscribers_json);

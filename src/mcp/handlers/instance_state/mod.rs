@@ -153,12 +153,32 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
     }
 }
 
-pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_delete_instance(
+    home: &Path,
+    args: &Value,
+    sender: &Option<crate::identity::Sender>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
+    // AUDIT2-002: deleting an instance tears down its PTY, inbox and worktree and
+    // orphans its tasks. Restrict an identified caller to deleting itself or a
+    // member of a team it orchestrates — a peer can no longer remove another
+    // agent by naming it. Anonymous (no sender: operator-direct / standalone)
+    // keeps full authority (the TUI close path calls `full_delete_instance`).
+    if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
+        if caller != name && !crate::teams::is_orchestrator_of(home, caller, name) {
+            return serde_json::json!({
+                "error": format!(
+                    "permission denied: '{caller}' cannot delete '{name}' \
+                     (only the instance itself or its team orchestrator may)"
+                ),
+                "code": "not_owner_or_orchestrator"
+            });
+        }
+    }
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     if let Some(ref config) = fleet {
         if config.channel.is_some()
@@ -534,6 +554,32 @@ pub(super) fn resolve_team_layout(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn delete_instance_denies_non_owner_non_orchestrator_audit2_002() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-2002-del-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A peer that is neither the target nor its orchestrator is denied — the
+        // ACL fires before any teardown / existence check.
+        let attacker = crate::identity::Sender::new("attacker");
+        let denied =
+            handle_delete_instance(&home, &serde_json::json!({"instance": "victim"}), &attacker);
+        assert_eq!(
+            denied["code"], "not_owner_or_orchestrator",
+            "non-owner delete must be denied: {denied}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn dirty_worktree(tag: &str) -> std::path::PathBuf {

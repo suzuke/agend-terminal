@@ -409,7 +409,21 @@ fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Re
         digest_input.push('\n');
     }
     let digest = stage_digest(digest_input.as_bytes());
-    let stage = home.join(".skills-stage").join(&digest);
+    let stage_root = home.join(".skills-stage");
+    let stage = stage_root.join(&digest);
+    // AUDIT2-013: serialize same-digest installs under a per-digest lock. Without
+    // it, two concurrent installs with the same allowlist compute the same path,
+    // and B's `remove_dir_all` wipes A's half-built tree mid-copy — A's
+    // `copy_dir_recursive` then hits ENOENT and aborts A's boot with missing
+    // skills (`create_dir_all`'s EEXIST-is-Ok makes the collision silent). The
+    // lock makes the remove + repopulate atomic w.r.t. other builders.
+    std::fs::create_dir_all(&stage_root)
+        .with_context(|| format!("create stage root {}", stage_root.display()))?;
+    // AUDIT2-013 (review): FAIL CLOSED if the per-digest lock can't be acquired —
+    // proceeding to remove/rebuild unlocked would re-open the same-digest race
+    // this guard prevents.
+    let _stage_lock = crate::store::acquire_file_lock(&stage_root.join(format!("{digest}.lock")))
+        .with_context(|| format!("acquire skills-stage lock for digest {digest}"))?;
     if stage.exists() {
         std::fs::remove_dir_all(&stage)
             .with_context(|| format!("clean stage {}", stage.display()))?;
@@ -472,6 +486,22 @@ pub fn cleanup_stale_stages(
     for entry in entries.flatten() {
         let path = entry.path();
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            // AUDIT2-013 follow-up: reap our own per-digest `.lock` files (siblings
+            // of the stage dirs) once they're past the retention window, so they
+            // don't accumulate one-per-allowlist forever. Only stale locks (no
+            // active install touched them within `retention_secs`) are removed.
+            if path.extension().and_then(|e| e.to_str()) == Some("lock") {
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs() >= retention_secs)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
             continue;
         }
         report.candidates += 1;

@@ -129,23 +129,17 @@ pub fn recover_half_writes(home: &Path) {
                     let _ = writeln!(rf, "{l}");
                 }
             }
-            // Rewrite the inbox with only the good lines via tmp + atomic rename
-            // (mirrors drain/sweep write-back) so every valid message survives.
-            let tmp = path.with_extension("jsonl.tmp");
-            let rewrite = (|| -> std::io::Result<()> {
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&tmp)?;
-                for l in &kept {
-                    writeln!(f, "{l}")?;
-                }
-                f.sync_all()?;
-                std::fs::rename(&tmp, &path)?;
-                Ok(())
-            })();
-            if rewrite.is_ok() {
+            // Rewrite the inbox with only the good lines, keeping every valid
+            // message. AUDIT2-015: route through `store::atomic_write` (tmp +
+            // fsync + rename + PARENT-DIR fsync) rather than a hand-rolled
+            // tmp+rename that fsync'd only the file — a crash right after
+            // `rename()` returned could otherwise lose the rename.
+            let mut content = String::new();
+            for l in &kept {
+                content.push_str(l);
+                content.push('\n');
+            }
+            if crate::store::atomic_write(&path, content.as_bytes()).is_ok() {
                 recovered += 1;
             }
         }

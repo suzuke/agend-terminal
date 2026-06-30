@@ -1046,17 +1046,9 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 }
                 continue;
             }
-            match exit_event {
-                crate::agent::AgentExitEvent::CleanExit(ref name) => {
-                    handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
-                }
-                crate::agent::AgentExitEvent::Stage2Restart(name) => {
-                    spawn_stage2_thread(home, &name, &ctx);
-                }
-                crate::agent::AgentExitEvent::Crash(name) => {
-                    crash_respawn::handle_crash_respawn(home, &name, &ctx);
-                }
-            }
+            // AUDIT2-007: panic-isolated (helper lives in `per_tick` to keep this
+            // grandfathered file under its anti-monolith ceiling).
+            per_tick::dispatch_exit_event_guarded(exit_event, home, &ctx);
         }
 
         log_residual_worktrees(home);

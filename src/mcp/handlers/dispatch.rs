@@ -211,7 +211,7 @@ adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
 adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
 adapter!(
     dispatch_delete_instance,
-    ha,
+    has,
     instance::handle_delete_instance
 );
 adapter!(dispatch_start_instance, ha, instance::handle_start_instance);

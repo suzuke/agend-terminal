@@ -432,18 +432,22 @@ pub(crate) fn is_due_in_tz(
     last_check_utc: chrono::DateTime<chrono::Utc>,
     now_utc: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let now_local = now_utc.with_timezone(&tz);
     let last_check_local = last_check_utc.with_timezone(&tz);
-    // #N3: `.take(1)` is the intentional COALESCE — return "due" if the FIRST
-    // cron instant after `last_check` is at/before `now`, regardless of how many
-    // further instants also lie in the window. The caller fires once. This is the
-    // contract for a reminder system: a sub-tick cron or a post-downtime catch-up
-    // window must not replay a burst of identical static reminders. (NOT a bug —
-    // see the `check_schedules` doc.)
+    // AUDIT2-010: bound the window in real (UTC) time, not local. During a DST
+    // fall-back the repeated wall-clock hour makes `.after(last_check_local)`
+    // yield an instant whose UTC PRECEDES `last_check` (the earlier ambiguous
+    // resolution, e.g. 01:30 EDT). The old `next <= now_local` instant-compare
+    // was then true on EVERY tick across the repeated hour — a ~180× re-fire
+    // storm for any cron in the fold hour. Comparing converted-to-UTC instants
+    // against `(last_check_utc, now_utc]` fires each real instant exactly once
+    // (01:30 fires twice on the fold day — once per real occurrence — which is
+    // correct). The #N3 coalesce is preserved: many instants in a catch-up
+    // window still yield a single `true`, so the caller fires once.
     schedule
         .after(&last_check_local)
-        .take(1)
-        .any(|next| next <= now_local)
+        .map(|next| next.with_timezone(&chrono::Utc))
+        .take_while(|next_utc| *next_utc <= now_utc)
+        .any(|next_utc| next_utc > last_check_utc)
 }
 
 #[cfg(test)]
@@ -617,6 +621,45 @@ mod tests {
             chrono_tz::America::Los_Angeles,
             last,
             now
+        ));
+    }
+
+    #[test]
+    fn ny_dst_fall_back_fold_hour_cron_does_not_storm_audit2_010() {
+        // 2026-11-01 fall-back: 02:00 EDT -> 01:00 EST. Wall-clock 01:30 occurs
+        // twice: 01:30 EDT = 05:30 UTC, 01:30 EST = 06:30 UTC. A cron in the fold
+        // hour must fire once at EACH real 01:30 and NOT on every tick in between
+        // — the pre-fix local compare re-fired ~180x across the repeated hour.
+        let schedule = cron("30 1 * * *"); // 01:30 daily
+        let tz = chrono_tz::America::New_York;
+
+        // Each real 01:30 fires exactly once.
+        assert!(is_due_in_tz(
+            &schedule,
+            tz,
+            Utc.with_ymd_and_hms(2026, 11, 1, 5, 29, 50).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap()
+        ));
+        assert!(is_due_in_tz(
+            &schedule,
+            tz,
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 29, 50).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 30, 0).unwrap()
+        ));
+
+        // The storm guard: ticks INSIDE the repeated hour but not at :30 must NOT
+        // fire (each of these was `true` before the fix).
+        assert!(!is_due_in_tz(
+            &schedule,
+            tz,
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 10).unwrap()
+        ));
+        assert!(!is_due_in_tz(
+            &schedule,
+            tz,
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 10, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 10, 10).unwrap()
         ));
     }
 

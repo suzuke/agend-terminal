@@ -222,7 +222,16 @@ impl Layout {
             return None;
         }
         let tab = self.tabs.remove(idx);
-        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+        // AUDIT2-016: `remove(idx)` shifts every later tab (the active one
+        // included) down by one. When a tab to the LEFT of the focused one is
+        // removed — e.g. fleet/team sync closing an agent in an earlier tab while
+        // the operator is focused elsewhere — `active` must decrement to keep
+        // pointing at the SAME tab. The pre-existing `>= len` branch only handled
+        // active-was-last; otherwise focus silently jumped to the right neighbour
+        // and keystrokes were routed to the wrong agent.
+        if self.active > idx {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() && !self.tabs.is_empty() {
             self.switch_active(self.tabs.len() - 1);
         }
         Some(tab)
@@ -667,6 +676,31 @@ mod tests {
         );
         assert!(layout.tabs[1].root().has_agent("dev"));
         assert_eq!(layout.active, 1, "recreated tab focused (add_tab parity)");
+    }
+
+    /// AUDIT2-016: closing a tab to the LEFT of the focused one must keep focus
+    /// on the same tab (it shifted left by one), not silently jump to its right
+    /// neighbour. Reproduces the fleet/team-sync close path (idx != active).
+    #[test]
+    fn close_tab_left_of_active_keeps_focus_audit2_016() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("A".into(), leaf(1, "a")));
+        layout.add_tab(Tab::new("B".into(), leaf(2, "b")));
+        layout.add_tab(Tab::new("C".into(), leaf(3, "c")));
+        layout.add_tab(Tab::new("D".into(), leaf(4, "d")));
+        layout.active = 2; // focus tab C
+
+        // A tab to the LEFT of the focused one is removed (e.g. agent in tab A
+        // deleted by fleet sync) — this is the buggy path (idx 0 < active 2).
+        layout.close_tab(0);
+        assert_eq!(layout.tabs.len(), 3);
+        assert_eq!(layout.active, 1, "focus follows C (now at idx 1), not D");
+        assert_eq!(layout.tabs[layout.active].name.as_str(), "C");
+
+        // Closing a tab to the RIGHT of focus must leave `active` untouched.
+        layout.active = 0; // focus C-now-at-0... refocus first tab
+        layout.close_tab(2); // remove the last (right of active)
+        assert_eq!(layout.active, 0, "right-of-active close leaves focus put");
     }
 
     /// #1939: all remembered sibling agents gone by respawn time → fall back

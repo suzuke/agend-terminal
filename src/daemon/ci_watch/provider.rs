@@ -19,6 +19,58 @@
 /// agend-terminal push fan-out and stays well under GitHub's 100-cap.
 pub(crate) const POLL_RUNS_PAGE_SIZE: u32 = 20;
 
+/// AUDIT2-001 (security): decide whether a CI credential may be attached to a
+/// request bound for `base_url`. An agent can supply an arbitrary
+/// `ci_provider_url` via the `ci watch` MCP tool; without this gate the daemon
+/// would send `Authorization: Bearer <forge-token>` (or the GitLab/Bitbucket
+/// equivalent) to that host — an SSRF / token-exfiltration primitive reachable
+/// even by the least-privileged role. Credentials are sent ONLY to the known
+/// SaaS API hosts over https, plus any host the operator explicitly allowlists
+/// via `AGEND_CI_TRUSTED_HOSTS` (comma-separated, for self-hosted GHE / GitLab).
+/// An untrusted host is still polled, but UNAUTHENTICATED — no secret leaves.
+pub(crate) fn host_receives_credentials(base_url: &str) -> bool {
+    // `reqwest::Url` (a re-export of the `url` crate) parses the authority
+    // correctly, including the userinfo trap: `https://api.github.com@evil/`
+    // has host `evil`, not `api.github.com`.
+    let url = match reqwest::Url::parse(base_url) {
+        Ok(u) => u,
+        Err(_) => return false, // unparseable → fail closed
+    };
+    let host = match url.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+    // Loopback never leaves the machine, so it is not an exfiltration target —
+    // allow it over any scheme (this is also where local CI mock servers live).
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "localhost"
+        || bare
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    if url.scheme() != "https" {
+        return false; // never send a credential over cleartext to a remote host
+    }
+    // Known SaaS provider API hosts (the built-in `with_base_url` defaults).
+    const DEFAULT_TRUSTED: &[&str] = &["api.github.com", "gitlab.com", "api.bitbucket.org"];
+    if DEFAULT_TRUSTED.contains(&host.as_str()) {
+        return true;
+    }
+    // Operator-configured self-hosted hosts (GHE / self-managed GitLab).
+    std::env::var("AGEND_CI_TRUSTED_HOSTS")
+        .ok()
+        .into_iter()
+        .flat_map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .any(|h| !h.is_empty() && h == host)
+}
+
 /// CR-2026-06-14: percent-encode a string for safe use as a URL QUERY-component
 /// value. Git ref names may legally contain `&`, `=`, spaces, etc.; a branch like
 /// `feat&per_page=1` interpolated raw into `?branch={branch}&…` injects a spurious
@@ -405,6 +457,7 @@ impl GitHubCiProvider {
     }
 
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        let auth_url = base_url.clone();
         Ok(Self {
             http: CiHttpClient::with_accept(
                 base_url,
@@ -414,7 +467,13 @@ impl GitHubCiProvider {
                 // centralized cache (env → gh CLI → None). The cache
                 // discovers once per process and never writes back to env,
                 // so child PTYs don't silently inherit a token.
-                || crate::github_token::cached_token().map(CiAuth::Bearer),
+                // AUDIT2-001: never hand the token to an untrusted host.
+                move || {
+                    if !host_receives_credentials(&auth_url) {
+                        return None;
+                    }
+                    crate::github_token::cached_token().map(CiAuth::Bearer)
+                },
             )?,
         })
     }
@@ -929,8 +988,13 @@ impl GitLabCiProvider {
     }
 
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        let auth_url = base_url.clone();
         Ok(Self {
-            http: CiHttpClient::new(base_url, "api/v4", || {
+            http: CiHttpClient::new(base_url, "api/v4", move || {
+                // AUDIT2-001: never hand the token to an untrusted host.
+                if !host_receives_credentials(&auth_url) {
+                    return None;
+                }
                 Self::resolve_token().map(|t| CiAuth::Header("PRIVATE-TOKEN".into(), t))
             })?,
         })
@@ -1151,8 +1215,13 @@ impl BitbucketCiProvider {
     }
 
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        let auth_url = base_url.clone();
         Ok(Self {
-            http: CiHttpClient::new(base_url, "2.0", || {
+            http: CiHttpClient::new(base_url, "2.0", move || {
+                // AUDIT2-001: never hand the token to an untrusted host.
+                if !host_receives_credentials(&auth_url) {
+                    return None;
+                }
                 Self::resolve_token().map(|t| {
                     let parts: Vec<&str> = t.splitn(2, ':').collect();
                     if parts.len() == 2 {
@@ -1421,3 +1490,37 @@ fn is_short_form_repo(repo: &str) -> bool {
 
 #[cfg(test)]
 mod review_repro_daemon_ci_pr;
+
+#[cfg(test)]
+mod audit2_001_credential_gate_tests {
+    use super::host_receives_credentials;
+
+    // AUDIT2-001: the CI token may only ride requests to trusted hosts. These
+    // cases are env-independent so they never race a parallel test mutating
+    // `AGEND_CI_TRUSTED_HOSTS`.
+    #[test]
+    fn credential_gate_blocks_untrusted_hosts() {
+        // Built-in SaaS API hosts over https → credentials allowed (unchanged).
+        assert!(host_receives_credentials("https://api.github.com"));
+        assert!(host_receives_credentials("https://gitlab.com"));
+        assert!(host_receives_credentials("https://api.bitbucket.org"));
+        // The whole point: an agent-supplied attacker host gets NO credential.
+        assert!(!host_receives_credentials("https://attacker.example"));
+        assert!(!host_receives_credentials(
+            "https://api.github.com.evil.example"
+        ));
+        // userinfo trap — the real host is `attacker.example`, not github.
+        assert!(!host_receives_credentials(
+            "https://api.github.com@attacker.example/"
+        ));
+        // cleartext downgrade, even for a known host → refused.
+        assert!(!host_receives_credentials("http://api.github.com"));
+        // loopback stays on-box → allowed over any scheme (local CI mocks).
+        assert!(host_receives_credentials("http://127.0.0.1:8080"));
+        assert!(host_receives_credentials("http://localhost:3000"));
+        assert!(host_receives_credentials("http://[::1]:9000"));
+        // unparseable / empty → fail closed.
+        assert!(!host_receives_credentials("not a url"));
+        assert!(!host_receives_credentials(""));
+    }
+}

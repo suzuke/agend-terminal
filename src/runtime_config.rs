@@ -231,7 +231,25 @@ fn fail_closed(is_startup: bool, reason: &str) {
 
 /// Set a single config key and persist to disk.
 pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
-    let mut config = get();
+    // AUDIT2-012: serialize the whole read-modify-write under a cross-process file
+    // lock AND base the mutation on the freshest ON-DISK config (read under the
+    // lock), not the in-memory snapshot. The TUI and the daemon are separate
+    // processes that both write this file (the TUI via `:set` / copy-on-select,
+    // the daemon via the MCP `config set` tool); basing the write on each
+    // process's stale `get()` global would let one clobber a key the other just
+    // wrote (lost update). Fall back to the in-memory keep-last-good only if the
+    // file is absent or corrupt. (The #1990 version guard below still refuses a
+    // newer-schema file before any write.)
+    let lock_path = home.join("runtime-config.json.lock");
+    // AUDIT2-012 (review): FAIL CLOSED if the lock can't be acquired — proceeding
+    // unlocked would silently re-open the cross-process lost-update this guard
+    // exists to prevent. Surface the error instead.
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| format!("runtime-config lock unavailable ({lock_path:?}): {e}"))?;
+    let mut config = std::fs::read_to_string(home.join("runtime-config.json"))
+        .ok()
+        .and_then(|d| serde_json::from_str::<RuntimeConfig>(&d).ok())
+        .unwrap_or_else(get);
     match key {
         "dev_idle_threshold_secs" => {
             config.dev_idle_threshold_secs = value
@@ -338,7 +356,10 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // #1990: stamp the current schema version on every write.
     config.schema_version = RuntimeConfig::CURRENT;
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // AUDIT2-012: atomic tmp+rename (was a plain std::fs::write) so a crash mid
+    // write can't leave truncated JSON that reverts to DEFAULTS at next startup —
+    // which would silently flip watchdog / recovery / progress_mode gates.
+    crate::store::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
     Ok(serde_json::to_string(&config).unwrap_or_default())
 }
@@ -432,6 +453,57 @@ mod tests {
     fn progress_mode_default_off() {
         // #2090: default is 0 (OFF) — a default fleet sees zero behaviour change.
         assert_eq!(RuntimeConfig::default().progress_mode, 0);
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn set_uses_disk_base_preserves_concurrent_key_audit2_012() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2012-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-config.json");
+
+        // Simulate ANOTHER process (e.g. the daemon) having written
+        // progress_mode=2 to disk while THIS process's in-memory global is stale.
+        let on_disk = RuntimeConfig {
+            progress_mode: 2,
+            ..RuntimeConfig::default()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
+
+        // This process sets a DIFFERENT key. With the disk-base read under the
+        // lock, the concurrently-written key must survive (not revert to default).
+        set(&dir, "copy_on_select", "off").unwrap();
+
+        let after: RuntimeConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.progress_mode, 2,
+            "AUDIT2-012: a concurrently-written key must be preserved, not clobbered"
+        );
+        assert!(!after.copy_on_select, "the just-set key must be applied");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn set_fails_closed_when_lock_unavailable_audit2_012() {
+        // `home` is a regular FILE, so `home.join("runtime-config.json.lock")`
+        // can't be created (ENOTDIR) and the lock cannot be acquired. set() must
+        // FAIL CLOSED (return Err), never proceed to write unlocked.
+        let home_file = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2012-isfile-{}",
+            std::process::id()
+        ));
+        std::fs::write(&home_file, b"x").unwrap();
+        let res = set(&home_file, "copy_on_select", "on");
+        assert!(
+            res.is_err(),
+            "set() must fail closed when the lock is unavailable, got: {res:?}"
+        );
+        std::fs::remove_file(&home_file).ok();
     }
 
     #[test]

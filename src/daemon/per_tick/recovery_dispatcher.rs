@@ -536,7 +536,28 @@ impl RecoveryDispatcherHandler {
 
         // Active mode — emit telegram notify pre-emit so operators have
         // visibility into the restart even if the channel send fails.
-        notify_stage2_fire(name, snapshot);
+        // AUDIT2-008: but a persistently-full crash_tx keeps the agent in
+        // Stage2Eligible, so this fire path re-runs every tick. Notify on the
+        // FIRST attempt (and at most once per backoff thereafter), not on every
+        // retry — otherwise it's an operator telegram every ~10s per stuck agent
+        // (and the changing silent_ms in the body even defeats channel dedup).
+        const STAGE2_NOTIFY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+        let should_notify = {
+            let mut core = target.core.lock();
+            let now = Instant::now();
+            let due = core
+                .health
+                .last_stage2_notify_at
+                .map(|t| now.duration_since(t) >= STAGE2_NOTIFY_BACKOFF)
+                .unwrap_or(true);
+            if due {
+                core.health.last_stage2_notify_at = Some(now);
+            }
+            due
+        };
+        if should_notify {
+            notify_stage2_fire(name, snapshot);
+        }
 
         // try_send returns `Err(TrySendError::Full)` if the bounded(64)
         // channel is saturated. Counter NOT incremented on rejection;
@@ -559,6 +580,10 @@ impl RecoveryDispatcherHandler {
                     entered_at: Instant::now(),
                 };
                 core.health.last_stage2_fired_at = Some(Instant::now());
+                // AUDIT2-008: the restart fired and we left Stage2Eligible — reset
+                // the notify backoff so a fresh future Stage-2 episode notifies
+                // immediately rather than being suppressed by this episode's stamp.
+                core.health.last_stage2_notify_at = None;
                 // Counter increment lives on the respawn worker side
                 // (selective-restore arm in `daemon/mod.rs` Stage 2 path)
                 // — it preserves the counter across the spawn boundary

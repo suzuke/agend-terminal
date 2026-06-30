@@ -165,33 +165,42 @@ fn system_identity_may_set_forensic_done_source_tasks() {
 /// GREEN once the id format is made globally unique across processes.
 #[test]
 fn task_id_has_process_unique_component_tasks() {
-    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tasks/handler.rs");
-    let text = std::fs::read_to_string(&src).expect("read handler.rs");
-
-    // Isolate the `handle_create` body (where the id is minted).
-    let body = {
+    // AUDIT2-011: cover EVERY task-id mint site, not just `handle_create`. The
+    // `send(kind=task)` auto-create path in `api/handlers/messaging.rs` was the
+    // un-audited second minter that kept shipping the colliding two-segment
+    // `t-<ts>-<seq>` form while this guard stayed green against handler.rs alone.
+    fn fn_body(rel: &str, needle: &str) -> String {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        let text = std::fs::read_to_string(&src).unwrap_or_else(|_| panic!("read {rel}"));
         let start = text
-            .find("fn handle_create(")
-            .expect("handle_create exists");
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} exists in {rel}"));
         let after = &text[start..];
         let end = after.find("\nfn ").map(|e| start + e).unwrap_or(text.len());
         text[start..end].to_string()
-    };
+    }
+    fn has_process_unique(body: &str) -> bool {
+        body.contains("std::process::id()")
+            || body.contains("process::id()")
+            || body.to_lowercase().contains("uuid")
+            || body.contains("getrandom")
+            || body.contains("rand::")
+            || body.contains("/dev/urandom")
+    }
 
-    // The id-minting line must include a process-unique disambiguator so two
-    // processes minting in the same microsecond cannot collide.
-    let has_process_unique = body.contains("std::process::id()")
-        || body.contains("process::id()")
-        || body.to_lowercase().contains("uuid")
-        || body.contains("getrandom")
-        || body.contains("rand::")
-        || body.contains("/dev/urandom");
-
-    assert!(
-        has_process_unique,
-        "FINDING #8: handle_create mints task ids as t-<ts>-<process-local ID_SEQ> \
-         with NO process-unique component, so two processes in the same microsecond \
-         mint identical ids and one Created is silently dropped at replay. Add a pid/\
-         uuid/random component to the id."
-    );
+    for (rel, needle) in [
+        ("src/tasks/handler.rs", "fn handle_create("),
+        (
+            "src/api/handlers/messaging.rs",
+            "fn auto_create_task_if_needed(",
+        ),
+    ] {
+        assert!(
+            has_process_unique(&fn_body(rel, needle)),
+            "FINDING #8 / AUDIT2-011: {rel} ({needle}) mints a task id with NO \
+             process-unique component, so two processes minting in the same \
+             microsecond produce identical ids and one Created is silently dropped \
+             at replay. Add a pid / uuid / random component."
+        );
+    }
 }

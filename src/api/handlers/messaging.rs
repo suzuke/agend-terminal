@@ -187,7 +187,7 @@ fn auto_create_task_if_needed(
     static AUTO_TASK_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
     let seq = AUTO_TASK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let id = format!("t-{ts}-{seq}");
+    let id = format!("t-{ts}-{}-{seq}", std::process::id()); // AUDIT2-011: pid → process-unique
     let event = crate::task_events::TaskEvent::Created {
         task_id: crate::task_events::TaskId(id.clone()),
         title,
