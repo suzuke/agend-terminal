@@ -355,8 +355,17 @@ pub(crate) fn resolve_fleet_and_reconcile(
     // beyond the single `git switch main` mutation when conditions
     // are right. Best-effort — boot continues regardless.
     time_step("canonical_hygiene::run_hygiene", || {
-        canonical_hygiene::run_hygiene(&config);
+        // L2: HEAD hygiene side effects + surface any DIRTY canonical (a worktree-
+        // discipline violation). Boot is exactly where a stale stray file left by a
+        // crashed/restarted prior incarnation surfaces, so notify each once here;
+        // the runtime tracker (canonical_drift) handles ongoing re-alert throttling.
+        for report in canonical_hygiene::run_hygiene_with_dirty_report(&config) {
+            canonical_hygiene::notify_operator_of_canonical_dirty(&report);
+        }
     });
+    // L1 support: publish the canonical repo roots for the Claude PreToolUse guard
+    // hook to read (advisory, Claude-only; L2 above is the authoritative guard).
+    canonical_hygiene::write_canonical_roots(&config, home);
     // #829 Fix A: boot-time orphan-owner sweep. We pass `live = ∅`
     // explicitly because `api::serve` hasn't bound the Unix socket
     // yet (that happens later in `daemon::run_with_prepared`) and no
