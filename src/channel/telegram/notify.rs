@@ -32,17 +32,19 @@ pub fn notify_telegram_silent(home: &std::path::Path, instance_name: &str, text:
     let _ = notify_telegram_inner(home, instance_name, text, true);
 }
 
-/// Drives the Telegram send to completion synchronously, returning `Some(())`
-/// when a send was attempted or `None` when nothing was sent (no telegram
-/// channel / dedup-suppressed).
+/// Claims the per-(instance, topic, content) dedup slot and ENQUEUES the Telegram
+/// send onto the bounded delivery worker (AUDIT2-006), so the tick / main-loop
+/// caller never blocks on the network round-trip. Returns `Some(())` when the send
+/// was accepted for delivery, or `None` when nothing was enqueued (no telegram
+/// channel / dedup-suppressed / delivery queue full → dedup claim evicted).
 ///
-/// H8 (channel-HIGH-1): this MUST drive the send rather than schedule it with
-/// `telegram_runtime().spawn(...)` and drop the `JoinHandle`. `telegram_runtime()`
-/// is a `new_current_thread` runtime with no persistent driver thread, so a
-/// spawned task makes no progress unless some later sync-context `block_on`
-/// happens to cooperatively poll it — otherwise the notification is queued
-/// forever while the dedup claim suppresses a re-emit for the whole TTL. We use
-/// the Handle-guarded `block_on_value` (#1476), mirroring `reply.rs::send_reply`.
+/// The actual send runs in [`send_telegram_job`] on the worker thread, which still
+/// drives it to completion via the Handle-guarded `block_on_value` (#1476) — never
+/// a fire-and-forget `telegram_runtime().spawn(...)` whose `JoinHandle` is dropped
+/// onto the driver-less `new_current_thread` runtime (the H8 / channel-HIGH-1
+/// invariant; `tests/notify_undriven_runtime_invariant_channel.rs` statically pins
+/// it). Moving delivery to the worker thread does not weaken H8: the send is still
+/// driven to completion, just off the caller's thread.
 fn notify_telegram_inner(
     home: &std::path::Path,
     instance_name: &str,
@@ -82,17 +84,70 @@ fn notify_telegram_inner(
         return None;
     }
 
-    let text = text.to_string();
-    let home_owned = home.to_path_buf();
-    let instance_owned = instance_name.to_string();
-    // H8: drive the send to completion on the Telegram runtime via the
-    // Handle-guarded `block_on_value` (#1476) — never fire-and-forget onto the
-    // undriven current_thread runtime (see fn doc). Blocks the caller for one
-    // send, exactly as `reply.rs::send_reply` does.
+    // AUDIT2-006: offload the blocking Telegram send (the network round-trip) off
+    // the tick / main-loop thread onto the bounded delivery worker. The dedup
+    // claim above already ran synchronously, so a concurrent duplicate is still
+    // suppressed; if the bounded queue is full the send never happens, so we evict
+    // the claim — otherwise a never-delivered notify would suppress a legitimate
+    // same-text re-emit for the whole TTL (the queue-full twin of the MED-1
+    // send-failure evict below).
+    let job = crate::daemon::delivery_worker::TelegramSendJob {
+        home: home.to_path_buf(),
+        instance: instance_name.to_string(),
+        text: text.to_string(),
+        disable_notification,
+        token,
+        group_id,
+        topic_id,
+        dedup_key: dedup_key.clone(),
+    };
+    if crate::daemon::delivery_worker::enqueue_telegram_send(job).is_err() {
+        crate::channel::dedup::global(home).evict(&dedup_key);
+        tracing::warn!(
+            instance = %instance_name,
+            "AUDIT2-006: telegram notify dropped — delivery queue full; dedup claim evicted"
+        );
+        return None;
+    }
+    Some(())
+}
+
+/// AUDIT2-006: the actual blocking Telegram send, run on the delivery worker
+/// thread (see `daemon::delivery_worker`). The dedup / retry / topic-recreate
+/// semantics are unchanged from the former inline `notify_telegram_inner` send —
+/// the only behavioural change is the THREAD it runs on. It still drives the send
+/// to completion via the Handle-guarded `block_on_value` (#1476) — never a fire-
+/// and-forget `spawn` onto the undriven current_thread runtime (the H8 invariant).
+pub(crate) fn send_telegram_job(job: crate::daemon::delivery_worker::TelegramSendJob) {
+    let crate::daemon::delivery_worker::TelegramSendJob {
+        home: home_owned,
+        instance: instance_owned,
+        text,
+        disable_notification,
+        token,
+        group_id,
+        topic_id,
+        dedup_key,
+    } = job;
     block_on_value(async move {
         use teloxide::payloads::SendMessageSetters;
         use teloxide::prelude::Requester;
-        let bot = teloxide::Bot::new(&token);
+        // AUDIT2-006 (A): give the Telegram client an explicit request timeout so
+        // a black-holed API connection can't park this delivery indefinitely. We
+        // start from teloxide's recommended settings (keep-alive etc.) and only
+        // add the timeout. On the (effectively impossible) builder failure, fall
+        // back to teloxide's default client — losing the timeout but never the
+        // send.
+        let bot = match teloxide::net::default_reqwest_settings()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => teloxide::Bot::with_client(&token, client),
+            Err(e) => {
+                tracing::warn!(error = %e, "AUDIT2-006: telegram client builder failed — using default (no request timeout)");
+                teloxide::Bot::new(&token)
+            }
+        };
         let chat_id = teloxide::types::ChatId(group_id);
         let result: anyhow::Result<()> = async {
             // Test seam: force the first send to fail without a network call.
@@ -178,7 +233,6 @@ fn notify_telegram_inner(
             tracing::warn!(error = %e, "telegram notify failed");
         }
     });
-    Some(())
 }
 
 #[cfg(test)]
@@ -227,13 +281,53 @@ mod tests {
         )
     }
 
-    /// §3.9 (MED-1): a notify whose send FAILS must evict its dedup claim, so a
-    /// retry of the same text within the TTL actually sends instead of being
-    /// suppressed into a no-op. The twin of the reply.rs HIGH-2 fix.
+    /// §3.9 (MED-1): a send that FAILS must evict its dedup claim, so a retry of
+    /// the same text within the TTL actually sends instead of being suppressed
+    /// into a no-op. The twin of the reply.rs HIGH-2 fix. AUDIT2-006 relocated the
+    /// send (and this evict) into `send_telegram_job` on the delivery worker, so
+    /// the test now drives that primitive directly (the caller already claimed the
+    /// dedup slot, exactly as `notify_telegram_inner` does before enqueueing).
     #[test]
-    fn notify_failed_send_evicts_dedup_med1() {
+    fn send_failed_evicts_dedup_med1() {
         let _g = guard();
         let home = tmp_home("evict");
+        std::env::set_var("NOTIFY_MED1_TOKEN", "fake");
+
+        // Claim the dedup slot as the synchronous caller would, then run the
+        // (forced-failing) send: it must roll the claim back.
+        let key = notify_key(&home, "C", "hello operator");
+        assert!(crate::channel::dedup::global(&home).record_and_check(key.clone()));
+
+        set_forced_send_error(anyhow::anyhow!("transient network error"));
+        super::send_telegram_job(crate::daemon::delivery_worker::TelegramSendJob {
+            home: home.clone(),
+            instance: "C".to_string(),
+            text: "hello operator".to_string(),
+            disable_notification: false,
+            token: "fake".to_string(),
+            group_id: -100_777,
+            topic_id: crate::channel::telegram::lookup_topic_for_instance(&home, "C"),
+            dedup_key: key.clone(),
+        });
+
+        // record_and_check is fresh again (would be `false`/suppressed w/o evict).
+        assert!(
+            crate::channel::dedup::global(&home).record_and_check(key),
+            "MED-1: a failed send must evict its dedup claim so a retry can send"
+        );
+
+        std::env::remove_var("NOTIFY_MED1_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// AUDIT2-006 (codex edit 2): when the bounded delivery queue is FULL the send
+    /// never happens, so `notify_telegram_inner` must evict the dedup claim it just
+    /// recorded — otherwise a never-delivered notify would suppress a legitimate
+    /// same-text re-emit for the whole TTL (a new silent-drop class).
+    #[test]
+    fn telegram_queue_full_evicts_dedup_audit2_006() {
+        let _g = guard();
+        let home = tmp_home("qfull");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             "channel:\n  type: telegram\n  bot_token_env: NOTIFY_MED1_TOKEN\n  group_id: -100777\n  mode: topic\ninstances:\n  C:\n    backend: claude\n",
@@ -241,19 +335,20 @@ mod tests {
         .unwrap();
         std::env::set_var("NOTIFY_MED1_TOKEN", "fake");
 
-        // First notify: records the dedup claim, then the (forced-failing) send.
-        // H8: `notify_telegram_inner` now drives the send synchronously
-        // (block_on_value), so by the time it returns the failed send has already
-        // evicted the claim — no JoinHandle to drive.
-        set_forced_send_error(anyhow::anyhow!("transient network error"));
-        notify_telegram_inner(&home, "C", "hello operator", false).expect("send driven");
+        // Force the delivery queue to report full: claim recorded, enqueue fails,
+        // claim must be evicted; nothing was sent so the call returns None.
+        crate::daemon::delivery_worker::test_support::set_force_full(true);
+        let sent = notify_telegram_inner(&home, "C", "hello operator", false);
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+        assert!(
+            sent.is_none(),
+            "a full delivery queue means nothing was sent"
+        );
 
-        // The failed send must have rolled back the claim: record_and_check is
-        // fresh again (would be `false`/suppressed without the evict).
         let key = notify_key(&home, "C", "hello operator");
         assert!(
             crate::channel::dedup::global(&home).record_and_check(key),
-            "MED-1: a failed notify must evict its dedup claim so a retry can send"
+            "AUDIT2-006: a queue-full drop must evict the dedup claim so a retry can send"
         );
 
         std::env::remove_var("NOTIFY_MED1_TOKEN");
