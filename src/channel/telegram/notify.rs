@@ -327,6 +327,7 @@ mod tests {
     #[test]
     fn telegram_queue_full_evicts_dedup_audit2_006() {
         let _g = guard();
+        let _ff = crate::daemon::delivery_worker::test_support::force_full_guard();
         let home = tmp_home("qfull");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),

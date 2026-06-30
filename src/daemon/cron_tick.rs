@@ -205,6 +205,20 @@ fn note_unhandled_cron_fire(home: &Path, sched_id: &str, target: &str, handled: 
 /// orphaned target), then records the run and auto-disables one-shots.
 /// `message`/`label` are the static schedule strings (frozen by the producer —
 /// non-time-sensitive, so no rebuild-drift concern).
+/// AUDIT2-006 C: map an offloaded-inject outcome to a `record_run` status. Pure so
+/// it is unit-tested without seeding a live registry. `ok_queued` means "accepted
+/// by the bounded delivery queue", NOT physically delivered (see `InjectDispatch`);
+/// the deferred-gate path keeps today's `ok`/`inject_failed` mapping because its
+/// durable enqueue already completed synchronously.
+fn cron_inject_status(dispatch: &agent::InjectDispatch) -> &'static str {
+    match dispatch {
+        agent::InjectDispatch::Deferred(Ok(())) => "ok",
+        agent::InjectDispatch::Deferred(Err(_)) => "inject_failed",
+        agent::InjectDispatch::Queued => "ok_queued",
+        agent::InjectDispatch::QueueFull => "drop_queue_full",
+    }
+}
+
 fn deliver_cron_fire(
     home: &Path,
     registry: &AgentRegistry,
@@ -245,14 +259,17 @@ fn deliver_cron_fire(
         // in run_history, and let the auto-disable below retire it.
         "missed"
     } else if let Some((tgt, name)) = inject_snap.as_ref() {
-        // #1769: cron is an operator-scheduled action, not a daemon auto-nudge → no marker.
-        match agent::inject_with_target_gated(tgt, name, message.as_bytes(), false, None) {
-            Ok(()) => "ok",
-            Err(e) => {
-                tracing::warn!(error = %e, "schedule inject failed");
-                "inject_failed"
-            }
+        // #1769: cron is an operator-scheduled action, not a daemon auto-nudge → no
+        // marker. AUDIT2-006 C: offload the physical PTY write to the bounded
+        // delivery worker so this tick never blocks on the typed-inject readback.
+        // The prepare/gate phase still runs synchronously inside `_offload`.
+        let dispatch = agent::inject_with_target_gated_offload(tgt, name, message.as_bytes());
+        if let agent::InjectDispatch::Deferred(Err(e)) = &dispatch {
+            tracing::warn!(error = %e, "schedule inject failed");
+        } else if matches!(dispatch, agent::InjectDispatch::QueueFull) {
+            tracing::warn!(target = %name, "schedule inject dropped: delivery queue full");
         }
+        cron_inject_status(&dispatch)
     } else if crate::fleet::instance_is_known(home, target) {
         // Known fleet instance that simply isn't running right now. Defer
         // the self-IPC enqueue past the lock (see the `deferred_inbox`
@@ -781,6 +798,33 @@ mod tests {
             .last()
             .map(|r| r.status.clone())
             .unwrap_or_default()
+    }
+
+    /// AUDIT2-006 C: the offloaded-inject → run-status mapping. `ok_queued` =
+    /// accepted by the bounded delivery queue (not physically delivered);
+    /// `drop_queue_full` = dropped; the deferred-gate path keeps today's
+    /// `ok`/`inject_failed` because its durable enqueue already completed.
+    #[test]
+    fn cron_inject_status_maps_dispatch() {
+        use crate::agent::InjectDispatch;
+        assert_eq!(
+            super::cron_inject_status(&InjectDispatch::Deferred(Ok(()))),
+            "ok"
+        );
+        assert_eq!(
+            super::cron_inject_status(&InjectDispatch::Deferred(Err(
+                crate::error::AgendError::ApiError("boom".into())
+            ))),
+            "inject_failed"
+        );
+        assert_eq!(
+            super::cron_inject_status(&InjectDispatch::Queued),
+            "ok_queued"
+        );
+        assert_eq!(
+            super::cron_inject_status(&InjectDispatch::QueueFull),
+            "drop_queue_full"
+        );
     }
 
     #[test]
