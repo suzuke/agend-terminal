@@ -148,38 +148,6 @@ pub(crate) fn run_hygiene_with_dirty_report(
     dirty
 }
 
-/// L1 support: write the managed canonical repo roots to
-/// `$AGEND_HOME/canonical-roots.json` so the Claude `PreToolUse` guard hook can
-/// block `Write`/`Edit`/`NotebookEdit` into a canonical working tree without
-/// parsing fleet.yaml itself. The daemon OWNS this file; the hook only reads it.
-/// Roots are canonicalized (absolute, symlinks resolved) so the hook's prefix
-/// check is robust against `./` / symlinked paths. Best-effort — a failure is
-/// warn-logged; the L1 hook is advisory and the L2 detector is the authoritative,
-/// backend-agnostic guard.
-pub(crate) fn write_canonical_roots(config: &crate::fleet::FleetConfig, home: &std::path::Path) {
-    let mut roots = std::collections::BTreeSet::<String>::new();
-    for instance in config.instances.values() {
-        let Some(src) = instance.source_repo.as_ref() else {
-            continue;
-        };
-        let p = std::path::PathBuf::from(src);
-        let abs = std::fs::canonicalize(&p).unwrap_or(p);
-        roots.insert(abs.to_string_lossy().into_owned());
-    }
-    let roots: Vec<String> = roots.into_iter().collect();
-    let json = match serde_json::to_vec_pretty(&roots) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::warn!(error = %e, "L1: failed to serialize canonical roots");
-            return;
-        }
-    };
-    let path = home.join("canonical-roots.json");
-    if let Err(e) = crate::store::atomic_write(&path, &json) {
-        tracing::warn!(error = %e, path = %path.display(), "L1: failed to write canonical-roots.json");
-    }
-}
-
 /// Run the canonical-hygiene decision against a single canonical
 /// repo path. Shells out to git twice (rev-parse and status), calls
 /// [`decide_canonical_action`], and dispatches by variant: NoOp is

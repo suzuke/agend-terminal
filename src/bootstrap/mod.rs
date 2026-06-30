@@ -363,9 +363,6 @@ pub(crate) fn resolve_fleet_and_reconcile(
             canonical_hygiene::notify_operator_of_canonical_dirty(&report);
         }
     });
-    // L1 support: publish the canonical repo roots for the Claude PreToolUse guard
-    // hook to read (advisory, Claude-only; L2 above is the authoritative guard).
-    canonical_hygiene::write_canonical_roots(&config, home);
     // #829 Fix A: boot-time orphan-owner sweep. We pass `live = ∅`
     // explicitly because `api::serve` hasn't bound the Unix socket
     // yet (that happens later in `daemon::run_with_prepared`) and no
