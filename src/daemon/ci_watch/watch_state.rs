@@ -8,6 +8,29 @@ pub struct Subscriber {
     pub subscribed_at: Option<String>,
 }
 
+/// AUDIT2-009: per-workflow notify cursor. CI runs from N workflows form N parallel
+/// `run_id` streams; the legacy single `last_run_id` high-water threshold silently
+/// dropped a lower-id workflow's rerun-to-green (`run.id < threshold`) BEFORE the
+/// attempt/conclusion check, breaking the `next_after_ci` reviewer handoff. Keyed by
+/// workflow name (unnamed runs use a synthetic `#run:<id>` key), this records the
+/// last-notified `(run_id, run_attempt, conclusion)` PER WORKFLOW, so a fresh
+/// terminal event in any workflow is selected regardless of its id relative to
+/// siblings. `run_id` is part of the cursor because a provider without an attempt
+/// concept reports a rerun as a NEW id with `run_attempt == 1` — keying on
+/// attempt+conclusion alone would swallow it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowNotifyCursor {
+    pub run_id: u64,
+    pub run_attempt: u64,
+    pub conclusion: String,
+}
+
+fn workflow_cursor_map_is_empty(
+    m: &std::collections::BTreeMap<String, WorkflowNotifyCursor>,
+) -> bool {
+    m.is_empty()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WatchState {
     #[serde(default)]
@@ -59,6 +82,13 @@ pub struct WatchState {
     /// `None` on a legacy watch → gate 1 falls back to the aggregate field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_notified_run_conclusion: Option<String>,
+    /// AUDIT2-009: per-workflow notify cursors (keyed by workflow name; unnamed →
+    /// `#run:<id>`). The authoritative notify gate — supersedes the single
+    /// `last_run_id` threshold (kept above with reduced authority for migration /
+    /// observability). Reset on head move. Absent on a legacy watch → seeded on
+    /// the first post-upgrade poll from the current head's latest-per-workflow runs.
+    #[serde(default, skip_serializing_if = "workflow_cursor_map_is_empty")]
+    pub last_notified_by_workflow: std::collections::BTreeMap<String, WorkflowNotifyCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stale_emitted_sha: Option<String>,
 
