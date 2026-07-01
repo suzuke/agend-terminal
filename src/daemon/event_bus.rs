@@ -209,7 +209,7 @@ pub(crate) fn register_all_subscribers_for_test() {
 /// happened to register first). Running registration before any test makes
 /// delivery order-INDEPENDENT — no per-test harness call, no order-dependent flake.
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn _register_event_bus_subscribers_at_test_load() {
     register_all_subscribers_for_test();
 }

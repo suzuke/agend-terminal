@@ -333,7 +333,7 @@ pub fn primary_remote(repo_dir: &Path) -> String {
 /// `env -u AGEND_INSTANCE_NAME cargo test` workaround automatic + permanent, and
 /// fixes ALL ~200 naked git call sites at the root rather than per-site.
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn _scrub_agent_session_env_at_test_load_2481() {
     // SAFETY: a `#[ctor]` runs before `main` on a single thread, so this
     // process-global env mutation cannot race another thread.
