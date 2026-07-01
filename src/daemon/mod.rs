@@ -796,6 +796,9 @@ pub(crate) fn build_default_handlers(
         // claimed/in_progress tasks back to Open + clears the work-stuck latch.
         // Runs in both run_core and app mode (live daemon is app-mode).
         Box::new(per_tick::ReclaimHandler::new(30, work_stuck_latch)),
+        // AUDIT2-014 (B'): cross-board claim-race detective backstop (multi-board
+        // only, Low), every 30 ticks (~5min). See the handler's module doc.
+        Box::new(per_tick::CrossBoardDepDetectiveHandler::new(30)),
     ]
 }
 

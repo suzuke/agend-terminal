@@ -1389,6 +1389,293 @@ fn cross_board_dep_gates_claim_2117_q2() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// AUDIT2-014 regression (Low, multi-board only): the claim precondition reads
+/// a cross-board dep's status lock-free (`DepResolver::status_of` → `replay_at`
+/// on the FOREIGN board), then commits the local `Claimed` event under only the
+/// LOCAL board's lock. If the foreign board is mutated in the window between
+/// that read and the local commit, the claim lands on stale information — and
+/// because `evaluate_with_resolver` short-circuits already-`Claimed` tasks, the
+/// resulting bad claim is never re-evaluated by the list-time dep eval alone.
+///
+/// The hook arms a synchronous callback that fires exactly inside that window
+/// (right after `status_of` resolves B's foreign status but before devA's
+/// local commit), reopening B via the normal `update` action — simulating a
+/// second writer racing the claim. This reproduces deterministically (no
+/// thread/timing flakiness) that current main lets A get claimed against a
+/// dependency that is, by claim-commit-time, no longer Done.
+#[test]
+fn cross_board_claim_race_stale_dep_read_audit2_014() {
+    let home = tmp_home("xboard-claim-race");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+
+    // Arm the seam: right after devA's claim precondition reads B==Done off
+    // teamB's board, reopen B — simulating a concurrent writer that commits
+    // to the foreign board inside the TOCTOU window.
+    {
+        let home = home.clone();
+        let b = b.clone();
+        super::set_after_foreign_dep_read_hook_for_test(move || {
+            let reopened = handle(
+                &home,
+                "devB",
+                &serde_json::json!({"action": "update", "id": b, "status": "open"}),
+            );
+            assert!(
+                reopened["error"].is_null(),
+                "test seam: reopening B must succeed: {reopened}"
+            );
+        });
+    }
+
+    let claim = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+
+    // B is genuinely reopened on its own board now.
+    assert_eq!(
+        status_via_list(&home, "devB", "B"),
+        "open",
+        "seam must have actually reopened B on teamB's board"
+    );
+    // The bug: devA's claim committed anyway, against a dep read that was
+    // stale by commit time — A is now Claimed while its cross-board dep B
+    // is genuinely Open again.
+    assert!(
+        claim["error"].is_null(),
+        "AUDIT2-014: current main's claim commits despite the raced foreign \
+         read — expected success (the bug), got: {claim}"
+    );
+    assert_eq!(
+        status_via_list(&home, "devA", "A"),
+        "claimed",
+        "AUDIT2-014: A is claimed against a dep that is no longer Done"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// AUDIT2-014 (B', detective backstop): a Claimed-but-not-yet-InProgress task
+/// whose cross-board dependency is no longer Done gets released back to Open
+/// (self-heals the permanently-stuck claim `cross_board_claim_race_stale_dep_read_audit2_014`
+/// pins). Doesn't need the race hook — the detective doesn't care WHEN the dep
+/// went stale, only that it currently isn't Done while the task sits Claimed.
+#[test]
+fn cross_board_dep_detective_releases_stale_claimed_audit2_014() {
+    let home = tmp_home("xboard-detective-release");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+    let claimed = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    assert!(claimed["error"].is_null(), "claim while B done: {claimed}");
+
+    // B reopens after the claim (any writer, any timing — the detective
+    // doesn't distinguish a race from a later legitimate reopen).
+    let reopened = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": b, "status": "open"}),
+    );
+    assert!(reopened["error"].is_null(), "reopen B: {reopened}");
+
+    let report = super::reconcile_stale_cross_board_claims(&home);
+    assert_eq!(
+        report.released,
+        vec![a.clone()],
+        "A must be released — its cross-board dep B is no longer Done"
+    );
+    assert!(report.flagged_in_progress.is_empty());
+    assert_eq!(
+        status_via_list(&home, "devA", "A"),
+        "blocked",
+        "released back to Open, list-time eval then shows Blocked (dep B is Open)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// AUDIT2-014 (B'): an InProgress task with a stale cross-board dep is
+/// FLAGGED, never auto-released — the daemon must not yank work already
+/// underway out from under an agent.
+#[test]
+fn cross_board_dep_detective_flags_but_does_not_release_in_progress_audit2_014() {
+    let home = tmp_home("xboard-detective-flag");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    let started = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": a, "status": "in_progress"}),
+    );
+    assert!(started["error"].is_null(), "start A: {started}");
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": b, "status": "open"}),
+    );
+
+    let report = super::reconcile_stale_cross_board_claims(&home);
+    assert!(
+        report.released.is_empty(),
+        "in-progress work must never be auto-released: {report:?}"
+    );
+    assert_eq!(report.flagged_in_progress, vec![a.clone()]);
+
+    // Persisted status (raw replay, not the list-time derived view — which
+    // already shows "blocked" for ANY InProgress task with an unsatisfied dep,
+    // pre-existing behavior unrelated to this detective) must be untouched:
+    // no event was emitted for A.
+    let board_a = super::board_router::board_for_task(&home, &a);
+    let persisted = crate::task_events::replay_at(&board_a)
+        .expect("replay A's board")
+        .tasks
+        .get(&crate::task_events::TaskId(a.clone()))
+        .expect("A present on its board")
+        .status;
+    assert_eq!(
+        persisted,
+        crate::task_events::TaskStatus::InProgress,
+        "in-progress task's PERSISTED status must be untouched by the detective — no Released event"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// AUDIT2-014 regression (codex-reviewer, PR #2521 review finding): the
+/// detective itself has a scan→append TOCTOU. It scans a stale, unlocked
+/// snapshot to decide a task is releasable, then (pre-fix) committed
+/// `Released` unconditionally — so a task that legitimately advances
+/// (Claimed → InProgress) between the scan and the commit would get yanked
+/// back to Open/ownerless, clobbering real work. The hook fires exactly in
+/// that window (right before the checked commit) and starts A via the normal
+/// `update` action, simulating the race deterministically. The fix
+/// (`append_checked_at` revalidating fresh state under the board lock) must
+/// skip the write — A's legitimate InProgress transition must survive.
+#[test]
+fn cross_board_dep_detective_release_toctou_skips_when_task_advances_audit2_014() {
+    let home = tmp_home("xboard-detective-toctou");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": b, "status": "open"}),
+    );
+
+    {
+        let home = home.clone();
+        let a = a.clone();
+        super::set_before_cross_board_release_hook_for_test(move || {
+            let started = handle(
+                &home,
+                "devA",
+                &serde_json::json!({"action": "update", "id": a, "status": "in_progress"}),
+            );
+            assert!(
+                started["error"].is_null(),
+                "test seam: starting A: {started}"
+            );
+        });
+    }
+
+    let report = super::reconcile_stale_cross_board_claims(&home);
+    assert!(
+        report.released.is_empty(),
+        "must not release a task that advanced to InProgress mid-scan: {report:?}"
+    );
+
+    let board_a = super::board_router::board_for_task(&home, &a);
+    let persisted = crate::task_events::replay_at(&board_a)
+        .expect("replay A's board")
+        .tasks
+        .get(&crate::task_events::TaskId(a.clone()))
+        .expect("A present on its board")
+        .status;
+    assert_eq!(
+        persisted,
+        crate::task_events::TaskStatus::InProgress,
+        "A's legitimate InProgress transition must survive the detective's stale-snapshot race"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// AUDIT2-014 scope boundary: a Claimed task with only a SAME-board dep that
+/// goes stale after claim is left untouched. The claim precondition already
+/// validates same-board deps atomically under one lock — there's no TOCTOU to
+/// backstop, and reconciling it here would be a behavior change beyond the
+/// bug's actual (cross-board-only) scope.
+#[test]
+fn cross_board_dep_detective_ignores_same_board_stale_dep_audit2_014() {
+    let home = tmp_home("xboard-detective-scope");
+    cross_board_fleet(&home);
+    // Both created by devA → both on teamA's board (same-board dep).
+    let c = create_on(&home, "devA", "C", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&c));
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "done", "id": c, "result": "ok"}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": c, "status": "open"}),
+    );
+
+    let report = super::reconcile_stale_cross_board_claims(&home);
+    assert!(
+        report.released.is_empty() && report.flagged_in_progress.is_empty(),
+        "a same-board dep must never be touched by the cross-board detective: {report:?}"
+    );
+    assert_eq!(
+        status_via_list(&home, "devA", "A"),
+        "claimed",
+        "same-board Claimed task is unaffected by its dep reopening (pre-existing, accepted behavior)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Control (single-board within a multi-project fleet): a same-board dep still
 /// blocks/unblocks via the local-first path — the cross-board machinery does not
 /// alter same-board behavior (the byte-identical local resolution guarantee).

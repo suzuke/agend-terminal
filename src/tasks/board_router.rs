@@ -373,7 +373,14 @@ pub(crate) fn resolve_task_project(home: &Path, task_id: &str) -> String {
 
 /// Every project with an on-disk board: the default (fleet) project plus each
 /// `home/boards/<project_id>` subdir (the dir name IS the project id).
-fn enumerate_projects(home: &Path) -> Vec<String> {
+///
+/// AUDIT2-014: `pub(super)` (was private) so the cross-board dep detective
+/// (`tasks::reconcile_stale_cross_board_claims`) can enumerate boards and
+/// replay each RAW (`task_events::replay_at`, no in-memory dep derivation) —
+/// unlike `list_all_boards`, which applies list-time dep derivation and would
+/// silently relabel an InProgress task's persisted status to `Blocked` before
+/// the detective ever sees it.
+pub(super) fn enumerate_projects(home: &Path) -> Vec<String> {
     let mut out = vec![DEFAULT_PROJECT.to_string()];
     if let Ok(entries) = std::fs::read_dir(home.join("boards")) {
         for e in entries.flatten() {
