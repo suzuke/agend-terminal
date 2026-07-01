@@ -264,8 +264,7 @@ fn test_binary_scrubs_agent_git_env_at_load_2481() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/git_helpers.rs");
     let src = std::fs::read_to_string(&path).expect("read src/git_helpers.rs");
     assert!(
-        src.contains("#[ctor::ctor")
-            && src.contains("_scrub_agent_session_env_at_test_load_2481"),
+        src.contains("#[ctor::ctor") && src.contains("_scrub_agent_session_env_at_test_load_2481"),
         "#2481: src/git_helpers.rs must install a test-load ctor that scrubs \
          agent-session env before any test can spawn `git`"
     );
