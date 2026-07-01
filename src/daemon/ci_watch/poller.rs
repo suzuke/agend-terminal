@@ -89,7 +89,7 @@ use super::registry::{ci_watches_dir, flush_watch_state, remove_watch};
 use super::sweep::{
     bump_repo_stall_and_maybe_notify, clear_repo_stall_and_maybe_resume, clear_stall_state,
 };
-use super::watch_state::WatchState;
+use super::watch_state::{WatchState, WorkflowNotifyCursor};
 use super::WATCH_TTL_HOURS;
 
 // Test-only re-exports so the existing test module (moved verbatim from
@@ -687,6 +687,101 @@ pub(crate) fn select_runs_to_notify(
     // Sort oldest-first by run_id
     selected.sort_by_key(|&(_, id)| id);
     selected.into_iter().map(|(i, _)| i).collect()
+}
+
+/// AUDIT2-009: the per-workflow notify key. Named workflows key by `name`; unnamed
+/// runs (degraded provider / parse) get a synthetic per-id key so two unnamed runs
+/// are never collapsed into one cursor (mirrors `latest_run_per_workflow`).
+fn workflow_cursor_key(run: &CiRun) -> String {
+    if run.name.is_empty() {
+        format!("#run:{}", run.id)
+    } else {
+        run.name.clone()
+    }
+}
+
+/// AUDIT2-009: per-workflow notify gate (used once the cursor map is seeded; the
+/// empty-map migration / fresh-watch path stays on the legacy
+/// [`select_runs_to_notify`]). For each latest-per-workflow TERMINAL run at the
+/// CURRENT head, select it (its index into `runs`) when its workflow has no cursor
+/// or its `(id, run_attempt, conclusion)` differs from the recorded cursor. This is
+/// what rescues a lower-id workflow's rerun-to-green that the single-`last_run_id`
+/// threshold silently dropped (the AUDIT2-009 handoff break).
+fn select_runs_to_notify_per_workflow(
+    runs: &[CiRun],
+    current_sha: &str,
+    last_notified_by_workflow: &std::collections::BTreeMap<String, WorkflowNotifyCursor>,
+) -> Vec<usize> {
+    // One terminal run per workflow at the current head — max `(id, run_attempt)`,
+    // keeping the index into `runs`.
+    let mut best: std::collections::HashMap<String, (usize, u64, u64)> =
+        std::collections::HashMap::new();
+    for (i, run) in runs.iter().enumerate() {
+        if run.head_sha != current_sha || run.conclusion.is_none() {
+            continue;
+        }
+        let key = workflow_cursor_key(run);
+        best.entry(key)
+            .and_modify(|e| {
+                if (run.id, run.run_attempt) > (e.1, e.2) {
+                    *e = (i, run.id, run.run_attempt);
+                }
+            })
+            .or_insert((i, run.id, run.run_attempt));
+    }
+    let mut selected: Vec<(usize, u64)> = best
+        .into_iter()
+        .filter_map(|(key, (i, _, _))| {
+            let run = &runs[i];
+            let conclusion = run.conclusion.as_deref()?;
+            let fresh = match last_notified_by_workflow.get(&key) {
+                None => true,
+                Some(c) => {
+                    c.run_id != run.id
+                        || c.run_attempt != run.run_attempt
+                        || c.conclusion != conclusion
+                }
+            };
+            fresh.then_some((i, run.id))
+        })
+        .collect();
+    selected.sort_by_key(|&(_, id)| id);
+    selected.into_iter().map(|(i, _)| i).collect()
+}
+
+/// AUDIT2-009: the per-workflow notify cursors for ALL latest-per-workflow TERMINAL
+/// runs at the current head. Persisted after every notify cycle (and on the
+/// migration / seeding poll, even when nothing was selected) so a high-id
+/// representative never leaves a sibling workflow unseeded — an unseeded sibling
+/// would later re-notify a stable state.
+fn compute_workflow_cursors(
+    runs: &[CiRun],
+    current_sha: &str,
+) -> std::collections::BTreeMap<String, WorkflowNotifyCursor> {
+    let mut best: std::collections::BTreeMap<String, WorkflowNotifyCursor> =
+        std::collections::BTreeMap::new();
+    for run in runs.iter() {
+        if run.head_sha != current_sha {
+            continue;
+        }
+        let Some(conclusion) = run.conclusion.as_deref() else {
+            continue;
+        };
+        let key = workflow_cursor_key(run);
+        let cursor = WorkflowNotifyCursor {
+            run_id: run.id,
+            run_attempt: run.run_attempt,
+            conclusion: conclusion.to_string(),
+        };
+        best.entry(key)
+            .and_modify(|e| {
+                if (run.id, run.run_attempt) > (e.run_id, e.run_attempt) {
+                    *e = cursor.clone();
+                }
+            })
+            .or_insert(cursor);
+    }
+    best
 }
 
 /// Pure function: deduplicate terminal runs by head_sha.
@@ -1384,13 +1479,37 @@ async fn ci_check_repo(
     // the terminal-only notification gates below.
     check_early_job_failures(&ctx, &mut state, &pr, provider).await;
 
-    let to_notify = select_runs_to_notify(
-        &pr.runs,
-        pr.effective_last_run_id,
-        tracking.last_notified_conclusion,
-        tracking.last_notified_run_attempt,
-        tracking.last_notified_run_conclusion,
-    );
+    // AUDIT2-009: on a head move the per-workflow cursors describe the OLD head —
+    // clear them so the new head is treated fresh (mirrors `effective_last_run_id`
+    // resetting `last_run_id`). Selection then falls to the legacy gate until the
+    // new head's cursors are seeded below.
+    let head_moved = tracking
+        .prev_head_sha
+        .is_some_and(|prev| prev != pr.current_sha.as_str());
+    if head_moved {
+        state.last_notified_by_workflow.clear();
+    }
+    // AUDIT2-009: once the per-workflow cursor map is seeded, it is the authoritative
+    // notify gate (one cursor per workflow `name`, so a low-id workflow's rerun-to-
+    // green is no longer hard-dropped by the single global `last_run_id` threshold).
+    // An EMPTY map (fresh watch or pre-upgrade legacy state) falls back to the legacy
+    // threshold gate — no behavior change, no post-upgrade storm — and is seeded
+    // below from this poll's latest-per-workflow runs.
+    let to_notify = if state.last_notified_by_workflow.is_empty() {
+        select_runs_to_notify(
+            &pr.runs,
+            pr.effective_last_run_id,
+            tracking.last_notified_conclusion,
+            tracking.last_notified_run_attempt,
+            tracking.last_notified_run_conclusion,
+        )
+    } else {
+        select_runs_to_notify_per_workflow(
+            &pr.runs,
+            &pr.current_sha,
+            &state.last_notified_by_workflow,
+        )
+    };
     if to_notify.is_empty() {
         // #1991: did anything actually change this cycle? A branch whose runs
         // are all terminal and all already-notified produces an UNCHANGED
@@ -1413,6 +1532,15 @@ async fn ci_check_repo(
             if activity {
                 state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
             }
+        }
+        // AUDIT2-009: seed/refresh per-workflow cursors even when nothing was
+        // selected — migration's first post-upgrade poll may notify nothing under
+        // the legacy gate, but the map must populate so later polls use the
+        // per-workflow gate. Only when there ARE current-head terminal runs, so a
+        // stale-only / all-in-progress poll preserves the existing map.
+        let cursors = compute_workflow_cursors(&pr.runs, &pr.current_sha);
+        if !cursors.is_empty() {
+            state.last_notified_by_workflow = cursors;
         }
         if state != snapshot {
             flush_watch_state(watch_path, &state);
@@ -2060,6 +2188,15 @@ fn persist_watch_state(
         state.last_stale_emitted_sha = Some(s.clone());
     }
     state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+    // AUDIT2-009: record the per-workflow cursors for ALL latest-per-workflow
+    // terminal runs at the current head (not just the notified representative), so
+    // an unnotified sibling workflow never re-triggers a stable-state notification
+    // next poll. Only overwrite when there ARE current-head terminal runs — a
+    // stale-only emit preserves the existing map.
+    let cursors = compute_workflow_cursors(&pr.runs, &pr.current_sha);
+    if !cursors.is_empty() {
+        state.last_notified_by_workflow = cursors;
+    }
 }
 
 /// Refresh `expires_at` to now + 72h after a successful poll (#1267).

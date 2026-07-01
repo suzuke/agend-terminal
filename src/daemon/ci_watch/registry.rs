@@ -353,6 +353,11 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
     merged.last_notified_conclusion = state.last_notified_conclusion.clone();
     merged.last_notified_run_attempt = state.last_notified_run_attempt;
     merged.last_notified_run_conclusion = state.last_notified_run_conclusion.clone();
+    // AUDIT2-009: the per-workflow notify cursors are poll-owned (like the
+    // last_notified_* fields above) — without this they'd never persist, so every
+    // poll would see an empty map, fall back to the legacy threshold gate, and the
+    // fix would be inert.
+    merged.last_notified_by_workflow = state.last_notified_by_workflow.clone();
     merged.last_stale_emitted_sha = state.last_stale_emitted_sha.clone();
     merged.last_mergeable_state = state.last_mergeable_state.clone();
     merged.last_mergeable_check_at = state.last_mergeable_check_at.clone();

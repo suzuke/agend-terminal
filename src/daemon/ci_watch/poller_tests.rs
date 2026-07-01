@@ -703,6 +703,177 @@ fn test_1307_rerun_pass_same_sha_fires_notification() {
     );
 }
 
+// ── AUDIT2-009: per-workflow notify cursor ──────────────────────────────────
+
+fn wf_run(name: &str, id: u64, attempt: u64, conclusion: Option<&str>, sha: &str) -> CiRun {
+    CiRun {
+        id,
+        run_attempt: attempt,
+        conclusion: conclusion.map(String::from),
+        head_sha: sha.into(),
+        url: String::new(),
+        name: name.into(),
+    }
+}
+
+fn cursor(
+    id: u64,
+    attempt: u64,
+    conclusion: &str,
+) -> crate::daemon::ci_watch::watch_state::WorkflowNotifyCursor {
+    crate::daemon::ci_watch::watch_state::WorkflowNotifyCursor {
+        run_id: id,
+        run_attempt: attempt,
+        conclusion: conclusion.into(),
+    }
+}
+
+/// The bug: workflow A (low id) failed and workflow B (high id) passed → both
+/// notified; the legacy single high-water threshold (= B.id) then HARD-dropped A's
+/// rerun-to-green because `A.id < threshold`. Per-workflow cursors rescue it.
+#[test]
+fn per_workflow_rescues_low_id_workflow_rerun_audit2_009() {
+    use std::collections::BTreeMap;
+    let runs = vec![
+        wf_run("A", 100, 2, Some("success"), "head"), // A reran: attempt 1→2, fail→success
+        wf_run("B", 200, 1, Some("success"), "head"),
+    ];
+    let mut map = BTreeMap::new();
+    map.insert("A".to_string(), cursor(100, 1, "failure"));
+    map.insert("B".to_string(), cursor(200, 1, "success"));
+    assert_eq!(
+        select_runs_to_notify_per_workflow(&runs, "head", &map),
+        vec![0],
+        "A's rerun-to-green (id 100 < B's 200) MUST be selected (AUDIT2-009)"
+    );
+}
+
+/// A provider without an attempt concept reruns by minting a NEW run_id with
+/// `run_attempt == 1`. Keying only on (attempt, conclusion) would swallow it; the
+/// cursor's `run_id` catches it.
+#[test]
+fn per_workflow_provider_retry_new_id_notifies_audit2_009() {
+    use std::collections::BTreeMap;
+    let runs = vec![wf_run("A", 150, 1, Some("success"), "head")];
+    let mut map = BTreeMap::new();
+    map.insert("A".to_string(), cursor(100, 1, "failure"));
+    assert_eq!(
+        select_runs_to_notify_per_workflow(&runs, "head", &map),
+        vec![0],
+        "a retry as a NEW run_id at attempt 1 must notify (run_id is part of the cursor)"
+    );
+}
+
+/// An unchanged latest-per-workflow terminal set on the same head selects nothing
+/// (the #1991 storm guard, subsumed per-workflow).
+#[test]
+fn per_workflow_stable_state_selects_nothing_audit2_009() {
+    use std::collections::BTreeMap;
+    let runs = vec![
+        wf_run("A", 100, 2, Some("success"), "head"),
+        wf_run("B", 200, 1, Some("success"), "head"),
+    ];
+    let mut map = BTreeMap::new();
+    map.insert("A".to_string(), cursor(100, 2, "success"));
+    map.insert("B".to_string(), cursor(200, 1, "success"));
+    assert!(
+        select_runs_to_notify_per_workflow(&runs, "head", &map).is_empty(),
+        "an unchanged latest-per-workflow terminal set must select nothing"
+    );
+}
+
+/// Two UNNAMED runs at the same head must NOT collapse into one cursor (synthetic
+/// `#run:<id>` keys), so one going terminal never masks the other.
+#[test]
+fn per_workflow_empty_name_runs_do_not_collapse_audit2_009() {
+    use std::collections::BTreeMap;
+    let runs = vec![
+        wf_run("", 100, 1, Some("success"), "head"),
+        wf_run("", 200, 1, Some("failure"), "head"),
+    ];
+    let cursors = compute_workflow_cursors(&runs, "head");
+    assert_eq!(cursors.len(), 2, "two unnamed runs → two #run:<id> cursors");
+    assert!(cursors.contains_key("#run:100") && cursors.contains_key("#run:200"));
+    let mut map = BTreeMap::new();
+    map.insert("#run:100".to_string(), cursor(100, 1, "success"));
+    assert_eq!(
+        select_runs_to_notify_per_workflow(&runs, "head", &map),
+        vec![1],
+        "the unseeded unnamed run must be selected independently"
+    );
+}
+
+/// `compute_workflow_cursors` records one cursor per workflow = its LATEST attempt,
+/// for TERMINAL runs at the CURRENT head only (stale-sha + in-progress excluded).
+#[test]
+fn compute_workflow_cursors_latest_per_workflow_current_head_audit2_009() {
+    let runs = vec![
+        wf_run("A", 99, 1, Some("failure"), "head"), // superseded older attempt
+        wf_run("A", 100, 2, Some("success"), "head"), // latest A
+        wf_run("B", 200, 1, Some("success"), "head"),
+        wf_run("A", 50, 1, Some("success"), "oldsha"), // stale sha → excluded
+        wf_run("C", 300, 1, None, "head"),             // in-progress → excluded
+    ];
+    let cursors = compute_workflow_cursors(&runs, "head");
+    assert_eq!(
+        cursors.len(),
+        2,
+        "only terminal latest A + B at current head"
+    );
+    assert_eq!(cursors.get("A"), Some(&cursor(100, 2, "success")));
+    assert_eq!(cursors.get("B"), Some(&cursor(200, 1, "success")));
+}
+
+/// AUDIT2-009 end-to-end (true regression): two workflows at the same head — A
+/// (low id) fails, B (high id) passes → aggregate failure notified + per-workflow
+/// cursors seeded. Then A is rerun to green (same id, attempt 2). The legacy single
+/// high-water threshold (= B.id) would HARD-drop A's rerun (`A.id < threshold`) and
+/// the watch would stay at `failure` (handoff silently broken). With per-workflow
+/// cursors the rerun is selected → aggregate success → the watch transitions to
+/// `success` (the same select→fan_out→persist chain that fires `[ci-pass]` /
+/// `[ci-ready-for-action]` + `record_ci_result`).
+#[test]
+fn e2e_low_id_workflow_rerun_green_notifies_handoff_audit2_009() {
+    let dir = tmp_dir("audit2-009-e2e");
+    let mut watch = base_watch();
+    watch["next_after_ci"] = serde_json::json!(["reviewer"]);
+
+    // Cycle 1: A (id 100) failure + B (id 200) success at "head".
+    let p1 = MockCiProvider::with_runs(vec![
+        wf_run("A", 100, 1, Some("failure"), "head"),
+        wf_run("B", 200, 1, Some("success"), "head"),
+    ]);
+    run_ci_check(&dir, &watch, &p1).unwrap();
+    let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+    let after1: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        after1["last_notified_conclusion"].as_str(),
+        Some("failure"),
+        "cycle 1: aggregate failure must be notified"
+    );
+
+    // Cycle 2: A rerun to green (same id 100, attempt 2). B unchanged.
+    let p2 = MockCiProvider::with_runs(vec![
+        wf_run("A", 100, 2, Some("success"), "head"),
+        wf_run("B", 200, 1, Some("success"), "head"),
+    ]);
+    run_ci_check(&dir, &after1, &p2).unwrap();
+    let after2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        after2["last_notified_conclusion"].as_str(),
+        Some("success"),
+        "AUDIT2-009: A's low-id rerun-to-green MUST notify (aggregate success), not be \
+         hard-dropped by the high-water threshold — else the handoff is silently broken"
+    );
+    assert_eq!(
+        after2["last_notified_by_workflow"]["A"]["conclusion"].as_str(),
+        Some("success"),
+        "A's per-workflow cursor must advance to success"
+    );
+}
+
 #[test]
 fn test_different_head_sha_triggers_new_notification() {
     let runs = vec![
