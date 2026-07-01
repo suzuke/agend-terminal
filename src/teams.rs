@@ -31,6 +31,9 @@ pub struct Team {
     /// teams needing remediation.
     #[serde(default)]
     pub source_repo: Option<std::path::PathBuf>,
+    /// #2509: explicit project-board id override — see `TeamConfig::project_id`.
+    #[serde(default)]
+    pub project_id: Option<String>,
     /// #785: team members that are registered in the team metadata but
     /// missing from the runtime registry (no live instance). Surfaces
     /// the desync state — operator can enumerate which members need a
@@ -123,6 +126,7 @@ fn project_team(name: &str, cfg: &crate::fleet::TeamConfig) -> Team {
         description: cfg.description.clone(),
         created_at: cfg.created_at.clone().unwrap_or_default(),
         source_repo: cfg.source_repo.clone(),
+        project_id: cfg.project_id.clone(),
         stale_members: Vec::new(),
         accept_from: cfg.accept_from.clone(),
     }
@@ -163,6 +167,9 @@ pub fn create(home: &Path, args: &Value) -> Value {
     let source_repo = args["repository_path"]
         .as_str()
         .map(std::path::PathBuf::from);
+    // #2509: independent of `source_repo` — lets the operator fix board-ACL
+    // routing without touching worktree/dispatch identity.
+    let project_id = args["project_id"].as_str().map(String::from);
 
     // Validate orchestrator
     if let Some(ref orch) = orchestrator {
@@ -212,6 +219,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
         description,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         source_repo,
+        project_id,
         accept_from,
     };
     match crate::fleet::add_team_to_yaml(home, &name, &cfg) {
@@ -489,6 +497,14 @@ pub fn update(home: &Path, args: &Value) -> Value {
         .map(std::path::PathBuf::from)
         .or_else(|| current.source_repo.clone());
 
+    // #2509: same set-or-preserve pattern as `source_repo` — no clear support
+    // (an omitted arg preserves the current value; `as_str()` can't
+    // distinguish `null` from absent anyway).
+    let new_project_id = args["project_id"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| current.project_id.clone());
+
     let new_accept_from: Vec<String> = args["accept_from"]
         .as_array()
         .map(|a| {
@@ -503,6 +519,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
         description: current.description.clone(),
         created_at: current.created_at.clone(),
         source_repo: new_source_repo,
+        project_id: new_project_id,
         accept_from: new_accept_from,
     };
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
@@ -562,6 +579,7 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
             description: cfg.description.clone(),
             created_at: cfg.created_at.clone(),
             source_repo: cfg.source_repo.clone(),
+            project_id: cfg.project_id.clone(),
             accept_from: cfg.accept_from.clone(),
         };
         let _ = crate::fleet::update_team_in_yaml(home, team_name, &new_cfg);
@@ -686,6 +704,116 @@ mod tests {
             "orphan must NOT double-fire on the already-Cancelled task (cancel-before-cascade), got {auto_orphan}"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #2509: explicit project_id override ──
+
+    /// `project_id` create/update/list round-trip: absent by default (renders
+    /// `null`, matching `source_repo`'s existing absent-field convention),
+    /// settable at create time independent of `repository_path`, and
+    /// settable/updatable later via `update` without needing to touch
+    /// `repository_path`.
+    #[test]
+    fn project_id_create_update_list_round_trip_2509() {
+        let home = tmp_home("2509-round-trip");
+        let created = create(&home, &serde_json::json!({"name": "t", "members": ["dev"]}));
+        assert_eq!(created["status"], "created", "{created}");
+        let listed = list(&home);
+        let t = listed["teams"]
+            .as_array()
+            .expect("teams array")
+            .iter()
+            .find(|t| t["name"] == "t")
+            .expect("team 't' present");
+        assert!(
+            t["project_id"].is_null(),
+            "project_id must be absent/null by default: {t}"
+        );
+
+        let updated = update(
+            &home,
+            &serde_json::json!({"name": "t", "project_id": "simple-edge-tts"}),
+        );
+        assert_eq!(updated["status"], "updated", "{updated}");
+        let listed = list(&home);
+        let t = listed["teams"]
+            .as_array()
+            .expect("teams array")
+            .iter()
+            .find(|t| t["name"] == "t")
+            .expect("team 't' present");
+        assert_eq!(t["project_id"], "simple-edge-tts");
+
+        // A second team can set project_id at create time, independent of
+        // repository_path (no repository_path at all here).
+        let created2 = create(
+            &home,
+            &serde_json::json!({"name": "t2", "members": ["dev2"], "project_id": "explicit-only"}),
+        );
+        assert_eq!(created2["status"], "created", "{created2}");
+        let listed = list(&home);
+        let t2 = listed["teams"]
+            .as_array()
+            .expect("teams array")
+            .iter()
+            .find(|t| t["name"] == "t2")
+            .expect("team 't2' present");
+        assert_eq!(t2["project_id"], "explicit-only");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2509 regression: the exact reported friction. Team's `source_repo` sits
+    /// under an intermediate directory (`~/Projects/simple-edge-tts`), so
+    /// `project_id_from_source_repo` mis-derives `Projects_simple-edge-tts`. A
+    /// task explicitly created on the `simple-edge-tts` board (e.g. via
+    /// `send repository=...`, modeled here with `create`'s `project` arg) is
+    /// then unclaimable by the team's own member — until `project_id` aligns
+    /// the team's resolved board with where the task actually lives.
+    #[test]
+    fn project_id_override_fixes_cross_board_denial_regression_2509() {
+        let home = tmp_home("2509-regression");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\nteams:\n  edge:\n    members:\n      - dev\n    source_repo: /Users/me/Projects/simple-edge-tts\n",
+        )
+        .unwrap();
+        let created = crate::tasks::handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "create", "title": "t", "project": "simple-edge-tts"}),
+        );
+        let task_id = created["id"].as_str().expect("task id").to_string();
+
+        // Pre-fix: dev's team resolves to the mis-derived slug, so this claim
+        // is denied — reproduces the reported bug.
+        let denied = crate::tasks::handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "claim", "id": task_id}),
+        );
+        assert!(
+            denied["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cross-board mutation denied")),
+            "must reproduce the reported false denial pre-fix: {denied}"
+        );
+
+        let updated = update(
+            &home,
+            &serde_json::json!({"name": "edge", "project_id": "simple-edge-tts"}),
+        );
+        assert_eq!(updated["status"], "updated", "{updated}");
+
+        let claimed = crate::tasks::handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "claim", "id": task_id}),
+        );
+        assert!(
+            claimed["error"].is_null(),
+            "project_id override must fix the claim: {claimed}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── #1744-M7: deterministic + fail-closed self-orch verdict ──
@@ -1484,6 +1612,7 @@ mod tests {
             description: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             source_repo: None,
+            project_id: None,
             stale_members: Vec::new(),
             accept_from: Vec::new(),
         };
@@ -1518,6 +1647,7 @@ mod tests {
             description: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             source_repo: None,
+            project_id: None,
             stale_members: vec!["stale-2".to_string()],
             accept_from: Vec::new(),
         };

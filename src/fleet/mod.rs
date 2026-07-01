@@ -520,6 +520,16 @@ pub struct TeamConfig {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<std::path::PathBuf>,
+    /// #2509: explicit project-board id override. `project_id_from_source_repo`
+    /// guesses `owner/repo` from `source_repo`'s last two path segments, which
+    /// mis-slugs when the local clone sits under an intermediate directory
+    /// (e.g. `~/Projects/x` → `Projects_x` instead of `x`). Set this to align
+    /// the team's resolved board with wherever its tasks actually live, without
+    /// touching `source_repo` (worktree/dispatch identity) or any existing
+    /// event history. `None` (default) preserves the source_repo-derived guess
+    /// exactly — byte-identical for every deployment that doesn't set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_from: Vec<String>,
 }
