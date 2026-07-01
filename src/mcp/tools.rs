@@ -268,6 +268,7 @@ pub(crate) fn def_team() -> Value {
             "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member."},
             "description": {"type": "string"},
             "repository_path": {"type": "string", "description": "Local filesystem path to the source repository for the team."},
+            "project_id": {"type": "string", "description": "#2509: explicit project-board id override. Set when `repository_path` sits under an intermediate directory (e.g. ~/Projects/x), which mis-derives the board slug from the last two path segments — this overrides that guess without touching repository_path/worktree identity."},
             "accept_from": {"type": "array", "items": {"type": "string"}, "description": "External agent names allowed to send directly to this team's orchestrator (cross-team allowlist). Empty = deny all cross-team sends (default)."},
             "add": {"type": "array", "items": {"type": "string"}},
             "remove": {"type": "array", "items": {"type": "string"}}
@@ -926,6 +927,7 @@ mod tests {
             ("team", "orchestrator", "teams.rs create/update validated member"),
             ("team", "description", "teams.rs create/update"),
             ("team", "repository_path", "teams.rs create/update source_repo"),
+            ("team", "project_id", "teams.rs create/update project_id override (#2509)"),
             ("team", "accept_from", "teams.rs create/update cross-team allowlist"),
             ("team", "add", "teams.rs update add-members"),
             ("team", "remove", "teams.rs update remove-members"),

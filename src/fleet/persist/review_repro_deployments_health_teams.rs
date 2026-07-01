@@ -42,6 +42,7 @@ fn team_with_member(member: &str) -> TeamConfig {
         description: None,
         created_at: Some("2026-06-14T00:00:00Z".to_string()),
         source_repo: None,
+        project_id: None,
         accept_from: Vec::new(),
     }
 }

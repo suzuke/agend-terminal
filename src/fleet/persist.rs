@@ -261,6 +261,12 @@ fn team_config_to_mapping(config: &TeamConfig) -> serde_yaml_ng::Mapping {
             serde_yaml_ng::Value::String(sr.display().to_string()),
         );
     }
+    if let Some(ref pid) = config.project_id {
+        team.insert(
+            "project_id".into(),
+            serde_yaml_ng::Value::String(pid.clone()),
+        );
+    }
     if !config.accept_from.is_empty() {
         let seq: Vec<serde_yaml_ng::Value> = config
             .accept_from
@@ -471,6 +477,7 @@ pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
             description: team.description.clone(),
             created_at: team.created_at.clone(),
             source_repo: None,
+            project_id: None,
             accept_from: Vec::new(),
         };
         match add_team_to_yaml(home, &team.name, &cfg) {

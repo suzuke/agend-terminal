@@ -303,13 +303,31 @@ pub(crate) fn project_id_from_source_repo(repo: &Path) -> String {
     project_slug(&raw)
 }
 
-/// The project a caller currently acts in: its team's `source_repo`, else the
-/// fleet-wide [`DEFAULT_PROJECT`]. (No team / no `source_repo` → default → the
-/// `home` board → byte-identical for single-project deployments.)
+/// #2509: a team's resolved project id — explicit `project_id` override
+/// (slugged for the same filesystem/path-escape safety as the source_repo
+/// derivation) takes priority over the `source_repo`-derived guess.
+/// `project_id_from_source_repo` guesses `owner/repo` from the last two path
+/// segments, which mis-slugs when the local clone sits under an intermediate
+/// directory (e.g. `~/Projects/x` → `Projects_x`); the override lets an
+/// operator align the team with wherever its tasks actually live without
+/// touching `source_repo` (worktree/dispatch identity) or any event history.
+/// `None` when the team has set neither, so the caller falls back to
+/// [`DEFAULT_PROJECT`] — byte-identical to pre-#2509 for every team that
+/// doesn't set `project_id`.
+fn project_id_for_team(team: &crate::teams::Team) -> Option<String> {
+    team.project_id
+        .as_ref()
+        .map(|pid| project_slug(pid))
+        .or_else(|| team.source_repo.as_deref().map(project_id_from_source_repo))
+}
+
+/// The project a caller currently acts in: its team's `project_id` override or
+/// `source_repo`-derived guess, else the fleet-wide [`DEFAULT_PROJECT`]. (No
+/// team / neither set → default → the `home` board → byte-identical for
+/// single-project deployments.)
 pub(super) fn resolve_current_project(home: &Path, caller: &str) -> String {
     crate::teams::find_team_for(home, caller)
-        .and_then(|t| t.source_repo)
-        .map(|repo| project_id_from_source_repo(&repo))
+        .and_then(|t| project_id_for_team(&t))
         .unwrap_or_else(|| DEFAULT_PROJECT.to_string())
 }
 
@@ -330,8 +348,7 @@ pub(super) fn resolve_current_project(home: &Path, caller: &str) -> String {
 pub(super) fn resolve_current_project_checked(home: &Path, caller: &str) -> anyhow::Result<String> {
     let fleet = crate::teams::try_load_fleet(home)?;
     Ok(crate::teams::find_team_for_in(&fleet, caller)
-        .and_then(|t| t.source_repo)
-        .map(|repo| project_id_from_source_repo(&repo))
+        .and_then(|t| project_id_for_team(&t))
         .unwrap_or_else(|| DEFAULT_PROJECT.to_string()))
 }
 

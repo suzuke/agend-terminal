@@ -1290,6 +1290,96 @@ teams:
     std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
 }
 
+// ── #2509: explicit project_id override at the resolver level ──
+
+/// A team whose `source_repo` sits under an intermediate directory — the
+/// exact reported friction (`~/Projects/simple-edge-tts` mis-derives to
+/// `Projects_simple-edge-tts` instead of `simple-edge-tts`).
+fn fragile_source_repo_fleet(home: &std::path::Path, project_id_line: &str) {
+    let yaml = format!(
+        "instances:\n  dev:\n    backend: claude\nteams:\n  edge:\n    members:\n      - dev\n    source_repo: /Users/me/Projects/simple-edge-tts\n{project_id_line}"
+    );
+    std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+}
+
+/// `resolve_current_project`/`resolve_current_project_checked` prefer an
+/// explicit `project_id` override over the fragile `source_repo`-derived
+/// guess; with no override, the fallback is byte-identical to pre-#2509
+/// (still the fragile slug — pinned here so a future change can't silently
+/// alter the fallback derivation itself, only add the override on top).
+#[test]
+fn resolve_current_project_prefers_explicit_project_id_2509() {
+    let home = tmp_home("2509-resolver-fallback");
+    fragile_source_repo_fleet(&home, "");
+    assert_eq!(
+        super::board_router::resolve_current_project(&home, "dev"),
+        "Projects_simple-edge-tts",
+        "byte-identical fallback: no project_id set, fragile derivation unchanged"
+    );
+    assert_eq!(
+        super::board_router::resolve_current_project_checked(&home, "dev").unwrap(),
+        "Projects_simple-edge-tts"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    let home = tmp_home("2509-resolver-override");
+    fragile_source_repo_fleet(&home, "    project_id: simple-edge-tts\n");
+    assert_eq!(
+        super::board_router::resolve_current_project(&home, "dev"),
+        "simple-edge-tts",
+        "explicit project_id must win over the fragile source_repo derivation"
+    );
+    assert_eq!(
+        super::board_router::resolve_current_project_checked(&home, "dev").unwrap(),
+        "simple-edge-tts"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `resolve_target_project` (the comms auto-create dispatch-routing path)
+/// inherits the same override — it's a direct passthrough to
+/// `resolve_current_project`, so a task auto-created for `dev` as dispatch
+/// target lands on the operator-intended board too, not just claim/done/update.
+#[test]
+fn resolve_target_project_prefers_explicit_project_id_2509() {
+    let home = tmp_home("2509-target-project");
+    fragile_source_repo_fleet(&home, "    project_id: simple-edge-tts\n");
+    assert_eq!(
+        super::resolve_target_project(&home, "dev"),
+        "simple-edge-tts"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Slug safety: an operator-supplied `project_id` goes through the SAME
+/// `project_slug` sanitization as the `source_repo` derivation — no path
+/// escape (`../`), no collapse to `.`/`..`/empty (CR-2026-06-14).
+#[test]
+fn resolve_current_project_sanitizes_malicious_project_id_2509() {
+    let home = tmp_home("2509-slug-safety");
+    fragile_source_repo_fleet(&home, "    project_id: \"../escape\"\n");
+    let resolved = super::board_router::resolve_current_project(&home, "dev");
+    assert_eq!(
+        resolved,
+        crate::task_events::project_slug("../escape"),
+        "project_id must be sanitized via project_slug, not raw-used"
+    );
+    assert!(
+        !resolved.contains('/') && resolved != ".." && resolved != ".",
+        "sanitized project_id must not be a path-escaping component: {resolved}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    let home = tmp_home("2509-slug-safety-alldots");
+    fragile_source_repo_fleet(&home, "    project_id: \"...\"\n");
+    let resolved = super::board_router::resolve_current_project(&home, "dev");
+    assert_eq!(
+        resolved, "_",
+        "an all-dots project_id must defang to the safe sentinel, not '..'-collapse"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 fn create_on(home: &std::path::Path, caller: &str, title: &str, deps: &[String]) -> String {
     handle(
         home,
