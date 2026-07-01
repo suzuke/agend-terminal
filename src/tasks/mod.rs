@@ -152,6 +152,31 @@ struct DepResolver<'a> {
     >,
 }
 
+// AUDIT2-014: test-only seam letting a regression test simulate a concurrent
+// writer landing in the narrow TOCTOU window between `DepResolver::status_of`
+// reading a foreign board's dep status and the local claim's commit (both
+// happen under only the LOCAL board's lock — the foreign board is read
+// lock-free). Armed via `set_after_foreign_dep_read_hook_for_test`; fires at
+// most once (`take`), so uninstrumented tests are unaffected.
+#[cfg(test)]
+thread_local! {
+    static AFTER_FOREIGN_DEP_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_foreign_dep_read_hook_for_test(f: impl FnOnce() + 'static) {
+    AFTER_FOREIGN_DEP_READ_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+fn fire_after_foreign_dep_read_hook_for_test() {
+    let hook = AFTER_FOREIGN_DEP_READ_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 impl<'a> DepResolver<'a> {
     fn new(home: &'a Path, local_board: &'a Path, snapshot: &[Task]) -> Self {
         let local = snapshot.iter().map(|t| (t.id.clone(), t.status)).collect();
@@ -191,7 +216,14 @@ impl<'a> DepResolver<'a> {
                 })
                 .unwrap_or_default()
         });
-        map.get(dep_id).copied()
+        let status = map.get(dep_id).copied();
+        // AUDIT2-014 regression seam: this is the exact TOCTOU window — a
+        // foreign-board write landing right here (after we've read `status`
+        // but before the caller's local claim commits) races the claim.
+        // No-op unless a test arms the hook.
+        #[cfg(test)]
+        fire_after_foreign_dep_read_hook_for_test();
+        status
     }
 }
 
@@ -408,6 +440,105 @@ pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
         }
     }
     released
+}
+
+/// Result of [`reconcile_stale_cross_board_claims`].
+#[derive(Debug, Clone, Default)]
+pub struct CrossBoardReconcileReport {
+    /// Claimed-but-not-yet-InProgress tasks released back to Open because a
+    /// cross-board dependency was found not-Done. Self-heals the AUDIT2-014
+    /// claim-time TOCTOU (see [`DepResolver::status_of`]).
+    pub released: Vec<String>,
+    /// InProgress tasks whose cross-board dependency is not-Done. Reported
+    /// only — work already underway is never auto-released.
+    pub flagged_in_progress: Vec<String>,
+}
+
+/// AUDIT2-014 (B', daemon detective backstop, multi-board only): the claim
+/// precondition validates a cross-board `depends_on` via a lock-free replay of
+/// the FOREIGN board (`DepResolver::status_of`), while the local `Claimed`
+/// commit lands under only the LOCAL board's lock. A foreign-board write
+/// landing in that window (dep reopened/cancelled) lets a claim commit against
+/// a dependency that is, by commit time, no longer Done — and because
+/// `evaluate_with_resolver` short-circuits already-`Claimed` tasks, list-time
+/// dep eval never revisits it (permanently stuck).
+///
+/// This is the periodic backstop that revisits what the claim-time check
+/// cannot atomically guarantee across boards: every board's Claimed/InProgress
+/// tasks that have at least one cross-board dependency are re-evaluated
+/// against CURRENT foreign-board state.
+/// - Claimed (not yet InProgress) + dep not Done → emit `Released` (clears
+///   owner, back to Open — list-time eval then shows Blocked again until the
+///   dep is Done, exactly like a task that was never wrongly claimed).
+/// - InProgress + dep not Done → flagged only; work already underway is never
+///   yanked out from under an agent.
+///
+/// Same-board deps are untouched (a same-board claim precondition already
+/// validates atomically under one lock — no TOCTOU, no reconciliation needed;
+/// touching them here would be a scope-creeping behavior change, not a fix).
+pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileReport {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId, TaskStatus};
+    let mut report = CrossBoardReconcileReport::default();
+    let emitter = InstanceName::from("system:cross_board_dep_detective");
+
+    for project in board_router::enumerate_projects(home) {
+        let board = crate::task_events::board_root(home, &project);
+        // RAW persisted state (`replay_at`, no in-memory dep derivation) — the
+        // derived view (`list_all_at`/`list_all_boards`) would relabel an
+        // InProgress task with an unsatisfied dep to `Blocked` before we ever
+        // see it, hiding it from both the Claimed and InProgress arms below.
+        let state = match crate::task_events::replay_at(&board) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let snapshot: Vec<Task> = state.tasks.values().map(record_to_task).collect();
+        let candidates: Vec<&Task> = snapshot
+            .iter()
+            .filter(|t| {
+                !t.depends_on.is_empty()
+                    && matches!(t.status, TaskStatus::Claimed | TaskStatus::InProgress)
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let mut resolver = DepResolver::new(home, &board, &snapshot);
+        for task in candidates {
+            let has_cross_board_dep = task
+                .depends_on
+                .iter()
+                .any(|d| board_router::resolve_task_project(home, d) != project);
+            if !has_cross_board_dep {
+                continue;
+            }
+            let all_done = task
+                .depends_on
+                .iter()
+                .all(|d| resolver.status_of(d) == Some(TaskStatus::Done));
+            if all_done {
+                continue;
+            }
+            if task.status == TaskStatus::InProgress {
+                report.flagged_in_progress.push(task.id.clone());
+                tracing::warn!(
+                    task_id = %task.id,
+                    "AUDIT2-014: in-progress task's cross-board dependency is not Done — flagged, not released"
+                );
+                continue;
+            }
+            let event = TaskEvent::Released {
+                task_id: TaskId(task.id.clone()),
+                reason: "AUDIT2-014: cross-board dependency no longer Done (claim raced a foreign-board write)".to_string(),
+            };
+            match crate::task_events::append_at(&board, &emitter, event) {
+                Ok(_) => report.released.push(task.id.clone()),
+                Err(e) => {
+                    tracing::warn!(error = %e, task = %task.id, "AUDIT2-014 detective: release append failed; will retry next pass");
+                }
+            }
+        }
+    }
+    report
 }
 
 /// Result of [`migrate_legacy_tasks_json_to_event_log`]. Reported back to
