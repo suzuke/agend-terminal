@@ -1566,6 +1566,75 @@ fn cross_board_dep_detective_flags_but_does_not_release_in_progress_audit2_014()
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// AUDIT2-014 regression (codex-reviewer, PR #2521 review finding): the
+/// detective itself has a scan→append TOCTOU. It scans a stale, unlocked
+/// snapshot to decide a task is releasable, then (pre-fix) committed
+/// `Released` unconditionally — so a task that legitimately advances
+/// (Claimed → InProgress) between the scan and the commit would get yanked
+/// back to Open/ownerless, clobbering real work. The hook fires exactly in
+/// that window (right before the checked commit) and starts A via the normal
+/// `update` action, simulating the race deterministically. The fix
+/// (`append_checked_at` revalidating fresh state under the board lock) must
+/// skip the write — A's legitimate InProgress transition must survive.
+#[test]
+fn cross_board_dep_detective_release_toctou_skips_when_task_advances_audit2_014() {
+    let home = tmp_home("xboard-detective-toctou");
+    cross_board_fleet(&home);
+    let b = create_on(&home, "devB", "B", &[]);
+    let a = create_on(&home, "devA", "A", std::slice::from_ref(&b));
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": b, "result": "ok"}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": a}),
+    );
+    handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": b, "status": "open"}),
+    );
+
+    {
+        let home = home.clone();
+        let a = a.clone();
+        super::set_before_cross_board_release_hook_for_test(move || {
+            let started = handle(
+                &home,
+                "devA",
+                &serde_json::json!({"action": "update", "id": a, "status": "in_progress"}),
+            );
+            assert!(
+                started["error"].is_null(),
+                "test seam: starting A: {started}"
+            );
+        });
+    }
+
+    let report = super::reconcile_stale_cross_board_claims(&home);
+    assert!(
+        report.released.is_empty(),
+        "must not release a task that advanced to InProgress mid-scan: {report:?}"
+    );
+
+    let board_a = super::board_router::board_for_task(&home, &a);
+    let persisted = crate::task_events::replay_at(&board_a)
+        .expect("replay A's board")
+        .tasks
+        .get(&crate::task_events::TaskId(a.clone()))
+        .expect("A present on its board")
+        .status;
+    assert_eq!(
+        persisted,
+        crate::task_events::TaskStatus::InProgress,
+        "A's legitimate InProgress transition must survive the detective's stale-snapshot race"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// AUDIT2-014 scope boundary: a Claimed task with only a SAME-board dep that
 /// goes stale after claim is left untouched. The claim precondition already
 /// validates same-board deps atomically under one lock — there's no TOCTOU to

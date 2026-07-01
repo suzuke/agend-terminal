@@ -177,6 +177,29 @@ fn fire_after_foreign_dep_read_hook_for_test() {
     }
 }
 
+// AUDIT2-014 (codex-reviewer, PR #2521): test-only seam for the B' detective's
+// OWN scan→append TOCTOU — simulates a task legitimately advancing (e.g.
+// Claimed → InProgress) between `reconcile_stale_cross_board_claims`'s stale
+// scan and its checked commit. Fires at most once.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CROSS_BOARD_RELEASE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_cross_board_release_hook_for_test(f: impl FnOnce() + 'static) {
+    BEFORE_CROSS_BOARD_RELEASE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+fn fire_before_cross_board_release_hook_for_test() {
+    let hook = BEFORE_CROSS_BOARD_RELEASE_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 impl<'a> DepResolver<'a> {
     fn new(home: &'a Path, local_board: &'a Path, snapshot: &[Task]) -> Self {
         let local = snapshot.iter().map(|t| (t.id.clone(), t.status)).collect();
@@ -526,14 +549,74 @@ pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileRep
                 );
                 continue;
             }
+            // codex-reviewer (PR #2521): a bare `append_at` here would commit the
+            // release against this stale, unlocked `snapshot` — the exact scan→
+            // append TOCTOU this whole audit is about, just relocated. Between the
+            // scan above and this write, the task can legitimately transition
+            // (Claimed → InProgress/Done) via a normal, properly-locked claim/
+            // update — and an unconditional Released would then yank that
+            // in-progress or completed work back to Open/ownerless. `append_checked_at`
+            // re-validates against a FRESH replay under the board's lock: only if
+            // the task is STILL Claimed with a STILL-unsatisfied cross-board dep
+            // does the write land; any other outcome (now InProgress/Done/gone,
+            // or the dep resolved) is a silent no-op here (a fresh flag/skip, not
+            // an error).
+            let task_id = task.id.clone();
+            let project_for_check = project.clone();
             let event = TaskEvent::Released {
-                task_id: TaskId(task.id.clone()),
+                task_id: TaskId(task_id.clone()),
                 reason: "AUDIT2-014: cross-board dependency no longer Done (claim raced a foreign-board write)".to_string(),
             };
-            match crate::task_events::append_at(&board, &emitter, event) {
-                Ok(_) => report.released.push(task.id.clone()),
+            // Regression seam for the detective's OWN scan→append TOCTOU
+            // (codex-reviewer, PR #2521): fires right before the checked commit,
+            // exactly where a test can simulate the task legitimately advancing
+            // (e.g. Claimed → InProgress) between the stale scan above and this
+            // write. No-op unless a test arms it.
+            #[cfg(test)]
+            fire_before_cross_board_release_hook_for_test();
+            let outcome =
+                crate::task_events::append_checked_at(&board, &emitter, event, |fresh_state| {
+                    let tid = TaskId(task_id.clone());
+                    let record = fresh_state
+                        .tasks
+                        .get(&tid)
+                        .ok_or_else(|| format!("task '{task_id}' no longer present"))?;
+                    if record.status != TaskStatus::Claimed {
+                        return Err(format!(
+                            "task '{task_id}' is now '{}', no longer Claimed",
+                            record.status
+                        ));
+                    }
+                    let fresh_snapshot: Vec<Task> =
+                        fresh_state.tasks.values().map(record_to_task).collect();
+                    let mut fresh_resolver = DepResolver::new(home, &board, &fresh_snapshot);
+                    let still_cross_board = record.depends_on.iter().any(|d| {
+                        board_router::resolve_task_project(home, &d.0) != project_for_check
+                    });
+                    if !still_cross_board {
+                        return Err(format!("task '{task_id}' no longer has a cross-board dep"));
+                    }
+                    let still_not_done = record
+                        .depends_on
+                        .iter()
+                        .any(|d| fresh_resolver.status_of(&d.0) != Some(TaskStatus::Done));
+                    if !still_not_done {
+                        return Err(format!("task '{task_id}' cross-board dep is now Done"));
+                    }
+                    Ok(())
+                });
+            match outcome {
+                Ok(Ok(_)) => report.released.push(task_id),
+                Ok(Err(reason)) => {
+                    tracing::debug!(
+                        task_id = %task_id,
+                        reason = %reason,
+                        "AUDIT2-014 detective: release precondition failed at commit time \
+                         (task changed between scan and commit) — skipped, no event written"
+                    );
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, task = %task.id, "AUDIT2-014 detective: release append failed; will retry next pass");
+                    tracing::warn!(error = %e, task_id = %task_id, "AUDIT2-014 detective: release append failed; will retry next pass");
                 }
             }
         }
