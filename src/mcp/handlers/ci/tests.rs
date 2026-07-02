@@ -862,6 +862,56 @@ fn checkout_bind_true_writes_binding_marker_and_no_longer_arms_watch_2158_gr1() 
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #2533: `repo action=checkout bind:true task_id=...` (the reviewer-workflow
+/// self-claim path, §3.19.1) must thread the caller-supplied `task_id` into
+/// `binding.json` — pre-fix, `handle_checkout_repo_inner` hardcoded `""`
+/// regardless of the `task_id` arg — AND the task_id linkage must suppress the
+/// `binding_out_of_dispatch` warning (the checkout is now attributable to a
+/// task, not a rogue bind).
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_with_task_id_records_task_id_and_suppresses_warning_2533() {
+    let home = p778_tmp_home("task-id");
+    let parent = p778_tmp_home("task-id-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/p2533");
+    let agent = "p2533-agent";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/p2533",
+            "bind": true,
+            "task_id": "T-2533",
+        }),
+        agent,
+    );
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+
+    let binding = crate::paths::runtime_dir(&home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    assert_eq!(
+        v["task_id"].as_str(),
+        Some("T-2533"),
+        "#2533: checkout bind:true must record the caller-supplied task_id, not a hardcoded \
+         empty sentinel: {v}"
+    );
+
+    assert!(
+        !std::fs::read_to_string(home.join("event-log.jsonl"))
+            .unwrap_or_default()
+            .contains("binding_out_of_dispatch"),
+        "#2533: a checkout bind:true CARRYING a task_id must be treated as in-dispatch — no \
+         out-of-dispatch warning"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 /// §3.9 #1882 (reviewer-2 re-verify): the repo-checkout bind path is the third
 /// production bind site. An end-to-end conflict — agent A checks out + binds a
 /// branch, then agent B repo-checkouts the SAME branch — must end with EXACTLY
