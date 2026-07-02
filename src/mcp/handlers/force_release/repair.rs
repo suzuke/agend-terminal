@@ -126,15 +126,33 @@ pub(crate) fn attempt_safe_rebind_repair(
     let Some(binding) = crate::binding::read(home, agent) else {
         return Ok(RepairAction::NoOp);
     };
+    // codex-reviewer (PR #2523 review): the recorded binding branch can have
+    // its own live dependents (CI watch / task) INDEPENDENT of the worktree's
+    // actual branch — a "double-stale" binding (binding.branch=A, worktree
+    // actually on B, requested C) must not silently abandon A's tracking just
+    // because the mutation touches B→C. Preflight EVERY branch this call is
+    // about to abandon — recorded_branch always, actual_branch too once known
+    // — BEFORE any mutation (switch or the destructive fallback below).
+    let recorded_branch = binding
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     let wt_str = binding
         .get("worktree")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let worktree = Path::new(wt_str);
     if wt_str.is_empty() || !worktree.exists() || !crate::worktree::is_git_repo(worktree) {
-        // No LIVE worktree at the recorded path — nothing to protect. Safe to
-        // fall back to the legacy stale-state cleanup (rebase_clean_self's
-        // original, still-legitimate purpose).
+        // No LIVE worktree at the recorded path — nothing to protect from
+        // mutation, but the binding we're about to CLEAR can still be the
+        // only thing tracking `recorded_branch` for a live CI watch/task.
+        if let Some(blocked) =
+            reject_if_branch_has_dependents(home, agent, &recorded_branch, branch)
+        {
+            return Err(blocked);
+        }
         return match rebase_clean_self(home, agent, branch) {
             Ok(_) => Ok(RepairAction::StaleStateCleared),
             Err(e) => Err(RepairBlocked::PathUnsafe(e)),
@@ -162,16 +180,24 @@ pub(crate) fn attempt_safe_rebind_repair(
     }
     let actual_branch =
         crate::git_helpers::git_cmd(worktree, &["branch", "--show-current"]).unwrap_or_default();
+
+    // Preflight BOTH candidate abandoned branches before any mutation —
+    // recorded_branch (the binding we're about to overwrite) and, if it
+    // differs, actual_branch (the branch the switch below would move away
+    // from). Order doesn't matter: either blocking either one must happen
+    // strictly before the `git switch` call.
+    if let Some(blocked) = reject_if_branch_has_dependents(home, agent, &recorded_branch, branch) {
+        return Err(blocked);
+    }
+    if actual_branch != recorded_branch {
+        if let Some(blocked) = reject_if_branch_has_dependents(home, agent, &actual_branch, branch)
+        {
+            return Err(blocked);
+        }
+    }
+
     if actual_branch == branch {
         return Ok(RepairAction::MetadataOnly);
-    }
-    // About to abandon `actual_branch` in-place — must not silently orphan a
-    // live dependent still tracking it.
-    if crate::binding::agent_has_active_ci_watch_on_branch(home, agent, &actual_branch) {
-        return Err(RepairBlocked::ActiveCiWatch);
-    }
-    if crate::binding::branch_has_active_task(home, &actual_branch) {
-        return Err(RepairBlocked::ActiveTask);
     }
     // Plain `git switch` — NOT `worktree::checkout_branch` (that falls back
     // to `git switch -c`, silently CREATING a branch; a repair path must
@@ -182,6 +208,29 @@ pub(crate) fn attempt_safe_rebind_repair(
         Err(GitError::NonZero { stderr, .. }) => Err(RepairBlocked::SwitchFailed(stderr)),
         Err(GitError::Spawn(e)) => Err(RepairBlocked::SwitchFailed(e.to_string())),
     }
+}
+
+/// `Some(blocked)` iff `candidate` is a real branch being abandoned (non-empty
+/// and different from the `target` we're moving TO) that still has a live
+/// dependent (this agent's CI watch, or any active task linked to it).
+/// `target` itself is never checked — it's where we're going, not what's
+/// being abandoned.
+fn reject_if_branch_has_dependents(
+    home: &Path,
+    agent: &str,
+    candidate: &str,
+    target: &str,
+) -> Option<RepairBlocked> {
+    if candidate.is_empty() || candidate == target {
+        return None;
+    }
+    if crate::binding::agent_has_active_ci_watch_on_branch(home, agent, candidate) {
+        return Some(RepairBlocked::ActiveCiWatch);
+    }
+    if crate::binding::branch_has_active_task(home, candidate) {
+        return Some(RepairBlocked::ActiveTask);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -320,6 +369,90 @@ mod tests {
         assert!(
             crate::binding::read(&home, "agentA").is_some(),
             "binding must survive the switch (no release_full call)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex-reviewer (PR #2523 review, finding 1): the "double-stale
+    /// ordering" bug — binding.branch=A, worktree ACTUALLY on B, requested C.
+    /// A has a live dependent. Pre-fix, the repair checked dependents only on
+    /// B, then switched the worktree to C — mutating live state before
+    /// `bind_full`'s later guard-b check on A could ever reject. Must now
+    /// block on A's dependent BEFORE any `git switch`, leaving the worktree
+    /// on B untouched.
+    #[test]
+    fn attempt_safe_rebind_repair_blocks_on_recorded_branch_dependent_before_switching_2496() {
+        let home = tmp_home("2496-repair-double-stale");
+        let wt = tmp_git_repo(&home, "agentA");
+        write_managed_marker(&wt, "agentA");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // binding.branch = "A".
+        crate::binding::bind_full(&home, "agentA", "", "A", &wt, &src, false)
+            .expect("first bind ok");
+        // Worktree drifts to B out-of-band (bind/release bypassed).
+        git_switch(&wt, "B");
+        // A (the STALE recorded branch, not B) has an active task.
+        crate::tasks::handle(
+            &home,
+            "agentA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "work on A",
+                "assignee": "agentA",
+                "branch": "A",
+            }),
+        );
+
+        let result = attempt_safe_rebind_repair(&home, "agentA", "C");
+        assert!(
+            matches!(result, Err(RepairBlocked::ActiveTask)),
+            "expected ActiveTask block on the recorded branch A, got {result:?}"
+        );
+        let actual = crate::git_helpers::git_cmd(&wt, &["branch", "--show-current"]).unwrap();
+        assert_eq!(
+            actual, "B",
+            "worktree must NOT have been switched — the block must land before any mutation"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex-reviewer (PR #2523 review, finding 2): the dead-worktree
+    /// fallback must also preflight the recorded branch's dependents before
+    /// falling through to the destructive `rebase_clean_self` — a missing
+    /// worktree doesn't make a live CI watch/task on the recorded branch
+    /// disappear.
+    #[test]
+    fn attempt_safe_rebind_repair_blocks_stale_state_cleanup_when_recorded_branch_has_dependent_2496(
+    ) {
+        let home = tmp_home("2496-repair-dead-with-dependent");
+        let wt = tmp_git_repo(&home, "agentA");
+        write_managed_marker(&wt, "agentA");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        crate::binding::bind_full(&home, "agentA", "", "A", &wt, &src, false)
+            .expect("first bind ok");
+        // Worktree is now GONE — the incident-recovery scenario.
+        std::fs::remove_dir_all(&wt).ok();
+        crate::tasks::handle(
+            &home,
+            "agentA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "work on A",
+                "assignee": "agentA",
+                "branch": "A",
+            }),
+        );
+
+        let result = attempt_safe_rebind_repair(&home, "agentA", "C");
+        assert!(
+            matches!(result, Err(RepairBlocked::ActiveTask)),
+            "expected ActiveTask block, got {result:?}"
+        );
+        assert!(
+            crate::binding::read(&home, "agentA").is_some(),
+            "binding must survive — rebase_clean_self/release_full must NOT have run"
         );
         std::fs::remove_dir_all(&home).ok();
     }
