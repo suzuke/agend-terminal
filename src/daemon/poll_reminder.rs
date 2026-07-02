@@ -63,6 +63,9 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
         // count, so re-nudging a duplicate the agent already handled stops here.
         let (count, oldest) = crate::inbox::unread_count_after_discharge(home, name);
         if count == 0 {
+            // RED stub (§3.10) — dedup-baseline reset intentionally omitted
+            // (this is the exact gap the r0 REJECTED finding caught); restored
+            // in the immediately-following GREEN commit.
             continue;
         }
         if !should_notify_and_record(name, count) {
@@ -820,6 +823,87 @@ mod tests {
             "a fully-discharged (head, job) — including its duplicate — must not \
              re-nudge: {second:?}"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2524 P6-r2 regression (gapfix-reviewer REJECTED finding, DUAL review r0):
+    /// discharging job A's ONLY unread ci-fail drops the count to 0, but
+    /// `collect_poll_reminders` used to `continue` on `count == 0` WITHOUT
+    /// updating `LAST_NOTIFIED` — leaving it stale at job A's pre-discharge
+    /// count. When a DIFFERENT job B then fails at the same head,
+    /// `unread_count_after_discharge` correctly reports count=1 (job B is not
+    /// discharged), but `should_notify_and_record` saw `prev(1) == count(1)`
+    /// (the stale value from job A) and silently suppressed the reminder — a
+    /// real silent-loss, not merely a missed optimization. Fixed by clearing the
+    /// agent's dedup entry whenever the discharge-aware count is confirmed
+    /// zero (the SAME invalidation `reclaim_stale_delivering` already performs
+    /// via `remove_agent` when a restore changes the count out from under the
+    /// ledger). REAL entry point (§3.9): drives `collect_poll_reminders`
+    /// itself, not the dedup helper in isolation.
+    #[test]
+    fn collect_poll_reminders_renotifies_for_different_job_after_discharge_zeroes_count() {
+        let home = tmp_home("collect-discharge-then-diff-job");
+        let agent = "collect-discharge-diff-job-agent";
+        let (repo, branch, head, short) = (
+            "o/r",
+            "feat/y",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "deadbee",
+        );
+
+        let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let ws = crate::daemon::ci_watch::WatchState {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            head_sha: Some(head.to_string()),
+            ..Default::default()
+        };
+        std::fs::write(
+            watch_dir.join(crate::daemon::ci_watch::watch_filename(repo, branch)),
+            serde_json::to_string_pretty(&ws).unwrap(),
+        )
+        .unwrap();
+
+        let ci_fail_msg = |job: &str| {
+            crate::inbox::InboxMessage::new_system(
+                "system:ci",
+                "ci-watch",
+                format!("[ci-fail] {repo}@{branch} ({short}): failure\nDetail: {job}\nURL: https://example/run/1"),
+            )
+            .with_correlation_id(format!("{repo}@{branch}"))
+        };
+
+        // Job A fails — undischarged, must nudge.
+        crate::inbox::enqueue(&home, agent, ci_fail_msg("audit")).unwrap();
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+        let first = collect_poll_reminders(&home, &registry);
+        assert_eq!(first.len(), 1, "job A's undischarged ci-fail must nudge once");
+
+        // Triage job A. It was the ONLY unread row, so the discharge-aware
+        // count drops to 0 this pass.
+        crate::daemon::discharge_ledger::record_discharge(&home, head, "audit", agent, None)
+            .unwrap();
+        let after_discharge = collect_poll_reminders(&home, &registry);
+        assert!(
+            after_discharge.is_empty(),
+            "job A is discharged and was the only unread row — count is 0, no nudge"
+        );
+
+        // Job B — a DIFFERENT job at the SAME head — fails.
+        crate::inbox::enqueue(&home, agent, ci_fail_msg("Coverage")).unwrap();
+        let third = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            third.len(),
+            1,
+            "job B is a genuinely different signature — it must notify even \
+             though its count (1) coincides with job A's stale pre-discharge \
+             count; a silent suppression here is exactly the #2537 \
+             different-signature-must-not-drop guarantee being violated"
+        );
+        assert!(third[0].1.contains("unread=1"));
 
         std::fs::remove_dir_all(&home).ok();
     }
