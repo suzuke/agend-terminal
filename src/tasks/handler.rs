@@ -52,6 +52,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "activity" => handle_activity(home, args),
         "metadata_set" => handle_metadata_set(home, instance_name, emitter, args),
         "metadata_get" => handle_metadata_get(home, args),
+        "ack_plan" => handle_ack_plan(home, instance_name, emitter, args),
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
     }
 }
@@ -71,6 +72,19 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         Some(t) => t,
         None => return serde_json::json!({"error": "missing 'title'"}),
     };
+    // #2249 pre-work alignment gate: validation mirrors second_reviewer_reason
+    // (comms_gates/dispatch.rs:104-109) — N>0 requires a non-empty reason.
+    // 0 (default/absent) leaves plan_ack_required unset, so the in_progress
+    // gate never fires — byte-identical to pre-#2249 behavior.
+    let plan_ack_required = args["plan_ack_required"].as_u64().unwrap_or(0);
+    if plan_ack_required > 0 {
+        let reason = args["plan_ack_reason"].as_str().unwrap_or("");
+        if reason.is_empty() {
+            return serde_json::json!({
+                "error": "plan_ack_required > 0 requires non-empty 'plan_ack_reason'"
+            });
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
@@ -173,6 +187,9 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
             let _ = super::board_router::record_task_project(home, &id, &project);
+            // #2249 RED: metadata-seeding for the plan-ack gate is not yet
+            // implemented — GREEN commit fills this in. `plan_ack_required`
+            // is validated above but intentionally not persisted here yet.
             let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             // #1496 Option 1: `task(action:create)` is a PURE board record
             // with ZERO dispatch side-effects — no inbox enqueue, no
@@ -910,6 +927,8 @@ fn handle_update(
                 });
             }
         }
+        // #2249 RED: the in_progress plan-ack gate check is not yet
+        // implemented — GREEN commit adds the chokepoint here.
         let event_for_transition: Option<crate::task_events::TaskEvent> =
             match (prev_status, s.as_str()) {
                 (_, "claimed") => Some(crate::task_events::TaskEvent::Claimed {
@@ -1319,6 +1338,25 @@ fn handle_metadata_set(
         }
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
+}
+
+// #2249 RED: ack-plan mechanism not yet implemented (self-ack rejection,
+// plan-set precondition, idempotent tracking) — GREEN commit fills this in.
+fn handle_ack_plan(
+    home: &Path,
+    _instance_name: &str,
+    _emitter: crate::task_events::InstanceName,
+    args: &Value,
+) -> Value {
+    let id = match id_arg(args) {
+        Some(i) => i,
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
+    };
+    let board = super::board_router::board_for_task(home, id);
+    if read_task_record_at(&board, id).is_none() {
+        return serde_json::json!({"error": format!("task not found: {id}")});
+    }
+    serde_json::json!({"id": id, "event": "ack_plan", "acked": 0, "already_acked": false})
 }
 
 fn handle_metadata_get(home: &Path, args: &Value) -> Value {
@@ -2320,6 +2358,274 @@ mod tests {
             read_task_record(&home, "t-upd").expect("exists").status,
             crate::task_events::TaskStatus::InProgress
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2524 P2a-r1 / #2249 pre-work alignment gate — real MCP handler
+    // entry point throughout (§3.9: no mid-pipeline event injection). Every
+    // call below goes through the top-level `handle()` exactly as the `task`
+    // MCP tool would dispatch it.
+
+    #[test]
+    fn plan_ack_gate_blocks_then_unblocks_in_progress_2249() {
+        let home = tmp_home("plan-ack-happy");
+        let created = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "create",
+                "title": "risky refactor",
+                "assignee": "worker",
+                "plan_ack_required": 2,
+                "plan_ack_reason": "touches auth boundary"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            created["task"]["metadata"]["plan_ack_required"], 2,
+            "plan_ack_required must be seeded into metadata: {created}"
+        );
+
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+
+        // Gate blocks: no plan set yet, 0 acks.
+        let blocked = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert_eq!(
+            blocked["code"], "plan_ack_pending",
+            "in_progress must be gated with 0/2 acks: {blocked}"
+        );
+        assert_eq!(blocked["required"], 2);
+        assert_eq!(blocked["acked"], 0);
+        assert_eq!(
+            read_task_record(&home, &id).expect("exists").status,
+            crate::task_events::TaskStatus::Claimed,
+            "status must NOT have advanced past claimed"
+        );
+
+        // Set the plan.
+        let set = handle(
+            &home,
+            "worker",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "step 1, step 2"
+            }),
+        );
+        assert!(
+            set["error"].is_null(),
+            "metadata_set plan must succeed: {set}"
+        );
+
+        // One ack: still blocked (1 < 2).
+        let ack1 = handle(
+            &home,
+            "reviewer-a",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert!(
+            ack1["error"].is_null(),
+            "reviewer-a ack must succeed: {ack1}"
+        );
+        assert_eq!(ack1["acked"], 1);
+        let still_blocked = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert_eq!(
+            still_blocked["code"], "plan_ack_pending",
+            "1/2 acks must still block: {still_blocked}"
+        );
+        assert_eq!(still_blocked["acked"], 1);
+
+        // Second (distinct) ack: threshold met, in_progress now passes.
+        let ack2 = handle(
+            &home,
+            "reviewer-b",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert_eq!(ack2["acked"], 2);
+        let unblocked = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert!(
+            unblocked["error"].is_null(),
+            "in_progress must pass once 2/2 acks are in: {unblocked}"
+        );
+        assert_eq!(
+            read_task_record(&home, &id).expect("exists").status,
+            crate::task_events::TaskStatus::InProgress
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn plan_ack_required_zero_is_byte_identical_regression_2249() {
+        // The N=0 (default/absent) path must be indistinguishable from
+        // pre-#2249 behavior: create → claim → in_progress, no plan, no
+        // acks, no gate — exactly the shape of the pre-existing
+        // `illegal_transition` regression test above, just without any
+        // plan_ack_* args at all.
+        let home = tmp_home("plan-ack-n0");
+        let created = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "create", "title": "ordinary task", "assignee": "worker"}),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        assert!(
+            created["task"]["metadata"]
+                .get("plan_ack_required")
+                .is_none(),
+            "N=0/absent must NOT seed any plan_ack_required metadata: {created}"
+        );
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let result = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert!(
+            result["error"].is_null(),
+            "N=0 must never gate in_progress: {result}"
+        );
+        assert_eq!(
+            read_task_record(&home, &id).expect("exists").status,
+            crate::task_events::TaskStatus::InProgress
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn plan_ack_required_without_reason_rejected_2249() {
+        let home = tmp_home("plan-ack-no-reason");
+        let result = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "create", "title": "x", "plan_ack_required": 1}),
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("plan_ack_reason"),
+            "plan_ack_required>0 without reason must error: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn plan_ack_self_ack_rejected_2249() {
+        let home = tmp_home("plan-ack-self");
+        let created = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "create", "title": "x", "assignee": "worker",
+                "plan_ack_required": 1, "plan_ack_reason": "reason"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "plan text"
+            }),
+        );
+        let self_ack = handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert_eq!(
+            self_ack["code"], "self_ack_forbidden",
+            "assignee must not be able to ack their own plan: {self_ack}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn plan_ack_before_plan_set_rejected_2249() {
+        let home = tmp_home("plan-ack-no-plan");
+        let created = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "create", "title": "x", "assignee": "worker",
+                "plan_ack_required": 1, "plan_ack_reason": "reason"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        let ack = handle(
+            &home,
+            "reviewer-a",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert_eq!(
+            ack["code"], "plan_not_set",
+            "ack before plan is set must be rejected: {ack}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn plan_ack_idempotent_reack_does_not_double_count_2249() {
+        let home = tmp_home("plan-ack-idempotent");
+        let created = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "create", "title": "x", "assignee": "worker",
+                "plan_ack_required": 2, "plan_ack_reason": "reason"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "plan text"
+            }),
+        );
+        let first = handle(
+            &home,
+            "reviewer-a",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert_eq!(first["acked"], 1);
+        assert_eq!(first["already_acked"], false);
+        let second = handle(
+            &home,
+            "reviewer-a",
+            &serde_json::json!({"action": "ack_plan", "id": id}),
+        );
+        assert_eq!(
+            second["acked"], 1,
+            "re-acking the same reviewer must NOT double-count: {second}"
+        );
+        assert_eq!(second["already_acked"], true);
         std::fs::remove_dir_all(&home).ok();
     }
 }

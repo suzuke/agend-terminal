@@ -24,6 +24,11 @@ pub(crate) struct DispatchPreChecks {
     pub force_reason: Option<String>,
     /// §3.5: consumed at the lease site as `review_class = "dual"`.
     pub second_reviewer: bool,
+    /// #2249: forwarded into the auto-created task's `create_args` when this
+    /// dispatch auto-creates a task (empty `task_id`) — 0 (default) = gate
+    /// off. Ignored when `task_id` already references an existing task (its
+    /// plan_ack_required, if any, was fixed at that task's own create time).
+    pub plan_ack_required: u64,
 }
 
 /// Run the delegate-task pre-send gates in their exact short-circuit order.
@@ -111,6 +116,18 @@ pub(crate) fn run_dispatch_pre_checks(
         }
     }
 
+    // #2249 pre-work alignment gate flag validation — same shape as
+    // second_reviewer_reason above.
+    let plan_ack_required = args["plan_ack_required"].as_u64().unwrap_or(0);
+    if plan_ack_required > 0 {
+        let par_reason = args["plan_ack_reason"].as_str().unwrap_or("");
+        if par_reason.is_empty() {
+            return Err(
+                json!({"error": "plan_ack_required > 0 requires non-empty plan_ack_reason"}),
+            );
+        }
+    }
+
     // #812: dispatch-time test-name validation. Extends §4.3
     // hallucinated-fn check to the dispatch path so `cargo test`
     // invocations naming a test that doesn't exist in the PR tree
@@ -141,6 +158,7 @@ pub(crate) fn run_dispatch_pre_checks(
         force,
         force_reason: force_reason.map(String::from),
         second_reviewer,
+        plan_ack_required,
     })
 }
 

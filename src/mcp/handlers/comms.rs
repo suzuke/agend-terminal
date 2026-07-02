@@ -286,6 +286,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             // the board the assignee actually works. Single-project → both resolve
             // to DEFAULT → home board → byte-identical.
             let target_project = crate::tasks::resolve_target_project(home, target);
+            // #2249: forward the pre-checked plan-ack gate flag into the
+            // auto-created task. `checks.plan_ack_required` already passed
+            // the plan_ack_reason non-empty validation above (mirrors
+            // second_reviewer's own forwarding).
             let create_args = json!({
                 "action": "create",
                 "title": auto_title,
@@ -293,6 +297,8 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "branch": args["branch"].as_str(),
                 "priority": "normal",
                 "project": target_project,
+                "plan_ack_required": checks.plan_ack_required,
+                "plan_ack_reason": args["plan_ack_reason"].as_str(),
             });
             let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
             match task_result["id"].as_str() {
