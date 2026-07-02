@@ -117,8 +117,12 @@ pub(crate) fn def_create_instance() -> Value {
 }
 
 pub(crate) fn def_delete_instance() -> Value {
-    json!({"name": "delete_instance", "description": "Stop and remove an instance.",
-        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to remove"}}, "required": ["instance"]}})
+    json!({"name": "delete_instance", "description": "Stop and remove an instance. Callable by the instance itself, its team orchestrator, or its creator (the caller that ran create_instance for it). A creator's delete of a target with an active worktree binding or a claimed/in_progress task additionally requires force=true + force_reason.",
+        "inputSchema": {"type": "object", "properties": {
+            "instance": {"type": "string", "description": "Name of the existing instance to remove"},
+            "force": {"type": "boolean", "description": "Required (with force_reason) for a creator-path delete when the target has in-flight work (active binding or a claimed/in_progress task)."},
+            "force_reason": {"type": "string", "description": "Required alongside force=true for the same in-flight creator-path override; audit-logged."}
+        }, "required": ["instance"]}})
 }
 
 pub(crate) fn def_start_instance() -> Value {
@@ -586,6 +590,29 @@ mod tests {
             .as_array()
             .expect("required");
         assert!(required.iter().any(|v| v == "instance"));
+    }
+
+    /// Creator-ACL follow-up: the handler reads `force`/`force_reason` from
+    /// args (the in-flight safety valve), but a schema that never declares
+    /// them is the exact #2539 class — the handler param exists, callers
+    /// can't discover it. Guards the schema stays in sync with the backend.
+    #[test]
+    fn delete_instance_schema_exposes_force_valve_params() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let delete = tools
+            .iter()
+            .find(|t| t["name"] == "delete_instance")
+            .expect("delete_instance tool not found");
+        let props = &delete["inputSchema"]["properties"];
+        assert_eq!(
+            props["force"]["type"], "boolean",
+            "force must be declared: {props}"
+        );
+        assert_eq!(
+            props["force_reason"]["type"], "string",
+            "force_reason must be declared: {props}"
+        );
     }
 
     #[test]
