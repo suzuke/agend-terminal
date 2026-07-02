@@ -287,13 +287,21 @@ pub fn resolve_supported_backend(backend: &str) -> Result<&'static str, String> 
 /// PR3b: backends whose one-shot DRIVER (inject → turn-end → capture → oracle) is
 /// §5-smoke-validated, so a `prompt` may be driven on them. Slice-1 added opencode;
 /// Slice-2 added claude (both proven to render a continuous work marker so the
-/// Idle-debounce isn't fooled by a mid-turn idle — confirm-first iron rule). A prompt
-/// for any other backend is rejected ([`SpawnError::DriverUnsupported`]) until its own
-/// §5 smoke lands. `backend_command` is the canonical, allowlist-resolved command.
+/// Idle-debounce isn't fooled by a mid-turn idle — confirm-first iron rule). #2524
+/// P3a PR-2 adds codex — its raw screen false-idles mid-turn for several seconds
+/// (SHADOW-OBSERVER-QUANT-CODEX-2413.md), longer than the Idle-debounce window, so its
+/// turn-end detection is routed through `core.observed_status` (Stream authority) — see
+/// `ephemeral_driver::effective_turn_state`. A prompt for any other backend is rejected
+/// ([`SpawnError::DriverUnsupported`]) until its own §5 smoke lands. `backend_command`
+/// is the canonical, allowlist-resolved command.
 fn driver_supported(backend_command: &str) -> bool {
     matches!(
         crate::backend::Backend::from_command(backend_command),
-        Some(crate::backend::Backend::OpenCode | crate::backend::Backend::ClaudeCode)
+        Some(
+            crate::backend::Backend::OpenCode
+                | crate::backend::Backend::ClaudeCode
+                | crate::backend::Backend::Codex
+        )
     )
 }
 
@@ -578,13 +586,15 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
                 drive_turn,
                 crate::backend::Backend::from_command(backend_command),
             ) {
-                let inject_target = crate::agent::InjectTarget::from_ephemeral(&handle, backend);
+                let inject_target =
+                    crate::agent::InjectTarget::from_ephemeral(&handle, backend.clone());
                 crate::ephemeral_driver::spawn_driver(crate::ephemeral_driver::DriverConfig {
                     home: home.to_path_buf(),
                     worker_id: worker_id.clone(),
                     prompt: spec.prompt.clone(),
                     inject_target,
                     wall_ttl: std::time::Duration::from_secs(ttl_secs),
+                    backend,
                 });
             }
             LIVE_CHILDREN.lock().insert(worker_id, handle);
@@ -1834,22 +1844,23 @@ mod tests {
 
     /// PR3b driver GATE: a `prompt` for a backend NOT in [`driver_supported`] is
     /// rejected as `DriverUnsupported` BEFORE any reserve/spawn (confirm-first iron rule
-    /// — never drive a backend whose turn-detection isn't §5-smoke-proven). codex is the
-    /// canonical still-unsupported backend (Slice-3+). Gated in the SHARED SINK so a
-    /// direct caller, not just the MCP handler, is protected. A prompt-LESS spawn of any
-    /// backend is unaffected (the PR3a lifecycle path).
+    /// — never drive a backend whose turn-detection isn't §5-smoke-proven). kiro-cli is
+    /// the canonical still-unsupported backend (codex joined the supported set in #2524
+    /// P3a PR-2 — see `driver_supported_is_opencode_claude_and_codex_only`). Gated in the
+    /// SHARED SINK so a direct caller, not just the MCP handler, is protected. A
+    /// prompt-LESS spawn of any backend is unaffected (the PR3a lifecycle path).
     #[test]
     fn spawn_and_track_rejects_prompt_for_unsupported_backend() {
         let home = tmp_home("driver-gate");
         let spec = SpawnSpec {
             workflow_id: "wf".to_string(),
-            backend: "codex".to_string(),
+            backend: "kiro-cli".to_string(),
             prompt: "do the thing".to_string(),
             ..Default::default()
         };
         let res = spawn_and_track(&home, spec);
         assert!(
-            matches!(&res, Err(SpawnError::DriverUnsupported(b)) if b == "codex"),
+            matches!(&res, Err(SpawnError::DriverUnsupported(b)) if b == "kiro-cli"),
             "a prompt for a driver-unsupported backend must be DriverUnsupported: {res:?}"
         );
         assert_eq!(
@@ -1860,25 +1871,30 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// PR3b Slice-2: the [`driver_supported`] set is exactly {opencode, claude} — the
-    /// §5-smoke-validated backends. Regression-guards the gate generalization: opencode
-    /// (Slice-1) MUST stay supported, claude (Slice-2) is added, and codex/kiro/agy stay
-    /// rejected (their per-backend smoke hasn't landed). Canonical commands + aliases.
+    /// #2524 P3a PR-2: the [`driver_supported`] set is exactly {opencode, claude,
+    /// codex} — the §5-smoke-validated backends. Regression-guards the gate
+    /// generalization: opencode (Slice-1) and claude (Slice-2) MUST stay supported,
+    /// codex (PR-2) is added, and kiro/agy stay rejected (their per-backend smoke
+    /// hasn't landed). Canonical commands + aliases.
     #[test]
-    fn driver_supported_is_opencode_and_claude_only() {
+    fn driver_supported_is_opencode_claude_and_codex_only() {
         assert!(
             driver_supported("opencode"),
             "opencode (Slice-1) must stay supported"
         );
         assert!(
             driver_supported("claude"),
-            "claude (Slice-2) is now supported"
+            "claude (Slice-2) must stay supported"
         );
         assert!(
             driver_supported("claude-2.1"),
             "a claude-prefixed alias maps to ClaudeCode → supported"
         );
-        for unsupported in ["codex", "kiro-cli", "kiro", "agy"] {
+        assert!(
+            driver_supported("codex"),
+            "codex (#2524 P3a PR-2) is now supported"
+        );
+        for unsupported in ["kiro-cli", "kiro", "agy"] {
             assert!(
                 !driver_supported(unsupported),
                 "{unsupported} has no §5 smoke yet → driver unsupported"
@@ -2040,6 +2056,115 @@ mod tests {
             summary.map(|s| !s.trim().is_empty()).unwrap_or(false),
             "result_summary must be non-empty on success"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// REAL codex end-to-end (`#[ignore]`: no binary/creds in CI) — #2524 P3a PR-2.
+    /// Drives a real headless codex worker through the SAME driver path as
+    /// claude/opencode, but ALSO exercises the `observed_status` wiring this PR's
+    /// turn-end veto depends on (unlike claude/opencode, whose driver never touches
+    /// it): starts the REAL rollout tailer ([`crate::daemon::shadow::rollout::spawn`],
+    /// read-only against `~/.codex/sessions`) and manually drives
+    /// `ShadowObserveHandler::run()` on a tight loop — standing in for the daemon's
+    /// per-tick supervisor, which isn't running in-test — so `core.observed_status`
+    /// actually gets populated from this worker's REAL rollout file, the same wiring
+    /// #2524 P3a PR-1 built. Asserts the worker records success with a non-empty
+    /// transcript. Run locally:
+    /// `cargo test --bin agend-terminal --features tray -- --ignored ephemeral_codex_driver_e2e`.
+    /// `#[cfg(unix)]`: ephemeral spawn is fail-closed on Windows.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires a real codex install + auth; run locally"]
+    fn ephemeral_codex_driver_e2e() {
+        use crate::agent::{AgentRegistry, ExternalRegistry};
+        use crate::daemon::per_tick::{PerTickHandler, ShadowObserveHandler, TickContext};
+        use parking_lot::Mutex as PLMutex;
+        use std::sync::atomic::AtomicBool;
+
+        let prev = std::env::var("AGEND_SHADOW_OBSERVER").ok();
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+
+        let home = tmp_home("codex-e2e");
+        let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+
+        // Real rollout tailer thread (#2524 P3a PR-1) — read-only against the REAL
+        // `~/.codex/sessions`; attribution is scoped to THIS worker's own recorded
+        // cwd, so the live fleet (if any) is untouched.
+        crate::daemon::shadow::rollout::spawn(Arc::clone(&registry), home.clone());
+
+        // Manually drive the per-tick reduce (standing in for the daemon's tick loop,
+        // which isn't running in-test) so `observed_status` is actually populated.
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let stop = Arc::clone(&stop);
+            let registry = Arc::clone(&registry);
+            let externals = Arc::clone(&externals);
+            let configs = Arc::clone(&configs);
+            let home = home.clone();
+            std::thread::spawn(move || {
+                let ctx = TickContext {
+                    home: &home,
+                    registry: &registry,
+                    externals: &externals,
+                    configs: &configs,
+                };
+                while !stop.load(Ordering::Relaxed) {
+                    ShadowObserveHandler::new().run(&ctx);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            })
+        };
+
+        let spec = SpawnSpec {
+            workflow_id: "e2e".to_string(),
+            backend: "codex".to_string(),
+            prompt: "Reply with exactly the word: pong".to_string(),
+            ttl_secs: Some(180),
+            ..Default::default()
+        };
+        let w = spawn_and_track(&home, spec).expect("spawn codex worker");
+        assert_ne!(w.pid, 0, "a real pid was stamped");
+
+        // Driver runs ASYNC; poll the row until it records a result.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+        let outcome = loop {
+            match list(&home, None)
+                .into_iter()
+                .find(|r| r.worker_id == w.worker_id)
+            {
+                Some(row) => {
+                    if let Some(success) = row.success {
+                        break Some((success, row.result_summary));
+                    }
+                }
+                None => break None,
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the driver did not record a result within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+        stop.store(true, Ordering::Relaxed);
+        let _ = ticker.join();
+        reap_one(&home, &w.worker_id);
+
+        let (success, summary) = outcome.expect("the worker row must carry a result before reap");
+        assert!(
+            success,
+            "a simple codex prompt turn must succeed; summary={summary:?}"
+        );
+        assert!(
+            summary.map(|s| !s.trim().is_empty()).unwrap_or(false),
+            "result_summary must be non-empty on success"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("AGEND_SHADOW_OBSERVER", v),
+            None => std::env::remove_var("AGEND_SHADOW_OBSERVER"),
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 }

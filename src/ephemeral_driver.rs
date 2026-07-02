@@ -20,9 +20,13 @@
 //!   the full `tick()` here would blanket-enable the 30 s `LATCHED_STATE_EXPIRY`
 //!   decay for every backend → a false turn-end on a quiet >30 s stretch. #2524 P3a
 //!   PR-2 (decision `d-20260702075424735619-11`) adds a NARROWER, throttled
-//!   exception in Phase 0 ONLY — [`StateTracker::expire_stale_latch_if_due`] — so a
-//!   mis-latched ready-screen state (confirm-first finding on a real backend spawn)
-//!   can self-heal without reopening the quiet->30s false-turn-end risk for Phase 2.
+//!   exception — [`StateTracker::expire_stale_latch_if_due`] — called in Phase 0 for
+//!   every backend (nothing is in-progress yet, so an early unblock costs nothing)
+//!   and in Phase 2 for codex ONLY (which alone has the `observed_status` veto below
+//!   as a safety net against that same false-turn-end risk — decision
+//!   `d-20260702081055743388-12`). See the Phase 0/Phase 2 comments in `run_turn` for
+//!   the full per-phase rationale — do NOT collapse this asymmetry into one
+//!   unconditional call without re-deriving that veto for every other backend first.
 //! - **Idle-debounce = 3 s of held Idle** before declaring the turn done. opencode
 //!   renders the Thinking marker CONTINUOUSLY while streaming (0 ms mid-turn Idle lull
 //!   observed on a fast model); 3 s cheaply covers a slower model's inter-render gaps.
@@ -41,13 +45,30 @@
 //!   (cosmetic) drops the trailing footer via a PATTERN-based strip ([`is_trailing_chrome`]),
 //!   not a per-backend magic row count, so it survives a backend bumping its footer.
 //!
-//! Scope: opencode (Slice-1) + claude (Slice-2) — each §5-smoke-validated. The gate
-//! ([`crate::ephemeral_tracking`] `driver_supported`) admits exactly this set; other
-//! backends are later slices. Both proven to render a continuous work marker so the
-//! Idle-debounce isn't fooled by a mid-turn idle. Durable telemetry (fleet_events
-//! L1/L2/L3 + task_events) is PR4; the result lands on the worker row for now.
+//! Scope: opencode (Slice-1) + claude (Slice-2) + codex (#2524 P3a PR-2) — each
+//! §5-smoke-validated. The gate ([`crate::ephemeral_tracking`] `driver_supported`)
+//! admits exactly this set; other backends are later slices. opencode/claude are
+//! proven to render a continuous work marker so the Idle-debounce isn't fooled by a
+//! mid-turn idle — their turn-end reads raw `get_state()` UNCHANGED. codex is
+//! different: its raw screen goes idle for several seconds mid-turn
+//! (SHADOW-OBSERVER-QUANT-CODEX-2413.md — longer than [`TURN_DEBOUNCE_MS`]), so its
+//! turn-end detection additionally consults `core.observed_status` (the Shadow
+//! Observer's Stream-authority-corrected status, populated by the codex rollout tail —
+//! #2524 P3a PR-1) and VETOES a raw-Idle sample when Stream evidence says the turn is
+//! still active ([`effective_turn_state`]). This is a per-backend veto, not a plane
+//! swap: opencode/claude never consult `observed_status` (zero behavior change), and
+//! codex still falls back to raw `get_state()` once Stream evidence goes stale or
+//! agrees with Idle. Durable telemetry (fleet_events L1/L2/L3 + task_events) is PR4;
+//! the result lands on the worker row for now.
 
 use crate::agent::InjectTarget;
+use crate::backend::Backend;
+// RED (#2524 P3a PR-2): `effective_turn_state` doesn't consult these yet — the
+// GREEN commit's real veto body uses both. Only referenced by tests until then.
+#[allow(unused_imports)]
+use crate::daemon::shadow::evidence::Authority;
+#[allow(unused_imports)]
+use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
 use crate::state::AgentState;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -87,6 +108,10 @@ pub(crate) struct DriverConfig {
     pub inject_target: InjectTarget,
     /// The worker's wall-TTL (the reap sweep's cost guard); the driver's hard ceiling.
     pub wall_ttl: Duration,
+    /// #2524 P3a PR-2: which backend this worker runs, so turn-end detection can branch
+    /// (codex consults `observed_status`; every other backend is unaffected — see
+    /// [`effective_turn_state`]).
+    pub backend: Backend,
 }
 
 /// Launch the one-shot driver thread for a freshly-finalized worker.
@@ -110,6 +135,7 @@ fn run_turn(cfg: DriverConfig) {
         prompt,
         inject_target,
         wall_ttl,
+        backend,
     } = cfg;
     let start = Instant::now();
     let wall_ttl_ms = wall_ttl.as_millis() as u64;
@@ -159,14 +185,43 @@ fn run_turn(cfg: DriverConfig) {
     }
 
     // Phase 2 — wait for turn end: Idle held ≥ debounce after work, an error class, or
-    // the wall-TTL. Poll get_state() ONLY (never tick()).
+    // the wall-TTL. Poll get_state() ONLY (never the general tick()).
+    //
+    // #2524 P3a PR-2 (decision d-20260702081055743388-12): the Phase 0 latch-expiry
+    // check does NOT extend here for opencode/claude — DELIBERATELY, not an oversight.
+    // `expire_stale_latch_if_due` transitions on ELAPSED TIME alone, without
+    // re-evaluating the current screen (`record_set`'s same-state early-return never
+    // refreshes `since` on a repeat Active match, however often the screen re-renders
+    // — see `StateTracker::record_set`). Calling it here for a backend with no
+    // turn-end-authority fallback would re-derive EXACTLY the risk this module's own
+    // top doc already flags ("Calling `tick()` here would re-enable that decay → a
+    // false turn-end on a quiet >30s stretch"): a genuinely-still-running turn past
+    // 30s continuously classified Active could get force-flipped to Idle and read as
+    // a real TurnEnded 3s later. opencode/claude are §5-smoke-validated on the
+    // OPPOSITE premise — a real turn-end always produces a final render burst (new
+    // pty bytes ⇒ `detect()` naturally re-evaluates and transitions), so they have
+    // no latent ready-style mis-latch to fix here, and adding the check would be a
+    // new, un-smoked risk for no benefit. codex is different ONLY because it has the
+    // `observed_status` veto below as a safety net: even if `expire_stale_latch_if_due`
+    // wrongly forces Idle on a still-active codex turn, fresh Stream-authority
+    // evidence overrides it back to `Active` before `TurnEndDetector` ever sees it
+    // (see `codex_expiry_forced_idle_is_vetoed_back_to_active` below) — a protection
+    // opencode/claude do not have. Do NOT "simplify" this to an unconditional call for
+    // all backends without re-adding that veto first.
     let mut detector = TurnEndDetector::new(TURN_DEBOUNCE_MS);
     let stop_reason = loop {
         let now_ms = start.elapsed().as_millis() as u64;
         if now_ms >= wall_ttl_ms {
             break "wall-TTL elapsed before turn end";
         }
-        let state = inject_target.core.lock().state.get_state();
+        let (raw, observed) = {
+            let mut c = inject_target.core.lock();
+            if backend == Backend::Codex {
+                c.state.expire_stale_latch_if_due(now_ms);
+            }
+            (c.state.get_state(), c.observed_status.clone())
+        };
+        let state = effective_turn_state(&backend, raw, observed.as_ref());
         match detector.observe(state, now_ms) {
             TurnDecision::Continue => std::thread::sleep(POLL_INTERVAL),
             TurnDecision::TurnEnded => break "turn ended (Idle held)",
@@ -352,6 +407,35 @@ fn build_summary(dump: &str, terminal_state: AgentState, grew: bool, stop_reason
         out.push_str("…[truncated]");
     }
     out
+}
+
+/// #2524 P3a PR-2: the state actually fed to [`TurnEndDetector`] for this poll sample.
+/// PURE (no lock, no I/O) — takes the raw screen state and the worker's current
+/// `observed_status` already read under one `core.lock()` by the caller — so it's
+/// unit-testable with synthetic inputs (see the `codex_survives_quant_2413_*` test,
+/// fed the REAL SHADOW-OBSERVER-QUANT-CODEX-2413.md trace).
+///
+/// opencode/claude: always the raw state, unchanged — zero behavior change, per the
+/// §5-smoke precedent (this function is a no-op for them).
+///
+/// codex: a raw `Idle` sample is VETOED (treated as still `Active`) when
+/// `observed_status` carries FRESH `Stream`-authority evidence that says otherwise —
+/// SHADOW-OBSERVER-QUANT-CODEX-2413.md shows codex's raw screen false-idling for
+/// several seconds mid-turn (longer than [`TURN_DEBOUNCE_MS`]) while the rollout-tail
+/// Stream evidence correctly holds `Responding`. Once Stream evidence goes stale or
+/// itself agrees with Idle (the reducer falls back to `Screen` authority — the real
+/// turn has ended), the raw state passes through unchanged, so the debounce still
+/// applies normally at the REAL end. A non-`Idle` raw sample is never touched — the
+/// veto only ever suppresses a false idle, never invents one.
+///
+/// RED (#2524 P3a PR-2): not yet vetoing anything — always the raw state, for every
+/// backend. The GREEN commit adds the codex Stream-authority veto.
+fn effective_turn_state(
+    _backend: &Backend,
+    raw: AgentState,
+    _observed: Option<&ObservedStatus>,
+) -> AgentState {
+    raw
 }
 
 /// Pure turn-end detector — the Idle-debounce state machine, time-injected (`now_ms`)
@@ -589,6 +673,24 @@ mod tests {
         assert!(!body.contains('❯'), "empty input box dropped");
     }
 
+    /// #2524 P3a PR-2: codex's bottom statusline, verbatim off a real isolated smoke
+    /// (`gpt-5.5 medium · /private/var/…/backend-data/ephemeral/eph-53468-0`) —
+    /// dropped structurally (path after " · "), not by the model name.
+    #[test]
+    fn strip_trailing_chrome_drops_codex_footer() {
+        let dump = "• pong\n\n  gpt-5.5 medium · /private/var/folders/wn/T/agend-ephemeral-53468-codex-e2e-0/backend-data/ephemeral/eph-53468-0";
+        let body = strip_trailing_chrome(dump);
+        assert!(body.contains("pong"), "body answer kept");
+        assert!(!body.contains("gpt-5.5 medium"), "codex statusline dropped");
+    }
+
+    /// A body line that happens to contain " · " but NOT followed by an absolute
+    /// path must NOT be mistaken for the codex statusline.
+    #[test]
+    fn is_trailing_chrome_requires_a_path_after_the_middle_dot() {
+        assert!(!is_trailing_chrome("today's agenda · groceries, laundry"));
+    }
+
     /// A `❯ <prompt>` echo (content after the glyph) is BODY, not chrome — only a LONE
     /// `❯` (empty input box) is stripped.
     #[test]
@@ -670,6 +772,294 @@ mod tests {
         assert_eq!(d.observe(AgentState::Idle, 1_000), TurnDecision::Continue);
         assert_eq!(d.observe(AgentState::Idle, 3_999), TurnDecision::Continue);
         assert_eq!(d.observe(AgentState::Idle, 4_000), TurnDecision::TurnEnded);
+    }
+
+    // ──────────────────── effective_turn_state (#2524 P3a PR-2) ────────────────────
+
+    fn observed(state: ObservedState, authority: Authority) -> ObservedStatus {
+        ObservedStatus {
+            state,
+            confidence: crate::daemon::shadow::evidence::Confidence::Strong,
+            authority,
+            evidence: Vec::new(),
+            since_ms: 0,
+        }
+    }
+
+    /// opencode/claude MUST be a no-op regardless of raw state or observed_status —
+    /// the veto is codex-only (zero behavior change for the §5-smoke-validated
+    /// backends, per the module doc).
+    #[test]
+    fn effective_turn_state_is_noop_for_opencode_and_claude() {
+        for backend in [Backend::OpenCode, Backend::ClaudeCode] {
+            for raw in [AgentState::Idle, AgentState::Active] {
+                assert_eq!(
+                    effective_turn_state(&backend, raw, None),
+                    raw,
+                    "{backend:?}/{raw:?} with no observed_status must pass through"
+                );
+                assert_eq!(
+                    effective_turn_state(
+                        &backend,
+                        raw,
+                        Some(&observed(ObservedState::Responding, Authority::Stream))
+                    ),
+                    raw,
+                    "{backend:?}/{raw:?} must ignore observed_status entirely"
+                );
+            }
+        }
+    }
+
+    /// codex: a non-Idle raw sample is never touched — the veto only ever suppresses
+    /// a false Idle, it never invents activity out of an already-active sample.
+    #[test]
+    fn effective_turn_state_codex_leaves_non_idle_raw_alone() {
+        assert_eq!(
+            effective_turn_state(&Backend::Codex, AgentState::Active, None),
+            AgentState::Active
+        );
+        assert_eq!(
+            effective_turn_state(
+                &Backend::Codex,
+                AgentState::Active,
+                Some(&observed(ObservedState::Idle, Authority::Screen))
+            ),
+            AgentState::Active
+        );
+    }
+
+    /// codex: raw Idle + no observed_status yet (e.g. the shadow-observer tick hasn't
+    /// run) → passes through unchanged. Never invents a veto from nothing.
+    #[test]
+    fn effective_turn_state_codex_no_observed_status_passes_through() {
+        assert_eq!(
+            effective_turn_state(&Backend::Codex, AgentState::Idle, None),
+            AgentState::Idle
+        );
+    }
+
+    /// codex: raw Idle + observed_status ALSO Idle (any authority) → the two planes
+    /// agree, no veto — the debounce proceeds normally at a REAL idle.
+    #[test]
+    fn effective_turn_state_codex_agreeing_idle_passes_through() {
+        assert_eq!(
+            effective_turn_state(
+                &Backend::Codex,
+                AgentState::Idle,
+                Some(&observed(ObservedState::Idle, Authority::Stream))
+            ),
+            AgentState::Idle
+        );
+        assert_eq!(
+            effective_turn_state(
+                &Backend::Codex,
+                AgentState::Idle,
+                Some(&observed(ObservedState::Idle, Authority::Screen))
+            ),
+            AgentState::Idle
+        );
+    }
+
+    /// codex: raw Idle + observed_status says active but via `Screen` authority (not
+    /// `Stream`) → NOT vetoed. `Screen` authority is the same plane as the raw sample
+    /// itself (no independent correction), so there is nothing to veto WITH.
+    #[test]
+    fn effective_turn_state_codex_screen_authority_does_not_veto() {
+        assert_eq!(
+            effective_turn_state(
+                &Backend::Codex,
+                AgentState::Idle,
+                Some(&observed(ObservedState::Responding, Authority::Screen))
+            ),
+            AgentState::Idle
+        );
+    }
+
+    /// codex: raw Idle + FRESH Stream-authority evidence saying the turn is still
+    /// active (Responding/Thinking/ToolUse/Active — anything that doesn't coarsen to
+    /// Idle) → VETOED to `Active`. This is the exact false-idle shape
+    /// SHADOW-OBSERVER-QUANT-CODEX-2413.md documents on a real turn.
+    #[test]
+    fn effective_turn_state_codex_stream_active_vetoes_false_idle() {
+        for state in [
+            ObservedState::Responding,
+            ObservedState::Thinking,
+            ObservedState::ToolUse,
+            ObservedState::Active,
+        ] {
+            assert_eq!(
+                effective_turn_state(
+                    &Backend::Codex,
+                    AgentState::Idle,
+                    Some(&observed(state, Authority::Stream))
+                ),
+                AgentState::Active,
+                "{state:?}/Stream must veto a raw-Idle sample"
+            );
+        }
+    }
+
+    /// #2524 P3a PR-2 — THE fixture-replay pin: the REAL raw/observed/authority trace
+    /// from SHADOW-OBSERVER-QUANT-CODEX-2413.md (§"Result" table, verbatim timestamps
+    /// converted to relative ms from the first sample), fed through
+    /// `effective_turn_state` into a REAL `TurnEndDetector`. Proves the false-idle
+    /// window (11:38:58–11:39:04, raw=Idle/observed=Responding/Stream — ~6 s, LONGER
+    /// than the 3 s debounce) does not end the turn, and the REAL end (11:39:05,
+    /// raw=Idle/observed=Idle/Screen — Stream evidence went stale, reducer fell back
+    /// to Screen) does, once held for the debounce. No real codex binary, no sleep —
+    /// pure data replay.
+    #[test]
+    fn codex_survives_quant_2413_false_idle_trace() {
+        let trace: &[(u64, AgentState, ObservedState, Authority)] = &[
+            // 11:38:41–56: continuous work, Stream authority throughout (11 samples in
+            // the doc; 4 representative ones suffice to establish Working).
+            (
+                0,
+                AgentState::Active,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                5_000,
+                AgentState::Active,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                10_000,
+                AgentState::Active,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                15_000,
+                AgentState::Active,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            // 11:38:58–11:39:04: raw screen false-idles for ~6s; Stream evidence still
+            // says Responding — this is the window a naive raw-state feed would
+            // wrongly end the turn in (3s debounce < 6s window).
+            (
+                17_000,
+                AgentState::Idle,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                18_000,
+                AgentState::Idle,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                20_000,
+                AgentState::Idle,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                21_000,
+                AgentState::Idle,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            (
+                23_000,
+                AgentState::Idle,
+                ObservedState::Responding,
+                Authority::Stream,
+            ),
+            // 11:39:05: the turn REALLY ends — no fresh Stream evidence, reducer falls
+            // back to Screen authority, agreeing with raw Idle.
+            (
+                24_000,
+                AgentState::Idle,
+                ObservedState::Idle,
+                Authority::Screen,
+            ),
+            // Hold the real Idle for the debounce window so TurnEnded actually fires.
+            (
+                27_000,
+                AgentState::Idle,
+                ObservedState::Idle,
+                Authority::Screen,
+            ),
+        ];
+
+        let mut detector = TurnEndDetector::new(TURN_DEBOUNCE_MS);
+        let mut turn_ended_at: Option<u64> = None;
+        for &(now_ms, raw, obs_state, authority) in trace {
+            let observed_status = observed(obs_state, authority);
+            let effective = effective_turn_state(&Backend::Codex, raw, Some(&observed_status));
+            if detector.observe(effective, now_ms) == TurnDecision::TurnEnded {
+                turn_ended_at.get_or_insert(now_ms);
+            }
+        }
+        assert_eq!(
+            turn_ended_at,
+            Some(27_000),
+            "must not false-fire during the 17s-23s false-idle window; must fire only \
+             once the REAL end (24s) has held the debounce"
+        );
+    }
+
+    /// #2524 P3a PR-2 (decision `d-20260702081055743388-12`) — THE decisive
+    /// interaction pin between the two codex-only Phase 2 safety nets:
+    /// `expire_stale_latch_if_due` transitions on ELAPSED TIME alone (never
+    /// re-reading the actual screen), so it CAN wrongly force a genuinely-still-
+    /// running codex turn's raw state to `Idle` after 30s of no state CHANGE (even
+    /// if the screen keeps re-rendering the SAME classification — `record_set`'s
+    /// same-state early-return never refreshes `since`). This is exactly the risk
+    /// the decision flagged. It's safe ONLY because `effective_turn_state`'s
+    /// `observed_status` veto catches it: fresh Stream-authority evidence saying the
+    /// turn is still `Responding` (the QUANT-CODEX-2413.md shape) overrides the
+    /// wrongly-forced `Idle` back to `Active` BEFORE `TurnEndDetector` ever sees it —
+    /// so the two mechanisms together never produce a false `TurnEnded`. This is
+    /// exactly why Phase 2's `expire_stale_latch_if_due` call is codex-ONLY (see
+    /// `run_turn`'s Phase 2 comment): opencode/claude have no such veto, so the same
+    /// risk would NOT be caught for them.
+    #[test]
+    fn codex_expiry_forced_idle_is_vetoed_back_to_active() {
+        let mut tracker = crate::state::StateTracker::new(Some(&Backend::Codex));
+        // A genuinely-still-running codex turn, classified `Active` for >30s straight
+        // (a slow model — real, not stale).
+        tracker.current = AgentState::Active;
+        tracker.since = std::time::Instant::now() - std::time::Duration::from_secs(31);
+
+        // The throttle is due → `expire_stale_latch_if_due` blindly force-transitions
+        // to `Idle` without re-checking the screen. This alone WOULD be wrong.
+        tracker.expire_stale_latch_if_due(1_000);
+        let raw = tracker.get_state();
+        assert_eq!(
+            raw,
+            AgentState::Idle,
+            "expiry force-transitions on elapsed time alone, with no screen re-check"
+        );
+
+        // Fresh Stream-authority evidence says the turn is genuinely still active —
+        // the veto must override the wrongly-forced Idle before TurnEndDetector sees it.
+        let observed_status = observed(ObservedState::Responding, Authority::Stream);
+        let effective = effective_turn_state(&Backend::Codex, raw, Some(&observed_status));
+        assert_eq!(
+            effective,
+            AgentState::Active,
+            "the observed_status veto must override the wrongly-forced Idle"
+        );
+
+        // Feed the ALREADY-Working detector the effective (vetoed) state — must NOT
+        // end the turn.
+        let mut detector = TurnEndDetector::new(TURN_DEBOUNCE_MS);
+        assert_eq!(
+            detector.observe(AgentState::Active, 0),
+            TurnDecision::Continue
+        ); // enter Working
+        assert_eq!(
+            detector.observe(effective, 1_000),
+            TurnDecision::Continue,
+            "the vetoed-back-to-Active sample must not end the turn"
+        );
     }
 
     // ─────────────────────────────── summary ───────────────────────────────
