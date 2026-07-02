@@ -398,7 +398,9 @@ pub(crate) fn def_repo() -> Value {
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
             "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
-            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."}
+            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
+            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. The handler always read this field, but it was never declared here — an MCP client validating against this schema had no way to send it, so force=true silently never reached the daemon (#2539)."},
+            "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."}
         }, "required": ["action"]}})
 }
 
@@ -493,6 +495,39 @@ mod tests {
         assert!(
             !required_strs.contains(&"command"),
             "command should NOT be required (backend is preferred, default is claude)"
+        );
+    }
+
+    #[test]
+    fn repo_merge_has_force_and_force_reason_params() {
+        // #2539: `handle_merge_repo` (ci/merge.rs) has ALWAYS read
+        // `args["force"]` / `args["force_reason"]` directly and correctly
+        // gated the CI-checks / base-drift / #2140 freshness refusals behind
+        // `if !force` — but the `repo` tool's inputSchema never DECLARED
+        // these two params. An MCP client that validates a tool call against
+        // the advertised inputSchema (the normal contract) has no way to
+        // include `force`/`force_reason` in a `repo action=merge` call, so
+        // `force=true` never reaches the daemon — the merge is refused
+        // exactly as if force had never been passed (#2539's live repro).
+        // The daemon-internal dispatch chain (execute_tool → handle_tool →
+        // ci::handle_merge_repo) never filters args by schema — confirmed by
+        // reading `mcp/handlers/mod.rs::handle_tool_with_runtime`, which
+        // passes `args` through unmodified — so this schema declaration IS
+        // the complete fix; no merge.rs logic change is needed.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let repo = tools
+            .iter()
+            .find(|t| t["name"] == "repo")
+            .expect("repo tool not found");
+        let props = &repo["inputSchema"]["properties"];
+        assert!(
+            props["force"].is_object(),
+            "#2539: repo tool must declare 'force' so MCP clients can pass it on merge"
+        );
+        assert!(
+            props["force_reason"].is_object(),
+            "#2539: repo tool must declare 'force_reason' so MCP clients can pass it on merge"
         );
     }
 
@@ -1004,6 +1039,8 @@ mod tests {
             ("repo", "audit_reason", "ci/mod.rs cleanup_merged audit"),
             ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
             ("repo", "task_id", "ci/checkout.rs checkout bind:true → binding::bind_full task_id linkage (#2533)"),
+            ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
+            ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
             ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
