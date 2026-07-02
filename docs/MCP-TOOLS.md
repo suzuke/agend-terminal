@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (36 tools)
+# AgEnD MCP Tools Reference (35 tools)
 
 ## Action-based Tools
 
@@ -98,13 +98,11 @@ Kill and restart an instance. Default mode `resume` preserves conversation state
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
 - **compact by default** (#2475): each row drops the noisy `observed_status.evidence` trail. Pass `verbose: true` (or `include_evidence: true`) to include it.
 
-### `set_display_name`
-Set your display name.
-- **name**: new display name
-
-### `set_description`
-Set a description for this instance.
-- **description**: instance description
+### `set_metadata`
+Set per-instance display metadata. #2547: merged from the former standalone `set_display_name` / `set_description` tools.
+- **action**: display_name / description
+- action=display_name: **name** — new display name
+- action=description: **description** — instance description
 
 ### `set_waiting_on`
 Declare what this instance is currently waiting for. Empty string to clear.

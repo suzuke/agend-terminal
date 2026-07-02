@@ -71,7 +71,7 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         "list_instances" | "binding_state" | "tokens" | "pane_snapshot"
         | "tui_screenshot" | "gc_dry_run" | "health" | "download_attachment"
         | "inbox" | "send" | "task" | "reply" | "decision" | "set_waiting_on"
-        | "interrupt" | "bind_self" | "set_description" | "set_display_name"
+        | "interrupt" | "bind_self"
         | "watchdog" | "ci"
         // direct API read / normal methods
         | "list" | "inject" | "status" | "register_external"
@@ -79,6 +79,13 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         | "clear_blocked_reason" => AlwaysAllow,
 
         // ── Action-bearing tools: read actions allow, mutating actions never ──
+        // #2547: set_metadata merged set_display_name/set_description — both
+        // actions are per-instance display attrs, no operator-authority concern,
+        // so both stay AlwaysAllow (unmapped action still fail-closed).
+        "set_metadata" => match action {
+            Some("display_name") | Some("description") => AlwaysAllow,
+            _ => AbsolutelyNever,
+        },
         "mode" => match action {
             Some("get") | None => AlwaysAllow,
             _ => AbsolutelyNever, // an agent must not flip operator authority

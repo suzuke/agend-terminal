@@ -159,14 +159,13 @@ pub(crate) fn def_interrupt() -> Value {
         }, "required": ["instance"]}})
 }
 
-pub(crate) fn def_set_display_name() -> Value {
-    json!({"name": "set_display_name", "description": "Set your display name. Empty string (or omitting `name`) clears it — the pane falls back to the agent name.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Display name. Empty string to clear (reset to the agent name)."}}}})
-}
-
-pub(crate) fn def_set_description() -> Value {
-    json!({"name": "set_description", "description": "Set a description for this instance. Empty string (or omitting `description`) clears it.",
-        "inputSchema": {"type": "object", "properties": {"description": {"type": "string", "description": "Description. Empty string to clear."}}}})
+pub(crate) fn def_set_metadata() -> Value {
+    json!({"name": "set_metadata", "description": "#2547: merged set_display_name + set_description. action=display_name sets your display name (empty `name`, or omitting it, clears — the pane falls back to the agent name); action=description sets a description for this instance (empty `description`, or omitting it, clears).",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["display_name", "description"]},
+            "name": {"type": "string", "description": "Display name (action=display_name). Empty string to clear (reset to the agent name)."},
+            "description": {"type": "string", "description": "Description (action=description). Empty string to clear."}
+        }, "required": ["action"]}})
 }
 
 pub(crate) fn def_set_waiting_on() -> Value {
@@ -680,10 +679,11 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            36,
+            35,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
-             restart_instance mode=fresh) = 36. Current tools: {:?}",
+             restart_instance mode=fresh) = 36; - set_display_name/set_description \
+             (#2547, merged into set_metadata) = 35. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1181,8 +1181,7 @@ mod tests {
             "start_instance",
             "tokens",
             "interrupt",
-            "set_display_name",
-            "set_description",
+            "set_metadata",
             "move_pane",
             "pane_snapshot",
             "tui_screenshot",

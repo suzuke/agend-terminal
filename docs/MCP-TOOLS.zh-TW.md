@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（36 個工具）
+# AgEnD MCP Tools Reference — 工具參考（35 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -98,13 +98,11 @@
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
 - 預設為 **compact**（#2475）：每列會移除雜訊較大的 `observed_status.evidence` trail。傳 `verbose: true`（或 `include_evidence: true`）可包含它。
 
-### `set_display_name`
-設定你的顯示名稱。
-- **name**: 新的顯示名稱
-
-### `set_description`
-為這個 instance 設定描述。
-- **description**: instance 描述
+### `set_metadata`
+設定 per-instance 顯示中繼資料。#2547：從原本獨立的 `set_display_name` / `set_description` 工具合併而來。
+- **action**: display_name / description
+- action=display_name：**name** — 新的顯示名稱
+- action=description：**description** — instance 描述
 
 ### `set_waiting_on`
 宣告這個 instance 目前正在等待什麼。傳入空字串以清除。

@@ -5,8 +5,11 @@ use std::path::Path;
 
 use super::err_needs_identity;
 
-/// #2050 simplify PR-B (⑩): shared body for the `set_display_name` /
-/// `set_description` metadata setters (byte-identical to the former inline code).
+/// #2050 simplify PR-B (⑩): shared body for the display-name / description
+/// metadata setters (byte-identical to the former inline code). Invoked via
+/// the `set_metadata` action-based tool (#2547: merged from the former
+/// standalone `set_display_name` / `set_description` tools) as
+/// `action=display_name` / `action=description`.
 ///
 /// #1604 semantics: an empty `value` = explicit CLEAR — store `null` (so the
 /// reader's `Option` is `None`, falling back to the default) and return
