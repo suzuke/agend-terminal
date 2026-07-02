@@ -138,14 +138,13 @@ pub(crate) fn spawn_driver(cfg: DriverConfig) {
     // fire-and-forget: drives the turn(s) off the MCP `ephemeral spawn` handler, which
     // returns worker_id+pid IMMEDIATELY (the PR1/2 async contract). The thread is
     // self-bounding — it exits when the turn(s) end, an error class latches, an inject
-    // fails, `max_iterations` is exhausted, or the wall-TTL lapses — and the reap
-    // sweep terminates the worker PROCESS independently, so no graceful JoinHandle is
-    // kept: a daemon shutdown simply drops the worker (its `reap_on_boot` sweeps any
-    // orphan on the next boot). This is also the loop's "orphan-clear" termination
-    // path (#2301 lack (c) item ⑤) — the driver does NOT duplicate process-liveness
-    // detection; a dead process is reclaimed by the SAME existing reap machinery
-    // regardless of whether the driver thread is mid-loop, single-shot, or already
-    // exited (see `ephemeral_tracking::reap_sweep` and its existing tests).
+    // fails, `max_iterations` is exhausted, or the wall-TTL lapses — and the reap sweep
+    // terminates the worker PROCESS independently, so no graceful JoinHandle is kept: a
+    // daemon shutdown simply drops the worker (`reap_on_boot` sweeps any orphan on the
+    // next boot). This is also the loop's "orphan-clear" path (#2301 lack (c) item ⑤) —
+    // the driver does NOT duplicate process-liveness detection; a dead process is
+    // reclaimed by the SAME reap machinery regardless of loop/single-shot/already-exited
+    // (see `ephemeral_tracking::reap_sweep`'s existing tests).
     std::thread::spawn(move || run_turn(cfg));
 }
 
