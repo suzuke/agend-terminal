@@ -398,7 +398,9 @@ pub(crate) fn def_repo() -> Value {
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
             "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
-            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."}
+            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
+            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. The handler always read this field, but it was never declared here — an MCP client validating against this schema had no way to send it, so force=true silently never reached the daemon (#2539)."},
+            "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."}
         }, "required": ["action"]}})
 }
 
@@ -1037,6 +1039,8 @@ mod tests {
             ("repo", "audit_reason", "ci/mod.rs cleanup_merged audit"),
             ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
             ("repo", "task_id", "ci/checkout.rs checkout bind:true → binding::bind_full task_id linkage (#2533)"),
+            ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
+            ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
             ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
