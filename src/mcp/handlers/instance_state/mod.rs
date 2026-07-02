@@ -219,6 +219,38 @@ pub(super) fn handle_delete_instance(
                             has_active_task,
                             "creator force-deleting instance with in-flight work"
                         );
+                        // Durable audit trail — a permission override deleting
+                        // in-flight work needs more than a process log line.
+                        // Mirrors ci/merge.rs's merge_force_bypass: fail-closed
+                        // if the write itself fails (an unrecordable override
+                        // must not proceed).
+                        let event = serde_json::json!({
+                            "kind": "creator_force_delete",
+                            "agent": caller,
+                            "target": name,
+                            "force_reason": reason,
+                            "has_binding": has_binding,
+                            "has_active_task": has_active_task,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        let events_path = home.join("fleet_events.jsonl");
+                        let audit_written = (|| -> std::io::Result<()> {
+                            use std::io::Write;
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(events_path)?;
+                            writeln!(f, "{event}")?;
+                            Ok(())
+                        })();
+                        if let Err(e) = audit_written {
+                            return serde_json::json!({
+                                "error": format!(
+                                    "creator force-delete refused: audit log write failed: {e}"
+                                ),
+                                "code": "creator_force_delete_audit_failed"
+                            });
+                        }
                     }
                     _ => {
                         return serde_json::json!({
