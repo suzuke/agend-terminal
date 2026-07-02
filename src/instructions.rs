@@ -216,6 +216,17 @@ pub(crate) fn build_instructions_body(
                 content.push_str(&format!("- `{safe_peer}` — {safe_peer_role}\n"));
             }
             content.push('\n');
+        } else if ctx.team.is_none() {
+            // #2524 P5a: no team and no other fleet peers observed — most of
+            // the ceremony below (task board coordination, decision
+            // threading, dual-review) assumes there's someone else to
+            // coordinate with. Point at the solo profile rather than let a
+            // single-instance user read fleet-only ceremony as mandatory.
+            content.push_str(
+                "You appear to be the only agent right now — see \
+                 docs/SOLO-PROFILE.md for which of the fleet ceremony below \
+                 actually applies solo.\n\n",
+            );
         }
     }
 
@@ -1074,6 +1085,44 @@ mod tests {
             "no team context should not produce a Team section: {body}"
         );
         assert!(!body.contains("## Other Fleet Members"));
+    }
+
+    /// #2524 P5a: no team and no other fleet peers → the solo-profile pointer
+    /// appears (there's no one else to apply fleet ceremony toward).
+    #[test]
+    fn body_points_to_solo_profile_when_truly_alone() {
+        let peers: Vec<(String, Option<String>)> = vec![];
+        let ctx = AgentContext {
+            name: "lonely",
+            role: None,
+            fleet_peers: &peers,
+            team: None,
+            extra_instructions: None,
+        };
+        let body = build_instructions_body(Some(&ctx), None, None);
+        assert!(
+            body.contains("docs/SOLO-PROFILE.md"),
+            "no team + no peers must point at the solo profile: {body}"
+        );
+    }
+
+    /// The solo-profile pointer must NOT appear once there's an actual peer
+    /// or team to coordinate with — it's additive guidance, not a blanket note.
+    #[test]
+    fn body_omits_solo_profile_pointer_when_peers_present() {
+        let peers = vec![("helper".to_string(), Some("assistant".to_string()))];
+        let ctx = AgentContext {
+            name: "not-alone",
+            role: None,
+            fleet_peers: &peers,
+            team: None,
+            extra_instructions: None,
+        };
+        let body = build_instructions_body(Some(&ctx), None, None);
+        assert!(
+            !body.contains("docs/SOLO-PROFILE.md"),
+            "a real fleet peer present must suppress the solo pointer: {body}"
+        );
     }
 
     #[test]
