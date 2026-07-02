@@ -159,6 +159,211 @@ fn delete_instance_creator_force_succeeds_when_target_has_active_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #ACL-creator audit (review finding F1): a creator force-delete override
+/// must write a durable `fleet_events.jsonl` entry — `tracing::warn!` alone
+/// is process-log-only and not queryable audit trail. Mirrors the
+/// `merge_force_bypass` pattern in `ci/merge.rs`.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_force_writes_fleet_events_audit() {
+    let home = tmp_home_for_creator_acl("audit");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    created_by: creator\n",
+    )
+    .unwrap();
+    seed_claimed_task(&home, "victim");
+
+    let creator = crate::identity::Sender::new("creator");
+    let resp = handle_delete_instance(
+        &home,
+        &serde_json::json!({
+            "instance": "victim",
+            "force": true,
+            "force_reason": "retiring my own spawn to change its model",
+        }),
+        &creator,
+    );
+    assert_eq!(resp["name"], "victim", "force-delete must succeed: {resp}");
+
+    let events_path = home.join("fleet_events.jsonl");
+    let content = std::fs::read_to_string(&events_path)
+        .unwrap_or_else(|e| panic!("fleet_events.jsonl must exist and be readable: {e}"));
+    let event: serde_json::Value = content
+        .lines()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .expect("fleet_events.jsonl must contain a parseable JSON line");
+    assert_eq!(event["kind"], "creator_force_delete");
+    assert_eq!(event["agent"], "creator");
+    assert_eq!(event["target"], "victim");
+    assert_eq!(
+        event["force_reason"],
+        "retiring my own spawn to change its model"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #ACL-creator audit fail-closed (review finding F1): if the durable audit
+/// write fails, the delete must be REFUSED — a permission override that
+/// can't be recorded must not proceed, same fail-closed semantics as
+/// `merge_force_bypass`. Simulated by making `home` itself unwritable for
+/// the new file (a directory in place of `fleet_events.jsonl`).
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_force_fails_closed_when_audit_write_fails() {
+    let home = tmp_home_for_creator_acl("audit-fail");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    created_by: creator\n",
+    )
+    .unwrap();
+    seed_claimed_task(&home, "victim");
+    // A directory at the audit log's path makes the OpenOptions::append open
+    // fail (EISDIR), simulating a write failure without touching permissions.
+    std::fs::create_dir_all(home.join("fleet_events.jsonl")).unwrap();
+
+    let creator = crate::identity::Sender::new("creator");
+    let resp = handle_delete_instance(
+        &home,
+        &serde_json::json!({
+            "instance": "victim",
+            "force": true,
+            "force_reason": "retiring my own spawn to change its model",
+        }),
+        &creator,
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "audit write failure must refuse the delete: {resp}"
+    );
+    assert_ne!(
+        resp["name"], "victim",
+        "a fail-closed refusal must not report the same success shape: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #ACL-creator safety valve (review finding F3): an active worktree binding
+/// (no task involved) must ALSO gate the creator path — production checks
+/// `has_binding || has_active_task`, but prior tests only exercised the
+/// claimed-task half.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_requires_force_when_target_has_active_binding() {
+    let home = tmp_home_for_creator_acl("active-binding");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    created_by: creator\n",
+    )
+    .unwrap();
+    let wt = dirty_worktree("acl-binding");
+    bind_worktree(&home, "victim", &wt);
+
+    let creator = crate::identity::Sender::new("creator");
+    let denied =
+        handle_delete_instance(&home, &serde_json::json!({"instance": "victim"}), &creator);
+    assert_eq!(
+        denied["code"], "creator_delete_requires_force",
+        "creator delete of a bound target without force must be denied: {denied}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// #ACL-creator safety valve (review finding F3): `force` + `force_reason`
+/// also overrides the active-binding half of the valve.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_force_succeeds_when_target_has_active_binding() {
+    let home = tmp_home_for_creator_acl("active-binding-force");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    created_by: creator\n",
+    )
+    .unwrap();
+    let wt = dirty_worktree("acl-binding-force");
+    bind_worktree(&home, "victim", &wt);
+
+    let creator = crate::identity::Sender::new("creator");
+    let resp = handle_delete_instance(
+        &home,
+        &serde_json::json!({
+            "instance": "victim",
+            "force": true,
+            "force_reason": "retiring my own spawn to change its model",
+        }),
+        &creator,
+    );
+    assert_ne!(
+        resp.get("code").and_then(|v| v.as_str()),
+        Some("creator_delete_requires_force"),
+        "force + force_reason must override the active-binding guard: {resp}"
+    );
+    assert_eq!(resp["name"], "victim");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// #ACL-creator restart-persistence (review finding F2): `created_by` must
+/// survive a daemon-restart-equivalent reload — written through the REAL
+/// spawn-time path (`add_instance_to_yaml`, not a hand-typed YAML fixture),
+/// then re-resolved via a fresh `FleetConfig::load` (no in-memory state
+/// carried over), and the creator ACL must still recognize it. Directly
+/// motivated by the same-night team-persistence bug investigation
+/// (t-20260702132159428591-56872-1) — a field that LOOKS persisted in a
+/// single process can still fail to round-trip.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_acl_survives_restart_equivalent_reload() {
+    let home = tmp_home_for_creator_acl("restart-persist");
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+    // The REAL write path a spawn takes (spawn.rs stamps this exact field).
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        "victim",
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("claude".into()),
+            created_by: Some("creator".into()),
+            ..Default::default()
+        },
+    )
+    .expect("write instance entry");
+
+    // "Restart-equivalent": a FRESH load off disk, no cached/in-memory state
+    // from the write above (FleetConfig::load has no such cache to begin
+    // with, but this asserts the round-trip explicitly rather than assuming
+    // it).
+    let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    assert_eq!(
+        reloaded
+            .instances
+            .get("victim")
+            .and_then(|i| i.created_by.clone()),
+        Some("creator".to_string()),
+        "created_by must round-trip through the real write + a fresh reload"
+    );
+
+    // The ACL path itself (handle_delete_instance) does its own fresh
+    // `FleetConfig::load` internally — this proves the end-to-end behavior,
+    // not just the struct round-trip above.
+    let creator = crate::identity::Sender::new("creator");
+    let resp = handle_delete_instance(&home, &serde_json::json!({"instance": "victim"}), &creator);
+    assert_ne!(
+        resp.get("code").and_then(|v| v.as_str()),
+        Some("not_owner_or_orchestrator"),
+        "creator ACL must resolve from persisted state after reload: {resp}"
+    );
+    assert_eq!(resp["name"], "victim");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn dirty_worktree(tag: &str) -> std::path::PathBuf {
     let wt = std::env::temp_dir().join(format!(
