@@ -74,12 +74,14 @@ pub(crate) type HandlerFn = fn(&HandlerCtx<'_>) -> Value;
 /// ERRORS (not defaults) when it's absent. The systematic audit found 5 tools
 /// whose handler instead DEFAULTS a "required" field, so their schemas were
 /// LYING. They were schema-aligned (field removed from `required[]`) rather than
-/// allowlisted, keeping this validator a plain hard-reject. The 5:
+/// allowlisted, keeping this validator a plain hard-reject. The 5 (now 4 after
+/// #2547 merged `set_display_name`/`set_description` into `set_metadata`):
 /// `mode` (`action` → `"get"`), `create_instance` (`name` auto-derived in team
 /// mode; single path still errors "missing 'name'"), `set_waiting_on`
-/// (`condition` absent = clear), and `set_display_name` / `set_description`
-/// (handler tolerates absent, sets `""` — a separate follow-up decides whether
-/// set-X-without-X should hard-error).
+/// (`condition` absent = clear), and `set_metadata` (`name`/`description`
+/// absent, sets `""` — a separate follow-up decides whether set-X-without-X
+/// should hard-error; `action` itself IS required — see the action_adapter
+/// fallthrough).
 ///
 /// Tools whose handler DOES error on a missing field (`reply.message`,
 /// `send.message`, `delete_instance.instance`, action-based `task`/`decision`)
@@ -202,11 +204,6 @@ adapter!(
     hai,
     instance::handle_create_instance
 );
-adapter!(
-    dispatch_set_description,
-    hai,
-    instance::handle_set_description
-);
 adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
 adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
 adapter!(
@@ -250,11 +247,6 @@ adapter!(
     channel::handle_download_attachment
 );
 adapter!(dispatch_reply, hai, channel::handle_reply);
-adapter!(
-    dispatch_set_display_name,
-    hai,
-    instance::handle_set_display_name
-);
 adapter!(dispatch_pane_snapshot, ha, instance::handle_pane_snapshot);
 adapter!(
     dispatch_task_sweep_config,
@@ -313,6 +305,11 @@ action_adapter!(dispatch_schedule, "schedule", [
     "list"   => schedule::handle_list_schedules,   ha;
     "update" => schedule::handle_update_schedule,  ha;
     "delete" => schedule::handle_delete_schedule,  ha;
+]);
+
+action_adapter!(dispatch_set_metadata, "set_metadata", [
+    "display_name" => instance::handle_set_display_name, hai;
+    "description"  => instance::handle_set_description,  hai;
 ]);
 
 action_adapter!(dispatch_team, "team", [
@@ -605,8 +602,7 @@ mod tests {
                 "start_instance",
                 "restart_instance",
                 "interrupt",
-                "set_display_name",
-                "set_description",
+                "set_metadata",
                 "set_waiting_on",
                 "move_pane",
                 "pane_snapshot",
@@ -633,7 +629,7 @@ mod tests {
                 "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 36);
+        assert_eq!(crate::mcp::registry::all().len(), 35);
     }
 
     #[test]
@@ -847,16 +843,16 @@ mod tests {
                 json!({}),
             ), // → clear
             (
-                "set_display_name",
-                def_set_display_name(),
+                "set_metadata",
+                def_set_metadata(),
                 "name",
-                json!({}),
+                json!({"action": "display_name"}),
             ), // → ""
             (
-                "set_description",
-                def_set_description(),
+                "set_metadata",
+                def_set_metadata(),
                 "description",
-                json!({}),
+                json!({"action": "description"}),
             ), // → ""
         ];
         for case in &cases {

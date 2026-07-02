@@ -241,7 +241,7 @@ pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, t
             .any(|entry| entry.name == tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 36] = [
+static ALL_TOOLS: [ToolEntry; 35] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -306,15 +306,9 @@ static ALL_TOOLS: [ToolEntry; 36] = [
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
-        name: "set_display_name",
-        definition: super::tools::def_set_display_name,
-        handler: super::handlers::dispatch::dispatch_set_display_name,
-        class: ToolClass::FAST_RETRY_SAFE,
-    },
-    ToolEntry {
-        name: "set_description",
-        definition: super::tools::def_set_description,
-        handler: super::handlers::dispatch::dispatch_set_description,
+        name: "set_metadata",
+        definition: super::tools::def_set_metadata,
+        handler: super::handlers::dispatch::dispatch_set_metadata,
         class: ToolClass::FAST_RETRY_SAFE,
     },
     ToolEntry {
@@ -491,12 +485,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_36_byte_identical() {
+    fn full_capability_roles_surface_all_35_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            36,
-            "registry baseline is 36 tools (#2547: replace_instance folded into restart_instance mode=fresh)"
+            35,
+            "registry baseline is 35 tools (#2547: replace_instance folded into restart_instance mode=fresh; set_display_name/set_description merged into set_metadata)"
         );
         for role in [
             None,
@@ -508,7 +502,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 36 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 35 tools in registry order (default-all-open)"
             );
         }
     }

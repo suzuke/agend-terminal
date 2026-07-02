@@ -71,7 +71,7 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         "list_instances" | "binding_state" | "tokens" | "pane_snapshot"
         | "tui_screenshot" | "gc_dry_run" | "health" | "download_attachment"
         | "inbox" | "send" | "task" | "reply" | "decision" | "set_waiting_on"
-        | "interrupt" | "bind_self" | "set_description" | "set_display_name"
+        | "interrupt" | "bind_self"
         | "watchdog" | "ci"
         // direct API read / normal methods
         | "list" | "inject" | "status" | "register_external"
@@ -79,6 +79,13 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         | "clear_blocked_reason" => AlwaysAllow,
 
         // ── Action-bearing tools: read actions allow, mutating actions never ──
+        // #2547: set_metadata merged set_display_name/set_description — both
+        // actions are per-instance display attrs, no operator-authority concern,
+        // so both stay AlwaysAllow (unmapped action still fail-closed).
+        "set_metadata" => match action {
+            Some("display_name") | Some("description") => AlwaysAllow,
+            _ => AbsolutelyNever,
+        },
         "mode" => match action {
             Some("get") | None => AlwaysAllow,
             _ => AbsolutelyNever, // an agent must not flip operator authority
@@ -437,6 +444,26 @@ mod tests {
         for op in ["send", "task", "inbox", "list_instances", "tokens"] {
             assert_eq!(classify(op, None), OpClass::AlwaysAllow, "{op}");
         }
+    }
+
+    /// #2547: `set_metadata` merged `set_display_name`/`set_description` into
+    /// one action-based tool. Both actions are per-instance display attrs with
+    /// no operator-authority concern, so both stay `AlwaysAllow`; an unmapped
+    /// action must still fail closed (taxonomy drift guard).
+    #[test]
+    fn set_metadata_actions_classified_2547() {
+        for action in ["display_name", "description"] {
+            assert_eq!(
+                classify("set_metadata", Some(action)),
+                OpClass::AlwaysAllow,
+                "set_metadata/{action} must stay allowed"
+            );
+        }
+        assert_eq!(
+            classify("set_metadata", Some("frobnicate")),
+            OpClass::AbsolutelyNever,
+            "set_metadata with an unmapped action must fail closed"
+        );
     }
 
     // ── MUST-PIN 5 (gate half): never-delegate blocked even sleep+full-scope;
