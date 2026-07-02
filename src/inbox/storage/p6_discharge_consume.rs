@@ -228,6 +228,57 @@ fn is_discharged_false_no_watch_file() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// #2524 P6-r2 r1 (gapfix-reviewer secondary coverage-gap finding): a
+/// `correlation_id` PRESENT but not a parseable `repo@branch` pair (no `@`)
+/// must fail open — distinct from the already-covered "correlation_id
+/// entirely absent" case above.
+#[test]
+fn is_discharged_false_malformed_correlation_id() {
+    let home = tmp_home("malformed-correlation");
+    write_watch(&home, REPO, BRANCH, HEAD);
+    record_discharge(&home, HEAD, JOB, "dev-1", None).unwrap();
+
+    let mut msg = ci_fail_msg(REPO, BRANCH, SHORT, JOB);
+    msg.correlation_id = Some("not-a-repo-at-branch-pair".to_string());
+    assert!(
+        !is_discharged_ci_fail(&home, &msg),
+        "a correlation_id with no '@' separator can't split into (repo, branch) → fail open"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2524 P6-r2 r1 (gapfix-reviewer secondary coverage-gap finding): a
+/// ci-watch file that EXISTS but has no `head_sha` yet (a fresh watch before
+/// its first poll populates it) must fail open — distinct from the
+/// already-covered "no watch file at all" case above.
+#[test]
+fn is_discharged_false_watch_file_with_no_head_sha_yet() {
+    let home = tmp_home("watch-no-head-sha");
+    let dir = ci_watches_dir(&home);
+    fs::create_dir_all(&dir).unwrap();
+    let ws = WatchState {
+        repo: REPO.to_string(),
+        branch: BRANCH.to_string(),
+        head_sha: None, // fresh watch, first poll hasn't run yet
+        ..Default::default()
+    };
+    fs::write(
+        dir.join(watch_filename(REPO, BRANCH)),
+        serde_json::to_string_pretty(&ws).unwrap(),
+    )
+    .unwrap();
+    record_discharge(&home, HEAD, JOB, "dev-1", None).unwrap();
+
+    let msg = ci_fail_msg(REPO, BRANCH, SHORT, JOB);
+    assert!(
+        !is_discharged_ci_fail(&home, &msg),
+        "a watch file with head_sha=None can't resolve a current head → fail open"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn is_discharged_absorption_writes_audit_log_entry() {
     let home = tmp_home("audit-log");

@@ -63,9 +63,19 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
         // count, so re-nudging a duplicate the agent already handled stops here.
         let (count, oldest) = crate::inbox::unread_count_after_discharge(home, name);
         if count == 0 {
-            // RED stub (§3.10) — dedup-baseline reset intentionally omitted
-            // (this is the exact gap the r0 REJECTED finding caught); restored
-            // in the immediately-following GREEN commit.
+            // #2537 fix (reviewer-caught REJECTED finding on the first pass):
+            // discharging the ONLY unread ci-fail drops the count to 0 here,
+            // but pre-fix `LAST_NOTIFIED` was left stale at whatever it was
+            // before the discharge — so a LATER, genuinely different-signature
+            // failure whose count happened to coincide with that stale value
+            // was silently suppressed by `should_notify_and_record`'s
+            // `prev == count` check below. Clear the dedup baseline whenever
+            // the count is confirmed zero, mirroring the SAME invalidation
+            // `reclaim_stale_delivering` already performs when a restore
+            // changes the count out from under the ledger (see its
+            // `remove_agent` call in `inbox::storage`) — a real signature
+            // change must never be masked by a stale prior count.
+            remove_agent(name);
             continue;
         }
         if !should_notify_and_record(name, count) {
@@ -880,7 +890,11 @@ mod tests {
         let registry = mock_registry(agent, AgentState::Idle);
         reset_dedup(agent);
         let first = collect_poll_reminders(&home, &registry);
-        assert_eq!(first.len(), 1, "job A's undischarged ci-fail must nudge once");
+        assert_eq!(
+            first.len(),
+            1,
+            "job A's undischarged ci-fail must nudge once"
+        );
 
         // Triage job A. It was the ONLY unread row, so the discharge-aware
         // count drops to 0 this pass.
