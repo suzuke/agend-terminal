@@ -21,9 +21,11 @@
 //! (d) the observed state genuinely DISAGREES with the raw screen baseline at the coarse
 //! level (the §5 correction predicate via [`screen_as_observed`]), so an agreeing-but-vaguer
 //! observed state never DOWNGRADES a more-specific raw state. `None` otherwise → the consumer
-//! keeps the raw state. Weak / screen-only backends (agy has no Hook/Stream plane →
+//! keeps the raw state. Weak / screen-only backends (e.g. Shell/Raw — no Hook/Stream plane →
 //! `authority` is always `Screen`/`ProcessHeuristic`/`Inferred`) can NEVER satisfy (a) → zero
-//! regression for them, by construction.
+//! regression for them, by construction. (agy is NOT such a backend since Phase D, #2448 —
+//! its `.agents/hooks.json` lifecycle hooks emit real `Hook`-authority evidence, turn-granular
+//! only, no per-tool spans — `has_state_hooks()` in `backend.rs` covers claude + agy.)
 
 use super::evidence::{Authority, Confidence};
 use super::reducer::{ObservedState, ObservedStatus, ScreenSignal};
@@ -182,8 +184,10 @@ mod tests {
         );
     }
 
-    /// Firewall (1): a screen-only backend (agy — authority always `Screen`) can NEVER
-    /// satisfy the Hook/Stream gate → raw kept even at Strong confidence + disagreement.
+    /// Firewall (1): a screen-only backend (e.g. Shell/Raw — authority always `Screen`,
+    /// no Hook/Stream plane) can NEVER satisfy the Hook/Stream gate → raw kept even at
+    /// Strong confidence + disagreement. (Not agy — agy has a Hook plane since Phase D,
+    /// #2448; this test exercises the Authority::Screen input shape, not a specific backend.)
     #[test]
     fn screen_only_backend_keeps_raw() {
         let s = status(
@@ -271,7 +275,8 @@ mod tests {
             Some(AgentState::Active),
             "Stream-plane parity (codex)"
         );
-        // Screen-authority observed (no real-time observer plane, e.g. agy) → keep SRL.
+        // Screen-authority observed (no fresh Hook/Stream evidence this tick, e.g. a
+        // Shell/Raw agent, or any backend between hook events) → keep SRL.
         let screen_active = status(ObservedState::Active, Authority::Screen, Confidence::Strong);
         assert_eq!(
             gated_override(AgentState::ServerRateLimit, &screen_active),
