@@ -4759,26 +4759,6 @@ fn anchor_suppress_warn_deduped_across_ticks() {
     });
 }
 
-#[test]
-fn append_jsonl_appends_one_record_per_line() {
-    let dir = std::env::temp_dir().join("agend_1562_append_jsonl_test");
-    let _ = std::fs::remove_dir_all(&dir);
-    let path = dir.join("nested").join("unclassified_errors.jsonl");
-
-    append_jsonl(&path, &serde_json::json!({"backend": "codex", "n": 1})).expect("first append");
-    append_jsonl(&path, &serde_json::json!({"backend": "claude", "n": 2})).expect("second append");
-
-    let body = std::fs::read_to_string(&path).expect("read back jsonl");
-    let lines: Vec<&str> = body.lines().collect();
-    assert_eq!(lines.len(), 2, "one record per line");
-    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("parse line 0");
-    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse line 1");
-    assert_eq!(first["backend"], "codex");
-    assert_eq!(second["n"], 2);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 // ── #SRL-phase2: Ink hard-wrap + hash-dedup blind-spot ───────────────────────
 
 /// #SRL-phase2 (a): a narrow-pane Ink HARD-wrapped ServerRateLimit line (the

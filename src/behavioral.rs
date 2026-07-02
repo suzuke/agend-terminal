@@ -7,8 +7,8 @@
 //!
 //! ## Architecture: free functions over trait
 //!
-//! `config_for(backend)` + `infer_from_silence(config, duration)` are free
-//! functions rather than a `BehavioralProbe` trait because:
+//! `config_for(backend)` is a free function rather than a `BehavioralProbe`
+//! trait because:
 //! 1. No dynamic dispatch needed — backend is known at StateTracker construction
 //! 2. Config is `Copy` data, not behavior — a struct with fields, not methods
 //! 3. Inference is a pure function of (config, signal) → result
@@ -21,38 +21,14 @@
 use crate::backend::Backend;
 use std::time::Duration;
 
-/// Behavioral state inference result.
-// Sprint 27 PR-A silence-based shadow probe: the live consumer
-// (`state::record_shadow_telemetry`) was retired with the rest of the
-// `behavioral_shadow` scaffolding; the inference layer is kept (exercised by the
-// tests below) for a potential Phase-2 promotion of silence → state.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BehavioralSignal {
-    /// PTY output silent beyond threshold → likely thinking/processing.
-    SilenceThinking,
-    /// PTY output silent beyond idle threshold → likely idle/waiting.
-    SilenceIdle,
-    /// No behavioral signal detected.
-    None,
-}
-
-impl std::fmt::Display for BehavioralSignal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SilenceThinking => write!(f, "silence_thinking"),
-            Self::SilenceIdle => write!(f, "silence_idle"),
-            Self::None => write!(f, "none"),
-        }
-    }
-}
-
 /// Per-backend behavioral calibration constants.
 #[derive(Debug, Clone, Copy)]
 pub struct BehavioralConfig {
-    // Read only by `infer_from_silence` (silence-based shadow probe), whose live
-    // consumer was retired with the `behavioral_shadow` scaffolding; populated by
-    // the `backend_profile` tables and kept for a potential Phase-2 promotion.
+    // #2547: the silence-based inference layer that read these (BehavioralSignal
+    // / infer_from_silence) was deleted as dead code — its live consumer
+    // (`state::record_shadow_telemetry`) had already retired with the rest of
+    // the `behavioral_shadow` scaffolding. Fields kept: populated by the
+    // `backend_profile` tables and asserted on by the calibration tests below.
     /// Silence duration before inferring "thinking" (ms).
     #[allow(dead_code)]
     pub silence_thinking_ms: u64,
@@ -80,27 +56,11 @@ pub fn config_for(backend: &Backend) -> BehavioralConfig {
     crate::backend_profile::profile(backend).behavioral
 }
 
-/// Infer behavioral signal from silence duration.
-// Sprint 27 PR-A: the live caller (`state::record_shadow_telemetry`) was retired
-// with the `behavioral_shadow` scaffolding; retained (and exercised by the tests
-// below) as the silence-inference primitive for a potential Phase-2 promotion.
-#[allow(dead_code)]
-pub fn infer_from_silence(config: &BehavioralConfig, silence: Duration) -> BehavioralSignal {
-    let silence_ms = silence.as_millis() as u64;
-    if silence_ms >= config.silence_idle_ms {
-        BehavioralSignal::SilenceIdle
-    } else if silence_ms >= config.silence_thinking_ms {
-        BehavioralSignal::SilenceThinking
-    } else {
-        BehavioralSignal::None
-    }
-}
-
 // ---------------------------------------------------------------------------
 // F9: productive-output signal (#685 sub-task 4)
 //
-// Parallel to `BehavioralSignal` (silence-based, absence-of-output) — uses
-// presence-of-specific-output evidence. Shares this module + the
+// Uses presence-of-specific-output evidence (absence-of-output silence
+// inference was #2547-deleted dead code). Shares this module + the
 // `behavioral_shadow` tracing target for telemetry infrastructure reuse.
 // See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.2 for design rationale.
 // ---------------------------------------------------------------------------
@@ -326,9 +286,8 @@ pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
 }
 
 /// Infer productive-output signal from screen text and heartbeat freshness.
-/// Pure function — no side effects, no state mutation. Parallels
-/// `infer_from_silence` shape so future signal types follow the same
-/// `(config, evidence) -> signal` pattern.
+/// Pure function — no side effects, no state mutation. Follows a
+/// `(config, evidence) -> signal` pattern so future signal types can match it.
 // #685 PR-2 RC1: production callers switched to
 // [`infer_productivity_with_match`] for evidence-substring dedup.
 // `infer_productivity` retained as the simpler interface for tests +
@@ -486,33 +445,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn silence_below_threshold_returns_none() {
-        let config = config_for(&Backend::ClaudeCode);
-        assert_eq!(
-            infer_from_silence(&config, Duration::from_millis(500)),
-            BehavioralSignal::None
-        );
-    }
-
-    #[test]
-    fn silence_above_thinking_threshold() {
-        let config = config_for(&Backend::ClaudeCode);
-        assert_eq!(
-            infer_from_silence(&config, Duration::from_millis(2500)),
-            BehavioralSignal::SilenceThinking
-        );
-    }
-
-    #[test]
-    fn silence_above_idle_threshold() {
-        let config = config_for(&Backend::ClaudeCode);
-        assert_eq!(
-            infer_from_silence(&config, Duration::from_millis(7000)),
-            BehavioralSignal::SilenceIdle
-        );
-    }
-
-    #[test]
     fn claude_has_shorter_thresholds_than_default() {
         let claude = config_for(&Backend::ClaudeCode);
         let default = BehavioralConfig::default();
@@ -544,15 +476,6 @@ mod tests {
     fn opencode_uses_default_thresholds() {
         let config = config_for(&Backend::OpenCode);
         assert_eq!(config.silence_idle_ms, 8000);
-    }
-
-    #[test]
-    fn behavioral_signal_display() {
-        assert_eq!(
-            format!("{}", BehavioralSignal::SilenceThinking),
-            "silence_thinking"
-        );
-        assert_eq!(format!("{}", BehavioralSignal::None), "none");
     }
 
     /// M2: Fixture replay — feed through StateTracker, verify state
@@ -613,27 +536,6 @@ mod tests {
     #[test]
     fn fixture_replay_opencode_tooluse() {
         replay_fixture("opencode-tooluse.raw", &Backend::OpenCode);
-    }
-
-    /// M2: Silence inference produces correct signal for calibrated thresholds.
-    #[test]
-    fn claude_silence_inference_matches_calibration() {
-        let config = config_for(&Backend::ClaudeCode);
-        // Below thinking threshold
-        assert_eq!(
-            infer_from_silence(&config, Duration::from_millis(1000)),
-            BehavioralSignal::None
-        );
-        // Above thinking, below idle
-        assert_eq!(
-            infer_from_silence(&config, Duration::from_millis(3000)),
-            BehavioralSignal::SilenceThinking
-        );
-        // Above idle
-        assert_eq!(
-            infer_from_silence(&config, Duration::from_millis(7000)),
-            BehavioralSignal::SilenceIdle
-        );
     }
 
     /// M4: StateTracker must expose has_behavioral_config() — fails to

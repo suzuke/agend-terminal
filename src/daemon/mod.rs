@@ -33,7 +33,6 @@ pub(crate) mod orphan_sweep;
 pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state;
-pub(crate) mod recovery_shadow;
 pub(crate) mod restart;
 pub(crate) mod retention;
 pub(crate) mod router;
