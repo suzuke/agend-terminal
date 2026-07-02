@@ -69,6 +69,13 @@ pub(super) fn handle_spawn(home: &Path, args: &Value, _instance_name: &str) -> V
             .as_str()
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        // #2524 P3b: ralph-loop opt-in. Absent/None on both = byte-identical to
+        // pre-P3b (validated together in `spawn_and_track`'s shared sink, not here).
+        max_iterations: args["max_iterations"].as_u64().map(|n| n as u32),
+        completion_promise: args["completion_promise"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     };
     match crate::ephemeral_tracking::spawn_and_track(home, spec) {
         Ok(w) => json!({

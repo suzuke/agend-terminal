@@ -98,40 +98,81 @@ const MAX_SUMMARY_BYTES: usize = 8_192;
 pub(crate) struct DriverConfig {
     pub home: PathBuf,
     pub worker_id: String,
+    /// #2524 P3b: the owning workflow id, carried only for iteration/terminal
+    /// telemetry (`event_log`) — never used for turn-end/oracle decisions.
+    pub workflow_id: String,
     pub prompt: String,
     /// Inject capability + the worker's `core` (polled for state/vterm). Built via
     /// [`InjectTarget::from_ephemeral`].
     pub inject_target: InjectTarget,
     /// The worker's wall-TTL (the reap sweep's cost guard); the driver's hard ceiling.
+    /// Shared across every iteration in loop mode — it is the whole worker's
+    /// lifetime budget, not a per-iteration one.
     pub wall_ttl: Duration,
     /// #2524 P3a PR-2: which backend this worker runs, so turn-end detection can branch
     /// (codex consults `observed_status`; every other backend is unaffected — see
     /// [`effective_turn_state`]).
     pub backend: Backend,
+    /// #2524 P3b (ralph-loop, Shape-1 P0 / decision `d-20260702105502384640-4`):
+    /// `None` = existing single-shot behavior, byte-identical to pre-P3b — `run_turn`
+    /// executes exactly one turn and returns. `Some(n)` (`1..=25`, validated at spawn
+    /// admission — [`crate::ephemeral_tracking::MAX_ITERATIONS_CAP`]) opts into the
+    /// self-continuation loop: after a non-terminal turn, the driver injects
+    /// [`CONTINUE_INJECT_TEXT`] and runs another turn, up to `n` turns total.
+    pub max_iterations: Option<u32>,
+    /// #2524 P3b: optional completion signal for loop mode. A literal string the
+    /// driver looks for in each turn's post-turn transcript dump; its presence ends
+    /// the loop as a SUCCESS (see [`next_loop_action`]). Ignored when
+    /// `max_iterations` is `None`.
+    pub completion_promise: Option<String>,
 }
 
-/// Launch the one-shot driver thread for a freshly-finalized worker.
+/// Launch the driver thread for a freshly-finalized worker — one-shot (default) or
+/// the #2524 P3b self-continuation loop when `cfg.max_iterations` is `Some`.
 pub(crate) fn spawn_driver(cfg: DriverConfig) {
-    // fire-and-forget: drives the one-shot turn off the MCP `ephemeral spawn` handler,
-    // which returns worker_id+pid IMMEDIATELY (the PR1/2 async contract). The thread is
-    // self-bounding — it exits when the turn ends, an error class latches, an inject
-    // fails, or the wall-TTL lapses — and the reap sweep terminates the worker PROCESS
-    // independently, so no graceful JoinHandle is kept: a daemon shutdown simply drops
-    // the worker (its `reap_on_boot` sweeps any orphan on the next boot).
+    // fire-and-forget: drives the turn(s) off the MCP `ephemeral spawn` handler, which
+    // returns worker_id+pid IMMEDIATELY (the PR1/2 async contract). The thread is
+    // self-bounding — it exits when the turn(s) end, an error class latches, an inject
+    // fails, `max_iterations` is exhausted, or the wall-TTL lapses — and the reap
+    // sweep terminates the worker PROCESS independently, so no graceful JoinHandle is
+    // kept: a daemon shutdown simply drops the worker (its `reap_on_boot` sweeps any
+    // orphan on the next boot). This is also the loop's "orphan-clear" termination
+    // path (#2301 lack (c) item ⑤) — the driver does NOT duplicate process-liveness
+    // detection; a dead process is reclaimed by the SAME existing reap machinery
+    // regardless of whether the driver thread is mid-loop, single-shot, or already
+    // exited (see `ephemeral_tracking::reap_sweep` and its existing tests).
     std::thread::spawn(move || run_turn(cfg));
 }
+
+/// #2524 P3b: text injected for iteration 2+ of a self-continuation loop (iteration 1
+/// always injects the caller's own `prompt`, unchanged from pre-P3b single-shot).
+/// Matches the `ralph-loop` reference pattern's own convention.
+const CONTINUE_INJECT_TEXT: &str = "continue";
 
 /// The driver's body: wait-ready → inject → turn-end → capture → oracle → record.
 /// ALWAYS records a result (success or a failure reason) so the worker never hangs in
 /// `running`/`prompting` until the wall-TTL reap.
+///
+/// #2524 P3b: when `cfg.max_iterations` is `None` (every pre-P3b caller), this is
+/// EXACTLY the original one-shot body — Phase 0 once, then Phase 1/2/3 exactly once,
+/// then `record_result` and return, byte-identical to pre-P3b (see
+/// `single_shot_zero_behavior_change_invariance` in `ephemeral_tracking`'s tests: the
+/// only change on this path is the code SHAPE, not the sequence of operations or their
+/// arguments). `Some(n)` opts into the loop: after a non-terminal turn (per
+/// [`next_loop_action`]), the driver injects [`CONTINUE_INJECT_TEXT`] and runs another
+/// turn, sharing the SAME Phase 2/3 logic and the SAME wall-TTL budget across every
+/// iteration.
 fn run_turn(cfg: DriverConfig) {
     let DriverConfig {
         home,
         worker_id,
+        workflow_id,
         prompt,
         inject_target,
         wall_ttl,
         backend,
+        max_iterations,
+        completion_promise,
     } = cfg;
     let start = Instant::now();
     let wall_ttl_ms = wall_ttl.as_millis() as u64;
@@ -165,88 +206,221 @@ fn run_turn(cfg: DriverConfig) {
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    // Baseline non-blank-line count (at ready, before inject) for the "grew" measure.
-    let baseline_dump = inject_target
-        .core
-        .lock()
-        .vterm
-        .tail_lines_dewrapped(CAPTURE_LINES);
-    let baseline_body = nonblank_count(&baseline_dump);
+    // #2524 P3b: `loop_mode` = false is the pre-P3b path — the block below runs
+    // exactly once (iteration 1, `current_prompt = prompt`) and returns from inside
+    // the loop body on its first pass, so the OPERATION SEQUENCE for a caller that
+    // never sets `max_iterations` is unchanged: Phase 0 (above) → baseline → Phase 1
+    // (inject `prompt`) → Phase 2 → Phase 3 → `record_result` → return.
+    let loop_mode = max_iterations.is_some();
+    let max_iter = max_iterations.unwrap_or(1);
+    let mut current_prompt = prompt.clone();
+    let mut iteration: u32 = 0;
 
-    // Phase 1 — inject the prompt. Mark phase=prompting first so `ephemeral list`
-    // reflects the mid-turn state.
-    crate::ephemeral_tracking::mark_prompting(&home, &worker_id);
-    if let Err(e) = crate::agent::run_ephemeral_inject(&inject_target, prompt.as_bytes()) {
-        return record_failure(&home, &worker_id, &format!("inject failed: {e}"));
-    }
+    'turns: loop {
+        iteration += 1;
 
-    // Phase 2 — wait for turn end: Idle held ≥ debounce after work, an error class, or
-    // the wall-TTL. Poll get_state() ONLY (never the general tick()).
-    //
-    // #2524 P3a PR-2 (decision d-20260702081055743388-12): the Phase 0 latch-expiry
-    // check does NOT extend here for opencode/claude — DELIBERATELY, not an oversight.
-    // `expire_stale_latch_if_due` transitions on ELAPSED TIME alone, without
-    // re-evaluating the current screen (`record_set`'s same-state early-return never
-    // refreshes `since` on a repeat Active match, however often the screen re-renders
-    // — see `StateTracker::record_set`). Calling it here for a backend with no
-    // turn-end-authority fallback would re-derive EXACTLY the risk this module's own
-    // top doc already flags ("Calling `tick()` here would re-enable that decay → a
-    // false turn-end on a quiet >30s stretch"): a genuinely-still-running turn past
-    // 30s continuously classified Active could get force-flipped to Idle and read as
-    // a real TurnEnded 3s later. opencode/claude are §5-smoke-validated on the
-    // OPPOSITE premise — a real turn-end always produces a final render burst (new
-    // pty bytes ⇒ `detect()` naturally re-evaluates and transitions), so they have
-    // no latent ready-style mis-latch to fix here, and adding the check would be a
-    // new, un-smoked risk for no benefit. codex is different ONLY because it has the
-    // `observed_status` veto below as a safety net: even if `expire_stale_latch_if_due`
-    // wrongly forces Idle on a still-active codex turn, fresh Stream-authority
-    // evidence overrides it back to `Active` before `TurnEndDetector` ever sees it
-    // (see `codex_expiry_forced_idle_is_vetoed_back_to_active` below) — a protection
-    // opencode/claude do not have. Do NOT "simplify" this to an unconditional call for
-    // all backends without re-adding that veto first.
-    let mut detector = TurnEndDetector::new(TURN_DEBOUNCE_MS);
-    let stop_reason = loop {
-        let now_ms = start.elapsed().as_millis() as u64;
-        if now_ms >= wall_ttl_ms {
-            break "wall-TTL elapsed before turn end";
+        // Baseline non-blank-line count (right before THIS iteration's inject) for
+        // the "grew" measure — re-captured every iteration so "grew" always means
+        // "this turn produced new output", not "since the very first turn".
+        let baseline_dump = inject_target
+            .core
+            .lock()
+            .vterm
+            .tail_lines_dewrapped(CAPTURE_LINES);
+        let baseline_body = nonblank_count(&baseline_dump);
+
+        // Phase 1 — inject the prompt (iteration 1) or the continuation text
+        // (iteration 2+). Mark phase=prompting first so `ephemeral list` reflects
+        // the mid-turn state.
+        crate::ephemeral_tracking::mark_prompting(&home, &worker_id);
+        if let Err(e) =
+            crate::agent::run_ephemeral_inject(&inject_target, current_prompt.as_bytes())
+        {
+            // Covers the loop's "orphan" case too (#2301 lack (c) item ⑤): if the
+            // underlying process is gone, the inject itself fails here — no separate
+            // process-liveness check is needed in the loop (see `spawn_driver`'s doc).
+            return record_failure(&home, &worker_id, &format!("inject failed: {e}"));
         }
-        let (raw, observed) = {
-            let mut c = inject_target.core.lock();
-            if backend == Backend::Codex {
-                c.state.expire_stale_latch_if_due(now_ms);
+
+        // Phase 2 — wait for turn end: Idle held ≥ debounce after work, an error class, or
+        // the wall-TTL (shared across every iteration — `start` is the WORKER's spawn
+        // time, not this iteration's). Poll get_state() ONLY (never the general tick()).
+        //
+        // #2524 P3a PR-2 (decision d-20260702081055743388-12): the Phase 0 latch-expiry
+        // check does NOT extend here for opencode/claude — DELIBERATELY, not an oversight.
+        // `expire_stale_latch_if_due` transitions on ELAPSED TIME alone, without
+        // re-evaluating the current screen (`record_set`'s same-state early-return never
+        // refreshes `since` on a repeat Active match, however often the screen re-renders
+        // — see `StateTracker::record_set`). Calling it here for a backend with no
+        // turn-end-authority fallback would re-derive EXACTLY the risk this module's own
+        // top doc already flags ("Calling `tick()` here would re-enable that decay → a
+        // false turn-end on a quiet >30s stretch"): a genuinely-still-running turn past
+        // 30s continuously classified Active could get force-flipped to Idle and read as
+        // a real TurnEnded 3s later. opencode/claude are §5-smoke-validated on the
+        // OPPOSITE premise — a real turn-end always produces a final render burst (new
+        // pty bytes ⇒ `detect()` naturally re-evaluates and transitions), so they have
+        // no latent ready-style mis-latch to fix here, and adding the check would be a
+        // new, un-smoked risk for no benefit. codex is different ONLY because it has the
+        // `observed_status` veto below as a safety net: even if `expire_stale_latch_if_due`
+        // wrongly forces Idle on a still-active codex turn, fresh Stream-authority
+        // evidence overrides it back to `Active` before `TurnEndDetector` ever sees it
+        // (see `codex_expiry_forced_idle_is_vetoed_back_to_active` below) — a protection
+        // opencode/claude do not have. Do NOT "simplify" this to an unconditional call for
+        // all backends without re-adding that veto first.
+        let mut detector = TurnEndDetector::new(TURN_DEBOUNCE_MS);
+        let stop_reason = loop {
+            let now_ms = start.elapsed().as_millis() as u64;
+            if now_ms >= wall_ttl_ms {
+                break "wall-TTL elapsed before turn end";
             }
-            (c.state.get_state(), c.observed_status.clone())
+            let (raw, observed) = {
+                let mut c = inject_target.core.lock();
+                if backend == Backend::Codex {
+                    c.state.expire_stale_latch_if_due(now_ms);
+                }
+                (c.state.get_state(), c.observed_status.clone())
+            };
+            let state = effective_turn_state(&backend, raw, observed.as_ref());
+            match detector.observe(state, now_ms) {
+                TurnDecision::Continue => std::thread::sleep(POLL_INTERVAL),
+                TurnDecision::TurnEnded => break "turn ended (Idle held)",
+                TurnDecision::ErrorClass => break "error-class state latched",
+            }
         };
-        let state = effective_turn_state(&backend, raw, observed.as_ref());
-        match detector.observe(state, now_ms) {
-            TurnDecision::Continue => std::thread::sleep(POLL_INTERVAL),
-            TurnDecision::TurnEnded => break "turn ended (Idle held)",
-            TurnDecision::ErrorClass => break "error-class state latched",
+
+        // Phase 3 — capture + oracle. Re-read the terminal state + dump at the end (an
+        // error banner can scroll off, so sample near turn-end), then decide success.
+        let end_dump = inject_target
+            .core
+            .lock()
+            .vterm
+            .tail_lines_dewrapped(CAPTURE_LINES);
+        let terminal_state = inject_target.core.lock().state.get_state();
+        let grew = transcript_grew(&end_dump, &current_prompt, baseline_body);
+        let success = oracle_success(terminal_state, grew);
+        let summary = build_summary(&end_dump, terminal_state, grew, stop_reason);
+
+        tracing::info!(
+            target: "ephemeral",
+            worker_id = %worker_id,
+            iteration,
+            success,
+            terminal_state = ?terminal_state,
+            grew,
+            stop_reason,
+            "ephemeral driver turn complete"
+        );
+
+        if !loop_mode {
+            // Pre-P3b path: record exactly once and return — byte-identical.
+            crate::ephemeral_tracking::record_result(&home, &worker_id, summary, success);
+            return;
         }
-    };
 
-    // Phase 3 — capture + oracle. Re-read the terminal state + dump at the end (an
-    // error banner can scroll off, so sample near turn-end), then decide success.
-    let end_dump = inject_target
-        .core
-        .lock()
-        .vterm
-        .tail_lines_dewrapped(CAPTURE_LINES);
-    let terminal_state = inject_target.core.lock().state.get_state();
-    let grew = transcript_grew(&end_dump, &prompt, baseline_body);
-    let success = oracle_success(terminal_state, grew);
-    let summary = build_summary(&end_dump, terminal_state, grew, stop_reason);
+        // #2524 P3b: per-iteration telemetry (#1967 Phase-1's "event layer" —
+        // `event_log` is the existing generic append-only audit-log primitive; no
+        // separate `fleet_events.jsonl` module exists to reuse).
+        crate::event_log::log(
+            &home,
+            "ephemeral_iteration",
+            &worker_id,
+            &format!(
+                "workflow_id={workflow_id} iteration={iteration} stop_reason={stop_reason} \
+                 grew={grew} terminal_state={terminal_state:?}"
+            ),
+        );
 
-    tracing::info!(
-        target: "ephemeral",
-        worker_id = %worker_id,
-        success,
-        terminal_state = ?terminal_state,
-        grew,
-        stop_reason,
-        "ephemeral driver turn complete"
-    );
-    crate::ephemeral_tracking::record_result(&home, &worker_id, summary, success);
+        let outcome = IterationOutcome {
+            iteration,
+            max_iterations: max_iter,
+            completion_promise: completion_promise.as_deref(),
+            end_dump: &end_dump,
+            grew,
+            terminal_state,
+            wall_ttl_hit: stop_reason == "wall-TTL elapsed before turn end",
+        };
+        let iteration_summary = format!("[iteration {iteration}/{max_iter}] {summary}");
+        match next_loop_action(&outcome) {
+            LoopAction::Continue => {
+                current_prompt = CONTINUE_INJECT_TEXT.to_string();
+                continue 'turns;
+            }
+            LoopAction::Stop {
+                success: loop_success,
+                reason,
+            } => {
+                crate::event_log::log(
+                    &home,
+                    "ephemeral_loop_terminal",
+                    &worker_id,
+                    &format!(
+                        "workflow_id={workflow_id} iterations={iteration} stop={reason} \
+                         success={loop_success}"
+                    ),
+                );
+                crate::ephemeral_tracking::record_result(
+                    &home,
+                    &worker_id,
+                    iteration_summary,
+                    loop_success,
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// #2524 P3b: everything [`next_loop_action`] needs to decide whether a completed
+/// loop iteration continues or stops (and why). Built from the SAME Phase 3 values
+/// `run_turn` already computes for the single-shot path — no new signals invented.
+struct IterationOutcome<'a> {
+    iteration: u32,
+    max_iterations: u32,
+    /// The loop's optional completion signal (see `DriverConfig::completion_promise`).
+    completion_promise: Option<&'a str>,
+    /// This iteration's post-turn transcript dump (chrome included — the promise
+    /// match is a raw substring search, deliberately not anchored past chrome-strip,
+    /// so a promise the worker prints anywhere in its final render is caught).
+    end_dump: &'a str,
+    /// [`transcript_grew`]'s verdict for this iteration — the structural "did this
+    /// turn do anything" proxy (#2524 P3b manifest `d-20260702105330148504-3` §2:
+    /// reused as-is for no-progress; codex's extra reliability already comes from
+    /// `effective_turn_state`'s `observed_status` veto applied upstream in Phase 2,
+    /// not from a second per-backend branch here — the existing asymmetry is
+    /// PRESERVED, not re-implemented).
+    grew: bool,
+    terminal_state: AgentState,
+    /// Phase 2's turn-end wait hit the shared wall-TTL budget instead of a clean
+    /// turn-end (`stop_reason == "wall-TTL elapsed before turn end"`).
+    wall_ttl_hit: bool,
+}
+
+/// #2524 P3b: whether the driver should re-inject [`CONTINUE_INJECT_TEXT`] and run
+/// another turn, or stop the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopAction {
+    Continue,
+    /// `success`: the persisted `EphemeralWorker.success` value for a loop-mode
+    /// worker — TRUE only on a completion-promise match (decision
+    /// `d-20260702105502384640-4` Q2: oracle is an AUXILIARY signal, not the
+    /// authoritative "the multi-turn task is done" verdict).
+    Stop {
+        success: bool,
+        reason: &'static str,
+    },
+}
+
+/// Pure decision function — the loop's five termination paths, checked in the exact
+/// priority order the dispatching task specifies: (a) completion-promise, (b)
+/// `max_iterations`, (c) no-progress, (d) wall-TTL. (e) orphan-clear is NOT decided
+/// here — it has no representation in a completed turn's outcome; it is the whole
+/// worker process being gone, handled entirely by `spawn_driver`'s inject-failure
+/// path and the independent reap sweep (see both docs).
+fn next_loop_action(o: &IterationOutcome) -> LoopAction {
+    // RED stub (§3.10) — intentionally always Continue; restored in the
+    // immediately-following GREEN commit.
+    let _ = o;
+    LoopAction::Continue
 }
 
 /// Record a pre-turn failure (not-ready / inject error): the worker produced nothing,
@@ -532,6 +706,197 @@ impl TurnEndDetector {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ──────────────── #2524 P3b: next_loop_action (5 termination paths) ────────────────
+
+    fn outcome<'a>(
+        iteration: u32,
+        max_iterations: u32,
+        completion_promise: Option<&'a str>,
+        end_dump: &'a str,
+        grew: bool,
+        terminal_state: AgentState,
+        wall_ttl_hit: bool,
+    ) -> IterationOutcome<'a> {
+        IterationOutcome {
+            iteration,
+            max_iterations,
+            completion_promise,
+            end_dump,
+            grew,
+            terminal_state,
+            wall_ttl_hit,
+        }
+    }
+
+    /// (a) completion-promise: found anywhere in the dump → Stop(success=true),
+    /// even when iteration/growth would otherwise say "keep going".
+    #[test]
+    fn loop_action_a_completion_promise_match_stops_success() {
+        let o = outcome(
+            1,
+            25,
+            Some("RALPH-DONE"),
+            "some output\nRALPH-DONE\n",
+            true,
+            AgentState::Idle,
+            false,
+        );
+        assert_eq!(
+            next_loop_action(&o),
+            LoopAction::Stop {
+                success: true,
+                reason: "completion-promise matched"
+            }
+        );
+    }
+
+    /// (a) absent / not-yet-printed promise does not stop the loop by itself.
+    #[test]
+    fn loop_action_a_promise_not_found_continues() {
+        let o = outcome(
+            1,
+            25,
+            Some("RALPH-DONE"),
+            "still working on it\n",
+            true,
+            AgentState::Idle,
+            false,
+        );
+        assert_eq!(next_loop_action(&o), LoopAction::Continue);
+    }
+
+    /// (a) an empty promise string (caller misconfiguration) never matches — treated
+    /// as "no promise configured", not "always matches".
+    #[test]
+    fn loop_action_a_empty_promise_never_matches() {
+        let o = outcome(
+            1,
+            25,
+            Some(""),
+            "anything at all",
+            true,
+            AgentState::Idle,
+            false,
+        );
+        assert_eq!(next_loop_action(&o), LoopAction::Continue);
+    }
+
+    /// (b) max_iterations reached → Stop(success=false), checked BEFORE no-progress
+    /// so a healthy-but-capped loop reports the real reason, not "no progress".
+    #[test]
+    fn loop_action_b_max_iterations_reached_stops() {
+        let o = outcome(25, 25, None, "still going", true, AgentState::Idle, false);
+        assert_eq!(
+            next_loop_action(&o),
+            LoopAction::Stop {
+                success: false,
+                reason: "max_iterations reached"
+            }
+        );
+    }
+
+    #[test]
+    fn loop_action_b_below_max_iterations_does_not_stop_on_count_alone() {
+        let o = outcome(24, 25, None, "still going", true, AgentState::Idle, false);
+        assert_eq!(next_loop_action(&o), LoopAction::Continue);
+    }
+
+    /// (c) no growth this turn → Stop(success=false) — #2301's own "no progress →
+    /// stop, don't re-inject".
+    #[test]
+    fn loop_action_c_no_growth_stops() {
+        let o = outcome(1, 25, None, "", false, AgentState::Idle, false);
+        assert_eq!(
+            next_loop_action(&o),
+            LoopAction::Stop {
+                success: false,
+                reason: "no progress (transcript did not grow, or an error class latched)"
+            }
+        );
+    }
+
+    /// (c) an error-class terminal state stops the loop even if the transcript grew
+    /// before the error appeared.
+    #[test]
+    fn loop_action_c_error_class_stops_even_if_grew() {
+        let o = outcome(
+            1,
+            25,
+            None,
+            "partial output then a crash",
+            true,
+            AgentState::RateLimit,
+            false,
+        );
+        assert_eq!(
+            next_loop_action(&o),
+            LoopAction::Stop {
+                success: false,
+                reason: "no progress (transcript did not grow, or an error class latched)"
+            }
+        );
+    }
+
+    /// (d) wall-TTL hit on a turn that WAS still actively producing (grew=true,
+    /// non-error, non-idle) — falls through (a)/(b)/(c) and stops here.
+    #[test]
+    fn loop_action_d_wall_ttl_hit_stops_when_not_caught_earlier() {
+        let o = outcome(
+            2,
+            25,
+            None,
+            "mid-turn output",
+            true,
+            AgentState::Active,
+            true,
+        );
+        assert_eq!(
+            next_loop_action(&o),
+            LoopAction::Stop {
+                success: false,
+                reason: "wall-TTL elapsed"
+            }
+        );
+    }
+
+    /// Priority order pin: promise match wins even when max_iterations is ALSO
+    /// exhausted this same turn — (a) is checked before (b).
+    #[test]
+    fn loop_action_priority_promise_beats_max_iterations() {
+        let o = outcome(
+            25,
+            25,
+            Some("DONE"),
+            "finishing up\nDONE\n",
+            true,
+            AgentState::Idle,
+            false,
+        );
+        assert_eq!(
+            next_loop_action(&o),
+            LoopAction::Stop {
+                success: true,
+                reason: "completion-promise matched"
+            }
+        );
+    }
+
+    /// Healthy iteration (grew, non-error, under cap, no promise configured, no TTL
+    /// hit) → Continue, so the loop actually re-injects.
+    #[test]
+    fn loop_action_healthy_iteration_continues() {
+        let o = outcome(
+            3,
+            25,
+            None,
+            "reasonable progress",
+            true,
+            AgentState::Idle,
+            false,
+        );
+        assert_eq!(next_loop_action(&o), LoopAction::Continue);
+    }
 
     // ───────────────────────── oracle truth-table ──────────────────────────
 

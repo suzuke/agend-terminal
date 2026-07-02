@@ -320,6 +320,8 @@ pub(crate) fn def_ephemeral() -> Value {
             "token_budget": {"type": "number", "description": "spawn: per-worker token budget (recorded; enforcement lands in a later PR)."},
             "prompt": {"type": "string", "description": "spawn (PR3b): prompt for a one-shot driven turn. Present = launch the driver (opencode ONLY; other backends rejected — Slice-2). Absent = lifecycle-only spawn (no driver). Poll `ephemeral list` for result_summary/success."},
             "model": {"type": "string", "description": "spawn (PR3b): optional model override for the worker (provider-prefixed for opencode, e.g. opencode/deepseek-v4-flash-free). Default = the backend's configured model."},
+            "max_iterations": {"type": "number", "description": "spawn (#2524 P3b ralph-loop): opts into the driver's self-continuation loop — after a non-terminal turn, inject 'continue' and run another turn, up to this many total. Must be 1..=25 (daemon-side hard cap, no unlimited option) and requires a non-empty 'prompt'. Absent = the pre-P3b single-shot turn, byte-identical."},
+            "completion_promise": {"type": "string", "description": "spawn (#2524 P3b ralph-loop): optional completion signal — a literal string the driver looks for in each turn's transcript; its presence ends the loop as a success. Requires 'max_iterations' to also be set."},
             "worker_id": {"type": "string", "description": "reap: reap a single worker by id."},
             "all_stale": {"type": "boolean", "description": "reap: reap all due/dead workers (TTL-expired, terminal, or process gone)."}
         }, "required": ["action"]}})
@@ -969,6 +971,8 @@ mod tests {
             ("ephemeral", "ttl_secs", "mcp/handlers/ephemeral.rs handle_spawn → ephemeral_tracking::resolve_ttl (max-wall-TTL guard)"),
             ("ephemeral", "prompt", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.prompt → ephemeral_driver one-shot turn (PR3b)"),
             ("ephemeral", "model", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.model → Backend::push_model_arg spawn argv (PR3b)"),
+            ("ephemeral", "max_iterations", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.max_iterations → ephemeral_tracking::spawn_and_track validation + ephemeral_driver::DriverConfig.max_iterations loop opt-in (#2524 P3b)"),
+            ("ephemeral", "completion_promise", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.completion_promise → ephemeral_tracking::spawn_and_track validation + ephemeral_driver::next_loop_action promise match (#2524 P3b)"),
             ("ephemeral", "worker_id", "mcp/handlers/ephemeral.rs handle_reap → reap_one"),
             ("ephemeral", "all_stale", "mcp/handlers/ephemeral.rs handle_reap → reap_sweep"),
             // ── ci ──
