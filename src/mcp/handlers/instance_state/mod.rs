@@ -582,6 +582,139 @@ mod tests {
     }
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn tmp_home_for_creator_acl(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-creator-acl-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    /// Seed a `claimed` task assigned to `assignee` directly in the event log
+    /// — the in-flight condition the creator-ACL safety valve checks for.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn seed_claimed_task(home: &std::path::Path, assignee: &str) {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let tid = TaskId("t-creator-acl-1".into());
+        let emitter = InstanceName::from("test:creator_acl");
+        crate::task_events::append_batch(
+            home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "in-flight work".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: tid,
+                    by: InstanceName::from(assignee),
+                },
+            ],
+        )
+        .expect("seed claimed task");
+    }
+
+    /// #ACL-creator: a creator with NO in-flight work on its target may delete
+    /// it — the pain point being fixed is "creator had to build a team just to
+    /// gain orchestrator authority" for a clean, no-longer-needed spawn.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn delete_instance_allows_creator_with_no_inflight_work() {
+        let home = tmp_home_for_creator_acl("clean");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  victim:\n    created_by: creator\n",
+        )
+        .unwrap();
+
+        let creator = crate::identity::Sender::new("creator");
+        let resp =
+            handle_delete_instance(&home, &serde_json::json!({"instance": "victim"}), &creator);
+        assert_ne!(
+            resp.get("code").and_then(|v| v.as_str()),
+            Some("not_owner_or_orchestrator"),
+            "creator must not be denied as a non-owner: {resp}"
+        );
+        assert_eq!(resp["name"], "victim");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #ACL-creator safety valve: a claimed/in_progress task on the target
+    /// blocks the creator path unless `force=true` + a non-empty
+    /// `force_reason` is supplied — in-flight work must not be casually reaped.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn delete_instance_creator_requires_force_when_target_has_active_task() {
+        let home = tmp_home_for_creator_acl("active-task");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  victim:\n    created_by: creator\n",
+        )
+        .unwrap();
+        seed_claimed_task(&home, "victim");
+
+        let creator = crate::identity::Sender::new("creator");
+        let denied =
+            handle_delete_instance(&home, &serde_json::json!({"instance": "victim"}), &creator);
+        assert_eq!(
+            denied["code"], "creator_delete_requires_force",
+            "creator delete of an in-flight target without force must be denied: {denied}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #ACL-creator safety valve: `force=true` + `force_reason` lets the
+    /// creator override the in-flight guard (audit-logged at the call site).
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn delete_instance_creator_force_succeeds_when_target_has_active_task() {
+        let home = tmp_home_for_creator_acl("force");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  victim:\n    created_by: creator\n",
+        )
+        .unwrap();
+        seed_claimed_task(&home, "victim");
+
+        let creator = crate::identity::Sender::new("creator");
+        let resp = handle_delete_instance(
+            &home,
+            &serde_json::json!({
+                "instance": "victim",
+                "force": true,
+                "force_reason": "retiring my own spawn to change its model",
+            }),
+            &creator,
+        );
+        assert_ne!(
+            resp.get("code").and_then(|v| v.as_str()),
+            Some("creator_delete_requires_force"),
+            "force + force_reason must override the in-flight guard: {resp}"
+        );
+        assert_eq!(resp["name"], "victim");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn dirty_worktree(tag: &str) -> std::path::PathBuf {
         let wt = std::env::temp_dir().join(format!(
             "agend-2476-{tag}-{}-{}",

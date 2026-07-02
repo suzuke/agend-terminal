@@ -397,6 +397,12 @@ pub struct InstanceConfig {
     /// Unique instance ID (UUIDv4). Auto-assigned on first load if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Name of the identified caller that ran `create_instance` for this
+    /// entry (stamped at spawn time, survives restart). `None` for
+    /// anonymous/operator-direct creates or instances predating this field.
+    /// Drives the `delete_instance` creator-ACL path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
     /// Backend preset name — overrides defaults.backend.
     pub backend: Option<Backend>,
     pub command: Option<String>,
@@ -869,6 +875,9 @@ pub struct InstanceYamlEntry {
     pub topic_binding_mode: Option<String>,
     /// Custom skills path override.
     pub skills_path: Option<String>,
+    /// Mirror of [`InstanceConfig::created_by`] — the identified caller that
+    /// ran `create_instance`, written at spawn time.
+    pub created_by: Option<String>,
 }
 
 // Persistence, merge, and team mutation functions live in fleet::persist and fleet::merge.

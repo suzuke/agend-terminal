@@ -233,6 +233,11 @@ fn create_instance_entries(
                 command: yaml_str(inst_val, "command"),
                 worktree: inst_val.get("worktree").and_then(|v| v.as_bool()),
                 topic_binding_mode: None,
+                // Deployment-templated instances have no single ACL-relevant
+                // "creator" caller the way a direct `create_instance` does —
+                // left unset, same gradient-deployment pattern as the other
+                // daemon-auto-write fields above.
+                created_by: None,
             },
         ));
         created.push(inst_name);

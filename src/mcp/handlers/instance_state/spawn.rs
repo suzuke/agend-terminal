@@ -187,6 +187,10 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
             .and_then(|v| v.as_str())
             .filter(|s| matches!(*s, "skip" | "deferred"))
             .map(String::from),
+        // ACL: stamp the identified caller so `delete_instance` can later
+        // allow the creator to reclaim its own spawn. Anonymous/operator-
+        // direct creates (empty `instance_name`) leave this unset.
+        created_by: (!instance_name.is_empty()).then(|| instance_name.to_string()),
         ..Default::default()
     };
     if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
