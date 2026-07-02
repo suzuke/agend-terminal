@@ -261,6 +261,10 @@ pub struct StateTracker {
     /// [`StateTracker::published_observed_handle`]; written only by `publish_observed`.
     published_observed: Arc<AtomicU8>,
     pub(crate) since: Instant,
+    /// #2524 P3a PR-2: last caller-supplied `now_ms` [`expire_stale_latch_if_due`]
+    /// actually ran on — caller-clock-relative (e.g. the ephemeral driver's own
+    /// turn-elapsed-ms), not wall-clock; only needs to be monotonic per caller.
+    pub(crate) last_latch_check_ms: u64,
     pub last_output: Instant,
     /// F9 (#685 sub-task 4): `Some(t)` only when `infer_productivity()` returned
     /// a `Productive` signal (heartbeat refresh or structural marker match) at
@@ -976,6 +980,10 @@ impl StateTracker {
     /// stalls.
     const PENDING_TRANSITIONS_CAP: usize = 256;
     const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
+    /// #2524 P3a PR-2: throttle window for `expire_stale_latch_if_due` — cheap
+    /// enough for every 250ms driver poll, tight enough to clear a mis-latch within
+    /// `LATCHED_STATE_EXPIRY` + a fraction of a second.
+    const LATCH_EXPIRE_CHECK_MS: u64 = 1_000;
 
     /// #1005 Phase A2: minimum hold in the lower-priority state before
     /// a priority-up back into the previous active state is allowed.
@@ -1040,6 +1048,7 @@ impl StateTracker {
             // publishes a high-confidence correction.
             published_observed: Arc::new(AtomicU8::new(OBSERVED_NONE)),
             since: Instant::now(),
+            last_latch_check_ms: 0,
             last_output: Instant::now(),
             last_productive_output: None,
             created_at: Instant::now(),
@@ -2205,6 +2214,22 @@ impl StateTracker {
         if long_expiring && self.since.elapsed() >= Self::INTERACTIVE_EXPIRY {
             self.transition(AgentState::Idle);
         }
+    }
+
+    /// #2524 P3a PR-2: throttled entry point for a caller that polls `get_state()`
+    /// on a fixed cadence but never calls the general `tick()` — the ephemeral
+    /// driver (#1967 avoids `tick()`'s managed-bookkeeping cadence there; see
+    /// `ephemeral_driver.rs`'s module doc). Without SOME periodic caller,
+    /// [`maybe_expire_latched_state`] never runs, so a mis-latched screen state
+    /// (confirm-first finding: codex's ready screen mis-latching `Active` then going
+    /// fully static — no new pty bytes ⇒ no `detect()` re-eval) can never self-heal.
+    /// `now_ms` is the CALLER's own clock — only needs to be monotonic per caller.
+    pub(crate) fn expire_stale_latch_if_due(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_latch_check_ms) < Self::LATCH_EXPIRE_CHECK_MS {
+            return;
+        }
+        self.last_latch_check_ms = now_ms;
+        self.maybe_expire_latched_state();
     }
 
     /// Get current state.
