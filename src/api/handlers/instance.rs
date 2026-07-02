@@ -208,18 +208,19 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .unwrap_or_default();
     // #2038: fleet.yaml's per-instance `model` (and, for arg-less callers,
     // `args`) only applied at the daemon-boot spawn — the runtime respawn
-    // flows (restart_instance / replace_instance / start_instance, deploy
-    // Phase 3) issue SPAWN without them, so the written config silently
-    // didn't apply until the next full daemon restart. Same class as the
-    // #900 env fix: re-resolve from fleet.yaml at this handler boundary
-    // (single resolve, shared with the env fallback below).
+    // flows (restart_instance / start_instance, deploy Phase 3) issue SPAWN
+    // without them, so the written config silently didn't apply until the
+    // next full daemon restart. Same class as the #900 env fix: re-resolve
+    // from fleet.yaml at this handler boundary (single resolve, shared with
+    // the env fallback below).
     let fleet_resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
         .ok()
         .and_then(|f| f.resolve_instance(name));
-    // replace_instance sends no `args` key at all — fall back to the fleet
-    // entry's resolved args (boot parity). A present-but-empty `args` ("")
-    // means the caller already resolved them as empty (restart path), which
-    // matches what the fallback would yield.
+    // deploy Phase 3 sends no `args` key at all when the fleet template entry
+    // defines none — fall back to the fleet entry's resolved args (boot
+    // parity). A present-but-empty `args` ("") means the caller already
+    // resolved them as empty (restart path), which matches what the
+    // fallback would yield.
     if params["args"].as_str().is_none() {
         if let Some(r) = &fleet_resolved {
             args = r.args.clone();
@@ -1333,14 +1334,15 @@ mod tests {
     // ----- #2038: fleet.yaml model/args propagation through SPAWN RPC -----
     //
     // §3.9 path mapping: restart_instance sends `args` (fleet-resolved, no
-    // --model) and replace_instance sends NO `args` key at all — both flows
-    // are SPAWN RPCs into handle_spawn, so the two shapes below ARE the
-    // restart/replace argv assertions. The crash-respawn path does not go
-    // through SPAWN: `respawn_agent_worker` replays the boot-resolved
-    // `AgentConfig.args`, which already carry `--model` from
-    // `bootstrap::agent_resolve` — model is preserved there by construction
-    // (no harness-reachable seam to assert the spawned argv without a live
-    // daemon, hence this doc note per the #2038 task contract).
+    // --model) and deploy Phase 3 sends NO `args` key at all when the
+    // template entry defines none — both flows are SPAWN RPCs into
+    // handle_spawn, so the two shapes below ARE the restart/args-less argv
+    // assertions. The crash-respawn path does not go through SPAWN:
+    // `respawn_agent_worker` replays the boot-resolved `AgentConfig.args`,
+    // which already carry `--model` from `bootstrap::agent_resolve` — model
+    // is preserved there by construction (no harness-reachable seam to
+    // assert the spawned argv without a live daemon, hence this doc note
+    // per the #2038 task contract).
 
     /// Write a tiny shell script that captures its own argv (`$*`) to
     /// `sentinel_path` then sleeps so the agent stays alive long enough for
@@ -1400,10 +1402,11 @@ mod tests {
         );
     }
 
-    /// #2038 ingress 2 (replace_instance shape) — SPAWN params omit `args`
-    /// entirely; handle_spawn MUST fall back to the fleet entry's resolved
-    /// `args` AND append its `model`. Pre-fix replace respawned with empty
-    /// argv: both fleet args and model were dropped.
+    /// #2038 ingress 2 (deploy Phase 3 / args-less SPAWN shape) — SPAWN
+    /// params omit `args` entirely; handle_spawn MUST fall back to the
+    /// fleet entry's resolved `args` AND append its `model`. Pre-fix an
+    /// args-less respawn had empty argv: both fleet args and model were
+    /// dropped.
     #[cfg(unix)]
     #[test]
     fn handle_spawn_falls_back_to_fleet_yaml_args_and_model_2038() {
@@ -1424,7 +1427,7 @@ mod tests {
             &json!({
                 "name": "args-fleet-test",
                 "backend": "/bin/sh",
-                // No "args" field at all — the replace_instance wire shape.
+                // No "args" field at all — the deploy Phase 3 (args-less SPAWN) wire shape.
             }),
             &ctx,
         );
@@ -1439,7 +1442,7 @@ mod tests {
         assert_eq!(
             actual.as_deref(),
             Some("--model model-2038-replace"),
-            "an args-less SPAWN (replace_instance shape) MUST respawn with the \
+            "an args-less SPAWN (deploy Phase 3 shape) MUST respawn with the \
              fleet entry's args + model"
         );
     }
