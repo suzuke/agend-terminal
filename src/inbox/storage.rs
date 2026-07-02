@@ -1107,10 +1107,45 @@ pub fn clear_compact(
 ///
 /// Only an EXPLICIT ledger hit for the watch's CURRENT head returns `true`.
 fn is_discharged_ci_fail(home: &Path, msg: &InboxMessage) -> bool {
-    // RED stub (§3.10) — intentionally always false (byte-identical to pre-#2537,
-    // the safest possible stub); restored in the immediately-following GREEN commit.
-    let _ = (home, msg);
-    false
+    if msg.kind.as_deref() != Some("ci-watch") {
+        return false;
+    }
+    let Some(job) = extract_ci_fail_job(&msg.text) else {
+        return false;
+    };
+    let Some((repo, branch)) = msg
+        .correlation_id
+        .as_deref()
+        .and_then(|c| c.split_once('@'))
+    else {
+        return false;
+    };
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(home)
+        .join(crate::daemon::ci_watch::watch_filename(repo, branch));
+    let Some(head_sha) = std::fs::read_to_string(&watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<crate::daemon::ci_watch::WatchState>(&c).ok())
+        .and_then(|w| w.head_sha)
+    else {
+        return false;
+    };
+    let Some(entry) = crate::daemon::discharge_ledger::lookup_discharge(home, &head_sha, &job)
+    else {
+        return false;
+    };
+    // Audit trail (dispatching task's explicit ask): every absorption is logged,
+    // even if the SAME row is re-evaluated on a later tick/sweep — the audit log
+    // is append-only history, not a dedup ledger (the discharge ledger already is).
+    crate::event_log::log(
+        home,
+        "discharge_absorbed",
+        &msg.from,
+        &format!(
+            "head={head_sha} job={job} discharged_by={} discharged_at={}",
+            entry.discharged_by, entry.discharged_at
+        ),
+    );
+    true
 }
 
 /// Pull the job name out of a ci-fail body's `Detail: <job>` line — the daemon's
