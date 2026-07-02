@@ -394,7 +394,8 @@ pub(crate) fn def_repo() -> Value {
             "apply": {"type": "boolean", "description": "#817 cleanup_merged_branches: when false (default), returns dry-run plan; when true, deletes confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
             "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
-            "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."}
+            "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
+            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."}
         }, "required": ["action"]}})
 }
 
@@ -404,7 +405,8 @@ pub(crate) fn def_bind_self() -> Value {
             "repository_path": {"type": "string", "description": "Local filesystem path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repository` (handler rejects both via `ambiguous_args` code)."},
             "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `repository_path`."},
             "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"},
-            "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1 PR-1: atomic recover-and-bind. When true, releases self's stale on-disk worktree dir + binding state before lease — closes the lease_failed recovery path without an explicit release_worktree call. Cross-agent isolation preserved (rejects branches leased by another agent)."}
+            "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1 PR-1: atomic recover-and-bind. When true, releases self's stale on-disk worktree dir + binding state before lease — closes the lease_failed recovery path without an explicit release_worktree call. Cross-agent isolation preserved (rejects branches leased by another agent)."},
+            "task_id": {"type": "string", "description": "#2533: optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."}
         }, "required": ["branch"]}})
 }
 
@@ -995,11 +997,13 @@ mod tests {
             ("repo", "confirm_ids", "ci/mod.rs cleanup_merged subset"),
             ("repo", "audit_reason", "ci/mod.rs cleanup_merged audit"),
             ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
+            ("repo", "task_id", "ci/checkout.rs checkout bind:true → binding::bind_full task_id linkage (#2533)"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
             ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
             ("bind_self", "branch", "mcp/handlers/worktree.rs validated bind branch"),
             ("bind_self", "rebase_mode", "mcp/handlers/worktree.rs recover-and-bind gate"),
+            ("bind_self", "task_id", "mcp/handlers/worktree.rs → binding::bind_full task_id linkage (#2533)"),
             // ── release_worktree / force_release_worktree ──
             ("release_worktree", "instance", "mcp/handlers/worktree.rs release target"),
             ("release_worktree", "dry_run", "mcp/handlers/worktree.rs preview gate (#1933 declared)"),

@@ -271,9 +271,11 @@ pub fn bind_full(
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
     // #2158 GR1: true ⟺ an AGENT SELF-CLAIM (`bind_self` / `repo checkout bind:true`),
-    // which surfaces to the operator. Dispatch / internal binds pass false. Keyed on
-    // the caller's EXPLICIT intent, NOT on task_id — a single-target auto-create
-    // `send kind=task` legitimately binds with task_id="" and must NOT false-notify.
+    // which surfaces to the operator UNLESS `task_id` is non-empty (#2533: a
+    // task_id-carrying self-claim is attributable to a task, so it's in-dispatch).
+    // Dispatch / internal binds pass `is_self_claim=false` and are NEVER gated on
+    // task_id here — a single-target auto-create `send kind=task` legitimately
+    // binds with task_id="" and must NOT false-notify.
     is_self_claim: bool,
 ) -> Result<(), String> {
     // #1888 phase-2: the agent claiming a branch is acting on any pending
@@ -426,9 +428,12 @@ pub fn bind_full(
     // guard-b cannot prevent (identity-indistinguishable). NOT gated on `changed`: the
     // dispatch flow double-binds (lease then re-bind), so a self-claim's intent-bind is
     // frequently a no-op (changed=false); the per-(agent,branch) sidecar in the helper
-    // gives fire-once. Keyed on the caller's explicit `is_self_claim`, NOT task_id — a
-    // single-target auto-create dispatch legitimately binds with task_id="".
-    if is_self_claim {
+    // gives fire-once. #2533: ALSO gated on an empty `task_id` — a self-claim that
+    // carries a task_id (e.g. `bind_self(task_id=...)` / `repo checkout bind:true
+    // task_id=...`) is attributable to a task and is treated as in-dispatch, so it
+    // does not warn. A single-target auto-create DISPATCH (is_self_claim=false)
+    // never reaches this branch regardless of task_id (see the param doc above).
+    if is_self_claim && task_id.is_empty() {
         notify_operator_out_of_dispatch_bind(home, agent, branch, &wt_str, prev_branch.as_deref());
     }
     Ok(())
@@ -524,7 +529,7 @@ fn out_of_dispatch_notify_body(agent: &str, branch: &str, prev_branch: Option<&s
         .map(|p| format!(", was `{p}`"))
         .unwrap_or_default();
     format!(
-        "[system:binding_out_of_dispatch] instance `{agent}` bound to branch `{branch}`{was} \
+        "instance `{agent}` bound to branch `{branch}`{was} \
          OUTSIDE a task dispatch (no task_id). If unexpected, a transient sub-agent or a \
          self-claim may have moved this instance's worktree. The daemon CANNOT name the exact \
          caller — a Task sub-agent shares the primary's identity and process. Inspect with \
