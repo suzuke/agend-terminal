@@ -56,6 +56,8 @@ pub(crate) fn def_send() -> Value {
             "force_reason": {"type": "string"},
             "second_reviewer": {"type": "boolean", "description": "Signal dual review (§3.5)"},
             "second_reviewer_reason": {"type": "string"},
+            "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: number of distinct non-assignee acks a plan (set via `task action=metadata_set metadata_key=plan`) needs before the task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior. Only meaningful when this send auto-creates a task (empty task_id) — forwarded into that task's create; ignored when task_id references an existing task."},
+            "plan_ack_reason": {"type": "string", "description": "Required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
             "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
             "artifacts": {"type": "string"},
             "branch": {"type": "string"},
@@ -214,9 +216,9 @@ pub(crate) fn def_decision() -> Value {
 }
 
 pub(crate) fn def_task() -> Value {
-    json!({"name": "task", "description": "Manage task board. Actions: create, list, get, claim, done, update, sweep, health, activity, metadata_set, metadata_get. #2475: `get` returns ONE task's FULL record by `id` (companion to the terse-by-default `list`); `list` accepts `fields:\"minimal\"` to project rows down to id/title/status/assignee/priority. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array.",
+    json!({"name": "task", "description": "Manage task board. Actions: create, list, get, claim, done, update, sweep, health, activity, metadata_set, metadata_get, ack_plan. #2475: `get` returns ONE task's FULL record by `id` (companion to the terse-by-default `list`); `list` accepts `fields:\"minimal\"` to project rows down to id/title/status/assignee/priority. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array. #2249: `ack_plan` records a non-assignee's ack of the task's `plan` metadata (idempotent); required before `in_progress` when the task was created with `plan_ack_required > 0`.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "get", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get"]},
+            "action": {"type": "string", "enum": ["create", "list", "get", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get", "ack_plan"]},
             "title": {"type": "string"}, "description": {"type": "string"},
             "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
             "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string", "description": "Parent task ID for subtask composition (A is composed of B,C,D). Complementary to depends_on (execution order)."},
@@ -240,7 +242,9 @@ pub(crate) fn def_task() -> Value {
             "bind": {"type": "boolean", "description": "#1933: create only — opt OUT of the daemon's auto-bind-on-dispatch (default true). Set false to leave the assignee unbound. Consumed in tasks/handler.rs (TaskEvent::Created.bind)."},
             "eta_secs": {"type": "integer", "description": "#1933: create only — task stall-watchdog ETA in seconds; the daemon flags the task as stalled once this budget elapses. Consumed in tasks/handler.rs (TaskEvent::Created.eta_secs)."},
             "project": {"type": "string", "description": "#2117 P1: target project board. create: route the task to this project (default: the caller's current project, derived from its team's source_repo). list: show this project, or `all` to aggregate every board."},
-            "scope": {"type": "string", "enum": ["fleet"], "description": "#2117 P1: list scope. `fleet` aggregates tasks across ALL project boards (each task tagged with its project id). Equivalent to `project=all`."}
+            "scope": {"type": "string", "enum": ["fleet"], "description": "#2117 P1: list scope. `fleet` aggregates tasks across ALL project boards (each task tagged with its project id). Equivalent to `project=all`."},
+            "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: create only — number of distinct non-assignee `ack_plan` calls needed before this task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior."},
+            "plan_ack_reason": {"type": "string", "description": "#2249: create only — required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."}
         }, "required": ["action"]}})
 }
 
@@ -868,6 +872,8 @@ mod tests {
             ("send", "terminal", "messaging.rs msg.terminal → auto_close_on_report"),
             ("send", "no_report_expected", "comms.rs track step → DispatchEntry status=no_report_expected (skips sweep_stuck/sweep_orphans) + messaging.rs track_dispatch skips the dispatch_idle sidecar record"),
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
+            ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
+            ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
             ("task", "title", "tasks/handler.rs handle_create"),
@@ -905,6 +911,8 @@ mod tests {
             ("task", "eta_secs", "tasks/handler.rs create → TaskEvent::Created.eta_secs (#1933 declared)"),
             ("task", "project", "tasks/handler.rs create board route (:136) + list project select (:221) (#2117 P1)"),
             ("task", "scope", "tasks/handler.rs list fleet_scope aggregate (:208) (#2117 P1)"),
+            ("task", "plan_ack_required", "tasks/handler.rs handle_create validation + metadata seed; handle_update in_progress gate chokepoint (#2249)"),
+            ("task", "plan_ack_reason", "tasks/handler.rs handle_create validation + metadata seed (#2249)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),

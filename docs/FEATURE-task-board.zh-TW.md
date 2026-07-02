@@ -89,6 +89,7 @@
 - `TaskEvent::Verified` 會更新狀態但不 close。
 - `TaskEvent::Linked` 會追加 PR link。
 - `TaskEvent::TaskCloseProposed` 是審核提案事件。
+- 有些功能不新增 event variant,而是沿用既有 metadata 機制——例如 plan-ack gate(§10)用 `MetadataSet` 存 `plan_ack_required`/`plan_ack_reason`/`plan_acks`。
 
 ## 4. 狀態語意
 
@@ -212,8 +213,34 @@
 - 多個變更可合併在同一次 append_batch。
 - 這讓一個 update 呼叫可以原子落盤。
 - update 的 ACL 跟 done 一樣看 owner/orchestrator。
+- 若任務建立時帶 `plan_ack_required > 0`,`status: in_progress` 還會額外過 plan-ack gate(§10)。
 
-## 10. `task action=sweep`
+## 10. Plan-Ack Gate（`#2249`）
+
+- 這是選擇性（opt-in）的事前對齊 gate。
+- 目的是讓 plan 被外部確認過,才能開始執行。
+- `task action=create`(以及 `send(kind=task)` 的 auto-create 路徑)新增 `plan_ack_required` 參數。
+- 預設值是 `0`,代表關閉。
+- 若 `plan_ack_required > 0`,必須同時提供非空的 `plan_ack_reason`。
+- 驗證方式比照 `second_reviewer_reason`。
+- 這個功能沒有新增 `TaskEvent` variant。
+- `plan_ack_required`/`plan_ack_reason` 是在 `Created` 之後,透過兩個 `MetadataSet` 事件寫入 `Task.metadata`。
+- assignee 透過既有的 `task action=metadata_set metadata_key=plan` 分享 plan。
+- 新增 `task action=ack_plan`,需要 `id`。
+- ack_plan 會冪等地把呼叫者加進 `metadata.plan_acks`。
+- assignee 不能 ack 自己的 plan,會回傳 `code: self_ack_forbidden`。
+- plan 還沒設定就 ack,會回傳 `code: plan_not_set`。
+- 同一個呼叫者重複 ack 不會重複計數,回傳 `already_acked: true`。
+- gate 本身只在單一個 chokepoint 生效:`task action=update status=in_progress`。
+- 若 `plan_ack_required > 0` 且已 ack 數量低於門檻,transition 會被拒絕。
+- 拒絕時回傳 `{code: "plan_ack_pending", required, acked}`。
+- 任務狀態不會前進。
+- `plan_ack_required` 為 `0`(預設/未設定)時,完全不會檢查。
+- 這與 #2249 之前的行為位元組相同(byte-identical)。
+- 不在此次範圍內:daemon 依 priority/tag 自動觸發、decision board 整合、protocol 條文修改。
+- 這些留給日後其他機制在這個 primitive 上疊加。
+
+## 11. `task action=sweep`
 
 - sweep 是操作板清理工具。
 - 它不是自動常駐的強制行為。
@@ -229,7 +256,7 @@
 - sweep 會把結果寫進 event_log。
 - 這讓 operator 可以先看 plan 再決定。
 
-## 11. `task action=health`
+## 12. `task action=health`
 
 - health 是一張板的快照。
 - 它不是變更。
@@ -248,7 +275,7 @@
 - health 對 board hygiene 很重要。
 - 它也讓 operator 先看到風險再 sweep。
 
-## 12. 事件記錄與遷移
+## 13. 事件記錄與遷移
 
 - canonical log 是 `task_events.jsonl`。
 - append 會先拿 lock 再寫。
@@ -266,7 +293,7 @@
 - board 的讀面已不依賴舊檔。
 - board 的寫面也不應回去改舊檔。
 
-## 13. ACL 與權限
+## 14. ACL 與權限
 
 - 未指派 task 可由任何人 mutating。
 - owner 可以改自己的 task。
@@ -282,7 +309,7 @@
 - 但 canonical truth 還是 event log。
 - 衝突最後會由 replay 後序事件決定。
 
-## 14. 與其他子系統的關係
+## 15. 與其他子系統的關係
 
 - `team` 模組會影響 assignee 解析。
 - `worktree` / `binding` 會影響 done 後清理。
@@ -295,7 +322,7 @@
 - `release_worktree` 不會直接改 task board。
 - 但 release 後常會清理與 task 相關的檔案狀態。
 
-## 15. 操作範例
+## 16. 操作範例
 
 - 建立任務時先填 `title`。
 - 如果是追蹤性工作，填 `branch`。
@@ -312,7 +339,7 @@
 - 如果 reviewer 要接棒，通常看 `branch` 與 `task_id`。
 - 如果要回報結果，done 事件比純文字更可追溯。
 
-## 16. 實作檢查點
+## 17. 實作檢查點
 
 - 任何新事件 variant 都要更新 replay fold。
 - 任何新狀態都要更新 list/health 投影。
@@ -327,11 +354,11 @@
 - 若要新增 sweep 類規則，先檢查 health 是否也要反映。
 - 若要改 legacy `tasks.json`，要確認它是否仍是 bridge。
 
-## 17. 總結
+## 18. 總結
 
 - Task board 是 fleet 的共享工作協議。
 - 它的語意靠事件維持，而不是靠單一 mutable 檔案。
-- `task create/list/claim/done/update/sweep/health` 是主要使用面。
+- `task create/list/claim/done/update/sweep/health` 是主要使用面,另外還有選擇性的 `ack_plan` 事前對齊 gate（§10）。
 - 預設清單是 actionable。
 - 依賴是 view 層自動計算。
 - ACL 是 owner / orchestrator / system identity。

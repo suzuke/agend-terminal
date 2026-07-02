@@ -52,6 +52,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "activity" => handle_activity(home, args),
         "metadata_set" => handle_metadata_set(home, instance_name, emitter, args),
         "metadata_get" => handle_metadata_get(home, args),
+        "ack_plan" => handle_ack_plan(home, instance_name, emitter, args),
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
     }
 }
@@ -71,6 +72,19 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         Some(t) => t,
         None => return serde_json::json!({"error": "missing 'title'"}),
     };
+    // #2249 pre-work alignment gate: validation mirrors second_reviewer_reason
+    // (comms_gates/dispatch.rs:104-109) — N>0 requires a non-empty reason.
+    // 0 (default/absent) leaves plan_ack_required unset, so the in_progress
+    // gate never fires — byte-identical to pre-#2249 behavior.
+    let plan_ack_required = args["plan_ack_required"].as_u64().unwrap_or(0);
+    if plan_ack_required > 0 {
+        let reason = args["plan_ack_reason"].as_str().unwrap_or("");
+        if reason.is_empty() {
+            return serde_json::json!({
+                "error": "plan_ack_required > 0 requires non-empty 'plan_ack_reason'"
+            });
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static ID_SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
@@ -173,6 +187,37 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
             let _ = super::board_router::record_task_project(home, &id, &project);
+            // #2249: seed the plan-ack gate's metadata right after Created.
+            // No new event variant — composes onto the existing MetadataSet
+            // event/action, matching #2249's "reuse existing mechanisms"
+            // design. Absent when plan_ack_required == 0 (the common case),
+            // so `handle_update`'s gate check (which reads this same key)
+            // never fires — byte-identical to pre-#2249 for every task that
+            // doesn't opt in.
+            if plan_ack_required > 0 {
+                let reason = args["plan_ack_reason"].as_str().unwrap_or("");
+                let task_id_typed = crate::task_events::TaskId(id.clone());
+                let _ = crate::task_events::append_at(
+                    &board,
+                    &emitter,
+                    crate::task_events::TaskEvent::MetadataSet {
+                        task_id: task_id_typed.clone(),
+                        by: emitter.clone(),
+                        key: "plan_ack_required".to_string(),
+                        value: serde_json::json!(plan_ack_required),
+                    },
+                );
+                let _ = crate::task_events::append_at(
+                    &board,
+                    &emitter,
+                    crate::task_events::TaskEvent::MetadataSet {
+                        task_id: task_id_typed,
+                        by: emitter.clone(),
+                        key: "plan_ack_reason".to_string(),
+                        value: serde_json::json!(reason),
+                    },
+                );
+            }
             let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             // #1496 Option 1: `task(action:create)` is a PURE board record
             // with ZERO dispatch side-effects — no inbox enqueue, no
@@ -798,8 +843,7 @@ fn update_batch_precondition(
     ) && fresh.owner != *stale_owner
     {
         return Err(format!(
-            "task '{upd_id}' owner changed since read; event attribution \
-             would be stale (retry)"
+            "task '{upd_id}' owner changed since read; event attribution would be stale (retry)"
         ));
     }
     Ok(())
@@ -908,6 +952,37 @@ fn handle_update(
                     ),
                     "code": "illegal_transition",
                 });
+            }
+        }
+        // #2249 pre-work alignment gate: the ONE live chokepoint for the
+        // claimed→in_progress transition (verified during the #2524 P2a
+        // spike — every other TaskEvent::InProgress emission site is
+        // test-only or the one-time legacy-migration replay). Absent/0
+        // `plan_ack_required` (the default) skips this entirely —
+        // byte-identical to pre-#2249 for every task that doesn't opt in.
+        if s.as_str() == "in_progress" {
+            let required = record
+                .metadata
+                .get("plan_ack_required")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if required > 0 {
+                let acked = record
+                    .metadata
+                    .get("plan_acks")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                if acked < required {
+                    return serde_json::json!({
+                        "error": format!(
+                            "plan-ack pending: {acked}/{required} acks (task {id})"
+                        ),
+                        "code": "plan_ack_pending",
+                        "required": required,
+                        "acked": acked,
+                    });
+                }
             }
         }
         let event_for_transition: Option<crate::task_events::TaskEvent> =
@@ -1321,6 +1396,76 @@ fn handle_metadata_set(
     }
 }
 
+/// #2249 pre-work alignment gate: idempotently record `instance_name`'s ack of
+/// the task's `plan` metadata. The assignee may never ack their own plan (the
+/// whole point is an outside check); plan_ack_required's threshold is read
+/// separately by `handle_update`'s `(_, "in_progress")` gate — this action
+/// only maintains the ack list, it never blocks a transition itself.
+fn handle_ack_plan(
+    home: &Path,
+    instance_name: &str,
+    emitter: crate::task_events::InstanceName,
+    args: &Value,
+) -> Value {
+    let id = match id_arg(args) {
+        Some(i) => i,
+        None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
+    };
+    let board = super::board_router::board_for_task(home, id);
+    let record = match read_task_record_at(&board, id) {
+        Some(r) => r,
+        None => return serde_json::json!({"error": format!("task not found: {id}")}),
+    };
+    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+        return deny;
+    }
+    if record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name) {
+        return serde_json::json!({
+            "error": "the task's assignee cannot ack their own plan",
+            "code": "self_ack_forbidden",
+        });
+    }
+    if !record.metadata.contains_key("plan") {
+        return serde_json::json!({
+            "error": format!(
+                "task '{id}' has no plan set yet — set one via \
+                 task action=metadata_set metadata_key=plan first"
+            ),
+            "code": "plan_not_set",
+        });
+    }
+    let mut acks: Vec<String> = record
+        .metadata
+        .get("plan_acks")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if acks.iter().any(|a| a == instance_name) {
+        // Idempotent: already acked by this caller — no-op success, no new event.
+        return serde_json::json!({
+            "id": id, "event": "ack_plan", "acked": acks.len(), "already_acked": true,
+        });
+    }
+    acks.push(instance_name.to_string());
+    let acked_count = acks.len();
+    let event = crate::task_events::TaskEvent::MetadataSet {
+        task_id: crate::task_events::TaskId(id.to_string()),
+        by: emitter.clone(),
+        key: "plan_acks".to_string(),
+        value: serde_json::json!(acks),
+    };
+    match crate::task_events::append_at(&board, &emitter, event) {
+        Ok(_) => serde_json::json!({
+            "id": id, "event": "ack_plan", "acked": acked_count, "already_acked": false,
+        }),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    }
+}
+
 fn handle_metadata_get(home: &Path, args: &Value) -> Value {
     let id = match id_arg(args) {
         Some(i) => i,
@@ -1550,779 +1695,7 @@ pub fn register_subscriber() {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    fn tmp_home(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-metadata-test-{}-{}-{}",
-            std::process::id(),
-            name,
-            id
-        ));
-        std::fs::create_dir_all(&dir).ok();
-        dir
-    }
-
-    fn create_task(home: &std::path::Path, task_id: &str) {
-        let args = serde_json::json!({
-            "action": "create",
-            "title": "test task",
-        });
-        let emitter = crate::task_events::InstanceName::from("test:operator");
-        let tid = crate::task_events::TaskId(task_id.into());
-        crate::task_events::append(
-            home,
-            &emitter,
-            crate::task_events::TaskEvent::Created {
-                task_id: tid,
-                title: "test task".into(),
-                description: String::new(),
-                priority: "normal".into(),
-                owner: Some(crate::task_events::InstanceName::from("dev-agent")),
-                due_at: None,
-                depends_on: Vec::new(),
-                routed_to: None,
-                branch: None,
-                bind: None,
-                eta_secs: None,
-                tags: vec![],
-                parent_id: None,
-            },
-        )
-        .expect("create task");
-        let _ = args;
-    }
-
-    /// Simulate a concurrent reassignment landing between handle_update's
-    /// out-of-lock read and its in-lock append.
-    fn reassign(home: &std::path::Path, task_id: &str, new_owner: &str) {
-        crate::task_events::append(
-            home,
-            &crate::task_events::InstanceName::from("lead"),
-            crate::task_events::TaskEvent::OwnerAssigned {
-                task_id: crate::task_events::TaskId(task_id.into()),
-                by: crate::task_events::InstanceName::from("lead"),
-                owner: Some(crate::task_events::InstanceName::from(new_owner)),
-                routed_to: None,
-            },
-        )
-        .expect("reassign");
-    }
-
-    /// CR-2026-06-14 (:231) ②, the core gap — a NON-status update (target=None)
-    /// by an unauthorized caller. Pre-fix the in-lock closure did nothing when
-    /// target_status was None, so the write slipped past the in-lock gate (RED).
-    #[test]
-    fn inlock_precond_rejects_unauthorized_nonstatus_update_231() {
-        let home = tmp_home("231-nonstatus-acl");
-        create_task(&home, "t-231-a"); // owner = dev-agent
-        let state = crate::task_events::replay(&home).unwrap();
-        let res = update_batch_precondition(
-            &state,
-            &home,
-            "intruder",
-            "t-231-a",
-            false,
-            None,
-            &Some(crate::task_events::InstanceName::from("dev-agent")),
-        );
-        assert!(
-            res.is_err(),
-            "unauthorized non-status update must be rejected in-lock"
-        );
-        assert!(res.unwrap_err().contains("no longer authorized"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// CR-2026-06-14 (:231) ① — a status update whose caller WAS authorized at
-    /// the out-of-lock read (stale_owner == caller), but the owner drifted to
-    /// someone else before the in-lock commit. The in-lock ACL must reject.
-    #[test]
-    fn inlock_precond_rejects_status_update_after_owner_reassign_231() {
-        let home = tmp_home("231-reassign");
-        create_task(&home, "t-231-b"); // owner = dev-agent
-        reassign(&home, "t-231-b", "other-owner");
-        let state = crate::task_events::replay(&home).unwrap();
-        let res = update_batch_precondition(
-            &state,
-            &home,
-            "dev-agent",
-            "t-231-b",
-            false,
-            Some(crate::task_events::TaskStatus::InProgress),
-            &Some(crate::task_events::InstanceName::from("dev-agent")),
-        );
-        assert!(
-            res.is_err(),
-            "status update after owner drift must be rejected"
-        );
-        assert!(res.unwrap_err().contains("no longer authorized"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// CR-2026-06-14 (:231) ③ — the done-arm `by` drift. A system identity
-    /// (ACL-bypassed, so the ACL gate alone wouldn't catch this) marks the task
-    /// Done; the Done event's `by` was baked from the stale owner (dev-agent),
-    /// but the task is now owned by new-owner → committing would mis-attribute.
-    #[test]
-    fn inlock_precond_rejects_done_when_by_owner_drifted_231() {
-        let home = tmp_home("231-by-drift");
-        create_task(&home, "t-231-c"); // owner = dev-agent
-        reassign(&home, "t-231-c", "new-owner");
-        let state = crate::task_events::replay(&home).unwrap();
-        let res = update_batch_precondition(
-            &state,
-            &home,
-            "system:task_sweep", // ACL bypassed → only the drift check can reject
-            "t-231-c",
-            false,
-            Some(crate::task_events::TaskStatus::Done),
-            &Some(crate::task_events::InstanceName::from("dev-agent")),
-        );
-        assert!(
-            res.is_err(),
-            "done with drifted by-owner must be rejected fail-closed"
-        );
-        assert!(res.unwrap_err().contains("attribution would be stale"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// CR-2026-06-14 (:231) control — a legitimate authorized update with no
-    /// drift MUST pass (guards against over-rejection from the new in-lock gate).
-    #[test]
-    fn inlock_precond_allows_legitimate_authorized_update_231() {
-        let home = tmp_home("231-control");
-        create_task(&home, "t-231-d"); // owner = dev-agent
-        let state = crate::task_events::replay(&home).unwrap();
-        let res = update_batch_precondition(
-            &state,
-            &home,
-            "dev-agent",
-            "t-231-d",
-            false,
-            Some(crate::task_events::TaskStatus::InProgress),
-            &Some(crate::task_events::InstanceName::from("dev-agent")),
-        );
-        assert!(
-            res.is_ok(),
-            "legitimate authorized non-drift update must pass: {res:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// §3.9 #1916 WIRING (real entry point, not just the helper): a `task update`
-    /// that changes the assignee must retarget the dispatch-idle sidecar to the new
-    /// owner — proving `handle_update` actually calls the reassign hook (an
-    /// injected-input helper test alone wouldn't prove the wiring reaches it).
-    #[test]
-    fn task_reassign_retargets_dispatch_sidecar_through_handle_1916() {
-        let home = tmp_home("1916-wiring");
-        create_task(&home, "t-wire-001"); // owner = dev-agent
-                                          // A dispatch-idle sidecar tracks the task, targeting the original owner.
-        crate::daemon::dispatch_idle::record_dispatch(
-            &home,
-            "lead",
-            "dev-agent",
-            Some("t-wire-001"),
-            "task",
-            600,
-        )
-        .expect("dispatch recorded");
-
-        // REAL entry point: the owner reassigns the task to a new owner.
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "update",
-                "id": "t-wire-001",
-                "assignee": "new-owner",
-            }),
-        );
-        assert!(
-            result.get("error").is_none(),
-            "#1916: reassign update should succeed, got {result}"
-        );
-
-        let pending = crate::daemon::dispatch_idle::list_pending(&home);
-        let s = pending
-            .iter()
-            .find(|p| p.correlation_id.as_deref() == Some("t-wire-001"))
-            .expect("#1916: sidecar must survive the reassign");
-        assert_eq!(
-            s.target, "new-owner",
-            "#1916 WIRING: `task update(assignee)` must retarget the dispatch-idle sidecar \
-             via handle_update's hook — else the watchdog keeps nudging the former owner"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn metadata_set_writes_and_reads() {
-        let home = tmp_home("set_read");
-        create_task(&home, "t-meta-001");
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-001",
-                "metadata_key": "pr_url",
-                "metadata_value": "https://github.com/test/repo/pull/42"
-            }),
-        );
-        assert_eq!(result["event"], "metadata_set");
-        assert!(result["error"].is_null(), "unexpected error: {result}");
-
-        let get_result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_get",
-                "id": "t-meta-001",
-            }),
-        );
-        assert_eq!(
-            get_result["metadata"]["pr_url"],
-            "https://github.com/test/repo/pull/42"
-        );
-    }
-
-    #[test]
-    fn metadata_set_overwrites_existing_key() {
-        let home = tmp_home("overwrite");
-        create_task(&home, "t-meta-002");
-
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-002",
-                "metadata_key": "commit_sha",
-                "metadata_value": "abc123"
-            }),
-        );
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-002",
-                "metadata_key": "commit_sha",
-                "metadata_value": "def456"
-            }),
-        );
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_get",
-                "id": "t-meta-002",
-            }),
-        );
-        assert_eq!(result["metadata"]["commit_sha"], "def456");
-    }
-
-    #[test]
-    fn metadata_supports_non_string_values() {
-        let home = tmp_home("non_string");
-        create_task(&home, "t-meta-003");
-
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-003",
-                "metadata_key": "retry_count",
-                "metadata_value": 3
-            }),
-        );
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_get",
-                "id": "t-meta-003",
-            }),
-        );
-        assert_eq!(result["metadata"]["retry_count"], 3);
-    }
-
-    #[test]
-    fn metadata_get_empty_on_new_task() {
-        let home = tmp_home("empty_meta");
-        create_task(&home, "t-meta-004");
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_get",
-                "id": "t-meta-004",
-            }),
-        );
-        assert!(result["error"].is_null());
-        assert_eq!(result["metadata"], serde_json::json!({}));
-    }
-
-    #[test]
-    fn metadata_set_missing_key_returns_error() {
-        let home = tmp_home("missing_key");
-        create_task(&home, "t-meta-005");
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-005",
-                "metadata_value": "some_value"
-            }),
-        );
-        assert!(result["error"].as_str().unwrap().contains("metadata_key"));
-    }
-
-    #[test]
-    fn metadata_set_missing_value_returns_error() {
-        let home = tmp_home("missing_val");
-        create_task(&home, "t-meta-006");
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-006",
-                "metadata_key": "some_key"
-            }),
-        );
-        assert!(result["error"].as_str().unwrap().contains("metadata_value"));
-    }
-
-    #[test]
-    fn metadata_appears_in_list() {
-        let home = tmp_home("list_meta");
-        create_task(&home, "t-meta-007");
-
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_set",
-                "id": "t-meta-007",
-                "metadata_key": "pr_url",
-                "metadata_value": "https://example.com/pr/1"
-            }),
-        );
-
-        let list = handle(&home, "dev-agent", &serde_json::json!({"action": "list"}));
-        let tasks = list["tasks"].as_array().unwrap();
-        let task = tasks.iter().find(|t| t["id"] == "t-meta-007").unwrap();
-        assert_eq!(task["metadata"]["pr_url"], "https://example.com/pr/1");
-    }
-
-    #[test]
-    fn metadata_get_nonexistent_task_returns_error() {
-        let home = tmp_home("nonexistent");
-
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "metadata_get",
-                "id": "t-meta-999",
-            }),
-        );
-        assert!(result["error"].as_str().unwrap().contains("not found"));
-    }
-
-    fn drain_inbox(home: &std::path::Path, agent: &str) -> Vec<crate::inbox::InboxMessage> {
-        crate::inbox::storage::drain(home, agent)
-    }
-
-    // #1496 Option 1: create no longer auto-notifies, so the prior
-    // `create_with_assignee_sends_task_to_inbox` /
-    // `create_with_assignee_correlation_id_matches_task_id` tests (which asserted
-    // an inbox message on create) are removed — their inverse is now
-    // `create_with_assignee_has_no_dispatch_side_effects_1496`. Dispatch-message
-    // shape (kind/task_id/correlation_id) is covered on the send(kind=task) path.
-
-    #[test]
-    fn create_without_assignee_sends_no_message() {
-        let home = tmp_home("no_assign");
-        let result = handle(
-            &home,
-            "lead-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "unassigned task",
-            }),
-        );
-        assert_eq!(result["event"], "created");
-
-        let msgs = drain_inbox(&home, "lead-agent");
-        assert!(msgs.is_empty(), "no inbox message without assignee");
-    }
-
-    #[test]
-    fn create_self_assign_sends_no_message() {
-        let home = tmp_home("self_assign");
-        let result = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "self-assigned task",
-                "assignee": "dev-agent",
-            }),
-        );
-        assert_eq!(result["event"], "created");
-
-        let msgs = drain_inbox(&home, "dev-agent");
-        assert!(msgs.is_empty(), "self-assign should not send inbox message");
-    }
-
-    #[test]
-    fn create_with_assignee_task_status_is_open() {
-        let home = tmp_home("status_open");
-        let result = handle(
-            &home,
-            "lead-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "test task",
-                "assignee": "dev-agent",
-            }),
-        );
-        let task = &result["task"];
-        assert_eq!(task["status"], "open");
-        assert_eq!(task["assignee"], "dev-agent");
-    }
-
-    fn write_fleet_yaml_with_team(home: &std::path::Path, team: &str, orchestrator: &str) {
-        let yaml = format!(
-            "teams:\n  {team}:\n    orchestrator: {orchestrator}\n    members:\n      - dev-a\n      - dev-b\n"
-        );
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
-    }
-
-    #[test]
-    fn create_with_team_assignee_records_orchestrator_routing() {
-        // #1496 Option 1: create no longer notifies, but it still RESOLVES a team
-        // assignee to its orchestrator and RECORDS that on the task (`routed_to`).
-        // The dispatch-time team→orchestrator inbox routing is covered separately
-        // on the send(kind=task) path
-        // (mcp::handlers::tests::test_delegate_task_resolves_team_to_orchestrator_inbox).
-        let home = tmp_home("team_route");
-        write_fleet_yaml_with_team(&home, "my-team", "team-lead");
-
-        let result = handle(
-            &home,
-            "operator",
-            &serde_json::json!({
-                "action": "create",
-                "title": "team task",
-                "assignee": "my-team",
-            }),
-        );
-        assert_eq!(result["event"], "created");
-        assert_eq!(
-            result["task"]["routed_to"].as_str(),
-            Some("team-lead"),
-            "team assignee must resolve to its orchestrator in the record: {result}"
-        );
-
-        // Pure record: no inbox side-effect for the orchestrator OR the raw team.
-        assert!(
-            !home.join("inbox").join("team-lead.jsonl").exists()
-                && !home.join("inbox").join("my-team.jsonl").exists(),
-            "create must not enqueue any inbox message"
-        );
-    }
-
-    #[test]
-    fn create_with_assignee_has_no_dispatch_side_effects_1496() {
-        // #1496 Option 1: `task(action:create)` is a PURE board record. Creating
-        // a task assigned to ANOTHER agent must NOT enqueue an inbox message or
-        // write a dispatch-tracking entry — dispatch (notify + worktree auto-bind)
-        // is solely `send(kind=task)`'s job. Pre-#1496 (#1238) this auto-notified
-        // with a title-only, non-actionable wake that raced the real send into the
-        // busy-gate, taxing every dispatch with a force-resend.
-        //
-        // REGRESSION-PROOF: restore the auto-notify block in the create handler →
-        // both assertions below fail (the assignee's inbox jsonl and
-        // dispatch_tracking.json reappear). Subsumes the old self-assign case:
-        // create never dispatches now, for self OR other.
-        let home = tmp_home("create_no_dispatch_1496");
-        let result = handle(
-            &home,
-            "lead-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "pure record task",
-                "assignee": "dev-agent",
-                "branch": "feat/x",
-            }),
-        );
-        assert_eq!(result["event"], "created", "task still created: {result}");
-        assert!(
-            result["id"].as_str().is_some(),
-            "task id returned: {result}"
-        );
-
-        // No inbox message enqueued for the assignee.
-        let assignee_inbox = home.join("inbox").join("dev-agent.jsonl");
-        assert!(
-            !assignee_inbox.exists(),
-            "#1496: create must not enqueue an inbox message for the assignee"
-        );
-        // No dispatch-tracking entry written.
-        let track = crate::store::store_path(&home, "dispatch_tracking.json");
-        assert!(
-            !track.exists(),
-            "#1496: create must not write a dispatch-tracking entry"
-        );
-    }
-
-    #[test]
-    fn create_without_assignee_no_dispatch_tracking() {
-        let home = tmp_home("dispatch_none");
-        handle(
-            &home,
-            "lead-agent",
-            &serde_json::json!({
-                "action": "create",
-                "title": "unassigned",
-            }),
-        );
-
-        let path = crate::store::store_path(&home, "dispatch_tracking.json");
-        assert!(
-            !path.exists(),
-            "unassigned task should not create dispatch tracking entry"
-        );
-    }
-
-    // #event-bus pattern #7: the (from, kind, text, correlation_id) tuple a
-    // drained notify carries — id/timestamp ignored so legacy-vs-bus compares clean.
-    fn cascade_payloads(
-        home: &std::path::Path,
-        recipient: &str,
-    ) -> Vec<(String, Option<String>, String, Option<String>)> {
-        crate::inbox::drain(home, recipient)
-            .into_iter()
-            .map(|m| (m.from, m.kind, m.text, m.correlation_id))
-            .collect()
-    }
-
-    // gate-ON: emit(CascadeCancelNotify)→subscriber re-delivers BYTE-IDENTICALLY
-    // to the legacy `deliver_cascade_cancel` direct enqueue.
-    #[test]
-    fn cascade_gate_on_emit_subscriber_matches_legacy() {
-        let owner = "fixup-dev";
-        let parent_id = "t-parent-1";
-        let child_id = "t-child-1";
-
-        let home_legacy = tmp_home("p7-parity-legacy");
-        deliver_cascade_cancel(&home_legacy, owner, parent_id, child_id);
-
-        let home_bus = tmp_home("p7-parity-bus");
-        let bus = crate::daemon::event_bus::EventBus::new();
-        bus.subscribe(handle_event);
-        bus.emit(
-            &home_bus,
-            crate::daemon::event_bus::EventKind::CascadeCancelNotify {
-                owner: owner.to_string(),
-                parent_id: parent_id.to_string(),
-                child_id: child_id.to_string(),
-            },
-        );
-
-        let legacy = cascade_payloads(&home_legacy, owner);
-        let via_bus = cascade_payloads(&home_bus, owner);
-        assert!(!legacy.is_empty(), "legacy notify must enqueue");
-        assert_eq!(
-            legacy, via_bus,
-            "bus delivery must match legacy byte-for-byte"
-        );
-
-        std::fs::remove_dir_all(&home_legacy).ok();
-        std::fs::remove_dir_all(&home_bus).ok();
-    }
-
-    // #event-bus Step 2 (legacy-zero): route_cascade_cancel emits to the global
-    // bus; the registered subscriber delivers via deliver_cascade_cancel to the
-    // event's home (this test's home).
-    #[test]
-    fn route_cascade_cancel_delivers_via_bus() {
-        let home = tmp_home("p7-via-bus");
-        route_cascade_cancel(&home, "fixup-dev", "t-parent-2", "t-child-2");
-        let alerts = cascade_payloads(&home, "fixup-dev");
-        assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");
-        assert_eq!(alerts[0].1.as_deref(), Some("parent_cancelled"));
-        assert!(alerts[0].2.contains("t-parent-2") && alerts[0].2.contains("t-child-2"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1868 §3.9: the in-lock precondition `handle_done` now uses
-    /// (`append_checked`) REJECTS a `done` whose out-of-lock read was stale — a
-    /// concurrent sweep/auto_close moved the task to Cancelled. Pre-fix (plain
-    /// `append`) this Done was silently applied (replay's `apply_done` does not
-    /// re-guard transitions).
-    #[test]
-    fn append_checked_rejects_stale_done_after_concurrent_cancel_1868() {
-        let home = tmp_home("1868-done-stale");
-        create_task(&home, "t1");
-        let emitter = crate::task_events::InstanceName::from("dev-agent");
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "claim", "id": "t1"}),
-        );
-        // Concurrent sweep/auto_close cancels it → committed state is Cancelled.
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "update", "id": "t1", "status": "cancelled"}),
-        );
-
-        // A `done` prepared as-if the caller had still seen Claimed: the in-lock
-        // precondition re-reads the FRESH committed state (Cancelled) and rejects
-        // (Cancelled→Done is illegal).
-        let done = crate::task_events::TaskEvent::Done {
-            task_id: crate::task_events::TaskId("t1".into()),
-            by: crate::task_events::InstanceName::from("dev-agent"),
-            source: crate::task_events::DoneSource::OperatorManual {
-                authored_at: "2026-06-09T00:00:00+00:00".into(),
-                result: None,
-            },
-        };
-        let r = crate::task_events::append_checked(&home, &emitter, done, |state| {
-            let tv = state
-                .tasks
-                .values()
-                .map(record_to_task)
-                .find(|t| t.id == "t1")
-                .ok_or_else(|| "not found".to_string())?;
-            if !tv
-                .status
-                .can_transition_to(crate::task_events::TaskStatus::Done)
-            {
-                return Err("illegal".to_string());
-            }
-            Ok(())
-        });
-        assert!(
-            matches!(r, Ok(Err(_))),
-            "#1868: in-lock guard must REJECT a stale done on a Cancelled task: {r:?}"
-        );
-        assert_eq!(
-            read_task_record(&home, "t1").expect("task exists").status,
-            crate::task_events::TaskStatus::Cancelled,
-            "no Done event must land → task stays Cancelled"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1868 §3.9: same in-lock guard for the multi-event `update` arm via
-    /// `append_batch_checked`.
-    #[test]
-    fn append_batch_checked_rejects_stale_update_after_concurrent_cancel_1868() {
-        let home = tmp_home("1868-update-stale");
-        create_task(&home, "t1");
-        let emitter = crate::task_events::InstanceName::from("dev-agent");
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "claim", "id": "t1"}),
-        );
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "update", "id": "t1", "status": "cancelled"}),
-        );
-        let ev = crate::task_events::TaskEvent::InProgress {
-            task_id: crate::task_events::TaskId("t1".into()),
-            by: crate::task_events::InstanceName::from("dev-agent"),
-        };
-        let r = crate::task_events::append_batch_checked(&home, &emitter, vec![ev], |state| {
-            let tv = state
-                .tasks
-                .values()
-                .map(record_to_task)
-                .find(|t| t.id == "t1")
-                .ok_or_else(|| "not found".to_string())?;
-            if !tv
-                .status
-                .can_transition_to(crate::task_events::TaskStatus::InProgress)
-            {
-                return Err("illegal".to_string());
-            }
-            Ok(())
-        });
-        assert!(
-            matches!(r, Ok(Err(_))),
-            "#1868: in-lock batch guard must REJECT a stale update on a Cancelled task: {r:?}"
-        );
-        assert_eq!(
-            read_task_record(&home, "t1").expect("task exists").status,
-            crate::task_events::TaskStatus::Cancelled
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1868 §3.9: the normal (uncontended) sequence still succeeds end-to-end
-    /// through the real handlers — no regression from the append→append_checked
-    /// swap.
-    #[test]
-    fn normal_done_and_update_still_succeed_1868() {
-        let home = tmp_home("1868-happy");
-        create_task(&home, "t-done");
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "claim", "id": "t-done"}),
-        );
-        let d = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "done", "id": "t-done"}),
-        );
-        assert!(d["error"].is_null(), "legal done must succeed: {d}");
-        assert_eq!(
-            read_task_record(&home, "t-done").expect("exists").status,
-            crate::task_events::TaskStatus::Done
-        );
-
-        create_task(&home, "t-upd");
-        handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "claim", "id": "t-upd"}),
-        );
-        let u = handle(
-            &home,
-            "dev-agent",
-            &serde_json::json!({"action": "update", "id": "t-upd", "status": "in_progress"}),
-        );
-        assert!(u["error"].is_null(), "legal update must succeed: {u}");
-        assert_eq!(
-            read_task_record(&home, "t-upd").expect("exists").status,
-            crate::task_events::TaskStatus::InProgress
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod review_repro_tasks;
