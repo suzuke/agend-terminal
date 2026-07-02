@@ -33,6 +33,7 @@ use crate::daemon::anti_stall::AntiStallTracker;
 use crate::daemon::auto_release::AutoReleaseTracker;
 use crate::daemon::canonical_drift::CanonicalDriftTracker;
 use crate::daemon::conflict_notify::ConflictNotifyTracker;
+use crate::daemon::decision_board_timeout::DecisionBoardTimeoutTracker;
 use crate::daemon::decision_timeout::DecisionTimeoutTracker;
 use crate::daemon::dispatch_idle::team_nudge::DispatchIdleNudgeTracker;
 use crate::daemon::dispatch_idle::DispatchIdleTracker;
@@ -91,6 +92,13 @@ tracker_handler!(
     /// Sprint 59 Wave 1 PR-4-recover (B): operator-decision auto-default on
     /// timeout, 5min throttle.
     DecisionTimeoutHandler => DecisionTimeoutTracker, "decision_timeout"
+);
+
+tracker_handler!(
+    /// #2524 P2c / #2313: decision-board per-decision timeout+default,
+    /// 5min throttle. NOT the same tracker as `DecisionTimeoutHandler`
+    /// above (see `daemon::decision_board_timeout` module doc for why).
+    DecisionBoardTimeoutHandler => DecisionBoardTimeoutTracker, "decision_board_timeout"
 );
 
 tracker_handler!(

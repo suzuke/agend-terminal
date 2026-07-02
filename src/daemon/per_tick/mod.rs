@@ -90,8 +90,9 @@ pub(crate) use shadow_observe::ShadowObserveHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) use supervisor_trackers::{
     AntiStallHandler, AutoReleaseHandler, CanonicalDriftHandler, ConflictNotifyHandler,
-    DecisionTimeoutHandler, DispatchIdleHandler, DispatchIdleNudgeHandler, HelperStalenessHandler,
-    IdleWatchdogHandler, McpRegistryHandler, RetentionHandler, WaitingOnStaleHandler,
+    DecisionBoardTimeoutHandler, DecisionTimeoutHandler, DispatchIdleHandler,
+    DispatchIdleNudgeHandler, HelperStalenessHandler, IdleWatchdogHandler, McpRegistryHandler,
+    RetentionHandler, WaitingOnStaleHandler,
 };
 pub(crate) use thread_dump::ThreadDumpHandler;
 pub(crate) use tmp_review_gc::TmpReviewGcHandler;

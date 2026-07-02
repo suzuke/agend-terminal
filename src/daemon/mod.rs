@@ -11,6 +11,7 @@ pub(crate) mod ci_watch;
 pub(crate) mod conflict_notify;
 mod crash_respawn;
 pub(crate) mod cron_tick;
+pub(crate) mod decision_board_timeout;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod delivery_worker;
@@ -780,6 +781,7 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::AntiStallHandler::new()),
         Box::new(per_tick::IdleWatchdogHandler::new()),
         Box::new(per_tick::DecisionTimeoutHandler::new()),
+        Box::new(per_tick::DecisionBoardTimeoutHandler::new()),
         Box::new(per_tick::HelperStalenessHandler::new()),
         Box::new(per_tick::McpRegistryHandler::new(daemon_binary_stale)),
         Box::new(per_tick::WaitingOnStaleHandler::new()),

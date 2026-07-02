@@ -281,7 +281,13 @@ retention:
 
 ---
 
-## 決策逾時（Decision Timeout）
+## 決策逾時（Decision Timeout，`reply` 工具）
+
+> 這節講的是 `reply` 工具自己的 pending-decision sidecar
+> （`pending-decisions/{id}.json`）——跟下面的決策板逾時是分開的機制。
+> 兩者共用「逾時自動採預設值」的概念與同款 daemon tracker idiom，
+> 但 store、資料模型、通知對象都不同（原因見下方
+> [決策板 Timeout+Default](#決策板-timeoutdefault2313-p2c) 一節）。
 
 Agent 可以在 `reply` 中設定自動決策：
 
@@ -302,6 +308,39 @@ Agent 可以在 `reply` 中設定自動決策：
 4. 逾時 → 標記為 `timeout`，發送帶有 default action 的通知到 agent 收件匣
 
 同一個 agent 同時只能有一個 pending decision。新的 pending 會自動取消前一個。
+
+---
+
+## 決策板 Timeout+Default（#2313 P2c）
+
+針對貼到決策板的 `needs_answer` 問題，提供選擇性（opt-in）的逾時機制——跟上面 `reply` 工具自己的逾時是分開的（原因見上方說明）。
+
+```json
+{
+  "action": "post",
+  "title": "要部署精簡版設定嗎？",
+  "content": "...",
+  "needs_answer": true,
+  "options": [{"label": "proceed", "recommended": true}, {"label": "abort"}],
+  "timeout_secs": 1800
+}
+```
+
+若操作者在 `timeout_secs` 內未回答，daemon 會用 `timeout_default` 自動回答（若未給，則取 `options` 裡 `recommended` 選項的 label）。若兩者都無法解出，`post` 會直接拒絕。
+
+| 參數 | 型態 | 必填 | 說明 |
+|------|------|------|------|
+| `timeout_secs` | integer | 否 | 只在 `needs_answer: true` 時有效。從 `created_at` 算起幾秒後自動回答。 |
+| `timeout_default` | string | 否* | 逾時要自動套用的答案。*除非 `options` 裡有 `recommended: true` 的項目可以推導，否則必填。 |
+
+流程：
+1. `post` 驗證 `timeout_secs`/`timeout_default`，存進決策記錄（不新增 store，仍是同一個 `decisions/{id}.json` 檔案，欄位純累加）。
+2. daemon tracker 大約每 5 分鐘掃一次待答問題（節流輪詢，非即時）。
+3. 一旦 `created_at + timeout_secs`已過、問題仍是 `Pending`，就用 `answer: timeout_default` 回答，`answered_by: "timeout-default"`。
+4. 通知該決策的**作者**（不一定是目前實際在處理相關工作的人）。
+5. 若操作者搶先回答，tracker 下次掃描看到 `status != Pending` 就跳過——不會覆蓋，也不會重複通知。
+
+不在此範圍內（詳見 #2524 P2b/P2c manifest 的完整前提查核）：不做 daemon 依 priority/tag 自動觸發、不做「current owner」動態 routing——那是另一個獨立的 clarify/threading 功能（#2313 P2d）。逾時通知一律用貼文當下記錄的 `author` 欄位。
 
 ---
 
