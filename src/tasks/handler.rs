@@ -187,9 +187,37 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
             let _ = super::board_router::record_task_project(home, &id, &project);
-            // #2249 RED: metadata-seeding for the plan-ack gate is not yet
-            // implemented — GREEN commit fills this in. `plan_ack_required`
-            // is validated above but intentionally not persisted here yet.
+            // #2249: seed the plan-ack gate's metadata right after Created.
+            // No new event variant — composes onto the existing MetadataSet
+            // event/action, matching #2249's "reuse existing mechanisms"
+            // design. Absent when plan_ack_required == 0 (the common case),
+            // so `handle_update`'s gate check (which reads this same key)
+            // never fires — byte-identical to pre-#2249 for every task that
+            // doesn't opt in.
+            if plan_ack_required > 0 {
+                let reason = args["plan_ack_reason"].as_str().unwrap_or("");
+                let task_id_typed = crate::task_events::TaskId(id.clone());
+                let _ = crate::task_events::append_at(
+                    &board,
+                    &emitter,
+                    crate::task_events::TaskEvent::MetadataSet {
+                        task_id: task_id_typed.clone(),
+                        by: emitter.clone(),
+                        key: "plan_ack_required".to_string(),
+                        value: serde_json::json!(plan_ack_required),
+                    },
+                );
+                let _ = crate::task_events::append_at(
+                    &board,
+                    &emitter,
+                    crate::task_events::TaskEvent::MetadataSet {
+                        task_id: task_id_typed,
+                        by: emitter.clone(),
+                        key: "plan_ack_reason".to_string(),
+                        value: serde_json::json!(reason),
+                    },
+                );
+            }
             let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             // #1496 Option 1: `task(action:create)` is a PURE board record
             // with ZERO dispatch side-effects — no inbox enqueue, no
@@ -927,8 +955,37 @@ fn handle_update(
                 });
             }
         }
-        // #2249 RED: the in_progress plan-ack gate check is not yet
-        // implemented — GREEN commit adds the chokepoint here.
+        // #2249 pre-work alignment gate: the ONE live chokepoint for the
+        // claimed→in_progress transition (verified during the #2524 P2a
+        // spike — every other TaskEvent::InProgress emission site is
+        // test-only or the one-time legacy-migration replay). Absent/0
+        // `plan_ack_required` (the default) skips this entirely —
+        // byte-identical to pre-#2249 for every task that doesn't opt in.
+        if s.as_str() == "in_progress" {
+            let required = record
+                .metadata
+                .get("plan_ack_required")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if required > 0 {
+                let acked = record
+                    .metadata
+                    .get("plan_acks")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                if acked < required {
+                    return serde_json::json!({
+                        "error": format!(
+                            "plan-ack pending: {acked}/{required} acks (task {id})"
+                        ),
+                        "code": "plan_ack_pending",
+                        "required": required,
+                        "acked": acked,
+                    });
+                }
+            }
+        }
         let event_for_transition: Option<crate::task_events::TaskEvent> =
             match (prev_status, s.as_str()) {
                 (_, "claimed") => Some(crate::task_events::TaskEvent::Claimed {
@@ -1340,12 +1397,15 @@ fn handle_metadata_set(
     }
 }
 
-// #2249 RED: ack-plan mechanism not yet implemented (self-ack rejection,
-// plan-set precondition, idempotent tracking) — GREEN commit fills this in.
+/// #2249 pre-work alignment gate: idempotently record `instance_name`'s ack of
+/// the task's `plan` metadata. The assignee may never ack their own plan (the
+/// whole point is an outside check); plan_ack_required's threshold is read
+/// separately by `handle_update`'s `(_, "in_progress")` gate — this action
+/// only maintains the ack list, it never blocks a transition itself.
 fn handle_ack_plan(
     home: &Path,
-    _instance_name: &str,
-    _emitter: crate::task_events::InstanceName,
+    instance_name: &str,
+    emitter: crate::task_events::InstanceName,
     args: &Value,
 ) -> Value {
     let id = match id_arg(args) {
@@ -1353,10 +1413,58 @@ fn handle_ack_plan(
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let board = super::board_router::board_for_task(home, id);
-    if read_task_record_at(&board, id).is_none() {
-        return serde_json::json!({"error": format!("task not found: {id}")});
+    let record = match read_task_record_at(&board, id) {
+        Some(r) => r,
+        None => return serde_json::json!({"error": format!("task not found: {id}")}),
+    };
+    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+        return deny;
     }
-    serde_json::json!({"id": id, "event": "ack_plan", "acked": 0, "already_acked": false})
+    if record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name) {
+        return serde_json::json!({
+            "error": "the task's assignee cannot ack their own plan",
+            "code": "self_ack_forbidden",
+        });
+    }
+    if !record.metadata.contains_key("plan") {
+        return serde_json::json!({
+            "error": format!(
+                "task '{id}' has no plan set yet — set one via \
+                 task action=metadata_set metadata_key=plan first"
+            ),
+            "code": "plan_not_set",
+        });
+    }
+    let mut acks: Vec<String> = record
+        .metadata
+        .get("plan_acks")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if acks.iter().any(|a| a == instance_name) {
+        // Idempotent: already acked by this caller — no-op success, no new event.
+        return serde_json::json!({
+            "id": id, "event": "ack_plan", "acked": acks.len(), "already_acked": true,
+        });
+    }
+    acks.push(instance_name.to_string());
+    let acked_count = acks.len();
+    let event = crate::task_events::TaskEvent::MetadataSet {
+        task_id: crate::task_events::TaskId(id.to_string()),
+        by: emitter.clone(),
+        key: "plan_acks".to_string(),
+        value: serde_json::json!(acks),
+    };
+    match crate::task_events::append_at(&board, &emitter, event) {
+        Ok(_) => serde_json::json!({
+            "id": id, "event": "ack_plan", "acked": acked_count, "already_acked": false,
+        }),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    }
 }
 
 fn handle_metadata_get(home: &Path, args: &Value) -> Value {

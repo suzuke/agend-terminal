@@ -872,6 +872,8 @@ mod tests {
             ("send", "terminal", "messaging.rs msg.terminal → auto_close_on_report"),
             ("send", "no_report_expected", "comms.rs track step → DispatchEntry status=no_report_expected (skips sweep_stuck/sweep_orphans) + messaging.rs track_dispatch skips the dispatch_idle sidecar record"),
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
+            ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
+            ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
             ("task", "title", "tasks/handler.rs handle_create"),
@@ -909,6 +911,8 @@ mod tests {
             ("task", "eta_secs", "tasks/handler.rs create → TaskEvent::Created.eta_secs (#1933 declared)"),
             ("task", "project", "tasks/handler.rs create board route (:136) + list project select (:221) (#2117 P1)"),
             ("task", "scope", "tasks/handler.rs list fleet_scope aggregate (:208) (#2117 P1)"),
+            ("task", "plan_ack_required", "tasks/handler.rs handle_create validation + metadata seed; handle_update in_progress gate chokepoint (#2249)"),
+            ("task", "plan_ack_reason", "tasks/handler.rs handle_create validation + metadata seed (#2249)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),
