@@ -819,3 +819,57 @@ fixtures:
     expected_final_detect: idle
     capture_kind: synthetic
     provenance: "#1470-1 regression-proof — agy prose mentioning net-error / rate-limit phrasing, expected Idle"
+
+  # ── #2524 P1b-r1 GitConflict real captures (2026-07-02) ────────────
+  # script -q via pexpect against an isolated scratch repo (never the
+  # canonical repo) with a genuine `git merge` content conflict, driving
+  # each CLI's own interactive TUI with an initial prompt to run the
+  # merge and report the result. See #2524 P1a/P1b spike manifests.
+
+  - file: opencode-conflict.raw
+    backend: opencode
+    cli_version: "1.17.5"
+    recorded_on: "2026-07-02"
+    scenario: |
+      opencode driven to `git merge feature-branch` against a real merge
+      conflict via its Bash tool. opencode renders the tool's raw stdout
+      inline (not collapsed) -- git's conflict text appears verbatim.
+      opencode's GitConflict pattern already existed in code but had zero
+      fixture coverage before this capture.
+    expected_transitions: [starting, idle, active, git_conflict]
+    expected_final_state: git_conflict
+    expected_final_detect: git_conflict
+    capture_kind: real_pty
+    provenance: "#2524 P1b-r1 real capture — pexpect-driven opencode against an isolated scratch merge conflict"
+
+  - file: codex-conflict.raw
+    backend: codex
+    cli_version: "0.142.2"
+    recorded_on: "2026-07-02"
+    scenario: |
+      codex driven to `git merge feature-branch` against a real merge
+      conflict via its shell tool. git's conflict text appears verbatim in
+      codex's tool-output block. Piggybacked onto the agy/opencode capture
+      session (#2524 P1b manifest fork 3) since codex's GitConflict pattern
+      already existed in code but had zero fixture coverage.
+    expected_transitions: [starting, active, git_conflict]
+    expected_final_state: git_conflict
+    expected_final_detect: git_conflict
+    capture_kind: real_pty
+    provenance: "#2524 P1b-r1 real capture — pexpect-driven codex against an isolated scratch merge conflict"
+
+  - file: agy-conflict.raw
+    backend: agy
+    cli_version: "1.0.15"
+    recorded_on: "2026-07-02"
+    scenario: |
+      agy driven to `git merge feature-branch` against a real merge conflict
+      via its Bash tool. Confirms git's own conflict text streams into agy's
+      pane (fragmented across the live tool-output redraw) before the tool
+      call collapses to its default "(ctrl+o to expand)" summary. Fills the
+      #2524 P1b gap: agy previously had NO GitConflict pattern at all.
+    expected_transitions: [starting, idle, active, git_conflict]
+    expected_final_state: git_conflict
+    expected_final_detect: git_conflict
+    capture_kind: real_pty
+    provenance: "#2524 P1b-r1 real capture — pexpect-driven agy against an isolated scratch merge conflict"

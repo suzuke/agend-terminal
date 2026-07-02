@@ -164,6 +164,18 @@ fn agy_profile() -> BackendProfile {
                 AgentState::PermissionPrompt,
                 r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
             ),
+            // #2524 P1b-r1: agy had no GitConflict pattern at all. Real capture
+            // (script -q via pexpect, isolated scratch repo, genuine `git merge`
+            // conflict) confirmed git's own conflict text streams into agy's pane
+            // verbatim. Reuses the SAME shared literal already used for
+            // kiro/opencode/codex (git's own stdout, not agy-specific chrome) —
+            // must come BEFORE the `● Bash(...)` Active pattern below, since a
+            // conflict pane still shows the tool-call bullet that would otherwise
+            // first-match Active.
+            (
+                AgentState::GitConflict,
+                r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+            ),
             (AgentState::Active, r"●\s+[A-Z][a-zA-Z]+\("),
             (AgentState::Active, r"esc to cancel"),
             (AgentState::Idle, r"\? for shortcuts"),
@@ -670,6 +682,46 @@ mod agy_apierror_2409 {
             patterns.detect(AGY_RETRY_PROSE_PANE),
             Some(AgentState::Idle),
             "#2409/PR2410: an agent's own 'try again in a minute' prose must NOT be misread as ApiError"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agy_gitconflict_2524 {
+    use super::*;
+
+    /// #2524 P1b-r1: agy had no GitConflict pattern at all (confirmed absent from
+    /// `agy_profile()` during the #2524 P1a/P1b spikes). Real capture (script -q via
+    /// pexpect, `agy -i "git merge feature-branch..."` against an isolated scratch
+    /// repo with a genuine merge conflict) confirms git's own conflict text streams
+    /// into agy's pane verbatim (fragmented across the live tool-output redraw, but
+    /// present) before the tool call collapses to its default summary. Reuses the
+    /// SAME shared literal already proven for kiro/opencode/codex — git's own stdout,
+    /// not agy-specific chrome.
+    const AGY_GITCONFLICT_PANE: &str = "  ● Bash(git merge feature-branch)\n  Auto-merging README.md\n  CONFLICT (content): Merge conflict in README.md\n  Automatic merge failed; fix conflicts and then commit the result.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_merge_conflict_detects_git_conflict() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_GITCONFLICT_PANE),
+            Some(AgentState::GitConflict),
+            "#2524: a real git merge conflict in agy's pane must read GitConflict (not Idle)"
+        );
+    }
+
+    /// FP guard: an agent's own prose mentioning "conflict"/"merge" in a non-error,
+    /// discussion context must NOT be misread as GitConflict — the pattern anchors on
+    /// git's own literal conflict-marker text, not the bare English words.
+    const AGY_CONFLICT_PROSE_PANE: &str = "  I looked at the conflict resolution logic and merge strategy in this module; nothing needs a merge right now.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_conflict_prose_not_misread_as_git_conflict() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_CONFLICT_PROSE_PANE),
+            Some(AgentState::Idle),
+            "#2524: an agent's own prose mentioning conflict/merge must NOT be misread as GitConflict"
         );
     }
 }
