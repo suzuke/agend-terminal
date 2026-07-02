@@ -131,6 +131,122 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
     }
 }
 
+/// #2496: strict, same-agent-only exception to guard-b (see call site). ALL
+/// conditions below must hold for a metadata-only catch-up to be allowed —
+/// any failure keeps guard-b's existing reject.
+fn same_agent_metadata_catchup_allowed(
+    home: &Path,
+    agent: &str,
+    worktree: &Path,
+    source_repo: &Path,
+    branch: &str,
+    ex_branch: &str,
+) -> bool {
+    if !crate::worktree::is_git_repo(worktree) {
+        return false;
+    }
+    if !crate::worktree_pool::is_daemon_managed(worktree) {
+        return false;
+    }
+    // Marker present (checked above) but its recorded `agent=` doesn't match
+    // the caller: this worktree is daemon-managed for a DIFFERENT agent —
+    // reject rather than treat as this agent's own stale metadata.
+    if let Some(marker_agent) = managed_marker_agent(worktree) {
+        if marker_agent != agent {
+            return false;
+        }
+    }
+    if crate::worktree::has_uncommitted_changes(worktree) {
+        return false;
+    }
+    let actual_branch =
+        crate::git_helpers::git_cmd(worktree, &["branch", "--show-current"]).unwrap_or_default();
+    if actual_branch != branch {
+        return false;
+    }
+    let source_repo_str = source_repo.display().to_string();
+    if scan_existing_branch_binding(home, &source_repo_str, branch, agent).is_some() {
+        return false;
+    }
+    if agent_has_active_ci_watch_on_branch(home, agent, ex_branch) {
+        return false;
+    }
+    if branch_has_active_task(home, ex_branch) {
+        return false;
+    }
+    true
+}
+
+/// Parse a daemon-managed worktree's `.agend-managed` marker for its recorded
+/// `agent=` line. `None` when the marker is missing or the line isn't present
+/// — callers that require ownership certainty must already have checked
+/// `worktree_pool::is_daemon_managed` before this matters.
+///
+/// `pub(crate)` — also used by `mcp::handlers::force_release`'s #2496 safe
+/// rebind-repair path (same ownership check, different flow control).
+pub(crate) fn managed_marker_agent(worktree: &Path) -> Option<String> {
+    let content =
+        std::fs::read_to_string(worktree.join(crate::worktree_pool::MANAGED_MARKER)).ok()?;
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("agent="))
+        .map(|s| s.trim().to_string())
+}
+
+/// #2496: does `agent` hold an active CI watch on `branch`? A stale branch
+/// still being watched must not be silently abandoned by a metadata-only
+/// binding repair. `pub(crate)` — shared with `force_release`'s repair path.
+pub(crate) fn agent_has_active_ci_watch_on_branch(home: &Path, agent: &str, branch: &str) -> bool {
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
+    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if watch["branch"].as_str() != Some(branch) {
+            continue;
+        }
+        if crate::daemon::ci_watch::parse_subscribers(&watch)
+            .iter()
+            .any(|s| s == agent)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// #2496: is any task's STRUCTURED `branch` link still pointing at `branch`
+/// in an active status? Same active-status set
+/// `status_summary::auto_close_merged_tasks` uses for its structured-link arm
+/// (Open/Claimed/InProgress/InReview/Blocked/Verified) — a stale branch still
+/// tracked by a live task must not be silently abandoned by a metadata-only
+/// binding repair. `pub(crate)` — shared with `force_release`'s repair path.
+pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
+    use crate::task_events::TaskStatus;
+    crate::tasks::list_all(home).iter().any(|t| {
+        t.branch.as_deref() == Some(branch)
+            && matches!(
+                t.status,
+                TaskStatus::Open
+                    | TaskStatus::Claimed
+                    | TaskStatus::InProgress
+                    | TaskStatus::InReview
+                    | TaskStatus::Blocked
+                    | TaskStatus::Verified
+            )
+    })
+}
+
 /// Write a full binding including worktree + source-repo paths.
 ///
 /// `source_repo` is the parent repo that owns the worktree, persisted as a
@@ -197,19 +313,44 @@ pub fn bind_full(
             .map(|w| std::path::Path::new(w).exists())
             .unwrap_or(false);
         if ex_worktree_live && !ex_branch.is_empty() && ex_branch != branch {
-            crate::event_log::log(
+            // #2496 (adversarial consensus d-20260701140903334693-1): guard-b's
+            // blanket rejection can't distinguish a genuine live cross-branch
+            // bind-over (the #2158 danger this guard exists for) from "the
+            // worktree was ALREADY cleanly switched to the requested branch
+            // out-of-band (a plain `git checkout`, bypassing bind/release) and
+            // binding.json just hasn't caught up". `same_agent_metadata_catchup_allowed`
+            // is the strict, same-agent-only exception for the latter: pure
+            // metadata catch-up, zero mutation to the worktree. Any condition
+            // failing keeps the original reject — this only WIDENS what's
+            // allowed, never narrows the existing guard.
+            if same_agent_metadata_catchup_allowed(
                 home,
-                "binding_rebind_rejected",
                 agent,
-                &format!(
-                    "live binding on '{ex_branch}' — refused cross-branch rebind to '{branch}' (#2158); {}",
-                    crate::event_log::caller_process_context()
-                ),
-            );
-            return Err(format!(
-                "#2158: agent '{agent}' is bound to a LIVE worktree on branch '{ex_branch}' — \
-                 release_worktree first before binding to '{branch}' (no silent cross-branch rebind)"
-            ));
+                worktree,
+                source_repo,
+                branch,
+                ex_branch,
+            ) {
+                tracing::info!(
+                    %agent, %ex_branch, %branch,
+                    "#2496: same-agent stale binding metadata caught up to the worktree's \
+                     already-correct branch — no worktree/branch mutation"
+                );
+            } else {
+                crate::event_log::log(
+                    home,
+                    "binding_rebind_rejected",
+                    agent,
+                    &format!(
+                        "live binding on '{ex_branch}' — refused cross-branch rebind to '{branch}' (#2158); {}",
+                        crate::event_log::caller_process_context()
+                    ),
+                );
+                return Err(format!(
+                    "#2158: agent '{agent}' is bound to a LIVE worktree on branch '{ex_branch}' — \
+                     release_worktree first before binding to '{branch}' (no silent cross-branch rebind)"
+                ));
+            }
         }
     }
     let wt_str = worktree.display().to_string();
@@ -1391,6 +1532,248 @@ mod tests {
             Some("feat/y"),
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2496: same-agent metadata-catchup exception to guard-b ──────────────
+
+    /// A real git-repo dir standing in for a worktree (plain repo — every
+    /// check the #2496 exception performs, `is_git_repo`/`has_uncommitted_changes`/
+    /// `branch --show-current`/`switch`, works identically on a plain repo or an
+    /// actual `git worktree add` checkout).
+    fn tmp_git_repo(tag: &str) -> std::path::PathBuf {
+        let dir = tmp_home(tag);
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        // Every REAL source repo gitignores `.agend-managed` (this repo's own
+        // .gitignore does — see `worktree.rs::commit_marker_gitignore`'s test
+        // precedent) so the lease marker never makes a clean worktree look
+        // dirty. Commit it here so `write_managed_marker` doesn't trip
+        // `has_uncommitted_changes` in these tests.
+        std::fs::write(dir.join(".gitignore"), ".agend-managed\n").unwrap();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["add", ".gitignore"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@test",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        dir
+    }
+
+    fn git_switch(repo: &Path, branch: &str) {
+        std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["switch", "-c", branch])
+            .current_dir(repo)
+            .output()
+            .ok();
+    }
+
+    fn write_managed_marker(worktree: &Path, agent: &str) {
+        std::fs::write(
+            worktree.join(crate::worktree_pool::MANAGED_MARKER),
+            format!("agent={agent}\nbranch=irrelevant\n"),
+        )
+        .unwrap();
+    }
+
+    /// #2496 (consensus test 1 + 8): a worktree that was cleanly `git
+    /// checkout`'d to the requested branch out-of-band (bind/release bypassed
+    /// entirely) — daemon-managed, owned by this agent, clean — gets its
+    /// STALE binding metadata caught up instead of rejected. No worktree
+    /// mutation happens (it was already on the right branch).
+    #[test]
+    fn guard_b_allows_metadata_catchup_when_worktree_already_on_requested_branch_2496() {
+        let home = tmp_home("2496-catchup-allow");
+        let wt = tmp_git_repo("2496-catchup-allow-wt");
+        write_managed_marker(&wt, "agentA");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
+
+        // Out-of-band: the worktree is switched to feat/y directly (bypassing
+        // bind/release) — binding.json still says feat/x.
+        git_switch(&wt, "feat/y");
+
+        bind_full(&home, "agentA", "", "feat/y", &wt, &src, false).expect(
+            "same-agent metadata catchup must be allowed: worktree is already on feat/y, clean, managed",
+        );
+        assert_eq!(
+            read(&home, "agentA")
+                .and_then(|b| b.get("branch").and_then(|v| v.as_str()).map(String::from))
+                .as_deref(),
+            Some("feat/y"),
+            "binding.json must catch up to the worktree's actual branch"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// #2496 (consensus test 2): same scenario, but the worktree is DIRTY —
+    /// guard-b's original reject stands; metadata is untouched.
+    #[test]
+    fn guard_b_rejects_metadata_catchup_when_worktree_dirty_2496() {
+        let home = tmp_home("2496-catchup-dirty");
+        let wt = tmp_git_repo("2496-catchup-dirty-wt");
+        write_managed_marker(&wt, "agentA");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
+        git_switch(&wt, "feat/y");
+        std::fs::write(wt.join("dirty.txt"), "uncommitted").unwrap();
+
+        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
+            .expect_err("dirty worktree must NOT get the metadata-catchup exception");
+        assert!(
+            err.contains("#2158"),
+            "must be the original guard-b reject: {err}"
+        );
+        assert_eq!(
+            read(&home, "agentA")
+                .and_then(|b| b.get("branch").and_then(|v| v.as_str()).map(String::from))
+                .as_deref(),
+            Some("feat/x"),
+            "rejected catchup must not mutate the binding"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// #2496 (consensus test 3): missing `.agend-managed` marker, and a marker
+    /// present but recording a DIFFERENT agent, both reject.
+    #[test]
+    fn guard_b_rejects_metadata_catchup_when_marker_missing_or_mismatched_2496() {
+        let home = tmp_home("2496-catchup-marker");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Sub-case: marker missing entirely.
+        let wt1 = tmp_git_repo("2496-catchup-marker-missing");
+        bind_full(&home, "agentA", "", "feat/x", &wt1, &src, false).expect("first bind ok");
+        git_switch(&wt1, "feat/y");
+        assert!(
+            bind_full(&home, "agentA", "", "feat/y", &wt1, &src, false).is_err(),
+            "no .agend-managed marker → not daemon-managed → reject"
+        );
+        std::fs::remove_dir_all(&wt1).ok();
+
+        // Sub-case: marker present but for a DIFFERENT agent.
+        let wt2 = tmp_git_repo("2496-catchup-marker-mismatch");
+        write_managed_marker(&wt2, "someone-else");
+        bind_full(&home, "agentB", "", "feat/x", &wt2, &src, false).expect("first bind ok");
+        git_switch(&wt2, "feat/y");
+        assert!(
+            bind_full(&home, "agentB", "", "feat/y", &wt2, &src, false).is_err(),
+            "marker agent mismatch → reject, not treated as this agent's own stale metadata"
+        );
+        std::fs::remove_dir_all(&wt2).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2496 (consensus test 4): the requested branch is already held by a
+    /// DIFFERENT agent — reject even though this agent's own worktree is
+    /// clean and genuinely on that branch (two worktrees can't both claim the
+    /// same (source_repo, branch)).
+    #[test]
+    fn guard_b_rejects_metadata_catchup_when_branch_held_by_another_agent_2496() {
+        let home = tmp_home("2496-catchup-other-agent");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let other_wt = home.join("other-wt");
+        std::fs::create_dir_all(&other_wt).unwrap();
+        bind_full(&home, "other-agent", "", "feat/y", &other_wt, &src, false)
+            .expect("other agent holds feat/y");
+
+        let wt = tmp_git_repo("2496-catchup-other-agent-wt");
+        write_managed_marker(&wt, "agentA");
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
+        git_switch(&wt, "feat/y");
+
+        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
+            .expect_err("feat/y is held by another agent on the same source_repo — must reject");
+        assert!(err.contains("#2158"), "{err}");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// #2496 (consensus test 5): the stale branch (`feat/x`, being abandoned)
+    /// has an active CI watch for this agent — must not silently orphan it.
+    #[test]
+    fn guard_b_rejects_metadata_catchup_when_stale_branch_has_active_ci_watch_2496() {
+        let home = tmp_home("2496-catchup-ci-watch");
+        let wt = tmp_git_repo("2496-catchup-ci-watch-wt");
+        write_managed_marker(&wt, "agentA");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
+        git_switch(&wt, "feat/y");
+
+        let ci_dir = home.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        std::fs::write(
+            ci_dir.join("w.json"),
+            serde_json::to_string(&serde_json::json!({
+                "repo": "o/r",
+                "branch": "feat/x",
+                "subscribers": [{"instance": "agentA"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
+            .expect_err("active CI watch on the abandoned stale branch must block catchup");
+        assert!(err.contains("#2158"), "{err}");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// #2496 (consensus test 6): the stale branch has an active
+    /// branch-linked task — must not silently orphan it.
+    #[test]
+    fn guard_b_rejects_metadata_catchup_when_stale_branch_has_active_task_2496() {
+        let home = tmp_home("2496-catchup-task");
+        let wt = tmp_git_repo("2496-catchup-task-wt");
+        write_managed_marker(&wt, "agentA");
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
+        git_switch(&wt, "feat/y");
+
+        crate::tasks::handle(
+            &home,
+            "agentA",
+            &serde_json::json!({
+                "action": "create",
+                "title": "work on feat/x",
+                "assignee": "agentA",
+                "branch": "feat/x",
+            }),
+        );
+
+        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
+            .expect_err("active task linked to the abandoned stale branch must block catchup");
+        assert!(err.contains("#2158"), "{err}");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
     }
 
     /// (ii) binding-change audit: a bind emits `binding_changed` and an unbind emits

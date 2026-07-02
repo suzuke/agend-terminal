@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 mod gc;
+mod repair;
+
+pub(crate) use repair::attempt_safe_rebind_repair;
 
 /// MCP tool: `force_release_worktree`.
 ///
@@ -145,9 +148,13 @@ pub(super) struct RebaseCleanOutcome {
     pub(super) binding_outcome: Value,
 }
 
-/// Sprint 60 W1 PR-1: shared cleanup helper used by both
-/// `force_release_worktree` (operator/agent-callable) and
-/// `bind_self(rebase_mode=true)` (atomic recover-and-bind).
+/// Sprint 60 W1 PR-1: cleanup helper for the EXPLICIT, operator-callable
+/// `force_release_worktree` tool (destructive by design — see its docstring).
+///
+/// #2496: no longer used by `bind_self(rebase_mode=true)` — that path now
+/// tries [`attempt_safe_rebind_repair`] FIRST and fails closed rather than
+/// silently landing here (this function's fallthrough to `release_full` is
+/// exactly the "as destructive as `release_worktree`" behavior #2496 reported).
 ///
 /// Validates path safety against the daemon worktree pool, removes
 /// the stale on-disk dir if present, and clears any lingering binding
