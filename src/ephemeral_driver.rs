@@ -15,11 +15,14 @@
 //!
 //! ## Empirical constants (PR3b 1a confirm-first smoke, lead-vetted — DO NOT change
 //! without re-smoking on a real backend)
-//! - **Poll `get_state()` ONLY, NEVER `state.tick()`.** The ephemeral read loop
-//!   ([`crate::agent`] `ephemeral_pty_read_loop`) never ticks, so the 30 s
-//!   `LATCHED_STATE_EXPIRY` Thinking→Idle decay is disabled and no phantom timer-Idle
-//!   fires. Calling `tick()` here would re-enable that decay → a false turn-end on a
-//!   quiet >30 s stretch. So the driver reads state, never advances the clock.
+//! - **Poll `get_state()` ONLY, NEVER the general `state.tick()`.** The ephemeral
+//!   read loop ([`crate::agent`] `ephemeral_pty_read_loop`) never ticks, so calling
+//!   the full `tick()` here would blanket-enable the 30 s `LATCHED_STATE_EXPIRY`
+//!   decay for every backend → a false turn-end on a quiet >30 s stretch. #2524 P3a
+//!   PR-2 (decision `d-20260702075424735619-11`) adds a NARROWER, throttled
+//!   exception in Phase 0 ONLY — [`StateTracker::expire_stale_latch_if_due`] — so a
+//!   mis-latched ready-screen state (confirm-first finding on a real backend spawn)
+//!   can self-heal without reopening the quiet->30s false-turn-end risk for Phase 2.
 //! - **Idle-debounce = 3 s of held Idle** before declaring the turn done. opencode
 //!   renders the Thinking marker CONTINUOUSLY while streaming (0 ms mid-turn Idle lull
 //!   observed on a fast model); 3 s cheaply covers a slower model's inter-render gaps.
@@ -112,12 +115,22 @@ fn run_turn(cfg: DriverConfig) {
     let wall_ttl_ms = wall_ttl.as_millis() as u64;
 
     // Phase 0 — wait for the worker to reach its first Idle (ready). Poll get_state()
-    // ONLY (never tick()). An error class before ready, or a ready timeout, fails the
-    // turn immediately.
+    // ONLY (never the general tick()) — but DO run the throttled latch-expiry check,
+    // for ALL backends here (#2524 P3a PR-2, decision `d-20260702075424735619-11`):
+    // without it, a screen-classifier state that mis-latches Active on the ready
+    // screen and then goes fully static (no further pty bytes ⇒ no `detect()`
+    // re-evaluation either) can NEVER self-heal, and Phase 0 would wait out the full
+    // `READY_TIMEOUT` on an already-ready worker. Safe for EVERY backend here
+    // specifically because nothing is "in progress" yet to falsely cut short — the
+    // worst case is Phase 0 unblocking slightly early, never a truncated turn.
     let ready_cap_ms = (READY_TIMEOUT.as_millis() as u64).min(wall_ttl_ms);
     loop {
         let now_ms = start.elapsed().as_millis() as u64;
-        let state = inject_target.core.lock().state.get_state();
+        let state = {
+            let mut c = inject_target.core.lock();
+            c.state.expire_stale_latch_if_due(now_ms);
+            c.state.get_state()
+        };
         if state.is_error() {
             return record_failure(&home, &worker_id, &format!("not ready: {state:?}"));
         }

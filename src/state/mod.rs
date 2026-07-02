@@ -264,9 +264,6 @@ pub struct StateTracker {
     /// #2524 P3a PR-2: last caller-supplied `now_ms` [`expire_stale_latch_if_due`]
     /// actually ran on — caller-clock-relative (e.g. the ephemeral driver's own
     /// turn-elapsed-ms), not wall-clock; only needs to be monotonic per caller.
-    // RED: no caller wires this in yet — the GREEN commit adds the ephemeral
-    // driver's Phase 0 call site.
-    #[allow(dead_code)]
     pub(crate) last_latch_check_ms: u64,
     pub last_output: Instant,
     /// F9 (#685 sub-task 4): `Some(t)` only when `infer_productivity()` returned
@@ -986,8 +983,6 @@ impl StateTracker {
     /// #2524 P3a PR-2: throttle window for `expire_stale_latch_if_due` — cheap
     /// enough for every 250ms driver poll, tight enough to clear a mis-latch within
     /// `LATCHED_STATE_EXPIRY` + a fraction of a second.
-    // RED: `expire_stale_latch_if_due` has no caller yet — see that fn's own note.
-    #[allow(dead_code)]
     const LATCH_EXPIRE_CHECK_MS: u64 = 1_000;
 
     /// #1005 Phase A2: minimum hold in the lower-priority state before
@@ -2229,16 +2224,12 @@ impl StateTracker {
     /// (confirm-first finding: codex's ready screen mis-latching `Active` then going
     /// fully static — no new pty bytes ⇒ no `detect()` re-eval) can never self-heal.
     /// `now_ms` is the CALLER's own clock — only needs to be monotonic per caller.
-    // RED: no production caller yet — the GREEN commit wires in the ephemeral
-    // driver's Phase 0 call site.
-    #[allow(dead_code)]
     pub(crate) fn expire_stale_latch_if_due(&mut self, now_ms: u64) {
         if now_ms.saturating_sub(self.last_latch_check_ms) < Self::LATCH_EXPIRE_CHECK_MS {
             return;
         }
         self.last_latch_check_ms = now_ms;
-        // RED (#2524 P3a PR-2): not yet calling `maybe_expire_latched_state()` here —
-        // the GREEN commit wires it in. A stale latch stays stuck for now.
+        self.maybe_expire_latched_state();
     }
 
     /// Get current state.
