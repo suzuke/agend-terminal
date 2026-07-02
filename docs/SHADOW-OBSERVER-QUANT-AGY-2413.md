@@ -2,8 +2,9 @@
 
 **Question:** does agy's Hook plane (turn-granular, `.agents/hooks.json`, Phase D
 #2448) make the fused `ObservedStatus` measurably cleaner than raw screen-scrape
-for agy agents — the agy analogue of `SHADOW-OBSERVER-QUANT-2413.md` (claude) and
-`SHADOW-OBSERVER-QUANT-CODEX-2413.md` (codex)? Commissioned by the #2524 P1a
+for agy agents — the agy analogue of `docs/archived/SHADOW-OBSERVER-QUANT-2413.md`
+(claude) and `docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md` (codex)?
+Commissioned by the #2524 P1a
 spike manifest, which found agy's hook-primary promotion had shipped to
 production default (2026-06-24) with **zero quantitative verification** — only
 claude and codex had QUANT docs.

@@ -56,7 +56,7 @@
 //! proven to render a continuous work marker so the Idle-debounce isn't fooled by a
 //! mid-turn idle — their turn-end reads raw `get_state()` UNCHANGED. codex is
 //! different: its raw screen goes idle for several seconds mid-turn
-//! (SHADOW-OBSERVER-QUANT-CODEX-2413.md — longer than [`TURN_DEBOUNCE_MS`]), so its
+//! (docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md — longer than [`TURN_DEBOUNCE_MS`]), so its
 //! turn-end detection additionally consults `core.observed_status` (the Shadow
 //! Observer's Stream-authority-corrected status, populated by the codex rollout tail —
 //! #2524 P3a PR-1) and VETOES a raw-Idle sample when Stream evidence says the turn is
@@ -629,14 +629,14 @@ fn build_summary(dump: &str, terminal_state: AgentState, grew: bool, stop_reason
 /// PURE (no lock, no I/O) — takes the raw screen state and the worker's current
 /// `observed_status` already read under one `core.lock()` by the caller — so it's
 /// unit-testable with synthetic inputs (see the `codex_survives_quant_2413_*` test,
-/// fed the REAL SHADOW-OBSERVER-QUANT-CODEX-2413.md trace).
+/// fed the REAL docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md trace).
 ///
 /// opencode/claude: always the raw state, unchanged — zero behavior change, per the
 /// §5-smoke precedent (this function is a no-op for them).
 ///
 /// codex: a raw `Idle` sample is VETOED (treated as still `Active`) when
 /// `observed_status` carries FRESH `Stream`-authority evidence that says otherwise —
-/// SHADOW-OBSERVER-QUANT-CODEX-2413.md shows codex's raw screen false-idling for
+/// docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md shows codex's raw screen false-idling for
 /// several seconds mid-turn (longer than [`TURN_DEBOUNCE_MS`]) while the rollout-tail
 /// Stream evidence correctly holds `Responding`. Once Stream evidence goes stale or
 /// itself agrees with Idle (the reducer falls back to `Screen` authority — the real
@@ -1295,7 +1295,7 @@ mod tests {
     /// codex: raw Idle + FRESH Stream-authority evidence saying the turn is still
     /// active (Responding/Thinking/ToolUse/Active — anything that doesn't coarsen to
     /// Idle) → VETOED to `Active`. This is the exact false-idle shape
-    /// SHADOW-OBSERVER-QUANT-CODEX-2413.md documents on a real turn.
+    /// docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md documents on a real turn.
     #[test]
     fn effective_turn_state_codex_stream_active_vetoes_false_idle() {
         for state in [
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     /// #2524 P3a PR-2 — THE fixture-replay pin: the REAL raw/observed/authority trace
-    /// from SHADOW-OBSERVER-QUANT-CODEX-2413.md (§"Result" table, verbatim timestamps
+    /// from docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md (§"Result" table, verbatim timestamps
     /// converted to relative ms from the first sample), fed through
     /// `effective_turn_state` into a REAL `TurnEndDetector`. Proves the false-idle
     /// window (11:38:58–11:39:04, raw=Idle/observed=Responding/Stream — ~6 s, LONGER
