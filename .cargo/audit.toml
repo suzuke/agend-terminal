@@ -29,12 +29,15 @@ ignore = [
     #    dependencies (transitive); no runtime surface. Benign.
     "RUSTSEC-2024-0370", # proc-macro-error — unmaintained, no fix (build-time, benign)
     "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained, no fix (build-time, benign)
-    # ── quick-xml quadratic-time attribute-duplicate check (DoS on untrusted XML
-    #    with many attributes on one tag) — via `plist`, [dev-dependencies] only,
-    #    no runtime exposure in this codebase. UNLIKE the entries above, a fix
-    #    EXISTS (quick-xml >=0.41.0) — this is a TEMPORARY unblock (advisory
-    #    published 2026-07-02, broke every branch's audit job same-day), not a
-    #    permanent no-fix-available entry. Remove once the version-bump
+    # ── quick-xml DoS pair (quadratic-time attribute-duplicate check +
+    #    unbounded namespace-declaration allocation) — via `plist`,
+    #    [dev-dependencies] only, no runtime exposure in this codebase. UNLIKE
+    #    the entries above, a fix EXISTS for both (quick-xml >=0.41.0) — this is
+    #    a TEMPORARY unblock (both advisories published 2026-06-29, surfaced to
+    #    CI same-day 2026-07-02, broke every branch's audit job), not a
+    #    permanent no-fix-available entry. Same advisory batch — check for
+    #    siblings before adding either alone. Remove once the version-bump
     #    follow-up (t-20260702084620067164-14977-32, verifies plist compat) lands.
-    "RUSTSEC-2026-0194", # quick-xml 0.39.4 — DoS-only, dev-dep via plist, fix pending (follow-up filed)
+    "RUSTSEC-2026-0194", # quick-xml 0.39.4 — quadratic attr-dup check, dev-dep via plist, fix pending
+    "RUSTSEC-2026-0195", # quick-xml 0.39.4 — unbounded ns-decl alloc, dev-dep via plist, fix pending
 ]
