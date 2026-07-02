@@ -413,6 +413,7 @@ pub fn render(
     registry: &AgentRegistry,
     telegram: TelegramStatus,
     binary_stale: bool,
+    pending_decisions: usize,
 ) {
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -426,7 +427,14 @@ pub fn render(
     let snapshot = build_agent_state_snapshot(layout, registry);
     render_pane_tree(frame, chunks[1], layout, repeat_mode, registry, &snapshot);
     render_tab_bar(frame, chunks[0], layout, &snapshot);
-    render_status_bar(frame, chunks[2], layout, telegram, binary_stale);
+    render_status_bar(
+        frame,
+        chunks[2],
+        layout,
+        telegram,
+        binary_stale,
+        pending_decisions,
+    );
 }
 
 /// Get the highest-priority state across all panes in a tab.
@@ -886,6 +894,7 @@ pub(super) fn pane_title_segments(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // #2313 RED: per-pane decision marker not yet implemented.
     // #1713/#1523 diagnostic (runtime_config.show_pane_state, default off): append
     // a `[<State>]` text badge of the DETECTED AgentState so the operator can
     // eyeball-verify detection against the live pane. Extra text only — the
@@ -904,6 +913,7 @@ pub(super) fn render_status_bar(
     layout: &Layout,
     telegram: TelegramStatus,
     binary_stale: bool,
+    pending_decisions: usize,
 ) {
     let mut spans = Vec::new();
 
@@ -939,6 +949,16 @@ pub(super) fn render_status_bar(
         spans.push(Span::styled(
             format!(" {total} pane(s) "),
             Style::default().fg(Color::White),
+        ));
+    }
+    // #2313 RED: status-line pending-decisions badge not yet implemented.
+    if false {
+        spans.push(Span::styled(
+            format!(" 🔴 {pending_decisions} decisions pending "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -1019,6 +1039,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 3,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -1030,6 +1051,72 @@ mod tests {
             .map(|(text, _)| text)
             .collect::<String>();
         assert!(joined.contains("[3]"));
+    }
+
+    #[test]
+    fn pane_title_shows_pending_decision_marker_2313() {
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 1,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
+        let joined = segments
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<String>();
+        assert!(
+            joined.contains('🔴'),
+            "pane authoring a pending decision must show the marker: {joined}"
+        );
+    }
+
+    #[test]
+    fn pane_title_no_decision_marker_when_zero_2313() {
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
+        let joined = segments
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<String>();
+        assert!(
+            !joined.contains('🔴'),
+            "no pending decision → no marker: {joined}"
+        );
     }
 
     #[test]
@@ -1048,6 +1135,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -1081,6 +1169,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -1132,6 +1221,7 @@ mod tests {
                 fleet_instance_name: None,
                 last_input_at: None,
                 pending_notification_count: 0,
+                pending_decision_count: 0,
                 selection: None,
                 source: PaneSource::Local,
                 offthread: None,
@@ -1168,6 +1258,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -1185,6 +1276,7 @@ mod tests {
                     &registry,
                     TelegramStatus::NotConfigured,
                     false,
+                    0,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1245,6 +1337,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: Some(handle),
@@ -1266,6 +1359,7 @@ mod tests {
                     &registry,
                     TelegramStatus::NotConfigured,
                     false,
+                    0,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1297,6 +1391,7 @@ mod tests {
                     &layout,
                     TelegramStatus::NotConfigured,
                     false,
+                    0,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1397,6 +1492,7 @@ mod tests {
                     &layout,
                     TelegramStatus::NotConfigured,
                     true,
+                    0,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1428,6 +1524,7 @@ mod tests {
                     &layout,
                     TelegramStatus::NotConfigured,
                     false,
+                    0,
                 );
             })
             .expect("test terminal draw should succeed");
@@ -1441,6 +1538,68 @@ mod tests {
         assert!(
             !text.contains("daemon binary stale"),
             "binary_stale=false must NOT surface warning, got: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_pending_decisions_badge_2313() {
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+        let layout = crate::layout::Layout::new();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                    2,
+                );
+            })
+            .expect("test terminal draw should succeed");
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(
+            text.contains("2 decisions pending"),
+            "pending_decisions=2 must surface the badge, got: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_no_decisions_badge_when_zero_2313() {
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+        let layout = crate::layout::Layout::new();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                    false,
+                    0,
+                );
+            })
+            .expect("test terminal draw should succeed");
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(
+            !text.contains("decisions pending"),
+            "pending_decisions=0 must NOT surface the badge, got: {text}"
         );
     }
 
@@ -1681,6 +1840,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -1736,6 +1896,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -1766,6 +1927,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,

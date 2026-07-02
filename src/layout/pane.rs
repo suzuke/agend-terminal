@@ -49,6 +49,12 @@ pub struct Pane {
     pub last_input_at: Option<Instant>,
     /// Count of pending queued notifications for this pane.
     pub pending_notification_count: usize,
+    /// #2313 P2b: count of decision-board questions (`needs_answer &&
+    /// Pending`) authored by this pane's agent, awaiting an operator answer.
+    /// Refreshed on the same ~1s throttle as `pending_notification_count`
+    /// (see `sync_decision_badge_state` in app/mod.rs) — a passive badge,
+    /// not a notification.
+    pub pending_decision_count: usize,
     /// Active text selection, in absolute scrollback logical coordinates.
     pub selection: Option<Selection>,
     /// Whether input/resize go to a local PTY (via registry) or a remote
@@ -522,6 +528,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
@@ -650,6 +657,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,

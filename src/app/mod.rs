@@ -302,6 +302,11 @@ fn should_draw(
 /// of #2346's draw cap: the scan runs at the loop-body TOP, before `should_draw`.
 const NOTIF_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// #2524 P2b / #2313: same disk-I/O-storm shape as `NOTIF_SYNC_INTERVAL` above,
+/// for the decision-board pending-question badge — throttle to once per second
+/// instead of scanning `decisions/` every wakeup.
+const DECISION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Pure throttle decision (the test seam), mirroring `should_draw`: may we re-scan
 /// the notification queues now? `None` = never scanned (scan the first frame so the
 /// badge is correct at startup); otherwise only once `NOTIF_SYNC_INTERVAL` has
@@ -787,6 +792,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // most once per `NOTIF_SYNC_INTERVAL` instead of once per wakeup (see
     // `should_sync_notifications`). Mirrors `last_draw`'s frame-cap state.
     let mut last_notif_sync: Option<std::time::Instant> = None;
+    // #2524 P2b / #2313: mirrors `last_notif_sync` for the decision-badge throttle.
+    let mut last_decision_sync: Option<std::time::Instant> = None;
+    // #2524 P2b / #2313: fleet-wide pending-decision total, refreshed alongside
+    // `last_decision_sync` below; read at render time by both `render()` call
+    // sites (mirrors how `binary_stale` is snapshotted once per draw).
+    let mut pending_decisions_total: usize = 0;
 
     // #freeze-4 (t-…2324) restart-flood boot phase: at restart every pane carries a
     // pre-restart backlog (its dump enqueues via #freeze-4 A1, plus the post-subscribe
@@ -832,6 +843,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         if should_sync_notifications(last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
             last_notif_sync = Some(notif_now);
             sync_notification_state(&home, &mut layout);
+        }
+        // #2524 P2b / #2313: same throttle idiom, separate cadence state — the
+        // decision-badge scan is independent of the notification scan above.
+        if should_sync_notifications(last_decision_sync, notif_now, DECISION_SYNC_INTERVAL) {
+            last_decision_sync = Some(notif_now);
+            pending_decisions_total = sync_decision_badge_state(&home, &mut layout);
         }
         // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm).
         // std::sync::Mutex is fine here: only the main thread touches this,
@@ -943,6 +960,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     &registry,
                     telegram_status,
                     binary_stale,
+                    pending_decisions_total,
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
@@ -1154,6 +1172,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     &registry,
                                     telegram_status,
                                     binary_stale,
+                                    pending_decisions_total,
                                 );
                                 // Render overlay (same as normal draw path).
                                 render_active_overlay(
@@ -1668,6 +1687,27 @@ fn sync_notification_state(home: &Path, layout: &mut Layout) {
             }
         }
     }
+}
+
+/// #2524 P2b / #2313: refresh the per-pane "you asked something" badge and
+/// return the fleet-wide pending-question total, from ONE
+/// `decisions::count_pending` scan — not one scan per pane (same disk-I/O
+/// shape `sync_notification_state` already documents above).
+fn sync_decision_badge_state(home: &Path, layout: &mut Layout) -> usize {
+    let counts = crate::decisions::count_pending(home);
+    for tab in &mut layout.tabs {
+        let pane_ids = tab.root().pane_ids();
+        for pane_id in pane_ids {
+            if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
+                pane.pending_decision_count = counts
+                    .by_author
+                    .get(pane.agent_name.as_str())
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+    }
+    counts.total
 }
 
 fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
@@ -2841,6 +2881,7 @@ mod tests {
             fleet_instance_name: None,
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
