@@ -94,6 +94,7 @@ Operator-side housekeeping subcommands. Destructive paths prompt `[y/N]` unless 
 ```
 agend-terminal admin cleanup-branches [--yes]
 agend-terminal admin cleanup-zombies [--age <DURATION>] [--yes]
+agend-terminal admin task-sweep-config [--repository <SLUG>] [--pause|--resume] [--dry-run|--no-dry-run] [--api-base-url <URL>]
 ```
 
 #### `admin cleanup-zombies` (#927)
@@ -118,6 +119,15 @@ Exit codes:
 #### `admin cleanup-branches`
 
 Delete local branches whose PRs have been merged (squash-merge safe). Default is dry-run (preview only); `--yes` actually deletes. See `docs/RCA-*` notes for the squash-merge detection heuristic.
+
+#### `admin task-sweep-config` (#2547)
+
+View or configure the GitHub-PR auto-close sweep daemon (polls merged PRs and emits `Done` events for `Closes t-XXX-N` markers). Moved here from the `task_sweep_config` MCP tool — operator-only setting, zero agent calls in 20 days. With no flags, prints the current config unchanged.
+
+- `--repository <owner/repo>` — GitHub slug to sweep. Empty string disables.
+- `--pause` / `--resume` — pause/resume the sweep tick (mutually exclusive).
+- `--dry-run` / `--no-dry-run` — log decisions without emitting events, or emit for real (mutually exclusive).
+- `--api-base-url <URL>` — REST API base for self-hosted GitHub Enterprise. Empty string resets to `https://api.github.com`.
 
 ### `connect`
 Register an *already-running* local agent with the daemon (inbox-only — no PTY management). Useful in headless environments or to mix a manually-launched CLI into a running fleet.

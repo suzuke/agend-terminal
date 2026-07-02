@@ -241,7 +241,7 @@ pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, t
             .any(|entry| entry.name == tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 35] = [
+static ALL_TOOLS: [ToolEntry; 33] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -350,12 +350,6 @@ static ALL_TOOLS: [ToolEntry; 35] = [
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
-        name: "task_sweep_config",
-        definition: super::tools::def_task_sweep_config,
-        handler: super::handlers::dispatch::dispatch_task_sweep_config,
-        class: ToolClass::SIDE_EFFECT,
-    },
-    ToolEntry {
         name: "restart_daemon",
         definition: super::tools::def_restart_daemon,
         handler: super::handlers::dispatch::dispatch_restart_daemon,
@@ -381,13 +375,6 @@ static ALL_TOOLS: [ToolEntry; 35] = [
         definition: super::tools::def_deployment,
         handler: super::handlers::dispatch::dispatch_deployment,
         class: ToolClass::SLOW_SIDE_EFFECT,
-    },
-    // ── Ephemeral workers (#1967 Phase-1) ──
-    ToolEntry {
-        name: "ephemeral",
-        definition: super::tools::def_ephemeral,
-        handler: super::handlers::dispatch::dispatch_ephemeral,
-        class: ToolClass::SIDE_EFFECT,
     },
     // ── CI ──
     ToolEntry {
@@ -485,12 +472,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_35_byte_identical() {
+    fn full_capability_roles_surface_all_33_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            35,
-            "registry baseline is 35 tools (#2547: replace_instance folded into restart_instance mode=fresh; set_display_name/set_description merged into set_metadata)"
+            33,
+            "registry baseline is 33 tools (#2547: replace_instance folded into restart_instance mode=fresh; set_display_name/set_description merged into set_metadata; ephemeral tool + task_sweep_config removed from registry)"
         );
         for role in [
             None,
@@ -502,7 +489,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 35 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 33 tools in registry order (default-all-open)"
             );
         }
     }

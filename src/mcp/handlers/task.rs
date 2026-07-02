@@ -79,10 +79,6 @@ pub(super) fn handle_task(home: &Path, args: &Value, instance_name: &str) -> Val
     crate::tasks::handle(home, instance_name, args)
 }
 
-pub(super) fn handle_task_sweep_config(home: &Path, args: &Value) -> Value {
-    crate::daemon::task_sweep::handle_task_sweep_config(home, args)
-}
-
 pub(super) fn handle_create_team(home: &Path, args: &Value) -> Value {
     match crate::api::call(
         home,

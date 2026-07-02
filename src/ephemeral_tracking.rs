@@ -22,6 +22,13 @@
 //! - **Max-wall-TTL** ([`DEFAULT_WALL_TTL_SECS`], clamped to [`MAX_WALL_TTL_SECS`]):
 //!   the reap sweep terminates any worker whose wall clock exceeds its `ttl_secs`,
 //!   so a wedged/forgotten worker cannot run (and bill) unbounded.
+//!
+//! ephemeral MCP surface retired in #2547; spawn path retained pending #2548 P1
+//! decision (#1967 Phase-1 infra). Only `reap_sweep`, `reap_on_boot`, and
+//! `live_children_snapshot` are still reachable from production `main()` — the
+//! rest is unreachable there but remains fully exercised by this file's own
+//! test suite.
+#![allow(dead_code)]
 
 use crate::store::SchemaVersioned;
 use parking_lot::Mutex;
