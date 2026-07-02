@@ -608,12 +608,8 @@ mod tests_2525 {
         use std::sync::atomic::{AtomicU32, Ordering};
         static C: AtomicU32 = AtomicU32::new(0);
         let id = C.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-2525-{}-{}-{}",
-            tag,
-            std::process::id(),
-            id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agend-2525-{}-{}-{}", tag, std::process::id(), id));
         std::fs::create_dir_all(&dir).ok();
         dir
     }
