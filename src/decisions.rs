@@ -602,9 +602,29 @@ pub fn answer(home: &Path, caller: &str, args: &Value) -> Value {
 /// under the lock (e.g. the operator answered it in the race window),
 /// mirroring `answer`'s own re-check-under-lock shape. Returns
 /// `(author, title)` on success, for the caller's notification text.
-pub(crate) fn auto_answer_timeout(_home: &Path, _id: &str) -> Option<(String, String)> {
-    // #2313 RED: not yet implemented.
-    None
+pub(crate) fn auto_answer_timeout(home: &Path, id: &str) -> Option<(String, String)> {
+    let locked = with_decision_lock(home, id, || -> Option<(String, String)> {
+        let path = decision_path(home, id);
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut decision: Decision = serde_json::from_str(&content).ok()?;
+        if decision.status != Some(DecisionStatus::Pending) {
+            return None;
+        }
+        let default_label = decision.timeout_default.clone()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        decision.answer = Some(default_label);
+        decision.answered_by = Some("timeout-default".to_string());
+        decision.answered_at = Some(now.clone());
+        decision.status = Some(DecisionStatus::Answered);
+        decision.updated_at = now;
+        decision.schema_version = SCHEMA_VERSION;
+        if crate::store::save_atomic(&path, &decision).is_ok() {
+            Some((decision.author.clone(), decision.title.clone()))
+        } else {
+            None
+        }
+    });
+    locked.ok().flatten()
 }
 
 #[cfg(test)]
