@@ -76,7 +76,7 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         // direct API read / normal methods
         | "list" | "inject" | "status" | "register_external"
         | "deregister_external" | "mcp_tools_list" | "set_blocked_reason"
-        | "clear_blocked_reason" | "verify_push" => AlwaysAllow,
+        | "clear_blocked_reason" => AlwaysAllow,
 
         // ── Action-bearing tools: read actions allow, mutating actions never ──
         "mode" => match action {

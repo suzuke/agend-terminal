@@ -150,7 +150,9 @@ Replaced PR1's fake `/bin/sleep` child with a REAL headless process. Key choices
   `headless::resolve_headless_command` reuses the SAME single-source helpers
   (`which` / `preset_spawn_args` / `spawn_flags` / `agent::resolve_child_env`) →
   no argv/isolation drift; `build_command` is untouched (zero PTY regression).
-- **`HeadlessTransport`** (`src/headless.rs`) = lifecycle only (`spawn` + `cancel`);
+- **`HeadlessTransport`** (`src/headless.rs`, HISTORICAL — this file was
+  removed in #2547 as dead code, zero callers ever wired up; superseded by
+  the ephemeral Route B PTY path) = lifecycle only (`spawn` + `cancel`);
   the ACP protocol methods (handshake/prompt/stream) are PR3. Captured stdin/
   stdout/stderr pipes ride on `HeadlessHandle` for PR3.
 - **Admission BEFORE spawn** (r4 PR1 note): `reserve → spawn → finalize`.
@@ -179,8 +181,9 @@ SECURITY prerequisite:
 5. terminal env (`TERM`/`COLORTERM`/`FORCE_COLOR`) + git-editor env
    (`GIT_EDITOR`/`GIT_SEQUENCE_EDITOR`/`EDITOR`/`VISUAL`) + `LANG`.
 
-(The same list is duplicated at the top of `src/headless.rs` so it is visible
-from the spawn site.)
+(HISTORICAL: this list was duplicated at the top of `src/headless.rs` so it
+was visible from the spawn site — that file was removed in #2547 as dead
+code, never reached by PR3, so the duplication no longer exists.)
 
 ### Windows posture
 The headless spawn (`std::process`) + `process::terminate` (TerminateProcess) are

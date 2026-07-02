@@ -216,9 +216,12 @@ for removal — dead shadow infra is worse than no infra.
   `src/daemon/per_tick/hang_detection.rs` (`rg "check_hang(" src/daemon`).
 - `src/behavioral.rs` — `ProductivitySignal`, `ProductivitySource`,
   `ProductivityConfig`, `config_for_productivity`, `infer_productivity`,
-  `log_productivity_telemetry`. Parallel to `BehavioralSignal` /
-  `BehavioralConfig` / `infer_from_silence` / `log_shadow_telemetry`
-  (Sprint 27 PR-A — silence-side equivalents).
+  `log_productivity_telemetry`. HISTORICAL: originally designed parallel to
+  the Sprint 27 PR-A silence-side equivalents (`BehavioralSignal` /
+  `infer_from_silence` / `log_shadow_telemetry`) — those were removed in
+  #2547 as dead code (zero external references, live consumer already
+  retired); `BehavioralConfig` itself is kept (still populated/read by
+  `backend_profile.rs`).
 - `docs/RECOVERY-STAGES.md` — `#685` Phase 2 staged auto-recovery
   dispatcher reads `productive_silence_exceeds` helper (extracted
   from `check_hang`) directly to decide Stage 1 alive-stuck vs

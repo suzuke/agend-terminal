@@ -942,29 +942,6 @@ fn usagelimit_banner_adjacent(flat: &str, matched: &str) -> bool {
     has_box && has_reset
 }
 
-/// #1562: best-effort append of one JSON record as a single `line\n` to `path`,
-/// creating parent dirs / the file as needed. Returns `Err` for the caller to
-/// log; never panics. The single small `write_all` relies on `O_APPEND`
-/// atomicity so concurrent appenders don't interleave within a record.
-/// `pub(crate)` so the shadow-telemetry family (e.g. `daemon::recovery_shadow`)
-/// shares the one append helper.
-pub(crate) fn append_jsonl(
-    path: &std::path::Path,
-    record: &serde_json::Value,
-) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
-    line.push('\n');
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(line.as_bytes())
-}
-
 impl StateTracker {
     /// Max time a self-expiring active state (Thinking / ToolUse) may stay
     /// latched when the screen keeps updating but no pattern matches on it.

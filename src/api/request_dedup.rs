@@ -626,8 +626,8 @@ pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
         }
 
         // Middle band — covers `send`, `inject`, `kill`, `delete`,
-        // `verify_push`, and any future method not yet classified.
-        m::SEND | m::INJECT | m::KILL | m::DELETE | m::VERIFY_PUSH => DEFAULT_TOOL_TIMEOUT,
+        // and any future method not yet classified.
+        m::SEND | m::INJECT | m::KILL | m::DELETE => DEFAULT_TOOL_TIMEOUT,
 
         // Unknown / unmapped — fall back to the conservative default.
         _ => DEFAULT_WAIT_TIMEOUT,

@@ -44,7 +44,6 @@ mod fleet;
 mod framing;
 mod git_helpers;
 mod github_token;
-mod headless;
 mod health;
 mod identity;
 mod image_paste;

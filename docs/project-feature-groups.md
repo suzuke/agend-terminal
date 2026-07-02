@@ -307,7 +307,6 @@ Task/event persistence, API layer, diagnostics, and utilities.
 | `src/api/handlers/team.rs` | 242 | API team handlers |
 | `src/api/handlers/query.rs` | 77 | API query handlers |
 | `src/api/handlers/external.rs` | 58 | External API handlers |
-| `src/api/handlers/verify_push.rs` | 27 | Push verification |
 | `src/api/handlers/mcp_proxy.rs` | 109 | MCP proxy handler |
 | `src/api/handlers/mod.rs` | 119 | API handler module root |
 | `src/api/request_dedup.rs` | 941 | API request deduplication |

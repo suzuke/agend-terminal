@@ -98,7 +98,12 @@ pub enum HookResolution {
     /// The last event is older than [`HOOK_FRESHNESS`] (or was never
     /// state-mapped) — consumers fall back to the screen heuristic.
     Stale,
-    /// No hook event ever recorded for this agent.
+    /// No hook event ever recorded for this agent. Only reachable through
+    /// the test-only [`resolved_state_for`] wrapper — production callers go
+    /// through `snapshot_for`/`resolve_snapshot` directly and handle the
+    /// `None` case themselves (#2547: `resolved_state_for`'s sole production
+    /// caller, `recovery_shadow.rs`, was deleted as dead code).
+    #[cfg(test)]
     Unknown,
 }
 
@@ -132,7 +137,12 @@ pub enum HookResolution {
 /// `SessionStart` on the next restart clears a stuck observation, and the
 /// `#hook-shadow` log keeps it operator-visible. The trade is a DEFINITELY-fixed
 /// false-nudge against a missed-nudge only on a double-drop corner — worth it.
-pub fn resolved_state_for(name: &str) -> HookResolution {
+// #2547: production-dead (sole caller `recovery_shadow.rs` deleted) — kept
+// as a test-only convenience wrapper for the freshness-window regression
+// tests below, which exercise the same `resolve_snapshot` logic production
+// code still calls directly (e.g. `fresh_active_hook_seq`).
+#[cfg(test)]
+fn resolved_state_for(name: &str) -> HookResolution {
     match snapshot_for(name) {
         Some(snap) => resolve_snapshot(&snap),
         None => HookResolution::Unknown,
@@ -217,9 +227,10 @@ pub fn is_promoted(backend_command: &str) -> bool {
 // (`per_tick/snapshot.rs`, gated by `shadow::operated_dispatch_enabled` + the shared
 // `shadow::gate`). The rest of this module's hook-shadow STORE stays LIVE: it feeds
 // supervisor hang/recovery (`fresh_active_hook_seq`/`latest_hook_seq`/`record_event`),
-// `inject_delivery` (`last_user_prompt_submit_for`), `recovery_shadow`/`divergence_telemetry`
-// (`resolved_state_for`), and `hook_event` (`is_promoted`) — so `AGEND_HOOK_STATE_POC`,
-// `promotion_enabled`, and `is_promoted` are intentionally KEPT (they are not the dead POC).
+// `inject_delivery` (`last_user_prompt_submit_for`), and `hook_event` (`is_promoted`) —
+// so `AGEND_HOOK_STATE_POC`, `promotion_enabled`, and `is_promoted` are intentionally
+// KEPT (they are not the dead POC). `resolved_state_for` (its `recovery_shadow`
+// consumer removed in #2547) is now #[cfg(test)]-only — see its own doc comment.
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
