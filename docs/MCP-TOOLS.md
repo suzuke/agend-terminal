@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (37 tools)
+# AgEnD MCP Tools Reference (36 tools)
 
 ## Action-based Tools
 
@@ -88,13 +88,8 @@ Stop and remove an instance.
 Start a stopped instance.
 - **instance**: instance to start
 
-### `replace_instance`
-Replace an instance with a fresh one.
-- **instance**: instance to replace
-- reason
-
 ### `restart_instance`
-Kill and restart an instance. Default mode `resume` preserves conversation state; `fresh` starts clean (like `replace_instance`).
+Kill and restart an instance. Default mode `resume` preserves conversation state; `fresh` starts clean.
 - **instance**: instance to restart
 - mode (resume / fresh), reason, force
 - `fresh` refuses by default if the bound worktree has uncommitted changes (#2476); commit/push or leave a task-board handoff first, or pass `force: true`.

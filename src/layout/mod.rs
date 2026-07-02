@@ -28,8 +28,8 @@ pub enum MovePlacement {
 }
 
 /// #1939: full placement of an agent's pane at removal time. Extends the
-/// #1431 tab-name-only memory so a `SameTab` respawn (replace_instance /
-/// restart_instance) restores the pane's position, not just its tab.
+/// #1431 tab-name-only memory so a `SameTab` respawn (restart_instance)
+/// restores the pane's position, not just its tab.
 pub struct RemovedPanePlacement {
     pub tab_name: String,
     /// Index the tab occupied — re-inserts a recreated tab in place when the
@@ -60,9 +60,8 @@ pub struct Layout {
     pub tab_reorder_target: Option<usize>,
     /// #1431/#1939: placement an agent's pane occupied at removal time, keyed
     /// by agent name. Recorded on pane removal and consumed by a subsequent
-    /// `LayoutHint::SameTab` spawn (replace_instance / restart_instance) so
-    /// the new pane returns to its original position. Bounded by distinct
-    /// agent names.
+    /// `LayoutHint::SameTab` spawn (restart_instance) so the new pane
+    /// returns to its original position. Bounded by distinct agent names.
     removed_pane_memory: HashMap<String, RemovedPanePlacement>,
 }
 

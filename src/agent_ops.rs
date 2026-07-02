@@ -558,7 +558,7 @@ pub fn spawn_one(
     std::fs::create_dir_all(work_dir).ok();
     // #1080: skills auto-install for dynamically spawned instances.
     // spawn_one is the SPAWN-RPC choke point — without this, instances
-    // created via create_instance / start_instance / replace_instance
+    // created via create_instance / start_instance / restart_instance
     // never get skill symlinks (only cold-boot spawn_and_register_agent
     // called install_for_agent). Respects fleet.yaml `instance.<name>.skills:`
     // allowlist, same as cold-boot path.

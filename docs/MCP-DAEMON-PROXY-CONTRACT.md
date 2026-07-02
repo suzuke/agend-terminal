@@ -75,7 +75,7 @@ Tools are classified into 3 tiers:
 |------|---------|-------|
 | Fast | 5s | inbox, describe_message, list_instances, list_teams, list_decisions, etc. |
 | Default | 30s | send_to_instance, delegate_task, task, and all others |
-| Slow | 60s | create_instance, deploy_template, replace_instance, watch_ci, checkout_repo |
+| Slow | 60s | create_instance, deploy_template, restart_instance, watch_ci, checkout_repo |
 
 Timeout is enforced in `handle_mcp_tool` via a scoped thread + `mpsc::recv_timeout`. A timed-out tool returns a structured error; the API session stays alive for subsequent calls.
 

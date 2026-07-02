@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（37 個工具）
+# AgEnD MCP Tools Reference — 工具參考（36 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -88,13 +88,8 @@
 啟動一個已停止的 instance。
 - **instance**: 要啟動的 instance
 
-### `replace_instance`
-以全新的 instance 取代既有的 instance。
-- **instance**: 要取代的 instance
-- reason
-
 ### `restart_instance`
-終止並重啟一個 instance。預設模式 `resume` 會保留對話狀態；`fresh` 則從乾淨狀態啟動（等同 `replace_instance`）。
+終止並重啟一個 instance。預設模式 `resume` 會保留對話狀態；`fresh` 則從乾淨狀態啟動。
 - **instance**: 要重啟的 instance
 - mode (resume / fresh), reason, force
 - `fresh` 預設會在 bound worktree 有未提交變更時拒絕（#2476）；請先 commit/push 或留下 task-board handoff，或傳 `force: true`。

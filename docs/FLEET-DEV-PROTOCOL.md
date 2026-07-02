@@ -560,7 +560,7 @@ Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml o
 | < 20 min | Normal. `describe_instance` — fresh heartbeat = agent active. |
 | 20 min, heartbeat fresh | Agent working. Extend wait. |
 | 20 min, heartbeat stale (>120s) | Ping via `send` with direct question. |
-| 20 min, no response to ping | `replace_instance` and re-dispatch. |
+| 20 min, no response to ping | `restart_instance mode=fresh` and re-dispatch. |
 
 **Backend modifiers**:
 - kiro-cli: 1-2h longer wait (context compaction self-heals); escalate to operator rather than `interrupt`
@@ -732,7 +732,7 @@ Use `$AGEND_INSTANCE_NAME` for the instance and your resolved backend/model. Ski
 | Wait state | `set_waiting_on` | prose |
 | Health check | `describe_instance` | guessing |
 | Schedule | `schedule(action: create)` | backend-specific tools |
-| Timeout | `replace_instance` | waiting forever |
+| Timeout | `restart_instance mode=fresh` | waiting forever |
 
 **Daemon-state error format (Sprint 54 #488 hotfix)**. Tools that
 depend on daemon-resident state — `reply`,

@@ -130,13 +130,8 @@ pub(crate) fn def_start_instance() -> Value {
         "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to start"}}, "required": ["instance"]}})
 }
 
-pub(crate) fn def_replace_instance() -> Value {
-    json!({"name": "replace_instance", "description": "Replace an instance with a fresh one.",
-        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to replace"}, "reason": {"type": "string"}}, "required": ["instance"]}})
-}
-
 pub(crate) fn def_restart_instance() -> Value {
-    json!({"name": "restart_instance", "description": "Kill and restart an instance. Default mode 'resume' preserves conversation state; 'fresh' starts clean (like replace_instance).",
+    json!({"name": "restart_instance", "description": "Kill and restart an instance. Default mode 'resume' preserves conversation state; 'fresh' starts clean.",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to restart"},
             "mode": {"type": "string", "enum": ["resume", "fresh"], "default": "resume", "description": "resume = keep conversation (--continue/--resume); fresh = clean start"},
@@ -685,9 +680,10 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            37,
+            36,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
-             + ephemeral (#1967 Phase-1) = 37. Current tools: {:?}",
+             + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
+             restart_instance mode=fresh) = 36. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1106,9 +1102,7 @@ mod tests {
             ("create_instance", "role", "instance_state/spawn.rs fleet.yaml role"),
             ("create_instance", "env", "instance_state/spawn.rs per-instance env (#900)"),
             ("create_instance", "topic_binding", "instance_state/spawn.rs telegram topic binding"),
-            // ── replace_instance / restart_instance ──
-            ("replace_instance", "instance", "mcp/handlers/instance.rs replace target"),
-            ("replace_instance", "reason", "mcp/handlers/instance.rs handover message + event"),
+            // ── restart_instance ──
             ("restart_instance", "instance", "mcp/handlers/instance.rs restart target"),
             ("restart_instance", "mode", "mcp/handlers/instance.rs restart_spawn_params --continue/--resume"),
             ("restart_instance", "reason", "mcp/handlers/instance.rs restart event"),
@@ -1169,7 +1163,6 @@ mod tests {
             "health",
             "set_waiting_on",
             "create_instance",
-            "replace_instance",
             "restart_instance",
             "watchdog",
             "config",

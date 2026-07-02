@@ -13,7 +13,7 @@
 
 AgEnD Terminal 是一個**單一 operator、零基礎設施、即時控制層**，用來指揮一支 AI coding CLI
 艦隊。它的可防禦護城河，是幾乎沒有任何競品能同時具備的組合：**即時 operator-in-the-loop 控制**
-（多 pane TUI、`interrupt`、`pane_snapshot`、`replace_instance`）+ **結構化 review chain**
+（多 pane TUI、`interrupt`、`pane_snapshot`、`restart_instance`）+ **結構化 review chain**
 （VERIFIED/REJECTED 裁決、對 diff 驗證的 claim-verify trailer、自動派發 reviewer）+
 **帶政策閘的 git-worktree 隔離**（per-branch flock lease、HMAC 簽章 binding、`agend-git`
 deny matrix）+ **崩潰重啟並 resume 對話**——全部裝進三個自包含的 Rust binary，搭配 file-based
@@ -290,7 +290,7 @@ graph LR
 ## 7. AgEnD 的護城河（幾乎沒有競品能同時具備）
 
 1. **即時 operator-in-the-loop 控制**——多 pane TUI、`pane_snapshot`、`interrupt`、
-   `replace_instance`。雲端 agent 與函式庫框架沒有可比物；它們只在 PR 階段審查。
+   `restart_instance`。雲端 agent 與函式庫框架沒有可比物；它們只在 PR 階段審查。
 2. **結構化 review chain**——VERIFIED/REJECTED/UNVERIFIED 裁決、對 diff 驗證的 claim-verify trailer
    （`claim_verifier.rs`：syn-AST test 名稱抽取 + scope 比對）、自動派發 reviewer、dual-review、
    evidence block。十三個競品沒有任何一個有這個。

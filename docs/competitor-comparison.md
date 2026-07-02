@@ -19,7 +19,7 @@
 AgEnD Terminal is a **single-operator, zero-infra, real-time control layer** for a
 fleet of AI coding CLIs. Its defensible moat is the combination almost no
 competitor has at once: **live operator-in-the-loop control** (multi-pane TUI,
-`interrupt`, `pane_snapshot`, `replace_instance`) + a **structured review chain**
+`interrupt`, `pane_snapshot`, `restart_instance`) + a **structured review chain**
 (VERIFIED/REJECTED verdicts, claim-verify trailers checked against the diff,
 auto-dispatched reviewer) + **git-worktree isolation with a policy gate**
 (per-branch flock lease, HMAC-signed binding, the `agend-git` deny matrix) +
@@ -368,7 +368,7 @@ chain + recovery; their lessons are concrete and cheap.
 ## 7. AgEnD's moat (what almost no competitor has at once)
 
 1. **Live operator-in-the-loop control** — multi-pane TUI, `pane_snapshot`,
-   `interrupt`, `replace_instance`. Cloud agents and library frameworks have nothing
+   `interrupt`, `restart_instance`. Cloud agents and library frameworks have nothing
    comparable; they review only at the PR.
 2. **Structured review chain** — VERIFIED/REJECTED/UNVERIFIED verdicts, claim-verify
    trailers checked against the diff (`claim_verifier.rs`: syn-AST test-name

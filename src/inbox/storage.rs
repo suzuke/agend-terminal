@@ -734,16 +734,16 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
 /// revert them to `unread` for re-delivery.
 ///
 /// Called by the daemon when an agent's session is **intentionally reset** —
-/// `replace_instance` or `restart_instance mode=fresh` — where the agent's
-/// context is known to be lost. The old session already drained these messages
-/// (they are `delivering`), so treating them as "delivered and processed" is
-/// correct: re-injecting them into a fresh, context-less session would cause
-/// the stale-resend pattern (agend-customization#159).
+/// `restart_instance mode=fresh` — where the agent's context is known to be
+/// lost. The old session already drained these messages (they are
+/// `delivering`), so treating them as "delivered and processed" is correct:
+/// re-injecting them into a fresh, context-less session would cause the
+/// stale-resend pattern (agend-customization#159).
 ///
 /// This does NOT break #2299's at-least-once guarantee for crashes: an
 /// unintentional interruption (OOM, kill -9, backend crash) never reaches this
-/// code path — only the explicit `replace_instance` / `restart mode=fresh`
-/// handlers call it — so `reclaim_stale_delivering` still recovers those.
+/// code path — only the explicit `restart mode=fresh` handler calls it — so
+/// `reclaim_stale_delivering` still recovers those.
 ///
 /// `restart_instance mode=resume` deliberately does NOT call this: the resumed
 /// session retains context and the implicit next-drain ack (A) handles it.

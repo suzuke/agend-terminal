@@ -334,111 +334,11 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
     }
 }
 
-/// #2547: `replace_instance` is `restart_instance mode=fresh` plus one
-/// unique value-add — a `[handover]` inbox message carrying the previous
-/// instance's last-known state/health and the replacement reason, which
-/// `restart_instance` has no notion of. Builds that message, then delegates
-/// the actual kill+respawn to `handle_restart_instance` so replace inherits
-/// its guards (#2476 uncommitted-worktree refusal) and self-kick arming
-/// verbatim instead of a second, drifting implementation.
-pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
-    let name = match super::require_instance(args) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    crate::validate_name_or_err!(name);
-    let reason = args["reason"].as_str().unwrap_or("manual replacement");
-
-    // Capture live status for the handover message BEFORE the delegated
-    // restart kills the old process — this is replace_instance's only
-    // behavior restart_instance doesn't already provide.
-    let list_resp = crate::api::call(home, &json!({"method": crate::api::method::LIST}));
-    let handover = list_resp
-        .ok()
-        .and_then(|resp| {
-            resp["result"]["agents"]
-                .as_array()?
-                .iter()
-                .find(|a| a["name"].as_str() == Some(name))
-                .map(|a| {
-                    format!(
-                        "Previous instance state: {}, health: {}. Replaced due to: {reason}",
-                        a["agent_state"].as_str().unwrap_or("unknown"),
-                        a["health_state"].as_str().unwrap_or("unknown")
-                    )
-                })
-        })
-        .unwrap_or_else(|| format!("Replaced due to: {reason}"));
-
-    persist_or_log!(
-        crate::inbox::enqueue(
-            home,
-            name,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                delivering_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                force_meta: None,
-                correlation_id: None,
-                reviewed_head: None,
-                from: "system:replace".to_string(),
-                text: format!("[handover] {handover}"),
-                kind: Some("handover".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                delivery_mode: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-                pr_number: None,
-                terminal: None,
-            },
-        ),
-        "replace_instance_handover",
-        name
-    );
-
-    // Delegate kill+respawn to restart(fresh): same DELETE(no_wait)+SPAWN
-    // shape, plus the #2476 uncommitted-worktree guard and self-kick arming
-    // this handler never had. `force` forwards so a replace on a dirty bound
-    // worktree behaves exactly like an equivalent fresh restart.
-    let restart_resp = handle_restart_instance(
-        home,
-        &json!({
-            "instance": name,
-            "mode": "fresh",
-            "reason": reason,
-            "force": args.get("force").cloned().unwrap_or(Value::Bool(false)),
-        }),
-    );
-    if restart_resp.get("error").is_some() {
-        return restart_resp;
-    }
-    let spawned = restart_resp
-        .get("spawned")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    tracing::info!(%name, %reason, %spawned, "replace_instance");
-    json!({"name": name, "reason": reason, "spawned": spawned})
-}
-
-/// #1625: assemble the SPAWN params for a restart. Mirrors replace_instance by
-/// tagging `layout: same-tab` so the respawned pane returns to the tab the
-/// killed pane occupied (recorded on its DELETE) instead of opening a fresh
-/// tab. `mode` only toggles backend resume args — placement is identical for
-/// resume and fresh restarts — so the hint is applied unconditionally.
+/// #1625: assemble the SPAWN params for a restart. Tags `layout: same-tab` so
+/// the respawned pane returns to the tab the killed pane occupied (recorded
+/// on its DELETE) instead of opening a fresh tab. `mode` only toggles backend
+/// resume args — placement is identical for resume and fresh restarts — so
+/// the hint is applied unconditionally.
 fn restart_spawn_params(
     name: &str,
     backend_command: &str,
