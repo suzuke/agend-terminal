@@ -506,6 +506,32 @@ enum AdminCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// #2547: view/configure the GitHub-PR auto-close sweep daemon. Moved from
+    /// the `task_sweep_config` MCP tool (zero calls in 20 days) — this is an
+    /// operator-only setting, not something agents coordinate around. With no
+    /// flags, prints the current config unchanged.
+    TaskSweepConfig {
+        /// GitHub `owner/repo` slug to sweep. Pass an empty string to disable.
+        #[arg(long)]
+        repository: Option<String>,
+        /// Pause the sweep tick.
+        #[arg(long, conflicts_with = "resume")]
+        pause: bool,
+        /// Resume the sweep tick.
+        #[arg(long)]
+        resume: bool,
+        /// Log decisions without emitting events.
+        #[arg(long, conflicts_with = "no_dry_run")]
+        dry_run: bool,
+        /// Disable dry-run (emit events for real).
+        #[arg(long)]
+        no_dry_run: bool,
+        /// REST API base URL for self-hosted GitHub Enterprise (e.g.
+        /// `https://ghe.example.com/api/v3`). Pass an empty string to reset to
+        /// the default `https://api.github.com`.
+        #[arg(long)]
+        api_base_url: Option<String>,
+    },
 }
 
 /// Issue #704: passive capture subcommands.
@@ -1251,6 +1277,37 @@ fn main() -> anyhow::Result<()> {
                     );
                     std::process::exit(2);
                 }
+            }
+            AdminCommands::TaskSweepConfig {
+                repository,
+                pause,
+                resume,
+                dry_run,
+                no_dry_run,
+                api_base_url,
+            } => {
+                let mut args = serde_json::json!({});
+                if let Some(repo) = repository {
+                    args["repository"] = serde_json::json!(repo);
+                }
+                if pause {
+                    args["pause"] = serde_json::json!(true);
+                } else if resume {
+                    args["pause"] = serde_json::json!(false);
+                }
+                if dry_run {
+                    args["dry_run"] = serde_json::json!(true);
+                } else if no_dry_run {
+                    args["dry_run"] = serde_json::json!(false);
+                }
+                if let Some(url) = api_base_url {
+                    args["api_base_url"] = serde_json::json!(url);
+                }
+                let result = daemon::task_sweep::handle_task_sweep_config(&home, &args);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+                );
             }
         },
         Some(Commands::Capture { action }) => match action {

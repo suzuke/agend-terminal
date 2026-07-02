@@ -123,7 +123,7 @@ change between minor versions.
 | Antigravity CLI (`agy`) backend | Experimental | Newer ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)); workspace-link shim |
 | Shadow Observer state plane | Experimental | Additive, observe-only ([#2413](https://github.com/suzuke/agend-terminal/issues/2413)); kill-switch `AGEND_SHADOW_OBSERVER=0` |
 | CI watch + PR auto-close sweep | Experimental | GitHub / GitLab / Bitbucket pollers |
-| Ephemeral cross-backend workers | Experimental · opt-in | `ephemeral` tool; real backend gated by `AGEND_EPHEMERAL_REAL_BACKEND` |
+| Ephemeral cross-backend workers | Experimental · opt-in, no MCP surface | #2547: `ephemeral` MCP tool retired (zero calls); tracking/reap infra retained pending #2548 P1. Real backend gated by `AGEND_EPHEMERAL_REAL_BACKEND` |
 | Discord channel | Experimental · opt-in | `--features discord` |
 | Menu-bar tray | Experimental · opt-in | `--features tray` |
 

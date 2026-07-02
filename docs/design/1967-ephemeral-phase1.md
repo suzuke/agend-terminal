@@ -50,8 +50,14 @@ Abstraction: `HeadlessTransport` trait (handshake / send-prompt / stream-events 
 cancel); ACP impl first.
 
 ## 3. Ephemeral lifecycle (spawn/reap MCP API)
+**#2547 update (P0 cleanup):** the `ephemeral` MCP tool described below was
+retired from the registry (zero calls in 20 days) — `mcp/handlers/ephemeral.rs`
+was deleted. The `ephemeral_tracking`/`ephemeral_driver` module body (below)
+stays intact pending #2548 P1's decision on how/whether to re-expose spawn.
+
 MCP tool `ephemeral` (mirrors the action-tool scaffold — `mcp/registry.rs:146`
-ALL_TOOLS + `mcp/tools.rs def_*` + `mcp/handlers/dispatch.rs:171 action_adapter!`):
+ALL_TOOLS + `mcp/tools.rs def_*` + `mcp/handlers/dispatch.rs:171 action_adapter!`),
+as originally built (historical — see the #2547 note above):
 - `spawn {backend, prompt, workflow_id, parent?, ttl_secs?, token_budget?}` → worker_id + pid
 - `list {workflow_id?}` → running workers + age + phase + tokens
 - `reap {worker_id? | workflow_id? | all_stale}` → reaped / still-running

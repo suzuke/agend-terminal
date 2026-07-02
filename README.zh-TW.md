@@ -118,7 +118,7 @@ graph LR
 | Antigravity CLI（`agy`）backend | Experimental | 較新（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）；workspace-link shim |
 | Shadow Observer 狀態層 | Experimental | 附加、唯讀觀測（[#2413](https://github.com/suzuke/agend-terminal/issues/2413)）；kill-switch `AGEND_SHADOW_OBSERVER=0` |
 | CI 監看 + PR 自動關閉 sweep | Experimental | GitHub／GitLab／Bitbucket poller |
-| 跨 backend ephemeral worker | Experimental · opt-in | `ephemeral` 工具；真 backend 由 `AGEND_EPHEMERAL_REAL_BACKEND` 把關 |
+| 跨 backend ephemeral worker | Experimental · opt-in，無 MCP 介面 | #2547：`ephemeral` MCP 工具已退場（零呼叫）；tracking／reap 基礎設施保留待 #2548 P1。真 backend 由 `AGEND_EPHEMERAL_REAL_BACKEND` 把關 |
 | Discord channel | Experimental · opt-in | `--features discord` |
 | 選單列 tray | Experimental · opt-in | `--features tray` |
 

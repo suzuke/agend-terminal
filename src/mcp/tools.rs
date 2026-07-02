@@ -249,17 +249,6 @@ pub(crate) fn def_task() -> Value {
         }, "required": ["action"]}})
 }
 
-pub(crate) fn def_task_sweep_config() -> Value {
-    json!({"name": "task_sweep_config",
-    "description": "Configure GitHub-PR auto-close sweep daemon. Sweep polls merged PRs and emits Done events for `Closes t-XXX-N` markers (validated by 5-must-have pipeline).",
-    "inputSchema": {"type": "object", "properties": {
-        "repository": {"type": "string", "description": "GitHub `owner/repo` slug to sweep (empty string disables)"},
-        "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
-        "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"},
-        "api_base_url": {"type": "string", "description": "REST API base URL for self-hosted GitHub Enterprise (e.g. `https://ghe.example.com/api/v3`). Empty string resets to the default `https://api.github.com`."}
-    }}})
-}
-
 pub(crate) fn def_restart_daemon() -> Value {
     json!({"name": "restart_daemon", "description": "Request a graceful daemon restart. Default (#1814): the daemon self-respawns — it spawns a successor, health-gates it, and only then exits(0) so the successor takes over; NO external supervisor required. Opt-out `AGEND_RESTART_HANDOFF=0` takes the legacy path (exit code 42 + a launchd/systemd/Task-Scheduler supervisor from `agend-terminal service install`, or `scripts/agend-wrapper.sh`, respawns it; returns ok:false if no supervisor is detected). Returns ok:false in `agend-terminal app` (combined TUI+daemon) mode — that process has no in-process restart consumer, so quit and relaunch the app, or SIGTERM + restart. Idempotent.",
         "inputSchema": {"type": "object", "properties": {}}})
@@ -305,24 +294,6 @@ pub(crate) fn def_deployment() -> Value {
             "directory": {"type": "string", "description": "Working directory for instances"},
             "name": {"type": "string", "description": "Deployment name"},
             "branch": {"type": "string", "description": "Git branch — each instance gets its own worktree"}
-        }, "required": ["action"]}})
-}
-
-pub(crate) fn def_ephemeral() -> Value {
-    json!({"name": "ephemeral", "description": "#1967 Phase-1: manage short-lived cross-backend ephemeral workers OUTSIDE managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap. PR3a spawns a REAL backend headlessly via a PTY (gated by AGEND_EPHEMERAL_REAL_BACKEND, default OFF); PR3b: a `prompt` runs a one-shot turn (inject → turn-end → capture → oracle), opencode only.",
-        "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["spawn", "list", "reap"]},
-            "backend": {"type": "string", "description": "spawn: target backend, a bare command (claude, codex, opencode, kiro-cli, agy). A path or unknown name is rejected."},
-            "workflow_id": {"type": "string", "description": "spawn: the owning workflow id (required). list/reap: optional filter to one workflow."},
-            "parent": {"type": "string", "description": "spawn: optional parent worker/agent id for the telemetry tree."},
-            "ttl_secs": {"type": "number", "description": "spawn: max wall-clock TTL in seconds (cost guard). Default 1800, clamped to 7200. The reap sweep terminates a worker past its TTL."},
-            "token_budget": {"type": "number", "description": "spawn: per-worker token budget (recorded; enforcement lands in a later PR)."},
-            "prompt": {"type": "string", "description": "spawn (PR3b): prompt for a one-shot driven turn. Present = launch the driver (opencode ONLY; other backends rejected — Slice-2). Absent = lifecycle-only spawn (no driver). Poll `ephemeral list` for result_summary/success."},
-            "model": {"type": "string", "description": "spawn (PR3b): optional model override for the worker (provider-prefixed for opencode, e.g. opencode/deepseek-v4-flash-free). Default = the backend's configured model."},
-            "max_iterations": {"type": "number", "description": "spawn (#2524 P3b ralph-loop): opts into the driver's self-continuation loop — after a non-terminal turn, inject 'continue' and run another turn, up to this many total. Must be 1..=25 (daemon-side hard cap, no unlimited option) and requires a non-empty 'prompt'. Absent = the pre-P3b single-shot turn, byte-identical."},
-            "completion_promise": {"type": "string", "description": "spawn (#2524 P3b ralph-loop): optional completion signal — a literal string the driver looks for in each turn's transcript; its presence ends the loop as a success. Requires 'max_iterations' to also be set."},
-            "worker_id": {"type": "string", "description": "reap: reap a single worker by id."},
-            "all_stale": {"type": "boolean", "description": "reap: reap all due/dead workers (TTL-expired, terminal, or process gone)."}
         }, "required": ["action"]}})
 }
 
@@ -679,11 +650,12 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            35,
+            33,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
-             (#2547, merged into set_metadata) = 35. Current tools: {:?}",
+             (#2547, merged into set_metadata) = 35; - ephemeral tool + task_sweep_config \
+             (#2547, removed from registry) = 33. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1025,18 +997,6 @@ mod tests {
             ("deployment", "directory", "deployments.rs working-dir override"),
             ("deployment", "name", "deployments.rs deployment name"),
             ("deployment", "branch", "deployments.rs per-instance worktree"),
-            // ── ephemeral (#1967 Phase-1) ──
-            ("ephemeral", "action", "mcp/handlers/dispatch.rs spawn/list/reap"),
-            ("ephemeral", "backend", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.backend"),
-            ("ephemeral", "workflow_id", "mcp/handlers/ephemeral.rs spawn/list/reap workflow filter"),
-            ("ephemeral", "parent", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.parent"),
-            ("ephemeral", "ttl_secs", "mcp/handlers/ephemeral.rs handle_spawn → ephemeral_tracking::resolve_ttl (max-wall-TTL guard)"),
-            ("ephemeral", "prompt", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.prompt → ephemeral_driver one-shot turn (PR3b)"),
-            ("ephemeral", "model", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.model → Backend::push_model_arg spawn argv (PR3b)"),
-            ("ephemeral", "max_iterations", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.max_iterations → ephemeral_tracking::spawn_and_track validation + ephemeral_driver::DriverConfig.max_iterations loop opt-in (#2524 P3b)"),
-            ("ephemeral", "completion_promise", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.completion_promise → ephemeral_tracking::spawn_and_track validation + ephemeral_driver::next_loop_action promise match (#2524 P3b)"),
-            ("ephemeral", "worker_id", "mcp/handlers/ephemeral.rs handle_reap → reap_one"),
-            ("ephemeral", "all_stale", "mcp/handlers/ephemeral.rs handle_reap → reap_sweep"),
             // ── ci ──
             ("ci", "action", "ci/mod.rs routing"),
             ("ci", "repository", "ci/mod.rs watch/unwatch/status"),
@@ -1138,11 +1098,6 @@ mod tests {
                 "reporting_cadence",
                 "#649 Phase-1 passthrough; Phase-2 cadence scheduler deferred",
             ),
-            (
-                "ephemeral",
-                "token_budget",
-                "#1967 PR6 per-workflow token-budget enforcement deferred (recorded on the worker in PR1)",
-            ),
         ];
 
         // The coordination tools this guard enforces (every declared field must be
@@ -1154,7 +1109,6 @@ mod tests {
             "team",
             "schedule",
             "deployment",
-            "ephemeral",
             "ci",
             "repo",
             "bind_self",
@@ -1186,7 +1140,6 @@ mod tests {
             "pane_snapshot",
             "tui_screenshot",
             "restart_daemon",
-            "task_sweep_config",
             "binding_state",
             "gc_dry_run",
         ];

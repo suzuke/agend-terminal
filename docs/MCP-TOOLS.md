@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (35 tools)
+# AgEnD MCP Tools Reference (33 tools)
 
 ## Action-based Tools
 
@@ -155,15 +155,6 @@ List Phase 4 GC candidates without deleting. Non-destructive.
 - format (human / json)
 
 ## Daemon Operations
-
-### `task_sweep_config`
-Configure GitHub-PR auto-close sweep daemon.
-- repository, dry_run, pause
-
-### `ephemeral`
-Manage short-lived cross-backend ephemeral workers outside managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap.
-- **action**: spawn / list / reap
-- backend, workflow_id, parent, ttl_secs, token_budget, prompt, model, worker_id, all_stale
 
 ### `watchdog`
 Fleet idle watchdog control. Actions: snooze, resume, status, ack. `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.

@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（35 個工具）
+# AgEnD MCP Tools Reference — 工具參考（33 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -155,15 +155,6 @@
 - format (human / json)
 
 ## Daemon 操作（Daemon Operations）
-
-### `task_sweep_config`
-設定 GitHub-PR 自動關閉的 sweep daemon。
-- repository, dry_run, pause
-
-### `ephemeral`
-管理短生命週期、跨 backend 的 ephemeral worker，獨立於受管理的簿記之外（無 roster／binding／worktree）。動作：spawn、list、reap。
-- **action**: spawn / list / reap
-- backend, workflow_id, parent, ttl_secs, token_budget, prompt, model, worker_id, all_stale
 
 ### `watchdog`
 Fleet idle watchdog 控制。動作：snooze、resume、status、ack。`ack` 會抑制 fleet 警示，直到偵測到 ack 之後的 agent 活動後自動解除。

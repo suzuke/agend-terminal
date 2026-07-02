@@ -94,6 +94,7 @@ Operator 端的維護子指令。具破壞性的路徑會提示 `[y/N]`，除非
 ```
 agend-terminal admin cleanup-branches [--yes]
 agend-terminal admin cleanup-zombies [--age <DURATION>] [--yes]
+agend-terminal admin task-sweep-config [--repository <SLUG>] [--pause|--resume] [--dry-run|--no-dry-run] [--api-base-url <URL>]
 ```
 
 #### `admin cleanup-zombies` (#927)
@@ -118,6 +119,15 @@ Exit code：
 #### `admin cleanup-branches`
 
 刪除其 PR 已被 merge 的本地分支（對 squash-merge 安全）。預設為 dry-run（僅預覽）；`--yes` 才會實際刪除。squash-merge 偵測的啟發式做法見 `docs/RCA-*` 筆記。
+
+#### `admin task-sweep-config` (#2547)
+
+檢視或設定 GitHub-PR 自動關閉的 sweep daemon（輪詢已 merge 的 PR，為 `Closes t-XXX-N` 標記發出 `Done` 事件）。從 `task_sweep_config` MCP 工具移至此處——這是 operator 專屬設定，20 天內零 agent 呼叫。不帶任何 flag 時，僅印出目前設定，不做變更。
+
+- `--repository <owner/repo>` — 要 sweep 的 GitHub slug。空字串停用。
+- `--pause` / `--resume` — 暫停／恢復 sweep tick（互斥）。
+- `--dry-run` / `--no-dry-run` — 僅記錄決策不發事件，或實際發出（互斥）。
+- `--api-base-url <URL>` — 自架 GitHub Enterprise 的 REST API base。空字串重設為 `https://api.github.com`。
 
 ### `connect`
 將一個*已經在運行*的本地 agent 註冊到 daemon（僅限 inbox——不做 PTY 管理）。在 headless 環境中、或要把手動啟動的 CLI 混入運行中的 fleet 時很有用。

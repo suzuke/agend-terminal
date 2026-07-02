@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Default sweep tick interval. Operator can override via the
-/// `task_sweep_config` MCP tool (`interval_secs`); the next tick after
-/// the config save observes the new interval.
+/// `agend-terminal admin task-sweep-config` CLI (`interval_secs`); the next
+/// tick after the config save observes the new interval.
 const DEFAULT_SWEEP_TICK_SECS: u64 = 300;
 
 /// Emitter identity stamped on sweep-driven events. Distinct from any
@@ -61,8 +61,9 @@ const PR_LIST_LIMIT: u32 = 30;
 /// github.com — mirrors `CiProvider::with_base_url`'s configurable base.
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Configuration persisted at `<home>/task_sweep.json`. Operator mutates
-/// via the `task_sweep_config` MCP tool; sweep tick reads on each invocation.
+/// Configuration persisted at `<home>/task_sweep.json`. Operator mutates via
+/// the `agend-terminal admin task-sweep-config` CLI (#2547: moved from the
+/// `task_sweep_config` MCP tool); sweep tick reads on each invocation.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct SweepConfig {
     /// `owner/repo` GitHub identifier (e.g. `"suzuke/agend-terminal"`).
@@ -646,9 +647,9 @@ fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrM
     })
 }
 
-// ── Operator-facing MCP tool surface ────────────────────────────────
+// ── Operator-facing CLI surface (#2547: moved from the task_sweep_config MCP tool) ──
 
-/// `task_sweep_config` MCP tool body. Args:
+/// `agend-terminal admin task-sweep-config` CLI body. Args:
 /// - `repo`: `"owner/repo"` to enable; empty string disables.
 /// - `pause`: `true|false`.
 /// - `dry_run`: `true|false`.
@@ -1427,8 +1428,9 @@ mod tests {
         assert!(meta.merged); // merged_at non-null
     }
 
-    /// `task_sweep_config` MCP tool round-trip — operator sets repo, then
-    /// pauses, then disables dry-run; final state matches.
+    /// `task_sweep_config` CLI round-trip (#2547: moved from the MCP tool) —
+    /// operator sets repo, then pauses, then disables dry-run; final state
+    /// matches.
     #[test]
     fn config_tool_round_trip() {
         let home = tmp_home("config_rt");
