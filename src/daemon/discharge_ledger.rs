@@ -69,10 +69,22 @@ pub(crate) fn record_discharge(
     discharged_by: &str,
     reason: Option<&str>,
 ) -> anyhow::Result<()> {
-    // RED stub (§3.10) — intentionally not persisting yet; restored in the
-    // immediately-following GREEN commit.
-    let _ = (home, head_sha, job, discharged_by, reason);
-    Ok(())
+    let path = ledger_path(home, head_sha);
+    let lock_path = path.with_extension("lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
+    let mut ledger: LedgerFile = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    ledger.jobs.insert(
+        job.to_string(),
+        DischargeEntry {
+            discharged_by: discharged_by.to_string(),
+            discharged_at: chrono::Utc::now().to_rfc3339(),
+            reason: reason.filter(|s| !s.is_empty()).map(String::from),
+        },
+    );
+    crate::store::save_atomic(&path, &ledger)
 }
 
 /// Look up whether `job` at `head_sha` has been discharged. `None` covers
