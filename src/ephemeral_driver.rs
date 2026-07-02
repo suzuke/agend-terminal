@@ -63,11 +63,7 @@
 
 use crate::agent::InjectTarget;
 use crate::backend::Backend;
-// RED (#2524 P3a PR-2): `effective_turn_state` doesn't consult these yet — the
-// GREEN commit's real veto body uses both. Only referenced by tests until then.
-#[allow(unused_imports)]
 use crate::daemon::shadow::evidence::Authority;
-#[allow(unused_imports)]
 use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
 use crate::state::AgentState;
 use std::path::PathBuf;
@@ -366,6 +362,15 @@ fn is_trailing_chrome(line: &str) -> bool {
     if matches!(t, "❯" | "›" | ">" | "┃") {
         return true;
     }
+    // codex (#2524 P3a PR-2): persistent bottom statusline `<model> · <cwd path>` —
+    // real capture off an isolated codex smoke: `gpt-5.5 medium · /private/var/
+    // .../backend-data/ephemeral/eph-53468-0`. Matched STRUCTURALLY (the segment
+    // after " · " is an absolute path) rather than the model name, which varies
+    // per-session/config — same pattern-not-magic-string principle as the rest of
+    // this function.
+    if t.split(" · ").nth(1).is_some_and(|s| s.starts_with('/')) {
+        return true;
+    }
     // Known backend footer statuslines (claude + opencode).
     let lower = t.to_ascii_lowercase();
     lower.contains("bypass permissions")        // claude: `⏵⏵ bypass permissions …`
@@ -428,14 +433,23 @@ fn build_summary(dump: &str, terminal_state: AgentState, grew: bool, stop_reason
 /// applies normally at the REAL end. A non-`Idle` raw sample is never touched — the
 /// veto only ever suppresses a false idle, never invents one.
 ///
-/// RED (#2524 P3a PR-2): not yet vetoing anything — always the raw state, for every
-/// backend. The GREEN commit adds the codex Stream-authority veto.
 fn effective_turn_state(
-    _backend: &Backend,
+    backend: &Backend,
     raw: AgentState,
-    _observed: Option<&ObservedStatus>,
+    observed: Option<&ObservedStatus>,
 ) -> AgentState {
-    raw
+    if *backend != Backend::Codex || raw != AgentState::Idle {
+        return raw;
+    }
+    match observed {
+        Some(status)
+            if status.authority == Authority::Stream
+                && status.state.coarse() != ObservedState::Idle =>
+        {
+            AgentState::Active
+        }
+        _ => raw,
+    }
 }
 
 /// Pure turn-end detector — the Idle-debounce state machine, time-injected (`now_ms`)
