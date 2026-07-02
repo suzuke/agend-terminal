@@ -586,3 +586,82 @@ mod tests_1964 {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests_2525 {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-2525-{}-{}-{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn test_ctx(home: &std::path::Path) -> HandlerCtx<'_> {
+        let registry: &'static crate::agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static crate::agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home,
+        }
+    }
+
+    /// #2525: CREATE_TEAM on an EXISTING team (the #1964 already-exists
+    /// branch, routed through `teams::update`) must forward `repository_path`
+    /// the same way the new-team path does (#1833 above) — same
+    /// allowlist-drop class, just never fixed for this branch. Pre-fix,
+    /// `update_params` only carries `name`/`add`/`orchestrator`, so a second
+    /// `create_instance(team=X, repository_path=Y)` call silently drops Y and
+    /// `teams::update`'s set-or-preserve keeps the team's prior (possibly
+    /// absent) source_repo.
+    #[test]
+    fn create_team_on_existing_team_forwards_repository_path_2525() {
+        let home = tmp_home("repo-forward");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances: {}\nteams:\n  sqd:\n    members: [sqd-lead]\n    orchestrator: sqd-lead\n",
+        )
+        .unwrap();
+        let ctx = test_ctx(&home);
+
+        let resp = handle_create_team(
+            &json!({
+                "name": "sqd",
+                "members": ["sqd-9"],
+                "repository_path": "/srv/canonical-repo",
+            }),
+            &ctx,
+        );
+        assert_eq!(resp["ok"], true, "extend must succeed: {resp}");
+
+        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let team = cfg.teams.get("sqd").expect("team still present");
+        assert_eq!(
+            team.source_repo.as_deref(),
+            Some(std::path::Path::new("/srv/canonical-repo")),
+            "#2525: repository_path must reach the team block on the already-exists \
+             (teams::update) branch, got {:?}",
+            team.source_repo
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
