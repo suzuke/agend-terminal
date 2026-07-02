@@ -2352,6 +2352,61 @@ fn merge_force_audit_write_failure_refuses_merge() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// #2539: `handle_tool_with_runtime` reads `AGEND_HOME` via `crate::home_dir()`
+/// (no explicit `home` param, unlike `handle_merge_repo`), so exercising the
+/// full dispatch chain needs the env var set process-wide. Serializes tests
+/// that mutate it — same hazard/pattern as `mcp::handlers::tests::fleet_test_guard`.
+fn ci_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// #2539 confidence pin (§3.9 real-entry-point): the test above calls
+/// `handle_merge_repo` directly, which is a mid-pipeline inject — it cannot
+/// catch a schema-declaration gap because the daemon-internal dispatch never
+/// filters by schema. This variant drives the SAME force-bypass scenario
+/// through the full internal dispatch chain (`handle_tool` → `try_dispatch`
+/// → `ci::handle_merge_repo`), confirming `force`/`force_reason` survive the
+/// whole daemon-side path intact. It is NOT a RED test for #2539 (it passes
+/// even without the `def_repo` schema fix, since that gap lives entirely at
+/// the external MCP-client boundary this test cannot reach) — it documents
+/// that the daemon-internal half of the chain was never the problem.
+#[test]
+fn merge_force_reaches_handler_through_full_dispatch_chain_2539() {
+    let _g = ci_env_test_guard();
+    let home = std::env::temp_dir().join(format!("agend-merge-force-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let events_path = home.join("fleet_events.jsonl");
+    std::fs::create_dir_all(&events_path).unwrap();
+    let prev_home = std::env::var("AGEND_HOME").ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let result = crate::mcp::handlers::handle_tool(
+        "repo",
+        &json!({
+            "action": "merge",
+            "pr": 9999,
+            "force": true,
+            "force_reason": "test emergency",
+            "repository": "suzuke/agend-terminal",
+        }),
+        "dev",
+    );
+
+    match prev_home {
+        Some(h) => std::env::set_var("AGEND_HOME", h),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+
+    let err = result["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("audit log write failed"),
+        "#2539: force/force_reason must survive the full handle_tool dispatch chain \
+         unmodified (same audit-write reject as the handler-direct test), got: {result}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// #1619: a merge with neither an explicit `repository` arg nor an
 /// active binding must FAIL LOUD — never silently fall back to a
 /// hardcoded maintainer repo (the old `.unwrap_or("suzuke/agend-terminal")`

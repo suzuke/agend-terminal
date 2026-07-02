@@ -497,6 +497,39 @@ mod tests {
     }
 
     #[test]
+    fn repo_merge_has_force_and_force_reason_params() {
+        // #2539: `handle_merge_repo` (ci/merge.rs) has ALWAYS read
+        // `args["force"]` / `args["force_reason"]` directly and correctly
+        // gated the CI-checks / base-drift / #2140 freshness refusals behind
+        // `if !force` — but the `repo` tool's inputSchema never DECLARED
+        // these two params. An MCP client that validates a tool call against
+        // the advertised inputSchema (the normal contract) has no way to
+        // include `force`/`force_reason` in a `repo action=merge` call, so
+        // `force=true` never reaches the daemon — the merge is refused
+        // exactly as if force had never been passed (#2539's live repro).
+        // The daemon-internal dispatch chain (execute_tool → handle_tool →
+        // ci::handle_merge_repo) never filters args by schema — confirmed by
+        // reading `mcp/handlers/mod.rs::handle_tool_with_runtime`, which
+        // passes `args` through unmodified — so this schema declaration IS
+        // the complete fix; no merge.rs logic change is needed.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let repo = tools
+            .iter()
+            .find(|t| t["name"] == "repo")
+            .expect("repo tool not found");
+        let props = &repo["inputSchema"]["properties"];
+        assert!(
+            props["force"].is_object(),
+            "#2539: repo tool must declare 'force' so MCP clients can pass it on merge"
+        );
+        assert!(
+            props["force_reason"].is_object(),
+            "#2539: repo tool must declare 'force_reason' so MCP clients can pass it on merge"
+        );
+    }
+
+    #[test]
     fn create_instance_has_target_pane_param() {
         // target_pane is optional but must be declared so MCP clients surface
         // it to the agent — without it, agents can't place new panes next to
