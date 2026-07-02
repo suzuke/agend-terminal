@@ -15,6 +15,7 @@ pub(crate) mod decision_board_timeout;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod delivery_worker;
+pub(crate) mod discharge_ledger;
 pub(crate) mod dispatch_idle;
 pub(crate) mod escalation_persist;
 pub(crate) mod event_bus;

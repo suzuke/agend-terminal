@@ -6,7 +6,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::send_envelope::SendEnvelope;
-use super::{comms_gates::enforce_send_invariants, err_needs_identity, is_ok_result};
+use super::{
+    comms_gates::{enforce_send_invariants, record_triaged_if_present, validate_triaged},
+    err_needs_identity, is_ok_result,
+};
 
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
@@ -62,6 +65,12 @@ pub(super) fn handle_send_to_instance(
     if *sender == target {
         return json!({"error": "cannot send to self — use a different instance"});
     }
+    // #2537/#2524 P6: validated up front so a malformed `triaged` rejects
+    // before a message goes out.
+    let triaged = match validate_triaged(args) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     // #1602: `message` only — the legacy `text` alias is dropped (reply's
     // text→message rename removed the last schema that declared `text`, and the
     // dispatch validator now rejects a message-less `send` before this handler
@@ -128,6 +137,9 @@ pub(super) fn handle_send_to_instance(
     let mut result = result;
     if kind == Some("report") && parent_id.is_none() {
         attach_report_parent_warning(&mut result);
+    }
+    if is_ok_result(&result) {
+        record_triaged_if_present(home, sender.as_str(), triaged);
     }
     result
 }
@@ -425,6 +437,11 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         Some(s) => s,
         None => return json!({"error": "missing 'summary'"}),
     };
+    // #2537/#2524 P6: same pre-send gate as handle_send_to_instance.
+    let triaged = match validate_triaged(args) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
     let msg = comms_inbox::build_report_text(
         summary,
         args["correlation_id"].as_str(),
@@ -528,6 +545,9 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 }
             }
         }
+        // #2537/#2524 P6 PR-1: best-effort — a ledger write failure doesn't
+        // fail the report (it already landed).
+        record_triaged_if_present(home, sender.as_str(), triaged);
         // Sprint 53 P0-Y: do NOT auto-unbind here. Every kind=report reply
         // (progress update OR final done) landed in this handler, so the
         // prior auto-unbind tore down the binding on the first progress
