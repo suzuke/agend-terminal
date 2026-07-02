@@ -152,9 +152,13 @@ quickstart 完成後會列出接下來需要做的事：
 
 === 啟動 ===
 
-$ agend-terminal start        # 啟動 daemon
+[推薦] 剛接觸 agend，或想一眼看完整個 fleet：
+$ agend-terminal app           # TUI 儀表板：一個畫面看所有 agent 的 pane + 即時狀態
+
+[進階] 自動化 / headless / 腳本（CI、遠端、無 TUI）：
+$ agend-terminal start         # 啟動 fleet daemon
 $ agend-terminal list          # 確認 agent 狀態
-$ agend-terminal attach general  # 連接到 agent 終端
+$ agend-terminal attach general  # 連接到某個 agent 的 pane
 ```
 
 ---

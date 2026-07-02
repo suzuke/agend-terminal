@@ -29,7 +29,7 @@
 ```bash
 cargo install agend-terminal
 agend-terminal quickstart    # 互動式設定，2 分鐘完成
-agend-terminal start         # 啟動 fleet
+agend-terminal app           # 啟動 TUI — 一個畫面看所有 agent 的 pane
 ```
 
 ### 無人值守設定（CI / 腳本）

@@ -27,7 +27,7 @@ Declare your entire AI dev team in one `fleet.yaml`. AgEnD Terminal launches eac
 ```bash
 cargo install agend-terminal
 agend-terminal quickstart    # Interactive setup in 2 minutes
-agend-terminal start         # Launch the fleet
+agend-terminal app           # Launch the TUI — every agent's pane in one screen
 ```
 
 ### Unattended setup (CI / scripts)
