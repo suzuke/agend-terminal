@@ -164,6 +164,18 @@ fn agy_profile() -> BackendProfile {
                 AgentState::PermissionPrompt,
                 r"Requesting permission for:|Do you trust the contents of this project|tab Amend · e edit command",
             ),
+            // #2524 P1b-r1: agy had no GitConflict pattern at all. Real capture
+            // (script -q via pexpect, isolated scratch repo, genuine `git merge`
+            // conflict) confirmed git's own conflict text streams into agy's pane
+            // verbatim. Reuses the SAME shared literal already used for
+            // kiro/opencode/codex (git's own stdout, not agy-specific chrome) —
+            // must come BEFORE the `● Bash(...)` Active pattern below, since a
+            // conflict pane still shows the tool-call bullet that would otherwise
+            // first-match Active.
+            (
+                AgentState::GitConflict,
+                r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+            ),
             (AgentState::Active, r"●\s+[A-Z][a-zA-Z]+\("),
             (AgentState::Active, r"esc to cancel"),
             (AgentState::Idle, r"\? for shortcuts"),
