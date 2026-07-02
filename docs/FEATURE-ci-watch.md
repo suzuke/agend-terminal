@@ -182,6 +182,59 @@ When polling resumes normally, a `[ci-watch-resumed]` notification is sent.
 
 ---
 
+## Discharge Ledger (Duplicate-Notification Suppression)
+
+A red CI run on a busy branch can produce several `[ci-fail]` notifications
+for the exact same underlying failure (a poll re-emits, a stale row gets
+reclaimed and re-nudged, `poll-reminder` re-pings on an unread-count bump).
+Once an agent has actually triaged a failure — investigated it, told the
+lead it's a known flaky job, or is already fixing it — repeated notifications
+for that SAME failure are noise, not signal.
+
+### Discharging a failure
+
+Report the triage via the SAME `send(kind=update` or `kind=report)` call you'd
+already make, with an added `triaged` field:
+
+```
+send(kind=report, ..., triaged={head: "<commit-sha>", job: "Coverage", reason: "known flaky, reran"})
+```
+
+- `head` and `job` must both be present (or both omitted) — a half-signature
+  is rejected, never silently ignored.
+- `reason` is optional free-text context.
+- This is a field on an existing `send` call, not a separate tool call — the
+  discharge ledger's design deliberately avoids adding a new mandatory
+  action agents have to remember to invoke (a prior mechanism with its own
+  dedicated "mark done" action measured effectively 0% real-world usage).
+
+The daemon persists the discharge to a disk-backed ledger (survives a daemon
+restart — an in-memory-only ledger would replay every already-triaged
+failure as unactioned on every restart, which is worse than no mechanism at
+all).
+
+### What gets suppressed
+
+A discharge is keyed by `(head_sha, job_name)`:
+
+- **Same head, same job** → suppressed (the exact failure you triaged).
+- **Same head, different job** → still notifies (a different check failing
+  is a different problem, even on the same commit).
+- **New head (you pushed a fix, or CI re-ran on a new commit)** → notifies
+  again automatically. There is no separate expiry/cleanup step: the ledger
+  is keyed against the branch's CURRENT head, so once the head moves on, an
+  old discharge simply stops matching.
+
+### Suppression is fail-open
+
+If the daemon can't establish BOTH sides of the signature with confidence —
+the message isn't a recognized ci-fail shape, the branch's current head is
+unknown, the ledger can't be read — it always falls through to notifying.
+Nothing is ever silently dropped on an inability to confirm a discharge;
+worst case is one extra (harmless) notification, never a missed one.
+
+---
+
 ## TTL and Auto-Cleanup
 
 ### Absolute TTL
