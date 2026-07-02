@@ -446,6 +446,26 @@ mod tests {
         }
     }
 
+    /// #2547: `set_metadata` merged `set_display_name`/`set_description` into
+    /// one action-based tool. Both actions are per-instance display attrs with
+    /// no operator-authority concern, so both stay `AlwaysAllow`; an unmapped
+    /// action must still fail closed (taxonomy drift guard).
+    #[test]
+    fn set_metadata_actions_classified_2547() {
+        for action in ["display_name", "description"] {
+            assert_eq!(
+                classify("set_metadata", Some(action)),
+                OpClass::AlwaysAllow,
+                "set_metadata/{action} must stay allowed"
+            );
+        }
+        assert_eq!(
+            classify("set_metadata", Some("frobnicate")),
+            OpClass::AbsolutelyNever,
+            "set_metadata with an unmapped action must fail closed"
+        );
+    }
+
     // ── MUST-PIN 5 (gate half): never-delegate blocked even sleep+full-scope;
     // delegate-scope deny-by-default; active = passthrough. (Store reload-
     // coherence is pinned in operator_mode.rs::set_mode_then_reload_is_coherent.) ──
