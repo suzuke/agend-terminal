@@ -63,6 +63,14 @@ pub const DEFAULT_WALL_TTL_SECS: u64 = 30 * 60;
 /// cannot disable the wall-TTL guard by requesting an enormous value.
 pub const MAX_WALL_TTL_SECS: u64 = 2 * 60 * 60;
 
+/// Cost-guard (#2524 P3b, decision `d-20260702105502384640-4`, HARD requirement):
+/// `max_iterations` for the ralph-loop must be `1..=MAX_ITERATIONS_CAP` — no
+/// "unlimited" option. An unattended self-continuation loop's failure mode is
+/// silent overnight spend (#1967 epic's own warning: 20 workers left running
+/// overnight burns 20x an already-costly night); the cost boundary must be
+/// structural, not a convention a caller can forget.
+pub const MAX_ITERATIONS_CAP: u32 = 25;
+
 /// Cost-guard / liveness: a worker stuck in the `"reserving"` state (admission
 /// slot taken but `finalize` never ran — daemon crashed between reserve and
 /// finalize) longer than this is reaped as stale. Conservative: WELL above the
@@ -205,6 +213,15 @@ pub struct SpawnSpec {
     /// PR3b: optional model override (e.g. `provider/model` for opencode), passed to
     /// the backend via its spawn argv. `None` = the backend's configured default.
     pub model: Option<String>,
+    /// #2524 P3b (ralph-loop, Shape-1 P0): opts into the driver's self-continuation
+    /// loop. `None` = the pre-P3b single-shot turn, byte-identical. `Some(n)` must
+    /// satisfy `1..=MAX_ITERATIONS_CAP` and requires a non-empty `prompt` — validated
+    /// in `spawn_and_track` before any process is spawned.
+    pub max_iterations: Option<u32>,
+    /// #2524 P3b: optional completion signal for loop mode — see
+    /// `ephemeral_driver::next_loop_action`. Requires `max_iterations` to be `Some`
+    /// (a promise with no loop to end would silently never be checked).
+    pub completion_promise: Option<String>,
 }
 
 /// Why a spawn failed.
@@ -220,6 +237,12 @@ pub enum SpawnError {
     /// Carries the rejected backend. A prompt-less spawn of any backend is unaffected
     /// (the PR3a lifecycle-only spawn path).
     DriverUnsupported(String),
+    /// #2524 P3b: `max_iterations` was given but is out of `1..=MAX_ITERATIONS_CAP`,
+    /// or `completion_promise`/`max_iterations` was given without a `prompt` (the
+    /// loop's first iteration has nothing to inject), or `completion_promise` was
+    /// given without `max_iterations` (would silently never be checked). Carries a
+    /// human-readable reason.
+    InvalidLoopParams(String),
     /// The hard max-live concurrency cap would be exceeded.
     CapExceeded { live: usize, cap: usize },
     /// The durable cap reservation could not be persisted (store write failed) —
@@ -244,6 +267,9 @@ impl std::fmt::Display for SpawnError {
                  per-backend turn-detection smoke. Spawn it without a prompt for a \
                  lifecycle-only worker."
             ),
+            SpawnError::InvalidLoopParams(reason) => {
+                write!(f, "ephemeral spawn: invalid ralph-loop parameters: {reason}")
+            }
             SpawnError::CapExceeded { live, cap } => write!(
                 f,
                 "ephemeral worker cap reached ({live}/{cap} live) — reap or wait before spawning more"
@@ -500,6 +526,29 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
         return Err(SpawnError::DriverUnsupported(spec.backend.clone()));
     }
 
+    // 0c) RALPH-LOOP PARAMS (#2524 P3b, decision `d-20260702105502384640-4`) —
+    // validated in the SAME shared sink as 0/0b, before any process is spawned.
+    if let Some(n) = spec.max_iterations {
+        if !(1..=MAX_ITERATIONS_CAP).contains(&n) {
+            return Err(SpawnError::InvalidLoopParams(format!(
+                "max_iterations={n} out of range — must be 1..={MAX_ITERATIONS_CAP} (no unlimited option)"
+            )));
+        }
+        if !drive_turn {
+            return Err(SpawnError::InvalidLoopParams(
+                "max_iterations requires a non-empty 'prompt' (the loop's first iteration \
+                 has nothing to inject)"
+                    .to_string(),
+            ));
+        }
+    } else if spec.completion_promise.is_some() {
+        return Err(SpawnError::InvalidLoopParams(
+            "completion_promise requires max_iterations to also be set — otherwise it would \
+             never be checked (there is no loop)"
+                .to_string(),
+        ));
+    }
+
     let ttl_secs = resolve_ttl(spec.ttl_secs);
     let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
     let worker_id = format!("eph-{}-{}", std::process::id(), seq);
@@ -591,10 +640,13 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
                 crate::ephemeral_driver::spawn_driver(crate::ephemeral_driver::DriverConfig {
                     home: home.to_path_buf(),
                     worker_id: worker_id.clone(),
+                    workflow_id: spec.workflow_id.clone(),
                     prompt: spec.prompt.clone(),
                     inject_target,
                     wall_ttl: std::time::Duration::from_secs(ttl_secs),
                     backend,
+                    max_iterations: spec.max_iterations,
+                    completion_promise: spec.completion_promise.clone(),
                 });
             }
             LIVE_CHILDREN.lock().insert(worker_id, handle);
@@ -1213,6 +1265,8 @@ mod tests {
             token_budget: None,
             prompt: String::new(),
             model: None,
+            max_iterations: None,
+            completion_promise: None,
         };
         let res = spawn_and_track(&home, spec);
         assert!(
@@ -1345,6 +1399,8 @@ mod tests {
             token_budget: None,
             prompt: String::new(),
             model: None,
+            max_iterations: None,
+            completion_promise: None,
         };
         let res = spawn_and_track(&home, spec);
         assert!(
@@ -1371,6 +1427,8 @@ mod tests {
             token_budget: None,
             prompt: String::new(),
             model: None,
+            max_iterations: None,
+            completion_promise: None,
         };
         assert!(matches!(
             spawn_and_track(&home, spec),
@@ -1510,6 +1568,8 @@ mod tests {
             token_budget: None,
             prompt: String::new(),
             model: None,
+            max_iterations: None,
+            completion_promise: None,
         };
         let res = spawn_and_track(&file_home, spec);
         assert!(
@@ -1867,6 +1927,122 @@ mod tests {
             list(&home, None).len(),
             0,
             "the driver gate rejects before reserve — no row, no process"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ──────────────── #2524 P3b: ralph-loop param validation (0c gate) ────────────────
+
+    #[test]
+    fn spawn_and_track_rejects_max_iterations_zero() {
+        let home = tmp_home("loop-zero");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "claude".to_string(),
+            prompt: "do the thing".to_string(),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::InvalidLoopParams(_))),
+            "max_iterations=0 must be rejected: {res:?}"
+        );
+        assert_eq!(list(&home, None).len(), 0, "rejected before reserve");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn spawn_and_track_rejects_max_iterations_over_cap() {
+        let home = tmp_home("loop-over-cap");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "claude".to_string(),
+            prompt: "do the thing".to_string(),
+            max_iterations: Some(MAX_ITERATIONS_CAP + 1),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::InvalidLoopParams(_))),
+            "max_iterations above MAX_ITERATIONS_CAP must be rejected (no unlimited option): {res:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn spawn_and_track_accepts_max_iterations_at_cap_boundary() {
+        let home = tmp_home("loop-at-cap");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "kiro-cli".to_string(), // driver-unsupported → fails LATER, proving the loop-param gate itself passed
+            prompt: "do the thing".to_string(),
+            max_iterations: Some(MAX_ITERATIONS_CAP),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::DriverUnsupported(_))),
+            "max_iterations==MAX_ITERATIONS_CAP must pass the loop-param gate (next gate is \
+             driver_supported, not InvalidLoopParams): {res:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn spawn_and_track_rejects_max_iterations_without_prompt() {
+        let home = tmp_home("loop-no-prompt");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "claude".to_string(),
+            prompt: String::new(),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::InvalidLoopParams(_))),
+            "max_iterations with no prompt (nothing for iteration 1 to inject) must be rejected: {res:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn spawn_and_track_rejects_completion_promise_without_max_iterations() {
+        let home = tmp_home("promise-no-loop");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "claude".to_string(),
+            prompt: "do the thing".to_string(),
+            completion_promise: Some("DONE".to_string()),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::InvalidLoopParams(_))),
+            "completion_promise without max_iterations would silently never be checked — must \
+             be rejected: {res:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression/invariance: the pre-P3b caller shape (no loop params at all) must
+    /// clear the 0c gate — the SAME `DriverUnsupported` rejection as before P3b for a
+    /// non-driver-supported backend, not a NEW `InvalidLoopParams` error.
+    #[test]
+    fn spawn_and_track_no_loop_params_is_byte_identical_pre_p3b_gate_order() {
+        let home = tmp_home("no-loop-params-invariance");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "kiro-cli".to_string(),
+            prompt: "do the thing".to_string(),
+            ..Default::default()
+        };
+        assert!(spec.max_iterations.is_none() && spec.completion_promise.is_none());
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::DriverUnsupported(b)) if b == "kiro-cli"),
+            "absent loop params must reach the pre-existing driver gate unchanged: {res:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
