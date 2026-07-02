@@ -81,10 +81,24 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         }
     }
 
+    // #2496: rebase_mode tries a SAFE same-agent repair FIRST — reads the
+    // agent's actual bound worktree and either finds it already on `branch`
+    // (metadata-only, no mutation) or in-place `git switch`es a clean
+    // worktree to it. Any condition that isn't safe (dirty, not
+    // daemon-managed, held by another agent, an active CI watch/task on the
+    // branch being abandoned, or the switch itself failing) is a fail-closed
+    // BLOCKED error — no more silent fallthrough to a full destructive
+    // release (that defeated the entire point of `rebase_mode`).
+    let mut repair_action = None;
     if args["rebase_mode"].as_bool().unwrap_or(false) {
-        if let Err(e) = crate::mcp::handlers::force_release::rebase_clean_self(home, agent, branch)
-        {
-            return json!({"error": e, "code": "path_outside_pool"});
+        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair(home, agent, branch) {
+            Ok(action) => repair_action = Some(action),
+            Err(reason) => {
+                return json!({
+                    "error": format!("rebase_mode repair blocked: {reason}"),
+                    "code": "rebind_repair_blocked"
+                });
+            }
         }
     }
 
@@ -113,11 +127,19 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                 .and_then(|v| v["worktree"].as_str().map(String::from))
                 .unwrap_or_default();
-            json!({
+            let mut resp = json!({
                 "bound": true,
                 "worktree_path": worktree_path,
                 "branch": branch,
-            })
+            });
+            // #2496: surface exactly what the safe repair did (or that it
+            // wasn't invoked at all) — the acceptance criteria requires
+            // callers to know whether metadata-only, a branch switch, or
+            // nothing happened.
+            if let Some(action) = repair_action {
+                resp["repair_action"] = serde_json::to_value(action).unwrap_or(Value::Null);
+            }
+            resp
         }
         Err(err) => {
             // Map `DispatchError` to the pre-#781 string-code response shape, but
