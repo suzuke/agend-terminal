@@ -140,9 +140,6 @@ static WORKER_SEQ: AtomicU64 = AtomicU64::new(0);
 /// READ-ONLY — this is an observation feed, not a registration: it doesn't add the
 /// worker to `AgentRegistry`/`fleet.yaml`/binding, so it doesn't reintroduce the
 /// "managed bookkeeping" #1967 deliberately avoids for ephemeral workers.
-// #2524 P3a PR-1 RED: `core`/`child_alive` aren't read yet — `shadow_observe.rs`
-// wires them in GREEN. Drop this once that caller lands.
-#[allow(dead_code)]
 pub(crate) struct LiveEphemeralSnapshot {
     pub worker_id: String,
     pub core: Arc<crate::sync_audit::CoreMutex<crate::agent::AgentCore>>,

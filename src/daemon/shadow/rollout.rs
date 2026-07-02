@@ -156,14 +156,25 @@ pub(crate) fn session_cwd(line: &str) -> Option<String> {
 /// round-1). codex canonicalizes `/tmp`→`/private/tmp` on macOS; [`strip_private`]
 /// (unix-only) reconciles that before the comparison.
 ///
-/// #2524 P3a PR-1 RED: not yet fail-closed on ambiguity — first match wins, same as
-/// the pre-PR behavior. GREEN commit makes this fail-closed instead.
+/// #2524 P3a PR-1: FAIL-CLOSED on an ambiguous cwd (≥2 candidates share the same
+/// expected cwd — e.g. two ephemeral workers spawned in the same directory, or an
+/// ephemeral worker's cwd colliding with a managed agent's workspace path). Do NOT
+/// guess: attribute to neither rather than silently mis-crediting Evidence.
 fn agent_for_cwd(cwd: &str, candidates: &[(String, PathBuf)]) -> Option<String> {
     let cwd_path = Path::new(strip_private(cwd));
-    candidates
+    let mut matches = candidates
         .iter()
-        .find(|(_, expected)| cwd_path == expected.as_path())
-        .map(|(name, _)| name.clone())
+        .filter(|(_, expected)| cwd_path == expected.as_path());
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        tracing::warn!(
+            tag = "#shadow-observer",
+            cwd = %cwd_path.display(),
+            "codex rollout: cwd matches MULTIPLE candidate agents — ambiguous, not attributing"
+        );
+        return None;
+    }
+    Some(first.0.clone())
 }
 
 /// Build the (name, expected-cwd) candidate list `agent_for_cwd` matches against:
