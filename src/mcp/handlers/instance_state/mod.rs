@@ -334,76 +334,42 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
     }
 }
 
+/// #2547: `replace_instance` is `restart_instance mode=fresh` plus one
+/// unique value-add — a `[handover]` inbox message carrying the previous
+/// instance's last-known state/health and the replacement reason, which
+/// `restart_instance` has no notion of. Builds that message, then delegates
+/// the actual kill+respawn to `handle_restart_instance` so replace inherits
+/// its guards (#2476 uncommitted-worktree refusal) and self-kick arming
+/// verbatim instead of a second, drifting implementation.
 pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
-    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
-    // self-orch once-off latch, so a fresh terminal death after this replace re-pages.
-    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let reason = args["reason"].as_str().unwrap_or("manual replacement");
 
-    // Capture backend + working_directory before kill so we can respawn.
-    // Prefer fleet.yaml (short name like "claude") over LIST API (which may
-    // store a resolved path). SPAWN expects the short preset name.
-    let fleet_resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|f| f.resolve_instance(name));
-
+    // Capture live status for the handover message BEFORE the delegated
+    // restart kills the old process — this is replace_instance's only
+    // behavior restart_instance doesn't already provide.
     let list_resp = crate::api::call(home, &json!({"method": crate::api::method::LIST}));
-    let (backend, handover) = {
-        let fleet_backend = fleet_resolved.as_ref().map(|r| r.backend_command.clone());
-        let list_info = list_resp.ok().and_then(|resp| {
+    let handover = list_resp
+        .ok()
+        .and_then(|resp| {
             resp["result"]["agents"]
                 .as_array()?
                 .iter()
                 .find(|a| a["name"].as_str() == Some(name))
                 .map(|a| {
-                    let backend = a["backend"].as_str().unwrap_or("claude").to_string();
-                    let handover = format!(
+                    format!(
                         "Previous instance state: {}, health: {}. Replaced due to: {reason}",
                         a["agent_state"].as_str().unwrap_or("unknown"),
                         a["health_state"].as_str().unwrap_or("unknown")
-                    );
-                    (backend, handover)
+                    )
                 })
-        });
-        let backend = fleet_backend.unwrap_or_else(|| {
-            list_info
-                .as_ref()
-                .map(|(b, _)| b.clone())
-                .unwrap_or_else(|| "claude".to_string())
-        });
-        let handover = list_info
-            .map(|(_, h)| h)
-            .unwrap_or_else(|| format!("Replaced due to: {reason}"));
-        (backend, handover)
-    };
+        })
+        .unwrap_or_else(|| format!("Replaced due to: {reason}"));
 
-    // Resolve working_directory from fleet.yaml (survives kill).
-    let working_dir = fleet_resolved
-        .and_then(|r| r.working_directory)
-        .map(|p| p.display().to_string());
-
-    // Session-reset inbox settle: a replace is always context-lost (fresh
-    // spawn), so settle all DELIVERING rows to PROCESSED before the old
-    // instance is killed. This prevents reclaim_stale_delivering from
-    // reverting them to UNREAD and re-injecting stale messages into the
-    // new, context-less session (agend-customization#159).
-    crate::inbox::settle_delivering_for_session_reset(home, name);
-
-    // #1366: kill via DELETE with no_wait — sends kill signal and removes
-    // registry entry without blocking up to 5 s for child exit. The OS
-    // reaps the old process asynchronously; the new spawn gets its own
-    // PID / PTY / port with no resource collision.
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
-    );
-
-    // Enqueue handover context for the new instance.
     persist_or_log!(
         crate::inbox::enqueue(
             home,
@@ -443,22 +409,25 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         name
     );
 
-    // Spawn fresh instance with same backend + working directory.
-    // #1431: `layout: same-tab` tells the TUI to return the new pane to the
-    // tab the replaced pane occupied (recorded on its removal) instead of
-    // opening a fresh tab.
-    let mut spawn_params = json!({"name": name, "backend": backend, "layout": "same-tab"});
-    if let Some(wd) = &working_dir {
-        spawn_params["working_directory"] = json!(wd);
-    }
-    let spawn_result = crate::api::call(
+    // Delegate kill+respawn to restart(fresh): same DELETE(no_wait)+SPAWN
+    // shape, plus the #2476 uncommitted-worktree guard and self-kick arming
+    // this handler never had. `force` forwards so a replace on a dirty bound
+    // worktree behaves exactly like an equivalent fresh restart.
+    let restart_resp = handle_restart_instance(
         home,
-        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
+        &json!({
+            "instance": name,
+            "mode": "fresh",
+            "reason": reason,
+            "force": args.get("force").cloned().unwrap_or(Value::Bool(false)),
+        }),
     );
-
-    let spawned = spawn_result
-        .as_ref()
-        .map(|r| r["ok"].as_bool() == Some(true))
+    if restart_resp.get("error").is_some() {
+        return restart_resp;
+    }
+    let spawned = restart_resp
+        .get("spawned")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
 
     tracing::info!(%name, %reason, %spawned, "replace_instance");
