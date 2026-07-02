@@ -130,14 +130,12 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "list_instances",
             "binding_state",
             "pane_snapshot",
-            "tui_screenshot",
             "task",
             "decision",
             "ci",
             "repo",
             "config",
             "set_waiting_on",
-            "tokens",
             "health",
             "mode",
         ],
@@ -154,14 +152,12 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "list_instances",
             "binding_state",
             "pane_snapshot",
-            "tui_screenshot",
             "task",
             "decision",
             "ci",
             "repo",
             "config",
             "set_waiting_on",
-            "tokens",
             "health",
             "mode",
         ],
@@ -179,12 +175,10 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "list_instances",
             "binding_state",
             "pane_snapshot",
-            "tui_screenshot",
             "task",
             "decision",
             "config",
             "set_waiting_on",
-            "tokens",
             "health",
             "mode",
         ],
@@ -241,7 +235,7 @@ pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, t
             .any(|entry| entry.name == tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 33] = [
+static ALL_TOOLS: [ToolEntry; 29] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -329,12 +323,6 @@ static ALL_TOOLS: [ToolEntry; 33] = [
         handler: super::handlers::dispatch::dispatch_pane_snapshot,
         class: ToolClass::READ_ONLY,
     },
-    ToolEntry {
-        name: "tui_screenshot",
-        definition: super::tools::def_tui_screenshot,
-        handler: super::handlers::dispatch::dispatch_tui_screenshot,
-        class: ToolClass::READ_ONLY,
-    },
     // ── Decision ──
     ToolEntry {
         name: "decision",
@@ -390,13 +378,6 @@ static ALL_TOOLS: [ToolEntry; 33] = [
         handler: super::handlers::dispatch::dispatch_health,
         class: ToolClass::FAST_RETRY_SAFE,
     },
-    // ── Watchdog ──
-    ToolEntry {
-        name: "watchdog",
-        definition: super::tools::def_watchdog,
-        handler: super::handlers::dispatch::dispatch_watchdog,
-        class: ToolClass::SIDE_EFFECT,
-    },
     // ── Config ──
     ToolEntry {
         name: "config",
@@ -436,19 +417,6 @@ static ALL_TOOLS: [ToolEntry; 33] = [
         handler: super::handlers::dispatch::dispatch_binding_state,
         class: ToolClass::READ_ONLY,
     },
-    ToolEntry {
-        name: "gc_dry_run",
-        definition: super::tools::def_gc_dry_run,
-        handler: super::handlers::dispatch::dispatch_gc_dry_run,
-        class: ToolClass::READ_ONLY,
-    },
-    // ── Observability ──
-    ToolEntry {
-        name: "tokens",
-        definition: super::tools::def_tokens,
-        handler: super::handlers::dispatch::dispatch_tokens,
-        class: ToolClass::READ_ONLY,
-    },
     // ── #1339: Operator mode ──
     ToolEntry {
         name: "mode",
@@ -472,12 +440,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_33_byte_identical() {
+    fn full_capability_roles_surface_all_29_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            33,
-            "registry baseline is 33 tools (#2547: replace_instance folded into restart_instance mode=fresh; set_display_name/set_description merged into set_metadata; ephemeral tool + task_sweep_config removed from registry)"
+            29,
+            "registry baseline is 29 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29)"
         );
         for role in [
             None,
@@ -489,7 +457,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 33 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 29 tools in registry order (default-all-open)"
             );
         }
     }
@@ -512,7 +480,6 @@ mod tests {
             "team",
             "deployment",
             "schedule",
-            "watchdog",
         ] {
             assert!(
                 !r.contains(&cut),

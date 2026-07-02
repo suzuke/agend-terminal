@@ -51,6 +51,7 @@
 //! for concurrency. Forward-compat preserved via `#[serde(default)]`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -579,6 +580,131 @@ pub(crate) fn fleet_ack_status() -> Option<i64> {
 #[cfg(test)]
 fn clear_fleet_ack() {
     FLEET_ACKED_AT.store(0, Ordering::Relaxed);
+}
+
+/// #2548: `agend-terminal admin watchdog` CLI body (moved from the retired
+/// `watchdog` MCP tool, zero calls in 20 days). `actor` is logged to the
+/// event log the same way the MCP handler stamped the calling instance name.
+pub(crate) fn handle_watchdog(home: &Path, args: &Value, actor: &str) -> Value {
+    match args["action"].as_str().unwrap_or("") {
+        "snooze" => handle_watchdog_snooze(home, args, actor),
+        "resume" => handle_watchdog_resume(home, actor),
+        "status" => handle_watchdog_status(home),
+        "ack" => handle_watchdog_ack(home, actor),
+        other => json!({"error": format!("unknown watchdog action: {other}")}),
+    }
+}
+
+fn handle_watchdog_snooze(home: &Path, args: &Value, actor: &str) -> Value {
+    const MAX_SNOOZE_SECS: i64 = 4 * 3600;
+
+    let duration_str = args["duration"].as_str().unwrap_or("1h");
+    let secs = match parse_duration_secs(duration_str) {
+        Some(s) => s.min(MAX_SNOOZE_SECS),
+        None => return json!({"error": format!("invalid duration: {duration_str}")}),
+    };
+    let until = chrono::Utc::now() + chrono::Duration::seconds(secs);
+    match snooze_fleet_idle(home, until, actor) {
+        Ok(snooze) => {
+            crate::event_log::log(
+                home,
+                "watchdog_snooze",
+                actor,
+                &format!(
+                    "fleet idle snoozed until {} ({duration_str})",
+                    snooze.snoozed_until
+                ),
+            );
+            json!({
+                "snoozed": true,
+                "snoozed_until": snooze.snoozed_until,
+                "duration_secs": secs,
+            })
+        }
+        Err(e) => json!({"error": format!("snooze failed: {e}")}),
+    }
+}
+
+fn handle_watchdog_resume(home: &Path, actor: &str) -> Value {
+    resume_fleet_idle(home);
+    crate::event_log::log(home, "watchdog_resume", actor, "fleet idle snooze cleared");
+    json!({"snoozed": false})
+}
+
+fn handle_watchdog_status(home: &Path) -> Value {
+    if let Some(snooze) = get_snooze_state(home) {
+        let remaining = chrono::DateTime::parse_from_rfc3339(&snooze.snoozed_until)
+            .ok()
+            .map(|dt| {
+                dt.with_timezone(&chrono::Utc)
+                    .signed_duration_since(chrono::Utc::now())
+                    .num_seconds()
+                    .max(0)
+            })
+            .unwrap_or(0);
+        json!({
+            "snoozed": true,
+            "snoozed_until": snooze.snoozed_until,
+            "remaining_secs": remaining,
+            "actor": snooze.actor,
+        })
+    } else {
+        let ack_info = fleet_ack_status().map(|ts| json!({"acked_at": ts}));
+        json!({"snoozed": false, "ack": ack_info})
+    }
+}
+
+fn handle_watchdog_ack(home: &Path, actor: &str) -> Value {
+    let ts = ack_fleet_idle();
+    crate::event_log::log(
+        home,
+        "watchdog_ack",
+        actor,
+        "fleet idle acked — suppressed until post-ack activity",
+    );
+    json!({
+        "acked": true,
+        "acked_at": ts,
+    })
+}
+
+/// Parse human-friendly duration strings like "2h", "30m", "1h30m".
+/// A bare number without suffix is interpreted as **minutes**.
+fn parse_duration_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total: i64 = 0;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+        } else {
+            let n: i64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            // Checked arithmetic: an attacker-controlled digit run (e.g.
+            // "9999999999999999h") parses to a valid i64 whose `* 3600` overflows
+            // i64::MAX — debug builds panic, release wraps to a bogus value.
+            // Reject the overflow as invalid (None) instead.
+            let secs = match ch {
+                'h' => n.checked_mul(3600)?,
+                'm' => n.checked_mul(60)?,
+                's' => n,
+                _ => return None,
+            };
+            total = total.checked_add(secs)?;
+        }
+    }
+    if !num_buf.is_empty() {
+        let n: i64 = num_buf.parse().ok()?;
+        total = total.checked_add(n.checked_mul(60)?)?; // bare number = minutes
+    }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 /// Vantage #12 — fleet-wide idle threshold check. Triggers when
@@ -1978,5 +2104,83 @@ mod tests {
         assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");
         assert_eq!(alerts[0].1.as_deref(), Some("fleet_idle_watchdog"));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1084/#2548 watchdog CLI tests (moved from the retired `watchdog` MCP tool) ──
+
+    #[test]
+    fn cli_watchdog_snooze_then_status_round_trip() {
+        let home = tmp_home("cli-watchdog-snooze-status");
+        let args = json!({"action": "snooze", "duration": "1h"});
+        let result = handle_watchdog(&home, &args, "test-agent");
+        assert_eq!(result["snoozed"], true);
+        assert!(result["snoozed_until"].is_string());
+        assert_eq!(result["duration_secs"], 3600);
+
+        let status_args = json!({"action": "status"});
+        let status = handle_watchdog(&home, &status_args, "test-agent");
+        assert_eq!(status["snoozed"], true);
+        assert!(status["remaining_secs"].as_i64().unwrap() > 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cli_watchdog_snooze_duration_clamped_to_4h() {
+        let home = tmp_home("cli-watchdog-snooze-clamp");
+        let args = json!({"action": "snooze", "duration": "24h"});
+        let result = handle_watchdog(&home, &args, "test-agent");
+        assert_eq!(
+            result["duration_secs"],
+            4 * 3600,
+            "#1084: 24h must clamp to 4h"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cli_watchdog_resume_clears_snooze() {
+        let home = tmp_home("cli-watchdog-resume");
+        let snooze_args = json!({"action": "snooze", "duration": "2h"});
+        handle_watchdog(&home, &snooze_args, "test-agent");
+
+        let resume_args = json!({"action": "resume"});
+        let result = handle_watchdog(&home, &resume_args, "test-agent");
+        assert_eq!(result["snoozed"], false);
+
+        let status_args = json!({"action": "status"});
+        let status = handle_watchdog(&home, &status_args, "test-agent");
+        assert_eq!(status["snoozed"], false);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cli_watchdog_unknown_action_errors() {
+        let home = tmp_home("cli-watchdog-unknown");
+        let args = json!({"action": "frobnicate"});
+        let result = handle_watchdog(&home, &args, "test-agent");
+        assert!(result["error"].as_str().unwrap_or("").contains("unknown"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2548-moved review-repro (mcp-dispatch-comms batch, Finding 5): `parse_duration_secs`
+    /// multiplies an `i64` parsed from an arbitrary digit run by 3600/60 with checked
+    /// arithmetic. An attacker-controlled duration such as `"9999999999999999h"` parses to
+    /// a valid `i64` (~1e16) whose unchecked `* 3600` (~3.6e19) would overflow `i64::MAX`
+    /// (~9.2e18) — checked_mul rejects it as invalid (`None`) instead of panicking (debug)
+    /// or wrapping to a bogus value (release).
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn parse_duration_secs_does_not_overflow_on_huge_input_mcp_dispatch_comms() {
+        let malicious = "9999999999999999h";
+        let outcome = std::panic::catch_unwind(|| parse_duration_secs(malicious));
+        let parsed = outcome.expect(
+            "parse_duration_secs must NOT panic on an oversized duration: the unchecked `n * 3600` \
+             overflows i64 (debug builds panic). Use checked arithmetic returning None instead.",
+        );
+        assert_eq!(
+            parsed, None,
+            "an oversized/overflowing duration must be rejected as invalid (None), \
+             not silently wrapped to a bogus value"
+        );
     }
 }

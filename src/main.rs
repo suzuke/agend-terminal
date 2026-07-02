@@ -72,7 +72,6 @@ mod runtime;
 pub mod runtime_config;
 mod schedules;
 mod scm;
-mod screenshot;
 mod service;
 mod shared_async;
 mod skills;
@@ -531,6 +530,50 @@ enum AdminCommands {
         /// the default `https://api.github.com`.
         #[arg(long)]
         api_base_url: Option<String>,
+    },
+    /// #2548: list Phase 4 GC candidates (released, past-grace, daemon-managed
+    /// worktrees) without deleting them. Non-destructive. Moved from the
+    /// `gc_dry_run` MCP tool (zero calls in 20 days).
+    GcDryRun {
+        /// Output format.
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+    /// #2548: on-demand token usage + estimated USD cost from Claude Code /
+    /// Codex session transcripts. Moved from the `tokens` MCP tool (zero calls
+    /// in 20 days). Cost is an estimate; OpenCode/Kiro/Gemini not covered.
+    Tokens {
+        /// summary (fleet totals + per-instance table) or by_instance (requires --instance).
+        #[arg(long, default_value = "summary")]
+        action: String,
+        /// instance (per-instance/per-model) or task (per-instance/per-task time-join).
+        #[arg(long, default_value = "instance")]
+        group_by: String,
+        /// Lookback window: "24h" (default) / "7d" / "90m" / "all".
+        #[arg(long)]
+        since: Option<String>,
+        /// Required for --action by_instance; optional filter for --action summary.
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// #2548: fleet idle watchdog control. Moved from the `watchdog` MCP tool
+    /// (zero calls in 20 days). `ack` suppresses fleet alerts until post-ack
+    /// agent activity is detected, then auto-clears.
+    Watchdog {
+        /// snooze | resume | status | ack
+        action: String,
+        /// Snooze duration (e.g. '2h', '30m', '1h30m'). Clamped to max 4h. Default: 1h.
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// #2548: set a runtime-mutable daemon config key. Moved from the `config`
+    /// tool's set action (zero MCP calls in 20 days) — agents can still read
+    /// config via the MCP tool, but only the operator can mutate it now.
+    ConfigSet {
+        /// Config key name (see `docs/MCP-TOOLS.md` `config` tool for the current key list).
+        key: String,
+        /// New value.
+        value: String,
     },
 }
 
@@ -1308,6 +1351,53 @@ fn main() -> anyhow::Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
                 );
+            }
+            AdminCommands::GcDryRun { format } => {
+                let args = serde_json::json!({"format": format});
+                let result = cli::handle_gc_dry_run(&home, &args);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+                );
+            }
+            AdminCommands::Tokens {
+                action,
+                group_by,
+                since,
+                instance,
+            } => {
+                let mut args = serde_json::json!({"action": action, "group_by": group_by});
+                if let Some(s) = since {
+                    args["since"] = serde_json::json!(s);
+                }
+                if let Some(i) = instance {
+                    args["instance"] = serde_json::json!(i);
+                }
+                let result = token_cost::handle_tokens(&home, &args);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+                );
+            }
+            AdminCommands::Watchdog { action, duration } => {
+                let mut args = serde_json::json!({"action": action});
+                if let Some(d) = duration {
+                    args["duration"] = serde_json::json!(d);
+                }
+                let result = daemon::idle_watchdog::handle_watchdog(&home, &args, "operator-cli");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+                );
+            }
+            AdminCommands::ConfigSet { key, value } => {
+                match runtime_config::set(&home, &key, &value) {
+                    Ok(_) => println!("{key} = {value}"),
+                    Err(e) => {
+                        eprintln!("agend-terminal admin config-set: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         },
         Some(Commands::Capture { action }) => match action {

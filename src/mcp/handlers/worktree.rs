@@ -1,7 +1,9 @@
 //! MCP handlers for daemon-managed worktree lifecycle. Operator- and
 //! agent-callable: `bind_self` (Sprint 54 P1-7), `release_worktree`
-//! (Sprint 53 P0-X), `gc_dry_run` (Sprint 53 P1-4 Phase 4 visibility,
-//! non-destructive — wraps `worktree_pool::gc_dry_run`).
+//! (Sprint 53 P0-X). Sibling non-destructive GC visibility (Sprint 53 P1-4,
+//! wraps `worktree_pool::gc_dry_run`) used to live alongside these as an MCP
+//! tool; #2548 moved it to `cli::handle_gc_dry_run` (`agend-terminal admin
+//! gc-dry-run`) — no longer part of the MCP surface.
 
 use crate::identity::Sender;
 use serde_json::{json, Value};

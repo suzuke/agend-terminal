@@ -3477,18 +3477,12 @@ fn non_read_only_tool_still_writes_usage_and_disk_heartbeat() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// The allowlist is exactly the six pure-query tools; mutating + action-based
+/// The allowlist is exactly the three pure-query tools (#2548: gc_dry_run/
+/// tokens/tui_screenshot removed or moved to CLI); mutating + action-based
 /// tools are excluded (they keep the full path).
 #[test]
 fn is_read_only_tool_allowlist() {
-    for t in [
-        "list_instances",
-        "binding_state",
-        "gc_dry_run",
-        "tokens",
-        "pane_snapshot",
-        "tui_screenshot",
-    ] {
+    for t in ["list_instances", "binding_state", "pane_snapshot"] {
         assert!(is_read_only_tool(t), "{t} must be classified read-only");
     }
     for t in [

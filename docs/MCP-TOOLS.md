@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (33 tools)
+# AgEnD MCP Tools Reference (29 tools)
 
 ## Action-based Tools
 
@@ -125,10 +125,6 @@ Read visible text from a target instance's PTY scrollback (ANSI stripped).
 - lines (default 100, max 10000)
 - `to_file: true` (#2478) writes the full snapshot under `$AGEND_HOME/captures/` and returns only a compact summary + path, keeping diagnostic dumps out of context.
 
-### `tui_screenshot`
-Capture the current TUI state as an SVG image. Only works in TUI mode (not daemon-only).
-- **Parameters**: None.
-
 ## Worktree & Binding
 
 ### `bind_self`
@@ -150,26 +146,12 @@ Force-release a stale daemon-managed worktree directory. Emergency recovery tool
 Report structured daemon-side bind state for an agent. Non-destructive introspection.
 - **instance**: instance to inspect
 
-### `gc_dry_run`
-List Phase 4 GC candidates without deleting. Non-destructive.
-- format (human / json)
-
 ## Daemon Operations
 
-### `watchdog`
-Fleet idle watchdog control. Actions: snooze, resume, status, ack. `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.
-- **action**: snooze / resume / status / ack
-- duration (e.g. `2h`, `30m`; clamped to max 4h)
-
 ### `config`
-Runtime-mutable daemon configuration. Actions: get, set, list. (Available keys are derived from the daemon's runtime config and listed in the live tool description.)
-- **action**: get / set / list
-- key, value
-
-### `tokens`
-On-demand token usage + estimated USD cost from Claude Code + Codex session transcripts. Cost is an estimate; OpenCode/Kiro/Gemini are not yet covered.
-- **action**: summary / by_instance
-- group_by (instance / task), since (`24h` / `7d` / `90m` / `all`), instance
+Runtime-mutable daemon configuration. Actions: get, list. #2548: the set action moved to the `agend-terminal admin config-set` CLI (zero MCP calls in 20 days). (Available keys are derived from the daemon's runtime config and listed in the live tool description.)
+- **action**: get / list
+- key (required for get)
 
 ### `mode`
 Read the operator availability/authority mode (read-only for agents). Setting the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI.
