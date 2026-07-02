@@ -27,6 +27,13 @@
   bug，不是 agend 的根本修正。
 - **Revisit when：** OpenCode 在 upstream 修正 dummy-session id 的問題。
 - **Refs：** #1526（agend 緩解：#1519）
+- **半死 wedge 變體（2026-07-02，待重現）：** 同一個 dummy-session bug 也可能表現成
+  OpenCode 行程「不退出」——TUI 框架持續渲染，未捕捉例外的堆疊卻疊加在畫面上，agend
+  現有三層偵測（state-pattern 分類器、respawn-stuck watchdog、backend-exit 偵測）全
+  都接不住，因為行程從未真的崩潰，也沒有已知錯誤簽名能匹配這段堆疊。目前已存到一份
+  真實 capture（推翻了先前一次 session 認為證據不可回收的判斷）；要再有第二個樣本才
+  會補偵測 pattern，避免誤判合法輸出（見 t-20260702144219394508-56872-6）。
+  respawn_watchdog 側的結構性加固併入 round-3 #2549 的範圍，不另立單。
 
 ## Deferred — 等待 operator 擷取資料或決策
 
