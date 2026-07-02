@@ -140,9 +140,13 @@ After completion, quickstart lists what to do next:
 
 === Launch ===
 
-$ agend-terminal start        # Start the daemon
-$ agend-terminal list          # Check agent status
-$ agend-terminal attach general  # Connect to the agent terminal
+[Recommended] New to agend, or want the whole fleet at a glance:
+$ agend-terminal app           # TUI dashboard: every agent's pane + live status
+
+[Advanced] Automation / headless / scripted (CI, remote, no TUI):
+$ agend-terminal start         # launch the fleet daemon
+$ agend-terminal list          # check agent status
+$ agend-terminal attach general  # attach to one agent's pane
 ```
 
 ---
