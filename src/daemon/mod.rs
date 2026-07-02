@@ -669,6 +669,11 @@ pub(crate) fn build_default_handlers(
     // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
     vec![
         Box::new(per_tick::HangDetectionHandler::new()),
+        // #2538: foreground-identity vs configured-backend mismatch detection —
+        // grouped with HangDetection (both are "detect an abnormal condition,
+        // set health state" concerns). Ordering-independent of RecoveryDispatcher
+        // below (that reacts only to `Hung`, never `Unhealthy`).
+        Box::new(per_tick::BackendExitDetectionHandler::new()),
         Box::new(per_tick::RecoveryDispatcherHandler::new(
             std::sync::Arc::new(crash_tx),
             stage2_dispatch_available,

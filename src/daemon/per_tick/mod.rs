@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) mod backend_exit_detection;
 pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
@@ -63,6 +64,7 @@ pub(crate) mod tmp_review_gc;
 pub(crate) mod watchdog;
 pub(crate) mod workspace_boundary_sweep;
 
+pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use context_alert::ContextAlertHandler;

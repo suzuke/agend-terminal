@@ -68,6 +68,18 @@ pub enum HealthState {
     /// See `docs/RECOVERY-STAGES.md` §RS for the lifecycle.
     Paused,
     Absent,
+    /// #2538: the daemon's foreground-identity tick detected that this agent's
+    /// LIVE `backend_command` no longer matches its fleet.yaml-DECLARED backend
+    /// (e.g. a `codex`-configured instance whose backend exited cleanly and got
+    /// replaced by the daemon's own shell-fallback spawn, or any other silent
+    /// identity change) — the strongest available ground-truth signal that the
+    /// expected agent program is simply not running anymore. Distinct from
+    /// `Failed`/`Unstable` (crash-counter-driven) and `Hung` (silence-driven):
+    /// this is an identity mismatch, not a liveness or responsiveness signal.
+    /// Cleared automatically once the mismatch resolves (see
+    /// `daemon::per_tick::backend_exit_detection`); never entered/cleared by
+    /// `record_crash` / `maybe_decay` / any other existing transition.
+    Unhealthy,
 }
 
 impl HealthState {
@@ -82,6 +94,7 @@ impl HealthState {
             Self::IdleLong => "idle_long",
             Self::Paused => "paused",
             Self::Absent => "absent",
+            Self::Unhealthy => "unhealthy",
         }
     }
 }
