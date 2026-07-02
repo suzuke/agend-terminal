@@ -147,20 +147,45 @@ pub(crate) fn session_cwd(line: &str) -> Option<String> {
     Some(rec.payload.get("cwd")?.as_str()?.to_string())
 }
 
-/// Map a session cwd → the agend codex agent that owns it. SCOPED + separator-agnostic:
-/// the cwd must EQUAL `<home>/workspace/<name>` for a LIVE codex agent, compared by path
-/// COMPONENTS (`Path` eq handles `\` vs `/`, so it works on Windows — #2437 round-1) AND
-/// rooted at THIS daemon's `home`, so a stray `*/workspace/<name>` OUTSIDE the fleet (a
-/// same-named operator codex, another daemon's home) is NOT attributed (#2437 round-3 r6).
-/// codex canonicalizes `/tmp`→`/private/tmp` on macOS; [`strip_private`] (unix-only)
-/// reconciles that before the comparison.
-fn agent_for_cwd(cwd: &str, home: &Path, codex_agents: &[String]) -> Option<String> {
+/// Map a session cwd → the agend codex agent that owns it. `candidates` is a
+/// (name, expected-cwd) list: for a MANAGED agent, `expected-cwd` is the fixed
+/// `<home>/workspace/<name>` convention; for an EPHEMERAL codex worker (#2524 P3a
+/// PR-1 — they bypass the registry by design, #1967, and have no fixed workspace
+/// convention), it's the worker's own recorded spawn cwd. Compared by path
+/// COMPONENTS (`Path` eq handles `\` vs `/`, so it works on Windows — #2437
+/// round-1). codex canonicalizes `/tmp`→`/private/tmp` on macOS; [`strip_private`]
+/// (unix-only) reconciles that before the comparison.
+///
+/// #2524 P3a PR-1 RED: not yet fail-closed on ambiguity — first match wins, same as
+/// the pre-PR behavior. GREEN commit makes this fail-closed instead.
+fn agent_for_cwd(cwd: &str, candidates: &[(String, PathBuf)]) -> Option<String> {
     let cwd_path = Path::new(strip_private(cwd));
-    let ws = home.join("workspace");
-    codex_agents
+    candidates
         .iter()
-        .find(|name| cwd_path == ws.join(name))
-        .cloned()
+        .find(|(_, expected)| cwd_path == expected.as_path())
+        .map(|(name, _)| name.clone())
+}
+
+/// Build the (name, expected-cwd) candidate list `agent_for_cwd` matches against:
+/// managed codex agents (from the registry, `<home>/workspace/<name>` convention)
+/// PLUS live ephemeral codex workers (#2524 P3a PR-1, their own recorded spawn
+/// cwd — read-only `LIVE_CHILDREN` snapshot, doesn't register them anywhere).
+fn codex_candidates(registry: &crate::agent::AgentRegistry, home: &Path) -> Vec<(String, PathBuf)> {
+    let ws = home.join("workspace");
+    let mut out: Vec<(String, PathBuf)> = live_codex_agents(registry)
+        .into_iter()
+        .map(|name| {
+            let expected = ws.join(&name);
+            (name, expected)
+        })
+        .collect();
+    out.extend(
+        crate::ephemeral_tracking::live_children_snapshot()
+            .into_iter()
+            .filter(|w| matches!(w.backend, Some(crate::backend::Backend::Codex)))
+            .filter_map(|w| w.cwd.map(|cwd| (w.worker_id, cwd))),
+    );
+    out
 }
 
 /// Strip codex's macOS `/private` canonicalization prefix (`/private/tmp/...` → `/tmp/...`)
@@ -235,8 +260,8 @@ fn tail_once(
     home: &Path,
     cursors: &mut HashMap<PathBuf, Cursor>,
 ) {
-    let codex_agents = live_codex_agents(registry);
-    if codex_agents.is_empty() {
+    let candidates = codex_candidates(registry, home);
+    if candidates.is_empty() {
         return;
     }
     for file in discover_rollouts(root) {
@@ -244,7 +269,7 @@ fn tail_once(
             offset: 0,
             agent: None,
         });
-        drain_file(&file, cur, home, &codex_agents);
+        drain_file(&file, cur, &candidates);
     }
 }
 
@@ -308,7 +333,7 @@ fn discover_rollouts(root: &Path) -> Vec<PathBuf> {
 /// the first `session_meta` line) to an agend codex agent, and push each transition as
 /// Evidence. A file not owned by any live codex agent is consumed-and-ignored (cursor
 /// advances so we don't re-scan it).
-fn drain_file(file: &Path, cur: &mut Cursor, home: &Path, codex_agents: &[String]) {
+fn drain_file(file: &Path, cur: &mut Cursor, candidates: &[(String, PathBuf)]) {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let Ok(f) = std::fs::File::open(file) else {
         return;
@@ -348,7 +373,7 @@ fn drain_file(file: &Path, cur: &mut Cursor, home: &Path, codex_agents: &[String
         // Resolve the owning agent from the session_meta header (first line).
         if cur.agent.is_none() {
             if let Some(cwd) = session_cwd(&line) {
-                cur.agent = agent_for_cwd(&cwd, home, codex_agents);
+                cur.agent = agent_for_cwd(&cwd, candidates);
             }
             // Either way the header line itself is not a transition.
             continue;
@@ -371,6 +396,15 @@ mod tests {
 
     fn kind_of(line: &str) -> Option<EvidenceKind> {
         record_to_evidence(line, 1_000).map(|e| e.kind)
+    }
+
+    /// Build the (name, expected-cwd) candidate list for a set of MANAGED agent
+    /// names under `home` — the `<home>/workspace/<name>` convention `codex_candidates`
+    /// derives for registry members. Test-only shorthand so existing fixtures don't
+    /// need to spell out the join at every call site.
+    fn ws_candidates(home: &Path, names: &[&str]) -> Vec<(String, PathBuf)> {
+        let ws = home.join("workspace");
+        names.iter().map(|n| (n.to_string(), ws.join(n))).collect()
     }
 
     #[test]
@@ -500,34 +534,60 @@ mod tests {
     #[test]
     fn agent_for_cwd_matches_only_fleet_codex_workspace() {
         let home = std::env::temp_dir().join("svcx_test_home");
-        let agents = vec!["cx".to_string(), "cx2".to_string()];
+        let candidates = ws_candidates(&home, &["cx", "cx2"]);
         // The agent's own workspace (built like production) → match, on any platform.
         let ws_cx = home.join("workspace").join("cx");
         assert_eq!(
-            agent_for_cwd(&ws_cx.to_string_lossy(), &home, &agents).as_deref(),
+            agent_for_cwd(&ws_cx.to_string_lossy(), &candidates).as_deref(),
             Some("cx")
         );
         // Unknown agent name UNDER the fleet workspace → None.
         let ghost = home.join("workspace").join("ghost");
-        assert_eq!(
-            agent_for_cwd(&ghost.to_string_lossy(), &home, &agents),
-            None
-        );
+        assert_eq!(agent_for_cwd(&ghost.to_string_lossy(), &candidates), None);
         // A cwd not ending in `workspace/<name>` → None.
-        assert_eq!(agent_for_cwd("/some/other/dir", &home, &agents), None);
+        assert_eq!(agent_for_cwd("/some/other/dir", &candidates), None);
+    }
+
+    /// #2524 P3a PR-1: an ephemeral codex worker's OWN recorded cwd (not the
+    /// `<home>/workspace/<name>` convention) also attributes correctly — it's just
+    /// another candidate in the merged list.
+    #[test]
+    fn agent_for_cwd_matches_ephemeral_worker_explicit_cwd() {
+        let candidates = vec![(
+            "eph-1".to_string(),
+            PathBuf::from("/tmp/some/ephemeral/dir"),
+        )];
+        assert_eq!(
+            agent_for_cwd("/tmp/some/ephemeral/dir", &candidates).as_deref(),
+            Some("eph-1")
+        );
+        assert_eq!(agent_for_cwd("/tmp/some/other/dir", &candidates), None);
+    }
+
+    /// #2524 P3a PR-1: two candidates (e.g. two ephemeral workers, or an ephemeral
+    /// worker colliding with a managed agent's workspace) sharing the SAME expected
+    /// cwd is FAIL-CLOSED — attribute to neither rather than guess.
+    #[test]
+    fn agent_for_cwd_ambiguous_when_two_candidates_share_a_cwd() {
+        let shared = PathBuf::from("/tmp/shared/workdir");
+        let candidates = vec![
+            ("eph-1".to_string(), shared.clone()),
+            ("eph-2".to_string(), shared.clone()),
+        ];
+        assert_eq!(
+            agent_for_cwd(&shared.to_string_lossy(), &candidates),
+            None,
+            "an ambiguous cwd must not attribute to either candidate"
+        );
     }
 
     /// #2437 r6 (regression, verbatim): a SAME-NAMED `workspace/<name>` OUTSIDE this daemon's
     /// home must NOT attribute — the tail-component-only match (round-3) wrongly did.
     #[test]
     fn agent_for_cwd_does_not_attribute_same_named_stray_workspace() {
-        let agents = vec!["cx".to_string()];
+        let candidates = ws_candidates(Path::new("/tmp/svcx"), &["cx"]);
         assert_eq!(
-            agent_for_cwd(
-                "/tmp/operator/workspace/cx",
-                Path::new("/tmp/svcx"),
-                &agents
-            ),
+            agent_for_cwd("/tmp/operator/workspace/cx", &candidates),
             None
         );
     }
@@ -537,14 +597,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn agent_for_cwd_reconciles_macos_private_prefix() {
-        let agents = vec!["cx".to_string()];
+        let candidates = ws_candidates(Path::new("/tmp/svcx"), &["cx"]);
         assert_eq!(
-            agent_for_cwd(
-                "/private/tmp/svcx/workspace/cx",
-                Path::new("/tmp/svcx"),
-                &agents
-            )
-            .as_deref(),
+            agent_for_cwd("/private/tmp/svcx/workspace/cx", &candidates).as_deref(),
             Some("cx")
         );
     }
@@ -593,8 +648,8 @@ mod tests {
             offset: 0,
             agent: None,
         };
-        let agents = vec!["cxt".to_string()];
-        drain_file(&roll, &mut cur, &home, &agents);
+        let candidates = ws_candidates(&home, &["cxt"]);
+        drain_file(&roll, &mut cur, &candidates);
 
         assert_eq!(
             cur.agent.as_deref(),
@@ -632,7 +687,7 @@ mod tests {
         )
         .unwrap();
         f2.flush().unwrap();
-        drain_file(&roll, &mut cur, &home, &agents);
+        drain_file(&roll, &mut cur, &candidates);
         assert_eq!(
             cur.offset, off_after,
             "partial line must not advance the cursor"
@@ -683,8 +738,8 @@ mod tests {
             offset: 0,
             agent: None,
         };
-        let agents = vec!["cxr".to_string()];
-        drain_file(&roll, &mut cur, &home, &agents);
+        let candidates = ws_candidates(&home, &["cxr"]);
+        drain_file(&roll, &mut cur, &candidates);
         assert!(
             cur.offset > 0 && cur.agent.is_some(),
             "first drain advanced"
@@ -712,7 +767,7 @@ mod tests {
             "rebuilt session is shorter than the prior cursor"
         );
 
-        drain_file(&roll, &mut cur, &home, &agents);
+        drain_file(&roll, &mut cur, &candidates);
         // Recovered: agent re-resolved from the new header + the new ToolStarted seen (the
         // pre-fix code would have left the cursor past EOF → observer DEAF → empty).
         let evs = super::super::peek("cxr");

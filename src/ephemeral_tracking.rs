@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 /// Cost-guard default: hard ceiling on simultaneously-live ephemeral workers when
 /// `AGEND_EPHEMERAL_MAX_LIVE` is unset/invalid. Spawn admission rejects once the
@@ -134,6 +134,40 @@ static LIVE_CHILDREN: LazyLock<Mutex<HashMap<String, crate::agent::EphemeralPtyH
 
 /// Process-local monotonic counter for unique worker ids within a daemon life.
 static WORKER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// #2524 P3a PR-1: one live ephemeral worker, as exposed to the shadow-observer's
+/// observation plane (`daemon::per_tick::shadow_observe` + `daemon::shadow::rollout`).
+/// READ-ONLY — this is an observation feed, not a registration: it doesn't add the
+/// worker to `AgentRegistry`/`fleet.yaml`/binding, so it doesn't reintroduce the
+/// "managed bookkeeping" #1967 deliberately avoids for ephemeral workers.
+// #2524 P3a PR-1 RED: `core`/`child_alive` aren't read yet — `shadow_observe.rs`
+// wires them in GREEN. Drop this once that caller lands.
+#[allow(dead_code)]
+pub(crate) struct LiveEphemeralSnapshot {
+    pub worker_id: String,
+    pub core: Arc<crate::sync_audit::CoreMutex<crate::agent::AgentCore>>,
+    pub child_alive: bool,
+    pub backend: Option<crate::backend::Backend>,
+    pub cwd: Option<PathBuf>,
+}
+
+/// Snapshot all live ephemeral workers under ONE brief `LIVE_CHILDREN` lock,
+/// released before this returns — so a caller (e.g. `shadow_observe`'s per-tick
+/// handler) never holds this lock nested with any other (the registry lock in
+/// particular; see that caller's own lock-ordering note).
+pub(crate) fn live_children_snapshot() -> Vec<LiveEphemeralSnapshot> {
+    LIVE_CHILDREN
+        .lock()
+        .iter()
+        .map(|(worker_id, h)| LiveEphemeralSnapshot {
+            worker_id: worker_id.clone(),
+            core: Arc::clone(&h.core),
+            child_alive: h.child.lock().process_id().is_some(),
+            backend: h.backend.clone(),
+            cwd: h.cwd.clone(),
+        })
+        .collect()
+}
 
 fn store_path(home: &Path) -> PathBuf {
     crate::store::store_path(home, "ephemeral_workers.json")
@@ -1059,6 +1093,80 @@ mod tests {
             "reaped worker removed from store"
         );
         assert_dead_within(w.pid, "reap must terminate the real ephemeral process");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2524 P3a PR-1 — THE wiring pin: a real ephemeral worker (registered ONLY in
+    /// `LIVE_CHILDREN`, never in the `AgentRegistry` this test deliberately leaves
+    /// EMPTY) still gets `observed_status` populated by running the REAL
+    /// `ShadowObserveHandler::run()` entry point. Before this PR the per-tick reduce
+    /// iterated the registry only, so an ephemeral worker's `observed_status` stayed
+    /// `None` forever — not laggy, NEVER SET. `#[cfg(unix)]`: ephemeral spawn is
+    /// fail-closed on Windows.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shadow_observer)]
+    fn ephemeral_worker_gets_observed_status_via_shadow_observe_2524_p3a() {
+        use crate::agent::{AgentRegistry, ExternalRegistry};
+        use crate::daemon::per_tick::{PerTickHandler, ShadowObserveHandler, TickContext};
+        use crate::daemon::shadow;
+        use crate::daemon::shadow::evidence::{Evidence, EvidenceKind};
+        use crate::daemon::shadow::reducer::ObservedState;
+        use parking_lot::Mutex as PLMutex;
+
+        let prev = std::env::var("AGEND_SHADOW_OBSERVER").ok();
+        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+
+        let home = tmp_home("shadow-ephemeral-wiring");
+        let w = track_real_worker(&home, "wf1", 3600);
+        let core = LIVE_CHILDREN
+            .lock()
+            .get(&w.worker_id)
+            .map(|h| Arc::clone(&h.core))
+            .expect("worker just inserted into LIVE_CHILDREN");
+
+        let token = shadow::new_session_token().unwrap();
+        shadow::register(&token, &w.worker_id);
+        shadow::push(
+            &w.worker_id,
+            Evidence::hook(
+                EvidenceKind::TurnStarted,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            ),
+        );
+
+        // Deliberately EMPTY registry — proves this is the LIVE_CHILDREN path, not
+        // the pre-existing managed-agent path (already covered by
+        // `shadow_observe::tests::flag_on_reduce_writes_observed_status`).
+        let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        ShadowObserveHandler::new().run(&ctx);
+
+        let status = core
+            .lock()
+            .observed_status
+            .clone()
+            .expect("ephemeral worker must ALSO get observed_status — #2524 P3a PR-1");
+        assert_ne!(
+            status.state,
+            ObservedState::Idle,
+            "an open episode + a live child ⇒ Active family, not Idle"
+        );
+
+        shadow::forget_agent(&w.worker_id);
+        reap_one(&home, &w.worker_id).expect("reap_one");
+        assert_dead_within(w.pid, "cleanup must terminate the real process");
+        match prev {
+            Some(v) => std::env::set_var("AGEND_SHADOW_OBSERVER", v),
+            None => std::env::remove_var("AGEND_SHADOW_OBSERVER"),
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
