@@ -52,7 +52,7 @@ impl PerTickHandler for ShadowObserveHandler {
         // it before touching any per-agent core lock (never hold the registry lock
         // across another lock — mirrors `api_activity_probe::probe_once`). child_alive
         // is read here (its own `child.lock()`) so the reduce loop needs only core.lock.
-        let agents: Vec<(String, Arc<CoreMutex<AgentCore>>, bool)> = {
+        let mut agents: Vec<(String, Arc<CoreMutex<AgentCore>>, bool)> = {
             let reg = crate::agent::lock_registry(ctx.registry);
             reg.values()
                 .map(|h| {
@@ -61,6 +61,19 @@ impl PerTickHandler for ShadowObserveHandler {
                 })
                 .collect()
         };
+        // #2524 P3a PR-1: ephemeral workers bypass the managed `AgentRegistry` by
+        // design (#1967 "avoid managed bookkeeping"), so without this merge the
+        // reduce below NEVER runs on their `core` and `observed_status` stays `None`
+        // forever (not just laggy). `live_children_snapshot()` takes its OWN brief
+        // `LIVE_CHILDREN` lock, already released by the time this line runs — the
+        // registry lock above is ALSO already released (its block ended) — so
+        // neither lock is ever held nested with the other (lock-ordering note: see
+        // PR body).
+        agents.extend(
+            crate::ephemeral_tracking::live_children_snapshot()
+                .into_iter()
+                .map(|w| (w.worker_id, w.core, w.child_alive)),
+        );
         if agents.is_empty() {
             return;
         }

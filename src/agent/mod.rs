@@ -1491,6 +1491,14 @@ pub struct EphemeralPtyHandle {
     /// alone to hold the master side open).
     #[allow(dead_code)]
     pub pty_master: Box<dyn portable_pty::MasterPty + Send>,
+    /// #2524 P3a PR-1: the detected backend, so the shadow-observer's rollout-tail
+    /// candidate merge (`daemon::shadow::rollout`) can filter ephemeral workers down
+    /// to codex ones — mirrors how a managed `AgentHandle` carries `backend_command`.
+    pub backend: Option<crate::backend::Backend>,
+    /// #2524 P3a PR-1: the worker's spawn cwd, so the rollout tailer can attribute a
+    /// codex session file to this worker directly (ephemeral workers have no fixed
+    /// `<home>/workspace/<name>` convention to derive it from, unlike managed agents).
+    pub cwd: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for EphemeralPtyHandle {
@@ -1709,6 +1717,8 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
             pty_writer,
             core,
             pty_master,
+            backend: detected_backend,
+            cwd: config.working_dir.map(std::path::Path::to_path_buf),
         })
     }
 }
