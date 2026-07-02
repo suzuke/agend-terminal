@@ -862,6 +862,56 @@ fn checkout_bind_true_writes_binding_marker_and_no_longer_arms_watch_2158_gr1() 
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #2533: `repo action=checkout bind:true task_id=...` (the reviewer-workflow
+/// self-claim path, §3.19.1) must thread the caller-supplied `task_id` into
+/// `binding.json` — pre-fix, `handle_checkout_repo_inner` hardcoded `""`
+/// regardless of the `task_id` arg — AND the task_id linkage must suppress the
+/// `binding_out_of_dispatch` warning (the checkout is now attributable to a
+/// task, not a rogue bind).
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_with_task_id_records_task_id_and_suppresses_warning_2533() {
+    let home = p778_tmp_home("task-id");
+    let parent = p778_tmp_home("task-id-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/p2533");
+    let agent = "p2533-agent";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/p2533",
+            "bind": true,
+            "task_id": "T-2533",
+        }),
+        agent,
+    );
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+
+    let binding = crate::paths::runtime_dir(&home)
+        .join(agent)
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    assert_eq!(
+        v["task_id"].as_str(),
+        Some("T-2533"),
+        "#2533: checkout bind:true must record the caller-supplied task_id, not a hardcoded \
+         empty sentinel: {v}"
+    );
+
+    assert!(
+        !std::fs::read_to_string(home.join("event-log.jsonl"))
+            .unwrap_or_default()
+            .contains("binding_out_of_dispatch"),
+        "#2533: a checkout bind:true CARRYING a task_id must be treated as in-dispatch — no \
+         out-of-dispatch warning"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 /// §3.9 #1882 (reviewer-2 re-verify): the repo-checkout bind path is the third
 /// production bind site. An end-to-end conflict — agent A checks out + binds a
 /// branch, then agent B repo-checkouts the SAME branch — must end with EXACTLY
@@ -2298,6 +2348,61 @@ fn merge_force_audit_write_failure_refuses_merge() {
     assert!(
         err.contains("audit log write failed"),
         "expected audit failure error, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #2539: `handle_tool_with_runtime` reads `AGEND_HOME` via `crate::home_dir()`
+/// (no explicit `home` param, unlike `handle_merge_repo`), so exercising the
+/// full dispatch chain needs the env var set process-wide. Serializes tests
+/// that mutate it — same hazard/pattern as `mcp::handlers::tests::fleet_test_guard`.
+fn ci_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// #2539 confidence pin (§3.9 real-entry-point): the test above calls
+/// `handle_merge_repo` directly, which is a mid-pipeline inject — it cannot
+/// catch a schema-declaration gap because the daemon-internal dispatch never
+/// filters by schema. This variant drives the SAME force-bypass scenario
+/// through the full internal dispatch chain (`handle_tool` → `try_dispatch`
+/// → `ci::handle_merge_repo`), confirming `force`/`force_reason` survive the
+/// whole daemon-side path intact. It is NOT a RED test for #2539 (it passes
+/// even without the `def_repo` schema fix, since that gap lives entirely at
+/// the external MCP-client boundary this test cannot reach) — it documents
+/// that the daemon-internal half of the chain was never the problem.
+#[test]
+fn merge_force_reaches_handler_through_full_dispatch_chain_2539() {
+    let _g = ci_env_test_guard();
+    let home = std::env::temp_dir().join(format!("agend-merge-force-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let events_path = home.join("fleet_events.jsonl");
+    std::fs::create_dir_all(&events_path).unwrap();
+    let prev_home = std::env::var("AGEND_HOME").ok();
+    std::env::set_var("AGEND_HOME", &home);
+
+    let result = crate::mcp::handlers::handle_tool(
+        "repo",
+        &json!({
+            "action": "merge",
+            "pr": 9999,
+            "force": true,
+            "force_reason": "test emergency",
+            "repository": "suzuke/agend-terminal",
+        }),
+        "dev",
+    );
+
+    match prev_home {
+        Some(h) => std::env::set_var("AGEND_HOME", h),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+
+    let err = result["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("audit log write failed"),
+        "#2539: force/force_reason must survive the full handle_tool dispatch chain \
+         unmodified (same audit-write reject as the handler-direct test), got: {result}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

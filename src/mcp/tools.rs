@@ -69,7 +69,8 @@ pub(crate) fn def_send() -> Value {
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "#931/#2502: when dispatching kind=task with a `branch`, set this to the agent or agents that should receive `[ci-ready-for-action]` after CI passes on that branch. The daemon's auto-armed ci-watch carries the chain target(s) so the handoff fires without a manual follow-up `ci action=watch next_after_ci=…`. Example: lead dispatches dev with `next_after_ci=[reviewer-a, reviewer-b]` — both reviewers are auto-notified when dev's PR goes green."},
             "terminal": {"type": "boolean", "description": "Set true on kind=report to signal task completion. When correlation_id matches a task and reporter is the assignee, the task is auto-closed. Default false — progress reports and review verdicts do not trigger auto-close."},
             "no_report_expected": {"type": "boolean", "description": "#2099: set true on a fire-and-forget kind=task dispatch that intentionally expects NO kind=report back. The dispatch is recorded with a terminal-like status so the 30-min dispatch-stuck sweep never false-fires a 'dispatch stuck check' for it (the audit row is kept). Default false — every normal dispatch stays stuck-tracked. Distinct from `terminal`, which is the report-side auto-close signal."},
-            "ack_inbox": {"type": "boolean", "description": "Set true on kind=report with correlation_id to auto-settle the sender's DELIVERING inbox messages whose task_id matches the correlation_id. Eliminates the need for a separate `inbox action=ack` call after sending a report — the daemon settles the dispatch message(s) atomically with the send. Only fires when the send succeeds. Default false (existing two-step flow still works)."}
+            "ack_inbox": {"type": "boolean", "description": "Set true on kind=report with correlation_id to auto-settle the sender's DELIVERING inbox messages whose task_id matches the correlation_id. Eliminates the need for a separate `inbox action=ack` call after sending a report — the daemon settles the dispatch message(s) atomically with the send. Only fires when the send succeeds. Default false (existing two-step flow still works)."},
+            "triaged": {"type": "object", "description": "#2537/#2524 P6 PR-1: optional discharge-ledger record on kind=update/report — {head, job, reason?}. `head` and `job` must both be non-empty (or both omitted); `reason` is optional free-text context. Persists to a disk-backed ledger keyed by head_sha, recording that this notification obligation was explicitly triaged. PR-1 is data-layer only — no notification path reads the ledger yet (that's PR-2)."}
         }, "required": ["message"]}})
 }
 
@@ -320,6 +321,8 @@ pub(crate) fn def_ephemeral() -> Value {
             "token_budget": {"type": "number", "description": "spawn: per-worker token budget (recorded; enforcement lands in a later PR)."},
             "prompt": {"type": "string", "description": "spawn (PR3b): prompt for a one-shot driven turn. Present = launch the driver (opencode ONLY; other backends rejected — Slice-2). Absent = lifecycle-only spawn (no driver). Poll `ephemeral list` for result_summary/success."},
             "model": {"type": "string", "description": "spawn (PR3b): optional model override for the worker (provider-prefixed for opencode, e.g. opencode/deepseek-v4-flash-free). Default = the backend's configured model."},
+            "max_iterations": {"type": "number", "description": "spawn (#2524 P3b ralph-loop): opts into the driver's self-continuation loop — after a non-terminal turn, inject 'continue' and run another turn, up to this many total. Must be 1..=25 (daemon-side hard cap, no unlimited option) and requires a non-empty 'prompt'. Absent = the pre-P3b single-shot turn, byte-identical."},
+            "completion_promise": {"type": "string", "description": "spawn (#2524 P3b ralph-loop): optional completion signal — a literal string the driver looks for in each turn's transcript; its presence ends the loop as a success. Requires 'max_iterations' to also be set."},
             "worker_id": {"type": "string", "description": "reap: reap a single worker by id."},
             "all_stale": {"type": "boolean", "description": "reap: reap all due/dead workers (TTL-expired, terminal, or process gone)."}
         }, "required": ["action"]}})
@@ -394,7 +397,10 @@ pub(crate) fn def_repo() -> Value {
             "apply": {"type": "boolean", "description": "#817 cleanup_merged_branches: when false (default), returns dry-run plan; when true, deletes confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
             "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
-            "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."}
+            "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
+            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
+            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. The handler always read this field, but it was never declared here — an MCP client validating against this schema had no way to send it, so force=true silently never reached the daemon (#2539)."},
+            "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."}
         }, "required": ["action"]}})
 }
 
@@ -404,7 +410,8 @@ pub(crate) fn def_bind_self() -> Value {
             "repository_path": {"type": "string", "description": "Local filesystem path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repository` (handler rejects both via `ambiguous_args` code)."},
             "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `repository_path`."},
             "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"},
-            "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1 PR-1: atomic recover-and-bind. When true, releases self's stale on-disk worktree dir + binding state before lease — closes the lease_failed recovery path without an explicit release_worktree call. Cross-agent isolation preserved (rejects branches leased by another agent)."}
+            "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1 PR-1: atomic recover-and-bind. When true, releases self's stale on-disk worktree dir + binding state before lease — closes the lease_failed recovery path without an explicit release_worktree call. Cross-agent isolation preserved (rejects branches leased by another agent)."},
+            "task_id": {"type": "string", "description": "#2533: optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."}
         }, "required": ["branch"]}})
 }
 
@@ -488,6 +495,39 @@ mod tests {
         assert!(
             !required_strs.contains(&"command"),
             "command should NOT be required (backend is preferred, default is claude)"
+        );
+    }
+
+    #[test]
+    fn repo_merge_has_force_and_force_reason_params() {
+        // #2539: `handle_merge_repo` (ci/merge.rs) has ALWAYS read
+        // `args["force"]` / `args["force_reason"]` directly and correctly
+        // gated the CI-checks / base-drift / #2140 freshness refusals behind
+        // `if !force` — but the `repo` tool's inputSchema never DECLARED
+        // these two params. An MCP client that validates a tool call against
+        // the advertised inputSchema (the normal contract) has no way to
+        // include `force`/`force_reason` in a `repo action=merge` call, so
+        // `force=true` never reaches the daemon — the merge is refused
+        // exactly as if force had never been passed (#2539's live repro).
+        // The daemon-internal dispatch chain (execute_tool → handle_tool →
+        // ci::handle_merge_repo) never filters args by schema — confirmed by
+        // reading `mcp/handlers/mod.rs::handle_tool_with_runtime`, which
+        // passes `args` through unmodified — so this schema declaration IS
+        // the complete fix; no merge.rs logic change is needed.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let repo = tools
+            .iter()
+            .find(|t| t["name"] == "repo")
+            .expect("repo tool not found");
+        let props = &repo["inputSchema"]["properties"];
+        assert!(
+            props["force"].is_object(),
+            "#2539: repo tool must declare 'force' so MCP clients can pass it on merge"
+        );
+        assert!(
+            props["force_reason"].is_object(),
+            "#2539: repo tool must declare 'force_reason' so MCP clients can pass it on merge"
         );
     }
 
@@ -876,6 +916,7 @@ mod tests {
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
             ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
+            ("send", "triaged", "comms_gates/triaged_gate.rs pre-check validation + comms.rs handle_send_to_instance/handle_report_result → daemon/discharge_ledger.rs record_discharge (#2537/#2524 P6 PR-1)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
             ("task", "title", "tasks/handler.rs handle_create"),
@@ -969,6 +1010,8 @@ mod tests {
             ("ephemeral", "ttl_secs", "mcp/handlers/ephemeral.rs handle_spawn → ephemeral_tracking::resolve_ttl (max-wall-TTL guard)"),
             ("ephemeral", "prompt", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.prompt → ephemeral_driver one-shot turn (PR3b)"),
             ("ephemeral", "model", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.model → Backend::push_model_arg spawn argv (PR3b)"),
+            ("ephemeral", "max_iterations", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.max_iterations → ephemeral_tracking::spawn_and_track validation + ephemeral_driver::DriverConfig.max_iterations loop opt-in (#2524 P3b)"),
+            ("ephemeral", "completion_promise", "mcp/handlers/ephemeral.rs handle_spawn → SpawnSpec.completion_promise → ephemeral_tracking::spawn_and_track validation + ephemeral_driver::next_loop_action promise match (#2524 P3b)"),
             ("ephemeral", "worker_id", "mcp/handlers/ephemeral.rs handle_reap → reap_one"),
             ("ephemeral", "all_stale", "mcp/handlers/ephemeral.rs handle_reap → reap_sweep"),
             // ── ci ──
@@ -995,11 +1038,15 @@ mod tests {
             ("repo", "confirm_ids", "ci/mod.rs cleanup_merged subset"),
             ("repo", "audit_reason", "ci/mod.rs cleanup_merged audit"),
             ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
+            ("repo", "task_id", "ci/checkout.rs checkout bind:true → binding::bind_full task_id linkage (#2533)"),
+            ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
+            ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
             // ── bind_self ──
             ("bind_self", "repository_path", "mcp/handlers/worktree.rs preferred source"),
             ("bind_self", "repository", "mcp/handlers/worktree.rs legacy slug"),
             ("bind_self", "branch", "mcp/handlers/worktree.rs validated bind branch"),
             ("bind_self", "rebase_mode", "mcp/handlers/worktree.rs recover-and-bind gate"),
+            ("bind_self", "task_id", "mcp/handlers/worktree.rs → binding::bind_full task_id linkage (#2533)"),
             // ── release_worktree / force_release_worktree ──
             ("release_worktree", "instance", "mcp/handlers/worktree.rs release target"),
             ("release_worktree", "dry_run", "mcp/handlers/worktree.rs preview gate (#1933 declared)"),

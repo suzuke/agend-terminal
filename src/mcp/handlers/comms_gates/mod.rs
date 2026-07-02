@@ -10,6 +10,7 @@ mod anti_stall;
 mod dispatch;
 mod evidence_gate;
 mod sha_gate;
+mod triaged_gate;
 
 // Report-path gates (handle_report_result).
 pub(super) use evidence_gate::{check_evidence_gate, cross_check_and_log};
@@ -24,3 +25,6 @@ pub(super) use anti_stall::enforce_send_invariants;
 
 // Delegate-task pre-send gates (handle_delegate_task).
 pub(super) use dispatch::run_dispatch_pre_checks;
+
+// #2537/#2524 P6: triaged pre-send gate (handle_send_to_instance / handle_report_result).
+pub(super) use triaged_gate::{record_triaged_if_present, validate_triaged};

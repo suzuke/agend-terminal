@@ -271,9 +271,11 @@ pub fn bind_full(
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
     // #2158 GR1: true ⟺ an AGENT SELF-CLAIM (`bind_self` / `repo checkout bind:true`),
-    // which surfaces to the operator. Dispatch / internal binds pass false. Keyed on
-    // the caller's EXPLICIT intent, NOT on task_id — a single-target auto-create
-    // `send kind=task` legitimately binds with task_id="" and must NOT false-notify.
+    // which surfaces to the operator UNLESS `task_id` is non-empty (#2533: a
+    // task_id-carrying self-claim is attributable to a task, so it's in-dispatch).
+    // Dispatch / internal binds pass `is_self_claim=false` and are NEVER gated on
+    // task_id here — a single-target auto-create `send kind=task` legitimately
+    // binds with task_id="" and must NOT false-notify.
     is_self_claim: bool,
 ) -> Result<(), String> {
     // #1888 phase-2: the agent claiming a branch is acting on any pending
@@ -426,9 +428,12 @@ pub fn bind_full(
     // guard-b cannot prevent (identity-indistinguishable). NOT gated on `changed`: the
     // dispatch flow double-binds (lease then re-bind), so a self-claim's intent-bind is
     // frequently a no-op (changed=false); the per-(agent,branch) sidecar in the helper
-    // gives fire-once. Keyed on the caller's explicit `is_self_claim`, NOT task_id — a
-    // single-target auto-create dispatch legitimately binds with task_id="".
-    if is_self_claim {
+    // gives fire-once. #2533: ALSO gated on an empty `task_id` — a self-claim that
+    // carries a task_id (e.g. `bind_self(task_id=...)` / `repo checkout bind:true
+    // task_id=...`) is attributable to a task and is treated as in-dispatch, so it
+    // does not warn. A single-target auto-create DISPATCH (is_self_claim=false)
+    // never reaches this branch regardless of task_id (see the param doc above).
+    if is_self_claim && task_id.is_empty() {
         notify_operator_out_of_dispatch_bind(home, agent, branch, &wt_str, prev_branch.as_deref());
     }
     Ok(())
@@ -504,22 +509,32 @@ fn notify_operator_out_of_dispatch_bind(
     };
     // Best-effort, file-based inbox to the resolved recipient — mirrors
     // `canonical_auto_stash`.
-    let was = prev_branch
-        .map(|p| format!(", was `{p}`"))
-        .unwrap_or_default();
-    let text = format!(
-        "[system:binding_out_of_dispatch] instance `{agent}` bound to branch `{branch}`{was} \
-         OUTSIDE a task dispatch (no task_id). If unexpected, a transient sub-agent or a \
-         self-claim may have moved this instance's worktree. The daemon CANNOT name the exact \
-         caller — a Task sub-agent shares the primary's identity and process. Inspect with \
-         `binding_state instance={agent}`; undo with `release_worktree`. (#2158 GR1)"
-    );
+    let text = out_of_dispatch_notify_body(agent, branch, prev_branch);
     crate::inbox::notify_agent(
         home,
         &recipient,
         &crate::inbox::NotifySource::System("binding_out_of_dispatch"),
         &text,
     );
+}
+
+/// #2533: the notification BODY text for an out-of-dispatch self-claim bind.
+/// Extracted as a pure fn so the double-tag regression is unit-testable:
+/// `NotifySource::System("binding_out_of_dispatch")` already renders the
+/// `[system:binding_out_of_dispatch]` tag at the delivery-layer wrapper
+/// (`inbox::format_notification_for_inject`) — this body must NOT hardcode
+/// the same tag, or the rendered notification doubles it.
+fn out_of_dispatch_notify_body(agent: &str, branch: &str, prev_branch: Option<&str>) -> String {
+    let was = prev_branch
+        .map(|p| format!(", was `{p}`"))
+        .unwrap_or_default();
+    format!(
+        "instance `{agent}` bound to branch `{branch}`{was} \
+         OUTSIDE a task dispatch (no task_id). If unexpected, a transient sub-agent or a \
+         self-claim may have moved this instance's worktree. The daemon CANNOT name the exact \
+         caller — a Task sub-agent shares the primary's identity and process. Inspect with \
+         `binding_state instance={agent}`; undo with `release_worktree`. (#2158 GR1)"
+    )
 }
 
 /// #2347: resolve WHO receives the out-of-dispatch live notice for `agent`.
@@ -1896,6 +1911,57 @@ mod tests {
             "#2158 GR1: an EMPTY-task_id dispatch (is_self_claim=false) must NOT false-notify: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2533: task_id-carrying self-claim is in-dispatch (no warning) ───────
+
+    /// A self-claim bind (`bind_self` / `repo checkout bind:true`) that CARRIES a
+    /// task_id — e.g. a dev's `bind_self(task_id=...)` workaround for #2525, or a
+    /// reviewer's `repo checkout bind:true task_id=...` — is legitimately
+    /// attributed to a task and must be treated as IN-DISPATCH: no
+    /// `binding_out_of_dispatch` marker/notify. An EMPTY task_id self-claim
+    /// (`self_claim_bind_surfaces_once_per_branch_2158_gr1` above) still warns —
+    /// unchanged.
+    #[test]
+    fn self_claim_bind_with_task_id_does_not_surface_2533() {
+        let home = tmp_home("2533-task-id-no-warn");
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        bind_full(&home, "ag", "T-123", "feat/x", &wt, &src, true)
+            .expect("self-claim bind with task_id ok");
+
+        let log = read_event_log(&home);
+        assert!(
+            !log.contains("binding_out_of_dispatch"),
+            "#2533: a self-claim bind CARRYING a task_id must be treated as in-dispatch — no \
+             warning: {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2533: `notify_operator_out_of_dispatch_bind`'s body text must NOT
+    /// hardcode the `[system:binding_out_of_dispatch]` tag — `NotifySource::System`
+    /// already renders it once at the delivery-layer wrapper
+    /// (`format_notification_for_inject`). A hardcoded prefix doubles it:
+    /// `[system:binding_out_of_dispatch] [system:binding_out_of_dispatch] ...`.
+    #[test]
+    fn out_of_dispatch_notification_renders_tag_exactly_once_2533() {
+        let text = out_of_dispatch_notify_body("ag", "feat/x", None);
+        let rendered = crate::inbox::format_notification_for_inject(
+            false,
+            &crate::inbox::NotifySource::System("binding_out_of_dispatch"),
+            &text,
+            &[],
+        );
+        assert_eq!(
+            rendered.matches("[system:binding_out_of_dispatch]").count(),
+            1,
+            "#2533: rendered notification must carry the tag exactly once (double-render bug): \
+             {rendered}"
+        );
     }
 
     // ── #2347: route the binding_out_of_dispatch DELIVERY to the team ────────

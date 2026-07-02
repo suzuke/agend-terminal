@@ -245,10 +245,18 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 warnings.push(format!("marker: {e}"));
             }
             if bind {
+                // #2533: optional caller-supplied task_id — attributes this self-claim
+                // to a task (§3.19.1 reviewer checkout is the common case) so `bind_full`
+                // treats it as in-dispatch instead of warning. Absent → "" (unattributed,
+                // pre-#2533 behavior unchanged).
+                let task_id = args["task_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("");
                 if let Err(e) = crate::binding::bind_full(
                     home,
                     instance_name,
-                    "",
+                    task_id,
                     branch,
                     &worktree_dir,
                     &source_canonical,

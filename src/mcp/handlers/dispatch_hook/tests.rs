@@ -1595,7 +1595,10 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
 /// `arm_ci_watch` intent, NOT on task_id presence (r6's catch: a single-target
 /// `send kind=task` is auto-create-exempt and reaches dispatch with task_id=""). The
 /// wrappers encode the intent: `_with_source` (bind_self) → false; `_with_chain`
-/// (delegate/dispatch) → true.
+/// (delegate/dispatch) → true. #2533: the operator NOTIFY decision, unlike arm, DOES
+/// now depend on task_id for a self-claim (task_id-carrying self-claim = in-dispatch
+/// = no notify) — sub-case (a2) below pins that the arm decision stays task_id-blind
+/// while notify does not.
 #[test]
 #[cfg(unix)]
 fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
@@ -1616,22 +1619,26 @@ fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
         ))
     };
     // #2158 GR1: the SAME dispatch-intent signal gates the operator NOTIFY (inverted):
-    // self-claim notifies, dispatch does not — regardless of task_id.
+    // self-claim notifies, dispatch does not. #2533: for a self-claim specifically,
+    // an ATTRIBUTED (task_id-carrying) bind is treated as in-dispatch and does not
+    // notify — see sub-case (a2). A dispatch's notify stays task_id-blind (always
+    // false) regardless — see (b)/(c).
     let notified = |home: &std::path::Path| {
         std::fs::read_to_string(home.join("event-log.jsonl"))
             .unwrap_or_default()
             .contains("binding_out_of_dispatch")
     };
 
-    // (a) bind_self self-claim (`_with_source`) → NO arm, even WITH a task_id
-    //     (self-provision must never silently arm) — and DOES notify the operator.
+    // (a) bind_self self-claim (`_with_source`), UNATTRIBUTED (task_id="") → NO arm
+    //     (self-provision must never silently arm) — and DOES notify the operator
+    //     (no task attribution → still an out-of-dispatch bind).
     let parent_a = mk_parent("bindself");
     let (home_a, _c) =
         p781_canonical_with_team_source_repo(&parent_a, "feat/gr1-bs", true, "val", &["val-dev"]);
     let r = super::dispatch_auto_bind_lease_with_source(
         &home_a,
         "val-dev",
-        "T-has-task",
+        "",
         "feat/gr1-bs",
         None,
         None,
@@ -1643,9 +1650,43 @@ fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
     );
     assert!(
         notified(&home_a),
-        "#2158 GR1: bind_self self-claim MUST notify the operator"
+        "#2158 GR1: an UNATTRIBUTED bind_self self-claim MUST notify the operator"
     );
     std::fs::remove_dir_all(&parent_a).ok();
+
+    // (a2) #2533: bind_self self-claim WITH a task_id → still NO arm (arm decision
+    //      stays task_id-blind for self-claims) but does NOT notify (attributed to a
+    //      task → treated as in-dispatch).
+    let parent_a2 = mk_parent("bindself-tid");
+    let (home_a2, _c) = p781_canonical_with_team_source_repo(
+        &parent_a2,
+        "feat/gr1-bs-tid",
+        true,
+        "val",
+        &["val-dev"],
+    );
+    let r_a2 = super::dispatch_auto_bind_lease_with_source(
+        &home_a2,
+        "val-dev",
+        "T-has-task",
+        "feat/gr1-bs-tid",
+        None,
+        None,
+    );
+    assert!(
+        r_a2.is_ok(),
+        "bind_self bind with task_id must succeed: {:?}",
+        r_a2.err()
+    );
+    assert!(
+        !watch_for(&home_a2, "feat/gr1-bs-tid").exists(),
+        "#2158 GR1: bind_self self-claim must NOT auto-arm ci_watch, even with a task_id"
+    );
+    assert!(
+        !notified(&home_a2),
+        "#2533: a task_id-carrying bind_self self-claim must NOT notify the operator (in-dispatch)"
+    );
+    std::fs::remove_dir_all(&parent_a2).ok();
 
     // (b) dispatch (`_with_chain`) WITH a task_id → arms.
     let parent_b = mk_parent("disp-tid");
