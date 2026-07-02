@@ -281,6 +281,176 @@ pub(crate) fn dispatch_exit_event_guarded(
     }
 }
 
+/// Build the canonical per-tick handler pipeline. Shared by `run_core` (daemon)
+/// and `app::run_app` (owned `agend-terminal app`) so both run the IDENTICAL set
+/// — the single source of truth that closes the recurring "app hand-picks a
+/// subset → silently drops a handler" class (#1002 / #982 / #1719). App filters
+/// only an explicit allowlist (see `app::APP_TICK_ALLOWLIST`), and a completeness
+/// invariant fails CI if a new handler lands here but neither runs in app nor is
+/// allowlisted.
+///
+/// `crash_tx` is consumed by `RecoveryDispatcherHandler`. `stage2_dispatch_available`
+/// tells the handler whether a `Stage2Restart` on that channel has a live consumer
+/// in this runtime: `run_core` wires `crash_rx` (true); app-standalone passes a
+/// throwaway sender (false) — #1694(a) now RUNS the handler in app mode (Stage1
+/// ESC-nudge), but its Stage2 path escalates to Stage3 rather than silent-drop
+/// onto the consumerless channel.
+///
+/// #2538: relocated verbatim from `daemon::mod` (that grandfathered file was at
+/// its LOC ceiling with zero slack) — every `per_tick::X` reference below became
+/// bare `X` (already in scope via this module's own re-exports) and the one
+/// daemon-level reference (`watchdog::watchdog_dry_run_from_env`) became
+/// `super::watchdog::...`; no other change.
+pub(crate) fn build_default_handlers(
+    crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+    stage2_dispatch_available: bool,
+    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
+) -> Vec<Box<dyn PerTickHandler>> {
+    let watchdog_dry_run = super::watchdog::watchdog_dry_run_from_env();
+    // #2127 Phase 1: the inbox-stuck handler and the new reclaim handler share one
+    // dedup latch so reclaim can clear an agent's repeat-alert entry. Construct the
+    // inbox-stuck handler first, clone its latch, then move it into the vec at its
+    // original position (order preserved).
+    let inbox_stuck = InboxStuckHandler::new(30);
+    let work_stuck_latch = inbox_stuck.latch();
+    // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
+    vec![
+        Box::new(HangDetectionHandler::new()),
+        Box::new(RecoveryDispatcherHandler::new(
+            std::sync::Arc::new(crash_tx),
+            stage2_dispatch_available,
+        )),
+        // #t-777-3: respawn-stuck watchdog — auto-Fresh-restart an agent whose
+        // Resume spawn hung (corrupt-session `resume --last`), bounded by a
+        // retry cap that escalates a P0 + pause. Recovers via the proven API
+        // restart path so it works in BOTH run_core and the live app-mode daemon
+        // (where the crash_tx→respawn machinery is inert). Disjoint state class
+        // from the Hung ladder above (no crash_tx needed).
+        Box::new(RespawnWatchdogHandler::new()),
+        Box::new(WatchdogHandler::new(watchdog_dry_run)),
+        Box::new(ExternalLivenessHandler::new()),
+        // #2413 (B): ShadowObserve MUST run immediately BEFORE SnapshotRotation so the
+        // snapshot's operated `agent_state` promotion reads THIS tick's `observed_status`
+        // (it was previously LAST in the list → the snapshot would read last tick's). The
+        // reorder is confirm-first safe:
+        //   - ShadowObserve only WRITES `observed_status` + `published_observed`; nothing
+        //     else in this list writes those, so there is no write-write hazard, and no
+        //     handler except SnapshotRotation (below) reads them.
+        //   - Its INPUTS are order-independent of the per-tick sequence: `api_activity` is
+        //     written by a BACKGROUND thread (`api_activity_probe::spawn`), `state` /
+        //     productive-silence by the PTY-feed thread, hook Evidence by the socket
+        //     thread — none are per-tick handlers, so moving ShadowObserve earlier does not
+        //     stale them.
+        //   - The state-transition handlers (HangDetection / RecoveryDispatcher /
+        //     RespawnWatchdog / Watchdog) sit ABOVE this point in BOTH the old and new
+        //     layout, so ShadowObserve observes the same post-transition `state` either way.
+        // The only behaviour change is the intended one: the snapshot promotes from a fresh
+        // (this-tick) `observed_status`.
+        Box::new(ShadowObserveHandler::new()),
+        Box::new(SnapshotRotationHandler::new()),
+        Box::new(CheckSchedulesHandler::new()),
+        Box::new(CiWatchPollHandler::new()),
+        Box::new(PrStateScanHandler::new()),
+        Box::new(InboxMaintenanceHandler::new(60)),
+        Box::new(PollReminderHandler::new(30)),
+        // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
+        // agent receiving but not draining its inbox; notifies lead (no auto-restart).
+        Box::new(inbox_stuck),
+        // #1491(B): next_after_ci handoff-timeout watchdog. #1859 lowered the
+        // cadence to ~2min (12 ticks) so the daemon-side RE-NUDGE of the target
+        // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
+        // + 30min re-alert windows, so the faster scan doesn't escalate sooner.
+        Box::new(HandoffTimeoutHandler::new(12)),
+        // #2090 (report mode): progress-backstop watchdog — ~30s cadence, boot-
+        // grace suppressed. Only fires when `progress_mode == 2`; nudges an agent
+        // to self-report if an external-channel turn runs long with no reply. It
+        // never authors/relays content itself (zero exfil). Default progress_mode
+        // is 0 (off) → this is a cheap early-return no-op for a default fleet.
+        Box::new(ProgressBackstopHandler::new()),
+        // #2090 (mirror mode): progress-mirror — every tick. Only relays when
+        // `progress_mode == 1`; tails each agent's transcript and sends NEW
+        // assistant text to its origin channel (active-turn gated, no broadcast,
+        // no backlog replay, truncated). ⚠ exfil surface — default OFF, so this
+        // is a cheap early-return no-op for a default fleet.
+        Box::new(ProgressMirrorHandler::new()),
+        // Daemon-side deferred-notification flush — every tick (~10s). The
+        // #1513 busy-gate defers notifications into the queue whose only other
+        // flusher is the TUI loop; headless `run_core` (`start --foreground`)
+        // has no TUI, so without this handler deferred operator messages
+        // strand forever (7 stranded Telegram messages, 2026-06-10). Idle
+        // cost per instance: one read_dir of notification-queue/ plus a line
+        // count of any existing queue files — trivial at fleet sizes.
+        Box::new(NotificationFlushHandler::new(1)),
+        Box::new(LogRotationHandler::new(360)),
+        Box::new(ThreadDumpHandler::new()),
+        Box::new(GcTickHandler::new(360)),
+        // #2158 item 2: hourly stray-managed-worktree sweep (edge-triggered
+        // event-log + fleet health count). Same 360-tick GC cadence; runs in app
+        // mode too (not allowlisted out) since the live daemon is app-mode.
+        Box::new(WorkspaceBoundarySweepHandler::new(360)),
+        // #1747: slow-cadence backstop GC for stale /tmp review worktrees (mtime
+        // > 2d). Same 360-tick cadence as the other GC siblings; runs in app mode
+        // (not allowlisted out) since the live daemon is app-mode.
+        Box::new(TmpReviewGcHandler::new(360)),
+        // #2234 (B) prereq: hourly retention GC for <home>/reconcile-backups/
+        // (mtime-age ≥ 14d), with a per-agent newest-1 floor as the destroy-work
+        // safety net. Same 360-tick cadence as the GC siblings; app-mode (the
+        // live daemon is app-mode). (B) OFF → no backups → natural no-op.
+        Box::new(ReconcileBackupsGcHandler::new(360)),
+        // #1967 Phase-1 (PR1): reap ephemeral workers every ~1min (6 ticks) —
+        // removes/terminates terminal, max-wall-TTL-expired (cost guard), or
+        // already-dead workers. Runs in app mode too (not allowlisted out); the
+        // live daemon is app-mode. Idle cost: one read of a usually-tiny JSON sidecar.
+        Box::new(EphemeralReapHandler::new(6)),
+        // Context% alert (operator-directed): every 6 ticks (~1min) refresh +
+        // ≥80% orchestrator alert. The transcript-estimate file IO lives in
+        // this handler's tick (lock-free during the read), NOT in the PTY
+        // feed path. Runs in app mode (the live daemon is app-mode).
+        Box::new(ContextAlertHandler::new(6)),
+        // #2007 context-full safety net: every 6 ticks (~1min) — 85% one-shot
+        // [AGEND-AUTO kind=context-handoff] injection to the agent itself,
+        // 92% one-shot operator escalation. Noise-budgeted (per-episode
+        // latch + hysteresis re-arm). Runs in app mode (live daemon).
+        Box::new(ContextHandoffHandler::new(6)),
+        // #2044 inject-delivery watchdog: every tick (~10s) verify that an
+        // armed actionable wake produced a UserPromptSubmit; re-deliver once
+        // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty
+        // map); claude-only in practice (arm self-gates on hook history).
+        Box::new(InjectDeliveryHandler::new(1)),
+        // ── W1.1 (#2050): the 12 trackers migrated from the supervisor
+        // `run_loop` (supervisor.rs:384-395). Appended in their original
+        // relative order; each self-throttles internally (TICKS_PER_SCAN), so
+        // running them every tick here is the same cadence the supervisor ran.
+        // They previously executed on the supervisor thread; the main loop
+        // ticks at the identical 10s interval and holds no lock across them, so
+        // this is behavior-preserving on unix (both run_core and app mode).
+        // Cadence-hoist to the handler (`should_fire`) is W2.4, not W1.1.
+        Box::new(AntiStallHandler::new()),
+        Box::new(IdleWatchdogHandler::new()),
+        Box::new(DecisionTimeoutHandler::new()),
+        Box::new(DecisionBoardTimeoutHandler::new()),
+        Box::new(HelperStalenessHandler::new()),
+        Box::new(McpRegistryHandler::new(daemon_binary_stale)),
+        Box::new(WaitingOnStaleHandler::new()),
+        Box::new(ConflictNotifyHandler::new()),
+        Box::new(CanonicalDriftHandler::new()),
+        Box::new(AutoReleaseHandler::new()),
+        Box::new(DispatchIdleHandler::new()),
+        Box::new(DispatchIdleNudgeHandler::new()),
+        Box::new(RetentionHandler::new()),
+        // #2127 Phase 1: reclaim board tasks from agents stuck in a non-recoverable
+        // usage_limit window (operator decision d-…085112: Phase 1, grace=10min).
+        // Every 30 ticks (~5min). Fires ONLY for UsageLimit/QuotaExceeded with a
+        // remaining window > grace and no recent recovery — releases the agent's
+        // claimed/in_progress tasks back to Open + clears the work-stuck latch.
+        // Runs in both run_core and app mode (live daemon is app-mode).
+        Box::new(ReclaimHandler::new(30, work_stuck_latch)),
+        // AUDIT2-014 (B'): cross-board claim-race detective backstop (multi-board
+        // only, Low), every 30 ticks (~5min). See the handler's module doc.
+        Box::new(CrossBoardDepDetectiveHandler::new(30)),
+    ]
+}
+
 /// Reduce a panic payload (`Box<dyn Any + Send>`) to a printable
 /// string. Mirrors `std::panic::panic_any` conventions: `String` and
 /// `&'static str` are the only payloads `panic!()` produces by
