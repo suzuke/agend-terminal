@@ -417,9 +417,42 @@ enum LoopAction {
 /// worker process being gone, handled entirely by `spawn_driver`'s inject-failure
 /// path and the independent reap sweep (see both docs).
 fn next_loop_action(o: &IterationOutcome) -> LoopAction {
-    // RED stub (§3.10) — intentionally always Continue; restored in the
-    // immediately-following GREEN commit.
-    let _ = o;
+    // (a) completion-promise: a non-empty promise string found anywhere in this
+    // iteration's transcript dump ends the loop as a SUCCESS.
+    if let Some(promise) = o.completion_promise {
+        if !promise.is_empty() && o.end_dump.contains(promise) {
+            return LoopAction::Stop {
+                success: true,
+                reason: "completion-promise matched",
+            };
+        }
+    }
+    // (b) max_iterations: the hard cap (validated 1..=25 at spawn admission).
+    if o.iteration >= o.max_iterations {
+        return LoopAction::Stop {
+            success: false,
+            reason: "max_iterations reached",
+        };
+    }
+    // (c) no-progress: this turn produced no growth, OR latched an error class
+    // (#2301's own step ②: "turn made no progress / errored? → stop, don't
+    // re-inject") — either way, re-injecting into a turn that didn't move forward
+    // just burns another iteration for nothing.
+    if !o.grew || o.terminal_state.is_error() {
+        return LoopAction::Stop {
+            success: false,
+            reason: "no progress (transcript did not grow, or an error class latched)",
+        };
+    }
+    // (d) wall-TTL: Phase 2 already breaks a turn early with this exact stop_reason
+    // when the shared TTL budget is exhausted mid-wait; a budget-starved loop must
+    // not retry into a worker with no time left.
+    if o.wall_ttl_hit {
+        return LoopAction::Stop {
+            success: false,
+            reason: "wall-TTL elapsed",
+        };
+    }
     LoopAction::Continue
 }
 

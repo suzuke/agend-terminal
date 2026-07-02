@@ -526,9 +526,28 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
         return Err(SpawnError::DriverUnsupported(spec.backend.clone()));
     }
 
-    // RED stub (§3.10) — 0c ralph-loop param validation intentionally skipped;
-    // restored in the immediately-following GREEN commit.
-    let _ = MAX_ITERATIONS_CAP;
+    // 0c) RALPH-LOOP PARAMS (#2524 P3b, decision `d-20260702105502384640-4`) —
+    // validated in the SAME shared sink as 0/0b, before any process is spawned.
+    if let Some(n) = spec.max_iterations {
+        if !(1..=MAX_ITERATIONS_CAP).contains(&n) {
+            return Err(SpawnError::InvalidLoopParams(format!(
+                "max_iterations={n} out of range — must be 1..={MAX_ITERATIONS_CAP} (no unlimited option)"
+            )));
+        }
+        if !drive_turn {
+            return Err(SpawnError::InvalidLoopParams(
+                "max_iterations requires a non-empty 'prompt' (the loop's first iteration \
+                 has nothing to inject)"
+                    .to_string(),
+            ));
+        }
+    } else if spec.completion_promise.is_some() {
+        return Err(SpawnError::InvalidLoopParams(
+            "completion_promise requires max_iterations to also be set — otherwise it would \
+             never be checked (there is no loop)"
+                .to_string(),
+        ));
+    }
 
     let ttl_secs = resolve_ttl(spec.ttl_secs);
     let seq = WORKER_SEQ.fetch_add(1, Ordering::Relaxed);
