@@ -307,6 +307,15 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         if let Some(orch) = params.get("orchestrator").and_then(|v| v.as_str()) {
             update_params["orchestrator"] = json!(orch);
         }
+        // #2525: same allowlist-drop class as the orchestrator/repository_path/
+        // accept_from forwarding above (#1833/#1837) — this branch re-marshals
+        // into a fresh update_params too, and repository_path was never added
+        // here. teams::update reads args["repository_path"] (set-or-preserve),
+        // so without this a second create_instance(team=X, repository_path=Y)
+        // on an existing team silently drops Y.
+        if let Some(repo) = params.get("repository_path").and_then(|v| v.as_str()) {
+            update_params["repository_path"] = json!(repo);
+        }
         crate::teams::update(ctx.home, &update_params)
     } else {
         crate::teams::create(ctx.home, &team_params)
