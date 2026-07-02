@@ -35,9 +35,10 @@ pub fn remove_agent(name: &str) {
 pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(String, String)> {
     // #1617-class (mirror conflict_notify's phase-1-collect / phase-2-IO): snapshot
     // the idle-agent names UNDER the registry lock, then DROP the guard before any
-    // inbox file IO. `inbox::unread_count` does `fs::read_to_string` + full-file
-    // parse; holding the GLOBAL registry lock across that (per agent, in a loop)
-    // stalls every other registry user when the inbox is large or the FS is slow.
+    // inbox file IO. `inbox::unread_count_after_discharge` does `fs::read_to_string`
+    // + full-file parse; holding the GLOBAL registry lock across that (per agent,
+    // in a loop) stalls every other registry user when the inbox is large or the
+    // FS is slow.
     let idle_names: Vec<String> = {
         let reg = agent::lock_registry(registry);
         reg.values()
@@ -57,7 +58,10 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
     // Phase 2: the inbox reads + dedup + formatting run lock-free.
     let mut result = Vec::new();
     for name in &idle_names {
-        let (count, oldest) = crate::inbox::unread_count(home, name);
+        // #2524 P6-r2 (#2537): discharge-aware count — a ci-fail row whose
+        // (head_sha, job) is already triaged (`send.triaged`) doesn't bump this
+        // count, so re-nudging a duplicate the agent already handled stops here.
+        let (count, oldest) = crate::inbox::unread_count_after_discharge(home, name);
         if count == 0 {
             continue;
         }
@@ -182,19 +186,21 @@ mod tests {
         }
         assert!(block_end > block_start, "binding block must close");
 
-        // #t-…61487: match the CALL form (`unread_count(home`), not a bare
-        // `unread_count` token — a doc/comment mention must NOT satisfy the guard
-        // (that is exactly how v1 left this guard "blind": the obligation-count
-        // refactor moved the real call away but a comment kept the loose needle green).
-        let io_needle = ["unread_count", "(home"].concat();
+        // #t-…61487: match the CALL form (`unread_count_after_discharge(home`), not
+        // a bare `unread_count` token — a doc/comment mention must NOT satisfy the
+        // guard (that is exactly how v1 left this guard "blind": the
+        // obligation-count refactor moved the real call away but a comment kept
+        // the loose needle green). #2524 P6-r2: the call site is now
+        // `unread_count_after_discharge` (discharge-aware count), same IO shape.
+        let io_needle = ["unread_count_after_discharge", "(home"].concat();
         let locked_region = &prod[block_start..=block_end];
         assert!(
             !locked_region.contains(&io_needle),
-            "collect_poll_reminders must NOT call inbox::unread_count under the registry lock (#1617 class)"
+            "collect_poll_reminders must NOT call inbox::unread_count_after_discharge under the registry lock (#1617 class)"
         );
         assert!(
             prod[block_end..].contains(&io_needle),
-            "inbox::unread_count must run AFTER the registry lock is dropped"
+            "inbox::unread_count_after_discharge must run AFTER the registry lock is dropped"
         );
     }
 
@@ -748,6 +754,71 @@ mod tests {
         assert!(
             crate::notification_queue::pending_count(&home, agent) > 0,
             "#event-bus Option A: gate-off must deliver via legacy (no regression)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2524 P6-r2 (#2537), REAL entry point (§3.9): `collect_poll_reminders`
+    /// itself — not just the `unread_count_after_discharge` helper it now calls
+    /// — must not re-nudge a duplicate `[ci-fail]` for a `(head, job)` already
+    /// discharged via `send.triaged`.
+    #[test]
+    fn collect_poll_reminders_no_nudge_for_fully_discharged_ci_fail() {
+        let home = tmp_home("collect-discharged");
+        let agent = "collect-discharged-agent";
+        let (repo, branch, head, short, job) = (
+            "o/r",
+            "feat/x",
+            "cafef00dcafef00dcafef00dcafef00dcafef00d",
+            "cafef00",
+            "Coverage",
+        );
+
+        // A real ci-watch WatchState at the CURRENT head — `is_discharged_ci_fail`
+        // resolves the signature's head from here, not the message body.
+        let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let ws = crate::daemon::ci_watch::WatchState {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            head_sha: Some(head.to_string()),
+            ..Default::default()
+        };
+        std::fs::write(
+            watch_dir.join(crate::daemon::ci_watch::watch_filename(repo, branch)),
+            serde_json::to_string_pretty(&ws).unwrap(),
+        )
+        .unwrap();
+
+        let ci_fail_msg = || {
+            crate::inbox::InboxMessage::new_system(
+                "system:ci",
+                "ci-watch",
+                format!("[ci-fail] {repo}@{branch} ({short}): failure\nDetail: {job}\nURL: https://example/run/1"),
+            )
+            .with_correlation_id(format!("{repo}@{branch}"))
+        };
+
+        crate::inbox::enqueue(&home, agent, ci_fail_msg()).unwrap();
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+
+        // First pass: undischarged — must nudge.
+        let first = collect_poll_reminders(&home, &registry);
+        assert_eq!(first.len(), 1, "the undischarged ci-fail must nudge once");
+
+        // Triage it (the real send.triaged→record_discharge path).
+        crate::daemon::discharge_ledger::record_discharge(&home, head, job, agent, None).unwrap();
+
+        // A duplicate [ci-fail] for the exact same (head, job) arrives.
+        crate::inbox::enqueue(&home, agent, ci_fail_msg()).unwrap();
+
+        let second = collect_poll_reminders(&home, &registry);
+        assert!(
+            second.is_empty(),
+            "a fully-discharged (head, job) — including its duplicate — must not \
+             re-nudge: {second:?}"
         );
 
         std::fs::remove_dir_all(&home).ok();
