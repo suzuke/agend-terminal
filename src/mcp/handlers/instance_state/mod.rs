@@ -168,15 +168,70 @@ pub(super) fn handle_delete_instance(
     // member of a team it orchestrates — a peer can no longer remove another
     // agent by naming it. Anonymous (no sender: operator-direct / standalone)
     // keeps full authority (the TUI close path calls `full_delete_instance`).
+    //
+    // ACL improvement: also allow the instance's CREATOR (the caller that ran
+    // `create_instance` for it, stamped as `created_by` in fleet.yaml — the
+    // "為 ACL 建 team" pain point: a creator wanting to redo/retire its own
+    // spawn shouldn't have to build a team just to gain orchestrator
+    // authority). Guarded by an in-flight safety valve: if the target has an
+    // active worktree binding or a claimed/in_progress task, the creator path
+    // requires `force=true` + a non-empty `force_reason` (audit-logged), so a
+    // creator can't casually reap an agent mid-work. Self/orchestrator deletes
+    // are unaffected by the valve — this only gates the NEW creator path.
     if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
         if caller != name && !crate::teams::is_orchestrator_of(home, caller, name) {
-            return serde_json::json!({
-                "error": format!(
-                    "permission denied: '{caller}' cannot delete '{name}' \
-                     (only the instance itself or its team orchestrator may)"
-                ),
-                "code": "not_owner_or_orchestrator"
+            let is_creator = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.created_by.clone()))
+                .as_deref()
+                == Some(caller);
+            if !is_creator {
+                return serde_json::json!({
+                    "error": format!(
+                        "permission denied: '{caller}' cannot delete '{name}' \
+                         (only the instance itself, its team orchestrator, or its creator may)"
+                    ),
+                    "code": "not_owner_or_orchestrator"
+                });
+            }
+            let has_binding = crate::binding::read(home, name).is_some();
+            let has_active_task = crate::tasks::list_all(home).iter().any(|t| {
+                t.assignee.as_deref() == Some(name)
+                    && matches!(
+                        t.status,
+                        crate::task_events::TaskStatus::Claimed
+                            | crate::task_events::TaskStatus::InProgress
+                    )
             });
+            if has_binding || has_active_task {
+                let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                let force_reason = args
+                    .get("force_reason")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                match force_reason {
+                    Some(reason) if force => {
+                        tracing::warn!(
+                            caller,
+                            target = name,
+                            reason,
+                            has_binding,
+                            has_active_task,
+                            "creator force-deleting instance with in-flight work"
+                        );
+                    }
+                    _ => {
+                        return serde_json::json!({
+                            "error": format!(
+                                "'{name}' has in-flight work (binding={has_binding}, \
+                                 active_task={has_active_task}) — creator delete requires \
+                                 force=true and a non-empty force_reason"
+                            ),
+                            "code": "creator_delete_requires_force"
+                        });
+                    }
+                }
+            }
         }
     }
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
