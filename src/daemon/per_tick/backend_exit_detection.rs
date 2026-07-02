@@ -34,21 +34,26 @@ const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
 /// with a Shell or unrecognized Raw backend — there is no known preset identity
 /// to compare against, so it is exempt. This is also how a `backend: shell`
 /// instance is naturally exempt (its resolved command never maps to a preset).
-pub(crate) fn backend_mismatch(_configured_backend_command: &str, _live_backend_command: &str) -> bool {
-    // #2538 RED: comparison not yet implemented.
-    false
+pub(crate) fn backend_mismatch(
+    configured_backend_command: &str,
+    live_backend_command: &str,
+) -> bool {
+    let Some(expected) = Backend::from_command(configured_backend_command) else {
+        return false;
+    };
+    Backend::from_command(live_backend_command) != Some(expected)
 }
 
 /// Pure: should this tick fire a backend-exit detection for an agent whose live
 /// backend mismatches its configured one, `elapsed_since_spawn` since its last
 /// (re)spawn?
 pub(crate) fn should_fire_backend_exit(
-    _configured_backend_command: &str,
-    _live_backend_command: &str,
-    _elapsed_since_spawn: Duration,
+    configured_backend_command: &str,
+    live_backend_command: &str,
+    elapsed_since_spawn: Duration,
 ) -> bool {
-    // #2538 RED: comparison not yet implemented.
-    false
+    backend_mismatch(configured_backend_command, live_backend_command)
+        && elapsed_since_spawn >= BACKEND_EXIT_GRACE
 }
 
 pub(crate) struct BackendExitDetectionHandler {
@@ -99,15 +104,22 @@ impl PerTickHandler for BackendExitDetectionHandler {
             if backend_mismatch(&resolved.backend_command, live_backend) {
                 mismatched.insert(name.clone());
             }
-            if should_fire_backend_exit(&resolved.backend_command, live_backend, spawned_at.elapsed())
-            {
+            if should_fire_backend_exit(
+                &resolved.backend_command,
+                live_backend,
+                spawned_at.elapsed(),
+            ) {
                 let mut tracker = self.last_notified.lock();
                 let should_notify = tracker
                     .get(name)
                     .is_none_or(|t| now.duration_since(*t) >= NOTIFY_COOLDOWN);
                 if should_notify {
                     tracker.insert(name.clone(), now);
-                    to_notify.push((name.clone(), resolved.backend_command.clone(), live_backend.clone()));
+                    to_notify.push((
+                        name.clone(),
+                        resolved.backend_command.clone(),
+                        live_backend.clone(),
+                    ));
                 }
             } else {
                 // Recovered (or never mismatched) — drop any stale debounce entry
