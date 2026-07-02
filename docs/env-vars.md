@@ -175,7 +175,6 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 | `AGEND_CONTEXT_HANDOFF_PCT` | Context-window usage percent at which the context-handoff watchdog injects a `SESSION-HANDOFF.md` request to the agent. | `85.0` (`DEFAULT_HANDOFF_PCT`). | Float percent; unparseable → default. | `src/daemon/per_tick/context_handoff.rs:51` | Tuning knob. Should sit above the alert pct. |
 | `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT` | Higher context-window percent at which the handoff watchdog escalates to the operator. | `92.0` (`DEFAULT_ESCALATE_PCT`). | Float percent; unparseable → default. | `src/daemon/per_tick/context_handoff.rs:58` | Tuning knob. Should sit above the handoff pct. |
 | `AGEND_LOW_DISK_THRESHOLD` | Free-space floor (bytes); inbox writes treat available space below this as "low disk". | `1 GiB` (`1024³`, `DEFAULT_LOW_DISK_FLOOR_BYTES`). | `u64` bytes; unparseable → default. | `src/inbox/disk.rs:13` | Tuning knob. Plain byte count (no `K`/`M`/`G` suffix, unlike `AGEND_LOG_MAX_BYTES`). |
-| `AGEND_RECOVERY_SHADOW` | #1523 Phase-0 **measure-only** shadow telemetry. When on, the supervisor records a per-agent "would the recovery discriminator have fired?" verdict (recovery-turn expectation vs observed recovery) to `recovery_shadow.jsonl`. | Off (every entry point early-returns → byte-identical behaviour). | `"1"` enables; any other value / unset → off. | `src/daemon/recovery_shadow.rs:54` (`enabled`) | **Measure-only**: Phase 0 only RECORDS the verdict, NEVER acts on it. Default-off → zero behaviour change. |
 
 ---
 
