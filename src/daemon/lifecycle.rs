@@ -72,7 +72,7 @@ fn drop_active_binding(name: &str) {
 ///
 /// When `skip_exit_wait` is `true`, the kill signal is sent but
 /// [`wait_for_child_exit`] is skipped — the OS reaps the child
-/// asynchronously. Used by `replace_instance` (#1366) where the caller
+/// asynchronously. Used by `restart_instance` (#1366) where the caller
 /// spawns a fresh instance immediately and the 5 s synchronous wait is
 /// unnecessary overhead.
 ///

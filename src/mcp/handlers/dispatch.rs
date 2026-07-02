@@ -216,11 +216,6 @@ adapter!(
 );
 adapter!(dispatch_start_instance, ha, instance::handle_start_instance);
 adapter!(
-    dispatch_replace_instance,
-    ha,
-    instance::handle_replace_instance
-);
-adapter!(
     dispatch_restart_instance,
     ha,
     instance::handle_restart_instance
@@ -608,7 +603,6 @@ mod tests {
                 "create_instance",
                 "delete_instance",
                 "start_instance",
-                "replace_instance",
                 "restart_instance",
                 "interrupt",
                 "set_display_name",
@@ -639,7 +633,7 @@ mod tests {
                 "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 37);
+        assert_eq!(crate::mcp::registry::all().len(), 36);
     }
 
     #[test]

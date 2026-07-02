@@ -330,7 +330,6 @@ mod tests {
             "deployment",
             "create_instance",
             "delete_instance",
-            "replace_instance",
             "restart_instance",
             "start_instance",
             "repo",

@@ -125,8 +125,8 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
     // #900: forward operator-supplied `env` through the SPAWN RPC AND
     // record it on the fleet.yaml entry. The runtime payload lets the
     // daemon's handle_spawn apply it directly (no second fleet.yaml
-    // read); the persisted entry covers replace_instance / restart
-    // flows that re-resolve from disk later. Non-string values are
+    // read); the persisted entry covers restart flows that re-resolve
+    // from disk later. Non-string values are
     // filtered out at the daemon side via `parse_env_object`.
     let env_value: Option<Value> = args.get("env").filter(|v| v.is_object()).cloned();
     let env_for_entry: Option<std::collections::HashMap<String, String>> =

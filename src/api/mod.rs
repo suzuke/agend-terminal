@@ -99,8 +99,8 @@ pub enum LayoutHint {
     SplitRight,
     SplitBelow,
     /// #1431: place the new pane in the tab the same-named pane occupied
-    /// before removal. Used by `replace_instance` so a replaced agent returns
-    /// to its original tab instead of opening a fresh one.
+    /// before removal. Used by `restart_instance` so a restarted agent
+    /// returns to its original tab instead of opening a fresh one.
     SameTab,
 }
 

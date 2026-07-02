@@ -1896,13 +1896,13 @@ fn pty_read_error_triggers_cleanup() {
 }
 
 // ── Rank4 bug-audit spike follow-up: lock the `handle_pty_close` source-side
-// `deleted` guard — the ONLY net that stops `restart_instance` /
-// `replace_instance` from double-spawning.
+// `deleted` guard — the ONLY net that stops `restart_instance` from
+// double-spawning.
 //
 // WHY THIS MATTERS — do NOT move or delete these without re-reading the Rank4
 // double-spawn spike conclusion:
 //
-//   `restart_instance` / `replace_instance` issue DELETE(no_wait) → SPAWN. The
+//   `restart_instance` issues DELETE(no_wait) → SPAWN. The
 //   new instance is re-created under the SAME name (with a fresh
 //   `deleted=false` handle) BEFORE the OS reaps the old process and its death is
 //   classified. `AgentExitEvent::Crash` carries only the NAME (no PID /

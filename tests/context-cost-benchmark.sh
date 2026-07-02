@@ -91,7 +91,6 @@ def handle(req):
             {"name":"delete_instance","description":"Delete an agent instance.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"start_instance","description":"Start an existing agent instance.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"describe_instance","description":"Get details about an agent instance.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
-            {"name":"replace_instance","description":"Replace an agent instance.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"reason":{"type":"string"}},"required":["name"]}},
             {"name":"set_display_name","description":"Set display name.","inputSchema":{"type":"object","properties":{"display_name":{"type":"string"}},"required":["display_name"]}},
             {"name":"set_description","description":"Set description.","inputSchema":{"type":"object","properties":{"description":{"type":"string"}},"required":["description"]}},
             {"name":"post_decision","description":"Post a decision.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"rationale":{"type":"string"},"alternatives":{"type":"string"},"status":{"type":"string"}},"required":["title","rationale"]}},

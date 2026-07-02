@@ -60,7 +60,7 @@ pub(crate) enum LayoutHint {
     SplitRight,
     SplitBelow,
     /// #1431: return the new pane to the tab the same-named pane occupied
-    /// before removal (replace_instance).
+    /// before removal (restart_instance).
     SameTab,
 }
 
@@ -344,9 +344,9 @@ fn handle_instance_created(
             }
         }
         None => match hint {
-            // #1431/#1939: a replace_instance / restart_instance re-spawn
-            // returns to the position the old same-named pane occupied
-            // (recorded on its removal).
+            // #1431/#1939: a restart_instance re-spawn returns to the
+            // position the old same-named pane occupied (recorded on its
+            // removal).
             LayoutHint::SameTab => match layout.take_removed_pane(name) {
                 Some(placement) => layout.restore_removed_pane(&placement, pane),
                 None => layout.add_tab(Tab::new(name.to_string(), pane)),

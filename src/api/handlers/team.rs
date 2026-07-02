@@ -171,9 +171,9 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         // (Phase 1 above wrote it), so resolve_instance returns the
         // merged defaults+instance map. CREATE_TEAM-time team members
         // currently have env: None at write-time (line 110), but
-        // operator hand-edits and downstream replace_instance flows
-        // can populate env on the entry between the write and this
-        // re-read — we honour whatever the disk says.
+        // operator hand-edits and downstream restart flows can populate
+        // env on the entry between the write and this re-read — we
+        // honour whatever the disk says.
         let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
             .ok()
             .and_then(|f| f.resolve_instance(inst_name));
