@@ -141,6 +141,21 @@ fn agy_profile() -> BackendProfile {
                 AgentState::UsageLimit,
                 r"Individual quota reached|Contact your administrator to enable overages",
             ),
+            // #2524 P1b-r2: agy had no RateLimit pattern (distinct from the
+            // UsageLimit quota-wall above — a per-request throttle with a short
+            // reset timer, not a multi-day quota). NOT a real capture: no burner/
+            // low-quota agy account was available to trigger a genuine 429 without
+            // risking the operator's shared main account (guardrail: don't force
+            // 429s on the live account). `capture_kind: synthetic_from_real_template`
+            // — the phrase is sourced from third-party (GitHub issue / blog)
+            // reports of real Antigravity 429 wording, NOT verified against agy's
+            // actual binary output. Low confidence; needs real-capture
+            // confirmation before being trusted as tightly as the other agy
+            // patterns in this file.
+            (
+                AgentState::RateLimit,
+                r"exhausted your capacity on this model",
+            ),
             // #2409: Gemini transient "high traffic" server error (agy/Antigravity).
             // ApiError (not ServerRateLimit): SRL is `is_high_fp_state` and needs a
             // content/red anchor (an error-line indicator like `Error:` / `429`),
@@ -279,6 +294,15 @@ fn opencode_profile() -> BackendProfile {
                 AgentState::UsageLimit,
                 r"Quota Limit Exceeded|monthly usage limit reached",
             ),
+            // #2524 P1b-r2: opencode had no AuthError pattern. Real capture (a
+            // provider-rejected key, process-scoped env override, isolated scratch
+            // dir — no persistent credential touched) confirmed opencode renders a
+            // DISTINCT boxed "Invalid API key" dialog, not just the generic "Error
+            // from provider:" wrapper below — so this is a genuine gap, not a
+            // duplicate of ApiError. Reuses the SAME literal already trusted for
+            // claude's AuthError pattern (`Invalid API key` — see
+            // `claudecode_profile()`), ordered BEFORE the generic ApiError arm.
+            (AgentState::AuthError, r"Invalid API key"),
             (
                 AgentState::ApiError,
                 r"Error from provider:|request validation errors",
