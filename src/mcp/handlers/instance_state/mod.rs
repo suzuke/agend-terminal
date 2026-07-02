@@ -168,15 +168,102 @@ pub(super) fn handle_delete_instance(
     // member of a team it orchestrates — a peer can no longer remove another
     // agent by naming it. Anonymous (no sender: operator-direct / standalone)
     // keeps full authority (the TUI close path calls `full_delete_instance`).
+    //
+    // ACL improvement: also allow the instance's CREATOR (the caller that ran
+    // `create_instance` for it, stamped as `created_by` in fleet.yaml — the
+    // "為 ACL 建 team" pain point: a creator wanting to redo/retire its own
+    // spawn shouldn't have to build a team just to gain orchestrator
+    // authority). Guarded by an in-flight safety valve: if the target has an
+    // active worktree binding or a claimed/in_progress task, the creator path
+    // requires `force=true` + a non-empty `force_reason` (audit-logged), so a
+    // creator can't casually reap an agent mid-work. Self/orchestrator deletes
+    // are unaffected by the valve — this only gates the NEW creator path.
     if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
         if caller != name && !crate::teams::is_orchestrator_of(home, caller, name) {
-            return serde_json::json!({
-                "error": format!(
-                    "permission denied: '{caller}' cannot delete '{name}' \
-                     (only the instance itself or its team orchestrator may)"
-                ),
-                "code": "not_owner_or_orchestrator"
+            let is_creator = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.created_by.clone()))
+                .as_deref()
+                == Some(caller);
+            if !is_creator {
+                return serde_json::json!({
+                    "error": format!(
+                        "permission denied: '{caller}' cannot delete '{name}' \
+                         (only the instance itself, its team orchestrator, or its creator may)"
+                    ),
+                    "code": "not_owner_or_orchestrator"
+                });
+            }
+            let has_binding = crate::binding::read(home, name).is_some();
+            let has_active_task = crate::tasks::list_all(home).iter().any(|t| {
+                t.assignee.as_deref() == Some(name)
+                    && matches!(
+                        t.status,
+                        crate::task_events::TaskStatus::Claimed
+                            | crate::task_events::TaskStatus::InProgress
+                    )
             });
+            if has_binding || has_active_task {
+                let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                let force_reason = args
+                    .get("force_reason")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                match force_reason {
+                    Some(reason) if force => {
+                        tracing::warn!(
+                            caller,
+                            target = name,
+                            reason,
+                            has_binding,
+                            has_active_task,
+                            "creator force-deleting instance with in-flight work"
+                        );
+                        // Durable audit trail — a permission override deleting
+                        // in-flight work needs more than a process log line.
+                        // Mirrors ci/merge.rs's merge_force_bypass: fail-closed
+                        // if the write itself fails (an unrecordable override
+                        // must not proceed).
+                        let event = serde_json::json!({
+                            "kind": "creator_force_delete",
+                            "agent": caller,
+                            "target": name,
+                            "force_reason": reason,
+                            "has_binding": has_binding,
+                            "has_active_task": has_active_task,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        let events_path = home.join("fleet_events.jsonl");
+                        let audit_written = (|| -> std::io::Result<()> {
+                            use std::io::Write;
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(events_path)?;
+                            writeln!(f, "{event}")?;
+                            Ok(())
+                        })();
+                        if let Err(e) = audit_written {
+                            return serde_json::json!({
+                                "error": format!(
+                                    "creator force-delete refused: audit log write failed: {e}"
+                                ),
+                                "code": "creator_force_delete_audit_failed"
+                            });
+                        }
+                    }
+                    _ => {
+                        return serde_json::json!({
+                            "error": format!(
+                                "'{name}' has in-flight work (binding={has_binding}, \
+                                 active_task={has_active_task}) — creator delete requires \
+                                 force=true and a non-empty force_reason"
+                            ),
+                            "code": "creator_delete_requires_force"
+                        });
+                    }
+                }
+            }
         }
     }
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
@@ -551,166 +638,4 @@ pub(super) fn resolve_team_layout(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn delete_instance_denies_non_owner_non_orchestrator_audit2_002() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-2002-del-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-
-        // A peer that is neither the target nor its orchestrator is denied — the
-        // ACL fires before any teardown / existence check.
-        let attacker = crate::identity::Sender::new("attacker");
-        let denied =
-            handle_delete_instance(&home, &serde_json::json!({"instance": "victim"}), &attacker);
-        assert_eq!(
-            denied["code"], "not_owner_or_orchestrator",
-            "non-owner delete must be denied: {denied}"
-        );
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn dirty_worktree(tag: &str) -> std::path::PathBuf {
-        let wt = std::env::temp_dir().join(format!(
-            "agend-2476-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&wt).unwrap();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&wt)
-                .env("AGEND_GIT_BYPASS", "1")
-                .output()
-                .expect("git");
-        };
-        git(&["init", "-b", "main"]);
-        // Untracked file → `git status --porcelain` non-empty → work-at-risk.
-        std::fs::write(wt.join("wip.txt"), "uncommitted groundwork").unwrap();
-        wt
-    }
-
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn bind_worktree(home: &std::path::Path, agent: &str, wt: &std::path::Path) {
-        let dir = crate::paths::runtime_dir(home).join(agent);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("binding.json"),
-            serde_json::json!({"worktree": wt.display().to_string()}).to_string(),
-        )
-        .unwrap();
-    }
-
-    /// #2476: a `fresh` restart must refuse when the bound worktree has
-    /// uncommitted changes (context drop would strand them), unless `force`.
-    /// `resume` keeps context so it is never guarded.
-    #[test]
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn fresh_restart_guards_uncommitted_worktree_2476() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-2476-home-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        let wt = dirty_worktree("wt");
-        bind_worktree(&home, "dev", &wt);
-
-        // fresh + dirty + no force → refused at the guard (before any spawn).
-        let refused = handle_restart_instance(
-            &home,
-            &serde_json::json!({"instance": "dev", "mode": "fresh"}),
-        );
-        assert_eq!(
-            refused["code"], "uncommitted_work_at_risk",
-            "got: {refused}"
-        );
-
-        // force bypasses the guard (proceeds past it — a later error is NOT the guard).
-        let forced = handle_restart_instance(
-            &home,
-            &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
-        );
-        assert_ne!(
-            forced["code"], "uncommitted_work_at_risk",
-            "force must bypass: {forced}"
-        );
-
-        // resume keeps context → never guarded.
-        let resumed = handle_restart_instance(
-            &home,
-            &serde_json::json!({"instance": "dev", "mode": "resume"}),
-        );
-        assert_ne!(
-            resumed["code"], "uncommitted_work_at_risk",
-            "resume must not guard: {resumed}"
-        );
-
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&wt).ok();
-    }
-
-    // #1625: every restart, regardless of mode, must carry the same-tab layout
-    // hint so the respawned pane returns to its original tab (the fresh path
-    // previously omitted it and fell out into a new tab).
-    #[test]
-    fn restart_spawn_params_carries_same_tab_fresh() {
-        let env = HashMap::new();
-        let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
-        assert_eq!(p["layout"], "same-tab");
-        // fresh must NOT request a resume.
-        assert!(p.get("mode").is_none());
-        // fresh restart arms the daemon self-kick (the independent flag).
-        assert_eq!(p["self_kick_on_ready"].as_bool(), Some(true));
-    }
-
-    #[test]
-    fn restart_spawn_params_carries_same_tab_resume() {
-        let env = HashMap::new();
-        let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
-        assert_eq!(p["layout"], "same-tab");
-        assert_eq!(p["mode"], "resume");
-        // resume preserves context → must NOT self-kick.
-        assert!(p.get("self_kick_on_ready").is_none());
-    }
-
-    /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
-    /// fresh-restart path, NEVER derived from `SpawnMode::Fresh` (initial fleet
-    /// spawns / create_instance / team-spawn are Fresh too but never set it). The
-    /// SPAWN handler reads `self_kick_on_ready` with `unwrap_or(false)`, so any
-    /// spawn-params shape that lacks the flag (every non-restart-fresh spawn)
-    /// gates the self-kick OUT, fail-safe.
-    #[test]
-    fn self_kick_flag_set_only_by_fresh_restart_fail_safe_default() {
-        let env = HashMap::new();
-        // fresh restart → flag present + true.
-        let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
-        assert!(fresh["self_kick_on_ready"].as_bool().unwrap_or(false));
-        // resume restart → no flag → reads false.
-        let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
-        assert!(!resume["self_kick_on_ready"].as_bool().unwrap_or(false));
-        // a generic spawn-params object (the initial-fleet / create_instance shape,
-        // which also maps to SpawnMode::Fresh) carries no flag → reads false.
-        let initial = json!({"name": "dev", "backend": "claude", "layout": "tab"});
-        assert!(!initial["self_kick_on_ready"].as_bool().unwrap_or(false));
-    }
-}
+mod tests;

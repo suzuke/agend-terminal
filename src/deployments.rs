@@ -233,6 +233,7 @@ fn create_instance_entries(
                 command: yaml_str(inst_val, "command"),
                 worktree: inst_val.get("worktree").and_then(|v| v.as_bool()),
                 topic_binding_mode: None,
+                created_by: None, // no single ACL creator for templated instances
             },
         ));
         created.push(inst_name);
