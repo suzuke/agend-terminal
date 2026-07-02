@@ -211,7 +211,9 @@ pub(crate) fn def_decision() -> Value {
             "needs_answer": {"type": "boolean", "description": "#2305 post: mark this decision a pending question awaiting an operator answer."},
             "options": {"type": "array", "description": "#2305 post: suggested answer options (recommended-first). Each is `{label, recommended}` or a bare string.", "items": {"type": ["object", "string"]}},
             "allow_free_text": {"type": "boolean", "description": "#2305 post: accept a free-text answer not matching any option."},
-            "answer": {"type": "string", "description": "#2305 answer action: the chosen option label or free-text answer for decision `id`."}
+            "answer": {"type": "string", "description": "#2305 answer action: the chosen option label or free-text answer for decision `id`."},
+            "timeout_secs": {"type": "integer", "description": "#2524 P2c / #2313 post: only valid with needs_answer=true. After this many seconds unanswered, the daemon auto-answers with `timeout_default`. Omitted (default) = wait indefinitely."},
+            "timeout_default": {"type": "string", "description": "#2524 P2c / #2313 post: the answer auto-applied on timeout. Required when `timeout_secs` is set unless derivable from an `options` entry with `recommended: true`."}
         }, "required": ["action"]}})
 }
 
@@ -928,6 +930,8 @@ mod tests {
             ("decision", "options", "decisions.rs post question options (#2305)"),
             ("decision", "allow_free_text", "decisions.rs post question free-text gate (#2305)"),
             ("decision", "answer", "decisions.rs answer action (#2305)"),
+            ("decision", "timeout_secs", "decisions.rs post validation + Decision field; daemon/decision_board_timeout.rs scan_and_answer elapsed check (#2524 P2c)"),
+            ("decision", "timeout_default", "decisions.rs post validation/derivation + Decision field; daemon/decision_board_timeout.rs auto_answer_timeout (#2524 P2c)"),
             // ── team ──
             ("team", "action", "teams.rs routing"),
             ("team", "name", "teams.rs create/delete/update target"),

@@ -281,7 +281,14 @@ The panel shows each decision's title, author, timestamp, content, and tags. The
 
 ---
 
-## Decision Timeout
+## Decision Timeout (`reply` tool)
+
+> This section is about the `reply` tool's own pending-decision sidecar
+> (`pending-decisions/{id}.json`) — a separate mechanism from the
+> decision-board timeout below. They share the "auto-resolve on timeout"
+> idea and the same daemon-tracker idiom, but different stores, data
+> models, and routing (see [Decision-Board Timeout+Default](#decision-board-timeoutdefault-2313-p2c)
+> for why they aren't the same thing).
 
 An agent can set an automatic decision in `reply`:
 
@@ -302,6 +309,39 @@ Flow:
 4. Timeout → marked as `timeout`, sends a notification with the default action to the agent's inbox
 
 The same agent can only have one pending decision at a time. A new pending decision automatically cancels the previous one.
+
+---
+
+## Decision-Board Timeout+Default (#2313 P2c)
+
+An opt-in per-decision timeout for `needs_answer` questions posted to the decision board (distinct from the `reply` tool's own timeout above — see the note there for why they're separate).
+
+```json
+{
+  "action": "post",
+  "title": "Deploy the lean config?",
+  "content": "...",
+  "needs_answer": true,
+  "options": [{"label": "proceed", "recommended": true}, {"label": "abort"}],
+  "timeout_secs": 1800
+}
+```
+
+If the operator has not answered within `timeout_secs`, the daemon auto-answers with `timeout_default` (or, if omitted, the `recommended` option's label). If neither is resolvable, `post` rejects the request up front.
+
+| Parameter | Type | Required | Description |
+|------|------|------|------|
+| `timeout_secs` | integer | no | Only valid with `needs_answer: true`. Seconds after `created_at` before auto-answer. |
+| `timeout_default` | string | no* | The answer to auto-apply on timeout. *Required unless an `options` entry has `recommended: true`, in which case it's derived from that label. |
+
+Flow:
+1. `post` validates `timeout_secs`/`timeout_default` and stores them on the decision record (no new store — same `decisions/{id}.json` file, additive fields).
+2. A daemon tracker scans pending questions roughly every 5 minutes (throttled, not real-time).
+3. Once `created_at + timeout_secs` has elapsed and the question is still `Pending`, it's answered with `answer: timeout_default`, `answered_by: "timeout-default"`.
+4. The decision's **author** (not necessarily whoever is currently working on the related task) is notified via inbox.
+5. If the operator answers first, the tracker's next scan sees `status != Pending` and skips it — no clobbering, no double notification.
+
+Out of scope (see #2524 P2b/P2c manifest for the full premise check): no daemon auto-trigger by priority/tag, no "current owner" routing — that's the separate clarify/threading feature (#2313 P2d). The timeout always notifies the `author` field as recorded at post time.
 
 ---
 

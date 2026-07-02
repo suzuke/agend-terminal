@@ -80,6 +80,20 @@ pub struct Decision {
     /// RFC3339 time the answer was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
+
+    // ── #2524 P2c / #2313 optional per-decision timeout+default ──
+    // Additive with serde defaults: a question posted without `timeout_secs`
+    // leaves both at `None` and is untouched by `DecisionBoardTimeoutTracker`
+    // — behaves exactly as before #2313 (indefinite wait, the default).
+    /// Seconds after `created_at` before the tracker auto-answers with
+    /// `timeout_default`. `None` = wait indefinitely (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// The option label auto-applied on timeout. Required (and validated at
+    /// `post` time) whenever `timeout_secs` is set — either given explicitly
+    /// or derived from the `recommended` option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_default: Option<String>,
 }
 
 pub(crate) fn decisions_dir(home: &Path) -> std::path::PathBuf {
@@ -204,6 +218,38 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let allow_free_text = args["allow_free_text"].as_bool().unwrap_or(false);
     let status = needs_answer.then_some(DecisionStatus::Pending);
 
+    // #2524 P2c / #2313: optional per-decision timeout+default. Validated
+    // before any side effects (ID gen, supersede-archive) so a bad request
+    // never partially commits. `timeout_secs` absent (the default) leaves
+    // `timeout_default` at `None` too — untouched by
+    // `DecisionBoardTimeoutTracker`, byte-identical to pre-#2313 behavior.
+    let timeout_secs = args["timeout_secs"].as_u64();
+    if timeout_secs.is_some() && !needs_answer {
+        return serde_json::json!({
+            "error": "timeout_secs is only valid when needs_answer=true"
+        });
+    }
+    let timeout_default = if timeout_secs.is_some() {
+        let explicit = args["timeout_default"].as_str().map(String::from);
+        let derived = explicit.or_else(|| {
+            options
+                .iter()
+                .find(|o| o.recommended)
+                .map(|o| o.label.clone())
+        });
+        match derived {
+            Some(d) => Some(d),
+            None => {
+                return serde_json::json!({
+                    "error": "timeout_secs requires 'timeout_default' or an options \
+                              entry with recommended=true to derive it from"
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     let clock = chrono::Utc::now();
     let now = clock.to_rfc3339();
     // The historical id format was seconds-precision only — two posts in the
@@ -273,6 +319,8 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         answer: None,
         answered_by: None,
         answered_at: None,
+        timeout_secs,
+        timeout_default,
     };
 
     match save(home, &decision) {
@@ -548,6 +596,39 @@ pub fn answer(home: &Path, caller: &str, args: &Value) -> Value {
     }
 }
 
+/// #2524 P2c / #2313: called by `daemon::decision_board_timeout`'s tracker
+/// once a pending question's `timeout_secs` has elapsed. Idempotent —
+/// returns `None` if the decision was already answered/expired/removed
+/// under the lock (e.g. the operator answered it in the race window),
+/// mirroring `answer`'s own re-check-under-lock shape. Returns
+/// `(author, title)` on success, for the caller's notification text.
+pub(crate) fn auto_answer_timeout(home: &Path, id: &str) -> Option<(String, String)> {
+    let locked = with_decision_lock(home, id, || -> Option<(String, String)> {
+        let path = decision_path(home, id);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return None;
+        };
+        let mut decision: Decision = serde_json::from_str(&content).ok()?;
+        if decision.status != Some(DecisionStatus::Pending) {
+            return None;
+        }
+        let default_label = decision.timeout_default.clone()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        decision.answer = Some(default_label);
+        decision.answered_by = Some("timeout-default".to_string());
+        decision.answered_at = Some(now.clone());
+        decision.status = Some(DecisionStatus::Answered);
+        decision.updated_at = now;
+        decision.schema_version = SCHEMA_VERSION;
+        if crate::store::save_atomic(&path, &decision).is_ok() {
+            Some((decision.author.clone(), decision.title.clone()))
+        } else {
+            None
+        }
+    });
+    locked.ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +834,8 @@ mod tests {
             answer: None,
             answered_by: None,
             answered_at: None,
+            timeout_secs: None,
+            timeout_default: None,
         }
     }
 
@@ -1216,6 +1299,166 @@ mod tests {
             "answered question must drop out of the tally"
         );
         assert!(counts.by_author.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2524 P2c / #2313 — timeout+default validation + auto_answer_timeout ──
+
+    #[test]
+    fn post_timeout_secs_without_needs_answer_rejected_2313() {
+        let home = tmp_home("timeout-needs-answer-2313");
+        let result = post(
+            &home,
+            "lead",
+            &serde_json::json!({"title": "x", "content": "?", "timeout_secs": 60}),
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("needs_answer"),
+            "timeout_secs without needs_answer must error: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn post_timeout_secs_without_default_or_recommended_rejected_2313() {
+        let home = tmp_home("timeout-no-default-2313");
+        let result = post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60
+            }),
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timeout_default"),
+            "timeout_secs without a resolvable default must error: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn post_timeout_secs_derives_default_from_recommended_option_2313() {
+        let home = tmp_home("timeout-derives-default-2313");
+        let result = post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
+                "options": [{"label": "proceed", "recommended": true}, {"label": "abort"}]
+            }),
+        );
+        assert_eq!(result["status"], "posted", "post must succeed: {result}");
+        let id = result["id"].as_str().expect("id").to_string();
+        let listed = list(&home, &serde_json::json!({}));
+        let decisions = listed["decisions"].as_array().expect("array");
+        let d = decisions.iter().find(|d| d["id"] == id).expect("found");
+        assert_eq!(d["timeout_secs"], 60);
+        assert_eq!(d["timeout_default"], "proceed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn post_timeout_secs_accepts_explicit_default_without_recommended_2313() {
+        let home = tmp_home("timeout-explicit-default-2313");
+        let result = post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
+                "timeout_default": "proceed"
+            }),
+        );
+        assert_eq!(result["status"], "posted", "post must succeed: {result}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn auto_answer_timeout_answers_pending_decision_2313() {
+        let home = tmp_home("auto-answer-2313");
+        let created = post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
+                "timeout_default": "proceed-with-lean"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let result = auto_answer_timeout(&home, &id);
+        let (author, title) = result.expect("must auto-answer a pending timeout decision");
+        assert_eq!(author, "lead");
+        assert_eq!(title, "x");
+
+        let listed = list(&home, &serde_json::json!({}));
+        let decisions = listed["decisions"].as_array().expect("array");
+        let d = decisions.iter().find(|d| d["id"] == id).expect("found");
+        assert_eq!(d["answer"], "proceed-with-lean");
+        assert_eq!(d["answered_by"], "timeout-default");
+        assert_eq!(d["status"], "answered");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn auto_answer_timeout_is_idempotent_2313() {
+        let home = tmp_home("auto-answer-idempotent-2313");
+        let created = post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
+                "timeout_default": "proceed"
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let first = auto_answer_timeout(&home, &id);
+        assert!(first.is_some(), "first call must answer: {first:?}");
+        let second = auto_answer_timeout(&home, &id);
+        assert!(
+            second.is_none(),
+            "already-answered decision must not be re-answered: {second:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn auto_answer_timeout_none_for_operator_answered_decision_2313() {
+        let home = tmp_home("auto-answer-operator-beat-2313");
+        let created = post(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
+                "timeout_default": "proceed", "allow_free_text": true
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        // Operator answers first (the race the timeout tracker must lose to).
+        answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": id, "answer": "operator-choice"}),
+        );
+
+        let result = auto_answer_timeout(&home, &id);
+        assert!(
+            result.is_none(),
+            "must not clobber an already-operator-answered decision: {result:?}"
+        );
+        let listed = list(&home, &serde_json::json!({}));
+        let decisions = listed["decisions"].as_array().expect("array");
+        let d = decisions.iter().find(|d| d["id"] == id).expect("found");
+        assert_eq!(
+            d["answer"], "operator-choice",
+            "operator's answer must survive"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
