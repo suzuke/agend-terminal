@@ -1177,13 +1177,10 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
 ///   immediately 529s still arms — an explicit silence threshold would wrongly block it).
 ///
 /// SINGLE-OWNERSHIP (decision d-20260625052109609105-0): there is NO live production recovery-arm
-/// today — `recovery_shadow` is a measure-only Phase-0 shadow that takes no action — so there is
-/// no episode for this work-turn arm to double-own. The boundary vs the (future) expectation-keyed
-/// 529-recovery is deliberately NOT enforced here: gating on `recovery_shadow`'s expectation map
-/// would let the `AGEND_RECOVERY_SHADOW=1` MEASURE-ONLY flag suppress this production arm — and a
-/// never-cleared expectation could permanently block arming — violating the shadow's zero-behavior
-/// invariant (r6 #2469). When dev-2 promotes 529-recovery to active it will carve the boundary
-/// with a PRODUCTION signal, not the shadow telemetry.
+/// today — the Phase-0 `recovery_shadow` measure-only shadow this reasoning was originally scoped
+/// against was itself removed in #2547 (zero real consumers of its verdict) — so there is no
+/// episode for this work-turn arm to double-own, by any mechanism, shadow or otherwise. When
+/// dev-2 promotes 529-recovery to active it will carve the boundary with a PRODUCTION signal.
 ///
 /// StopFailure-hook corroboration is deliberately NOT required (hooks are best-effort/droppable,
 /// and would re-introduce a false-negative); it only adds confidence when present (claude).
@@ -1630,7 +1627,8 @@ pub(crate) fn process_error_recovery(
             // the arm branch below so the Idle-clear branch (`clears_server_rate_limit_retry`) only
             // fires when this is FALSE — arm and clear stay synchronized on one signal (no same-tick
             // fight). Single-ownership vs the future 529-recovery is left to a PRODUCTION signal
-            // (not the measure-only recovery_shadow); see `work_turn_throttle_arm`.
+            // (the #2547-removed measure-only recovery_shadow shadow never counted); see
+            // `work_turn_throttle_arm`.
             let loose_arm =
                 work_turn_throttle_arm(blocked_rl, has_throttle_hint, recovered, self_cleared);
 
