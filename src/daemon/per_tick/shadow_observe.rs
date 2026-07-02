@@ -15,7 +15,7 @@
 //!
 //! Flag-OFF default ⇒ a single cheap `enabled()` check then early-return (zero work,
 //! zero behaviour change). The reduce reads ONLY the hook buffer + screen + lsof signal
-//! — zero in-path (SHADOW-OBSERVER-ARCH-2413.md invariants).
+//! — zero in-path (docs/archived/SHADOW-OBSERVER-ARCH-2413.md invariants).
 
 use super::{PerTickHandler, TickContext};
 use crate::agent::AgentCore;

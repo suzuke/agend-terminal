@@ -322,7 +322,7 @@ pub fn resolve_supported_backend(backend: &str) -> Result<&'static str, String> 
 /// Slice-2 added claude (both proven to render a continuous work marker so the
 /// Idle-debounce isn't fooled by a mid-turn idle — confirm-first iron rule). #2524
 /// P3a PR-2 adds codex — its raw screen false-idles mid-turn for several seconds
-/// (SHADOW-OBSERVER-QUANT-CODEX-2413.md), longer than the Idle-debounce window, so its
+/// (docs/archived/SHADOW-OBSERVER-QUANT-CODEX-2413.md), longer than the Idle-debounce window, so its
 /// turn-end detection is routed through `core.observed_status` (Stream authority) — see
 /// `ephemeral_driver::effective_turn_state`. A prompt for any other backend is rejected
 /// ([`SpawnError::DriverUnsupported`]) until its own §5 smoke lands. `backend_command`
