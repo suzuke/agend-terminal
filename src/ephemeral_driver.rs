@@ -1,10 +1,15 @@
-//! #1967 Phase-1 PR3b: the one-shot ephemeral-worker DRIVER (Route B).
+//! #1967 Phase-1 PR3b: the ephemeral-worker DRIVER (Route B).
 //!
 //! After [`crate::ephemeral_tracking::spawn_and_track`] finalizes a headless
-//! opencode/claude worker, it launches a background driver thread (this module) that
-//! runs exactly ONE prompt turn to a recorded result:
+//! opencode/claude/codex worker, it launches a background driver thread (this
+//! module) that runs one or more prompt turns to a recorded result:
 //!
-//!   wait-ready → inject prompt → turn-end (Idle-debounce) → capture → oracle → record
+//!   wait-ready → [inject → turn-end (Idle-debounce) → capture → oracle]+ → record
+//!
+//! `[...]+` = exactly once for the pre-P3b single-shot path (`DriverConfig.
+//! max_iterations` is `None` — every caller before #2524 P3b), or the #2524 P3b
+//! ralph-loop's self-continuation loop (`Some(n)`, `1..=25`) — see `run_turn` and
+//! [`next_loop_action`] for the loop's five termination paths.
 //!
 //! The driver is decoupled from the worker's [`crate::agent::EphemeralPtyHandle`]
 //! (the reaper owns that in `LIVE_CHILDREN`): it holds only Arc clones of the PTY
