@@ -181,6 +181,53 @@ CI Watch 同時監控 PR 的 mergeable 狀態。
 
 ---
 
+## Discharge Ledger（重複通知抑制）
+
+同一個底層失敗，在活躍分支上可能因為輪詢重新發出、stale 訊息被 reclaim 重新
+nudge、poll-reminder 因 unread 數量變化再次提醒等原因，產生多則 `[ci-fail]`
+通知。一旦某個 agent 已經實際處理過這則失敗——查過原因、跟 lead 說這是已知的
+不穩定 job、或正在修——同一件事的重複通知就是雜訊，不是訊號。
+
+### 標記已處理
+
+在你原本就會發出的 `send(kind=update` 或 `kind=report)` 呼叫上，加一個
+`triaged` 欄位即可：
+
+```
+send(kind=report, ..., triaged={head: "<commit-sha>", job: "Coverage", reason: "known flaky, reran"})
+```
+
+- `head` 與 `job` 必須同時提供（或同時省略）——只給一半的簽名會被拒絕，
+  不會被悄悄忽略。
+- `reason` 是選填的自由文字備註。
+- 這是既有 `send` 呼叫上的一個欄位，不是獨立的工具呼叫——discharge ledger
+  的設計刻意避免新增一個 agent 得另外記得呼叫的必要動作（先前一個機制帶了
+  獨立的「標記完成」動作，實測使用率趨近於 0%）。
+
+Daemon 會把這次處理紀錄持久化到磁碟上的 ledger（daemon 重啟後仍然存在——
+純記憶體的 ledger 會讓重啟後所有已處理的失敗瞬間變回「未處理」，比完全沒有
+這個機制還糟）。
+
+### 什麼會被抑制
+
+Discharge 以 `(head_sha, job_name)` 為鍵：
+
+- **同一個 head、同一個 job** → 抑制（你剛處理過的那個確切失敗）。
+- **同一個 head、不同 job** → 照常通知（同一個 commit 上另一個 check 失敗，
+  是不同的問題）。
+- **新的 head（你推了修復，或 CI 在新的 commit 上重跑）** → 自動恢復通知。
+  不需要額外的過期/清理步驟：ledger 是對照分支「目前」的 head 查表，
+  head 一旦前進，舊的 discharge 紀錄自然就不再匹配。
+
+### 抑制邏輯是 fail-open
+
+只要 daemon 無法同時確立簽名的兩端——訊息不是可辨識的 ci-fail 格式、
+分支目前的 head 未知、ledger 讀取失敗——一律照常通知。沒有任何情況會因為
+「無法確認是否已處理」而悄悄漏發；最壞情況只是多一則（無害的）通知，
+絕不會漏掉一則。
+
+---
+
 ## TTL 與自動清理
 
 CI Watch 有兩種過期機制：

@@ -31,6 +31,7 @@ pub use storage::{
     ack, ack_by_correlation, clear_compact, describe_message, drain, enqueue, find_message,
     get_thread, has_drained_blocker_for_correlation, mark_ci_watch_superseded, obligation_reason,
     reclaim_stale_delivering, settle_delivering_for_session_reset, sweep_expired, unread_count,
+    unread_count_after_discharge,
 };
 // Storage CRUD (pub(crate))
 pub(crate) use storage::inbox_path_resolved;

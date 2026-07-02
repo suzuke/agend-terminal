@@ -35,9 +35,10 @@ pub fn remove_agent(name: &str) {
 pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(String, String)> {
     // #1617-class (mirror conflict_notify's phase-1-collect / phase-2-IO): snapshot
     // the idle-agent names UNDER the registry lock, then DROP the guard before any
-    // inbox file IO. `inbox::unread_count` does `fs::read_to_string` + full-file
-    // parse; holding the GLOBAL registry lock across that (per agent, in a loop)
-    // stalls every other registry user when the inbox is large or the FS is slow.
+    // inbox file IO. `inbox::unread_count_after_discharge` does `fs::read_to_string`
+    // + full-file parse; holding the GLOBAL registry lock across that (per agent,
+    // in a loop) stalls every other registry user when the inbox is large or the
+    // FS is slow.
     let idle_names: Vec<String> = {
         let reg = agent::lock_registry(registry);
         reg.values()
@@ -57,8 +58,24 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
     // Phase 2: the inbox reads + dedup + formatting run lock-free.
     let mut result = Vec::new();
     for name in &idle_names {
-        let (count, oldest) = crate::inbox::unread_count(home, name);
+        // #2524 P6-r2 (#2537): discharge-aware count — a ci-fail row whose
+        // (head_sha, job) is already triaged (`send.triaged`) doesn't bump this
+        // count, so re-nudging a duplicate the agent already handled stops here.
+        let (count, oldest) = crate::inbox::unread_count_after_discharge(home, name);
         if count == 0 {
+            // #2537 fix (reviewer-caught REJECTED finding on the first pass):
+            // discharging the ONLY unread ci-fail drops the count to 0 here,
+            // but pre-fix `LAST_NOTIFIED` was left stale at whatever it was
+            // before the discharge — so a LATER, genuinely different-signature
+            // failure whose count happened to coincide with that stale value
+            // was silently suppressed by `should_notify_and_record`'s
+            // `prev == count` check below. Clear the dedup baseline whenever
+            // the count is confirmed zero, mirroring the SAME invalidation
+            // `reclaim_stale_delivering` already performs when a restore
+            // changes the count out from under the ledger (see its
+            // `remove_agent` call in `inbox::storage`) — a real signature
+            // change must never be masked by a stale prior count.
+            remove_agent(name);
             continue;
         }
         if !should_notify_and_record(name, count) {
@@ -182,19 +199,21 @@ mod tests {
         }
         assert!(block_end > block_start, "binding block must close");
 
-        // #t-…61487: match the CALL form (`unread_count(home`), not a bare
-        // `unread_count` token — a doc/comment mention must NOT satisfy the guard
-        // (that is exactly how v1 left this guard "blind": the obligation-count
-        // refactor moved the real call away but a comment kept the loose needle green).
-        let io_needle = ["unread_count", "(home"].concat();
+        // #t-…61487: match the CALL form (`unread_count_after_discharge(home`), not
+        // a bare `unread_count` token — a doc/comment mention must NOT satisfy the
+        // guard (that is exactly how v1 left this guard "blind": the
+        // obligation-count refactor moved the real call away but a comment kept
+        // the loose needle green). #2524 P6-r2: the call site is now
+        // `unread_count_after_discharge` (discharge-aware count), same IO shape.
+        let io_needle = ["unread_count_after_discharge", "(home"].concat();
         let locked_region = &prod[block_start..=block_end];
         assert!(
             !locked_region.contains(&io_needle),
-            "collect_poll_reminders must NOT call inbox::unread_count under the registry lock (#1617 class)"
+            "collect_poll_reminders must NOT call inbox::unread_count_after_discharge under the registry lock (#1617 class)"
         );
         assert!(
             prod[block_end..].contains(&io_needle),
-            "inbox::unread_count must run AFTER the registry lock is dropped"
+            "inbox::unread_count_after_discharge must run AFTER the registry lock is dropped"
         );
     }
 
@@ -749,6 +768,156 @@ mod tests {
             crate::notification_queue::pending_count(&home, agent) > 0,
             "#event-bus Option A: gate-off must deliver via legacy (no regression)"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2524 P6-r2 (#2537), REAL entry point (§3.9): `collect_poll_reminders`
+    /// itself — not just the `unread_count_after_discharge` helper it now calls
+    /// — must not re-nudge a duplicate `[ci-fail]` for a `(head, job)` already
+    /// discharged via `send.triaged`.
+    #[test]
+    fn collect_poll_reminders_no_nudge_for_fully_discharged_ci_fail() {
+        let home = tmp_home("collect-discharged");
+        let agent = "collect-discharged-agent";
+        let (repo, branch, head, short, job) = (
+            "o/r",
+            "feat/x",
+            "cafef00dcafef00dcafef00dcafef00dcafef00d",
+            "cafef00",
+            "Coverage",
+        );
+
+        // A real ci-watch WatchState at the CURRENT head — `is_discharged_ci_fail`
+        // resolves the signature's head from here, not the message body.
+        let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let ws = crate::daemon::ci_watch::WatchState {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            head_sha: Some(head.to_string()),
+            ..Default::default()
+        };
+        std::fs::write(
+            watch_dir.join(crate::daemon::ci_watch::watch_filename(repo, branch)),
+            serde_json::to_string_pretty(&ws).unwrap(),
+        )
+        .unwrap();
+
+        let ci_fail_msg = || {
+            crate::inbox::InboxMessage::new_system(
+                "system:ci",
+                "ci-watch",
+                format!("[ci-fail] {repo}@{branch} ({short}): failure\nDetail: {job}\nURL: https://example/run/1"),
+            )
+            .with_correlation_id(format!("{repo}@{branch}"))
+        };
+
+        crate::inbox::enqueue(&home, agent, ci_fail_msg()).unwrap();
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+
+        // First pass: undischarged — must nudge.
+        let first = collect_poll_reminders(&home, &registry);
+        assert_eq!(first.len(), 1, "the undischarged ci-fail must nudge once");
+
+        // Triage it (the real send.triaged→record_discharge path).
+        crate::daemon::discharge_ledger::record_discharge(&home, head, job, agent, None).unwrap();
+
+        // A duplicate [ci-fail] for the exact same (head, job) arrives.
+        crate::inbox::enqueue(&home, agent, ci_fail_msg()).unwrap();
+
+        let second = collect_poll_reminders(&home, &registry);
+        assert!(
+            second.is_empty(),
+            "a fully-discharged (head, job) — including its duplicate — must not \
+             re-nudge: {second:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2524 P6-r2 regression (gapfix-reviewer REJECTED finding, DUAL review r0):
+    /// discharging job A's ONLY unread ci-fail drops the count to 0, but
+    /// `collect_poll_reminders` used to `continue` on `count == 0` WITHOUT
+    /// updating `LAST_NOTIFIED` — leaving it stale at job A's pre-discharge
+    /// count. When a DIFFERENT job B then fails at the same head,
+    /// `unread_count_after_discharge` correctly reports count=1 (job B is not
+    /// discharged), but `should_notify_and_record` saw `prev(1) == count(1)`
+    /// (the stale value from job A) and silently suppressed the reminder — a
+    /// real silent-loss, not merely a missed optimization. Fixed by clearing the
+    /// agent's dedup entry whenever the discharge-aware count is confirmed
+    /// zero (the SAME invalidation `reclaim_stale_delivering` already performs
+    /// via `remove_agent` when a restore changes the count out from under the
+    /// ledger). REAL entry point (§3.9): drives `collect_poll_reminders`
+    /// itself, not the dedup helper in isolation.
+    #[test]
+    fn collect_poll_reminders_renotifies_for_different_job_after_discharge_zeroes_count() {
+        let home = tmp_home("collect-discharge-then-diff-job");
+        let agent = "collect-discharge-diff-job-agent";
+        let (repo, branch, head, short) = (
+            "o/r",
+            "feat/y",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "deadbee",
+        );
+
+        let watch_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let ws = crate::daemon::ci_watch::WatchState {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            head_sha: Some(head.to_string()),
+            ..Default::default()
+        };
+        std::fs::write(
+            watch_dir.join(crate::daemon::ci_watch::watch_filename(repo, branch)),
+            serde_json::to_string_pretty(&ws).unwrap(),
+        )
+        .unwrap();
+
+        let ci_fail_msg = |job: &str| {
+            crate::inbox::InboxMessage::new_system(
+                "system:ci",
+                "ci-watch",
+                format!("[ci-fail] {repo}@{branch} ({short}): failure\nDetail: {job}\nURL: https://example/run/1"),
+            )
+            .with_correlation_id(format!("{repo}@{branch}"))
+        };
+
+        // Job A fails — undischarged, must nudge.
+        crate::inbox::enqueue(&home, agent, ci_fail_msg("audit")).unwrap();
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+        let first = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            first.len(),
+            1,
+            "job A's undischarged ci-fail must nudge once"
+        );
+
+        // Triage job A. It was the ONLY unread row, so the discharge-aware
+        // count drops to 0 this pass.
+        crate::daemon::discharge_ledger::record_discharge(&home, head, "audit", agent, None)
+            .unwrap();
+        let after_discharge = collect_poll_reminders(&home, &registry);
+        assert!(
+            after_discharge.is_empty(),
+            "job A is discharged and was the only unread row — count is 0, no nudge"
+        );
+
+        // Job B — a DIFFERENT job at the SAME head — fails.
+        crate::inbox::enqueue(&home, agent, ci_fail_msg("Coverage")).unwrap();
+        let third = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            third.len(),
+            1,
+            "job B is a genuinely different signature — it must notify even \
+             though its count (1) coincides with job A's stale pre-discharge \
+             count; a silent suppression here is exactly the #2537 \
+             different-signature-must-not-drop guarantee being violated"
+        );
+        assert!(third[0].1.contains("unread=1"));
 
         std::fs::remove_dir_all(&home).ok();
     }

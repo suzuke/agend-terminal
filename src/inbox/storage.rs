@@ -1088,6 +1088,78 @@ pub fn clear_compact(
     }
 }
 
+/// #2524 P6-r2 (#2537): does `msg` represent a ci-fail whose `(head_sha, job_name)`
+/// signature is already discharged (`send.triaged`, PR-1)?
+///
+/// Silent-loss defense (§3.21 — this predicate can ONLY suppress, it is consumed
+/// by callers that only ever narrow "worthy of nudge" to "not worthy", never widen
+/// it): every extraction step fails OPEN — `false` = "not confirmed discharged,
+/// treat as a normal live obligation":
+/// - wrong `kind` (only `"ci-watch"` rows are ci-fail-shaped at all),
+/// - no `Detail: <job>` line in the body ([`extract_ci_fail_job`] — a ci-pass/
+///   ci-ended body has none, or the format has drifted),
+/// - `correlation_id` isn't a parseable `repo@branch` pair,
+/// - no on-disk ci-watch file for that `repo@branch`, or it has no `head_sha` yet,
+/// - the ledger has no entry for `(head_sha, job)` — including a genuinely
+///   different job, or the SAME job at an OLDER head (the watch's `head_sha` is
+///   always the CURRENT head, so a discharge recorded against a since-superseded
+///   head naturally stops matching — free head-invalidation, per PR-1's spike).
+///
+/// Only an EXPLICIT ledger hit for the watch's CURRENT head returns `true`.
+fn is_discharged_ci_fail(home: &Path, msg: &InboxMessage) -> bool {
+    if msg.kind.as_deref() != Some("ci-watch") {
+        return false;
+    }
+    let Some(job) = extract_ci_fail_job(&msg.text) else {
+        return false;
+    };
+    let Some((repo, branch)) = msg
+        .correlation_id
+        .as_deref()
+        .and_then(|c| c.split_once('@'))
+    else {
+        return false;
+    };
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(home)
+        .join(crate::daemon::ci_watch::watch_filename(repo, branch));
+    let Some(head_sha) = std::fs::read_to_string(&watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<crate::daemon::ci_watch::WatchState>(&c).ok())
+        .and_then(|w| w.head_sha)
+    else {
+        return false;
+    };
+    let Some(entry) = crate::daemon::discharge_ledger::lookup_discharge(home, &head_sha, &job)
+    else {
+        return false;
+    };
+    // Audit trail (dispatching task's explicit ask): every absorption is logged,
+    // even if the SAME row is re-evaluated on a later tick/sweep — the audit log
+    // is append-only history, not a dedup ledger (the discharge ledger already is).
+    crate::event_log::log(
+        home,
+        "discharge_absorbed",
+        &msg.from,
+        &format!(
+            "head={head_sha} job={job} discharged_by={} discharged_at={}",
+            entry.discharged_by, entry.discharged_at
+        ),
+    );
+    true
+}
+
+/// Pull the job name out of a ci-fail body's `Detail: <job>` line — the daemon's
+/// own `build_inbox_body` format (`daemon/ci_watch/poller.rs`), the SAME material
+/// `send.triaged.job` reports when an agent discharges it. `None` when the line
+/// is absent (a ci-pass/ci-ended body has none) or empty.
+fn extract_ci_fail_job(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("Detail: "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Count unread messages (read_at == None) for an agent.
 pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
     let path = inbox_path_resolved(home, name);
@@ -1125,6 +1197,56 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
                         oldest = Some(ts_utc);
                     }
                 }
+            }
+        }
+    }
+    (count, oldest)
+}
+
+/// #2524 P6-r2 (#2537): [`unread_count`], but a ci-fail row already discharged
+/// (`(head_sha, job)` — [`is_discharged_ci_fail`]) doesn't count. Byte-identical
+/// to `unread_count` for every row that isn't a discharged ci-fail — same TTL/
+/// delivering/superseded filter, same `oldest` computation.
+///
+/// This is the fix for `collect_poll_reminders`'s literal observed duplicate-nudge:
+/// `should_notify_and_record` only compares whether the unread COUNT changed. A
+/// second `[ci-fail]` for the SAME `(head, job)` an agent already triaged is a
+/// genuinely NEW file row (0→1, a real count change) even though the daemon and
+/// the agent both already know it's the same failure — `unread_count` alone has no
+/// way to see that. This function is the discharge-aware count `collect_poll_reminders`
+/// needs instead.
+pub fn unread_count_after_discharge(
+    home: &Path,
+    name: &str,
+) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
+    let path = inbox_path_resolved(home, name);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (0, None),
+    };
+    let mut count = 0usize;
+    let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for line in content.lines() {
+        let Ok(probe) = serde_json::from_str::<UnreadProbe>(line) else {
+            continue;
+        };
+        if !probe.is_unread() {
+            continue;
+        }
+        // Only a ci-watch row needs the full parse (signature extraction) — every
+        // other kind is counted exactly as `unread_count` does, cheap-probe-only.
+        if probe.kind.as_deref() == Some("ci-watch") {
+            if let Ok(full) = serde_json::from_str::<InboxMessage>(line) {
+                if is_discharged_ci_fail(home, &full) {
+                    continue; // absorbed — does not count, does not set `oldest`
+                }
+            }
+        }
+        count += 1;
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&probe.timestamp) {
+            let ts_utc = ts.with_timezone(&chrono::Utc);
+            if oldest.is_none_or(|t| t > ts_utc) {
+                oldest = Some(ts_utc);
             }
         }
     }
@@ -1181,7 +1303,21 @@ pub fn obligation_reason(home: &Path, msg: &InboxMessage) -> Option<String> {
 /// [`reclaim_stale_delivering`], after the `with_inbox_lock` closure closes — never
 /// inside it (holding the per-agent inbox flock across a blocking board read is the
 /// #1617 fleet-stall class).
+///
+/// #2524 P6-r2 (#2537): [`is_discharged_ci_fail`] is checked FIRST and can only
+/// force `false` (never override an existing `false` back to `true`) — a
+/// discharged ci-fail is never worth re-arming regardless of what
+/// `obligation_reason`/`kind_is_unknown` would otherwise say. In practice this is
+/// a defense-in-depth wire, not a behavior change TODAY: `ci-watch` is already in
+/// `known_fire_and_forget_kind`, so `obligation_reason` already returns `None` and
+/// `kind_is_unknown` already returns `false` for it — this function already
+/// returns `false` for every ci-watch row before this change. Wired anyway per the
+/// dispatching task, so a future kind-taxonomy change can't silently reopen the
+/// gap this closes.
 fn reclaim_renudge_worthy(home: &Path, msg: &InboxMessage) -> bool {
+    if is_discharged_ci_fail(home, msg) {
+        return false;
+    }
     obligation_reason(home, msg).is_some() || kind_is_unknown(msg)
 }
 
@@ -1721,3 +1857,9 @@ mod perf_r3_equiv;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod perf_r3_bench;
+
+// #2524 P6-r2 (#2537): discharge-ledger consumption tests for the two
+// chokepoints (reclaim_renudge_worthy + unread_count_after_discharge).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod p6_discharge_consume;

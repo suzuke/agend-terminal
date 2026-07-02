@@ -90,9 +90,7 @@ pub(crate) fn record_discharge(
 /// Look up whether `job` at `head_sha` has been discharged. `None` covers
 /// both "no ledger file for this head" (head advanced past it — free
 /// invalidation, per the spike) and "file exists but this job isn't in it
-/// yet". Not called from any notification-decision code in PR-1 — exists for
-/// this module's own round-trip tests; PR-2 wires a real caller.
-#[cfg_attr(not(test), allow(dead_code))]
+/// yet". Consumed by `inbox::storage::is_discharged_ci_fail` (#2524 P6-r2).
 pub(crate) fn lookup_discharge(home: &Path, head_sha: &str, job: &str) -> Option<DischargeEntry> {
     let path = ledger_path(home, head_sha);
     let ledger: LedgerFile = std::fs::read_to_string(&path)
