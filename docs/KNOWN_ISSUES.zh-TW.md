@@ -33,7 +33,10 @@
   都接不住，因為行程從未真的崩潰，也沒有已知錯誤簽名能匹配這段堆疊。目前已存到一份
   真實 capture（推翻了先前一次 session 認為證據不可回收的判斷）；要再有第二個樣本才
   會補偵測 pattern，避免誤判合法輸出（見 t-20260702144219394508-56872-6）。
-  respawn_watchdog 側的結構性加固併入 round-3 #2549 的範圍，不另立單。
+  respawn_watchdog 側的結構性加固併入 round-3 #2549 的範圍，不另立單。**若再次遇到：
+  務必在 restart 或任何介入之前先存證**——對卡住的 instance 呼叫
+  `pane_snapshot(to_file=true)` 會把完整畫面寫進 `$AGEND_HOME/captures/`；一旦
+  restart/replace，唯一的證據就沒了。
 
 ## Deferred — 等待 operator 擷取資料或決策
 

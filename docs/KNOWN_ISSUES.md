@@ -40,7 +40,10 @@ Status legend: **Upstream-blocker** (fix lives in another project) ·
   before a detection pattern is added, to avoid false-positiving on
   legitimate output (see t-20260702144219394508-56872-6). Structural
   hardening for the watchdog side is tracked under the round-3 #2549 scope
-  rather than as a standalone fix.
+  rather than as a standalone fix. **If you hit this again: capture it BEFORE
+  restarting or otherwise intervening** — `pane_snapshot(to_file=true)` on the
+  wedged instance writes the full pane to `$AGEND_HOME/captures/`; a
+  restart/replace destroys the only evidence.
 
 ## Deferred — awaiting operator capture or decision
 
