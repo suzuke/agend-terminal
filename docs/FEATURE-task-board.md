@@ -60,6 +60,7 @@ foundation for sweep, health, and dependency evaluation.
   - `Verified` — marks reviewer approval without closing.
   - `Linked` — appends a PR link.
   - `TaskCloseProposed` — review-gated close proposal.
+- Some features compose on existing metadata rather than adding a new variant — e.g. the plan-ack gate (§10) uses `MetadataSet` for `plan_ack_required`/`plan_ack_reason`/`plan_acks`.
 
 ## 4. Status Semantics
 
@@ -134,8 +135,24 @@ foundation for sweep, health, and dependency evaluation.
   - done → open: `Reopened`
 - Multiple changes can be batched in a single `append_batch` for atomic persistence.
 - ACL rules match those of `done` (owner / orchestrator).
+- `status: in_progress` additionally passes through the plan-ack gate (§10) when the task was created with `plan_ack_required > 0`.
 
-## 10. `task action=sweep`
+## 10. Plan-Ack Gate (`#2249`)
+
+An opt-in pre-work alignment gate: require outside acks on a task's plan before it may start.
+
+- `task action=create` (and `send(kind=task)`'s auto-create path) accepts `plan_ack_required` (integer, default `0` = off) and `plan_ack_reason` (required non-empty when `plan_ack_required > 0`, mirrors `second_reviewer_reason`'s validation shape).
+- No new `TaskEvent` variant — `plan_ack_required`/`plan_ack_reason` are seeded into `Task.metadata` via two `MetadataSet` events right after `Created`.
+- The assignee shares their plan via the existing `task action=metadata_set metadata_key=plan`.
+- `task action=ack_plan` (requires `id`) idempotently appends the caller to `metadata.plan_acks`:
+  - The task's own assignee may never ack their own plan (`code: self_ack_forbidden`).
+  - Acking before a plan is set is rejected (`code: plan_not_set`).
+  - Re-acking by the same caller is a no-op (`already_acked: true`, does not double-count).
+- The gate itself lives at the single verified live chokepoint: `task action=update status=in_progress`. If `plan_ack_required > 0` and the number of distinct acks is below that threshold, the transition is rejected with `{code: "plan_ack_pending", required, acked}` and the task's status does not advance.
+- `plan_ack_required == 0` (the default/absent case) skips the check entirely — byte-identical to pre-#2249 behavior for every task that doesn't opt in.
+- Out of scope (deliberately): no daemon auto-trigger by priority/tag, no decision-board integration, no protocol-clause changes — this is a pure opt-in primitive other automation may build on later.
+
+## 11. `task action=sweep`
 
 - A board hygiene tool, not an always-on enforcer.
 - Default is dry-run (`apply=false`).
@@ -143,7 +160,7 @@ foundation for sweep, health, and dependency evaluation.
 - Processes stale tasks and tasks whose linked PR has been closed.
 - Cancelled tasks are emitted in batch with an audit reason.
 
-## 11. `task action=health`
+## 12. `task action=health`
 
 - Returns a read-only board snapshot: totals, by_status breakdown, ghost_owners, stale_claims, age aggregates, and recommendations.
 - Ghost owners: **strict** (not in fleet or live registry) vs. **soft** (in fleet but not live).
@@ -151,14 +168,14 @@ foundation for sweep, health, and dependency evaluation.
 - Age statistics cover non-terminal tasks only.
 - Recommendations are operator-facing next-step hints.
 
-## 12. Event Recording and Migration
+## 13. Event Recording and Migration
 
 - Append acquires a lock before writing; `append_batch` fsyncs multiple events atomically.
 - Replay folds the archive first, then the hot log. It is a strict reader — unknown variants or higher-version schemas cause an abort (fail-closed).
 - Legacy `tasks.json` is consumed only during migration, which converts old tasks into events and renames the file to `.legacy_pre_v2`.
 - **No single→multi-project backfill (#2117 P3 Gap1).** Migrated legacy tasks have no `project_id`, so they land on the default board and stay there. Adopting per-project boards (#2125) later does not retroactively re-bucket them — only newly created tasks are per-project-stamped. This asymmetry is the accepted semantics, not a gap: legacy tasks carry no signal to auto-bucket, and cross-board lookups stay correct via the full-board-scan fallback. To re-home a legacy task, an operator moves it explicitly.
 
-## 13. ACL and Permissions
+## 14. ACL and Permissions
 
 - Unassigned tasks can be mutated by any agent.
 - The task owner and their team orchestrator can mutate.
@@ -166,7 +183,7 @@ foundation for sweep, health, and dependency evaluation.
 - `force` mode is for historical cleanup, not a shortcut — it requires a reason.
 - ACL is evaluated on the replay snapshot (small TOCTOU window; canonical truth is the event log).
 
-## 14. Interactions with Other Subsystems
+## 15. Interactions with Other Subsystems
 
 - **Teams** — affect assignee resolution.
 - **Worktree / Binding** — `done` triggers best-effort worktree cleanup.
@@ -176,7 +193,7 @@ foundation for sweep, health, and dependency evaluation.
 - **Health** — uses the board as an operator snapshot.
 - **Sweep** — often reviewed alongside CI sweep.
 
-## 15. Usage Guide
+## 16. Usage Guide
 
 - Always provide `title` when creating.
 - Use `branch` for tracking branches, `eta_secs` for stall watchdog, `depends_on` for sequencing, `assignee` for routing.
@@ -186,7 +203,7 @@ foundation for sweep, health, and dependency evaluation.
 - Reserve `force=true` for historical data cleanup only.
 - Prefer `done` events over plain-text result reports for traceability.
 
-## 16. Implementation Checklist
+## 17. Implementation Checklist
 
 - Any new event variant must update the replay fold.
 - Any new status must update list/health projections.
@@ -199,6 +216,6 @@ foundation for sweep, health, and dependency evaluation.
 - New write paths should go through `task_events`.
 - New sweep rules should also be reflected in health.
 
-## 17. Summary
+## 18. Summary
 
-The task board is the fleet's shared work protocol. Its semantics are maintained through events, not a single mutable file. The primary surface is `task create/list/claim/done/update/sweep/health`. Default listing is actionable-only. Dependencies are evaluated at the view layer. ACL is owner / orchestrator / system identity. Batch append and strict replay are the two most important invariants. When something looks wrong, check the event log before touching the view.
+The task board is the fleet's shared work protocol. Its semantics are maintained through events, not a single mutable file. The primary surface is `task create/list/claim/done/update/sweep/health`, plus the opt-in `ack_plan` pre-work alignment gate (§10). Default listing is actionable-only. Dependencies are evaluated at the view layer. ACL is owner / orchestrator / system identity. Batch append and strict replay are the two most important invariants. When something looks wrong, check the event log before touching the view.
