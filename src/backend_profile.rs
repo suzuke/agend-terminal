@@ -725,3 +725,76 @@ mod agy_gitconflict_2524 {
         );
     }
 }
+
+#[cfg(test)]
+mod agy_ratelimit_2524 {
+    use super::*;
+
+    /// #2524 P1b-r2: agy had no RateLimit pattern. UNVERIFIED wording (no real
+    /// capture obtained — no burner/low-quota account available; see the #2524
+    /// P1b-r2 report for the guardrail reasoning). Third-party-sourced candidate
+    /// phrase — `capture_kind: synthetic_from_real_template`, low confidence,
+    /// see `tests/fixtures/state-replay/agy-ratelimit.raw` +
+    /// `MANIFEST.yaml`'s matching entry for the corpus-visible fixture
+    /// (r1: a code-comment-only low-confidence flag isn't corpus-visible).
+    const AGY_RATELIMIT_PANE: &str = "  You have exhausted your capacity on this model. Your quota will reset after 58s.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_capacity_exhausted_detects_rate_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_RATELIMIT_PANE),
+            Some(AgentState::RateLimit),
+            "#2524: agy per-model capacity-exhausted banner must read RateLimit (not Idle)"
+        );
+    }
+
+    /// FP guard: prose merely discussing capacity/quota concepts must stay Idle.
+    const AGY_CAPACITY_PROSE_PANE: &str = "  I checked how the rate limiter tracks per-model capacity and when quotas reset; nothing is exhausted right now.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_capacity_prose_not_misread_as_rate_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_CAPACITY_PROSE_PANE),
+            Some(AgentState::Idle),
+            "#2524: an agent's own prose discussing capacity/quota must NOT be misread as RateLimit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opencode_autherror_2524 {
+    use super::*;
+
+    /// #2524 P1b-r2: opencode had no AuthError pattern. Real capture (a
+    /// provider-rejected key via a process-scoped env override against an
+    /// isolated scratch dir — no persistent credential touched, see the #2524
+    /// P1b-r2 report) confirmed opencode renders a distinct boxed "Invalid API
+    /// key" dialog, not just the generic "Error from provider:" ApiError wrapper.
+    /// Reuses the same literal already trusted for claude's AuthError pattern.
+    const OPENCODE_AUTHERROR_PANE: &str = "  ┃Invalid API key┃\n\n  Ask anything";
+
+    #[test]
+    fn opencode_invalid_api_key_detects_auth_error() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(OPENCODE_AUTHERROR_PANE),
+            Some(AgentState::AuthError),
+            "#2524: opencode's Invalid API key dialog must read AuthError (not Idle/ApiError)"
+        );
+    }
+
+    /// FP guard: prose merely discussing API keys must stay Idle.
+    const OPENCODE_KEY_PROSE_PANE: &str = "  Let's review how the provider validates an API key before we ship the auth flow.\n\n  Ask anything";
+
+    #[test]
+    fn opencode_key_prose_not_misread_as_auth_error() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(OPENCODE_KEY_PROSE_PANE),
+            Some(AgentState::Idle),
+            "#2524: an agent's own prose discussing API keys must NOT be misread as AuthError"
+        );
+    }
+}

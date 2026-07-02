@@ -873,3 +873,47 @@ fixtures:
     expected_final_detect: git_conflict
     capture_kind: real_pty
     provenance: "#2524 P1b-r1 real capture — pexpect-driven agy against an isolated scratch merge conflict"
+
+  # ── #2524 P1b-r2 AuthError real capture (2026-07-02) ────────────────
+  - file: opencode-autherror.raw
+    backend: opencode
+    cli_version: "1.17.5"
+    recorded_on: "2026-07-02"
+    scenario: |
+      opencode driven against the Sakana AI provider with a deliberately invalid,
+      process-scoped SAKANA_API_KEY override (never touched ~/.config/opencode's
+      persistent credentials). Confirms opencode renders a distinct boxed
+      "Invalid API key" dialog for a real provider-rejected key — not just the
+      generic "Error from provider:" ApiError wrapper. Fills the #2524 P1b gap:
+      opencode previously had NO AuthError pattern at all.
+      Note: the AuthError dialog is on screen throughout the capture (detect()
+      confirms it on the final frame), but the hysteresis-tracked settled state
+      lands on `active` at the cut — same shape as the existing
+      `agy-thinking.raw` fixture's documented detect()-vs-final_state split.
+    expected_transitions: [starting, idle, active]
+    expected_final_state: active
+    expected_final_detect: auth_error
+    capture_kind: real_pty
+    provenance: "#2524 P1b-r2 real capture — pexpect-driven opencode against an invalid, process-scoped Sakana AI API key"
+
+  # ── #2524 P1b-r2-r1 RateLimit synthetic fixture (2026-07-02) ────────
+  - file: agy-ratelimit.raw
+    backend: agy
+    cli_version: "1.0.15"
+    recorded_on: "2026-07-02"
+    scenario: |
+      SYNTHETIC — NOT a real capture. Renders the exact template string the
+      agy RateLimit pattern is based on: a third-party (GitHub issue / blog)
+      report of real Antigravity 429 wording ("You have exhausted your
+      capacity on this model. Your quota will reset after Ns."), NOT verified
+      against agy's actual binary output. Landed per gapfix-reviewer's r1
+      finding on this PR (F1): the pattern's low-confidence provenance must
+      be corpus-visible (a MANIFEST.yaml + replay_manifest_regression entry),
+      not just a code comment / commit message. Needs real-capture
+      confirmation (a burner/low-quota agy account) before this fixture's
+      wording can be trusted as tightly as the rest of the corpus.
+    expected_transitions: [starting]
+    expected_final_state: starting
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_real_template
+    provenance: "#2524 P1b-r2-r1 — synthetic, third-party-sourced wording, UNVERIFIED against real agy output, low confidence"
