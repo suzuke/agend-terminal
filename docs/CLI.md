@@ -95,6 +95,10 @@ Operator-side housekeeping subcommands. Destructive paths prompt `[y/N]` unless 
 agend-terminal admin cleanup-branches [--yes]
 agend-terminal admin cleanup-zombies [--age <DURATION>] [--yes]
 agend-terminal admin task-sweep-config [--repository <SLUG>] [--pause|--resume] [--dry-run|--no-dry-run] [--api-base-url <URL>]
+agend-terminal admin gc-dry-run [--format human|json]
+agend-terminal admin tokens [--action summary|by_instance] [--group-by instance|task] [--since <WINDOW>] [--instance <NAME>]
+agend-terminal admin watchdog <snooze|resume|status|ack> [--duration <DURATION>]
+agend-terminal admin config-set <KEY> <VALUE>
 ```
 
 #### `admin cleanup-zombies` (#927)
@@ -128,6 +132,34 @@ View or configure the GitHub-PR auto-close sweep daemon (polls merged PRs and em
 - `--pause` / `--resume` — pause/resume the sweep tick (mutually exclusive).
 - `--dry-run` / `--no-dry-run` — log decisions without emitting events, or emit for real (mutually exclusive).
 - `--api-base-url <URL>` — REST API base for self-hosted GitHub Enterprise. Empty string resets to `https://api.github.com`.
+
+#### `admin gc-dry-run` (#2548)
+
+List Phase 4 GC candidates (released, past-grace, daemon-managed worktrees) without deleting them. Non-destructive. Moved from the `gc_dry_run` MCP tool (zero calls in 20 days).
+
+- `--format human|json` — output format (default `human`).
+
+#### `admin tokens` (#2548)
+
+On-demand token usage + estimated USD cost from Claude Code / Codex session transcripts. Moved from the `tokens` MCP tool (zero calls in 20 days). Cost is an estimate; OpenCode/Kiro/Gemini are not covered.
+
+- `--action summary|by_instance` — `summary` (default) is fleet totals + per-instance table; `by_instance` requires `--instance`.
+- `--group-by instance|task` — `instance` (default) is per-instance/per-model; `task` time-joins each message to the active task.
+- `--since <WINDOW>` — lookback window, e.g. `24h` (default), `7d`, `90m`, `all`.
+- `--instance <NAME>` — required for `--action by_instance`; optional filter for `summary`.
+
+#### `admin watchdog` (#2548)
+
+Fleet idle watchdog control. Moved from the `watchdog` MCP tool (zero calls in 20 days). `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.
+
+- `<snooze|resume|status|ack>` — positional action.
+- `--duration <DURATION>` — snooze duration, e.g. `2h`, `30m`, `1h30m`. Clamped to max 4h. Default `1h`.
+
+#### `admin config-set` (#2548)
+
+Set a runtime-mutable daemon config key. Moved from the `config` MCP tool's `set` action (zero MCP calls in 20 days) — agents can still read config via the `config` MCP tool (`get`/`list`), but only the operator can mutate it now. See the `config` tool's live description (`docs/MCP-TOOLS.md`) for the current key list.
+
+- `<KEY> <VALUE>` — positional key and new value.
 
 ### `connect`
 Register an *already-running* local agent with the daemon (inbox-only — no PTY management). Useful in headless environments or to mix a manually-launched CLI into a running fleet.

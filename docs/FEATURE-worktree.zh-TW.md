@@ -287,7 +287,7 @@
 - `release_worktree` 是正式釋放入口。
 - `force_release_worktree` 是 emergency recovery 入口。
 - `repo action=release` 是 path-centric 釋放入口。
-- `gc_dry_run` / `gc_cutover` 負責延遲回收。
+- `agend-terminal admin gc-dry-run`（#2548：從 `gc_dry_run` MCP 工具移過來）/ `gc_cutover` 負責延遲回收。
 - `.agend-managed`、`.agend-pinned`、binding.json 共同描述狀態。
 - 如果 worktree 出問題，先判斷是 lease、release、還是 GC。
 - 這個模組的目標是讓工作空間隔離、可回收、可恢復。

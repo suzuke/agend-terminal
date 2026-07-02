@@ -29,8 +29,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::{
-    binding_state, channel, ci, comms, force_release, gc, instance, restart, schedule, task,
-    worktree,
+    binding_state, channel, ci, comms, force_release, instance, restart, schedule, task, worktree,
 };
 
 /// Shared per-call context — every common parameter `handle_tool`
@@ -205,7 +204,6 @@ adapter!(
     instance::handle_create_instance
 );
 adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
-adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
 adapter!(
     dispatch_delete_instance,
     has,
@@ -240,7 +238,6 @@ adapter!(
     has,
     force_release::handle_force_release_worktree
 );
-adapter!(dispatch_gc_dry_run, has, gc::handle_gc_dry_run);
 adapter!(
     dispatch_download_attachment,
     hai,
@@ -338,117 +335,6 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
-pub(crate) fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
-    match crate::api::call(
-        ctx.home,
-        &serde_json::json!({"method": crate::api::method::TUI_SCREENSHOT, "params": {}}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            serde_json::json!({"svg": resp["svg"]})
-        }
-        Ok(resp) => {
-            serde_json::json!({"error": resp["error"].as_str().unwrap_or("tui_screenshot failed")})
-        }
-        Err(e) => serde_json::json!({"error": format!("tui_screenshot: {e}")}),
-    }
-}
-
-// `watchdog` — actions with inline business logic (not just forwarding).
-pub(crate) fn dispatch_watchdog(ctx: &HandlerCtx<'_>) -> Value {
-    match ctx.args["action"].as_str().unwrap_or("") {
-        "snooze" => dispatch_watchdog_snooze(ctx),
-        "resume" => dispatch_watchdog_resume(ctx),
-        "status" => dispatch_watchdog_status(ctx),
-        "ack" => dispatch_watchdog_ack(ctx),
-        other => json!({"error": format!("unknown watchdog action: {other}")}),
-    }
-}
-
-fn dispatch_watchdog_snooze(ctx: &HandlerCtx<'_>) -> Value {
-    use crate::daemon::idle_watchdog;
-
-    const MAX_SNOOZE_SECS: i64 = 4 * 3600;
-
-    let duration_str = ctx.args["duration"].as_str().unwrap_or("1h");
-    let secs = match parse_duration_secs(duration_str) {
-        Some(s) => s.min(MAX_SNOOZE_SECS),
-        None => return json!({"error": format!("invalid duration: {duration_str}")}),
-    };
-    let until = chrono::Utc::now() + chrono::Duration::seconds(secs);
-    let actor = ctx.instance_name;
-    match idle_watchdog::snooze_fleet_idle(ctx.home, until, actor) {
-        Ok(snooze) => {
-            crate::event_log::log(
-                ctx.home,
-                "watchdog_snooze",
-                actor,
-                &format!(
-                    "fleet idle snoozed until {} ({duration_str})",
-                    snooze.snoozed_until
-                ),
-            );
-            json!({
-                "snoozed": true,
-                "snoozed_until": snooze.snoozed_until,
-                "duration_secs": secs,
-            })
-        }
-        Err(e) => json!({"error": format!("snooze failed: {e}")}),
-    }
-}
-
-fn dispatch_watchdog_resume(ctx: &HandlerCtx<'_>) -> Value {
-    use crate::daemon::idle_watchdog;
-    idle_watchdog::resume_fleet_idle(ctx.home);
-    crate::event_log::log(
-        ctx.home,
-        "watchdog_resume",
-        ctx.instance_name,
-        "fleet idle snooze cleared",
-    );
-    json!({"snoozed": false})
-}
-
-fn dispatch_watchdog_status(ctx: &HandlerCtx<'_>) -> Value {
-    use crate::daemon::idle_watchdog;
-    if let Some(snooze) = idle_watchdog::get_snooze_state(ctx.home) {
-        let remaining = chrono::DateTime::parse_from_rfc3339(&snooze.snoozed_until)
-            .ok()
-            .map(|dt| {
-                dt.with_timezone(&chrono::Utc)
-                    .signed_duration_since(chrono::Utc::now())
-                    .num_seconds()
-                    .max(0)
-            })
-            .unwrap_or(0);
-        json!({
-            "snoozed": true,
-            "snoozed_until": snooze.snoozed_until,
-            "remaining_secs": remaining,
-            "actor": snooze.actor,
-        })
-    } else {
-        let ack_info = idle_watchdog::fleet_ack_status().map(|ts| json!({"acked_at": ts}));
-        json!({"snoozed": false, "ack": ack_info})
-    }
-}
-
-fn dispatch_watchdog_ack(ctx: &HandlerCtx<'_>) -> Value {
-    use crate::daemon::idle_watchdog;
-    let ts = idle_watchdog::ack_fleet_idle();
-    let actor = ctx.instance_name;
-    crate::event_log::log(
-        ctx.home,
-        "watchdog_ack",
-        actor,
-        "fleet idle acked — suppressed until post-ack activity",
-    );
-    json!({
-        "acked": true,
-        "acked_at": ts,
-    })
-}
-
 pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "get" => {
@@ -458,17 +344,6 @@ pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
             }
             match crate::runtime_config::get_key(key) {
                 Ok(v) => json!({"key": key, "value": v}),
-                Err(e) => json!({"error": e}),
-            }
-        }
-        "set" => {
-            let key = ctx.args["key"].as_str().unwrap_or("");
-            let value = ctx.args["value"].as_str().unwrap_or("");
-            if key.is_empty() || value.is_empty() {
-                return json!({"error": "key and value are required for set"});
-            }
-            match crate::runtime_config::set(ctx.home, key, value) {
-                Ok(_) => json!({"ok": true, "key": key, "value": value}),
                 Err(e) => json!({"error": e}),
             }
         }
@@ -500,45 +375,6 @@ pub(crate) fn dispatch_mode(ctx: &HandlerCtx<'_>) -> Value {
                  `agend-terminal mode <active|away|sleep>` CLI (operator-only)"
             )
         }),
-    }
-}
-
-/// Parse human-friendly duration strings like "2h", "30m", "1h30m".
-/// A bare number without suffix is interpreted as **minutes**.
-fn parse_duration_secs(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let mut total: i64 = 0;
-    let mut num_buf = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            num_buf.push(ch);
-        } else {
-            let n: i64 = num_buf.parse().ok()?;
-            num_buf.clear();
-            // Checked arithmetic: an attacker-controlled digit run (e.g.
-            // "9999999999999999h") parses to a valid i64 whose `* 3600` overflows
-            // i64::MAX — debug builds panic, release wraps to a bogus value.
-            // Reject the overflow as invalid (None) instead.
-            let secs = match ch {
-                'h' => n.checked_mul(3600)?,
-                'm' => n.checked_mul(60)?,
-                's' => n,
-                _ => return None,
-            };
-            total = total.checked_add(secs)?;
-        }
-    }
-    if !num_buf.is_empty() {
-        let n: i64 = num_buf.parse().ok()?;
-        total = total.checked_add(n.checked_mul(60)?)?; // bare number = minutes
-    }
-    if total > 0 {
-        Some(total)
-    } else {
-        None
     }
 }
 
@@ -595,7 +431,6 @@ mod tests {
                 "set_waiting_on",
                 "move_pane",
                 "pane_snapshot",
-                "tui_screenshot",
                 "decision",
                 "task",
                 "restart_daemon",
@@ -604,19 +439,16 @@ mod tests {
                 "deployment",
                 "ci",
                 "health",
-                "watchdog",
                 "config",
                 "repo",
                 "bind_self",
                 "release_worktree",
                 "force_release_worktree",
                 "binding_state",
-                "gc_dry_run",
-                "tokens",
                 "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 33);
+        assert_eq!(crate::mcp::registry::all().len(), 29);
     }
 
     #[test]
@@ -678,8 +510,7 @@ mod tests {
             ),
             ("schedule", &["create", "list", "update", "delete"]),
             ("team", &["create", "delete", "list", "update"]),
-            ("watchdog", &["snooze", "resume", "status", "ack"]),
-            ("config", &["get", "set", "list"]),
+            ("config", &["get", "list"]),
         ];
         for (tool, actions) in cases {
             for action in actions.iter() {
@@ -714,66 +545,6 @@ mod tests {
         let args = json!({}); // no "action" key
         let ctx = ctx_for(&home, &args, "");
         assert!(try_dispatch("task", &ctx).is_some());
-    }
-
-    // ── #1084 watchdog snooze MCP tests ──────────────────────────
-
-    fn watchdog_home(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("agend-watchdog-mcp-{}-{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        dir
-    }
-
-    #[test]
-    fn watchdog_snooze_then_status_round_trip() {
-        let home = watchdog_home("snooze-status");
-        let args = json!({"action": "snooze", "duration": "1h"});
-        let ctx = ctx_for(&home, &args, "test-agent");
-        let result = try_dispatch("watchdog", &ctx).unwrap();
-        assert_eq!(result["snoozed"], true);
-        assert!(result["snoozed_until"].is_string());
-        assert_eq!(result["duration_secs"], 3600);
-
-        let status_args = json!({"action": "status"});
-        let status_ctx = ctx_for(&home, &status_args, "test-agent");
-        let status = try_dispatch("watchdog", &status_ctx).unwrap();
-        assert_eq!(status["snoozed"], true);
-        assert!(status["remaining_secs"].as_i64().unwrap() > 0);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn watchdog_snooze_duration_clamped_to_4h() {
-        let home = watchdog_home("snooze-clamp");
-        let args = json!({"action": "snooze", "duration": "24h"});
-        let ctx = ctx_for(&home, &args, "test-agent");
-        let result = try_dispatch("watchdog", &ctx).unwrap();
-        assert_eq!(
-            result["duration_secs"],
-            4 * 3600,
-            "#1084: 24h must clamp to 4h"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn watchdog_resume_clears_snooze() {
-        let home = watchdog_home("resume");
-        let snooze_args = json!({"action": "snooze", "duration": "2h"});
-        let ctx = ctx_for(&home, &snooze_args, "test-agent");
-        try_dispatch("watchdog", &ctx);
-
-        let resume_args = json!({"action": "resume"});
-        let resume_ctx = ctx_for(&home, &resume_args, "test-agent");
-        let result = try_dispatch("watchdog", &resume_ctx).unwrap();
-        assert_eq!(result["snoozed"], false);
-
-        let status_args = json!({"action": "status"});
-        let status_ctx = ctx_for(&home, &status_args, "test-agent");
-        let status = try_dispatch("watchdog", &status_ctx).unwrap();
-        assert_eq!(status["snoozed"], false);
-        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── #1602: inputSchema enforcement at dispatch ──────────────────────
@@ -951,6 +722,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-mod review_repro_mcp_dispatch_comms;

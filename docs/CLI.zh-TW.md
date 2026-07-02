@@ -95,6 +95,10 @@ Operator 端的維護子指令。具破壞性的路徑會提示 `[y/N]`，除非
 agend-terminal admin cleanup-branches [--yes]
 agend-terminal admin cleanup-zombies [--age <DURATION>] [--yes]
 agend-terminal admin task-sweep-config [--repository <SLUG>] [--pause|--resume] [--dry-run|--no-dry-run] [--api-base-url <URL>]
+agend-terminal admin gc-dry-run [--format human|json]
+agend-terminal admin tokens [--action summary|by_instance] [--group-by instance|task] [--since <WINDOW>] [--instance <NAME>]
+agend-terminal admin watchdog <snooze|resume|status|ack> [--duration <DURATION>]
+agend-terminal admin config-set <KEY> <VALUE>
 ```
 
 #### `admin cleanup-zombies` (#927)
@@ -128,6 +132,34 @@ Exit code：
 - `--pause` / `--resume` — 暫停／恢復 sweep tick（互斥）。
 - `--dry-run` / `--no-dry-run` — 僅記錄決策不發事件，或實際發出（互斥）。
 - `--api-base-url <URL>` — 自架 GitHub Enterprise 的 REST API base。空字串重設為 `https://api.github.com`。
+
+#### `admin gc-dry-run` (#2548)
+
+列出 Phase 4 GC 的候選項目（已釋放、過了 grace period、daemon 管理的 worktree）但不刪除。非破壞性。從 `gc_dry_run` MCP 工具移過來（20 天內零呼叫）。
+
+- `--format human|json` — 輸出格式（預設 `human`）。
+
+#### `admin tokens` (#2548)
+
+依需求統計 token 用量與估計的 USD 成本，來源為 Claude Code／Codex 的 session transcript。從 `tokens` MCP 工具移過來（20 天內零呼叫）。成本為估計值；OpenCode／Kiro／Gemini 尚未涵蓋。
+
+- `--action summary|by_instance` — `summary`（預設）為 fleet 總計＋per-instance 表格；`by_instance` 需搭配 `--instance`。
+- `--group-by instance|task` — `instance`（預設）為 per-instance/per-model；`task` 會把每筆訊息時間對應到當時的 active task。
+- `--since <WINDOW>` — 回溯窗口，例如 `24h`（預設）、`7d`、`90m`、`all`。
+- `--instance <NAME>` — `--action by_instance` 必填；`summary` 時為可選過濾器。
+
+#### `admin watchdog` (#2548)
+
+Fleet idle watchdog 控制。從 `watchdog` MCP 工具移過來（20 天內零呼叫）。`ack` 會抑制 fleet 警示，直到偵測到 ack 之後的 agent 活動後自動解除。
+
+- `<snooze|resume|status|ack>` — 位置參數，指定動作。
+- `--duration <DURATION>` — snooze 時長，例如 `2h`、`30m`、`1h30m`。上限為 4h。預設 `1h`。
+
+#### `admin config-set` (#2548)
+
+設定一個執行期可變更的 daemon 設定 key。從 `config` MCP 工具的 `set` 動作移過來（20 天內零 MCP 呼叫）——agent 仍可透過 `config` MCP 工具讀取設定（`get`／`list`），但只有 operator 能變更它。目前可用的 key 列表見 `config` 工具的即時描述（`docs/MCP-TOOLS.zh-TW.md`）。
+
+- `<KEY> <VALUE>` — 位置參數，key 與新值。
 
 ### `connect`
 將一個*已經在運行*的本地 agent 註冊到 daemon（僅限 inbox——不做 PTY 管理）。在 headless 環境中、或要把手動啟動的 CLI 混入運行中的 fleet 時很有用。

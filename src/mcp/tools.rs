@@ -140,16 +140,6 @@ pub(crate) fn def_restart_instance() -> Value {
         }, "required": ["instance"]}})
 }
 
-pub(crate) fn def_tokens() -> Value {
-    json!({"name": "tokens", "description": "On-demand token usage + estimated USD cost from Claude Code + Codex session transcripts. Scans ~/.claude/projects/*.jsonl and ~/.codex/sessions/rollout-*.jsonl at query time, dedups streaming-duplicated rows by message id, and attributes usage to fleet instances by transcript cwd (workspace + worktree paths). action=summary → fleet totals + per-instance table; action=by_instance (requires `instance`) → that instance's per-model breakdown. group_by=task (#1077 slice-1) time-joins each message to whichever task the instance had active at the message's timestamp, with a (no active task) bucket — this is TIME-WINDOW ATTRIBUTION, NOT per-task billing. Cost is an ESTIMATE pending operator pricing calibration; excludes the >200k long-context surcharge tier; OpenCode/Kiro/Gemini are not yet covered.",
-    "inputSchema": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["summary", "by_instance"], "default": "summary"},
-        "group_by": {"type": "string", "enum": ["instance", "task"], "default": "instance", "description": "instance (default) → per-instance/per-model; task → per-instance/per-task time-join (#1077). Default is backward-compatible."},
-        "since": {"type": "string", "description": "Lookback window: \"24h\" (default) / \"7d\" / \"90m\" / \"all\""},
-        "instance": {"type": "string", "description": "Required for action=by_instance; optional filter for action=summary"}
-    }}})
-}
-
 pub(crate) fn def_interrupt() -> Value {
     json!({"name": "interrupt", "description": "Send ESC byte to target agent's PTY to interrupt current LLM turn. Context preserved, agent accepts next prompt.",
         "inputSchema": {"type": "object", "properties": {
@@ -190,11 +180,6 @@ pub(crate) fn def_pane_snapshot() -> Value {
             "to_file": {"type": "boolean", "description": "#2478: write the full snapshot to $AGEND_HOME/captures/ and return only a summary + file path, keeping the dump out of context."},
             "head": {"type": "integer", "description": "#2478 to_file summary: number of leading lines to include in the returned preview (default 40)."}
         }, "required": ["instance"]}})
-}
-
-pub(crate) fn def_tui_screenshot() -> Value {
-    json!({"name": "tui_screenshot", "description": "Capture the current TUI state as an SVG image. Only works in TUI mode (not daemon-only). Returns SVG string.",
-        "inputSchema": {"type": "object", "properties": {}}})
 }
 
 pub(crate) fn def_decision() -> Value {
@@ -311,24 +296,15 @@ pub(crate) fn def_ci() -> Value {
         }, "required": ["action"]}})
 }
 
-pub(crate) fn def_watchdog() -> Value {
-    json!({"name": "watchdog", "description": "#1084/#1076: Fleet idle watchdog control. Actions: snooze, resume, status, ack. `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.",
-        "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["snooze", "resume", "status", "ack"]},
-            "duration": {"type": "string", "description": "Snooze duration (e.g. '2h', '30m', '1h30m'). Clamped to max 4h. Default: 1h."}
-        }, "required": ["action"]}})
-}
-
 pub(crate) fn def_config() -> Value {
     // Keys are derived from runtime_config's serialized fields so this list can
     // never go stale as config keys are added (it previously omitted several,
     // incl. show_pane_state).
     let keys = crate::runtime_config::keys().join(", ");
-    json!({"name": "config", "description": format!("#1085: Runtime-mutable daemon configuration. Actions: get, set, list. Keys: {keys}."),
+    json!({"name": "config", "description": format!("#1085: Runtime-mutable daemon configuration. Actions: get, list. #2548: the set action moved to the `agend-terminal admin config-set` CLI (zero MCP calls in 20 days) — agents can read config but not mutate it. Keys: {keys}."),
     "inputSchema": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["get", "set", "list"]},
-        "key": {"type": "string", "description": "Config key name (required for get/set)"},
-        "value": {"type": "string", "description": "New value (required for set)"}
+        "action": {"type": "string", "enum": ["get", "list"]},
+        "key": {"type": "string", "description": "Config key name (required for get)"}
     }, "required": ["action"]}})
 }
 
@@ -406,13 +382,6 @@ pub(crate) fn def_binding_state() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to inspect"}
         }, "required": ["instance"]}})
-}
-
-pub(crate) fn def_gc_dry_run() -> Value {
-    json!({"name": "gc_dry_run", "description": "List Phase 4 GC candidates (released, past-grace, daemon-managed worktrees) without deleting them. Non-destructive. Default human format; pass `format=json` for tooling.",
-    "inputSchema": {"type": "object", "properties": {
-        "format": {"type": "string", "enum": ["human", "json"], "description": "Output format (default: human)"}
-    }}})
 }
 
 #[cfg(test)]
@@ -650,12 +619,13 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            33,
+            29,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
              (#2547, merged into set_metadata) = 35; - ephemeral tool + task_sweep_config \
-             (#2547, removed from registry) = 33. Current tools: {:?}",
+             (#2547, removed from registry) = 33; - tui_screenshot/gc_dry_run/tokens/watchdog \
+             (#2548 Wave1-PR1, removed or moved to CLI) = 29. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1071,12 +1041,9 @@ mod tests {
                 "force",
                 "instance_state/mod.rs fresh-restart uncommitted-work guard bypass (#2476)",
             ),
-            // ── watchdog / config / mode ──
-            ("watchdog", "action", "mcp/handlers/dispatch.rs snooze/resume/status/ack"),
-            ("watchdog", "duration", "mcp/handlers/dispatch.rs parse_duration_secs (snooze)"),
-            ("config", "action", "mcp/handlers/dispatch.rs get/set/list"),
-            ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key/set"),
-            ("config", "value", "mcp/handlers/dispatch.rs runtime_config::set"),
+            // ── config / mode ── (#2548: watchdog moved to CLI, no longer a coordination tool)
+            ("config", "action", "mcp/handlers/dispatch.rs get/list"),
+            ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key"),
             ("mode", "action", "mcp/handlers/dispatch.rs get (read-only #1339)"),
         ];
 
@@ -1118,7 +1085,6 @@ mod tests {
             "set_waiting_on",
             "create_instance",
             "restart_instance",
-            "watchdog",
             "config",
             "mode",
         ];
@@ -1133,15 +1099,12 @@ mod tests {
             "list_instances",
             "delete_instance",
             "start_instance",
-            "tokens",
             "interrupt",
             "set_metadata",
             "move_pane",
             "pane_snapshot",
-            "tui_screenshot",
             "restart_daemon",
             "binding_state",
-            "gc_dry_run",
         ];
 
         let defs = tool_definitions();

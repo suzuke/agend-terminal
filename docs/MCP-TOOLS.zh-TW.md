@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（33 個工具）
+# AgEnD MCP Tools Reference — 工具參考（29 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -125,10 +125,6 @@
 - lines（預設 100，最大 10000）
 - `to_file: true`（#2478）會把完整 snapshot 寫到 `$AGEND_HOME/captures/`，tool 只回精簡摘要與路徑，避免診斷 dump 灌進 context。
 
-### `tui_screenshot`
-將目前的 TUI 狀態擷取成 SVG 圖片。僅在 TUI 模式下可用（daemon-only 模式無效）。
-- **參數**：無。
-
 ## Worktree 與 Binding（Worktree & Binding）
 
 ### `bind_self`
@@ -150,26 +146,12 @@
 回報某個 agent 在 daemon 端的結構化 bind 狀態。非破壞性的內省查詢。
 - **instance**: 要檢視的 instance
 
-### `gc_dry_run`
-列出 Phase 4 GC 的候選項目但不刪除。非破壞性。
-- format (human / json)
-
 ## Daemon 操作（Daemon Operations）
 
-### `watchdog`
-Fleet idle watchdog 控制。動作：snooze、resume、status、ack。`ack` 會抑制 fleet 警示，直到偵測到 ack 之後的 agent 活動後自動解除。
-- **action**: snooze / resume / status / ack
-- duration（例如 `2h`、`30m`；上限為 4h）
-
 ### `config`
-執行期可變更的 daemon 設定。動作：get、set、list。（可用的設定 key 由 daemon 的 runtime config 推導，列於工具的即時描述中。）
-- **action**: get / set / list
-- key, value
-
-### `tokens`
-依需求統計 token 用量與估計的 USD 成本，來源為 Claude Code 與 Codex 的 session transcript。成本為估計值；OpenCode／Kiro／Gemini 尚未涵蓋。
-- **action**: summary / by_instance
-- group_by (instance / task), since（`24h` / `7d` / `90m` / `all`）, instance
+執行期可變更的 daemon 設定。動作：get、list。#2548：set 動作已移至 `agend-terminal admin config-set` CLI（20 天內零 MCP 呼叫）。（可用的設定 key 由 daemon 的 runtime config 推導，列於工具的即時描述中。）
+- **action**: get / list
+- key（get 必填）
 
 ### `mode`
 讀取 operator 的可用性／授權模式（對 agent 為唯讀）。設定模式僅限 operator，透過 `agend-terminal mode <active|away|sleep>` CLI 操作。
