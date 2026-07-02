@@ -1,6 +1,6 @@
 [2J[H[0mAntigravity CLI session. Discussing how connection reset by peer and rate limit
 phrases show up in prose without being real backend faults; the detector must keep
 this pane Idle while the conversation merely talks about them.
- We also discussed how a git merge conflict would be reported and what the conflict resolution workflow looks like, without actually running a merge right now.
+ We also discussed how a git merge conflict would be reported and what the conflict resolution workflow looks like, without actually running a merge right now. We also talked about how a per-model capacity-exhausted throttle would be reported and when quotas typically reset, purely as background context, with no throttle actually in effect right now.
 Type your message
 ? for shortcuts

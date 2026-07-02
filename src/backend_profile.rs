@@ -141,6 +141,21 @@ fn agy_profile() -> BackendProfile {
                 AgentState::UsageLimit,
                 r"Individual quota reached|Contact your administrator to enable overages",
             ),
+            // #2524 P1b-r2: agy had no RateLimit pattern (distinct from the
+            // UsageLimit quota-wall above — a per-request throttle with a short
+            // reset timer, not a multi-day quota). NOT a real capture: no burner/
+            // low-quota agy account was available to trigger a genuine 429 without
+            // risking the operator's shared main account (guardrail: don't force
+            // 429s on the live account). `capture_kind: synthetic_from_real_template`
+            // — the phrase is sourced from third-party (GitHub issue / blog)
+            // reports of real Antigravity 429 wording, NOT verified against agy's
+            // actual binary output. Low confidence; needs real-capture
+            // confirmation before being trusted as tightly as the other agy
+            // patterns in this file.
+            (
+                AgentState::RateLimit,
+                r"exhausted your capacity on this model",
+            ),
             // #2409: Gemini transient "high traffic" server error (agy/Antigravity).
             // ApiError (not ServerRateLimit): SRL is `is_high_fp_state` and needs a
             // content/red anchor (an error-line indicator like `Error:` / `429`),
@@ -279,6 +294,15 @@ fn opencode_profile() -> BackendProfile {
                 AgentState::UsageLimit,
                 r"Quota Limit Exceeded|monthly usage limit reached",
             ),
+            // #2524 P1b-r2: opencode had no AuthError pattern. Real capture (a
+            // provider-rejected key, process-scoped env override, isolated scratch
+            // dir — no persistent credential touched) confirmed opencode renders a
+            // DISTINCT boxed "Invalid API key" dialog, not just the generic "Error
+            // from provider:" wrapper below — so this is a genuine gap, not a
+            // duplicate of ApiError. Reuses the SAME literal already trusted for
+            // claude's AuthError pattern (`Invalid API key` — see
+            // `claudecode_profile()`), ordered BEFORE the generic ApiError arm.
+            (AgentState::AuthError, r"Invalid API key"),
             (
                 AgentState::ApiError,
                 r"Error from provider:|request validation errors",
@@ -722,6 +746,79 @@ mod agy_gitconflict_2524 {
             patterns.detect(AGY_CONFLICT_PROSE_PANE),
             Some(AgentState::Idle),
             "#2524: an agent's own prose mentioning conflict/merge must NOT be misread as GitConflict"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agy_ratelimit_2524 {
+    use super::*;
+
+    /// #2524 P1b-r2: agy had no RateLimit pattern. UNVERIFIED wording (no real
+    /// capture obtained — no burner/low-quota account available; see the #2524
+    /// P1b-r2 report for the guardrail reasoning). Third-party-sourced candidate
+    /// phrase — `capture_kind: synthetic_from_real_template`, low confidence,
+    /// see `tests/fixtures/state-replay/agy-ratelimit.raw` +
+    /// `MANIFEST.yaml`'s matching entry for the corpus-visible fixture
+    /// (r1: a code-comment-only low-confidence flag isn't corpus-visible).
+    const AGY_RATELIMIT_PANE: &str = "  You have exhausted your capacity on this model. Your quota will reset after 58s.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_capacity_exhausted_detects_rate_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_RATELIMIT_PANE),
+            Some(AgentState::RateLimit),
+            "#2524: agy per-model capacity-exhausted banner must read RateLimit (not Idle)"
+        );
+    }
+
+    /// FP guard: prose merely discussing capacity/quota concepts must stay Idle.
+    const AGY_CAPACITY_PROSE_PANE: &str = "  I checked how the rate limiter tracks per-model capacity and when quotas reset; nothing is exhausted right now.\n\n  Type your message\n  ? for shortcuts";
+
+    #[test]
+    fn agy_capacity_prose_not_misread_as_rate_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::Agy);
+        assert_eq!(
+            patterns.detect(AGY_CAPACITY_PROSE_PANE),
+            Some(AgentState::Idle),
+            "#2524: an agent's own prose discussing capacity/quota must NOT be misread as RateLimit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opencode_autherror_2524 {
+    use super::*;
+
+    /// #2524 P1b-r2: opencode had no AuthError pattern. Real capture (a
+    /// provider-rejected key via a process-scoped env override against an
+    /// isolated scratch dir — no persistent credential touched, see the #2524
+    /// P1b-r2 report) confirmed opencode renders a distinct boxed "Invalid API
+    /// key" dialog, not just the generic "Error from provider:" ApiError wrapper.
+    /// Reuses the same literal already trusted for claude's AuthError pattern.
+    const OPENCODE_AUTHERROR_PANE: &str = "  ┃Invalid API key┃\n\n  Ask anything";
+
+    #[test]
+    fn opencode_invalid_api_key_detects_auth_error() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(OPENCODE_AUTHERROR_PANE),
+            Some(AgentState::AuthError),
+            "#2524: opencode's Invalid API key dialog must read AuthError (not Idle/ApiError)"
+        );
+    }
+
+    /// FP guard: prose merely discussing API keys must stay Idle.
+    const OPENCODE_KEY_PROSE_PANE: &str = "  Let's review how the provider validates an API key before we ship the auth flow.\n\n  Ask anything";
+
+    #[test]
+    fn opencode_key_prose_not_misread_as_auth_error() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect(OPENCODE_KEY_PROSE_PANE),
+            Some(AgentState::Idle),
+            "#2524: an agent's own prose discussing API keys must NOT be misread as AuthError"
         );
     }
 }
