@@ -894,7 +894,16 @@ pub(super) fn pane_title_segments(
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // #2313 RED: per-pane decision marker not yet implemented.
+    // #2313 P2b: marker on the pane of the agent that AUTHORED a
+    // still-unanswered decision-board question — lets the operator see WHERE
+    // a pending question came from, distinct from the notification badge
+    // above (which is about messages TO this pane, not FROM it).
+    if pane.pending_decision_count > 0 {
+        segments.push((
+            " 🔴".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
     // #1713/#1523 diagnostic (runtime_config.show_pane_state, default off): append
     // a `[<State>]` text badge of the DETECTED AgentState so the operator can
     // eyeball-verify detection against the live pane. Extra text only — the
@@ -951,8 +960,13 @@ pub(super) fn render_status_bar(
             Style::default().fg(Color::White),
         ));
     }
-    // #2313 RED: status-line pending-decisions badge not yet implemented.
-    if false {
+    // #2313 P2b: passive discoverability badge for decision-board questions
+    // awaiting an operator answer — no popup/sound, just a status-line count.
+    // `pending_decisions` is the fleet-wide `decisions::count_pending(home)`
+    // total (NOT summed from open panes — an author's pane may not be open in
+    // this layout), refreshed by `sync_decision_badge_state` (app/mod.rs) on
+    // the same ~1s throttle as the per-pane notification badge.
+    if pending_decisions > 0 {
         spans.push(Span::styled(
             format!(" 🔴 {pending_decisions} decisions pending "),
             Style::default()

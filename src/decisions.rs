@@ -335,12 +335,13 @@ pub struct PendingDecisionCounts {
     pub by_author: std::collections::HashMap<String, usize>,
 }
 
-pub fn count_pending(_home: &Path) -> PendingDecisionCounts {
-    // #2313 RED: not yet implemented.
-    PendingDecisionCounts {
-        total: 0,
-        by_author: std::collections::HashMap::new(),
+pub fn count_pending(home: &Path) -> PendingDecisionCounts {
+    let mut by_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for d in list_pending(home) {
+        *by_author.entry(d.author).or_insert(0) += 1;
     }
+    let total = by_author.values().sum();
+    PendingDecisionCounts { total, by_author }
 }
 
 pub fn list(home: &Path, args: &Value) -> Value {
