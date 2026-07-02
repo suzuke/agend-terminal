@@ -605,7 +605,9 @@ pub fn answer(home: &Path, caller: &str, args: &Value) -> Value {
 pub(crate) fn auto_answer_timeout(home: &Path, id: &str) -> Option<(String, String)> {
     let locked = with_decision_lock(home, id, || -> Option<(String, String)> {
         let path = decision_path(home, id);
-        let content = std::fs::read_to_string(&path).ok()?;
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return None;
+        };
         let mut decision: Decision = serde_json::from_str(&content).ok()?;
         if decision.status != Some(DecisionStatus::Pending) {
             return None;
