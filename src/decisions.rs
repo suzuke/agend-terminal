@@ -325,6 +325,25 @@ pub fn list_pending(home: &Path) -> Vec<Decision> {
         .collect()
 }
 
+/// #2313 P2b: pending-question tally bucketed by author, computed with ONE
+/// `list_pending` scan — feeds both the status-line total and the per-pane
+/// "you asked something" badge without each caller re-scanning `decisions/`
+/// (the same disk-I/O-storm shape `should_sync_notifications` already
+/// documents and throttles for the notification badge).
+pub struct PendingDecisionCounts {
+    pub total: usize,
+    pub by_author: std::collections::HashMap<String, usize>,
+}
+
+pub fn count_pending(home: &Path) -> PendingDecisionCounts {
+    let mut by_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for d in list_pending(home) {
+        *by_author.entry(d.author).or_insert(0) += 1;
+    }
+    let total = by_author.values().sum();
+    PendingDecisionCounts { total, by_author }
+}
+
 pub fn list(home: &Path, args: &Value) -> Value {
     let include_archived = args["include_archived"].as_bool().unwrap_or(false);
     let filter_tags: Vec<String> = args["tags"]
@@ -1132,6 +1151,71 @@ mod tests {
             pending_questions(&home).is_empty(),
             "question is answered, not pending"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2524 P2b / #2313 — count_pending badge helper ──
+
+    #[test]
+    fn count_pending_buckets_by_author_2313() {
+        let home = tmp_home("count-pending-buckets-2313");
+        post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q1", "content": "?", "needs_answer": true}),
+        );
+        post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q2", "content": "?", "needs_answer": true}),
+        );
+        post(
+            &home,
+            "bob",
+            &serde_json::json!({"title": "Q3", "content": "?", "needs_answer": true}),
+        );
+        // Plain scope record (not a question) — must not count toward the badge.
+        post(
+            &home,
+            "carol",
+            &serde_json::json!({"title": "note", "content": "fyi"}),
+        );
+
+        let counts = count_pending(&home);
+        assert_eq!(counts.total, 3, "3 pending questions across alice+bob");
+        assert_eq!(counts.by_author.get("alice"), Some(&2));
+        assert_eq!(counts.by_author.get("bob"), Some(&1));
+        assert_eq!(
+            counts.by_author.get("carol"),
+            None,
+            "a plain scope record must not appear in the badge tally"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn count_pending_excludes_answered_2313() {
+        let home = tmp_home("count-pending-answered-2313");
+        let created = post(
+            &home,
+            "alice",
+            &serde_json::json!({
+                "title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true
+            }),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        answer(
+            &home,
+            "operator",
+            &serde_json::json!({"id": id, "answer": "yes"}),
+        );
+
+        let counts = count_pending(&home);
+        assert_eq!(
+            counts.total, 0,
+            "answered question must drop out of the tally"
+        );
+        assert!(counts.by_author.is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
 }

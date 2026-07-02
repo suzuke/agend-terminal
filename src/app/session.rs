@@ -566,6 +566,7 @@ mod tests {
             fleet_instance_name: fleet_name.map(String::from),
             last_input_at: None,
             pending_notification_count: 0,
+            pending_decision_count: 0,
             selection: None,
             source: PaneSource::Local,
             offthread: None,
