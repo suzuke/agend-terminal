@@ -61,6 +61,14 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
     if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
         tracing::warn!(error = %e, "failed to persist general instance");
     }
+    // #2562 PR-2 verified: this call is unconditional regardless of which
+    // `channel:` kind triggered `auto_create_general` above. For a
+    // Discord-only fleet it's a harmless no-op — `register_topic` only
+    // writes `home/topics.json` (Telegram's own topic_id -> instance
+    // table), which Discord's routing (`channel_to_instance`, populated by
+    // `app/discord_hooks.rs::maybe_create_discord_binding`) never reads.
+    // No functional effect either way; left as-is rather than
+    // conditionalizing on channel kind for a write nothing reads.
     if let Err(e) = crate::channel::telegram::register_topic(home, 1, "general") {
         tracing::warn!(error = %e, "failed to register general topic_id=1");
     }
