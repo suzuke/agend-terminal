@@ -46,6 +46,7 @@ pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
+pub(crate) mod context_thresholds;
 pub(crate) mod ephemeral_reap;
 pub(crate) mod external_liveness;
 pub(crate) mod gc_tick;
@@ -75,8 +76,7 @@ pub(crate) mod workspace_boundary_sweep;
 pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
-pub(crate) use context_alert::ContextAlertHandler;
-pub(crate) use context_handoff::ContextHandoffHandler;
+pub(crate) use context_thresholds::ContextThresholdsHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use hang_detection::HangDetectionHandler;
@@ -385,16 +385,19 @@ pub(crate) fn build_default_handlers(
         // already-dead workers. Runs in app mode too (not allowlisted out); the
         // live daemon is app-mode. Idle cost: one read of a usually-tiny JSON sidecar.
         Box::new(EphemeralReapHandler::new(6)),
-        // Context% alert (operator-directed): every 6 ticks (~1min) refresh +
-        // ≥80% orchestrator alert. The transcript-estimate file IO lives in
-        // this handler's tick (lock-free during the read), NOT in the PTY
-        // feed path. Runs in app mode (the live daemon is app-mode).
-        Box::new(ContextAlertHandler::new(6)),
-        // #2007 context-full safety net: every 6 ticks (~1min) — 85% one-shot
-        // [AGEND-AUTO kind=context-handoff] injection to the agent itself,
-        // 92% one-shot operator escalation. Noise-budgeted (per-episode
-        // latch + hysteresis re-arm). Runs in app mode (live daemon).
-        Box::new(ContextHandoffHandler::new(6)),
+        // #2549 W5: ContextAlertHandler (operator-directed: every 6 ticks
+        // ~1min, ≥80% orchestrator alert) and ContextHandoffHandler (#2007
+        // context-full safety net: every 6 ticks, 85% one-shot
+        // [AGEND-HANDOFF] injection to the agent itself, 92% one-shot
+        // operator escalation) collapsed into one registered handler. Both
+        // read `handle.core.lock().state.resolved_context()` — the agent's
+        // in-memory statusline-pattern reading (NOT a transcript-estimate
+        // file; #1945-disable retired that fallback) — lock-free during the
+        // read. Each keeps its own noise-budgeted latch/hysteresis state
+        // (re-alertable vs one-shot-per-episode — genuinely different state
+        // machines, not shared) and is panic-isolated from the other inside
+        // `ContextThresholdsHandler::run`. Runs in app mode (live daemon).
+        Box::new(ContextThresholdsHandler::new(6, 6)),
         // #2044 inject-delivery watchdog: every tick (~10s) verify that an
         // armed actionable wake produced a UserPromptSubmit; re-deliver once
         // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty
@@ -491,6 +494,77 @@ pub(crate) fn mock_live_agent_no_context(
         vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
         state: crate::state::StateTracker::new(None),
+        health: crate::health::HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let handle = crate::agent::AgentHandle {
+        id: crate::types::InstanceId::default(),
+        name: name.to_string().into(),
+        backend_command: "claude".to_string(),
+        pty_writer,
+        pty_master: Arc::new(parking_lot::Mutex::new(pair.master)),
+        published_state: crate::agent::published_state_of(&core),
+        published_observed: crate::agent::published_observed_of(&core),
+        core,
+        child: Arc::new(parking_lot::Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    (handle, reader)
+}
+
+/// Test-only: build a LIVE `AgentHandle` (real openpty, child `cat`) whose
+/// `StateTracker` has a REAL, fresh Claude context-percent reading (fed via
+/// a synthetic statusline frame, same shape as `state::tests::CLAUDE_STATUSLINE_FRAME`)
+/// — so `core.state.resolved_context()` resolves to `Some((pct, "pattern"))`.
+/// Sibling of [`mock_live_agent_no_context`] (kept separate rather than
+/// parameterizing it, to avoid touching that function's signature and its 6
+/// existing call sites across `per_tick`'s test suites — #2549 W5). Used by
+/// the `ContextAlertHandler`/`ContextHandoffHandler` merge's cross-
+/// independence pin, which needs a live agent whose threshold-crossing
+/// decision actually fires.
+#[cfg(test)]
+pub(crate) fn mock_live_agent_with_context(
+    name: &str,
+    pct: f32,
+) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    use std::sync::Arc;
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows: 10,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+    #[cfg(not(target_os = "windows"))]
+    let cmd = portable_pty::CommandBuilder::new("cat");
+    #[cfg(target_os = "windows")]
+    let cmd = {
+        let mut c = portable_pty::CommandBuilder::new("cmd");
+        c.args(["/c", "findstr", ".*"]);
+        c
+    };
+    let child = pair.slave.spawn_command(cmd).expect("spawn cat");
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let writer = pair.master.take_writer().expect("take writer");
+    let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
+    let mut state = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    state.feed(&format!(
+        "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    ));
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
+        vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state,
         health: crate::health::HealthTracker::new(),
         api_activity: crate::agent::ApiActivity::default(),
         observed_status: None,
