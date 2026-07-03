@@ -578,7 +578,8 @@ pub fn reconcile_orphan_leases(home: &Path) {
     }
     if let Ok(entries) = std::fs::read_dir(&runtime_dir) {
         for entry in entries.flatten() {
-            let binding_path = entry.path().join("binding.json");
+            let agent_name = entry.file_name().to_string_lossy().into_owned();
+            let binding_path = crate::paths::binding_path(home, &agent_name);
             if !binding_path.exists() {
                 continue;
             }

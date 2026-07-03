@@ -364,12 +364,7 @@ pub(crate) fn name_residual_anywhere(
     if crate::daemon::supervisor::usage_limit_notify_has(home, name) {
         sources.push("usage_limit_notify");
     }
-    if home
-        .join("runtime")
-        .join(name)
-        .join("binding.json")
-        .exists()
-    {
+    if crate::paths::binding_path(home, name).exists() {
         sources.push("runtime/binding.json");
     }
     if home

@@ -121,9 +121,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             // file we just wrote so the response reflects authoritative
             // state. #781 `DispatchOutcome` fields are dropped here —
             // surfacing them is a `bind_self` consumer follow-up.
-            let binding_path = crate::paths::runtime_dir(home)
-                .join(agent)
-                .join("binding.json");
+            let binding_path = crate::paths::binding_path(home, agent);
             let worktree_path = std::fs::read_to_string(&binding_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
