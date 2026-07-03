@@ -1,7 +1,14 @@
 //! Discord adapter — behind the `discord` feature gate.
 //!
-//! PR1 scope: gateway scaffold + auth + `ChannelEvent::Connected`.
-//! Other trait methods stub `Err(NotSupported)` until PR2-4.
+//! The full outbound REST surface (send/edit/delete/create_binding/
+//! remove_binding), gateway protocol parsing (HELLO/IDENTIFY/HEARTBEAT/READY/
+//! MESSAGE_CREATE mapping), binding lifecycle, and capability matrix shipped
+//! 2026-04-29 (PR1-4, #316-319). #2562 P0 adds the piece that was missing
+//! since then: [`start_gateway`] actually opens the live WebSocket to
+//! Discord's gateway (via `twilight_gateway::Shard`) and feeds real events
+//! through the mapping functions above — see `DISCORD-COMPLETION-SPIKE.md`
+//! for the full gap analysis. Bootstrap wiring (constructing a `DiscordChannel`
+//! from `ChannelConfig::Discord` and calling `start_gateway`) is #2562 P1.
 
 use crate::agent::AgentRegistry;
 use crate::channel::{
@@ -328,6 +335,125 @@ pub(crate) fn map_channel_delete_to_binding_revoked(channel_id: u64) -> ChannelE
             DiscordBindingPayload { channel_id },
         ),
         reason: crate::channel::event::RevokeReason::Deleted,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gateway connection (#2562 P0)
+// ---------------------------------------------------------------------------
+//
+// PR1-4 (2026-04-29) built the full outbound REST surface + gateway protocol
+// PARSING layer (opcode/HELLO/IDENTIFY/READY/MESSAGE_CREATE mapping above),
+// all fixture-tested — but never opened a live WebSocket to Discord's gateway.
+// `DiscordChannel::new`'s own doc comment describes `event_rx` as "fed by the
+// gateway reader task", but that task never existed. This section adds it,
+// purely additively: it feeds the already-tested mapping functions above and
+// changes none of them.
+
+/// Translate a `twilight_gateway::Event` into our `ChannelEvent`, reusing the
+/// existing (tested) protocol-mapping functions. Returns `None` for event
+/// types we don't forward (Discord's gateway emits far more event types than
+/// this adapter currently models — unmodeled ones are silently dropped, not
+/// an error). This is the sole decision point for "which gateway events
+/// become `ChannelEvent`s", kept as a pure function so it's unit-testable
+/// without a live connection.
+pub(crate) fn gateway_event_to_channel_event(
+    event: twilight_gateway::Event,
+    allowlist: &Option<Vec<i64>>,
+) -> Option<ChannelEvent> {
+    use twilight_gateway::Event;
+    match event {
+        Event::Ready(ready) => Some(map_ready_to_connected(&ready)),
+        Event::MessageCreate(msg) => map_message_create_to_message_in(&msg, allowlist),
+        Event::ChannelDelete(channel) => {
+            Some(map_channel_delete_to_binding_revoked(channel.id.get()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the shard's current state means the gateway connection loop
+/// should give up (vs. let twilight's built-in reconnect keep working).
+/// `twilight_gateway::Shard` reconnects and resumes sessions automatically
+/// as long as `next_event` keeps being called — this only needs to catch
+/// the ONE state that reconnecting can never fix: a fatal close (bad
+/// token / invalid intents / etc., per twilight's `CloseCode::can_reconnect`).
+/// Mirrors Telegram's `poll_supervisor::ConnectErrorClass::PermanentAuth`
+/// stop behavior.
+pub(crate) fn should_stop_gateway_loop(state: twilight_gateway::ShardState) -> bool {
+    matches!(state, twilight_gateway::ShardState::FatallyClosed)
+}
+
+/// Start the Discord gateway connection: opens (and, via twilight's internal
+/// reconnect/resume handling, maintains) the live WebSocket to Discord,
+/// mapping real events into `tx` via [`gateway_event_to_channel_event`].
+///
+/// fire-and-forget (#10.5): this thread runs for the daemon's process
+/// lifetime, mirroring `start_keepalive` above and
+/// `channel::telegram::inbound::start_polling`'s existing rationale —
+/// Telegram (the one complete channel) has no runtime shutdown capability
+/// either, so adding one for Discord alone would be an asymmetric new
+/// capability with no current consumer. No `JoinHandle` needed; process
+/// exit cleans up the thread.
+///
+/// Runs on ITS OWN dedicated `current_thread` tokio runtime, deliberately
+/// NOT `discord_runtime()` (reserved for the short-lived outbound
+/// `block_on_value` calls in `send`/`edit`/`delete`/etc.) — this loop runs
+/// forever, and sharing a single-threaded runtime with it would starve
+/// every outbound call behind the permanently-running reader.
+pub(crate) fn start_gateway(
+    token: String,
+    intents: twilight_model::gateway::Intents,
+    allowlist: Option<Vec<i64>>,
+    tx: mpsc::Sender<ChannelEvent>,
+) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("discord-gateway".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                tracing::error!("discord gateway: failed to build tokio runtime");
+                return;
+            };
+            rt.block_on(async move {
+                use twilight_gateway::{EventTypeFlags, Shard, ShardId, StreamExt as _};
+                let mut shard = Shard::new(ShardId::ONE, token, intents);
+                loop {
+                    match shard.next_event(EventTypeFlags::all()).await {
+                        Some(Ok(event)) => {
+                            if let Some(mapped) = gateway_event_to_channel_event(event, &allowlist)
+                            {
+                                if tx.send(mapped).is_err() {
+                                    tracing::warn!(
+                                        "discord gateway: event receiver dropped, stopping"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(source)) => {
+                            tracing::warn!(error = %source, "discord gateway: receive error");
+                        }
+                        None => {
+                            tracing::error!("discord gateway: shard stream ended");
+                            break;
+                        }
+                    }
+                    if should_stop_gateway_loop(shard.state()) {
+                        tracing::error!(
+                            state = ?shard.state(),
+                            "discord gateway: fatal close, stopping (operator must fix config \
+                             and restart)"
+                        );
+                        break;
+                    }
+                }
+            });
+        })
+    {
+        tracing::error!(error = %e, "failed to spawn discord gateway thread");
     }
 }
 
@@ -760,6 +886,124 @@ mod tests {
             }
             other => panic!("expected Connected, got: {other:?}"),
         }
+    }
+
+    // ── #2562 P0: gateway_event_to_channel_event / should_stop_gateway_loop ──
+
+    fn ready_fixture() -> twilight_model::gateway::payload::incoming::Ready {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-ready.json");
+        let frame: serde_json::Value =
+            serde_json::from_str(fixture).expect("fixture must parse as JSON");
+        let d = frame.get("d").expect("fixture must have 'd' field");
+        serde_json::from_value(d.clone()).expect("'d' must parse as Ready")
+    }
+
+    fn message_create_fixture() -> twilight_gateway::Event {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-message-create.json");
+        let frame: serde_json::Value =
+            serde_json::from_str(fixture).expect("fixture must parse as JSON");
+        let d = frame.get("d").expect("fixture must have 'd' field");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_value(d.clone()).expect("'d' must parse as Message");
+        twilight_gateway::Event::MessageCreate(Box::new(
+            twilight_model::gateway::payload::incoming::MessageCreate(msg),
+        ))
+    }
+
+    /// `Event::Ready` reaches `gateway_event_to_channel_event` and comes out
+    /// as `Connected` — proves the gateway-event dispatch wiring, not just
+    /// the already-tested `map_ready_to_connected` in isolation.
+    #[test]
+    fn gateway_event_to_channel_event_ready_is_connected() {
+        let event = twilight_gateway::Event::Ready(ready_fixture());
+        let result = super::gateway_event_to_channel_event(event, &None);
+        match result {
+            Some(ChannelEvent::Connected { kind, who }) => {
+                assert_eq!(kind, "discord");
+                assert_eq!(who, "agend-bot");
+            }
+            other => panic!("expected Some(Connected), got: {other:?}"),
+        }
+    }
+
+    /// `Event::MessageCreate` with an allowlisted author reaches
+    /// `gateway_event_to_channel_event` and comes out as `MessageIn`.
+    #[test]
+    fn gateway_event_to_channel_event_message_create_allowlisted_is_message_in() {
+        let event = message_create_fixture();
+        let allowlist = Some(vec![82198898841029460_i64]);
+        let result = super::gateway_event_to_channel_event(event, &allowlist);
+        assert!(
+            matches!(result, Some(ChannelEvent::MessageIn { .. })),
+            "expected Some(MessageIn), got: {result:?}"
+        );
+    }
+
+    /// `Event::MessageCreate` with a non-allowlisted author is dropped —
+    /// the allowlist gate must survive being routed through the gateway
+    /// dispatcher, not just the underlying mapper.
+    #[test]
+    fn gateway_event_to_channel_event_message_create_not_allowlisted_is_dropped() {
+        let event = message_create_fixture();
+        let allowlist = Some(vec![999_i64]);
+        let result = super::gateway_event_to_channel_event(event, &allowlist);
+        assert!(result.is_none(), "expected None, got: {result:?}");
+    }
+
+    /// `Event::ChannelDelete` reaches `gateway_event_to_channel_event` and
+    /// comes out as `BindingRevoked`.
+    #[test]
+    fn gateway_event_to_channel_event_channel_delete_is_binding_revoked() {
+        let channel: twilight_model::channel::Channel =
+            serde_json::from_value(serde_json::json!({"id": "223456789012345678", "type": 0}))
+                .expect("minimal channel object must parse");
+        let event = twilight_gateway::Event::ChannelDelete(Box::new(
+            twilight_model::gateway::payload::incoming::ChannelDelete(channel),
+        ));
+        let result = super::gateway_event_to_channel_event(event, &None);
+        match result {
+            Some(ChannelEvent::BindingRevoked { binding, .. }) => {
+                assert_eq!(binding.kind(), "discord");
+            }
+            other => panic!("expected Some(BindingRevoked), got: {other:?}"),
+        }
+    }
+
+    /// Event types this adapter doesn't model (e.g. a bare heartbeat ack)
+    /// are silently dropped, not an error — the dispatcher only forwards
+    /// what it explicitly recognizes.
+    #[test]
+    fn gateway_event_to_channel_event_unmodeled_event_is_none() {
+        let event = twilight_gateway::Event::GatewayHeartbeatAck;
+        let result = super::gateway_event_to_channel_event(event, &None);
+        assert!(result.is_none(), "expected None, got: {result:?}");
+    }
+
+    /// The one shard state that must stop the reader loop: a fatal close
+    /// (bad token, invalid intents, etc.) that twilight's own reconnect
+    /// logic cannot recover from.
+    #[test]
+    fn should_stop_gateway_loop_stops_on_fatally_closed() {
+        assert!(super::should_stop_gateway_loop(
+            twilight_gateway::ShardState::FatallyClosed
+        ));
+    }
+
+    /// Every other shard state is something twilight will keep working on
+    /// internally (reconnecting/resuming) — the loop must NOT give up.
+    #[test]
+    fn should_stop_gateway_loop_continues_on_recoverable_states() {
+        assert!(!super::should_stop_gateway_loop(
+            twilight_gateway::ShardState::Active
+        ));
+        assert!(!super::should_stop_gateway_loop(
+            twilight_gateway::ShardState::Disconnected {
+                reconnect_attempts: 3
+            }
+        ));
+        assert!(!super::should_stop_gateway_loop(
+            twilight_gateway::ShardState::Identifying
+        ));
     }
 
     /// Contract test: DiscordChannel satisfies the registry-side
