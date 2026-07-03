@@ -43,6 +43,7 @@ mod event_log;
 mod fleet;
 mod framing;
 mod git_helpers;
+mod git_worktree;
 mod github_token;
 mod health;
 mod identity;

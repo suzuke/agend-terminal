@@ -29,42 +29,32 @@ pub struct WorktreeEntry {
 }
 
 /// List all git worktrees (excluding the main worktree).
+///
+/// #2550 W2: converged onto `git_worktree::list_porcelain` (via
+/// `git_helpers::git_bypass`) — that parser flushes on the NEXT `worktree`
+/// line plus an explicit final flush after the loop, so unlike the ad-hoc
+/// blank-line-triggered loop this replaced, it does NOT depend on a
+/// trailing blank-line record terminator (the exact fragility the old
+/// TRIM-SENSITIVE comment here warned about — `git_bypass` doesn't trim
+/// either way, so this was already safe, but the new parser isn't even
+/// exposed to that failure mode). Adds the #1897 60s LOCAL_GIT_TIMEOUT
+/// bound `git_bypass` provides — the raw `Command` this replaced had NO
+/// timeout, unlike the other 3 porcelain call sites already converged here.
 fn list_worktrees(repo_root: &Path) -> Vec<WorktreeEntry> {
-    // git-raw-allowed: TRIM-SENSITIVE parser. `--porcelain` terminates each
-    // worktree record with a blank line; the loop below flushes a pending entry
-    // on that blank line. `git_cmd` trims trailing whitespace → the final record's
-    // terminator is dropped → the last (often only) worktree is never pushed →
-    // the sweep silently finds nothing. Must read raw, untrimmed stdout.
-    // (Already AGEND_GIT_BYPASS.)
-    let output = match Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-    let mut current_path = None;
-    let mut current_branch = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            current_path = Some(p.to_string());
-        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-            current_branch = Some(b.to_string());
-        } else if line.is_empty() {
-            if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
-                if branch != "main" && branch != "master" {
-                    entries.push(WorktreeEntry { path, branch });
-                }
+    crate::git_worktree::list_porcelain(repo_root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(path, branch)| {
+            let branch = branch?;
+            if branch == "main" || branch == "master" {
+                return None;
             }
-            current_path = None;
-            current_branch = None;
-        }
-    }
-    entries
+            Some(WorktreeEntry {
+                path: path.display().to_string(),
+                branch,
+            })
+        })
+        .collect()
 }
 
 /// Check if a branch is merged into the default branch (local check, no API needed).

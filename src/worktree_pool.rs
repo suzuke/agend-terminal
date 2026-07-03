@@ -354,22 +354,16 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
         ));
     }
 
+    // #2550 W2: empty source_repo → `git_worktree::remove_force` runs with NO
+    // `current_dir` (git resolves the repo from `--force <abs wt>` itself;
+    // `git_cmd`/`git_bypass` both REQUIRE a cwd, and `wt_path.parent()` is
+    // wrong — it's the worktrees-pool dir, outside the repo tree, per lead
+    // ruling). Converged with `worktree_pool/workspace.rs::teardown_workspace_worktree`'s
+    // byte-identical dual-cwd arm (see git_worktree.rs module doc).
+    // TODO(W1.2): audit whether the empty-source_repo branch is still
+    // reachable in practice; if dead, delete this arm rather than migrate it.
     let wt_str = wt_path.display().to_string();
-    let result = if source_repo.as_os_str().is_empty() {
-        // git-raw-allowed: empty source_repo → this arm intentionally runs with
-        // NO `current_dir`, so `git` resolves the repo from `--force <abs wt>`
-        // itself. `git_cmd`/`git_bypass` both REQUIRE a cwd; passing `wt_path
-        // .parent()` is wrong (it's the worktrees-pool dir `~/.agend-terminal/
-        // worktrees/<agent>/`, outside the repo tree, per lead ruling). Keep raw.
-        // TODO(W1.2): audit whether the empty-source_repo branch is still
-        // reachable in practice; if dead, delete this arm rather than migrate it.
-        std::process::Command::new("git")
-            .args(["worktree", "remove", "--force", &wt_str])
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-    } else {
-        crate::git_helpers::git_bypass(source_repo, &["worktree", "remove", "--force", &wt_str])
-    };
+    let result = crate::git_worktree::remove_force(source_repo, &wt_str);
     match result {
         Ok(o) if o.status.success() => WorktreeRemoval::Removed,
         Ok(o) => {

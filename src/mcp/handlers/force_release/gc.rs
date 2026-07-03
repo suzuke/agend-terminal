@@ -130,41 +130,27 @@ pub(crate) fn prune_git_metadata_for_agent(
     outcome
 }
 
-/// #826 L2 fork of `crate::worktree_cleanup::list_worktrees`. The
-/// shared helper omits `AGEND_GIT_BYPASS=1`, which means the daemon
-/// `agend-git` shim may intercept the call when an instance binding
-/// is active in the calling context — list_worktrees would then
-/// return Vec::new() instead of the real entries. Daemon-internal
-/// L2 GC always wants the raw `git worktree list --porcelain` output
-/// from the source repo, so we run it with the shim bypass set
-/// (mirrors the `release_full` precedent at src/worktree_pool.rs:311).
+/// #826 L2 fork of `crate::worktree_cleanup::list_worktrees` — #2550 W2
+/// converged both onto the shared `git_worktree::list_porcelain` core
+/// (always bypass-enabled via `git_helpers::git_bypass`; mirrors the
+/// `release_full` precedent at src/worktree_pool.rs:311), keeping this
+/// site's own main/master exclusion + `WorktreeEntry` conversion as a thin
+/// caller-specific layer on top (unchanged from the pre-#2550 fork).
 fn list_worktrees_bypass_shim(repo_root: &Path) -> Vec<crate::worktree_cleanup::WorktreeEntry> {
-    // #1899: bounded via git_bypass (LOCAL 60s).
-    let output = crate::git_helpers::git_bypass(repo_root, &["worktree", "list", "--porcelain"]);
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-    let mut current_path = None;
-    let mut current_branch = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            current_path = Some(p.to_string());
-        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-            current_branch = Some(b.to_string());
-        } else if line.is_empty() {
-            if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
-                if branch != "main" && branch != "master" {
-                    entries.push(crate::worktree_cleanup::WorktreeEntry { path, branch });
-                }
+    crate::git_worktree::list_porcelain(repo_root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(path, branch)| {
+            let branch = branch?;
+            if branch == "main" || branch == "master" {
+                return None;
             }
-            current_path = None;
-            current_branch = None;
-        }
-    }
-    entries
+            Some(crate::worktree_cleanup::WorktreeEntry {
+                path: path.display().to_string(),
+                branch,
+            })
+        })
+        .collect()
 }
 
 /// #826 L2: best-effort source-repo enumeration when the operator

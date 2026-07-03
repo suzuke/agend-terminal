@@ -25,19 +25,13 @@ pub enum BranchAction {
 
 /// List local branches that are NOT checked out in any worktree.
 fn worktree_branches(repo: &Path) -> std::collections::HashSet<String> {
-    // #1899: bounded via git_bypass (LOCAL 60s) — a stuck local git returns Err
-    // instead of hanging; the empty-set fallback is unchanged.
-    let output = crate::git_helpers::git_bypass(repo, &["worktree", "list", "--porcelain"]);
-    let mut branches = std::collections::HashSet::new();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if let Some(b) = line.strip_prefix("branch refs/heads/") {
-                branches.insert(b.to_string());
-            }
-        }
-    }
-    branches
+    // #1899/#2550: bounded via git_worktree::list_porcelain (git_bypass, LOCAL
+    // 60s) — a stuck local git returns Err/empty instead of hanging.
+    crate::git_worktree::list_porcelain(repo)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, branch)| branch)
+        .collect()
 }
 
 /// List all local branch names.
