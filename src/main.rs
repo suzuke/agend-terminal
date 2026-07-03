@@ -63,6 +63,7 @@ mod notification_queue;
 pub mod operator_mode;
 mod paths;
 mod process;
+mod protected_refs;
 mod protocol;
 mod provider_detect;
 mod quickstart;

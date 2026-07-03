@@ -342,25 +342,12 @@ pub fn validate_branch(branch: &str) -> bool {
         })
 }
 
-/// E4.5 protected-branch invariant. Returns `true` for branches that
-/// agents MUST NOT lease, watch, or otherwise hold a per-agent
-/// concept of interest in. The canonical set is `main` and `master`;
-/// extending the set here propagates to every E4.5 enforcement site
-/// (currently `worktree_pool::lease` for worktree leases and
-/// `mcp::handlers::ci::handle_watch_ci` for CI watch subscriptions).
-///
-/// CR-2026-06-14: matched **case-insensitively**. On a case-insensitive
-/// filesystem (darwin/APFS, Windows NTFS) `refs/heads/Main` and
-/// `refs/heads/main` collide — a `branch="Main"` lease passes a case-sensitive
-/// guard, then `git worktree add -b Main` fails ("already exists") and the
-/// fallback `git worktree add <path> Main` checks out the EXISTING `main`, so
-/// the agent commits land on `main` (empirically reproduced on darwin/APFS:
-/// committing on "Main" advanced `main`). `eq_ignore_ascii_case` is a full-
-/// string compare, so substrings like `mainline` / `maintenance` /
-/// `upstream-main` stay unprotected.
-pub fn is_protected_ref(branch: &str) -> bool {
-    branch.eq_ignore_ascii_case("main") || branch.eq_ignore_ascii_case("master")
-}
+/// E4.5 protected-branch invariant — see `crate::protected_refs::is_protected_ref`
+/// for the canonical definition + rationale. #2550 W4: re-exported here (not
+/// redefined) so this module's existing public path (`agent_ops::is_protected_ref`)
+/// is unchanged for callers, while the shim binary `#[path]`-includes the same
+/// standalone source instead of hand-mirroring it.
+pub use crate::protected_refs::is_protected_ref;
 
 pub fn ensure_not_protected(branch: &str) -> Result<(), String> {
     if is_protected_ref(branch) {

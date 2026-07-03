@@ -24,6 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[path = "../integrity_core.rs"]
 mod integrity_core;
 
+// #2550 W4: share the EXACT protected-ref predicate with the daemon lib by
+// source (same precedent as `integrity_core` above) — closes the manual-sync
+// gap the local mirror's doc comment used to warn about.
+#[path = "../protected_refs.rs"]
+mod protected_refs;
+
 /// #1504 L3: max times the shim may re-enter before hard-failing. Healthy
 /// operation never exceeds 1 (real git ≠ shim → no re-entry), so a small cap
 /// has zero false-trip risk while containing a self-resolution spawn storm.
@@ -390,18 +396,12 @@ enum Action {
     Deny(String),
 }
 
-/// Local mirror of `agent_ops::is_protected_ref`. The wrapper binary
-/// is intentionally self-contained (no `crate::*` imports) so it
-/// builds standalone without the full library surface. Sprint 57
-/// Wave 2 Track B introduced the lib-side helper; the literal here
-/// MUST stay in sync.
-///
-/// CR-2026-06-14: matched **case-insensitively** (mirrors the lib-side fix).
-/// A case-insensitive FS folds `Main`→`main`, so a case-sensitive guard would
-/// let `branch="Main"` slip past gh-push protection here.
-fn is_protected_ref(branch: &str) -> bool {
-    branch.eq_ignore_ascii_case("main") || branch.eq_ignore_ascii_case("master")
-}
+// #2550 W4: the local mirror (a hand-copied `eq_ignore_ascii_case` literal
+// that "MUST stay in sync" with `agent_ops::is_protected_ref`) is gone —
+// `protected_refs::is_protected_ref` (the `#[path]`-included module above)
+// IS `agent_ops::is_protected_ref`'s exact source, so there is nothing left
+// to drift. Call sites below use `protected_refs::is_protected_ref` directly.
+use protected_refs::is_protected_ref;
 
 /// #778 Option 3 (originally) + #852 residual PR-A: detect that cwd
 /// is rooted inside a canonical-origin git repo — either a
@@ -1062,25 +1062,9 @@ fn classify(
         "checkout" | "switch" => {
             let target_branch = args.get(1).map(|s| s.as_str()).unwrap_or("");
             if !bound {
-                // #852: agent callers must NOT use the #778 Option-3
-                // leniency below. The leniency was designed for the
-                // operator-typed validation-canary flow (operator runs
-                // `repo action=checkout` to provision a worktree in
-                // detached-HEAD, then `git switch <branch>` to land on
-                // the branch; that follow-up needs to pass without a
-                // BYPASS). But the gate wasn't agent-aware, so
-                // reviewer agents whose binding lookup failed for the
-                // canonical-rooted cwd fell through to the same
-                // leniency — and the resulting `git checkout <sha>` /
-                // `git checkout -b tmp_review` calls polluted
-                // canonical's branch list with stale `pr*_head` /
-                // `tmp*` / `review/*` refs. Operator surfaced the
-                // recurrence on PR #805 morning + PR #850 afternoon.
-                // Fix: route agents to either `repo action=checkout
-                // bind=true` (gives them a properly-bound worktree)
-                // or `gh pr diff/view` (read-only). Operator path
-                // unchanged.
-                if is_agent_caller && canonical_cwd {
+                // #852: leniency below (#778) is for the operator-typed
+                // validation-canary flow, not agent callers — deny first.
+                if is_agent_checkout_in_canonical(is_agent_caller, canonical_cwd) {
                     return Action::Deny(
                         "agent callers must not checkout in canonical \
                          (use `repo action=checkout` for PR inspection or \
@@ -1088,23 +1072,8 @@ fn classify(
                             .into(),
                     );
                 }
-                // #778 Option 3: shim leniency for canonical-rooted
-                // unbound worktrees. When cwd is inside a worktree whose
-                // `.git` pointer resolves to a source repo carrying a
-                // `[remote "origin"]` config entry (i.e. a canonical
-                // repo, not the orphan workspace-placeholder daemon
-                // startup leaves), allow `git checkout`/`git switch
-                // <branch>` as a Passthrough. Closes the chicken-and-egg
-                // surfaced by validation canary 2026-05-14:
-                // `repo action=checkout` provisions the worktree in
-                // detached-HEAD but doesn't bind, so the natural
-                // follow-up `git switch <branch>` would otherwise need
-                // a BYPASS. Narrow by design — `target_branch` must be
-                // a positional argument (not a flag) and the worktree
-                // must be daemon-provisioned canonical-rooted, so the
-                // surface is limited to navigation within an already-
-                // materialized worktree.
-                if !target_branch.is_empty() && !target_branch.starts_with('-') && canonical_cwd {
+                // #778 Option 3: canonical-rooted unbound checkout leniency.
+                if is_canonical_unbound_checkout_leniency(target_branch, canonical_cwd) {
                     return Action::Passthrough;
                 }
                 return Action::Deny("unbound — no active task assignment".into());
@@ -1115,20 +1084,8 @@ fn classify(
                     && target_branch != assigned
                     && !target_branch.starts_with('-')
                 {
-                    // Sprint 57 Wave 2 Track D: gh post-merge cleanup
-                    // exemption. Trigger requires ALL of:
-                    //   - target is a protected ref (main / master)
-                    //   - parent process is `gh` (signal that this
-                    //     invocation is from `gh pr merge --delete-branch`
-                    //     post-merge local-state cleanup)
-                    //   - we're in the agent-invoked path (AGEND_INSTANCE_NAME
-                    //     was set; bound binding is the consequence of that)
-                    // Heuristic robustness: a non-gh parent (interactive
-                    // shell, script, IDE) reaches the cross-branch deny
-                    // unchanged, preserving E4.5 protection for the
-                    // operator-typed case the rule was originally built
-                    // for.
-                    if is_protected_ref(target_branch) && parent_is_gh {
+                    // Sprint 57 Wave 2 Track D: gh post-merge cleanup exemption.
+                    if is_gh_post_merge_cleanup_checkout(target_branch, parent_is_gh) {
                         return Action::SilentExempt {
                             target_branch: target_branch.to_string(),
                             reason: format!(
@@ -1205,6 +1162,60 @@ fn classify(
             Action::Passthrough
         }
     }
+}
+
+// ── `classify`'s checkout/switch arm — named predicates (#2550 W4) ──────
+//
+// Pure structural extraction of the three special cases the arm carries
+// (#852, #778, Sprint 57 Track D) — each predicate is a byte-for-byte move
+// of the condition it replaces; no branch/return site changed.
+
+/// #852: agent callers must NOT use the #778 Option-3 leniency below. The
+/// leniency was designed for the operator-typed validation-canary flow
+/// (operator runs `repo action=checkout` to provision a worktree in
+/// detached-HEAD, then `git switch <branch>` to land on the branch; that
+/// follow-up needs to pass without a BYPASS). But the gate wasn't
+/// agent-aware, so reviewer agents whose binding lookup failed for the
+/// canonical-rooted cwd fell through to the same leniency — and the
+/// resulting `git checkout <sha>` / `git checkout -b tmp_review` calls
+/// polluted canonical's branch list with stale `pr*_head` / `tmp*` /
+/// `review/*` refs. Operator surfaced the recurrence on PR #805 morning +
+/// PR #850 afternoon. Fix: route agents to either `repo action=checkout
+/// bind=true` (gives them a properly-bound worktree) or `gh pr diff/view`
+/// (read-only). Operator path unchanged.
+fn is_agent_checkout_in_canonical(is_agent_caller: bool, canonical_cwd: bool) -> bool {
+    is_agent_caller && canonical_cwd
+}
+
+/// #778 Option 3: shim leniency for canonical-rooted unbound worktrees. When
+/// cwd is inside a worktree whose `.git` pointer resolves to a source repo
+/// carrying a `[remote "origin"]` config entry (i.e. a canonical repo, not
+/// the orphan workspace-placeholder daemon startup leaves), allow `git
+/// checkout`/`git switch <branch>` as a Passthrough. Closes the
+/// chicken-and-egg surfaced by validation canary 2026-05-14: `repo
+/// action=checkout` provisions the worktree in detached-HEAD but doesn't
+/// bind, so the natural follow-up `git switch <branch>` would otherwise need
+/// a BYPASS. Narrow by design — `target_branch` must be a positional
+/// argument (not a flag) and the worktree must be daemon-provisioned
+/// canonical-rooted, so the surface is limited to navigation within an
+/// already-materialized worktree.
+fn is_canonical_unbound_checkout_leniency(target_branch: &str, canonical_cwd: bool) -> bool {
+    !target_branch.is_empty() && !target_branch.starts_with('-') && canonical_cwd
+}
+
+/// Sprint 57 Wave 2 Track D: gh post-merge cleanup exemption. Trigger
+/// requires ALL of:
+///   - target is a protected ref (main / master)
+///   - parent process is `gh` (signal that this invocation is from `gh pr
+///     merge --delete-branch` post-merge local-state cleanup)
+///   - we're in the agent-invoked path (AGEND_INSTANCE_NAME was set; bound
+///     binding is the consequence of that)
+///
+/// Heuristic robustness: a non-gh parent (interactive shell, script, IDE)
+/// reaches the cross-branch deny unchanged, preserving E4.5 protection for
+/// the operator-typed case the rule was originally built for.
+fn is_gh_post_merge_cleanup_checkout(target_branch: &str, parent_is_gh: bool) -> bool {
+    is_protected_ref(target_branch) && parent_is_gh
 }
 
 // ── Parent-process detection (gh post-merge cleanup heuristic) ──────────
@@ -1940,15 +1951,14 @@ fn push_trust_root_denylist_violation(worktree: &str) -> Option<String> {
 
 // ── #2379 S3: protected-ref push deny (policy.toml override) ─────────────
 
-/// The ALWAYS-protected refs — the hardcode floor an operator override can only ADD to
-/// (tighten-only), never shrink. Mirrors `is_protected_ref` (kept in sync with the
-/// lib-side E4.5 guard).
-const HARDCODE_PROTECTED_REFS: &[&str] = &["main", "master"];
-
-/// The protected-ref set this invocation enforces: the hardcode floor (`main`/`master`)
-/// PLUS the operator's `$AGEND_HOME/policy.toml` `protected_refs` override — but ONLY
-/// when the file is present, HMAC-verified (hygiene, mirrors `read_binding`'s sidecar),
-/// and parses. **Fail-closed, never less safe than the hardcode floor:**
+/// The protected-ref set this invocation enforces: the hardcode floor
+/// (`protected_refs::PROTECTED_REFS` — #2550 W4: was its own hand-copied
+/// `HARDCODE_PROTECTED_REFS` const here, now the shared list an operator
+/// override can only ADD to, tighten-only, never shrink) PLUS the operator's
+/// `$AGEND_HOME/policy.toml` `protected_refs` override — but ONLY when the
+/// file is present, HMAC-verified (hygiene, mirrors `read_binding`'s
+/// sidecar), and parses. **Fail-closed, never less safe than the hardcode
+/// floor:**
 /// - missing policy.toml → hardcode floor only (the default),
 /// - tampered / unsigned sidecar → hardcode floor only (override ignored),
 /// - unparseable array → hardcode floor only (override ignored).
@@ -1956,7 +1966,7 @@ const HARDCODE_PROTECTED_REFS: &[&str] = &["main", "master"];
 /// The override is additive-only, so the floor is always denied regardless. HMAC is
 /// hygiene, NOT a security boundary (a same-uid agent could re-sign — #1653 ceiling).
 fn load_protected_refs(home: &str) -> Vec<String> {
-    let mut refs: Vec<String> = HARDCODE_PROTECTED_REFS
+    let mut refs: Vec<String> = protected_refs::PROTECTED_REFS
         .iter()
         .map(|s| s.to_string())
         .collect();
