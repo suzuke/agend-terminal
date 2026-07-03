@@ -71,10 +71,7 @@ fn resolve_repo_or_error(home: &Path, instance_name: &str, args: &Value) -> Resu
             }
         }
         None => {
-            let binding = home
-                .join("runtime")
-                .join(instance_name)
-                .join("binding.json");
+            let binding = crate::paths::binding_path(home, instance_name);
             let Ok(content) = std::fs::read_to_string(&binding) else {
                 return Err(json!({
                     "error": "could not determine repo slug; pass explicit 'repository' arg or call bind_self first (no active binding)",

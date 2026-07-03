@@ -13,7 +13,6 @@ pub fn runtime_dir(home: &Path) -> PathBuf {
 }
 
 /// `<home>/runtime/<agent>/binding.json`
-#[allow(dead_code)]
 pub fn binding_path(home: &Path, agent: &str) -> PathBuf {
     runtime_dir(home).join(agent).join(BINDING_FILENAME)
 }

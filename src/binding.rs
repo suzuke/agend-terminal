@@ -681,7 +681,8 @@ pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
     };
     let mut repos: Vec<std::path::PathBuf> = Vec::new();
     for entry in entries.flatten() {
-        let binding_path = entry.path().join("binding.json");
+        let agent_name = entry.file_name().to_string_lossy().into_owned();
+        let binding_path = crate::paths::binding_path(home, &agent_name);
         let Ok(content) = std::fs::read_to_string(&binding_path) else {
             continue;
         };

@@ -225,9 +225,7 @@ fn predicate_protects(home: &Path, wt: &Path, roster: &std::collections::HashSet
     if !roster.contains(&owner) {
         return false; // instance gone (deleted) ⇒ no process can build ⇒ sweepable
     }
-    let binding_path = crate::paths::runtime_dir(home)
-        .join(&owner)
-        .join("binding.json");
+    let binding_path = crate::paths::binding_path(home, &owner);
     if !binding_path.exists() {
         return false; // in roster but unbound ⇒ sweepable (can't rebind under our lock)
     }

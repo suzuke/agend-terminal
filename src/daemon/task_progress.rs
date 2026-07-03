@@ -195,7 +195,8 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
     let runtime_dir = crate::paths::runtime_dir(home);
     let entries = std::fs::read_dir(&runtime_dir).ok()?;
     for entry in entries.flatten() {
-        let binding_path = entry.path().join("binding.json");
+        let agent_name = entry.file_name().to_string_lossy().into_owned();
+        let binding_path = crate::paths::binding_path(home, &agent_name);
         let Ok(content) = std::fs::read_to_string(&binding_path) else {
             continue;
         };

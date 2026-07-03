@@ -202,7 +202,7 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
         if other == exclude_agent {
             continue;
         }
-        let bp = entry.path().join("binding.json");
+        let bp = crate::paths::binding_path(home, &other);
         let Ok(c) = std::fs::read_to_string(&bp) else {
             continue;
         };
