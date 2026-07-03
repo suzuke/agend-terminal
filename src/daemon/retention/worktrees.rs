@@ -1287,18 +1287,28 @@ mod tests {
 
         let dir = tmp_home("w1-baseline-clean");
         let repo = setup_git_repo(&dir);
-        let lease =
-            crate::worktree_pool::lease(&dir, &repo, "dev-baseline", "feat/baseline").expect("lease");
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-baseline", "feat/baseline")
+            .expect("lease");
         crate::binding::unbind(&dir, "dev-baseline"); // released → binding must be gone
         let released = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
-        backdate_marker(&lease.path, "dev-baseline", "feat/baseline", Some(&released));
+        backdate_marker(
+            &lease.path,
+            "dev-baseline",
+            "feat/baseline",
+            Some(&released),
+        );
 
         let gc_results = crate::worktree_pool::gc_run(&dir);
         assert!(
-            gc_results.iter().any(|r| r.agent == "dev-baseline" && r.removed),
+            gc_results
+                .iter()
+                .any(|r| r.agent == "dev-baseline" && r.removed),
             "gc_run must hard-delete the CleanRelease candidate: {gc_results:?}"
         );
-        assert!(!lease.path.exists(), "worktree gone from its original location");
+        assert!(
+            !lease.path.exists(),
+            "worktree gone from its original location"
+        );
         let trash_count = std::fs::read_dir(dir.join(".trash").join("worktrees"))
             .map(|d| d.flatten().count())
             .unwrap_or(0);
@@ -1327,13 +1337,23 @@ mod tests {
         let repo = setup_git_repo(&dir);
         let lease =
             crate::worktree_pool::lease(&dir, &repo, "dev-fr-gcrun", "feat/fr").expect("lease");
-        crate::binding::bind_full(&dir, "dev-fr-gcrun", "", "feat/fr", &lease.path, &repo, false)
-            .expect("bind_full");
+        crate::binding::bind_full(
+            &dir,
+            "dev-fr-gcrun",
+            "",
+            "feat/fr",
+            &lease.path,
+            &repo,
+            false,
+        )
+        .expect("bind_full");
         backdate_marker(&lease.path, "dev-fr-gcrun", "feat/fr", None); // no released_at → force-reclaim eligible
 
         let gc_results = crate::worktree_pool::gc_run(&dir);
         assert!(
-            gc_results.iter().any(|r| r.agent == "dev-fr-gcrun" && r.removed),
+            gc_results
+                .iter()
+                .any(|r| r.agent == "dev-fr-gcrun" && r.removed),
             "gc_run must archive the ForceReclaim candidate via delegation: {gc_results:?}"
         );
         assert!(!lease.path.exists(), "gone from original location");
