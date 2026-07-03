@@ -430,12 +430,37 @@ pub(crate) fn should_stop_gateway_loop(state: twilight_gateway::ShardState) -> b
 /// `block_on_value` calls in `send`/`edit`/`delete`/etc.) — this loop runs
 /// forever, and sharing a single-threaded runtime with it would starve
 /// every outbound call behind the permanently-running reader.
+/// #2562 PR-3a: set when the gateway connection thread has permanently
+/// stopped (fatal close, or its event receiver disappeared) and nothing
+/// will restart it without an operator fix / daemon restart. `false`
+/// initially and while the gateway is live — including while it's
+/// transiently reconnecting, since `twilight_gateway::Shard` handles that
+/// internally (see `should_stop_gateway_loop`'s doc comment) and the loop
+/// never reaches a break point for a merely-transient disconnect. Exposed
+/// so status/MCP surfaces can show "Discord: dead" instead of requiring a
+/// log grep.
+static GATEWAY_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the Discord gateway connection has permanently died — see
+/// [`GATEWAY_DEAD`].
+pub fn gateway_is_dead() -> bool {
+    GATEWAY_DEAD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_gateway_dead_for_test() {
+    GATEWAY_DEAD.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn start_gateway(
     token: String,
     intents: twilight_model::gateway::Intents,
     allowlist: Option<Vec<i64>>,
     tx: mpsc::Sender<ChannelEvent>,
 ) {
+    // A restart (PR-3b) calling this again after a prior death should
+    // clear the stale flag — the new attempt gets its own fair chance.
+    GATEWAY_DEAD.store(false, std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = std::thread::Builder::new()
         .name("discord-gateway".into())
         .spawn(move || {
@@ -444,6 +469,7 @@ pub(crate) fn start_gateway(
                 .build()
             else {
                 tracing::error!("discord gateway: failed to build tokio runtime");
+                GATEWAY_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             };
             rt.block_on(async move {
@@ -480,9 +506,11 @@ pub(crate) fn start_gateway(
                     }
                 }
             });
+            GATEWAY_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
         })
     {
         tracing::error!(error = %e, "failed to spawn discord gateway thread");
+        GATEWAY_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1072,6 +1100,7 @@ impl crate::channel::Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use crate::channel::ChannelEvent;
+    use serial_test::serial;
 
     /// §3.5.10 wire-format fixture: Discord Gateway READY payload
     /// (tests/fixtures/discord-gateway-ready.json) is deserialized via
@@ -1215,6 +1244,30 @@ mod tests {
         assert!(!super::should_stop_gateway_loop(
             twilight_gateway::ShardState::Identifying
         ));
+    }
+
+    /// #2562 PR-3a: `gateway_is_dead()` reflects whatever `GATEWAY_DEAD`
+    /// was last set to, and `reset_gateway_dead_for_test()` clears it back.
+    /// `#[serial]` because the flag is a process-wide static (mirrors
+    /// `daemon::mod::SHUTDOWN_REASON`'s shape) — parallel tests touching it
+    /// would race. `start_gateway` itself sets this on its real exit paths
+    /// (fatal close / receiver dropped / spawn failure); those paths need a
+    /// live gateway attempt to reach, so this test exercises the static
+    /// directly rather than driving a real connection.
+    #[test]
+    #[serial]
+    fn gateway_is_dead_reflects_death_state() {
+        super::reset_gateway_dead_for_test();
+        assert!(!super::gateway_is_dead(), "must start alive after reset");
+
+        super::GATEWAY_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(super::gateway_is_dead(), "must reflect a marked death");
+
+        super::reset_gateway_dead_for_test();
+        assert!(
+            !super::gateway_is_dead(),
+            "reset must clear it back to alive"
+        );
     }
 
     /// Contract test: DiscordChannel satisfies the registry-side
