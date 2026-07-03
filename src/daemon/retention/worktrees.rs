@@ -1244,4 +1244,218 @@ mod tests {
         assert!(lease.path.exists(), "preserved");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ───────── #2550 W1 (P3-2550-SPIKE.md §2a/§4, decision d-20260703062722787157-1):
+    // gc_run + retention::sweep COMBINED-PIPELINE pins ─────────
+    //
+    // Every test above drives `maybe_remove_candidate` directly with a hand-built
+    // `GcCandidate` — correct for pinning that function's own guards in isolation,
+    // but none of them exercise `gc_run` and `sweep` running in the SAME-tick
+    // sequence `build_default_handlers` actually uses (HourlyGcHandler before
+    // RetentionHandler). These tests close that gap: real `lease()`-built
+    // worktrees, driven through the REAL `gc_candidates()` → `gc_run`/`sweep`
+    // entry points (not injected candidates), pinning today's behavior before any
+    // W5 unification touches it.
+
+    /// Backdate a REAL `lease()`-built worktree's `.agend-managed` marker so
+    /// `gc_candidates()` classifies it as requested: `released_at: Some(_)` (past
+    /// `GC_GRACE_HOURS`) → CleanRelease-eligible; `None` → ForceReclaim-eligible
+    /// (also needs `leased_at` past the force-reclaim age cap + jitter, which this
+    /// always backdates 10 days regardless of kind — harmless for CleanRelease,
+    /// which ignores `leased_at`).
+    fn backdate_marker(wt: &Path, agent: &str, branch: &str, released_at: Option<&str>) {
+        let leased_at = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let mut marker = format!("agent={agent}\nbranch={branch}\nleased_at={leased_at}\n");
+        if let Some(r) = released_at {
+            marker.push_str(&format!("released_at={r}\n"));
+        }
+        std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), marker).unwrap();
+    }
+
+    /// Baseline (no forced skip): `gc_run` hard-deletes a CleanRelease candidate
+    /// through the real `gc_candidates()` discovery path — confirms it lands
+    /// NOWHERE in `.trash` (a genuine hard delete, not the retention path's
+    /// archive), and that `sweep`'s own fresh re-scan afterward finds nothing left
+    /// to do (no double-processing).
+    #[test]
+    fn gc_run_hard_deletes_clean_release_then_sweep_is_noop_2550_w1() {
+        // `sweep` (unlike `gc_run`) is gated on `AGEND_WORKTREE_GC=1` and calls
+        // `purge_trash`, which reads `AGEND_WORKTREE_GC_TRASH_DAYS` — reuse the
+        // existing env-var lock so this doesn't race a parallel TRASH_DAYS test.
+        let _env_guard = gc_trash_env_guard();
+        std::env::set_var("AGEND_WORKTREE_GC", "1");
+
+        let dir = tmp_home("w1-baseline-clean");
+        let repo = setup_git_repo(&dir);
+        let lease =
+            crate::worktree_pool::lease(&dir, &repo, "dev-baseline", "feat/baseline").expect("lease");
+        crate::binding::unbind(&dir, "dev-baseline"); // released → binding must be gone
+        let released = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        backdate_marker(&lease.path, "dev-baseline", "feat/baseline", Some(&released));
+
+        let gc_results = crate::worktree_pool::gc_run(&dir);
+        assert!(
+            gc_results.iter().any(|r| r.agent == "dev-baseline" && r.removed),
+            "gc_run must hard-delete the CleanRelease candidate: {gc_results:?}"
+        );
+        assert!(!lease.path.exists(), "worktree gone from its original location");
+        let trash_count = std::fs::read_dir(dir.join(".trash").join("worktrees"))
+            .map(|d| d.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(
+            trash_count, 0,
+            "CleanRelease via gc_run is a HARD delete — must NOT land in .trash"
+        );
+
+        let removed_by_sweep = sweep(&dir);
+        assert_eq!(
+            removed_by_sweep, 0,
+            "nothing left for retention sweep on its own fresh re-scan — gc_run already handled it"
+        );
+        std::env::remove_var("AGEND_WORKTREE_GC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `gc_run`'s dispatch to `maybe_remove_candidate` for `ForceReclaim`
+    /// candidates (gc.rs:733-751's explicit delegation) — driven through the real
+    /// discovery path this time, not a hand-built candidate. Pins the
+    /// architectural guarantee that a ForceReclaim candidate is NEVER hard-deleted
+    /// by `gc_run`, only ever archived.
+    #[test]
+    fn gc_run_delegates_force_reclaim_to_archive_never_hard_delete_2550_w1() {
+        let dir = tmp_home("w1-force-reclaim-gcrun");
+        let repo = setup_git_repo(&dir);
+        let lease =
+            crate::worktree_pool::lease(&dir, &repo, "dev-fr-gcrun", "feat/fr").expect("lease");
+        crate::binding::bind_full(&dir, "dev-fr-gcrun", "", "feat/fr", &lease.path, &repo, false)
+            .expect("bind_full");
+        backdate_marker(&lease.path, "dev-fr-gcrun", "feat/fr", None); // no released_at → force-reclaim eligible
+
+        let gc_results = crate::worktree_pool::gc_run(&dir);
+        assert!(
+            gc_results.iter().any(|r| r.agent == "dev-fr-gcrun" && r.removed),
+            "gc_run must archive the ForceReclaim candidate via delegation: {gc_results:?}"
+        );
+        assert!(!lease.path.exists(), "gone from original location");
+        let archived = std::fs::read_dir(dir.join(".trash").join("worktrees"))
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("dev-fr-gcrun-"))
+            })
+            .unwrap_or(false);
+        assert!(
+            archived,
+            "ForceReclaim via gc_run's delegation MUST land in .trash (never hard-deleted) — \
+             gc.rs:733-738's architectural guarantee"
+        );
+        assert!(
+            crate::binding::read(&dir, "dev-fr-gcrun").is_none(),
+            "force-reclaim must unbind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The Q1 pin** (P3-2550-SPIKE.md §2a, decision d-20260703062722787157-1):
+    /// when `gc_run`'s own hard-delete path SKIPS a CleanRelease candidate, the
+    /// retention `sweep` running later in the SAME tick must catch it and archive
+    /// it — this two-stage fallback is now a decided, intentional piece of defense
+    /// -in-depth (not an accidental side effect of two independent scanners), and
+    /// this test is what W5's unification must not regress.
+    ///
+    /// Forces the skip by making `gc_run`'s OWN binding-lock acquisition
+    /// (gc.rs:753-758) fail with a genuine I/O error — NOT lock contention:
+    /// `acquire_file_lock` is a BLOCKING flock, so holding the lock ourselves on
+    /// the same thread before calling `gc_run` would deadlock the test. Putting a
+    /// REGULAR FILE where the lock's parent directory must be created reproduces
+    /// gc.rs:758's `Err` arm deterministically and non-blockingly.
+    #[test]
+    fn gc_run_skip_then_sweep_retry_archives_clean_release_1053_1058_1170() {
+        // See the baseline test above for why this lock + env var is needed.
+        let _env_guard = gc_trash_env_guard();
+        std::env::set_var("AGEND_WORKTREE_GC", "1");
+
+        let dir = tmp_home("w1-q1-skip-retry");
+        let repo = setup_git_repo(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-q1", "feat/q1").expect("lease");
+        crate::binding::unbind(&dir, "dev-q1");
+        let released = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        backdate_marker(&lease.path, "dev-q1", "feat/q1", Some(&released));
+
+        let agent_runtime_dir = crate::paths::runtime_dir(&dir).join("dev-q1");
+        std::fs::create_dir_all(agent_runtime_dir.parent().unwrap()).unwrap();
+        std::fs::write(&agent_runtime_dir, "blocking-file").unwrap(); // FILE, not dir
+
+        let gc_results = crate::worktree_pool::gc_run(&dir);
+        let this_result = gc_results.iter().find(|r| r.agent == "dev-q1");
+        assert!(
+            this_result.is_some_and(|r| !r.removed),
+            "gc_run must SKIP when its own binding-lock acquisition fails: {gc_results:?}"
+        );
+        assert!(
+            lease.path.exists(),
+            "skipped candidate must still be on disk right after gc_run"
+        );
+
+        // Clear the blocking condition (the transient failure has "resolved") and
+        // let retention's sweep retry — it does NOT take this lock for
+        // CleanRelease (maybe_remove_candidate's own doc: "Clean-release archives
+        // via this fn only from the retention sweep ... we scope the lock to the
+        // force-reclaim branch to avoid changing clean-release's locking").
+        std::fs::remove_file(&agent_runtime_dir).unwrap();
+        let removed_by_sweep = sweep(&dir);
+        assert_eq!(
+            removed_by_sweep, 1,
+            "retention sweep must catch the CleanRelease candidate gc_run skipped"
+        );
+        assert!(!lease.path.exists(), "gone from its original location");
+        let archived = std::fs::read_dir(dir.join(".trash").join("worktrees"))
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("dev-q1-"))
+            })
+            .unwrap_or(false);
+        assert!(
+            archived,
+            "the retry must ARCHIVE (not hard-delete) — pinning the two-stage \
+             fallback decision d-20260703062722787157-1 as intentional defense-in-depth"
+        );
+        std::env::remove_var("AGEND_WORKTREE_GC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Liveness re-check at ARCHIVE time (worktrees.rs's force-reclaim branch,
+    /// `is_agent_alive` — distinct from `agent_has_liveness` at classification
+    /// time in gc.rs's `evaluate_candidate`). No existing test pinned this
+    /// specific skip reason (`agent_alive_at_archive`) before this PR — a genuine
+    /// gap found while writing the W1 pin suite, not just a #2550 spike item.
+    #[test]
+    fn force_reclaim_spared_when_agent_shows_liveness_at_archive_time() {
+        let dir = tmp_home("fr-liveness-archive-2550-w1");
+        let repo = setup_git_repo(&dir);
+        let wt = add_worktree(&repo, "wt-alive");
+        write_binding(&dir, "dev-alive-2550-w1", "feat/x", &wt);
+
+        // Agent shows liveness via the heartbeat_pair signal (one of
+        // `agent_has_liveness`'s three sources) — simulating "came back to life
+        // between enumeration and archive". Unique agent name: heartbeat_pair is
+        // a process-global registry, not home-scoped, so a collision with another
+        // test's agent name would cross-contaminate under parallel test execution.
+        crate::daemon::heartbeat_pair::update_with("dev-alive-2550-w1", |p| {
+            p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
+
+        let cand = crate::worktree_pool::GcCandidate {
+            path: wt.clone(),
+            agent: "dev-alive-2550-w1".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Skipped { ref reason } if reason == "agent_alive_at_archive"),
+            "an agent showing liveness at archive time must be spared: {outcome:?}"
+        );
+        assert!(wt.exists(), "preserved — agent came back to life");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
