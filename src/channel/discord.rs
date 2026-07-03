@@ -514,6 +514,91 @@ pub(crate) fn start_gateway(
     }
 }
 
+/// #2562 PR-3b: maximum number of restart attempts after `start_gateway`
+/// dies, before giving up permanently. Bounded (unlike Telegram's
+/// `poll_supervisor`, which retries most errors indefinitely) because
+/// every condition that kills `start_gateway` is a config/auth problem
+/// (see `should_stop_gateway_loop`'s doc comment) that won't self-resolve
+/// by waiting — see `DISCORD-P2-RECONNECT-PRERESEARCH.md` §1. The cap
+/// exists so a still-bad token/intents config doesn't hot-loop forever,
+/// while still giving an operator who fixes the config WHILE the daemon
+/// keeps running a chance at automatic recovery without a full restart.
+const GATEWAY_RESTART_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff before restart attempt number `attempt` (1-indexed: the delay
+/// before the FIRST restart, i.e. the second overall try). Mirrors
+/// Telegram's `poll_supervisor::backoff_delay` shape (exponential, base
+/// 5s, cap 60s) — same constants for consistency, not because the two
+/// domains share an error taxonomy (they don't; see PRERESEARCH §2).
+fn discord_gateway_backoff_delay(attempt: u32) -> std::time::Duration {
+    let exp = attempt.saturating_sub(1).min(20);
+    let mult = 1u32 << exp;
+    std::time::Duration::from_secs(5)
+        .saturating_mul(mult)
+        .min(std::time::Duration::from_secs(60))
+}
+
+/// Whether another restart attempt should be made, given how many restart
+/// attempts have already happened (not counting the original attempt).
+/// `false` once [`GATEWAY_RESTART_MAX_ATTEMPTS`] is reached.
+fn should_restart_gateway(attempts_so_far: u32) -> bool {
+    attempts_so_far < GATEWAY_RESTART_MAX_ATTEMPTS
+}
+
+/// Supervises `start_gateway`: restarts it (up to
+/// [`GATEWAY_RESTART_MAX_ATTEMPTS`] times, with backoff) if it dies. Polls
+/// [`gateway_is_dead`] rather than holding a `JoinHandle` on
+/// `start_gateway`'s inner thread, since `start_gateway` itself is
+/// fire-and-forget by design (§10.5) and `GATEWAY_DEAD` already carries
+/// exactly the "has it exited" signal this loop needs — no reason to widen
+/// `start_gateway`'s contract just to duplicate that signal via a handle.
+///
+/// fire-and-forget (§10.5): mirrors every other Discord/Telegram
+/// background thread — no `JoinHandle`, lives for the daemon's process
+/// lifetime, process exit cleans it up.
+pub(crate) fn spawn_gateway_supervisor(
+    token: String,
+    intents: twilight_model::gateway::Intents,
+    allowlist: Option<Vec<i64>>,
+    tx: mpsc::Sender<ChannelEvent>,
+) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("discord-gateway-supervisor".into())
+        .spawn(move || {
+            let mut attempt: u32 = 0;
+            loop {
+                start_gateway(token.clone(), intents, allowlist.clone(), tx.clone());
+                // start_gateway resets GATEWAY_DEAD to false synchronously
+                // before it returns here (its own thread runs
+                // independently) — poll until that thread's exit path
+                // flips it back to true.
+                while !gateway_is_dead() {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if !should_restart_gateway(attempt) {
+                    tracing::error!(
+                        attempt,
+                        "discord gateway: giving up after max restart attempts \
+                         (operator must fix config and restart the daemon)"
+                    );
+                    break;
+                }
+                attempt += 1;
+                let delay = discord_gateway_backoff_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    delay_secs = delay.as_secs(),
+                    "discord gateway: died, restarting after backoff"
+                );
+                std::thread::sleep(delay);
+            }
+        })
+    {
+        tracing::error!(error = %e, "failed to spawn discord gateway supervisor thread");
+        GATEWAY_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap (#2562 P1)
 // ---------------------------------------------------------------------------
@@ -584,7 +669,7 @@ pub fn init_from_config(config: &crate::fleet::FleetConfig) -> Option<DiscordCha
     // stays correct even if an operator pastes an already-prefixed token)
     // — pass the raw token to both, per their documented contract.
     let (tx, rx) = mpsc::channel();
-    start_gateway(token.clone(), discord_intents(), user_allowlist.clone(), tx);
+    spawn_gateway_supervisor(token.clone(), discord_intents(), user_allowlist.clone(), tx);
     let http_client = std::sync::Arc::new(build_http_client(token));
     Some(DiscordChannel::new(
         rx,
@@ -1268,6 +1353,42 @@ mod tests {
             !super::gateway_is_dead(),
             "reset must clear it back to alive"
         );
+    }
+
+    /// #2562 PR-3b: exponential backoff, base 5s, cap 60s — same shape and
+    /// same expected sequence as Telegram's `poll_supervisor::backoff_delay`
+    /// test, confirming the constants chosen for consistency actually land
+    /// on the same numbers.
+    #[test]
+    fn discord_gateway_backoff_delay_follows_expected_sequence() {
+        let expected = [5u64, 10, 20, 40, 60, 60, 60];
+        for (i, &secs) in expected.iter().enumerate() {
+            let attempt = (i + 1) as u32;
+            assert_eq!(
+                super::discord_gateway_backoff_delay(attempt),
+                std::time::Duration::from_secs(secs),
+                "attempt {attempt} backoff mismatch"
+            );
+        }
+    }
+
+    /// #2562 PR-3b: restart attempts are allowed strictly below the cap,
+    /// and refused at and beyond it — the supervisor must give up for good
+    /// rather than hot-loop a still-bad config forever.
+    #[test]
+    fn should_restart_gateway_caps_at_max_attempts() {
+        for n in 0..super::GATEWAY_RESTART_MAX_ATTEMPTS {
+            assert!(
+                super::should_restart_gateway(n),
+                "attempt {n} should still be allowed to retry"
+            );
+        }
+        assert!(!super::should_restart_gateway(
+            super::GATEWAY_RESTART_MAX_ATTEMPTS
+        ));
+        assert!(!super::should_restart_gateway(
+            super::GATEWAY_RESTART_MAX_ATTEMPTS + 5
+        ));
     }
 
     /// Contract test: DiscordChannel satisfies the registry-side
