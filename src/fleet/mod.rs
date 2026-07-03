@@ -265,8 +265,8 @@ pub enum ChannelConfig {
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
     },
-    /// Discord adapter (Phase 2+). Bootstrap selection lands in Phase 1;
-    /// actual adapter implementation is behind the `discord` feature gate.
+    /// Discord adapter. Bootstrap wiring landed #2562 P1; the adapter
+    /// implementation is behind the `discord` feature gate.
     #[serde(rename = "discord")]
     Discord {
         /// Env var name containing the Discord bot token.
@@ -274,6 +274,22 @@ pub enum ChannelConfig {
         bot_token_env: String,
         /// Discord guild (server) ID.
         guild_id: u64,
+        /// Optional allowlist of Discord user IDs (snowflakes) permitted to
+        /// command the fleet via messages.
+        ///
+        /// - `None` (field omitted): fail-closed — every inbound message is
+        ///   dropped (see `channel::auth::is_authorized_recipient`,
+        ///   `channel::discord::map_message_create_to_message_in`).
+        /// - `Some([])`: reject all — same effect as `None` today, but
+        ///   explicit in fleet.yaml.
+        /// - `Some([...])`: only those user IDs are accepted.
+        ///
+        /// Unlike Telegram's `user_allowlist` (`Vec<AllowlistEntry>`),
+        /// entries are bare snowflakes — Discord messages always carry a
+        /// real username (`msg.author.name`), so there's no "no public
+        /// handle" case needing an operator-supplied display name.
+        #[serde(default)]
+        user_allowlist: Option<Vec<i64>>,
     },
 }
 
