@@ -47,6 +47,27 @@ final-status-level = "slow"
 [test-groups]
 git-subprocess = { max-threads = 1 }
 
+# #2549-flake (t-20260702161319112091-56872-10, 7-sample pattern-ready class):
+# on Windows runners this SAME real-git cluster intermittently fails at the
+# process-spawn/DLL-init layer, not the test's own logic — misjudged merge-
+# state, an outright hang, and (2026-07-03, main @ 22068ef1) an ABORT
+# 0xc0000142 "DLL initialization routine failed" 0.008s into the test, with
+# the other 4861 tests in the same run passing clean. Every sampled failure
+# resolved on a bare rerun with NO code change — the signature of a
+# runner-environment race (antivirus/DLL-load contention is a well-known
+# 0xc0000142 cause), not a real regression. `retries = 2` gives this SAME
+# already-scoped `git-subprocess` group (both overrides below — the filter
+# is untouched) up to 2 automatic reruns on failure, CI-profile only (the
+# `default` profile below stays retry-free: a local dev re-running a
+# genuinely-broken test by hand should still see it fail every time).
+# Deliberately NOT a suite-wide `retries` at `[profile.ci]` level — masking a
+# REAL regression is the risk this must not create, so retry only applies to
+# the test filter already carved out for infra-flake-prone real-git spawns;
+# every other test in the suite still fails on the first try. A genuinely
+# broken test in this filter also stays broken across retries (they don't
+# change inputs or fix code) — the 3 failure retries only rescue outcomes
+# that a bare rerun already proved were transient.
+#
 # `*_stress_50_iter_*` do 50 real git branch-creates (~60s locally, slower on CI
 # runners). Listed FIRST so its slow-timeout wins for them: give 3×120s headroom
 # so the suite-wide 120s terminate-after can't FALSE-kill a genuinely-slow (not
@@ -57,10 +78,12 @@ git-subprocess = { max-threads = 1 }
 filter = 'test(/_stress_50_iter_/)'
 test-group = 'git-subprocess'
 slow-timeout = { period = "120s", terminate-after = 3 }
+retries = 2
 
 [[profile.ci.overrides]]
 filter = 'test(/(^(worktree|worktree_pool|worktree_cleanup|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2|shim_denies_agent_bypass_canonical_provisioning_2234|denylist_[a-z_]+_2379|tracked_tree_[a-z_]+_2379)/)'
 test-group = 'git-subprocess'
+retries = 2
 
 # Local `default` profile has no terminate-after, so no false-kill risk — just
 # serialize the same cluster for parity with CI.
