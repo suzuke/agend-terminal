@@ -461,6 +461,60 @@ fn bind_self_creates_binding_and_worktree() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2550 W3 Wave2 pin: the response's `worktree_path` must be an EXACT
+/// match for the `worktree` field the bind just wrote to binding.json (not
+/// just non-empty) — locks the read-back value before converging the raw
+/// `read_to_string`+parse onto `binding::read()`.
+#[test]
+fn bind_self_response_worktree_path_matches_written_binding_2550_w3() {
+    let home = tmp_home("resp-matches-binding");
+    p17_setup_repo(&home, "agent-match");
+
+    let resp = handle_bind_self(
+        &home,
+        &json!({"repository": "owner/name", "branch": "feat/w3-match"}),
+        &sender_for("agent-match"),
+    );
+    assert_eq!(
+        resp["bound"].as_bool(),
+        Some(true),
+        "bind_self must succeed: {resp}"
+    );
+    let resp_worktree = resp["worktree_path"]
+        .as_str()
+        .expect("worktree_path in success response");
+
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("agent-match")
+        .join("binding.json");
+    let v: Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding_path).expect("read binding"))
+            .expect("parse binding");
+    let disk_worktree = v["worktree"].as_str().expect("worktree field on disk");
+
+    assert_eq!(
+        resp_worktree, disk_worktree,
+        "response worktree_path must exactly match the just-written binding.json worktree field"
+    );
+
+    // Response JSON structure: exactly the documented success shape (no
+    // extra/missing keys for the non-rebase_mode path).
+    let mut keys: Vec<&str> = resp
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["bound", "branch", "worktree_path"],
+        "success response shape must be unchanged: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn bind_self_idempotent_same_agent_same_branch() {
     // Gate 2: a second bind_self call from the same agent on the
