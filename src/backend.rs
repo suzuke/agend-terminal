@@ -75,19 +75,6 @@ impl Backend {
         matches!(self, Backend::ClaudeCode | Backend::Agy)
     }
 
-    /// #2090: does this backend expose a subagent / sub-task mechanism an agent
-    /// can offload long or independent work to (preserving the main agent's
-    /// context + focus)? **claude-only in v1** — Claude Code's Task/Agent tool is
-    /// the one the daemon relies on. Other backends (Codex, OpenCode, Agy,
-    /// KiroCli, Shell, Raw) have no equivalent the daemon wires today, so the
-    /// progress-reporting directive instead tells those agents to interleave
-    /// brief inline updates AND surface that subagent offload isn't available on
-    /// their backend. Flip a variant here when a backend gains (and we wire) a
-    /// real subagent tool.
-    pub fn supports_subagents(&self) -> bool {
-        matches!(self, Backend::ClaudeCode)
-    }
-
     /// #1440: credential env-var names this backend legitimately needs to
     /// authenticate to its LLM provider. Under `AGEND_ENV_ISOLATION`, only
     /// these (plus the base runtime allowlist + operator `passthrough_env`)
@@ -930,32 +917,6 @@ pub(crate) mod claude_session {
             .flatten()
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
             .any(|e| jsonl_has_user_entry(&e.path()))
-    }
-
-    /// #2090 M2 (mode-1 mirror): resolve `working_dir`'s project dir (the SAME
-    /// canonicalize + encode path as [`has_resumable`]) and return the `.jsonl`
-    /// with the newest mtime, or `None` if the dir is missing / has no `.jsonl`.
-    /// Used by the progress-mirror tail to locate the agent's live transcript.
-    /// Fail-open: any read/metadata error yields `None`. Pure read — never
-    /// mutates anything (additive sibling of `has_resumable`; the #2262
-    /// `pub(crate)` exposure of this module is reused, its logic untouched).
-    pub(crate) fn newest_session_jsonl(
-        working_dir: &Path,
-        projects_root: &Path,
-    ) -> Option<PathBuf> {
-        let canonical = canonicalize_for_encode(working_dir);
-        let project_dir = projects_root.join(encode_project_dir(&canonical));
-        std::fs::read_dir(&project_dir)
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-            .filter_map(|p| {
-                let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
-                Some((p, mtime))
-            })
-            .max_by_key(|(_, mtime)| *mtime)
-            .map(|(p, _)| p)
     }
 
     /// Canonicalize `working_dir` so the encoded project-dir name matches what

@@ -76,25 +76,6 @@ pub struct RuntimeConfig {
     /// `default_true` also fills the field for configs written before it existed.
     #[serde(default = "default_true")]
     pub observed_badge: bool,
-    /// #2090: origin-aware long-task progress reporting mode. `0` = off
-    /// (DEFAULT — zero behaviour change).
-    ///
-    /// `2` = report: the agent self-reports progress on the channel a request came
-    /// from; the daemon's progress-backstop watchdog only NUDGES it if a long
-    /// external-channel turn goes quiet — it never authors or relays content, so
-    /// no transcript is exfiltrated.
-    ///
-    /// `1` = mirror: the daemon tails the agent's transcript and **auto-relays the
-    /// agent's raw assistant text** back to the origin channel. ⚠ EXFILTRATION
-    /// SURFACE — this sends the FULL assistant output stream off-box: any secret
-    /// or injected content the agent echoes is relayed to the external channel.
-    /// Opt-in only; bounded by an active-turn gate (origin channel only, never
-    /// broadcast), no-backlog-replay, and truncation. See `progress_mirror.rs`.
-    ///
-    /// `#[serde(default)]` fills 0 for older configs (additive — no schema bump).
-    /// Hot-reloadable via the `config` MCP tool.
-    #[serde(default)]
-    pub progress_mode: i64,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
     /// written before this field reads back as 0 (≤ CURRENT, loads normally);
     /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
@@ -139,7 +120,6 @@ impl Default for RuntimeConfig {
             copy_on_select: true,
             dim_unfocused_panes: true,
             observed_badge: true,
-            progress_mode: 0,
             schema_version: RuntimeConfig::CURRENT,
         }
     }
@@ -320,19 +300,6 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use on/off)")),
             };
         }
-        "progress_mode" => {
-            let m: i64 = value
-                .parse()
-                .map_err(|_| format!("invalid integer: {value}"))?;
-            // 0 = off (default), 1 = mirror (⚠ exfil — relays raw assistant
-            // output to the origin channel), 2 = report (self-report + nudge).
-            if !matches!(m, 0..=2) {
-                return Err(format!(
-                    "invalid progress_mode: {m} (0 = off, 1 = mirror, 2 = report)"
-                ));
-            }
-            config.progress_mode = m;
-        }
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
@@ -358,7 +325,7 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     // AUDIT2-012: atomic tmp+rename (was a plain std::fs::write) so a crash mid
     // write can't leave truncated JSON that reverts to DEFAULTS at next startup —
-    // which would silently flip watchdog / recovery / progress_mode gates.
+    // which would silently flip watchdog / recovery gates.
     crate::store::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
     Ok(serde_json::to_string(&config).unwrap_or_default())
@@ -378,7 +345,6 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "copy_on_select" => Ok(config.copy_on_select.to_string()),
         "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
         "observed_badge" => Ok(config.observed_badge.to_string()),
-        "progress_mode" => Ok(config.progress_mode.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -450,12 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_mode_default_off() {
-        // #2090: default is 0 (OFF) — a default fleet sees zero behaviour change.
-        assert_eq!(RuntimeConfig::default().progress_mode, 0);
-    }
-
-    #[test]
     #[serial(runtime_config)]
     fn set_uses_disk_base_preserves_concurrent_key_audit2_012() {
         let dir = std::env::temp_dir().join(format!(
@@ -466,9 +426,12 @@ mod tests {
         let path = dir.join("runtime-config.json");
 
         // Simulate ANOTHER process (e.g. the daemon) having written
-        // progress_mode=2 to disk while THIS process's in-memory global is stale.
+        // dev_idle_threshold_secs=9999 to disk while THIS process's in-memory
+        // global is stale. (#2549: was `progress_mode` before that field was
+        // retired — any field works here, the test is about the disk-base
+        // mechanism, not this specific key's semantics.)
         let on_disk = RuntimeConfig {
-            progress_mode: 2,
+            dev_idle_threshold_secs: 9999,
             ..RuntimeConfig::default()
         };
         std::fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
@@ -480,10 +443,42 @@ mod tests {
         let after: RuntimeConfig =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            after.progress_mode, 2,
+            after.dev_idle_threshold_secs, 9999,
             "AUDIT2-012: a concurrently-written key must be preserved, not clobbered"
         );
         assert!(!after.copy_on_select, "the just-set key must be applied");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2549: `progress_mode` was retired (ProgressBackstop/ProgressMirror
+    /// deleted). An on-disk `runtime-config.json` from BEFORE the retirement
+    /// may still carry the now-unknown `progress_mode` key — `RuntimeConfig`
+    /// has no `#[serde(deny_unknown_fields)]`, so serde silently drops unknown
+    /// keys on deserialize, but this pins that contract explicitly rather than
+    /// relying on it staying true by accident (a future `deny_unknown_fields`
+    /// addition elsewhere in the struct would silently break old configs).
+    #[test]
+    #[serial(runtime_config)]
+    fn reload_tolerates_retired_progress_mode_key_2549() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2549-retired-key-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-config.json");
+        std::fs::write(
+            &path,
+            r#"{"dev_idle_threshold_secs": 1234, "progress_mode": 1, "schema_version": 1}"#,
+        )
+        .unwrap();
+
+        reload(&dir);
+
+        let config = get();
+        assert_eq!(
+            config.dev_idle_threshold_secs, 1234,
+            "fields that still exist must load normally"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -504,24 +499,6 @@ mod tests {
             "set() must fail closed when the lock is unavailable, got: {res:?}"
         );
         std::fs::remove_file(&home_file).ok();
-    }
-
-    #[test]
-    #[serial(runtime_config)]
-    fn progress_mode_accepts_0_1_2_rejects_garbage() {
-        let dir = std::env::temp_dir().join("agend-test-runtime-config-progress");
-        std::fs::create_dir_all(&dir).ok();
-        // 0 (off), 1 (mirror), 2 (report) all accepted + round-trip.
-        for v in ["0", "1", "2"] {
-            set(&dir, "progress_mode", v).unwrap();
-            reload(&dir);
-            assert_eq!(get_key("progress_mode").unwrap(), v);
-        }
-        // Out-of-range integer → rejected.
-        assert!(set(&dir, "progress_mode", "3").is_err());
-        // Non-integer → rejected.
-        assert!(set(&dir, "progress_mode", "mirror").is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

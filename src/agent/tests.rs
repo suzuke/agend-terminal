@@ -142,34 +142,16 @@ fn resume_marker_distinct_from_auto_marker() {
     assert!(!super::DAEMON_AUTO_INJECT_MARKER.starts_with(super::DAEMON_RESUME_INJECT_MARKER));
 }
 
-/// #2090 O1: the `[AGEND-PROGRESS]` backstop marker is a THIRD distinct token —
-/// neither a prefix of, nor prefixed by, the never-act `[AGEND-AUTO]` or the
-/// recovery `[AGEND-RESUME]` markers (so an agent can't confuse an actionable
-/// progress nudge with either).
-#[test]
-fn progress_marker_distinct_from_auto_and_resume_markers() {
-    assert_eq!(super::DAEMON_PROGRESS_INJECT_MARKER, "[AGEND-PROGRESS]");
-    for other in [
-        super::DAEMON_AUTO_INJECT_MARKER,
-        super::DAEMON_RESUME_INJECT_MARKER,
-    ] {
-        assert_ne!(super::DAEMON_PROGRESS_INJECT_MARKER, other);
-        assert!(!super::DAEMON_PROGRESS_INJECT_MARKER.starts_with(other));
-        assert!(!other.starts_with(super::DAEMON_PROGRESS_INJECT_MARKER));
-    }
-}
-
-/// #2282: the `[AGEND-HANDOFF]` context-handoff marker is a FOURTH distinct token —
-/// neither a prefix of, nor prefixed by, `[AGEND-AUTO]` / `[AGEND-RESUME]` /
-/// `[AGEND-PROGRESS]` (so an agent can't confuse the save-state directive with the
-/// never-act nudge, the recovery trigger, or the progress nudge).
+/// #2282: the `[AGEND-HANDOFF]` context-handoff marker is a THIRD distinct token —
+/// neither a prefix of, nor prefixed by, `[AGEND-AUTO]` / `[AGEND-RESUME]` (so an
+/// agent can't confuse the save-state directive with the never-act nudge or the
+/// recovery trigger).
 #[test]
 fn handoff_marker_distinct_from_auto_resume_progress_markers_2282() {
     assert_eq!(super::DAEMON_HANDOFF_INJECT_MARKER, "[AGEND-HANDOFF]");
     for other in [
         super::DAEMON_AUTO_INJECT_MARKER,
         super::DAEMON_RESUME_INJECT_MARKER,
-        super::DAEMON_PROGRESS_INJECT_MARKER,
     ] {
         assert_ne!(super::DAEMON_HANDOFF_INJECT_MARKER, other);
         assert!(!super::DAEMON_HANDOFF_INJECT_MARKER.starts_with(other));

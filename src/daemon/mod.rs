@@ -42,7 +42,6 @@ pub(crate) mod supervisor;
 pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
 pub(crate) mod ticker;
-pub(crate) mod transcript_tail;
 mod tui_bridge;
 pub(crate) mod usage_limit;
 pub(crate) mod utils;

@@ -2726,27 +2726,16 @@ fn daemon_auto_prefix(kind: &str) -> String {
 /// muddied: `[AGEND-AUTO]` = never act, `[AGEND-RESUME]` = run your recovery.
 pub(crate) const DAEMON_RESUME_INJECT_MARKER: &str = "[AGEND-RESUME]";
 
-/// #2090 O1: progress-backstop marker — DISTINCT from both [`DAEMON_AUTO_INJECT_MARKER`]
-/// and [`DAEMON_RESUME_INJECT_MARKER`]. Like `[AGEND-RESUME]` (and unlike the
-/// never-act `[AGEND-AUTO]`), `[AGEND-PROGRESS]` is **actionable**: it asks the
-/// agent to post a brief progress update on its in-flight external-channel
-/// request. It is still daemon-originated and NOT operator authority — the agent
-/// must not dispatch a task or make a decision from it beyond posting the update.
-/// A separate marker (NOT an `[AGEND-AUTO]` per-kind carve-out, mirroring the
-/// `[AGEND-RESUME]` design) so the `[AGEND-AUTO]` "never act" blanket stays clean:
-/// the report-mode backstop must be acted on, so it can't wear the never-act tag.
-pub(crate) const DAEMON_PROGRESS_INJECT_MARKER: &str = "[AGEND-PROGRESS]";
-
-/// #2282: context-handoff marker — a FOURTH distinct daemon token, actionable like
-/// [`DAEMON_RESUME_INJECT_MARKER`] / [`DAEMON_PROGRESS_INJECT_MARKER`] and unlike the
-/// never-act [`DAEMON_AUTO_INJECT_MARKER`]. The context-handoff watchdog
+/// #2282: context-handoff marker — a THIRD distinct daemon token, actionable like
+/// [`DAEMON_RESUME_INJECT_MARKER`] and unlike the never-act
+/// [`DAEMON_AUTO_INJECT_MARKER`]. The context-handoff watchdog
 /// (`daemon::per_tick::context_handoff`) injects it near context-full to ask the
 /// agent to SAVE its state (write `SESSION-HANDOFF.md` + annotate its task) before
 /// the context window runs out. It must NOT use `[AGEND-AUTO]`: that marker's "never
 /// act" blanket would suppress the very save the nudge asks for — the latent bug
 /// this fixes (the nudge was silently ignored, leaving only the 92% operator
 /// escalation as a degraded backstop). A separate marker keeps the `[AGEND-AUTO]`
-/// blanket clean (mirrors the `[AGEND-RESUME]` / `[AGEND-PROGRESS]` design).
+/// blanket clean (mirrors the `[AGEND-RESUME]` design).
 pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
 
 /// The fixed first turn injected ONCE after a fresh-restart respawn. It is an

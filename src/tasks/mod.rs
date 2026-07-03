@@ -466,6 +466,11 @@ pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
 }
 
 /// Result of [`reconcile_stale_cross_board_claims`].
+// #2549: dead_code allowed — the per-tick `CrossBoardDepDetectiveHandler`
+// wrapper that called this was retired (d-20260703021554626467-13), but this
+// AUDIT2-014 reconcile backstop is standalone task-board machinery, not
+// handler-specific glue, so it's kept (test-covered) rather than deleted.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct CrossBoardReconcileReport {
     /// Claimed-but-not-yet-InProgress tasks released back to Open because a
@@ -499,6 +504,7 @@ pub struct CrossBoardReconcileReport {
 /// Same-board deps are untouched (a same-board claim precondition already
 /// validates atomically under one lock — no TOCTOU, no reconciliation needed;
 /// touching them here would be a scope-creeping behavior change, not a fix).
+#[allow(dead_code)] // #2549: see CrossBoardReconcileReport's dead_code note above
 pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileReport {
     use crate::task_events::{InstanceName, TaskEvent, TaskId, TaskStatus};
     let mut report = CrossBoardReconcileReport::default();
