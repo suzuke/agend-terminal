@@ -430,14 +430,16 @@ pub(crate) fn should_stop_gateway_loop(state: twilight_gateway::ShardState) -> b
 /// `block_on_value` calls in `send`/`edit`/`delete`/etc.) — this loop runs
 /// forever, and sharing a single-threaded runtime with it would starve
 /// every outbound call behind the permanently-running reader.
-/// #2562 PR-3a: set when the gateway connection thread has permanently
-/// stopped (fatal close, or its event receiver disappeared) and nothing
-/// will restart it without an operator fix / daemon restart. `false`
-/// initially and while the gateway is live — including while it's
-/// transiently reconnecting, since `twilight_gateway::Shard` handles that
-/// internally (see `should_stop_gateway_loop`'s doc comment) and the loop
-/// never reaches a break point for a merely-transient disconnect. Exposed
-/// so status/MCP surfaces can show "Discord: dead" instead of requiring a
+/// #2562 PR-3a: set each time the gateway connection thread stops (fatal
+/// close, or its event receiver disappeared). `false` initially and while
+/// the gateway is live — including while it's transiently reconnecting,
+/// since `twilight_gateway::Shard` handles that internally (see
+/// `should_stop_gateway_loop`'s doc comment) and the loop never reaches a
+/// break point for a merely-transient disconnect. `spawn_gateway_supervisor`
+/// (#2562 PR-3b) does a bounded number of automatic restarts (with
+/// backoff) when this flips true; only once it gives up for good does an
+/// operator need to fix the config / restart the daemon. Exposed so
+/// status/MCP surfaces can show "Discord: dead" instead of requiring a
 /// log grep.
 static GATEWAY_DEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1370,6 +1372,13 @@ mod tests {
                 "attempt {attempt} backoff mismatch"
             );
         }
+        // Never panics / overflows for a pathologically large attempt
+        // count — same saturating-exponent-cap shape as Telegram's
+        // `poll_supervisor::backoff_delay`, same assertion.
+        assert_eq!(
+            super::discord_gateway_backoff_delay(u32::MAX),
+            std::time::Duration::from_secs(60)
+        );
     }
 
     /// #2562 PR-3b: restart attempts are allowed strictly below the cap,
