@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（29 個工具）
+# AgEnD MCP Tools Reference — 工具參考（27 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -97,6 +97,7 @@
 ### `list_instances`
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
 - 預設為 **compact**（#2475）：每列會移除雜訊較大的 `observed_status.evidence` trail。傳 `verbose: true`（或 `include_evidence: true`）可包含它。
+- **operator_mode**（#2548）：回應也會帶一個頂層的 `operator_mode: {mode, delegate_to, delegate_scope}` 欄位——已退役的 `mode` 工具的讀取端折入這裡，讓 agent 能連同 fleet 狀態一起觀察 operator 的可用性。設定模式仍僅限 CLI（`agend-terminal mode <active|away|sleep>`）。
 
 ### `set_metadata`
 設定 per-instance 顯示中繼資料。#2547：從原本獨立的 `set_display_name` / `set_description` 工具合併而來。
@@ -133,14 +134,9 @@
 - repository_path, repository（已棄用）, rebase_mode
 
 ### `release_worktree`
-釋放由 daemon 管理的 worktree 並清除綁定。只會移除帶有 `.agend-managed` 標記的 worktree。
+釋放由 daemon 管理的 worktree 並清除綁定。只會移除帶有 `.agend-managed` 標記的 worktree。#2548：`force:true` 吸收了原本獨立的 `force_release_worktree` 工具——直接清除殘留的 worktree 目錄（不檢查標記，需要 `branch`），用於 binding 已消失但目錄仍殘留時的緊急救援。
 - **instance**: 要釋放的 instance
-- dry_run
-
-### `force_release_worktree`
-強制釋放一個殘留的、由 daemon 管理的 worktree 目錄。緊急救援工具。
-- **instance**: instance 名稱
-- **branch**: branch 名稱
+- dry_run, force, branch（force:true 時必填）, repository_path
 
 ### `binding_state`
 回報某個 agent 在 daemon 端的結構化 bind 狀態。非破壞性的內省查詢。
@@ -152,10 +148,6 @@
 執行期可變更的 daemon 設定。動作：get、list。#2548：set 動作已移至 `agend-terminal admin config-set` CLI（20 天內零 MCP 呼叫）。（可用的設定 key 由 daemon 的 runtime config 推導，列於工具的即時描述中。）
 - **action**: get / list
 - key（get 必填）
-
-### `mode`
-讀取 operator 的可用性／授權模式（對 agent 為唯讀）。設定模式僅限 operator，透過 `agend-terminal mode <active|away|sleep>` CLI 操作。
-- **action**: get
 
 ### `restart_daemon`
 

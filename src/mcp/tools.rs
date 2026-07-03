@@ -308,13 +308,6 @@ pub(crate) fn def_config() -> Value {
     }, "required": ["action"]}})
 }
 
-pub(crate) fn def_mode() -> Value {
-    json!({"name": "mode", "description": "#1339: Read the operator availability/authority mode (READ-ONLY for agents). `get` → current mode (active|away|sleep) + delegate. Agents observe this to back off when the operator is away/asleep. SETTING the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI — never available to agents.",
-    "inputSchema": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["get"], "default": "get"}
-    }}})
-}
-
 pub(crate) fn def_health() -> Value {
     json!({"name": "health", "description": "Manage health state. Actions: report, clear.",
         "inputSchema": {"type": "object", "properties": {
@@ -361,20 +354,14 @@ pub(crate) fn def_bind_self() -> Value {
 }
 
 pub(crate) fn def_release_worktree() -> Value {
-    json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone.",
+    json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone. #2548 PR-2: `force:true` absorbs the former standalone `force_release_worktree` tool — cleans a stale worktree directory directly via <home>/worktrees/<agent>/<branch>/ (no `.agend-managed` marker check; this is the stale-state recovery path, requires `branch`), runs the standard release_full for any lingering binding state, and restricts callers to the worktree's own agent or its team orchestrator (AUDIT2-002). Refuses to clean paths outside the daemon worktree pool.",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance whose worktree + binding to release"},
-            "dry_run": {"type": "boolean", "description": "#1933: when true, preview what would be released WITHOUT releasing (no binding/worktree mutation). Default false. Consumed at mcp/handlers/worktree.rs."}
+            "dry_run": {"type": "boolean", "description": "#1933: when true, preview what would be released WITHOUT releasing (no binding/worktree mutation). Default false. Consumed at mcp/handlers/worktree.rs."},
+            "force": {"type": "boolean", "description": "#2548: when true, clean a stale worktree directory directly instead of via the binding — requires `branch`. Default false (byte-identical to pre-#2548 behavior)."},
+            "branch": {"type": "string", "description": "#2548: branch name (worktree subdirectory) — only consumed/required when `force:true`."},
+            "repository_path": {"type": "string", "description": "#2548/#826: optional local filesystem path to the source repository, only used when `force:true`. When given, git-metadata GC candidate enumeration is skipped and cleanup targets this repo directly. Standard cross-tool name (matches checkout / bind_self / team update)."}
         }, "required": ["instance"]}})
-}
-
-pub(crate) fn def_force_release_worktree() -> Value {
-    json!({"name": "force_release_worktree", "description": "Force-release a stale daemon-managed worktree directory — cleans <home>/worktrees/<agent>/<branch>/ on disk + runs the standard release_full to clear any lingering binding state. Idempotent. Refuses to clean paths outside the daemon worktree pool. Sprint 59 Wave 1 PR-5 emergency cherry-pick supporting Q2=(C) bypass-free permanent protocol.",
-        "inputSchema": {"type": "object", "properties": {
-            "instance": {"type": "string", "description": "Name of the existing instance (worktree owner)"},
-            "branch": {"type": "string", "description": "Branch name (worktree subdirectory)"},
-            "repository_path": {"type": "string", "description": "#826: optional local filesystem path to the source repository. When given, candidate enumeration is skipped and cleanup targets this repo directly. Standard cross-tool name (matches checkout / bind_self / team update)."}
-        }, "required": ["instance", "branch"]}})
 }
 
 pub(crate) fn def_binding_state() -> Value {
@@ -619,13 +606,15 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            29,
+            27,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
              (#2547, merged into set_metadata) = 35; - ephemeral tool + task_sweep_config \
              (#2547, removed from registry) = 33; - tui_screenshot/gc_dry_run/tokens/watchdog \
-             (#2548 Wave1-PR1, removed or moved to CLI) = 29. Current tools: {:?}",
+             (#2548 Wave1-PR1, removed or moved to CLI) = 29; - mode/force_release_worktree \
+             (#2548 Wave1-PR2, mode folded into list_instances, force_release_worktree merged \
+             into release_worktree(force:true)) = 27. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1000,12 +989,12 @@ mod tests {
             ("bind_self", "branch", "mcp/handlers/worktree.rs validated bind branch"),
             ("bind_self", "rebase_mode", "mcp/handlers/worktree.rs recover-and-bind gate"),
             ("bind_self", "task_id", "mcp/handlers/worktree.rs → binding::bind_full task_id linkage (#2533)"),
-            // ── release_worktree / force_release_worktree ──
+            // ── release_worktree (#2548 PR-2: force:true absorbs former force_release_worktree) ──
             ("release_worktree", "instance", "mcp/handlers/worktree.rs release target"),
             ("release_worktree", "dry_run", "mcp/handlers/worktree.rs preview gate (#1933 declared)"),
-            ("force_release_worktree", "instance", "force_release/mod.rs worktree owner"),
-            ("force_release_worktree", "branch", "force_release/mod.rs worktree subdir"),
-            ("force_release_worktree", "repository_path", "force_release/mod.rs GC enumeration hint"),
+            ("release_worktree", "force", "mcp/handlers/worktree.rs force:true stale-dir path gate (#2548)"),
+            ("release_worktree", "branch", "mcp/handlers/worktree.rs force:true worktree subdir (#2548)"),
+            ("release_worktree", "repository_path", "mcp/handlers/worktree.rs force:true GC enumeration hint (#2548)"),
             // ── health ──
             ("health", "action", "instance.rs report/clear routing"),
             ("health", "reason", "instance.rs handle_report_health → set_blocked_reason"),
@@ -1041,10 +1030,9 @@ mod tests {
                 "force",
                 "instance_state/mod.rs fresh-restart uncommitted-work guard bypass (#2476)",
             ),
-            // ── config / mode ── (#2548: watchdog moved to CLI, no longer a coordination tool)
+            // ── config ── (#2548: watchdog moved to CLI, mode retired, no longer coordination tools)
             ("config", "action", "mcp/handlers/dispatch.rs get/list"),
             ("config", "key", "mcp/handlers/dispatch.rs runtime_config::get_key"),
-            ("mode", "action", "mcp/handlers/dispatch.rs get (read-only #1339)"),
         ];
 
         // Intentionally-deferred passthrough: advertised by design, Phase-2
@@ -1080,13 +1068,11 @@ mod tests {
             "repo",
             "bind_self",
             "release_worktree",
-            "force_release_worktree",
             "health",
             "set_waiting_on",
             "create_instance",
             "restart_instance",
             "config",
-            "mode",
         ];
 
         // Simple query/display/control tools — not directive-bearing, so their

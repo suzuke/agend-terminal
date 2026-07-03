@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (29 tools)
+# AgEnD MCP Tools Reference (27 tools)
 
 ## Action-based Tools
 
@@ -97,6 +97,7 @@ Kill and restart an instance. Default mode `resume` preserves conversation state
 ### `list_instances`
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
 - **compact by default** (#2475): each row drops the noisy `observed_status.evidence` trail. Pass `verbose: true` (or `include_evidence: true`) to include it.
+- **operator_mode** (#2548): the response also carries a top-level `operator_mode: {mode, delegate_to, delegate_scope}` field — the retired `mode` tool's read side folded in here, so agents can observe operator availability alongside fleet state. Setting the mode stays CLI-only (`agend-terminal mode <active|away|sleep>`).
 
 ### `set_metadata`
 Set per-instance display metadata. #2547: merged from the former standalone `set_display_name` / `set_description` tools.
@@ -133,14 +134,9 @@ Bind the calling agent to a fresh worktree on the named branch. Rejects main/mas
 - repository_path, repository (deprecated), rebase_mode
 
 ### `release_worktree`
-Release the daemon-managed worktree and clear binding. Only removes worktrees with `.agend-managed` marker.
+Release the daemon-managed worktree and clear binding. Only removes worktrees with `.agend-managed` marker. #2548: `force:true` absorbs the former standalone `force_release_worktree` tool — cleans a stale worktree directory directly (no marker check, requires `branch`), for emergency recovery when a directory survives after its binding is already gone.
 - **instance**: instance to release
-- dry_run
-
-### `force_release_worktree`
-Force-release a stale daemon-managed worktree directory. Emergency recovery tool.
-- **instance**: instance name
-- **branch**: branch name
+- dry_run, force, branch (required when force:true), repository_path
 
 ### `binding_state`
 Report structured daemon-side bind state for an agent. Non-destructive introspection.
@@ -152,10 +148,6 @@ Report structured daemon-side bind state for an agent. Non-destructive introspec
 Runtime-mutable daemon configuration. Actions: get, list. #2548: the set action moved to the `agend-terminal admin config-set` CLI (zero MCP calls in 20 days). (Available keys are derived from the daemon's runtime config and listed in the live tool description.)
 - **action**: get / list
 - key (required for get)
-
-### `mode`
-Read the operator availability/authority mode (read-only for agents). Setting the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI.
-- **action**: get
 
 ### `restart_daemon`
 

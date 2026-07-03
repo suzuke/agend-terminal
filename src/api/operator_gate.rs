@@ -87,10 +87,6 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
             Some("display_name") | Some("description") => AlwaysAllow,
             _ => AbsolutelyNever,
         },
-        "mode" => match action {
-            Some("get") | None => AlwaysAllow,
-            _ => AbsolutelyNever, // an agent must not flip operator authority
-        },
         "config" => match action {
             Some("set") => AbsolutelyNever,
             _ => AlwaysAllow, // list / get
@@ -113,7 +109,7 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         // ── Structural lifecycle / daemon control: never-delegate ──
         "create_instance" | "delete_instance"
         | "restart_instance" | "start_instance" | "restart_daemon"
-        | "force_release_worktree" | "release_worktree" | "move_pane"
+        | "release_worktree" | "move_pane"
         // direct API peers
         | "spawn" | "delete" | "kill" | "shutdown" | "create_team"
         | "update_team" => AbsolutelyNever,
@@ -345,6 +341,12 @@ mod tests {
     }
 
     // ── An agent must never change operator authority (mode set), in ANY mode. ──
+    // #2548: the MCP `mode` tool itself was retired (read side folded into
+    // `list_instances`) — the `classify()` arm for it is gone too, so this now
+    // pins ONLY the hardcoded early-return in `check_operation_allowed` (an
+    // agent spoofing `tool:"mode"`/`action:"set"` over the tunnel is denied
+    // regardless of classify() table state). There's no more "reading mode via
+    // mcp_tool is fine" case to pin — that path no longer exists.
     #[test]
     fn agent_cannot_set_operator_mode() {
         for st in [
@@ -360,11 +362,6 @@ mod tests {
                 st.mode
             );
         }
-        // Reading the mode is fine for agents.
-        assert!(
-            check_operation_allowed("mcp_tool", &mcp_action("mode", "get", "dev-2"), &away())
-                .is_ok()
-        );
     }
 
     // ── MUST-PIN 2: mcp_tool decodes the INNER tool, not the outer method ──
@@ -405,7 +402,7 @@ mod tests {
             "delete_instance",
             "restart_instance",
             "restart_daemon",
-            "force_release_worktree",
+            "release_worktree",
             "move_pane",
             "spawn",
             "delete",
@@ -428,7 +425,6 @@ mod tests {
             ("schedule", "delete"),
             ("config", "set"),
             ("deployment", "deploy"),
-            ("mode", "set"),
         ] {
             assert_eq!(
                 classify(tool, Some(action)),
