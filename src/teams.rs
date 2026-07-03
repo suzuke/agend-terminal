@@ -816,6 +816,84 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── team-update-persistence: `update add` + `project_id` must survive a
+    //    daemon restart (t-20260702132159428591-56872-1) ──
+
+    /// Reported 2026-07-02: `team create` survives a daemon rebuild+restart,
+    /// but a member added via a LATER `team update add=[...]` call does not
+    /// — the added instance comes back with `team=None` post-restart, and
+    /// its orchestrator's authority over it silently breaks.
+    ///
+    /// This drives the exact real code path (`create` then `update`, both
+    /// through the public API, no direct fleet.yaml poking) and re-reads
+    /// fleet.yaml with a FRESH `FleetConfig::load` call — not `list()`,
+    /// not any handle carried over from `create`/`update` — to simulate a
+    /// cold daemon boot re-parsing the file from scratch, the same way
+    /// #2552's `created_by` persistence was pinned.
+    #[test]
+    fn update_add_member_survives_fresh_fleet_reload_2548() {
+        let home = tmp_home("update-add-restart");
+        let created = create(
+            &home,
+            &serde_json::json!({"name": "gapfix", "members": ["lead"], "orchestrator": "lead"}),
+        );
+        assert_eq!(created["status"], "created", "{created}");
+
+        let updated = update(
+            &home,
+            &serde_json::json!({"name": "gapfix", "add": ["dev2"]}),
+        );
+        assert_eq!(updated["status"], "updated", "{updated}");
+
+        // Simulate a daemon restart: a brand-new, from-scratch parse of
+        // fleet.yaml, independent of anything `create`/`update` touched.
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml must parse on cold reload");
+        let team = reloaded
+            .teams
+            .get("gapfix")
+            .expect("team 'gapfix' must survive a cold reload");
+        assert!(
+            team.members.iter().any(|m| m == "dev2"),
+            "member added via `update add` must survive a cold fleet.yaml reload, got members={:?}",
+            team.members
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Same restart-survival contract as above, for `project_id` set via
+    /// `update` (not `create`) — the other half of the reported bug
+    /// (#2509's project_id, board-isolation-critical for `orchestrator`
+    /// task authority).
+    #[test]
+    fn update_project_id_survives_fresh_fleet_reload_2548() {
+        let home = tmp_home("update-project-id-restart");
+        let created = create(
+            &home,
+            &serde_json::json!({"name": "gapfix", "members": ["lead"]}),
+        );
+        assert_eq!(created["status"], "created", "{created}");
+
+        let updated = update(
+            &home,
+            &serde_json::json!({"name": "gapfix", "project_id": "Hack_agend-terminal"}),
+        );
+        assert_eq!(updated["status"], "updated", "{updated}");
+
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml must parse on cold reload");
+        let team = reloaded
+            .teams
+            .get("gapfix")
+            .expect("team 'gapfix' must survive a cold reload");
+        assert_eq!(
+            team.project_id.as_deref(),
+            Some("Hack_agend-terminal"),
+            "project_id set via `update` must survive a cold fleet.yaml reload"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ── #1744-M7: deterministic + fail-closed self-orch verdict ──
     // (#1701's boolean `is_self_orchestrator` was replaced by the 3-state
     // `self_orch_status`; the Yes/No verdict is covered by
