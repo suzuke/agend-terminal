@@ -3410,3 +3410,85 @@ fn target_sweep_skips_when_bind_lock_contended() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── #2550 W3 Wave1 pins: reconcile_orphan_leases (pre-refactor, zero prior
+// coverage) — locks current field-extraction/corruption-tolerance/missing-
+// field behavior before the binding_scan_all() extraction. ───────────────
+
+#[tracing_test::traced_test]
+#[test]
+fn reconcile_orphan_leases_warns_when_worktree_path_missing_2550_w3() {
+    let home = tmp_home("orphan-warns");
+    let runtime = crate::paths::runtime_dir(&home).join("dev");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let missing_wt = home.join("nonexistent-worktree");
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::json!({"worktree": missing_wt.to_str().unwrap()}).to_string(),
+    )
+    .unwrap();
+
+    reconcile_orphan_leases(&home);
+
+    assert!(
+        logs_contain("orphan lease"),
+        "a binding pointing at a missing worktree path must warn"
+    );
+    assert!(logs_contain("dev"), "the warn must name the orphaned agent");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn reconcile_orphan_leases_silent_when_worktree_path_exists_2550_w3() {
+    let home = tmp_home("orphan-silent");
+    let runtime = crate::paths::runtime_dir(&home).join("dev");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let real_wt = home.join("real-worktree");
+    std::fs::create_dir_all(&real_wt).unwrap();
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::json!({"worktree": real_wt.to_str().unwrap()}).to_string(),
+    )
+    .unwrap();
+
+    reconcile_orphan_leases(&home);
+
+    assert!(
+        !logs_contain("orphan lease"),
+        "a binding whose worktree path exists must not be flagged as orphaned"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reconcile_orphan_leases_tolerates_corrupt_binding_json_2550_w3() {
+    let home = tmp_home("orphan-corrupt");
+    let runtime = crate::paths::runtime_dir(&home).join("bad-agent");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(runtime.join("binding.json"), b"not valid json").unwrap();
+
+    reconcile_orphan_leases(&home); // must not panic
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn reconcile_orphan_leases_tolerates_missing_worktree_field_2550_w3() {
+    let home = tmp_home("orphan-no-field");
+    let runtime = crate::paths::runtime_dir(&home).join("dev");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::json!({"branch": "feat/x"}).to_string(),
+    )
+    .unwrap();
+
+    reconcile_orphan_leases(&home);
+
+    assert!(
+        !logs_contain("orphan lease"),
+        "a binding.json without a `worktree` field must not be flagged"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

@@ -572,29 +572,14 @@ pub fn is_pinned(worktree_path: &Path) -> bool {
 
 /// Reconcile orphan leases at daemon startup (log only, no delete in Phase 3).
 pub fn reconcile_orphan_leases(home: &Path) {
-    let runtime_dir = crate::paths::runtime_dir(home);
-    if !runtime_dir.exists() {
-        return;
-    }
-    if let Ok(entries) = std::fs::read_dir(&runtime_dir) {
-        for entry in entries.flatten() {
-            let agent_name = entry.file_name().to_string_lossy().into_owned();
-            let binding_path = crate::paths::binding_path(home, &agent_name);
-            if !binding_path.exists() {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(&binding_path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(wt_path) = v["worktree"].as_str() {
-                        if !Path::new(wt_path).exists() {
-                            tracing::warn!(
-                                agent = entry.file_name().to_string_lossy().as_ref(),
-                                worktree = wt_path,
-                                "orphan lease: worktree path missing"
-                            );
-                        }
-                    }
-                }
+    for (agent_name, v) in crate::binding::binding_scan_all(home) {
+        if let Some(wt_path) = v["worktree"].as_str() {
+            if !Path::new(wt_path).exists() {
+                tracing::warn!(
+                    agent = agent_name.as_str(),
+                    worktree = wt_path,
+                    "orphan lease: worktree path missing"
+                );
             }
         }
     }
