@@ -89,6 +89,17 @@ impl ContextAlertHandler {
             states: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Test-only: whether `name`'s alert latch is currently armed (`None` if
+    /// the agent has no latch entry yet). Used by the #2549 W5 merge's
+    /// cross-independence pin — proves `ContextHandoffHandler` firing never
+    /// touches this handler's OWN latch, and vice versa (P2-2549-SPIKE.md
+    /// §3c: the two handlers' latch/hysteresis state must stay independent
+    /// after the merge).
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self, name: &str) -> Option<bool> {
+        self.states.lock().get(name).map(|s| s.armed)
+    }
 }
 
 impl PerTickHandler for ContextAlertHandler {

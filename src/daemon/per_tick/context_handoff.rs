@@ -64,7 +64,7 @@ fn escalate_threshold() -> f32 {
 /// Episode phase per agent. One episode = one continuous stay above the
 /// handoff threshold.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
-enum Phase {
+pub(crate) enum Phase {
     /// Below threshold (or never seen): the next crossing acts.
     #[default]
     Armed,
@@ -211,6 +211,16 @@ impl ContextHandoffHandler {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
             states: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Test-only: `name`'s current episode phase (`None` if the agent has no
+    /// episode latch entry yet). Used by the #2549 W5 merge's
+    /// cross-independence pin — proves `ContextAlertHandler` firing never
+    /// touches this handler's OWN episode state, and vice versa
+    /// (P2-2549-SPIKE.md §3c).
+    #[cfg(test)]
+    pub(crate) fn phase_of(&self, name: &str) -> Option<Phase> {
+        self.states.lock().get(name).map(|s| s.phase)
     }
 }
 
