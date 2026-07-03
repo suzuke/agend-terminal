@@ -692,6 +692,45 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    // #2550 W6: cross-test pinning the behavior GAP between the
+    // ancestor-check (`git merge-base --is-ancestor`, used by
+    // worktree_cleanup.rs's is_branch_merged / worktree_pool.rs's
+    // cleanup_merged_branch via git_helpers::git_ok) and this file's own
+    // squash-merge detection (is_squash_merged, cherry + tree-diff based) —
+    // for a GitHub-style squash-merged branch. This is the decision input
+    // for whether the three merge-detection sites should unify onto
+    // branch_sweep.rs's heavier squash-aware method.
+    #[test]
+    fn ancestor_check_misses_squash_merge_that_branch_sweep_catches() {
+        let repo = setup_repo("w6_ancestor_vs_squash");
+        create_branch_with_commit(&repo, "feat-c", "feat: c body");
+        // Make main diverge first so cherry-pick doesn't fast-forward
+        // (mirrors test_branch_sweep_scan_categorizes_squash_merged above).
+        std::fs::write(repo.join("unrelated2.txt"), "main moves\n").expect("write");
+        git_run(&repo, &["add", "unrelated2.txt"]);
+        git_run(&repo, &["commit", "-m", "main: unrelated work 2"]);
+        git_run(&repo, &["cherry-pick", "--no-commit", "feat-c"]);
+        git_run(&repo, &["commit", "-m", "squash: feat-c body"]);
+
+        assert!(
+            !crate::git_helpers::git_ok(&repo, &["merge-base", "--is-ancestor", "feat-c", "main"],),
+            "ancestor-check must return false for a squash-merged branch — \
+             squash produces a new commit on main with no direct ancestry \
+             back to feat-c's tip, so this is a real (not incidental) gap, \
+             not a bug to unify away lightly"
+        );
+        assert!(
+            is_squash_merged(&repo, "main", "feat-c"),
+            "is_squash_merged (this file's cherry/patch-id detection) must \
+             still catch it — this is the gap ancestor-check callers close \
+             via a DIFFERENT, cheaper signal instead (remote-tracking-ref-gone,\
+             see worktree_cleanup.rs's is_remote_gone / worktree_pool.rs's \
+             is_gone), not by adopting this file's cherry+diff(+gh API) method"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
     #[test]
     fn test_branch_sweep_scan_categorizes_stale_idle() {
         // #817 RED 3: branch "old-wip" with committer-date 100 days

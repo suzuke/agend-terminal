@@ -236,12 +236,14 @@ fn cleanup_merged_branch(
     }
 
     let default = crate::git_helpers::default_branch(source_repo);
-    let is_merged = crate::git_helpers::git_bypass(
+    // W6: converged onto git_helpers::git_ok — byte-identical to the prior
+    // git_bypass(...).map(|o| o.status.success()).unwrap_or(false) idiom this
+    // absorbs (worktree_cleanup.rs's is_branch_merged already used it; this
+    // was the one remaining manual call site).
+    let is_merged = crate::git_helpers::git_ok(
         source_repo,
         &["merge-base", "--is-ancestor", branch, &default],
-    )
-    .map(|o| o.status.success())
-    .unwrap_or(false);
+    );
 
     let is_gone = {
         let remote_name = crate::git_helpers::git_bypass(
