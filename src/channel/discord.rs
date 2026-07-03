@@ -588,7 +588,7 @@ pub(crate) fn dispatch_channel_event(
         binding,
         from,
         payload,
-        ..
+        ts,
     } = event
     else {
         return;
@@ -606,6 +606,36 @@ pub(crate) fn dispatch_channel_event(
         "discord inbound: routing message to instance"
     );
     let display_name = from.handle.as_deref().unwrap_or(&from.id);
+
+    // #1352 parity with telegram/inbound.rs's short/long split: short
+    // messages go straight to the PTY-notification layer (no persistence).
+    // Long messages MUST be persisted first — `notify_agent_with_attachments`
+    // truncates and points at "use the inbox MCP tool to read full message",
+    // and under `AGEND_POINTER_ONLY_INJECT=1` EVERY message is pointer-only.
+    // Skipping the enqueue here left the pointer with nothing in the inbox
+    // to point at (silent-loss class, found in PR-1 review).
+    //
+    // Residual window (pre-existing, not introduced by this PR): a short
+    // message still has no inbox fallback if the live PTY inject fails
+    // (e.g. stale agent_state snapshot + genuinely dead daemon) — same
+    // limitation Telegram's short-message path already has. Not fixed
+    // here; would be a cross-channel behavior change.
+    let is_short = payload.text.chars().count() < 200;
+    let pointer_only = crate::inbox::notify::pointer_only_inject();
+    if !is_short || pointer_only {
+        let msg_obj = crate::inbox::InboxMessage {
+            from: format!("user:{display_name}"),
+            text: payload.text.clone(),
+            timestamp: ts.to_rfc3339(),
+            channel: Some(crate::channel::ChannelKind::Discord),
+            ..Default::default()
+        };
+        persist_or_log!(
+            crate::inbox::enqueue(home, &instance, msg_obj),
+            "discord_dispatch_enqueue",
+            instance
+        );
+    }
     crate::inbox::notify_agent_with_attachments(
         home,
         &instance,
@@ -1537,6 +1567,63 @@ mod tests {
         assert!(
             logs_contain("routing message to instance") && logs_contain("dev-agent"),
             "dispatch must resolve and log the bound instance"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// PR-1 review fix: a message ≥ 200 chars must be persisted to the
+    /// instance's inbox BEFORE the (truncating, pointer-only-for-long-text)
+    /// PTY notification fires — otherwise the notification's "use the inbox
+    /// MCP tool to read full message" pointer has nothing to point at.
+    /// Verified directly via `inbox::drain` (unlike the short-message tests
+    /// above, this doesn't depend on live daemon/PTY state — `enqueue` is a
+    /// plain synchronous file write).
+    #[test]
+    fn dispatch_channel_event_persists_long_message_to_inbox() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#444".into()),
+            super::DiscordBindingPayload { channel_id: 444 },
+        );
+        crate::channel::Channel::record_binding(&ch, "dev-agent", binding, "\r".into());
+        let home = dispatch_test_home("long-message");
+        let long_text = "a".repeat(250);
+
+        super::dispatch_channel_event(&ch, &home, message_in_event(444, &long_text));
+
+        let msgs = crate::inbox::drain(&home, "dev-agent");
+        assert!(
+            msgs.iter().any(|m| m.text == long_text),
+            "long message must be persisted in full to the bound instance's inbox; \
+             got {} message(s), lengths: {:?}",
+            msgs.len(),
+            msgs.iter().map(|m| m.text.len()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Short message (< 200 chars) must NOT be persisted to the inbox —
+    /// preserves Telegram's existing short-message behavior (PTY-only,
+    /// no disk write) rather than accidentally persisting everything.
+    #[test]
+    fn dispatch_channel_event_does_not_persist_short_message_to_inbox() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#555".into()),
+            super::DiscordBindingPayload { channel_id: 555 },
+        );
+        crate::channel::Channel::record_binding(&ch, "dev-agent", binding, "\r".into());
+        let home = dispatch_test_home("short-message");
+
+        super::dispatch_channel_event(&ch, &home, message_in_event(555, "hi"));
+
+        let msgs = crate::inbox::drain(&home, "dev-agent");
+        assert!(
+            msgs.iter().all(|m| m.text != "hi"),
+            "short message must not be persisted to inbox (PTY-inject-only path); got: {:?}",
+            msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&home);
     }
