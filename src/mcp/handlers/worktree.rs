@@ -118,13 +118,13 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     ) {
         Ok(_outcome) => {
             // Successful bind: read back the worktree path from the binding
-            // file we just wrote so the response reflects authoritative
-            // state. #781 `DispatchOutcome` fields are dropped here —
+            // we just wrote so the response reflects authoritative state.
+            // #2550 W3 Wave2: `bind_full` updates `binding::binding_index()`
+            // under the same lock it writes the file in, so the cache is
+            // already current here — `read()` reflects it without a second
+            // disk read. #781 `DispatchOutcome` fields are dropped here —
             // surfacing them is a `bind_self` consumer follow-up.
-            let binding_path = crate::paths::binding_path(home, agent);
-            let worktree_path = std::fs::read_to_string(&binding_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            let worktree_path = crate::binding::read(home, agent)
                 .and_then(|v| v["worktree"].as_str().map(String::from))
                 .unwrap_or_default();
             let mut resp = json!({
