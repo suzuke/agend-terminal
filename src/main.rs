@@ -69,6 +69,8 @@ mod provider_detect;
 mod quickstart;
 mod render;
 mod reply_ledger;
+#[cfg(test)]
+mod review_repro_test_util;
 mod runtime;
 pub mod runtime_config;
 mod schedules;
