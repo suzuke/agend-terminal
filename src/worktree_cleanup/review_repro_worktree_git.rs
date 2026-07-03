@@ -23,7 +23,7 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// Run `git` with the daemon bypass env (mirrors the in-module test harness).
 fn git(dir: &Path, args: &[&str]) {
-    crate::review_repro_test_util::git(dir, args)
+    crate::review_repro_test_util::review_repro_git(dir, args)
 }
 
 /// True iff `branch` still exists as a local ref in `repo`.

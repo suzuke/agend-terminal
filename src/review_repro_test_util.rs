@@ -22,7 +22,15 @@ pub(crate) fn scratch(prefix: &str, tag: &str) -> PathBuf {
 }
 
 /// Run `git` with the daemon bypass env (mirrors the in-module test harness).
-pub(crate) fn git(dir: &Path, args: &[&str]) {
+///
+/// Named `review_repro_git`, not the bare `git` the two call sites' own
+/// local wrappers used — `tests/anti_pattern_invariant.rs`'s Rule 1
+/// (dead-code-helper-pattern) scans `src/` for `pub`/`pub(crate)` fn names
+/// that collide with a `tests/`-integration-test's own local helper of the
+/// same name (several already define their own `fn git(...)`); a bare `git`
+/// here would trip that lint by newly colliding with those pre-existing,
+/// unrelated helpers.
+pub(crate) fn review_repro_git(dir: &Path, args: &[&str]) {
     std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
