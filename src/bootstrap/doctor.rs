@@ -508,6 +508,7 @@ mod tests {
             channel: Some(ChannelConfig::Discord {
                 bot_token_env: "AGEND_DISCORD_BOT_TOKEN".into(),
                 guild_id: 123,
+                user_allowlist: None,
             }),
             ..Default::default()
         };

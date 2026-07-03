@@ -458,6 +458,65 @@ pub(crate) fn start_gateway(
 }
 
 // ---------------------------------------------------------------------------
+// Bootstrap (#2562 P1)
+// ---------------------------------------------------------------------------
+
+/// Intents this adapter requests — matches the shape already pinned by
+/// `discord_gateway_identify_shape_matches_spec` (PR1, 2026-04-29): guild
+/// membership + message content, the minimum needed to receive
+/// `MESSAGE_CREATE` for a bound channel.
+fn discord_intents() -> twilight_model::gateway::Intents {
+    twilight_model::gateway::Intents::GUILDS
+        | twilight_model::gateway::Intents::GUILD_MESSAGES
+        | twilight_model::gateway::Intents::MESSAGE_CONTENT
+}
+
+/// Initialize Discord from fleet config: on `Some`, the gateway connection
+/// is ALREADY running (via [`start_gateway`]) and the returned
+/// [`DiscordChannel`] is ready to register. Returns `None` when Discord
+/// isn't configured or the bot token env var isn't set — mirrors
+/// `channel::telegram::init_from_config`'s not-configured contract so
+/// callers can treat both channels symmetrically.
+pub fn init_from_config(config: &crate::fleet::FleetConfig) -> Option<DiscordChannel> {
+    let (bot_token_env, guild_id, user_allowlist) = match config.channel.as_ref()? {
+        crate::fleet::ChannelConfig::Telegram { .. } => return None,
+        crate::fleet::ChannelConfig::Discord {
+            bot_token_env,
+            guild_id,
+            user_allowlist,
+        } => (bot_token_env, *guild_id, user_allowlist.clone()),
+    };
+    let token = match std::env::var(bot_token_env) {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::info!(env = %bot_token_env, "discord bot token env not set, skipping");
+            return None;
+        }
+    };
+    if user_allowlist.is_none() {
+        tracing::warn!(
+            "discord channel.user_allowlist is not set — fail-closed default: ALL inbound \
+             messages are dropped. Set `user_allowlist: [123456789012345678]` in fleet.yaml \
+             to enable the channel."
+        );
+    }
+
+    // twilight_gateway::Config::new and twilight_http::Client::new each
+    // add the `Bot ` prefix themselves if it's missing (checked, so this
+    // stays correct even if an operator pastes an already-prefixed token)
+    // — pass the raw token to both, per their documented contract.
+    let (tx, rx) = mpsc::channel();
+    start_gateway(token.clone(), discord_intents(), user_allowlist.clone(), tx);
+    let http_client = std::sync::Arc::new(twilight_http::Client::new(token));
+    Some(DiscordChannel::new(
+        rx,
+        user_allowlist,
+        http_client,
+        guild_id,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Outbound request body construction
 // ---------------------------------------------------------------------------
 

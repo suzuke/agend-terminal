@@ -16,11 +16,29 @@ mod agent_resolve;
 mod attach_detect;
 pub(crate) mod canonical_hygiene;
 pub mod daemon_spawn;
+#[cfg(feature = "discord")]
+mod discord_init;
 pub(crate) mod doctor;
 pub(crate) mod doctor_topics;
 mod fleet_normalize;
 pub mod signals;
 mod telegram_init;
+
+/// #2562 P1: `channel::discord` (and this module's own `discord_init`) only
+/// exist behind the `discord` feature — this wrapper keeps
+/// `resolve_fleet_and_reconcile` callable unconditionally regardless of
+/// whether the feature is compiled in.
+#[cfg(feature = "discord")]
+fn maybe_init_discord(config: &crate::fleet::FleetConfig, enabled: bool) {
+    if enabled {
+        time_step("discord_init::init", || {
+            discord_init::init(config);
+        });
+    }
+}
+
+#[cfg(not(feature = "discord"))]
+fn maybe_init_discord(_config: &crate::fleet::FleetConfig, _enabled: bool) {}
 
 pub use agent_resolve::AgentDef;
 
@@ -128,6 +146,10 @@ pub struct PrepareOptions {
     /// If true, initialize Telegram polling when `channel:` is configured.
     /// Set false for tests that don't need real bot traffic.
     pub init_telegram: bool,
+    /// If true, initialize the Discord gateway connection when
+    /// `channel:`/`channels:` configures `type: discord` (#2562 P1). Set
+    /// false for tests that don't need a real bot connection.
+    pub init_discord: bool,
     /// If true, resolve every fleet instance into an [`AgentDef`] (creates
     /// worktrees, generates instructions, appends resume/model/Claude flags).
     /// Set false for app mode, where pane_factory spawns on demand from tabs
@@ -140,6 +162,7 @@ impl Default for PrepareOptions {
         Self {
             mutate_fleet_yaml: true,
             init_telegram: true,
+            init_discord: true,
             resolve_agents: true,
         }
     }
@@ -322,6 +345,16 @@ pub(crate) fn resolve_fleet_and_reconcile(
     } else {
         None
     };
+
+    // #2562 P1: mirrors telegram_init's fire-and-forget shape exactly, but
+    // its result isn't threaded through `ResolvedFleet`/`OwnedFleet` the way
+    // `telegram` is above — `telegram_init::init` ALSO always returns `None`
+    // in production (real registration happens async via
+    // `register_active_channel`), so that field is already inert on every
+    // real code path; adding a second always-`None` slot for symmetry alone
+    // would be speculative surface with no consumer. Callers on both
+    // channels discover the real registered channel via `active_channel()`.
+    maybe_init_discord(&config, opts.init_discord);
 
     // agend-git-shim init (shared by daemon + app mode).
     time_step("protocol::extract_default", || {
@@ -576,6 +609,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: false,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
@@ -605,6 +639,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: false,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
@@ -641,6 +676,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: false,
         };
         let err = match prepare(&home, &fleet, opts) {
@@ -669,6 +705,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: false,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
@@ -709,6 +746,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: false,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
@@ -737,6 +775,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: true,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
@@ -877,6 +916,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            init_discord: false,
             resolve_agents: false,
         };
         let _ = prepare(&home, &fleet, opts).expect("prepare must succeed");
