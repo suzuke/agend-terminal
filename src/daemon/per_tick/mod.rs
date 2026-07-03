@@ -57,6 +57,7 @@ pub(crate) mod inbox_stuck;
 pub(crate) mod inject_delivery;
 pub(crate) mod log_rotation;
 pub(crate) mod notification_flush;
+pub(crate) mod notification_watchdogs;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state_scan;
 pub(crate) mod reclaim;
@@ -78,15 +79,13 @@ pub(crate) use context_alert::ContextAlertHandler;
 pub(crate) use context_handoff::ContextHandoffHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
-pub(crate) use handoff_timeout::HandoffTimeoutHandler;
 pub(crate) use hang_detection::HangDetectionHandler;
 pub(crate) use hourly_gc::HourlyGcHandler;
 pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
-pub(crate) use inbox_stuck::InboxStuckHandler;
 pub(crate) use inject_delivery::InjectDeliveryHandler;
 pub(crate) use log_rotation::LogRotationHandler;
 pub(crate) use notification_flush::NotificationFlushHandler;
-pub(crate) use poll_reminder::PollReminderHandler;
+pub(crate) use notification_watchdogs::NotificationWatchdogsHandler;
 pub(crate) use pr_state_scan::PrStateScanHandler;
 pub(crate) use reclaim::ReclaimHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
@@ -307,12 +306,13 @@ pub(crate) fn build_default_handlers(
     daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
 ) -> Vec<Box<dyn PerTickHandler>> {
     let watchdog_dry_run = super::watchdog::watchdog_dry_run_from_env();
-    // #2127 Phase 1: the inbox-stuck handler and the new reclaim handler share one
-    // dedup latch so reclaim can clear an agent's repeat-alert entry. Construct the
-    // inbox-stuck handler first, clone its latch, then move it into the vec at its
-    // original position (order preserved).
-    let inbox_stuck = InboxStuckHandler::new(30);
-    let work_stuck_latch = inbox_stuck.latch();
+    // #2127 Phase 1: the inbox-stuck sub-handler (inside NotificationWatchdogsHandler,
+    // #2549 W3) and the reclaim handler share one dedup latch so reclaim can clear an
+    // agent's repeat-alert entry. Construct the notification-watchdogs handler first,
+    // clone its inbox-stuck latch, then move it into the vec at its original position
+    // (order preserved) — same shape as before the W3 merge.
+    let notification_watchdogs = NotificationWatchdogsHandler::new(30, 30, 12);
+    let work_stuck_latch = notification_watchdogs.inbox_stuck_latch();
     // Vec order MUST match the pre-extraction call order (zero-behavior-change guarantee).
     vec![
         Box::new(HangDetectionHandler::new()),
@@ -357,15 +357,19 @@ pub(crate) fn build_default_handlers(
         Box::new(CiWatchPollHandler::new()),
         Box::new(PrStateScanHandler::new()),
         Box::new(InboxMaintenanceHandler::new(60)),
-        Box::new(PollReminderHandler::new(30)),
-        // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
-        // agent receiving but not draining its inbox; notifies lead (no auto-restart).
-        Box::new(inbox_stuck),
-        // #1491(B): next_after_ci handoff-timeout watchdog. #1859 lowered the
-        // cadence to ~2min (12 ticks) so the daemon-side RE-NUDGE of the target
-        // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
-        // + 30min re-alert windows, so the faster scan doesn't escalate sooner.
-        Box::new(HandoffTimeoutHandler::new(12)),
+        // #2549 W3: PollReminder (30 ticks) + InboxStuck watchdog (#1491(A), 30
+        // ticks — every agent receiving but not draining its inbox; notifies lead,
+        // no auto-restart) + HandoffTimeout watchdog (#1491(B), 12 ticks — #1859
+        // lowered the cadence to ~2min so the daemon-side RE-NUDGE of the
+        // next_after_ci target is timely; the lead ESCALATION stays gated by its
+        // own 10min age + 30min re-alert windows, so the faster scan doesn't
+        // escalate sooner) collapsed into one registered handler — same three
+        // cadences, same thread, mutually independent; each sub-check keeps its
+        // own cadence gate / extra state unchanged and is panic-isolated from its
+        // siblings inside `NotificationWatchdogsHandler::run` (per-check
+        // catch_unwind, replacing the per-handler isolation the outer loop used to
+        // provide for these 3 separately).
+        Box::new(notification_watchdogs),
         // Daemon-side deferred-notification flush — every tick (~10s). The
         // #1513 busy-gate defers notifications into the queue whose only other
         // flusher is the TUI loop; headless `run_core` (`start --foreground`)

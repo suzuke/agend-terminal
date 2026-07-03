@@ -22,8 +22,12 @@ impl PollReminderHandler {
         }
     }
 
+    /// #2549 W3: `pub(crate)` (not just `#[cfg(test)] fn`) so
+    /// `notification_watchdogs`'s merged-handler tests can construct this
+    /// sub-handler past its boot-grace window too. Zero behavior change —
+    /// visibility only.
     #[cfg(test)]
-    fn new_at(every_n_ticks: u64, created_at: std::time::Instant) -> Self {
+    pub(crate) fn new_at(every_n_ticks: u64, created_at: std::time::Instant) -> Self {
         Self {
             gate: crate::daemon::cadence_gate::CadenceGate::new_with_boot_grace_at(
                 every_n_ticks,

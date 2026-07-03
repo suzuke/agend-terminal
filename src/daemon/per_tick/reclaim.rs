@@ -961,4 +961,64 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #2549 W3 (P2-2549-SPIKE.md §3b, the merge's hard constraint): end-to-end
+    /// pin proving Reclaim's shared-latch consumption survives the
+    /// `NotificationWatchdogsHandler` merge. Constructs the merged handler
+    /// EXACTLY the way `build_default_handlers` wires it — merged handler
+    /// first, clone its InboxStuck sub-handler's latch via
+    /// `NotificationWatchdogsHandler::inbox_stuck_latch`, hand that SAME Arc to
+    /// Reclaim — not a synthetic fresh latch like this file's other tests use.
+    /// A wiring regression (cloning the wrong sub-handler, or handing Reclaim a
+    /// fresh Arc instead of a shared clone) would fail THIS test even though
+    /// the tests above (which construct their own local latch) stay green.
+    #[test]
+    fn latch_shared_with_notification_watchdogs_merge_2549_w3() {
+        use crate::daemon::per_tick::notification_watchdogs::NotificationWatchdogsHandler;
+        use parking_lot::Mutex as PLMutex;
+        use std::sync::Arc;
+
+        let now = chrono::Utc::now();
+        let home = tmp_home("w3-latch-wiring");
+        seed_claimed_task(&home, "t-w3", "dev-w3");
+        seed_usage_notify(&home, "dev-w3", now, 30); // 30min > 10min grace
+
+        let past = std::time::Instant::now()
+            - super::super::NOTIFICATION_BOOT_GRACE
+            - Duration::from_secs(1);
+        let notify = NotificationWatchdogsHandler::new_at(1, 1, 1, past);
+        let latch = notify.inbox_stuck_latch();
+        // As if InboxStuck already alerted on "dev-w3" last tick.
+        latch.lock().insert("dev-w3".to_string(), now);
+
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("dev-w3");
+        handle.core.lock().state.current = AgentState::UsageLimit;
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        let reclaim = ReclaimHandler::new_at(1, latch, past);
+        reclaim.run(&ctx);
+
+        assert_eq!(
+            task_status(&home, "t-w3"),
+            crate::task_events::TaskStatus::Open,
+            "sanity: reclaim must actually have fired"
+        );
+        assert!(
+            !notify.inbox_stuck_latch().lock().contains_key("dev-w3"),
+            "reclaim must clear the SAME Arc InboxStuckHandler owns inside the \
+             merged NotificationWatchdogsHandler — proves the #2127 latch-sharing \
+             wiring survived the W3 merge"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
