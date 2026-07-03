@@ -471,6 +471,27 @@ fn discord_intents() -> twilight_model::gateway::Intents {
         | twilight_model::gateway::Intents::MESSAGE_CONTENT
 }
 
+/// Construct the Discord outbound HTTP client.
+///
+/// Must run through [`discord_runtime()`] (via the local [`block_on_value`]),
+/// not on a bare thread. `twilight_http::Client::new` builds a
+/// `twilight_http_ratelimiting::RateLimiter` whose constructor does
+/// `tokio::spawn(actor::runner(..))` internally — called with no active
+/// Tokio runtime in scope (as `bootstrap::discord_init::init` does, since it
+/// runs `init_from_config` on a plain `std::thread`) that panics with
+/// "there is no reactor running, must be called from the context of a
+/// Tokio 1.x runtime" (twilight-http-ratelimiting 0.17.1 src/lib.rs:279 —
+/// found via #2562 P3 isolated-smoke-home boot, 2026-07-03: the daemon's
+/// real bootstrap path never got an end-to-end run before, only
+/// `#[tokio::test]`-shielded unit tests, which supply an ambient runtime
+/// this call site doesn't have on real boot). Routing through the same
+/// `discord_runtime()` the outbound `send`/`edit`/`delete` calls already use
+/// keeps the Client's rate-limiter actor task on one runtime for its whole
+/// lifetime instead of init and outbound each managing their own.
+fn build_http_client(token: String) -> twilight_http::Client {
+    block_on_value(async move { twilight_http::Client::new(token) })
+}
+
 /// Initialize Discord from fleet config: on `Some`, the gateway connection
 /// is ALREADY running (via [`start_gateway`]) and the returned
 /// [`DiscordChannel`] is ready to register. Returns `None` when Discord
@@ -507,7 +528,7 @@ pub fn init_from_config(config: &crate::fleet::FleetConfig) -> Option<DiscordCha
     // — pass the raw token to both, per their documented contract.
     let (tx, rx) = mpsc::channel();
     start_gateway(token.clone(), discord_intents(), user_allowlist.clone(), tx);
-    let http_client = std::sync::Arc::new(twilight_http::Client::new(token));
+    let http_client = std::sync::Arc::new(build_http_client(token));
     Some(DiscordChannel::new(
         rx,
         user_allowlist,
@@ -1868,5 +1889,30 @@ mod tests {
     fn discord_keepalive_interval_within_auto_archive_window() {
         const { assert!(super::KEEPALIVE_INTERVAL_SECS < 3600) };
         const { assert!(super::KEEPALIVE_INTERVAL_SECS >= 60) };
+    }
+
+    /// #2562 P3 regression pin: `build_http_client` must not panic when
+    /// called from a bare `std::thread` with no ambient Tokio runtime —
+    /// mirrors exactly how `bootstrap::discord_init::init` calls it on real
+    /// daemon boot (a plain `std::thread::Builder::spawn`, not a
+    /// `#[tokio::main]`/`#[tokio::test]` thread). Before the
+    /// `discord_runtime()`/`block_on_value` fix, this panicked with "there
+    /// is no reactor running, must be called from the context of a Tokio
+    /// 1.x runtime" (twilight-http-ratelimiting's internal `tokio::spawn` in
+    /// `Client::new`'s rate limiter) — caught only by an isolated
+    /// smoke-home real boot, never by the `#[tokio::test]`-shielded tests
+    /// above, which supply the missing runtime and hide the bug.
+    #[test]
+    fn build_http_client_does_not_panic_on_bare_thread() {
+        let joined = std::thread::spawn(|| {
+            super::build_http_client("Bot pin-test-not-a-real-token".to_string());
+        })
+        .join();
+        assert!(
+            joined.is_ok(),
+            "build_http_client must not panic when called from a bare std::thread \
+             with no ambient Tokio runtime (matches bootstrap::discord_init::init's \
+             real call site)"
+        );
     }
 }
