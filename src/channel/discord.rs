@@ -12,8 +12,8 @@
 
 use crate::agent::AgentRegistry;
 use crate::channel::{
-    BindingRef, ChannelCapabilities, ChannelError, ChannelEvent, MarkdownDialect, MentionStyle,
-    MsgRef, OutMsg, RateBudget,
+    BindingRef, Channel, ChannelCapabilities, ChannelError, ChannelEvent, MarkdownDialect,
+    MentionStyle, MsgRef, OutMsg, RateBudget,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -74,8 +74,9 @@ pub struct DiscordState {
 pub struct DiscordChannel {
     state: Mutex<DiscordState>,
     caps: ChannelCapabilities,
-    /// Receiver end of the bounded event channel. The gateway reader
-    /// task pushes `ChannelEvent`s here; `poll_event` drains them.
+    /// Receiver end of the unbounded event channel (`std::sync::mpsc::
+    /// channel`, not `sync_channel`). The gateway reader task pushes
+    /// `ChannelEvent`s here; `poll_event` drains them.
     event_rx: Mutex<mpsc::Receiver<ChannelEvent>>,
 }
 
@@ -166,6 +167,27 @@ impl DiscordChannel {
             event_rx: Mutex::new(rx),
         };
         (ch, tx)
+    }
+
+    /// Resolve which fleet instance owns `channel_id`, via the same
+    /// `channel_to_instance` reverse lookup Telegram's `resolve_topic` uses
+    /// for `topic_id` (#2562 PR-1). Miss (channel_id not bound to any
+    /// instance) falls back to `"general"` + a warn log — mirrors
+    /// `telegram/inbound.rs`'s topic-miss fallback semantics.
+    pub(crate) fn resolve_instance_for_channel(&self, channel_id: u64) -> String {
+        let instance = self
+            .state
+            .lock()
+            .channel_to_instance
+            .get(&channel_id)
+            .cloned();
+        instance.unwrap_or_else(|| {
+            tracing::warn!(
+                channel_id,
+                "discord inbound: no instance bound to this channel, falling back to 'general'"
+            );
+            "general".to_string()
+        })
     }
 }
 
@@ -287,6 +309,13 @@ pub(crate) fn map_message_create_to_message_in(
         );
         return None;
     }
+
+    tracing::info!(
+        author = %msg.author.name,
+        user_id = author_id,
+        channel_id = msg.channel_id.get(),
+        "discord message accepted by user_allowlist"
+    );
 
     Some(ChannelEvent::MessageIn {
         binding: BindingRef::new(
@@ -535,6 +564,108 @@ pub fn init_from_config(config: &crate::fleet::FleetConfig) -> Option<DiscordCha
         http_client,
         guild_id,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Inbound dispatcher (#2562 PR-1)
+// ---------------------------------------------------------------------------
+
+/// Drain-loop body: route one already-polled `ChannelEvent` to its target
+/// agent's inbox. Only `MessageIn` results in an inject — other event kinds
+/// (`Connected`, `BindingRevoked`, `ButtonClick`, ...) are intentionally
+/// no-ops here; this dispatcher's scope is inbound message routing only.
+///
+/// Session-agnostic by design (#2562 P2 boundary): this function has no
+/// notion of "which gateway connection" an event came from, so it needs no
+/// changes when P2 adds gateway reconnect — it just keeps draining whatever
+/// the queue has.
+pub(crate) fn dispatch_channel_event(
+    channel: &DiscordChannel,
+    home: &std::path::Path,
+    event: ChannelEvent,
+) {
+    let ChannelEvent::MessageIn {
+        binding,
+        from,
+        payload,
+        ts,
+    } = event
+    else {
+        return;
+    };
+    let Some(discord_binding) = binding.downcast::<DiscordBindingPayload>() else {
+        tracing::warn!(
+            "discord inbound: MessageIn binding is not a DiscordBindingPayload, dropping"
+        );
+        return;
+    };
+    let instance = channel.resolve_instance_for_channel(discord_binding.channel_id);
+    tracing::info!(
+        instance = %instance,
+        channel_id = discord_binding.channel_id,
+        "discord inbound: routing message to instance"
+    );
+    let display_name = from.handle.as_deref().unwrap_or(&from.id);
+
+    // #1352 parity with telegram/inbound.rs's short/long split: short
+    // messages go straight to the PTY-notification layer (no persistence).
+    // Long messages MUST be persisted first — `notify_agent_with_attachments`
+    // truncates and points at "use the inbox MCP tool to read full message",
+    // and under `AGEND_POINTER_ONLY_INJECT=1` EVERY message is pointer-only.
+    // Skipping the enqueue here left the pointer with nothing in the inbox
+    // to point at (silent-loss class, found in PR-1 review).
+    //
+    // Residual window (pre-existing, not introduced by this PR): a short
+    // message still has no inbox fallback if the live PTY inject fails
+    // (e.g. stale agent_state snapshot + genuinely dead daemon) — same
+    // limitation Telegram's short-message path already has. Not fixed
+    // here; would be a cross-channel behavior change.
+    let is_short = payload.text.chars().count() < 200;
+    let pointer_only = crate::inbox::notify::pointer_only_inject();
+    if !is_short || pointer_only {
+        let msg_obj = crate::inbox::InboxMessage {
+            from: format!("user:{display_name}"),
+            text: payload.text.clone(),
+            timestamp: ts.to_rfc3339(),
+            channel: Some(crate::channel::ChannelKind::Discord),
+            ..Default::default()
+        };
+        persist_or_log!(
+            crate::inbox::enqueue(home, &instance, msg_obj),
+            "discord_dispatch_enqueue",
+            instance
+        );
+    }
+    crate::inbox::notify_agent_with_attachments(
+        home,
+        &instance,
+        &crate::inbox::NotifySource::Channel(display_name, crate::channel::ChannelKind::Discord),
+        &payload.text,
+        &[],
+    );
+}
+
+/// Start the inbound dispatcher: a plain `std::thread` poll loop, no tokio
+/// runtime needed (`poll_event` is a synchronous, non-blocking `try_recv`;
+/// unlike Telegram's `start_polling`, Discord's network I/O already lives on
+/// its own thread in `start_gateway` — this loop only drains and routes).
+///
+/// fire-and-forget (§10.5): mirrors every other Discord/Telegram background
+/// thread in this codebase (`start_gateway`, `start_keepalive`,
+/// `telegram::inbound::start_polling`) — no `JoinHandle`, lives for the
+/// daemon's process lifetime, process exit cleans it up. Telegram's own
+/// dispatcher has no shutdown signal either (see PRERESEARCH §1e); this
+/// doesn't introduce a new inconsistency.
+pub(crate) fn spawn_inbound_dispatcher(
+    channel: std::sync::Arc<DiscordChannel>,
+    home: std::path::PathBuf,
+) {
+    std::thread::spawn(move || loop {
+        if let Some(event) = channel.poll_event() {
+            dispatch_channel_event(&channel, &home, event);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1455,201 @@ mod tests {
             super::map_message_create_to_message_in(&msg, &Some(vec![])).is_none(),
             "empty allowlist must reject all"
         );
+    }
+
+    /// Accept-path parity (#2562 PR-1): allowlisted messages must log for
+    /// observability, same as the reject path already does. Regression
+    /// guard for the asymmetry found during #2562 P3's live smoke test
+    /// (the accept path produced zero log output before this PR).
+    #[test]
+    #[tracing_test::traced_test]
+    fn discord_message_create_accept_path_logs_info() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-message-create.json");
+        let frame: serde_json::Value = serde_json::from_str(fixture).expect("fixture must parse");
+        let d = frame.get("d").expect("d field");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_value(d.clone()).expect("Message");
+
+        let allowlist = Some(vec![82198898841029460_i64]);
+        super::map_message_create_to_message_in(&msg, &allowlist)
+            .expect("allowlisted author must emit MessageIn");
+
+        assert!(
+            logs_contain("discord message accepted by user_allowlist"),
+            "accept path must log for observability parity with the reject path"
+        );
+    }
+
+    // ── #2562 PR-1: inbound dispatcher ──
+
+    fn dispatch_test_home(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-discord-dispatch-test-{}-{label}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn message_in_event(channel_id: u64, text: &str) -> ChannelEvent {
+        ChannelEvent::MessageIn {
+            binding: crate::channel::BindingRef::new(
+                "discord",
+                Some(format!("DC#{channel_id}")),
+                super::DiscordBindingPayload { channel_id },
+            ),
+            from: crate::channel::event::User {
+                id: "999".to_string(),
+                handle: Some("someuser".to_string()),
+            },
+            payload: crate::channel::event::MsgPayload {
+                text: text.to_string(),
+            },
+            ts: chrono::Utc::now(),
+        }
+    }
+
+    /// `resolve_instance_for_channel` returns the instance bound to a
+    /// channel_id via `record_binding` — the reverse-lookup table
+    /// Telegram's `resolve_topic` uses for `topic_id`.
+    #[test]
+    fn resolve_instance_for_channel_returns_bound_instance() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#111".into()),
+            super::DiscordBindingPayload { channel_id: 111 },
+        );
+        crate::channel::Channel::record_binding(&ch, "dev-agent", binding, "\r".into());
+
+        assert_eq!(ch.resolve_instance_for_channel(111), "dev-agent");
+    }
+
+    /// Unbound channel_id (no `record_binding` call ever happened) falls
+    /// back to `"general"` + a warn log — mirrors `telegram/inbound.rs`'s
+    /// topic-miss fallback semantics.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_instance_for_channel_falls_back_to_general_when_unbound() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+
+        assert_eq!(ch.resolve_instance_for_channel(222), "general");
+        assert!(
+            logs_contain("no instance bound to this channel"),
+            "unbound channel_id must warn so operators can trace the fallback"
+        );
+    }
+
+    /// `dispatch_channel_event` end-to-end: extracts channel_id from the
+    /// binding and routes via `resolve_instance_for_channel` — an
+    /// integration check on top of the resolver unit tests above (proves
+    /// the wiring, not just the resolver in isolation). Verified via the
+    /// routing-decision log rather than `inbox::drain`, since the
+    /// delivery layer below `notify_agent_with_attachments` depends on
+    /// live daemon/PTY state this test environment doesn't have.
+    #[test]
+    #[tracing_test::traced_test]
+    fn dispatch_channel_event_routes_to_bound_instance() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#111".into()),
+            super::DiscordBindingPayload { channel_id: 111 },
+        );
+        crate::channel::Channel::record_binding(&ch, "dev-agent", binding, "\r".into());
+        let home = dispatch_test_home("routes");
+
+        super::dispatch_channel_event(&ch, &home, message_in_event(111, "hello dev-agent"));
+
+        assert!(
+            logs_contain("routing message to instance") && logs_contain("dev-agent"),
+            "dispatch must resolve and log the bound instance"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// PR-1 review fix: a message ≥ 200 chars must be persisted to the
+    /// instance's inbox BEFORE the (truncating, pointer-only-for-long-text)
+    /// PTY notification fires — otherwise the notification's "use the inbox
+    /// MCP tool to read full message" pointer has nothing to point at.
+    /// Verified directly via `inbox::drain` (unlike the short-message tests
+    /// above, this doesn't depend on live daemon/PTY state — `enqueue` is a
+    /// plain synchronous file write).
+    #[test]
+    fn dispatch_channel_event_persists_long_message_to_inbox() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#444".into()),
+            super::DiscordBindingPayload { channel_id: 444 },
+        );
+        crate::channel::Channel::record_binding(&ch, "dev-agent", binding, "\r".into());
+        let home = dispatch_test_home("long-message");
+        let long_text = "a".repeat(250);
+
+        super::dispatch_channel_event(&ch, &home, message_in_event(444, &long_text));
+
+        let msgs = crate::inbox::drain(&home, "dev-agent");
+        assert!(
+            msgs.iter().any(|m| m.text == long_text),
+            "long message must be persisted in full to the bound instance's inbox; \
+             got {} message(s), lengths: {:?}",
+            msgs.len(),
+            msgs.iter().map(|m| m.text.len()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Short message (< 200 chars) must NOT be persisted to the inbox —
+    /// preserves Telegram's existing short-message behavior (PTY-only,
+    /// no disk write) rather than accidentally persisting everything.
+    #[test]
+    fn dispatch_channel_event_does_not_persist_short_message_to_inbox() {
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#555".into()),
+            super::DiscordBindingPayload { channel_id: 555 },
+        );
+        crate::channel::Channel::record_binding(&ch, "dev-agent", binding, "\r".into());
+        let home = dispatch_test_home("short-message");
+
+        super::dispatch_channel_event(&ch, &home, message_in_event(555, "hi"));
+
+        let msgs = crate::inbox::drain(&home, "dev-agent");
+        assert!(
+            msgs.iter().all(|m| m.text != "hi"),
+            "short message must not be persisted to inbox (PTY-inject-only path); got: {:?}",
+            msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #2562 PR-1 regression pin, same shape as `build_http_client_does_not_
+    /// panic_on_bare_thread`: the dispatch path touches no tokio runtime, so
+    /// calling it from a genuine bare `std::thread` must not panic.
+    #[test]
+    fn dispatch_channel_event_does_not_panic_on_bare_thread() {
+        let home = dispatch_test_home("bare-thread");
+        let home_for_thread = home.clone();
+        let joined = std::thread::spawn(move || {
+            let (ch, _tx) = super::DiscordChannel::new_for_test();
+            super::dispatch_channel_event(
+                &ch,
+                &home_for_thread,
+                message_in_event(333, "bare thread smoke"),
+            );
+        })
+        .join();
+        assert!(
+            joined.is_ok(),
+            "dispatch_channel_event must not panic when called from a bare std::thread \
+             with no ambient Tokio runtime"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// §3.5.10 wire-format fixture: outbound POST /channels/{id}/messages
