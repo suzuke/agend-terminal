@@ -1020,7 +1020,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 fleet_path: &fleet_path,
                                 wakeup_tx: &wakeup_tx,
                                 name_counter: &mut name_counter,
-                                telegram_state: &telegram_state,
                             };
                             let outcome = overlay::handle_key(&mut overlay, key, &mut octx);
                             if outcome.needs_resize {

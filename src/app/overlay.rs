@@ -5,7 +5,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::agent::AgentRegistry;
 use crate::backend::Backend;
@@ -181,7 +180,6 @@ pub(super) struct OverlayCtx<'a> {
     pub fleet_path: &'a Path,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
-    pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
 
 #[derive(Default)]
@@ -232,7 +230,6 @@ pub(super) fn handle_key(
                         ) {
                             Ok(pane) => {
                                 super::telegram_hooks::maybe_create_telegram_topic(
-                                    ctx.telegram_state,
                                     ctx.registry,
                                     ctx.home,
                                     &pane,
@@ -302,7 +299,6 @@ pub(super) fn handle_key(
                             ) {
                                 Ok(p) => {
                                     super::telegram_hooks::maybe_create_telegram_topic(
-                                        ctx.telegram_state,
                                         ctx.registry,
                                         ctx.home,
                                         &p,
@@ -595,7 +591,6 @@ pub(super) fn handle_key(
                     home: ctx.home,
                     wakeup_tx: ctx.wakeup_tx,
                     name_counter: &mut *ctx.name_counter,
-                    telegram_state: ctx.telegram_state,
                 };
                 if super::commands::execute(&cmd, &mut cctx) {
                     outcome.needs_resize = true;
@@ -1112,7 +1107,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
@@ -1121,7 +1115,6 @@ mod tests {
             fleet_path: home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
-            telegram_state: &tg,
         };
         for k in keys {
             handle_key(overlay, press(*k), &mut ctx);
@@ -1135,7 +1128,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
@@ -1144,7 +1136,6 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
-            telegram_state: &tg,
         };
         let mut overlay = task_overlay();
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
@@ -1159,7 +1150,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
@@ -1168,7 +1158,6 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
-            telegram_state: &tg,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1189,7 +1178,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
@@ -1198,7 +1186,6 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
-            telegram_state: &tg,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1237,7 +1224,6 @@ mod tests {
         registry: &'a crate::agent::AgentRegistry,
         tx: &'a crossbeam_channel::Sender<usize>,
         name_counter: &'a mut HashMap<String, usize>,
-        tg: &'a Option<Arc<dyn crate::channel::Channel>>,
     ) -> OverlayCtx<'a> {
         OverlayCtx {
             layout,
@@ -1246,7 +1232,6 @@ mod tests {
             fleet_path: home,
             wakeup_tx: tx,
             name_counter,
-            telegram_state: tg,
         }
     }
 
@@ -1258,7 +1243,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
 
         // Create a task (status=open) — #2306: open lives in the Todo column (0).
@@ -1279,7 +1263,7 @@ mod tests {
         };
 
         // Kitty protocol: Shift+L → KeyCode::Char('l') + SHIFT
-        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
+        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
         // Reload from disk — must be persisted. #2306: Todo →L→ Working (in_progress).
@@ -1306,7 +1290,6 @@ mod tests {
             let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
             let (tx, _rx) = crossbeam_channel::unbounded();
             let mut name_counter = HashMap::new();
-            let tg: Option<Arc<dyn crate::channel::Channel>> = None;
             let mut layout = crate::layout::Layout::new();
 
             crate::tasks::handle(
@@ -1327,7 +1310,7 @@ mod tests {
                 view: BoardView::Tasks,
             };
 
-            let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
+            let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
             handle_key(&mut overlay, key_event, &mut ctx);
 
             let reloaded = crate::tasks::list_all(&home);
@@ -1351,7 +1334,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
 
         // Create two tasks in Open column with different priorities
@@ -1387,7 +1369,7 @@ mod tests {
             view: BoardView::Tasks,
         };
 
-        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
+        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
         // high-pri must have moved, low-pri must stay
@@ -1420,7 +1402,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
@@ -1429,7 +1410,6 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
-            telegram_state: &tg,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1466,7 +1446,6 @@ mod tests {
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
-        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
@@ -1475,7 +1454,6 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
-            telegram_state: &tg,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
