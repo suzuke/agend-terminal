@@ -10,7 +10,6 @@ use crate::layout::{Layout, SplitDir, Tab};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Bundle of mutable references the command handler needs to affect the
 /// running TUI state. Constructed by the caller for each invocation.
@@ -20,7 +19,6 @@ pub(super) struct CommandCtx<'a> {
     pub home: &'a Path,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
-    pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
 
 /// The dynamic source feeding a command-argument position, declared per token in
@@ -408,7 +406,6 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
             match pane_result {
                 Ok(pane) => {
                     super::telegram_hooks::maybe_create_telegram_topic(
-                        ctx.telegram_state,
                         ctx.registry,
                         ctx.home,
                         &pane,
@@ -439,11 +436,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         "kill" => {
             if let Some(name) = parts.get(1) {
                 if let Some(fleet_name) = lookup_fleet_name(ctx.layout, name) {
-                    super::telegram_hooks::maybe_delete_telegram_topic(
-                        ctx.telegram_state,
-                        ctx.home,
-                        &fleet_name,
-                    );
+                    super::telegram_hooks::maybe_delete_telegram_topic(ctx.home, &fleet_name);
                     let _ = crate::fleet::remove_instance_from_yaml(ctx.home, &fleet_name);
                 }
                 super::kill_agent(ctx.home, ctx.registry, name);
