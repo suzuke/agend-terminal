@@ -25,6 +25,15 @@
 //! runs it through [`run_handlers_with_panic_guard`] (a panicking handler is
 //! isolated, never aborting the tick). Further subsystems move behind the
 //! same trait by extending that Vec.
+//!
+//! #2549 operator-approved deletions (d-20260703021554626467-13): removed
+//! `ProgressBackstopHandler` + `ProgressMirrorHandler` (the `progress_mode`
+//! runtime-config key they served was retired along with them — see
+//! `runtime_config.rs`) and `CrossBoardDepDetectiveHandler` (its underlying
+//! `tasks::reconcile_stale_cross_board_claims` logic is untouched, only the
+//! per-tick wrapper is gone). `RecoveryDispatcherHandler` converged to
+//! Stage1-only (Stage2/3 skeleton removed). 40 → 37 handlers in
+//! `build_default_handlers`.
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use parking_lot::Mutex;
@@ -37,7 +46,6 @@ pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
-pub(crate) mod cross_board_dep_detective;
 pub(crate) mod ephemeral_reap;
 pub(crate) mod external_liveness;
 pub(crate) mod gc_tick;
@@ -51,8 +59,6 @@ pub(crate) mod log_rotation;
 pub(crate) mod notification_flush;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state_scan;
-pub(crate) mod progress_backstop;
-pub(crate) mod progress_mirror;
 pub(crate) mod reclaim;
 pub(crate) mod reconcile_backups_gc;
 pub(crate) mod recovery_dispatcher;
@@ -70,7 +76,6 @@ pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use context_alert::ContextAlertHandler;
 pub(crate) use context_handoff::ContextHandoffHandler;
-pub(crate) use cross_board_dep_detective::CrossBoardDepDetectiveHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use handoff_timeout::HandoffTimeoutHandler;
@@ -83,8 +88,6 @@ pub(crate) use log_rotation::LogRotationHandler;
 pub(crate) use notification_flush::NotificationFlushHandler;
 pub(crate) use poll_reminder::PollReminderHandler;
 pub(crate) use pr_state_scan::PrStateScanHandler;
-pub(crate) use progress_backstop::ProgressBackstopHandler;
-pub(crate) use progress_mirror::ProgressMirrorHandler;
 pub(crate) use reclaim::ReclaimHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
 pub(crate) use respawn_watchdog::RespawnWatchdogHandler;
@@ -363,18 +366,6 @@ pub(crate) fn build_default_handlers(
         // (Fix A) is timely; the lead ESCALATION stays gated by its own 10min age
         // + 30min re-alert windows, so the faster scan doesn't escalate sooner.
         Box::new(HandoffTimeoutHandler::new(12)),
-        // #2090 (report mode): progress-backstop watchdog — ~30s cadence, boot-
-        // grace suppressed. Only fires when `progress_mode == 2`; nudges an agent
-        // to self-report if an external-channel turn runs long with no reply. It
-        // never authors/relays content itself (zero exfil). Default progress_mode
-        // is 0 (off) → this is a cheap early-return no-op for a default fleet.
-        Box::new(ProgressBackstopHandler::new()),
-        // #2090 (mirror mode): progress-mirror — every tick. Only relays when
-        // `progress_mode == 1`; tails each agent's transcript and sends NEW
-        // assistant text to its origin channel (active-turn gated, no broadcast,
-        // no backlog replay, truncated). ⚠ exfil surface — default OFF, so this
-        // is a cheap early-return no-op for a default fleet.
-        Box::new(ProgressMirrorHandler::new()),
         // Daemon-side deferred-notification flush — every tick (~10s). The
         // #1513 busy-gate defers notifications into the queue whose only other
         // flusher is the TUI loop; headless `run_core` (`start --foreground`)
@@ -455,9 +446,6 @@ pub(crate) fn build_default_handlers(
         // claimed/in_progress tasks back to Open + clears the work-stuck latch.
         // Runs in both run_core and app mode (live daemon is app-mode).
         Box::new(ReclaimHandler::new(30, work_stuck_latch)),
-        // AUDIT2-014 (B'): cross-board claim-race detective backstop (multi-board
-        // only, Low), every 30 ticks (~5min). See the handler's module doc.
-        Box::new(CrossBoardDepDetectiveHandler::new(30)),
     ]
 }
 

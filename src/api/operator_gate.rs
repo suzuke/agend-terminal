@@ -168,14 +168,15 @@ pub(crate) fn check_operation_allowed(
     }
 
     // AUDIT2-003: a handful of runtime-config keys are safety/observability gates
-    // — `progress_mode` (=1 mirrors the FULL assistant transcript off-box), and
-    // the watchdog / recovery / usage-limit toggles that govern the operator's
+    // — the watchdog / recovery / usage-limit toggles that govern the operator's
     // visibility into (and auto-recovery of) a misbehaving agent. An agent must
     // not flip these in ANY mode, fleet-wide, or it could silence the very alerts
     // an injected agent would want silenced. Benign UI keys stay agent-settable.
+    // (#2549: `progress_mode` removed from this list — the key itself was
+    // retired along with ProgressBackstop/ProgressMirror, not merely moved to
+    // another surface, so there is no longer a real key here to defend.)
     if op == "config" && matches!(action, Some("set")) {
         const OPERATOR_ONLY_CONFIG_KEYS: &[&str] = &[
-            "progress_mode",
             "idle_watchdog_enabled",
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
@@ -514,7 +515,6 @@ mod tests {
                    "arguments": {"action": "set", "key": key, "value": "1"}})
         };
         for key in [
-            "progress_mode",
             "idle_watchdog_enabled",
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
