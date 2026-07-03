@@ -1,18 +1,51 @@
-//! Hook-driven state SHADOW store (PoC, #hook-state-spike phase 2).
+//! Hook-driven state SHADOW store — originated as a PoC (#hook-state-spike
+//! phase 2), now LIVE production infrastructure with real consumers (see
+//! "Current status" below). **Do not delete this module on a "PoC cleanup"
+//! pass** — it backs the inject-delivery watchdog and the ServerRateLimit
+//! hook-override.
 //!
 //! Claude Code lifecycle hooks (injected per-workspace by `mcp_config.rs`
 //! under the `AGEND_HOOK_STATE_POC=1` flag) report back via the
 //! `agend-terminal hook-event` subcommand → the `HOOK_EVENT` API method →
-//! here. SHADOW-MODE ONLY: events are recorded and compared against the
-//! screen-heuristic state (`#hook-shadow` log) — they do NOT drive
-//! transitions. Empirically verified before wiring (2026-06-11, live fleet
+//! [`record_event`], which populates this store unconditionally for any hook
+//! event received (independent of whether promotion — see below — is
+//! enabled). Empirically verified before wiring (2026-06-11, live fleet
 //! spawn): SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop
 //! / Notification(idle_prompt) all fire as documented with the expected
 //! payload fields; the TUI shows no artifacts (async hooks).
 //!
-//! Promotion to authoritative (hook state wins over heuristic within a
-//! freshness window, the #1945 resolution pattern) is the PRODUCTION step,
-//! gated on shadow agreement data from this PoC.
+//! ## Current status (post-#2413)
+//!
+//! The original PoC goal — this module's own `authoritative_state` snapshot
+//! promotion (hook state overriding the screen heuristic within a freshness
+//! window, gated on shadow-agreement data collected here) — was REMOVED,
+//! superseded by the multi-backend Shadow Observer's `observed_status`
+//! promotion at a different chokepoint (`per_tick/snapshot.rs`, gated by
+//! `shadow::operated_dispatch_enabled` + `shadow::gate`; see the comment
+//! above [`is_promoted`] for detail). That removal does NOT make this
+//! module dead: its store is independently read by name from three
+//! production call sites, none of which go through any promotion mechanism —
+//! - [`fresh_active_hook_seq`] / [`latest_hook_seq`] — `daemon::supervisor`'s
+//!   ServerRateLimit-retry hook-override (a fresh active hook proves the
+//!   agent is genuinely working, so a sticky screen-scraped SRL must not
+//!   fire).
+//! - [`last_user_prompt_submit_for`] — `daemon::inject_delivery`'s watchdog
+//!   (a `UserPromptSubmit` is the only proof a daemon-injected prompt
+//!   physically reached the agent; a dialog-swallowed inject never submits
+//!   one).
+//! - [`is_promoted`] and [`record_event`] — `api::handlers::hook_event`, the
+//!   API handler that writes every hook event into this store and reports
+//!   whether THIS backend is hook-promoted (for the `#hook-shadow` log's
+//!   honest disposition).
+//! - [`forget`] — `mcp::handlers::instance_state::lifecycle`'s delete path
+//!   (evicts a deleted agent's entry so a same-name redeploy doesn't inherit
+//!   stale state).
+//!
+//! [`resolved_state_for`] is the one piece that IS production-dead (#2547:
+//! its sole caller, `recovery_shadow.rs`, was deleted as dead code) — kept
+//! `#[cfg(test)]`-only as a convenience wrapper for the freshness-window
+//! regression tests below, which exercise the same `resolve_snapshot` logic
+//! production code still calls directly (see its own doc comment).
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -21,11 +54,13 @@ use std::sync::OnceLock;
 
 /// One agent's latest hook-derived observation.
 ///
-/// PoC scaffolding (deferred consumers, not ghost — the #649-trio annotation
-/// pattern): in shadow-mode the only readers are the `#hook-shadow` log (which
-/// reads the values at record time) and tests; the PRODUCTION promotion step
-/// (hook state wins over heuristic within a freshness window) is the consumer
-/// of `snapshot_for` + these fields.
+/// LIVE fields, not scaffolding — see the module doc's "Current status" for
+/// the three production call sites that read `snapshot_for` + these fields
+/// directly (`fresh_active_hook_seq`/`latest_hook_seq`,
+/// `last_user_prompt_submit_for`, `is_promoted`/`record_event`), none of them
+/// through the now-removed `authoritative_state` promotion step. Every field
+/// is read by at least one of those paths (`resolve_snapshot`,
+/// `last_user_prompt_submit_for`) or the freshness-window tests.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HookShadow {
