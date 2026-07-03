@@ -43,6 +43,7 @@ pub(crate) mod external_liveness;
 pub(crate) mod gc_tick;
 pub(crate) mod handoff_timeout;
 pub(crate) mod hang_detection;
+pub(crate) mod hourly_gc;
 pub(crate) mod inbox_maintenance;
 pub(crate) mod inbox_stuck;
 pub(crate) mod inject_delivery;
@@ -72,9 +73,9 @@ pub(crate) use context_handoff::ContextHandoffHandler;
 pub(crate) use cross_board_dep_detective::CrossBoardDepDetectiveHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
-pub(crate) use gc_tick::GcTickHandler;
 pub(crate) use handoff_timeout::HandoffTimeoutHandler;
 pub(crate) use hang_detection::HangDetectionHandler;
+pub(crate) use hourly_gc::HourlyGcHandler;
 pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
 pub(crate) use inbox_stuck::InboxStuckHandler;
 pub(crate) use inject_delivery::InjectDeliveryHandler;
@@ -85,7 +86,6 @@ pub(crate) use pr_state_scan::PrStateScanHandler;
 pub(crate) use progress_backstop::ProgressBackstopHandler;
 pub(crate) use progress_mirror::ProgressMirrorHandler;
 pub(crate) use reclaim::ReclaimHandler;
-pub(crate) use reconcile_backups_gc::ReconcileBackupsGcHandler;
 pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
 pub(crate) use respawn_watchdog::RespawnWatchdogHandler;
 pub(crate) use shadow_observe::ShadowObserveHandler;
@@ -97,9 +97,7 @@ pub(crate) use supervisor_trackers::{
     RetentionHandler, WaitingOnStaleHandler,
 };
 pub(crate) use thread_dump::ThreadDumpHandler;
-pub(crate) use tmp_review_gc::TmpReviewGcHandler;
 pub(crate) use watchdog::WatchdogHandler;
-pub(crate) use workspace_boundary_sweep::WorkspaceBoundarySweepHandler;
 
 /// Shared per-tick context. Field types match what the daemon main loop
 /// holds verbatim — the trait is pure relocation, not abstraction. New
@@ -388,20 +386,21 @@ pub(crate) fn build_default_handlers(
         Box::new(NotificationFlushHandler::new(1)),
         Box::new(LogRotationHandler::new(360)),
         Box::new(ThreadDumpHandler::new()),
-        Box::new(GcTickHandler::new(360)),
-        // #2158 item 2: hourly stray-managed-worktree sweep (edge-triggered
-        // event-log + fleet health count). Same 360-tick GC cadence; runs in app
-        // mode too (not allowlisted out) since the live daemon is app-mode.
-        Box::new(WorkspaceBoundarySweepHandler::new(360)),
-        // #1747: slow-cadence backstop GC for stale /tmp review worktrees (mtime
-        // > 2d). Same 360-tick cadence as the other GC siblings; runs in app mode
-        // (not allowlisted out) since the live daemon is app-mode.
-        Box::new(TmpReviewGcHandler::new(360)),
-        // #2234 (B) prereq: hourly retention GC for <home>/reconcile-backups/
-        // (mtime-age ≥ 14d), with a per-agent newest-1 floor as the destroy-work
-        // safety net. Same 360-tick cadence as the GC siblings; app-mode (the
-        // live daemon is app-mode). (B) OFF → no backups → natural no-op.
-        Box::new(ReconcileBackupsGcHandler::new(360)),
+        // #2549 W1: GcTickHandler (worktree GC + stale ci-watch locks + target/
+        // sweep), WorkspaceBoundarySweepHandler (#2158 item 2: hourly
+        // stray-managed-worktree sweep, edge-triggered event-log + fleet
+        // health count), TmpReviewGcHandler (#1747: slow-cadence backstop GC
+        // for stale /tmp review worktrees, mtime > 2d), and
+        // ReconcileBackupsGcHandler (#2234 (B) prereq: hourly retention GC for
+        // <home>/reconcile-backups/, mtime-age ≥ 14d + per-agent newest-1
+        // floor) collapsed into one registered handler — same 360-tick
+        // cadence, same thread, mutually independent; each sub-sweep keeps
+        // its own cadence gate / extra state unchanged and is panic-isolated
+        // from its siblings inside `HourlyGcHandler::run` (per-sweep
+        // catch_unwind, replacing the per-handler isolation the outer loop
+        // used to provide for these 4 separately). All four run in app mode
+        // too (not allowlisted out) since the live daemon is app-mode.
+        Box::new(HourlyGcHandler::new(360)),
         // #1967 Phase-1 (PR1): reap ephemeral workers every ~1min (6 ticks) —
         // removes/terminates terminal, max-wall-TTL-expired (cost guard), or
         // already-dead workers. Runs in app mode too (not allowlisted out); the
