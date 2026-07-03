@@ -82,6 +82,18 @@ pub fn lookup_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
 /// Create a forum topic for a new instance.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
     // Idempotent: reuse existing topic from topics.json if present.
+    //
+    // #2550: this reuse is trusted without verifying the topic still exists /
+    // still means what the mapping claims — the Bot API has no read-only
+    // "does this forum topic still exist" call (only state-changing
+    // edit/close/reopen/delete/unpin methods), so a clean, side-effect-free
+    // verification isn't available. `full_delete_instance` unregisters this
+    // mapping unconditionally on delete (regardless of whether the Telegram-
+    // side delete itself succeeded), which closes the main way a stale
+    // mapping used to survive to be reused here. The remaining exposure is
+    // narrow: the Telegram-side topic vanishing unilaterally (not through our
+    // own delete path) or the daemon crashing mid-teardown before reaching
+    // the unregister step above — accepted residual risk, not guarded here.
     if let Some(tid) = lookup_topic_for_instance(home, instance_name) {
         tracing::info!(instance = %instance_name, topic_id = tid, "reusing existing topic");
         return Some(tid);

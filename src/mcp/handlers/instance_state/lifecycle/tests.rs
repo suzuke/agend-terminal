@@ -274,6 +274,45 @@ fn full_delete_instance_removes_usage_limit_notify_1906() {
     std::fs::remove_dir_all(home).ok();
 }
 
+/// #2550 telegram-topic-lifecycle (identity-confusion root cause): when
+/// `telegram::delete_topic` can't reach Telegram (no channel configured here
+/// → `ChannelUnavailable`, the same "topic-side cleanup failed" shape as a
+/// live `PermissionDenied`/`ApiError`), `full_delete_instance` must STILL
+/// unregister the topic_id from `topics.json` — leaving it mapped is exactly
+/// what let a LATER same-name instance silently inherit a stale/foreign
+/// topic_id via `create_topic_for_instance`'s reuse-if-found check, which
+/// could then have its own first genuine topic-closed event tear down the
+/// wrong (new) instance.
+#[test]
+fn full_delete_instance_unregisters_topic_even_when_telegram_delete_fails_2550() {
+    let home = tmp_home("topic_unregister_on_fail");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  doomed:\n    backend: claude\n    topic_id: 501\n",
+    )
+    .unwrap();
+    // No `channel:` section in fleet.yaml → `resolve_channel_only_from` errors
+    // → `delete_topic` returns `ChannelUnavailable` without ever reaching
+    // `unregister_topic` pre-fix (deterministic, no network/bot-token needed).
+    crate::channel::telegram::register_topic(&home, 501, "doomed").expect("seed topics.json");
+    assert_eq!(
+        crate::channel::telegram::lookup_topic_for_instance(&home, "doomed"),
+        Some(501),
+        "pre: topic mapping must exist"
+    );
+
+    let _ = super::full_delete_instance(&home, "doomed");
+
+    assert_eq!(
+        crate::channel::telegram::lookup_topic_for_instance(&home, "doomed"),
+        None,
+        "topics.json must be unregistered even when the Telegram-side delete \
+         couldn't run — a stale mapping left behind is what a later same-name \
+         instance would silently (and wrongly) inherit"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
 #[test]
 fn full_delete_instance_releases_worktree_1906() {
     // #1906 Leak 1 §3.9: a single delete must release the PHYSICAL worktree

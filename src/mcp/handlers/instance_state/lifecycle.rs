@@ -105,7 +105,30 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
     }
     if let Some(tid) = topic_id {
-        telegram::delete_topic(home, tid);
+        // #2550 identity-confusion root cause: `delete_topic` only unregisters
+        // `topics.json` on its own `Deleted` outcome. A `PermissionDenied` /
+        // `ApiError` / `ChannelUnavailable` result left the mapping in place —
+        // our own bookkeeping said this instance still owned `tid` even though
+        // we'd already decided to tear it down. A LATER instance created under
+        // the same name then silently inherited that stale mapping via
+        // `create_topic_for_instance`'s reuse-if-found check, with no
+        // verification the topic still meant what the mapping claimed.
+        // Unregister unconditionally: our registry reflects our own intent
+        // (this instance is gone) regardless of whether the Telegram-side API
+        // call could complete. A Telegram-side topic left dangling after a
+        // failed delete becomes a genuine orphan (no daemon-side mapping to
+        // anything) for the existing orphan-sweep paths (`doctor_topics`,
+        // `bootstrap::init_from_config`) to reap later — not a landmine for
+        // the next same-name instance.
+        match telegram::delete_topic(home, tid) {
+            telegram::DeleteTopicOutcome::Deleted => {}
+            other => {
+                telegram::unregister_topic(home, tid);
+                let detail = format!("telegram topic {tid} cleanup: {other:?}");
+                tracing::warn!(%name, topic_id = tid, %detail, "full_delete_instance: topic cleanup incomplete — registry unregistered anyway");
+                step_errors.push(detail);
+            }
+        }
     } else {
         tracing::warn!(%name, "no topic_id found for full_delete_instance — possible orphan");
     }
