@@ -192,23 +192,11 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
     if branch.is_empty() {
         return Vec::new();
     }
-    let runtime_dir = crate::paths::runtime_dir(home);
-    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let other = entry.file_name().to_string_lossy().to_string();
+    for (other, v) in crate::binding::binding_scan_all(home) {
         if other == exclude_agent {
             continue;
         }
-        let bp = crate::paths::binding_path(home, &other);
-        let Ok(c) = std::fs::read_to_string(&bp) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&c) else {
-            continue;
-        };
         if v["branch"].as_str() == Some(branch) {
             out.push(other);
         }
@@ -485,6 +473,24 @@ mod tests {
         assert!(
             !names.contains(&"gamma"),
             "gamma holds a different branch, must NOT appear: {names:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2550 W3 Wave1 pin: a corrupt sibling binding.json must not abort the
+    /// scan — a later agent's valid, matching binding must still surface.
+    #[test]
+    fn cross_branch_holders_for_skips_corrupt_binding_continues_scan_2550_w3() {
+        let home = tmp_home("cross-corrupt");
+        let corrupt_dir = crate::paths::runtime_dir(&home).join("corrupt-agent");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("binding.json"), b"not valid json").unwrap();
+        write_binding(&home, "beta", "shared-branch", "/tmp/wt-beta");
+
+        let holders = cross_branch_holders_for(&home, "shared-branch", "alpha");
+        assert!(
+            holders.contains(&"beta".to_string()),
+            "a corrupt sibling binding must not block finding beta: {holders:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

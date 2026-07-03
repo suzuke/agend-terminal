@@ -664,6 +664,30 @@ pub fn scan_existing_branch_binding(
     None
 }
 
+/// #2550 W3 Wave1: fresh (uncached) enumeration of every agent under `home`'s
+/// runtime dir whose `binding.json` is present and parses as JSON. An agent
+/// with a missing/unreadable/corrupt binding.json is silently skipped —
+/// every existing scan-all-agents call site already tolerated this, so the
+/// shared primitive preserves it uniformly. Field-level extraction and any
+/// further validation (branch match, empty-task_id, dedup, ...) is the
+/// caller's job.
+pub(crate) fn binding_scan_all(home: &Path) -> Vec<(String, serde_json::Value)> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let agent_name = entry.file_name().to_string_lossy().into_owned();
+            let binding_path = crate::paths::binding_path(home, &agent_name);
+            let content = std::fs::read_to_string(&binding_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+            Some((agent_name, v))
+        })
+        .collect()
+}
+
 /// PR-3 (t-ci-ready-pr3-arm-not-armed): the distinct `source_repo` paths of every
 /// LIVE bound branch (each `runtime/<agent>/binding.json`'s `source_repo`).
 ///
@@ -675,20 +699,8 @@ pub fn scan_existing_branch_binding(
 /// #1782 gap). Returns raw paths (slug resolution is the caller's job) to keep
 /// this module free of the git/scm dependency.
 pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
-    let runtime_dir = crate::paths::runtime_dir(home);
-    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
-        return Vec::new();
-    };
     let mut repos: Vec<std::path::PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        let agent_name = entry.file_name().to_string_lossy().into_owned();
-        let binding_path = crate::paths::binding_path(home, &agent_name);
-        let Ok(content) = std::fs::read_to_string(&binding_path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
+    for (_, v) in binding_scan_all(home) {
         if let Some(src) = v["source_repo"].as_str() {
             let path = std::path::PathBuf::from(src);
             if !repos.contains(&path) {
@@ -1086,6 +1098,74 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    // ─── #2550 W3 Wave1 pins: bound_source_repos (pre-refactor, zero prior
+    // coverage) — locks current field-extraction/dedup/corruption-tolerance/
+    // missing-field behavior before the binding_scan_all() extraction. ───────
+
+    #[test]
+    fn bound_source_repos_returns_distinct_source_repos_2550_w3() {
+        let home = tmp_home("src-repos-distinct");
+        write_binding_json(&home, "alpha", "feat/a", Some("/repo/a"));
+        write_binding_json(&home, "beta", "feat/b", Some("/repo/b"));
+
+        let mut repos = bound_source_repos(&home);
+        repos.sort();
+        assert_eq!(
+            repos,
+            vec![
+                std::path::PathBuf::from("/repo/a"),
+                std::path::PathBuf::from("/repo/b")
+            ],
+            "distinct source_repo paths across agents must all surface: {repos:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bound_source_repos_dedupes_same_source_repo_2550_w3() {
+        let home = tmp_home("src-repos-dedup");
+        write_binding_json(&home, "alpha", "feat/a", Some("/repo/shared"));
+        write_binding_json(&home, "beta", "feat/b", Some("/repo/shared"));
+
+        let repos = bound_source_repos(&home);
+        assert_eq!(
+            repos,
+            vec![std::path::PathBuf::from("/repo/shared")],
+            "two agents bound to the SAME source_repo must dedupe to one entry: {repos:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bound_source_repos_skips_missing_source_repo_field_2550_w3() {
+        let home = tmp_home("src-repos-missing-field");
+        write_binding_json(&home, "legacy", "feat/legacy", None); // no source_repo
+
+        let repos = bound_source_repos(&home);
+        assert!(
+            repos.is_empty(),
+            "a binding with no source_repo field must not contribute an entry: {repos:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bound_source_repos_tolerates_corrupt_binding_json_2550_w3() {
+        let home = tmp_home("src-repos-corrupt");
+        let corrupt_dir = crate::paths::runtime_dir(&home).join("corrupt-agent");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("binding.json"), b"not valid json").unwrap();
+        write_binding_json(&home, "good-agent", "feat/good", Some("/repo/good"));
+
+        let repos = bound_source_repos(&home);
+        assert_eq!(
+            repos,
+            vec![std::path::PathBuf::from("/repo/good")],
+            "a corrupt sibling binding must not block finding the valid one: {repos:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #2234: install_hooks must write the reference-transaction detach instrument

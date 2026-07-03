@@ -192,17 +192,7 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
     if branch.is_empty() {
         return None;
     }
-    let runtime_dir = crate::paths::runtime_dir(home);
-    let entries = std::fs::read_dir(&runtime_dir).ok()?;
-    for entry in entries.flatten() {
-        let agent_name = entry.file_name().to_string_lossy().into_owned();
-        let binding_path = crate::paths::binding_path(home, &agent_name);
-        let Ok(content) = std::fs::read_to_string(&binding_path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
+    for (_, v) in crate::binding::binding_scan_all(home) {
         if v["branch"].as_str() != Some(branch) {
             continue;
         }
@@ -470,6 +460,40 @@ mod tests {
         assert!(
             touched.is_none(),
             "self-binding must NOT trigger progress touch"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2550 W3 Wave1 pin: a corrupt binding.json for one agent must not
+    /// abort the scan — a later agent's matching, valid binding must still
+    /// be found.
+    #[test]
+    fn touch_progress_for_branch_skips_corrupt_binding_continues_scan_2550_w3() {
+        let home = tmp_home("hook-corrupt-continues");
+        let corrupt_dir = crate::paths::runtime_dir(&home).join("corrupt-agent");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("binding.json"), b"not valid json").unwrap();
+
+        let good_dir = crate::paths::runtime_dir(&home).join("good-agent");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        let binding = serde_json::json!({
+            "version": 1,
+            "agent": "good-agent",
+            "task_id": "t-scan-continues",
+            "branch": "feature/z",
+            "issued_at": "2026-05-09T00:00:00Z",
+        });
+        std::fs::write(
+            good_dir.join("binding.json"),
+            serde_json::to_string_pretty(&binding).unwrap(),
+        )
+        .unwrap();
+
+        let touched = touch_progress_for_branch(&home, "feature/z");
+        assert_eq!(
+            touched.as_deref(),
+            Some("t-scan-continues"),
+            "a corrupt sibling binding must not block finding the valid match: {touched:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
