@@ -91,6 +91,16 @@ pub(crate) fn handle_release_repo(args: &Value) -> Value {
     // git-raw-allowed: deliberate non-bypass + no current_dir; already bounded via
     // spawn_group_bounded; the Ok(non-zero) arm surfaces stderr in the JSON `note`
     // (git_ok would discard it), so git_cmd/git_ok would not be byte-identical.
+    //
+    // #2550 W2 (git_worktree.rs primitives module): this is the ONE
+    // `worktree remove --force` call site NOT converged onto
+    // `git_worktree::remove_force` — that helper always either bypasses
+    // (non-empty repo) or sets AGEND_GIT_BYPASS without a cwd (empty repo),
+    // neither of which matches this site's deliberate no-bypass/no-cwd
+    // shape. Lead's decision (`m-20260703064336281447-62`): a mechanical
+    // consolidation PR must not silently resolve this still-open "should it
+    // bypass like ci/mod:270" question above — left as-is, tracked as an
+    // open item for operator/a future lead, not part of W2.
     let mut cmd = std::process::Command::new("git");
     cmd.args(["worktree", "remove", "--force", &path_str]);
     let result = match crate::git_helpers::spawn_group_bounded(

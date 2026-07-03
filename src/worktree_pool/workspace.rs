@@ -56,20 +56,12 @@ pub fn teardown_workspace_worktree(home: &Path, agent: &str, working_dir: &Path)
 
     // Mirror `remove_worktree`'s git call, WITHOUT the marker veto: run from the
     // owning repo so the registration is cleared (not just the dir).
+    // #2550 W2: `git_worktree::remove_force` — defensive empty-source_repo
+    // fallback (effectively unreachable — a real gitlink always yields a
+    // common-dir) mirrors `remove_worktree`'s byte-identical arm; see
+    // git_worktree.rs module doc for the shared "lead ruling" rationale.
     let wt_str = working_dir.display().to_string();
-    let result = if source_repo.as_os_str().is_empty() {
-        // git-raw-allowed: defensive fallback when the owning repo can't be
-        // resolved (effectively unreachable — a real gitlink always yields a
-        // common-dir). Mirrors `remove_worktree`'s empty-source_repo arm: git
-        // must resolve the repo from the absolute `<wt>` itself, so this runs
-        // with NO `current_dir` — `git_bypass`/`git_cmd` both REQUIRE a cwd.
-        std::process::Command::new("git")
-            .args(["worktree", "remove", "--force", &wt_str])
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-    } else {
-        crate::git_helpers::git_bypass(&source_repo, &["worktree", "remove", "--force", &wt_str])
-    };
+    let result = crate::git_worktree::remove_force(&source_repo, &wt_str);
     let removed = matches!(&result, Ok(o) if o.status.success());
     if !removed {
         if let Ok(o) = &result {

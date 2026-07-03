@@ -171,36 +171,6 @@ pub struct ManagedWorktree {
     pub registered: bool,
 }
 
-/// Parse `git worktree list --porcelain` into `(path, branch)` pairs. Porcelain
-/// records are blank-line-separated; `worktree <path>` opens a record, `branch
-/// refs/heads/<b>` names the checked-out branch (absent = detached).
-fn parse_worktree_porcelain(out: &str) -> Vec<(PathBuf, Option<String>)> {
-    let mut records = Vec::new();
-    let mut cur_path: Option<PathBuf> = None;
-    let mut cur_branch: Option<String> = None;
-    let flush = |p: &mut Option<PathBuf>, b: &mut Option<String>, out: &mut Vec<_>| {
-        if let Some(path) = p.take() {
-            out.push((path, b.take()));
-        }
-        *b = None;
-    };
-    for line in out.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            flush(&mut cur_path, &mut cur_branch, &mut records);
-            cur_path = Some(PathBuf::from(p.trim()));
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            cur_branch = Some(
-                b.trim()
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(b.trim())
-                    .to_string(),
-            );
-        }
-    }
-    flush(&mut cur_path, &mut cur_branch, &mut records);
-    records
-}
-
 /// #2234 Phase 2: cure-(B) workspace worktrees — `workspace/<agent>` dirs whose
 /// `.git` is a gitlink FILE (a real worktree, Phase 0's discriminator). Empty
 /// when (B) is OFF (no workspace dir is a worktree), so every consumer stays
@@ -283,24 +253,20 @@ pub fn enumerate_managed_worktrees(home: &Path, source_repo: &Path) -> Vec<Manag
 
     // Registry pass — authoritative, any path. Filter to the managed roots
     // (excludes the canonical main worktree + foreign worktrees).
-    if let Ok(out) =
-        crate::git_helpers::git_bypass(source_repo, &["worktree", "list", "--porcelain"])
-    {
-        if out.status.success() {
-            for (path, branch) in parse_worktree_porcelain(&String::from_utf8_lossy(&out.stdout)) {
-                let cp = canon(&path);
-                if under_managed(&cp) {
-                    let agent = agent_of(&cp);
-                    by_path.insert(
-                        cp.clone(),
-                        ManagedWorktree {
-                            path: cp,
-                            agent,
-                            branch,
-                            registered: true,
-                        },
-                    );
-                }
+    if let Ok(entries) = crate::git_worktree::list_porcelain(source_repo) {
+        for (path, branch) in entries {
+            let cp = canon(&path);
+            if under_managed(&cp) {
+                let agent = agent_of(&cp);
+                by_path.insert(
+                    cp.clone(),
+                    ManagedWorktree {
+                        path: cp,
+                        agent,
+                        branch,
+                        registered: true,
+                    },
+                );
             }
         }
     }
