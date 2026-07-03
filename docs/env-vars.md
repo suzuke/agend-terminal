@@ -63,16 +63,14 @@ The variables below are the **default names** for that indirection.
 
 ## 4. Auto-recovery
 
-The Stage gates are **value-based** (must equal `"1"`); when off they run in
+The Stage 1 gate is **value-based** (must equal `"1"`); when off it runs in
 "shadow mode" (telemetry/logging only, no live action). A separate runtime-config
-master gate (`hang_auto_recovery_enabled`) can also enable Stages 1–3.
+master gate (`hang_auto_recovery_enabled`) can also enable it. (#2549: Stage 2/3
+gates removed — converged to Stage-1-only, see `docs/RECOVERY-STAGES.md`.)
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_AUTO_RECOVERY_STAGE1` | Stage 1 gate: write ESC byte to a hung agent's PTY. | Inactive (shadow mode) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:193` | Operator flag; mutates a live PTY. |
-| `AGEND_AUTO_RECOVERY_STAGE2` | Stage 2 gate: emit `Stage2Restart` event (restarts the agent). | Inactive (shadow mode) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:155` | Operator flag; triggers agent restart. |
-| `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS` | Max Stage 2 restart attempts. | `3` (`STAGE2_MAX_RESTARTS_DEFAULT`). | `u32`. | `src/daemon/per_tick/recovery_dispatcher.rs:161` | Safety bound on restart loops. |
-| `AGEND_AUTO_RECOVERY_STAGE3` | Stage 3 gate: escalate by writing `HealthState::Paused`. | Inactive (shadow mode: telegram + tracing only) unless master gate on. | `"1"` enables; else off. | `src/daemon/per_tick/recovery_dispatcher.rs:114` | Operator escalation gate. |
 | `AGEND_PRODUCTIVE_GATE` | Activates the F9 "productive-silence" hang-detection path (can flag an agent Hung). Off → shadow telemetry only. | `false` (inactive). | `"1"` activates; else off. | `src/health.rs:753` | Rollout feature gate. |
 
 ---

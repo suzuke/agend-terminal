@@ -1,20 +1,34 @@
 # Recovery Stages
 
-Source-of-truth for the `#685` Phase 2 staged auto-recovery dispatcher.
+Source-of-truth for the `#685` staged auto-recovery dispatcher.
+
+**#2549 P2 update (operator decision `d-20260703021554626467-13`):**
+Stage 2 (auto-restart) and the dispatcher-driven Stage 3 escalation path
+were **removed** — converged to **Stage-1-only**. `§RS.9` (Stage 2) and
+`§RS.10` (Stage 3, dispatcher-side) below are kept as a **historical
+decision record** of what sub-tasks 7b/7c shipped and why, but no longer
+describe live code — see the banners on each section. `HealthState::Paused`
+/ `HealthTracker::enter_paused` / `RecoveryStageState::Stage3Pending`
+themselves are **still live** (`§RS.7`, `§10.2`-`§10.7` mechanics) — they
+are shared terminal-escalation machinery now also used independently by
+`RespawnWatchdogHandler` (an unrelated failure mode), not exclusive to
+this dispatcher's ladder. See `src/daemon/per_tick/recovery_dispatcher.rs`'s
+module doc for the full rationale (why the pre-#2549 default-gate-off
+behavior made this a behavior-preserving, not a scope-expanding, cut).
+
 This PR (`#685` sub-task 7a) ships **Stage 1 ESC interrupt** with full
 infrastructure (state machine, env-var gate, anti-thrash cooldown,
-telemetry pattern) reusable by future Stages 2 (auto-restart) and 3
-(pause + escalate).
+telemetry pattern).
 
 Decision: `d-20260514030404021793-1` (three-party consensus: lead-claude
 + dev-claude + reviewer-opencode).
 
 Sibling chain: sub-task 1 (PR #750) + 2 (#752) + 3 (#763) + 4 (#766) +
-5 (#769) + 6 (#770). Stages 2 (7b) and 3 (7c) are follow-up sub-tasks
-of `#685` that add their dispatch arms but reuse this module's
-infrastructure.
+5 (#769) + 6 (#770). Stages 2 (7b) and 3 (7c) were follow-up sub-tasks
+of `#685` that added dispatch arms reusing this module's infrastructure
+— since removed per #2549 (see above).
 
-Maintenance: section IDs (`§RS.1`-`§RS.8`) are stable contract anchors
+Maintenance: section IDs (`§RS.1`-`§RS.10`) are stable contract anchors
 per the M1/M2/M3 discipline established in sub-task 1.
 
 ## §RS.1 — Why staged auto-recovery
@@ -25,28 +39,32 @@ nothing. Operators must manually press ESC in the agent's TUI pane to
 recover. Issue `#685` Phase 2 mandates staged automation:
 
 - **Stage 1**: daemon writes ESC byte to PTY (simulate operator ESC)
-- **Stage 2**: Stage 1 fails to recover → auto-restart agent + telegram
-  warn operator
-- **Stage 3**: Stage 2 fails N times → pause + telegram escalate +
-  flag for manual investigation
+- ~~**Stage 2**: Stage 1 fails to recover → auto-restart agent + telegram
+  warn operator~~ — **removed #2549**, see the banner above.
+- ~~**Stage 3**: Stage 2 fails N times → pause + telegram escalate +
+  flag for manual investigation~~ — **removed #2549** as a
+  dispatcher-driven arm; `Paused`/`enter_paused` themselves stay live
+  as shared machinery (`§RS.7`).
 
 Each stage gated behind an env var with operator default `warn-only`.
 
 ## §RS.2 — Lifecycle (state machine)
 
+**Current (post-#2549):**
+
 ```rust
 pub enum RecoveryStageState {
     None,
     Stage1Pending { entered_at: Instant },
-    Stage2Eligible,
-    Stage2Pending { entered_at: Instant },
-    Stage3Eligible,
-    Stage3Pending,
+    Stage3Pending { entered_at: Instant },
 }
 ```
 
 Carried inside `HealthTracker` so the dispatcher reads both
 `HealthState` and stage progression under one per-agent lock.
+`Stage3Pending` is reached only via `HealthTracker::enter_paused` —
+by `RespawnWatchdogHandler` independently of this dispatcher, not by
+a `Stage3Eligible` waiting-room state (removed, see below).
 
 ```
                       ┌──────┐
@@ -56,51 +74,33 @@ Carried inside `HealthTracker` so the dispatcher reads both
         HealthState::Hung + alive-stuck branch
                          ▼
               ┌─────────────────┐
-              │ Stage1Pending   │── Stage 1 timeout / dead-likely / cooldown
-              └────────┬────────┘
-                       ▼
+              │ Stage1Pending   │── Stage 1 timeout / dead-likely / cooldown:
+              └─────────────────┘   log-only, terminal (#2549 — see below)
+
               ┌─────────────────┐
-              │ Stage2Eligible  │── (7b) Stage 2 fires
-              └────────┬────────┘
-                       ▼
-              ┌─────────────────┐
-              │ Stage2Pending   │── (7b) timeout
-              └────────┬────────┘
-                       ▼
-              ┌─────────────────┐
-              │ Stage3Eligible  │── (7c) Stage 3 fires:
-              └────────┬────────┘    enter_paused(now) writes
-                       ▼               HealthState::Paused atomically
-              ┌─────────────────┐    Terminal. `Paused` short-circuits
-              │ Stage3Pending   │    check_hang + maybe_decay; only an
-              │   { entered_at }│    operator unpause (future sub-task)
-              └─────────────────┘    leaves this state.
+              │ Stage3Pending   │── reached via a DIFFERENT handler
+              │   { entered_at }│   (RespawnWatchdogHandler's own
+              └─────────────────┘   enter_paused call), not from
+                                     Stage1Pending in this dispatcher.
 ```
 
-Sub-task 7a (Stage 1) implemented:
-- `None → Stage1Pending` (alive-stuck branch)
-- `None → Stage2Eligible` (dead-likely branch OR cooldown skip)
-- `Stage1Pending → Stage2Eligible` (Stage 1 timeout expired)
+Sub-task 7a (Stage 1) implemented, **current shape post-#2549**:
+- `None → Stage1Pending` (alive-stuck branch, incl. PTY-write-failure —
+  parks as a one-shot "attempted, stop" marker instead of retrying)
+- `None → None` (dead-likely branch OR cooldown skip — log-only, no
+  transition; was `None → Stage2Eligible` pre-#2549)
+- `Stage1Pending → Stage1Pending` (Stage 1 timeout expired — log-only,
+  re-logs every tick; was `→ Stage2Eligible` pre-#2549)
 - `* → None` (spontaneous recovery on `Healthy`)
 
-**Sub-task 7b (Stage 2) implemented** (this PR):
-- `None → Stage3Eligible` (cumulative restart cap reached — direct
-  escalation, bypass Stages 1/2)
-- `Stage2Eligible → Stage2Pending` (Stage 2 fire — emits
-  `AgentExitEvent::Stage2Restart` via `try_send`; counter increment
-  lives in respawn worker `selective-restore` arm)
-- `Stage2Pending → Stage3Eligible` (Stage 2 timeout expired without
-  recovery)
-- `Stage2Eligible → Stage2Eligible` (channel-full retry — `try_send`
-  failed, state stays for next-tick retry without counter increment)
+**Sub-task 7b (Stage 2) — REMOVED #2549.** Historical record of what it
+implemented is kept in `§RS.9` below (banner marks it non-current).
 
-**Sub-task 7c (Stage 3) implemented** (this PR):
-- `Stage3Eligible → Stage3Pending { entered_at }` (Stage 3 fire — only
-  via `HealthTracker::enter_paused` per §F39.5; atomically writes
-  `state = Paused`, `recovery_stage_state = Stage3Pending`,
-  `last_stage3_fired_at = Some(now)`)
-- `Stage3Pending` is terminal — explicit no-op arm in dispatcher; only
-  a future operator-unpause sub-task transitions out.
+**Sub-task 7c (Stage 3), dispatcher-driven arm — REMOVED #2549.**
+Historical record kept in `§RS.10` below. The underlying
+`HealthTracker::enter_paused` / `Stage3Pending` / `HealthState::Paused`
+mechanics themselves are unchanged and still live — see `§RS.7` and
+`§10.2`-`§10.7`.
 
 ## §RS.3 — Tick order & dispatcher placement
 
@@ -129,7 +129,7 @@ Stage 1 ships valuable independent of F9 promotion timeline:
 | Branch | Condition | Action |
 |---|---|---|
 | **alive-stuck** | `productive_silence > threshold` && `silence < threshold` | Fire Stage 1 ESC (agent process reading PTY, just not productive). State → `Stage1Pending`. |
-| **dead-likely** | `silence > threshold` | Skip Stage 1, ESC won't help a process not reading. State → `Stage2Eligible`. |
+| **dead-likely** | `silence > threshold` | Skip Stage 1, ESC won't help a process not reading. Log-only, state stays `None` (#2549: was `→ Stage2Eligible`, removed). |
 | **anomaly** | Neither condition holds | Log warning, leave state unchanged. Agent shouldn't be `Hung`. |
 
 Thresholds match `silence_exceeds_threshold` in `check_hang`:
@@ -139,8 +139,7 @@ Thresholds match `silence_exceeds_threshold` in `check_hang`:
 - Other states: 120s
 
 Productive-silence threshold extracted via `health::productive_silence_exceeds`
-helper (decision §1.4 Delta 2 Option a — DRY, single source of truth
-shared with future Stages 2/3 and any other dispatcher consumers).
+helper (decision §1.4 Delta 2 Option a — DRY, single source of truth).
 
 ## §RS.5 — Shadow-mode default + env var gate
 
@@ -183,7 +182,8 @@ is worse than no infra" discipline.
 
 Decision §1.4 Refinement B — if agent re-enters `Hung` within
 `STAGE1_COOLDOWN_DEFAULT_MS` of a recent Stage 1 fire, dispatcher skips
-Stage 1 and transitions directly to `Stage2Eligible`. Prevents
+re-firing Stage 1; log-only, no further stage to escalate to (#2549:
+was a transition to the now-removed `Stage2Eligible`). Prevents
 rapid-fire ESC sending that would mask underlying issues like infinite
 loops or persistent backend bugs.
 
@@ -193,28 +193,28 @@ the linear-escalation discipline.
 
 ## §RS.7 — `HealthState::Paused` guards
 
-Stage 3 (sub-task 7c) will transition `HealthState::Hung →
-HealthState::Paused` when Stage 2 exhausts its retry budget. `Paused`
-is an operator-action-required terminal state distinct from `Failed`
-(crash counter exhausted):
+**Still live post-#2549** — `Paused` is an operator-action-required
+terminal state distinct from `Failed` (crash counter exhausted).
+Originally reached only via this dispatcher's (now-removed) Stage 3 arm;
+`enter_paused` — its sole writer — is now called independently by
+`RespawnWatchdogHandler` too (an unrelated failure mode: a stuck
+`resume` spawn), making `Paused` shared terminal-escalation machinery
+rather than exclusive to the Hung ladder:
 
 | State | Trigger | Recovery |
 |---|---|---|
 | `Failed` | `record_crash` counter ≥ `max_retries` (5 process crashes within window) | Operator action OR `maybe_decay` slowly clears the counter |
-| `Paused` | Stage 3 dispatcher | Operator unpause command (separate sub-task) |
+| `Paused` | `HealthTracker::enter_paused` (`RespawnWatchdogHandler`'s retry-cap escalation; previously also this dispatcher's Stage 3 arm, removed #2549) | Operator unpause command (separate sub-task) |
 
-Phase 1 implements the guards already (decision §5):
+Phase 1 implements the guards already (decision §5), still in effect:
 
 - `check_hang` short-circuits on `Paused` (returns `false` — no
-  auto-recovery dispatcher work; operator already alerted via Stage 3
-  telegram notify, further warns are noise).
+  auto-recovery dispatcher work; operator already alerted, further
+  warns are noise).
 - `maybe_decay` does NOT touch `Paused` (crash decay must not exit
   Paused; only operator unpause can).
 - `display_name() -> "paused"` for telegram visibility + JSON API
   consumer (`api/handlers/query.rs`).
-
-The variant itself ships in this PR but is constructed only by
-sub-task 7c's Stage 3 dispatcher arm.
 
 ## §RS.8 — Cross-references & out-of-scope
 
@@ -230,26 +230,29 @@ sub-task 7c's Stage 3 dispatcher arm.
   capture PTY traces around Stage 1 shadow fires for fixture
   collection).
 - `src/daemon/per_tick/recovery_dispatcher.rs` — module implementation.
-- `src/health.rs::RecoveryStageState` — state machine variants.
-- `src/health.rs::HealthState::Paused` — terminal state for Stage 3.
-- `src/agent.rs::AgentExitEvent::Stage2Restart` — variant definition
-  for sub-task 7b emission.
+- `src/health.rs::RecoveryStageState` — state machine variants
+  (`None` / `Stage1Pending` / `Stage3Pending` post-#2549).
+- `src/health.rs::HealthState::Paused` — terminal state, now reached via
+  either `RespawnWatchdogHandler` or (historically) this dispatcher.
 
 ### Out of scope (sub-task 7a baseline)
 
-- Stage 3 pause + escalate dispatcher arm — sub-task 7c.
-- Operator unpause command (CLI or MCP tool) — separate sub-task,
-  required before Stage 3 ships in production.
+- Operator unpause command (CLI or MCP tool) — separate sub-task.
 - Per-backend stage timing tuning — needs corpus measurement, follow-up
   similar to sub-task 6's per-backend marker calibration.
 - Telegram notify for Stage 1 — decision §6 Refinement A: Stage 1
-  silent on success (info-level log only). Stages 2/3 will fire
-  telegram via existing `gated_notify` infrastructure.
+  silent on success (info-level log only).
 - F39 mitigation selection / F9 promotion — fixture-corpus-N-gated.
-- Multi-stage timeout per-backend overrides beyond uniform defaults +
-  env-var overrides.
 
 ## §RS.9 — Stage 2 specifics (sub-task 7b)
+
+> ⚠ **HISTORICAL — REMOVED IN #2549.** Everything below this line in
+> `§RS.9` describes what sub-task 7b built and why, kept as a decision
+> record. It no longer describes live code: `AgentExitEvent::Stage2Restart`,
+> `RecoveryStageState::{Stage2Eligible,Stage2Pending}`,
+> `recovery_restart_count`, `daemon/mod.rs::handle_stage2_restart`, and the
+> `AGEND_AUTO_RECOVERY_STAGE2*` env vars are all deleted. See the file
+> header banner for the rationale.
 
 Sub-task 7b (decision `d-20260514034230950032-2`) implements Stage 2 on
 top of the 7a infrastructure. Stage 2 is **controlled auto-restart**:
@@ -403,6 +406,18 @@ removal candidate.
   integration deferred unless shadow telemetry surfaces edge cases.
 
 ## §RS.10 — Stage 3 specifics (sub-task 7c)
+
+> ⚠ **HISTORICAL — the dispatcher-driven arm described in this section
+> was REMOVED IN #2549.** `RecoveryStageState::Stage3Eligible`,
+> `recovery_dispatcher.rs::handle_stage3_escalate` /
+> `notify_stage3_escalate` / `format_stage3_body`, and this dispatcher's
+> own call into `enter_paused` are all deleted. **`HealthTracker::enter_paused`
+> / `HealthState::Paused` / `RecoveryStageState::Stage3Pending` themselves
+> are still live** — `§10.2`-`§10.5`'s atomic-invariant / no-op-arm
+> mechanics still apply verbatim, just triggered by `RespawnWatchdogHandler`
+> instead of this dispatcher. `§10.4`'s `recovery_restart_count` no longer
+> exists (deleted with Stage 2, not reset-on-unpause since there's nothing
+> to reset). See the file header banner for the rationale.
 
 Stage 3 is the terminal stage of the auto-recovery state machine.
 After Stage 1 ESC failed and Stage 2 auto-restart was attempted up to

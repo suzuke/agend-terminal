@@ -163,10 +163,9 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 /// daemon runs in app mode (`app::run_app`, never `run_core`), so allowlisting it
 /// out meant the #685 recovery ladder was silently dead in the live daemon (the
 /// #1720 class). It now runs in app mode: Stage1 (ESC-nudge to the PTY) needs no
-/// `crash_rx`; Stage2 (restart) has no app-mode consumer, so it escalates to
-/// Stage3 instead of silent-dropping (see `build_default_handlers`'
-/// `stage2_dispatch_available = false` below). All stages stay shadow-gated-off by
-/// default — zero behavior change unless an operator opts in.
+/// `crash_rx` at all (#2549: Stage2/3 were converged away — see
+/// `daemon/per_tick/recovery_dispatcher.rs`'s module doc). Stage1 stays
+/// shadow-gated-off by default — zero behavior change unless an operator opts in.
 ///
 /// #2413 Phase B (live-fix): `shadow_observe` was REMOVED from this allowlist (same
 /// #1720/#685 class as `recovery_dispatcher` above). The original #2433 allowlisted it
@@ -202,16 +201,10 @@ fn app_snapshot_rotation_enabled() -> bool {
 /// `build_default_handlers` minus `APP_TICK_ALLOWLIST` (and minus `snapshot_rotation` only when
 /// the `AGEND_APP_SNAPSHOT=0` kill-switch is set). Extracted so the completeness invariant can
 /// compare it against the full daemon set.
-///
-/// #1694(a): `crash_tx` here is a throwaway sender (its receiver is dropped), so
-/// `stage2_dispatch_available = false` — `RecoveryDispatcherHandler` now RUNS
-/// (no longer allowlisted out) and its Stage2 path escalates to Stage3 rather
-/// than emit onto the consumerless channel.
 fn app_tick_handlers(
     daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
 ) -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
-    let (crash_tx, _crash_rx) = crossbeam_channel::bounded(1);
-    let mut handlers = crate::daemon::build_default_handlers(crash_tx, false, daemon_binary_stale);
+    let mut handlers = crate::daemon::build_default_handlers(daemon_binary_stale);
     let skip_snapshot = !app_snapshot_rotation_enabled();
     handlers.retain(|h| {
         let name = h.name();
@@ -2063,10 +2056,9 @@ mod tests {
     #[test]
     fn app_tick_handlers_cover_every_non_allowlisted_daemon_handler() {
         use std::collections::HashSet;
-        let (crash_tx, _rx) = crossbeam_channel::bounded(1);
         let stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let all: HashSet<&str> = crate::daemon::build_default_handlers(crash_tx, true, stale)
+        let all: HashSet<&str> = crate::daemon::build_default_handlers(stale)
             .iter()
             .map(|h| h.name())
             .collect();

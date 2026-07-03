@@ -140,34 +140,25 @@ avoid false Hung classification during MCP roundtrip completion.
 
 ---
 
-## Auto-Recovery Ladder
+## Auto-Recovery (Stage 1)
 
-When an agent is classified as `Hung`, the daemon initiates a three-stage
-recovery:
+When an agent is classified as `Hung`, the daemon fires an ESC key to the
+agent's PTY (interrupts the current operation) and waits 10 seconds for
+recovery. Cooldown: 60 seconds (prevents rapid ESC spam). If the PTY write
+fails, or the agent doesn't recover in time, or it's classified dead-likely
+(silence exceeds threshold — ESC wouldn't help), the daemon logs the outcome
+and stops there; no further automated action is taken (#2549: the Stage 2
+auto-restart and Stage 3 pause-and-escalate stages that used to follow were
+removed — see `docs/RECOVERY-STAGES.md` for the historical design and why
+this is a behavior-preserving cut, not a capability regression).
 
-### Stage 1: ESC Key
+Toggled via the `hang_auto_recovery_enabled` runtime config gate (or the
+`AGEND_AUTO_RECOVERY_STAGE1` env var).
 
-- Sends an ESC key to the agent's PTY (interrupts the current operation).
-- Waits 10 seconds for recovery.
-- Cooldown: 60 seconds (prevents rapid ESC spam).
-
-### Stage 2: Auto-Restart
-
-- If Stage 1 fails, restarts the agent process.
-- Waits 30 seconds for recovery.
-- Maximum 3 restarts (cumulative across Hung cycles).
-- Backoff delay: 1 second.
-
-### Stage 3: Pause
-
-- If all 3 Stage 2 restarts fail:
-  - Sets HealthState to `Paused` (terminal state).
-  - Notifies the operator that manual intervention is needed.
-  - `check_hang` short-circuits (returns false) for this agent.
-  - Crash decay does not affect the `Paused` state.
-
-The entire ladder can be toggled via the `hang_auto_recovery_enabled` runtime
-config gate.
+`HealthState::Paused` still exists as a terminal state — `RespawnWatchdogHandler`
+(a separate mechanism, for a stuck `resume` spawn rather than a Hung agent)
+still escalates into it after its own retry cap. `check_hang` short-circuits
+and crash decay does not affect `Paused` regardless of which handler set it.
 
 ---
 

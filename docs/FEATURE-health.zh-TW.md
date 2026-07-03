@@ -137,32 +137,22 @@ input 送達和 heartbeat 刷新之間有 5 秒的寬限窗口，避免在 MCP r
 
 ---
 
-## 自動恢復階梯
+## 自動恢復(Stage 1)
 
-當 agent 被分類為 `Hung` 時，daemon 啟動三階段恢復：
+當 agent 被分類為 `Hung` 時，daemon 會向其 PTY 發送 ESC 鍵(中斷當前操作),
+並等待 10 秒看是否恢復。冷卻時間 60 秒(避免頻繁發送 ESC)。若 PTY 寫入失敗、
+逾時未恢復,或被判定為 dead-likely(靜默超過閾值 — ESC 也無濟於事),daemon
+會記錄結果後停止,不再有進一步的自動動作(#2549:原本後續的 Stage 2 自動重啟
+與 Stage 3 暫停升級已移除 — 歷史設計與「這是行為保真、非能力倒退」的理由詳見
+`docs/RECOVERY-STAGES.md`)。
 
-### Stage 1：ESC 鍵
+可透過 runtime config 的 `hang_auto_recovery_enabled` 開關(或
+`AGEND_AUTO_RECOVERY_STAGE1` 環境變數)控制。
 
-- 向 agent 的 PTY 發送 ESC 鍵（中斷當前操作）
-- 等待 10 秒看是否恢復
-- 冷卻時間 60 秒（避免頻繁發送 ESC）
-
-### Stage 2：自動重啟
-
-- Stage 1 失敗後，自動重啟 agent 程序
-- 等待 30 秒看是否恢復
-- 最多重啟 3 次（跨 Hung 週期累計）
-- 退避延遲 1 秒
-
-### Stage 3：暫停
-
-- Stage 2 的 3 次重啟都失敗後
-- 將 HealthState 設為 `Paused`（終態）
-- 通知 operator 需要手動介入
-- `check_hang` 不再觸發（短路返回 false）
-- crash 衰減不會改變 `Paused` 狀態
-
-整個階梯可以透過 runtime config 的 `hang_auto_recovery_enabled` 開關控制。
+`HealthState::Paused` 這個終態仍然存在 —— `RespawnWatchdogHandler`(另一套獨立
+機制,處理卡住的 `resume` spawn,而非 Hung agent)在自己的重試上限後仍會升級進
+入該狀態。無論是哪個 handler 設定的,`check_hang` 都會短路、crash 衰減也不會
+影響 `Paused` 狀態。
 
 ---
 

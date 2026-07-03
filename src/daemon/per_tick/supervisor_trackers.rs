@@ -398,10 +398,9 @@ mod tests {
     /// order — handler order in the `build_default_handlers` Vec is load-bearing.
     #[test]
     fn all_migrated_supervisor_trackers_registered_in_order() {
-        let (crash_tx, _rx) = crossbeam_channel::bounded(1);
         let stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let names: Vec<&str> = crate::daemon::build_default_handlers(crash_tx, true, stale)
+        let names: Vec<&str> = crate::daemon::build_default_handlers(stale)
             .iter()
             .map(|h| h.name())
             .collect();

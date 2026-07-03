@@ -1258,14 +1258,12 @@ fn build_tick_infrastructure(
     // by instances deleted before the cascade-on-delete fix existed.
     crate::daemon::orphan_sweep::run(home);
 
-    // #1694(a): run_core wires `crash_rx` → `handle_crash_respawn`, so Stage2
-    // restarts have a live consumer here (true). `run_core` is headless (no
-    // TUI), so the `DaemonBinaryStale` flag the `mcp_registry` handler flips is
-    // a throwaway here — nothing surfaces it, exactly as the pre-W1.1
-    // supervisor-side flag was in run_core.
+    // `run_core` is headless (no TUI), so the `DaemonBinaryStale` flag the
+    // `mcp_registry` handler flips is a throwaway here — nothing surfaces it,
+    // exactly as the pre-W1.1 supervisor-side flag was in run_core.
     let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
         Arc::new(AtomicBool::new(false));
-    let handlers = build_default_handlers(ctx.crash_tx.clone(), true, daemon_binary_stale);
+    let handlers = build_default_handlers(daemon_binary_stale);
 
     let tick_rx = {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1284,27 +1282,6 @@ fn build_tick_infrastructure(
     };
 
     (TickKeepalive { _task_sweep }, handlers, tick_rx)
-}
-
-fn spawn_stage2_thread(home: &Path, name: &str, ctx: &DaemonContext) {
-    let home_owned = home.to_path_buf();
-    let name_owned = name.to_owned();
-    let reg = Arc::clone(&ctx.registry);
-    let cfgs = Arc::clone(&ctx.configs);
-    let tx = ctx.crash_tx.clone();
-    let sd = Arc::clone(&ctx.shutdown);
-    // fire-and-forget: stage2 restart worker is short-lived (backoff sleep
-    // then spawn_agent + restore health counters). Observes shutdown flag
-    // after backoff to abort cleanly. JoinHandle dropped because errors are
-    // logged inside handle_stage2_restart + event_log records outcome.
-    if let Err(e) = std::thread::Builder::new()
-        .name(format!("{name}_stage2"))
-        .spawn(move || {
-            handle_stage2_restart(&home_owned, &name_owned, &reg, &cfgs, &tx, &sd);
-        })
-    {
-        tracing::warn!(agent = %name, error = %e, "failed to spawn stage2 restart thread");
-    }
 }
 
 fn log_residual_worktrees(home: &Path) {
@@ -1854,202 +1831,6 @@ fn spawn_and_register_agent(
         return Err(e.into());
     }
     Ok(())
-}
-
-/// `#685` sub-task 7b: Stage 2 auto-restart handler. Distinct from
-/// the Crash path (which calls `record_crash` + uses exponential
-/// backoff): Stage 2 is a *controlled* restart initiated by the
-/// recovery dispatcher when the agent failed to recover from Stage 1
-/// ESC. Selectively preserves crash counters + recovery counter
-/// across the spawn boundary so the cap (`STAGE2_MAX_RESTARTS_DEFAULT`)
-/// survives the restart it drove.
-///
-/// Decision §1 selective restore (5 fields): `crash_times`,
-/// `total_crashes`, `last_crash_notification`, `last_hung_notification`,
-/// `recovery_restart_count` (+1).
-/// All other `HealthTracker` fields reset to fresh defaults — including
-/// `state: Healthy` (Stage 2 success seed) and `recovery_stage_state:
-/// None` (linear escalation rule restarts).
-///
-/// `spawn_agent` failure: agent removed from registry, dispatcher
-/// next-tick won't find it. Operator already received Stage 2 telegram
-/// pre-emit so visibility is preserved. Phase 1 limitation acknowledged
-/// in `docs/RECOVERY-STAGES.md §RS.9` — full operator unpause +
-/// re-spawn flow ships in sub-task 7c.
-fn handle_stage2_restart(
-    home: &Path,
-    name: &str,
-    registry: &AgentRegistry,
-    configs: &Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>,
-    crash_tx: &crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
-    shutdown: &Arc<std::sync::atomic::AtomicBool>,
-) {
-    use std::time::{Duration, Instant};
-    tracing::warn!(
-        target: "recovery_shadow",
-        agent = %name,
-        "stage2 restart initiated"
-    );
-    crate::event_log::log(home, "stage2_restart", name, "stage 2 auto-restart");
-
-    // #1441: registry is UUID-keyed; resolve once and key both the snapshot
-    // read and the post-spawn restore by it.
-    let instance_id = crate::fleet::resolve_uuid(home, name);
-
-    // Snapshot the 4 fields we'll preserve across spawn. Reads then
-    // drops the lock before backoff sleep + spawn.
-    let saved = {
-        let reg = agent::lock_registry(registry);
-        instance_id.and_then(|id| reg.get(&id)).map(|h| {
-            let core = h.core.lock();
-            (
-                core.health.crash_times.clone(),
-                core.health.total_crashes,
-                // #1744-H3: the former shared `last_notification` is now two
-                // per-class cooldowns — preserve both across the Stage-2 respawn.
-                core.health.last_crash_notification,
-                core.health.last_hung_notification,
-                core.health.recovery_restart_count,
-            )
-        })
-    };
-    let saved = match saved {
-        Some(s) => s,
-        None => {
-            tracing::warn!(
-                target: "recovery_shadow",
-                agent = %name,
-                "stage2 restart: agent not in registry, skipping"
-            );
-            return;
-        }
-    };
-
-    let config = match configs.lock().get(name).cloned() {
-        Some(c) => c,
-        None => {
-            tracing::warn!(
-                target: "recovery_shadow",
-                agent = %name,
-                "stage2 restart: no config for respawn (likely deleted)"
-            );
-            return;
-        }
-    };
-
-    let backoff = Duration::from_millis(crate::health::STAGE2_BACKOFF_DEFAULT_MS);
-
-    std::thread::sleep(backoff);
-    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!(
-            target: "recovery_shadow",
-            agent = %name,
-            "shutdown during stage2 backoff, aborting"
-        );
-        return;
-    }
-
-    // #1080: re-install skills on stage2 restart (idempotent).
-    if let Some(ref wd) = config.working_dir {
-        let skills_filter: Option<Vec<String>> =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                .ok()
-                .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
-        let custom_skills_source: Option<std::path::PathBuf> =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                .ok()
-                .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
-                .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
-        let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
-            .and_then(|b| b.skill_dir_name());
-        if let Err(e) = crate::skills::install_for_agent_backend_with_source(
-            home,
-            wd,
-            skills_filter.as_deref(),
-            backend_skill,
-            custom_skills_source.as_deref(),
-        ) {
-            tracing::warn!(
-                target: "recovery_shadow",
-                agent = %name, error = %e, "stage2 skills install failed"
-            );
-        }
-    }
-
-    // #1547 M2(b): re-run MCP config on the recovery/respawn path (idempotent).
-    // Critical for agy: its HOME-level discovery cache means a respawn that does
-    // NOT re-configure comes back WITHOUT fleet tools (recovery is exactly when
-    // they're needed). `configure_agy` rewrites `.agents/mcp_config.json` and
-    // busts the discovery cache; for other backends this is a harmless
-    // idempotent rewrite of the project-local config. Mirrors the skills
-    // re-install above (the spawn path's config-generation is otherwise only
-    // run on the INITIAL spawn, not here).
-    if let Some(ref wd) = config.working_dir {
-        crate::mcp_config::configure(wd, &config.backend_command, Some(name));
-    }
-
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-    let spawn_result = agent::spawn_agent(
-        &agent::SpawnConfig {
-            name,
-            backend_command: &config.backend_command,
-            args: &config.args,
-            spawn_mode: crate::backend::SpawnMode::Fresh,
-            cols,
-            rows,
-            env: config.env.as_ref(),
-            working_dir: config.working_dir.as_deref(),
-            submit_key: &config.submit_key,
-            home: Some(home),
-            crash_tx: Some(crash_tx.clone()),
-            shutdown: Some(Arc::clone(shutdown)),
-        },
-        registry,
-    );
-
-    match spawn_result {
-        Ok(_) => {
-            tracing::info!(
-                target: "recovery_shadow",
-                agent = %name,
-                "stage2 spawn ok"
-            );
-            crate::event_log::log(home, "stage2_spawn_ok", name, "stage 2 spawn succeeded");
-
-            // Selective restore — fresh tracker starts with default
-            // values; we overwrite only the 4 preserved fields and
-            // increment recovery_restart_count by 1 (this Stage 2 fire
-            // contributes to the cap). All other fields stay at
-            // default — state stays Healthy (recovery success seed),
-            // recovery_stage_state stays None (linear escalation reset
-            // already encoded by spontaneous-recovery reset in
-            // dispatcher).
-            let reg = agent::lock_registry(registry);
-            if let Some(handle) = instance_id.and_then(|id| reg.get(&id)) {
-                let mut core = handle.core.lock();
-                let (crash_times, total_crashes, last_crash_notif, last_hung_notif, prev_count) =
-                    saved;
-                core.health.crash_times = crash_times;
-                core.health.total_crashes = total_crashes;
-                core.health.last_crash_notification = last_crash_notif;
-                core.health.last_hung_notification = last_hung_notif;
-                core.health.recovery_restart_count = prev_count.saturating_add(1);
-                core.health.last_stage2_fired_at = Some(Instant::now());
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "recovery_shadow",
-                agent = %name,
-                error = %e,
-                "stage2 spawn failed — agent removed, operator notified via telegram"
-            );
-            crate::event_log::log(home, "stage2_spawn_failed", name, &format!("error: {e}"));
-            // Agent left removed; operator handles via manual re-spawn
-            // OR future operator-unpause / re-spawn sub-task. Phase 1
-            // limitation documented in §RS.9.
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3019,44 +2800,6 @@ mod tests {
         for name in &agent_names {
             kill_registered_child(&registry, name);
         }
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1126 characterization: handle_stage2_restart runs on a spawned
-    /// thread without blocking the caller. Pre-fix, the function ran
-    /// inline on the main loop with `thread::sleep(backoff)`.
-    #[test]
-    fn stage2_restart_does_not_block_caller() {
-        let home = tmp_home("stage2_nonblock");
-        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let configs: Arc<Mutex<HashMap<String, AgentConfig>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let (crash_tx, _crash_rx) = crossbeam_channel::unbounded();
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Backoff is the fixed STAGE2_BACKOFF_DEFAULT_MS const; the spawned
-        // worker sleeps it on its own thread, so the caller must still return
-        // immediately (that non-blocking contract is what this test pins).
-        let start = std::time::Instant::now();
-        let home_owned = home.to_path_buf();
-        let reg = Arc::clone(&registry);
-        let cfgs = Arc::clone(&configs);
-        let tx = crash_tx.clone();
-        let sd = Arc::clone(&shutdown);
-        let handle = std::thread::Builder::new()
-            .name("test_stage2".into())
-            .spawn(move || {
-                handle_stage2_restart(&home_owned, "ghost", &reg, &cfgs, &tx, &sd);
-            })
-            .unwrap();
-
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(100),
-            "spawn must return immediately — main loop is not blocked"
-        );
-
-        handle.join().unwrap();
-
         std::fs::remove_dir_all(&home).ok();
     }
 }

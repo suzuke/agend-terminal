@@ -61,16 +61,14 @@
 
 ## 4. Auto-recovery
 
-各 Stage 閘門都是**以值判定**（必須等於 `"1"`）；關閉時它們會以
+Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 「shadow mode」運行（只做 telemetry／logging，不做實際動作）。另有一個 runtime-config
-的總開關（`hang_auto_recovery_enabled`）也能啟用 Stage 1–3。
+的總開關（`hang_auto_recovery_enabled`）也能啟用它。（#2549：Stage 2/3 閘門已移除 —
+收斂為 Stage-1-only，詳見 `docs/RECOVERY-STAGES.md`。）
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_AUTO_RECOVERY_STAGE1` | Stage 1 閘門：對 hung 的 agent 的 PTY 寫入 ESC byte。 | 除非總開關開啟，否則不啟用（shadow mode）。 | `"1"` 啟用；否則關閉。 | `src/daemon/per_tick/recovery_dispatcher.rs:193` | Operator 旗標；會更動一個運行中的 PTY。 |
-| `AGEND_AUTO_RECOVERY_STAGE2` | Stage 2 閘門：發出 `Stage2Restart` 事件（重啟該 agent）。 | 除非總開關開啟，否則不啟用（shadow mode）。 | `"1"` 啟用；否則關閉。 | `src/daemon/per_tick/recovery_dispatcher.rs:155` | Operator 旗標；會觸發 agent 重啟。 |
-| `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS` | Stage 2 的最大重啟嘗試次數。 | `3`（`STAGE2_MAX_RESTARTS_DEFAULT`）。 | `u32`。 | `src/daemon/per_tick/recovery_dispatcher.rs:161` | 對重啟迴圈的安全上限。 |
-| `AGEND_AUTO_RECOVERY_STAGE3` | Stage 3 閘門：藉由寫入 `HealthState::Paused` 來升級處理。 | 除非總開關開啟，否則不啟用（shadow mode：只有 telegram + tracing）。 | `"1"` 啟用；否則關閉。 | `src/daemon/per_tick/recovery_dispatcher.rs:114` | Operator 升級閘門。 |
 | `AGEND_PRODUCTIVE_GATE` | 啟用 F9 的「productive-silence」hang 偵測路徑（可把 agent 標記為 Hung）。關閉 → 只做 shadow telemetry。 | `false`（不啟用）。 | `"1"` 啟用；否則關閉。 | `src/health.rs:753` | Rollout 功能閘門。 |
 
 ---
