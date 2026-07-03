@@ -342,7 +342,6 @@ mod tests {
             "inbox",
             "list_instances",
             "pane_snapshot",
-            "mode",
             "binding_state",
             "download_attachment",
             "set_waiting_on",
@@ -350,7 +349,6 @@ mod tests {
             "health",
             "bind_self",
             "release_worktree",
-            "force_release_worktree",
             "ci",
         ] {
             assert!(!is_side_effect_tool(t), "{t} must stay retry-safe");

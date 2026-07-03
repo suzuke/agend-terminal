@@ -101,8 +101,10 @@ on a version older than those fixes, upgrade; on a current version, treat
 - Agent truly wedged → `agend-terminal kill <name>`; the daemon respawns it
   (within the crash budget, §1).
 - A worktree binding survived its agent (e.g. you deleted/recreated an
-  instance and `bind_self` now refuses): use the `force_release_worktree`
-  MCP tool (from any connected agent or the lead).
+  instance and `bind_self` now refuses): use `release_worktree(force:true)`
+  (#2548: absorbed the former standalone `force_release_worktree` tool; from
+  any connected agent or the lead — restricted to the worktree's own agent
+  or its team orchestrator).
   **Warning: it deletes the worktree directory on disk — any uncommitted
   WIP in `~/.agend-terminal/worktrees/<agent>/...` is gone.** Commit/push
   first if the work matters. It refuses paths outside the daemon worktree

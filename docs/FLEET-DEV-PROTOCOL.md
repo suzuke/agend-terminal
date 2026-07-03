@@ -253,7 +253,7 @@ Right path, by inspection depth:
 - **Full tree** (`cargo test` replay, runtime validation, multi-file inspection): `repo action=checkout source=<canonical> branch=<PR-branch> bind=true`. The daemon provisions a fresh worktree at the named branch, binds it to the caller, and `release_worktree` returns cleanly with no residue.
 - **Read-only** (diff inspection, file listing): `gh pr diff <N>` or `gh pr view <N> --json files`. No working-tree mutation at all.
 
-If `repo action=checkout` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send `kind=query` to lead with the failure mode; lead routes via `force_release_worktree` or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
+If `repo action=checkout` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send `kind=query` to lead with the failure mode; lead routes via `release_worktree(force:true)` (#2548: absorbed the former standalone `force_release_worktree` tool) or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
 
 **Relationship to §3.19.** §3.19 says *what reviewers must not do in canonical*. §3.19.1 says *what every agent must do when the protocol gate fires* — abort and ask, not bypass and retry.
 
@@ -395,7 +395,7 @@ Impl pushes PR then immediately starts next task. Reviewer issues verdict then i
   - `inbox(instance: <receiver>)` — confirms unread queued message (offline agents only; active agents receive PTY direct injection and inbox stays empty)
   - `describe_instance(name: <receiver>)` — confirms agent_state active (PTY delivery already arrived)
   - `binding_state(agent: <receiver>)` — confirms task lifecycle started (binding metadata present)
-  - If all three show no progress, suspect lease conflict / stale binding / dispatch path block — investigate (`force_release_worktree` if needed) before re-dispatching
+  - If all three show no progress, suspect lease conflict / stale binding / dispatch path block — investigate (`release_worktree(force:true)` if needed; #2548 absorbed the former standalone `force_release_worktree` tool) before re-dispatching
 - **Pane-claim is not delivery**: agent writing a response in its own pane is NOT a `send`. Every reply / verdict / report must be triggered via the MCP `send` tool. Receivers do not see pane content. Verify via §6 channel discipline.
 - **Post-PR-merge close-loop reporting**: each PR `kind=report` MUST include a "lessons learned" section noting process wins, scope shifts, unexpected discoveries. Captures process-maturity signals for protocol evolution.
 - Takeover requires 4 criteria independently verified (heartbeat stale ≥1h, last_input frozen, idle state, zero activity)
@@ -751,7 +751,7 @@ Daemon binary refresh (recompile + restart, or hot-reload via `mcp_registry_watc
 - **CI watch state** — fixed by #786, but pre-#786 watches may be missing
 - **Instance registry vs team metadata sync** — fixed by #785 (better-error surfaces desync); team membership outlives instance restart, may reference wiped instances
 - **Source_repo on team** — historically wiped by `teams.json` migration on refresh (was #781 root cause); persisted as of #781 but verify with `grep source_repo fleet.yaml` if behavior unexpected
-- **Active bindings** — in-memory `bind_in_flight` flag may be lost; check `binding_state(agent)` and `force_release_worktree` if dangling
+- **Active bindings** — in-memory `bind_in_flight` flag may be lost; check `binding_state(agent)` and `release_worktree(force:true)` (#2548: absorbed the former standalone `force_release_worktree` tool) if dangling
 
 **Operator workflow**: `mcp_registry_watcher` notification = restart-needed signal. Run `agend-terminal stop && cargo build --release && agend-terminal start` to pick up new binary. Subsequent agent dispatches benefit from fresh code.
 

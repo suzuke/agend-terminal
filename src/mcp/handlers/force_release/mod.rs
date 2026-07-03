@@ -1,144 +1,33 @@
-//! MCP handler for `force_release_worktree` (Sprint 59 Wave 1 PR-5
-//! emergency cherry-pick) — closes the architectural defect that
-//! drove the Sprint 59 Wave 1 PR-2 BYPASS incident + PR-4 (C)-path
-//! stall.
+//! Stale daemon-managed worktree recovery helpers. Originally built to
+//! back the standalone `force_release_worktree` MCP tool (Sprint 59 Wave 1
+//! PR-5 emergency cherry-pick, closing the architectural defect that drove
+//! the Sprint 59 Wave 1 PR-2 BYPASS incident + PR-4 (C)-path stall); #2548
+//! PR-2 folded that tool into `release_worktree(force:true)`
+//! (`mcp/handlers/worktree.rs`), which is now the sole caller of
+//! [`rebase_clean_self`] + [`prune_git_metadata_for_agent`] for that path.
+//! [`attempt_safe_rebind_repair`] remains `bind_self(rebase_mode=true)`'s
+//! safe-repair-first helper — unaffected by the #2548 fold-in.
 //!
 //! When `bind_self` returns `lease_failed` because an on-disk
 //! worktree dir exists from a prior bind cycle but the daemon
 //! binding state was already released, callers had no daemon-
 //! managed path to clean the stale dir without resorting to
 //! `AGEND_GIT_BYPASS=1`. Per operator's Q2=(C) bypass-free
-//! permanent protocol decision (2026-05-09), this tool ships the
-//! daemon-side cleanup surface so the (C) path can recover from
+//! permanent protocol decision (2026-05-09), this module ships the
+//! daemon-side cleanup logic so the (C) path can recover from
 //! stale-state without ever touching BYPASS.
 //!
 //! Extracted from `worktree.rs` to keep that file under the 700
 //! LOC handler invariant (`tests/file_size_invariant.rs`).
 
-use crate::identity::Sender;
-use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use serde_json::Value;
+use std::path::Path;
 
 mod gc;
 mod repair;
 
+pub(crate) use gc::prune_git_metadata_for_agent;
 pub(crate) use repair::attempt_safe_rebind_repair;
-
-/// MCP tool: `force_release_worktree`.
-///
-/// Required args: `agent` (string), `branch` (string).
-///
-/// Behavior:
-/// 1. Validate agent + branch name format.
-/// 2. Compute target dir: `<home>/worktrees/<agent>/<branch>/`.
-/// 3. Safety: reject if the resolved path is outside the daemon-
-///    managed worktree pool (defense-in-depth against malicious args).
-/// 4. If dir exists: `std::fs::remove_dir_all`.
-/// 5. Defensively call existing `release_full` to clear any lingering
-///    binding state (idempotent on already-cleared bindings).
-/// 6. Return structured `{"released": true, "dir_existed": bool,
-///    "dir_removed": bool, "binding_outcome": <ReleaseOutcome>}`.
-///
-/// Idempotent: calling twice on a clean state is a no-op.
-///
-/// Fail-open: minor IO errors during dir removal are logged via
-/// `tracing::warn` but the binding-clear half still runs so partial
-/// recovery is preserved.
-pub(crate) fn handle_force_release_worktree(
-    home: &Path,
-    args: &Value,
-    sender: &Option<Sender>,
-) -> Value {
-    let agent = match args["instance"].as_str() {
-        Some(a) if !a.is_empty() => a,
-        _ => return json!({"error": "missing 'instance'"}),
-    };
-    let branch = match args["branch"].as_str() {
-        Some(b) if !b.is_empty() => b,
-        _ => return json!({"error": "missing 'branch'"}),
-    };
-    if let Err(e) = crate::agent::validate_name(agent) {
-        return json!({"error": e, "code": "invalid_agent"});
-    }
-    // AUDIT2-002: force-releasing (rebase + `git worktree remove --force`)
-    // discards the target's uncommitted work. Restrict it to the worktree's own
-    // agent or that agent's team orchestrator — an identified peer can no longer
-    // destroy another agent's worktree by naming it. An anonymous caller (no
-    // sender: operator-direct / standalone) keeps full authority.
-    if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
-        if caller != agent && !crate::teams::is_orchestrator_of(home, caller, agent) {
-            return json!({
-                "error": format!(
-                    "permission denied: '{caller}' cannot force-release '{agent}'s worktree \
-                     (only the owner or its team orchestrator may)"
-                ),
-                "code": "not_owner_or_orchestrator"
-            });
-        }
-    }
-    if !crate::agent_ops::validate_branch(branch) {
-        return json!({
-            "error": format!("invalid branch name '{branch}'"),
-            "code": "invalid_branch"
-        });
-    }
-
-    // Compute the canonical daemon-managed worktree path. The Wave 4
-    // layout (Sprint 57 #546 Item 4) is `$AGEND_HOME/worktrees/<agent>/<branch>/`.
-    let worktrees_root = home.join("worktrees");
-    let target = worktrees_root.join(agent).join(branch);
-
-    // Safety: ensure the resolved target is within the worktrees pool
-    // AND deeper than the agent-level subdirectory (a `branch == ""`
-    // would otherwise resolve to the agent's own dir; the empty-
-    // string check at the top already rejects this, but the
-    // defense-in-depth guard catches future validator drift).
-    let safe = target.starts_with(&worktrees_root)
-        && target != worktrees_root
-        && target != worktrees_root.join(agent);
-    if !safe {
-        return json!({
-            "error": format!(
-                "force_release_worktree refuses to clean path outside the daemon \
-                 worktree pool: {}",
-                target.display()
-            ),
-            "code": "path_outside_pool"
-        });
-    }
-
-    // #826: optional operator-supplied `repository_path` arg. When
-    // present, L2 skips enumeration and goes straight to the named
-    // repo. When absent, L2 enumerates daemon-managed candidates.
-    // #1461 cleanup: renamed from `source_repo` to the cross-tool
-    // standard `repository_path` (matches checkout / bind_self / team).
-    let source_repo_hint = args["repository_path"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-
-    match rebase_clean_self(home, agent, branch) {
-        Ok(o) => {
-            // #826 L2 GC: when the binding-clear path short-circuited
-            // on "no binding" (the post-disband state), the
-            // `git worktree remove --force` step inside `release_full`
-            // never ran. Run it now against any source repos that
-            // still hold `.git/worktrees/<meta-dir>/` metadata for
-            // our target worktree path.
-            let gc =
-                gc::prune_git_metadata_for_agent(home, agent, branch, source_repo_hint.as_deref());
-            json!({
-                "released": true,
-                "dir_existed": o.dir_existed,
-                "dir_removed": o.dir_removed,
-                "binding_outcome": o.binding_outcome,
-                "git_metadata_pruned": gc.pruned_count,
-                "git_metadata_repos": gc.repos_touched,
-            })
-        }
-        Err(e) => json!({"error": e, "code": "path_outside_pool"}),
-    }
-}
 
 /// Outcome of a rebase-clean operation.
 #[derive(Debug)]
@@ -178,8 +67,7 @@ pub(super) fn rebase_clean_self(
         && target != worktrees_root.join(agent);
     if !safe {
         return Err(format!(
-            "force_release_worktree refuses to clean path outside the daemon \
-             worktree pool: {}",
+            "refuses to clean path outside the daemon worktree pool: {}",
             target.display()
         ));
     }
@@ -194,7 +82,7 @@ pub(super) fn rebase_clean_self(
                     %agent,
                     %branch,
                     path = %target.display(),
-                    "force_release_worktree: stale worktree dir cleaned"
+                    "rebase_clean_self: stale worktree dir cleaned"
                 );
             }
             Err(e) => {
@@ -203,7 +91,7 @@ pub(super) fn rebase_clean_self(
                     %branch,
                     error = %e,
                     path = %target.display(),
-                    "force_release_worktree: dir removal failed (will still try binding-clear)"
+                    "rebase_clean_self: dir removal failed (will still try binding-clear)"
                 );
             }
         }
@@ -226,6 +114,7 @@ pub(super) fn rebase_clean_self(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn tmp_home(suffix: &str) -> std::path::PathBuf {
@@ -255,233 +144,6 @@ mod tests {
         // Drop a sample file so we can verify recursive cleanup.
         std::fs::write(dir.join("sample.txt"), "leftover").unwrap();
         dir
-    }
-
-    // ── Lead-spec named tests (per dispatch m-20260509125352834800-192) ──
-
-    #[test]
-    fn force_release_worktree_cleans_existing_dir() {
-        let home = tmp_home("clean-existing");
-        let dir = seed_daemon_worktree(&home, "dev", "feature/x");
-        assert!(dir.exists(), "seeded dir must exist pre-call");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "feature/x"}),
-            &None,
-        );
-        assert_eq!(result["released"].as_bool(), Some(true));
-        assert_eq!(result["dir_existed"].as_bool(), Some(true));
-        assert_eq!(result["dir_removed"].as_bool(), Some(true));
-        assert!(!dir.exists(), "dir must be cleaned post-call");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_idempotent_on_missing_dir() {
-        let home = tmp_home("idempotent");
-        // No seed — call directly on a non-existent target.
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "feature/never-existed"}),
-            &None,
-        );
-        assert_eq!(result["released"].as_bool(), Some(true));
-        assert_eq!(
-            result["dir_existed"].as_bool(),
-            Some(false),
-            "missing dir reports dir_existed=false"
-        );
-        assert_eq!(
-            result["dir_removed"].as_bool(),
-            Some(false),
-            "no removal happens on missing dir"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_releases_binding_too() {
-        // Per spec: even when only the on-disk dir is stale (no
-        // active binding), the call must still invoke release_full
-        // for defense-in-depth. The outcome surfaces in the
-        // `binding_outcome` field.
-        let home = tmp_home("releases-binding");
-        seed_daemon_worktree(&home, "dev", "feature/y");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "feature/y"}),
-            &None,
-        );
-        assert!(
-            result["binding_outcome"].is_object(),
-            "binding_outcome must surface the release_full result: {result}"
-        );
-        // No prior binding existed → #1465: release_full is an idempotent
-        // SUCCESS no-op (released:true, already_released:true, no error).
-        let outcome = &result["binding_outcome"];
-        assert_eq!(outcome["released"].as_bool(), Some(true), "{result}");
-        assert_eq!(
-            outcome["already_released"].as_bool(),
-            Some(true),
-            "{result}"
-        );
-        assert!(outcome["error"].is_null(), "no-op must not error: {result}");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_rejects_path_outside_worktree_pool() {
-        // Defense-in-depth: even if a malicious caller could pass
-        // names that bypass the validator (or the validator is
-        // weakened in a future change), the path-safety guard
-        // refuses to clean anything outside <home>/worktrees/.
-        let home = tmp_home("outside-pool-reject");
-        // Seed a dir OUTSIDE the worktree pool, simulating where a
-        // malicious caller might try to send the cleanup.
-        let outside = home.join("config");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("important.json"), "data").unwrap();
-        // Use empty branch — caught by the missing-branch check
-        // first, but this exercises the input-rejection path.
-        let r1 =
-            handle_force_release_worktree(&home, &json!({"instance": "dev", "branch": ""}), &None);
-        assert!(r1["error"].is_string(), "empty branch must error: {r1}");
-        // The outside dir must still exist (no manipulation).
-        assert!(outside.join("important.json").exists());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_rejects_invalid_agent_name() {
-        let home = tmp_home("invalid-agent");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "../etc/passwd", "branch": "feature/x"}),
-            &None,
-        );
-        assert!(result["error"].is_string());
-        assert_eq!(result["code"].as_str(), Some("invalid_agent"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_rejects_invalid_branch_name() {
-        let home = tmp_home("invalid-branch");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "../../escape"}),
-            &None,
-        );
-        assert!(result["error"].is_string());
-        assert_eq!(result["code"].as_str(), Some("invalid_branch"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ── Defensive bonuses ─────────────────────────────────────────
-
-    #[test]
-    fn force_release_worktree_rejects_missing_agent() {
-        let home = tmp_home("missing-agent");
-        let result = handle_force_release_worktree(&home, &json!({"branch": "feature/x"}), &None);
-        assert_eq!(result["error"].as_str(), Some("missing 'instance'"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_rejects_missing_branch() {
-        let home = tmp_home("missing-branch");
-        let result = handle_force_release_worktree(&home, &json!({"instance": "dev"}), &None);
-        assert_eq!(result["error"].as_str(), Some("missing 'branch'"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_after_failure_allows_bind_self_succeed() {
-        // Integration-of-the-unblock-scenario test: simulate the
-        // post-PR-2/PR-4 stale-state, call force_release_worktree,
-        // then assert the worktree dir is gone (so a subsequent
-        // bind_self would NOT trip on lease_failed).
-        let home = tmp_home("integration-bind-succeed");
-        let dir = seed_daemon_worktree(&home, "dev", "sprint59-wave1-pr4-issue-b");
-        assert!(dir.exists(), "stale dir present pre-cleanup");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "sprint59-wave1-pr4-issue-b"}),
-            &None,
-        );
-        assert_eq!(result["released"].as_bool(), Some(true));
-        assert_eq!(result["dir_removed"].as_bool(), Some(true));
-        // Post-cleanup: the canonical bind_self target path is gone
-        // → bind_self would proceed cleanly. We can't actually call
-        // bind_self in a unit test (needs daemon registry), but
-        // the absence of the dir IS the necessary precondition
-        // for bind_self to succeed.
-        assert!(!dir.exists(), "worktree dir must be gone");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_handles_partial_cleanup_state() {
-        // Defensive: a dir that's been partially cleaned (some files
-        // already removed by an aborted prior call) still gets
-        // recursively wiped without panic.
-        let home = tmp_home("partial-cleanup");
-        let dir = home.join("worktrees").join("dev").join("feature/x");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Don't seed with .agend-managed marker — partial state.
-        std::fs::write(dir.join("leftover"), "data").unwrap();
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "feature/x"}),
-            &None,
-        );
-        assert_eq!(result["dir_removed"].as_bool(), Some(true));
-        assert!(!dir.exists());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_preserves_other_branches() {
-        // Defense-in-depth: cleaning one branch's dir must NOT
-        // touch sibling branches under the same agent.
-        let home = tmp_home("preserves-siblings");
-        let dir_x = seed_daemon_worktree(&home, "dev", "feature/x");
-        let dir_y = seed_daemon_worktree(&home, "dev", "feature/y");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "feature/x"}),
-            &None,
-        );
-        assert_eq!(result["dir_removed"].as_bool(), Some(true));
-        assert!(!dir_x.exists(), "target branch dir cleaned");
-        assert!(
-            dir_y.exists(),
-            "sibling branch dir preserved: {}",
-            dir_y.display()
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn force_release_worktree_preserves_other_agents() {
-        // Defense-in-depth: cleaning one agent's dir must NOT
-        // touch other agents' worktrees.
-        let home = tmp_home("preserves-agents");
-        let dir_dev = seed_daemon_worktree(&home, "dev", "feature/x");
-        let dir_lead = seed_daemon_worktree(&home, "lead", "feature/x");
-        let result = handle_force_release_worktree(
-            &home,
-            &json!({"instance": "dev", "branch": "feature/x"}),
-            &None,
-        );
-        assert_eq!(result["dir_removed"].as_bool(), Some(true));
-        assert!(!dir_dev.exists());
-        assert!(
-            dir_lead.exists(),
-            "lead's dir preserved: {}",
-            dir_lead.display()
-        );
-        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── Sprint 60 W1 PR-1: rebase_clean_self helper tests ──────────────

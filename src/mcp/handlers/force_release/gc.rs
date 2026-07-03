@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 /// step actually pruned a metadata entry for the target agent's
 /// worktree path.
 #[derive(Debug, Default)]
-pub(super) struct GcOutcome {
-    pub(super) pruned_count: usize,
-    pub(super) repos_touched: Vec<String>,
+pub(crate) struct GcOutcome {
+    pub(crate) pruned_count: usize,
+    pub(crate) repos_touched: Vec<String>,
 }
 
 /// #826 L2: enumerate source repos that may still hold
@@ -48,7 +48,7 @@ pub(super) struct GcOutcome {
 /// `git worktree remove --force <path>` against the source repo's
 /// cwd. AGEND_GIT_BYPASS=1 is set on every git invocation to bypass
 /// the daemon shim per the operator-confirmed manual recovery command.
-pub(super) fn prune_git_metadata_for_agent(
+pub(crate) fn prune_git_metadata_for_agent(
     home: &Path,
     agent: &str,
     branch: &str,
@@ -289,7 +289,10 @@ fn canonicalize_via_parent(path: &Path) -> PathBuf {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::super::handle_force_release_worktree;
+    // #2548 PR-2: `force_release_worktree` folded into
+    // `release_worktree(force:true)` — these tests now drive the merged
+    // handler directly (every call below adds `"force": true`).
+    use crate::mcp::handlers::worktree::handle_release_worktree;
     use serde_json::json;
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -401,9 +404,9 @@ mod tests {
 
         // A peer that is neither the owner nor its orchestrator is denied.
         let attacker = crate::identity::Sender::new("attacker");
-        let denied = handle_force_release_worktree(
+        let denied = handle_release_worktree(
             &home,
-            &json!({"instance": "victim", "branch": "feat/x", "repository_path": repo}),
+            &json!({"instance": "victim", "branch": "feat/x", "repository_path": repo, "force": true}),
             &attacker,
         );
         assert_eq!(
@@ -413,9 +416,9 @@ mod tests {
 
         // The owner itself is allowed (no ACL error).
         let owner = crate::identity::Sender::new("victim");
-        let ok = handle_force_release_worktree(
+        let ok = handle_release_worktree(
             &home,
-            &json!({"instance": "victim", "branch": "feat/x", "repository_path": repo}),
+            &json!({"instance": "victim", "branch": "feat/x", "repository_path": repo, "force": true}),
             &owner,
         );
         assert_ne!(
@@ -432,12 +435,13 @@ mod tests {
         let (source_repo, agent_meta_dir) =
             seed_disbanded_agent_with_git_metadata(&home, "dev826", "feat/826");
 
-        let result = handle_force_release_worktree(
+        let result = handle_release_worktree(
             &home,
             &json!({
                 "instance": "dev826",
                 "branch": "feat/826",
                 "repository_path": source_repo.display().to_string(),
+                "force": true,
             }),
             &None,
         );
@@ -473,9 +477,9 @@ mod tests {
         // repos_touched: []. The response shape still includes the
         // fields (audit contract).
         let home = tmp_home("826_c3_response_shape");
-        let result = handle_force_release_worktree(
+        let result = handle_release_worktree(
             &home,
-            &json!({"instance": "dev826c3", "branch": "feat/826"}),
+            &json!({"instance": "dev826c3", "branch": "feat/826", "force": true}),
             &None,
         );
         assert_eq!(result["git_metadata_pruned"], 0, "got: {result}");
@@ -498,12 +502,13 @@ mod tests {
             seed_disbanded_agent_with_git_metadata(&home, "dev826", "feat/826");
 
         // First call: prunes 1.
-        let r1 = handle_force_release_worktree(
+        let r1 = handle_release_worktree(
             &home,
             &json!({
                 "instance": "dev826",
                 "branch": "feat/826",
                 "repository_path": source_repo.display().to_string(),
+                "force": true,
             }),
             &None,
         );
@@ -511,12 +516,13 @@ mod tests {
         assert!(!meta_dir.exists());
 
         // Second call: prunes 0 (already pruned, no-op).
-        let r2 = handle_force_release_worktree(
+        let r2 = handle_release_worktree(
             &home,
             &json!({
                 "instance": "dev826",
                 "branch": "feat/826",
                 "repository_path": source_repo.display().to_string(),
+                "force": true,
             }),
             &None,
         );
@@ -551,12 +557,13 @@ mod tests {
             seed_disbanded_agent_with_git_metadata(&repo_b_home, agent, "feat/bbb");
 
         // Prune repo_a's metadata.
-        let r1 = handle_force_release_worktree(
+        let r1 = handle_release_worktree(
             &home,
             &json!({
                 "instance": agent,
                 "branch": "feat/aaa",
                 "repository_path": repo_a.display().to_string(),
+                "force": true,
             }),
             &None,
         );
@@ -567,12 +574,13 @@ mod tests {
 
         // Prune repo_b's metadata (different home so target path
         // computation aligns with the second fixture).
-        let r2 = handle_force_release_worktree(
+        let r2 = handle_release_worktree(
             &repo_b_home,
             &json!({
                 "instance": agent,
                 "branch": "feat/bbb",
                 "repository_path": repo_b.display().to_string(),
+                "force": true,
             }),
             &None,
         );
@@ -630,12 +638,13 @@ mod tests {
         assert!(meta_x.exists(), "fixture: agent_x metadata pre-call");
 
         // Prune ONLY agent_x's metadata.
-        let result = handle_force_release_worktree(
+        let result = handle_release_worktree(
             &home,
             &json!({
                 "instance": "agent_x826",
                 "branch": "feat/x",
                 "repository_path": source_repo.display().to_string(),
+                "force": true,
             }),
             &None,
         );

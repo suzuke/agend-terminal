@@ -71,7 +71,7 @@ agend-terminal doctor
 **復原**
 
 - agent 真的卡死了 → `agend-terminal kill <name>`；daemon 會把它重生（在 crash 預算範圍內，見 §1）。
-- 一個 worktree binding 在它的 agent 之後還活著（例如你刪掉／重建了一個 instance，而 `bind_self` 現在拒絕綁定）：用 `force_release_worktree` 這個 MCP 工具（從任何已連線的 agent 或 lead 都可以呼叫）。
+- 一個 worktree binding 在它的 agent 之後還活著（例如你刪掉／重建了一個 instance，而 `bind_self` 現在拒絕綁定）：用 `release_worktree(force:true)`（#2548：從原本獨立的 `force_release_worktree` 工具吸收而來；從任何已連線的 agent 或 lead 都可以呼叫，但僅限該 worktree 自己的 agent 或其 team orchestrator）。
   **警告：它會刪掉磁碟上的 worktree 目錄——任何在 `~/.agend-terminal/worktrees/<agent>/...` 裡未提交的 WIP 都會不見。** 如果那些工作重要，請先 commit／push。它會拒絕 daemon worktree pool 以外的路徑，而且是冪等的。
 
 ---

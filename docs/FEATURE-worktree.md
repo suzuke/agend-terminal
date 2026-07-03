@@ -4,8 +4,9 @@
 
 This document describes git worktree creation, binding, release, and garbage
 collection, as well as the division of responsibility among `bind_self`,
-`release_worktree`, `force_release_worktree`, `repo action=checkout`, and
-`repo action=release`.
+`release_worktree` (including its `force:true` emergency-recovery mode,
+absorbed from the former standalone `force_release_worktree` tool — #2548),
+`repo action=checkout`, and `repo action=release`.
 
 ## Usage Scenarios
 
@@ -15,7 +16,7 @@ collection, as well as the division of responsibility among `bind_self`,
 
 **Mid-lifecycle recovery.** An agent's worktree binding becomes stale after a crash or daemon restart. The agent uses `bind_self` to re-establish its binding to the existing worktree, optionally with `rebase_mode=true` to rebase onto the latest upstream changes before resuming work.
 
-**Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC (`gc_cutover` with `AGEND_WORKTREE_GC=1`) removes it automatically. For stuck or orphaned worktrees, the operator can use `force_release_worktree` as an emergency measure.
+**Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC (`gc_cutover` with `AGEND_WORKTREE_GC=1`) removes it automatically. For stuck or orphaned worktrees, the operator can use `release_worktree(force:true)` as an emergency measure.
 
 **Auto-release on merge (#1344).** When the pr_state scanner detects a PR has been merged, it automatically calls `auto_release_for_merged_branch` to free the worktree before emitting the `[pr-merged]` notification. This ensures `gh pr merge --delete-branch` succeeds without manual intervention. Dirty worktrees are skipped (with a warning log) and retried on the next scanner tick.
 
@@ -104,7 +105,10 @@ Suitable for mid-lifecycle rebinding.
 
 ## 9. Emergency Cleanup
 
-`force_release_worktree` is the emergency tool for stale worktree directories.
+`release_worktree(force:true)` (#2548: absorbed the former standalone
+`force_release_worktree` tool) is the emergency tool for stale worktree
+directories. Requires `branch` in addition to `instance`; restricted to the
+worktree's own agent or its team orchestrator (AUDIT2-002).
 
 - Target must be within `<home>/worktrees/<agent>/<branch>/`; paths outside the pool are rejected.
 - Attempts `remove_dir_all` directly (directory deletion failure does not block binding cleanup).
@@ -169,7 +173,7 @@ Both the new layout (`<home>/worktrees/<agent>/<branch>/`) and legacy layout (`<
 1. New task: `repo action=checkout bind:true`.
 2. Mid-lifecycle recovery: `bind_self`.
 3. Ready to release: `release_worktree`.
-4. Stale directory remains: `force_release_worktree`.
+4. Stale directory remains: `release_worktree(force:true)`.
 5. Preview candidates: `gc_dry_run`.
 6. Execute collection: set `AGEND_WORKTREE_GC=1`, run cutover.
 7. Preserve a worktree: `pin`.
@@ -190,4 +194,4 @@ Both the new layout (`<home>/worktrees/<agent>/<branch>/`) and legacy layout (`<
 
 ## 18. Summary
 
-Worktrees are the isolation layer between agents and branches. `repo action=checkout bind:true` creates new bindings; `bind_self` rebinds mid-lifecycle; `release_worktree` releases formally; `force_release_worktree` handles emergencies; `repo action=release` releases by path. GC (`agend-terminal admin gc-dry-run` — #2548: moved from the `gc_dry_run` MCP tool — / `gc_cutover`) handles deferred reclamation. `.agend-managed`, `.agend-pinned`, and `binding.json` together describe the full state. When something goes wrong, determine whether the issue is in lease, release, or GC.
+Worktrees are the isolation layer between agents and branches. `repo action=checkout bind:true` creates new bindings; `bind_self` rebinds mid-lifecycle; `release_worktree` releases formally; `release_worktree(force:true)` (#2548: absorbed the former standalone `force_release_worktree` tool) handles emergencies; `repo action=release` releases by path. GC (`agend-terminal admin gc-dry-run` — #2548: moved from the `gc_dry_run` MCP tool — / `gc_cutover`) handles deferred reclamation. `.agend-managed`, `.agend-pinned`, and `binding.json` together describe the full state. When something goes wrong, determine whether the issue is in lease, release, or GC.

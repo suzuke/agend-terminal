@@ -21,7 +21,7 @@ pub(super) fn handle_list_instances_with_runtime(
     let include_evidence = args["verbose"].as_bool().unwrap_or(false)
         || args["include_evidence"].as_bool().unwrap_or(false);
     let Some(runtime) = runtime else {
-        return json!({"instances": list_agents(), "compact": true});
+        return with_operator_mode(json!({"instances": list_agents(), "compact": true}));
     };
     let resp = crate::api::list_response(home, &runtime.registry, &runtime.externals);
     if let Some(agents) = resp["result"]["agents"].as_array() {
@@ -44,10 +44,25 @@ pub(super) fn handle_list_instances_with_runtime(
                 info
             })
             .collect();
-        json!({"instances": instances, "compact": !include_evidence})
+        with_operator_mode(json!({"instances": instances, "compact": !include_evidence}))
     } else {
-        json!({"instances": list_agents(), "compact": true})
+        with_operator_mode(json!({"instances": list_agents(), "compact": true}))
     }
+}
+
+/// #2548 PR-2: fold the retired `mode` MCP tool's read side into
+/// `list_instances` — agents already poll this to observe fleet state, and
+/// the operator-availability mode belongs alongside it (back off when the
+/// operator is away/asleep). Setting the mode stays CLI-only
+/// (`agend-terminal mode <active|away|sleep>`); this is read-only.
+fn with_operator_mode(mut result: Value) -> Value {
+    let state = crate::operator_mode::get();
+    result["operator_mode"] = json!({
+        "mode": state.mode,
+        "delegate_to": state.delegate_to,
+        "delegate_scope": state.delegate_scope,
+    });
+    result
 }
 
 fn strip_observed_evidence(info: &mut Value) {
@@ -127,6 +142,29 @@ mod tests {
         let mut info = json!({"name": "dev-2", "agent_state": "idle"});
         strip_observed_evidence(&mut info); // must not panic / must be inert
         assert_eq!(info["name"], "dev-2");
+    }
+
+    #[test]
+    fn list_instances_includes_operator_mode_2548() {
+        // #2548 PR-2: the retired `mode` tool's read side folds into
+        // list_instances. Assert shape only (not a specific mode value) —
+        // operator_mode is process-global state other tests may mutate
+        // concurrently in the same test binary.
+        let home = std::env::temp_dir().join(format!("agend-list-opmode-{}", std::process::id()));
+        let result = handle_list_instances_with_runtime(&home, &json!({}), "caller", None);
+        let om = &result["operator_mode"];
+        assert!(
+            om.is_object(),
+            "list_instances must surface operator_mode: {result}"
+        );
+        assert!(
+            om["mode"].is_string(),
+            "operator_mode.mode must be a string: {result}"
+        );
+        assert!(
+            om["delegate_scope"].is_array(),
+            "operator_mode.delegate_scope must be an array: {result}"
+        );
     }
 
     #[test]

@@ -137,7 +137,6 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "config",
             "set_waiting_on",
             "health",
-            "mode",
         ],
     ),
     // planner: reads code/CI to plan + reports. Same read/report surface as
@@ -159,7 +158,6 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "config",
             "set_waiting_on",
             "health",
-            "mode",
         ],
     ),
     // explorer: read-only investigation + report. Strictest — also drops `repo`
@@ -180,7 +178,6 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "config",
             "set_waiting_on",
             "health",
-            "mode",
         ],
     ),
 ];
@@ -235,7 +232,7 @@ pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, t
             .any(|entry| entry.name == tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 29] = [
+static ALL_TOOLS: [ToolEntry; 27] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -406,23 +403,10 @@ static ALL_TOOLS: [ToolEntry; 29] = [
         class: ToolClass::RETRY_SAFE,
     },
     ToolEntry {
-        name: "force_release_worktree",
-        definition: super::tools::def_force_release_worktree,
-        handler: super::handlers::dispatch::dispatch_force_release_worktree,
-        class: ToolClass::RETRY_SAFE,
-    },
-    ToolEntry {
         name: "binding_state",
         definition: super::tools::def_binding_state,
         handler: super::handlers::dispatch::dispatch_binding_state,
         class: ToolClass::READ_ONLY,
-    },
-    // ── #1339: Operator mode ──
-    ToolEntry {
-        name: "mode",
-        definition: super::tools::def_mode,
-        handler: super::handlers::dispatch::dispatch_mode,
-        class: ToolClass::RETRY_SAFE,
     },
 ];
 
@@ -440,12 +424,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_29_byte_identical() {
+    fn full_capability_roles_surface_all_27_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            29,
-            "registry baseline is 29 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29)"
+            27,
+            "registry baseline is 27 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27)"
         );
         for role in [
             None,
@@ -457,7 +441,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 29 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 27 tools in registry order (default-all-open)"
             );
         }
     }
@@ -471,7 +455,6 @@ mod tests {
         for cut in [
             "bind_self",
             "release_worktree",
-            "force_release_worktree",
             "create_instance",
             "delete_instance",
             "restart_instance",

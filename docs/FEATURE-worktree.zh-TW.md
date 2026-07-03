@@ -3,7 +3,8 @@
 # Worktree Management
 
 這份文件說明 git worktree 的建立、綁定、釋放、GC，以及
-`bind_self` / `release_worktree` / `force_release_worktree` /
+`bind_self` / `release_worktree`（含其 `force:true` 緊急救援模式，#2548 從原本獨立的
+`force_release_worktree` 工具吸收而來）/
 `repo action=checkout` / `repo action=release` 之間的分工。
 
 ## 使用情境
@@ -14,7 +15,7 @@
 
 **中途恢復。** Agent 的 worktree binding 在 crash 或 daemon 重啟後可能變得過時。Agent 使用 `bind_self` 重新建立與現有 worktree 的綁定，可選擇以 `rebase_mode=true` 先 rebase 到最新的上游變更再繼續工作。
 
-**可控的清理。** 任務完成且 PR 合併後，daemon 對 worktree 執行 soft release（標記 `released_at`）。Worktree 會在磁碟上保留 24 小時寬限期。如果沒有人重新認領，GC（設定 `AGEND_WORKTREE_GC=1` 後執行 `gc_cutover`）會自動移除。對於卡住或孤立的 worktree，operator 可以使用 `force_release_worktree` 作為緊急手段。
+**可控的清理。** 任務完成且 PR 合併後，daemon 對 worktree 執行 soft release（標記 `released_at`）。Worktree 會在磁碟上保留 24 小時寬限期。如果沒有人重新認領，GC（設定 `AGEND_WORKTREE_GC=1` 後執行 `gc_cutover`）會自動移除。對於卡住或孤立的 worktree，operator 可以使用 `release_worktree(force:true)` 作為緊急手段。
 
 ## 1. 設計初衷
 
@@ -152,7 +153,7 @@
 
 ## 9. emergency cleanup
 
-- `force_release_worktree` 是 emergency tool。
+- `release_worktree(force:true)`（#2548：從原本獨立的 `force_release_worktree` 工具吸收而來）是 emergency tool，需額外帶 `branch`，僅限該 worktree 自己的 agent 或其 team orchestrator 呼叫(AUDIT2-002)。
 - 它是給 stale worktree directory 使用的。
 - 它的 target 是 `<home>/worktrees/<agent>/<branch>/`。
 - 它會先驗證 path 安全。
@@ -251,14 +252,14 @@
 - 不要把 GC 當成 release 的替代品。
 - release 是顯式釋放。
 - GC 是延後回收。
-- force_release_worktree 是 emergency recovery。
+- release_worktree(force:true) 是 emergency recovery。
 
 ## 16. 使用流程
 
 - 新任務先用 `repo action=checkout bind:true`。
 - mid-lifecycle 恢復用 `bind_self`。
 - 準備釋放時先用 `release_worktree`。
-- 若還有殘留 dir，再用 `force_release_worktree`。
+- 若還有殘留 dir，再用 `release_worktree(force:true)`。
 - 只想看候選，先跑 `gc_dry_run`。
 - 確認無誤且要切回收，再設 `AGEND_WORKTREE_GC=1`。
 - 若要保留工作樹，先 pin。
@@ -285,7 +286,7 @@
 - `repo action=checkout bind:true` 是新建綁定的主入口。
 - `bind_self` 是 mid-lifecycle 重綁入口。
 - `release_worktree` 是正式釋放入口。
-- `force_release_worktree` 是 emergency recovery 入口。
+- `release_worktree(force:true)`（#2548：從原本獨立的 `force_release_worktree` 工具吸收而來）是 emergency recovery 入口。
 - `repo action=release` 是 path-centric 釋放入口。
 - `agend-terminal admin gc-dry-run`（#2548：從 `gc_dry_run` MCP 工具移過來）/ `gc_cutover` 負責延遲回收。
 - `.agend-managed`、`.agend-pinned`、binding.json 共同描述狀態。

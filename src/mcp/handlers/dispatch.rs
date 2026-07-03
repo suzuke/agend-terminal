@@ -28,9 +28,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{
-    binding_state, channel, ci, comms, force_release, instance, restart, schedule, task, worktree,
-};
+use super::{binding_state, channel, ci, comms, instance, restart, schedule, task, worktree};
 
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
@@ -234,11 +232,6 @@ adapter!(
     worktree::handle_release_worktree
 );
 adapter!(
-    dispatch_force_release_worktree,
-    has,
-    force_release::handle_force_release_worktree
-);
-adapter!(
     dispatch_download_attachment,
     hai,
     channel::handle_download_attachment
@@ -352,32 +345,6 @@ pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
-/// #1339: read the operator-mode (GET-ONLY for agents). `mode get` → current
-/// mode + delegate. SETTING the mode is operator-only and lives on the operator
-/// transport (`agend-terminal mode <active|away|sleep>` CLI → the direct `MODE`
-/// API method); the ingress gate blocks any agent `mode set` regardless, so this
-/// tool exposes read access only — agents observe the mode (e.g. to back off when
-/// the operator is away/asleep) but can never change operator authority.
-pub(crate) fn dispatch_mode(ctx: &HandlerCtx<'_>) -> Value {
-    match ctx.args["action"].as_str().unwrap_or("get") {
-        "get" => {
-            let s = crate::operator_mode::get();
-            json!({
-                "ok": true,
-                "mode": s.mode,
-                "delegate_to": s.delegate_to,
-                "delegate_scope": s.delegate_scope,
-            })
-        }
-        other => json!({
-            "error": format!(
-                "mode is read-only via MCP (action '{other}'); set the operator mode with the \
-                 `agend-terminal mode <active|away|sleep>` CLI (operator-only)"
-            )
-        }),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -443,12 +410,10 @@ mod tests {
                 "repo",
                 "bind_self",
                 "release_worktree",
-                "force_release_worktree",
                 "binding_state",
-                "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 29);
+        assert_eq!(crate::mcp::registry::all().len(), 27);
     }
 
     #[test]
@@ -575,19 +540,19 @@ mod tests {
         );
     }
 
-    /// #1602/#1603 audit pin. The systematic re-audit found 5 tools whose
+    /// #1602/#1603 audit pin. The systematic re-audit found tools whose
     /// HANDLER defaults a field instead of erroring on its absence, so that
     /// field must NOT be in `required[]` (else the validator would hard-reject a
     /// legitimate call). Pins BOTH that the schema omits it from `required[]`
     /// AND that the validator lets the field-less call through. If a future
     /// tool/edit declares a handler-defaulted field required, this fails — re-run
-    /// the audit (`grep unwrap_or` the handler).
+    /// the audit (`grep unwrap_or` the handler). #2548: `mode` case removed —
+    /// the tool was retired (folded into `list_instances`).
     #[test]
     fn handler_defaulted_fields_are_not_declared_required() {
         use crate::mcp::tools::*;
         // (tool, def, handler-defaulted field, a legit call that omits it)
         let cases = [
-            ("mode", def_mode(), "action", json!({})), // → "get" (read-only)
             (
                 "create_instance",
                 def_create_instance(),
