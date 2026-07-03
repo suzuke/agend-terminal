@@ -250,11 +250,11 @@ pub(crate) fn run_handlers_with_panic_guard(
 }
 
 /// AUDIT2-007: run the crash-event dispatch arm under the same panic guard the
-/// per-tick handlers get (#1002). `handle_clean_exit` / `spawn_stage2_thread` /
-/// `handle_crash_respawn` do telegram `block_on`, `escalation_persist` and fleet
-/// resolve — a panic there would unwind out of `run_core` and take down the whole
-/// daemon, escalating one agent's crash into a fleet-wide supervisor outage. Lives
-/// here (not in `daemon/mod.rs`) to keep that grandfathered file under its ceiling.
+/// per-tick handlers get (#1002). `handle_clean_exit` / `handle_crash_respawn` do
+/// telegram `block_on`, `escalation_persist` and fleet resolve — a panic there
+/// would unwind out of `run_core` and take down the whole daemon, escalating one
+/// agent's crash into a fleet-wide supervisor outage. Lives here (not in
+/// `daemon/mod.rs`) to keep that grandfathered file under its ceiling.
 pub(crate) fn dispatch_exit_event_guarded(
     exit_event: crate::agent::AgentExitEvent,
     home: &std::path::Path,
@@ -264,9 +264,6 @@ pub(crate) fn dispatch_exit_event_guarded(
     let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match exit_event {
         AgentExitEvent::CleanExit(ref name) => {
             super::handle_clean_exit(home, name.as_str(), &ctx.registry, &ctx.configs);
-        }
-        AgentExitEvent::Stage2Restart(name) => {
-            super::spawn_stage2_thread(home, &name, ctx);
         }
         AgentExitEvent::Crash(name) => {
             super::crash_respawn::handle_crash_respawn(home, &name, ctx);
@@ -288,21 +285,12 @@ pub(crate) fn dispatch_exit_event_guarded(
 /// invariant fails CI if a new handler lands here but neither runs in app nor is
 /// allowlisted.
 ///
-/// `crash_tx` is consumed by `RecoveryDispatcherHandler`. `stage2_dispatch_available`
-/// tells the handler whether a `Stage2Restart` on that channel has a live consumer
-/// in this runtime: `run_core` wires `crash_rx` (true); app-standalone passes a
-/// throwaway sender (false) — #1694(a) now RUNS the handler in app mode (Stage1
-/// ESC-nudge), but its Stage2 path escalates to Stage3 rather than silent-drop
-/// onto the consumerless channel.
-///
 /// #2538: relocated verbatim from `daemon::mod` (that grandfathered file was at
 /// its LOC ceiling with zero slack) — every `per_tick::X` reference below became
 /// bare `X` (already in scope via this module's own re-exports) and the one
 /// daemon-level reference (`watchdog::watchdog_dry_run_from_env`) became
 /// `super::watchdog::...`; no other change.
 pub(crate) fn build_default_handlers(
-    crash_tx: crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
-    stage2_dispatch_available: bool,
     daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
 ) -> Vec<Box<dyn PerTickHandler>> {
     let watchdog_dry_run = super::watchdog::watchdog_dry_run_from_env();
@@ -321,10 +309,7 @@ pub(crate) fn build_default_handlers(
         // set health state" concerns). Ordering-independent of RecoveryDispatcher
         // below (that reacts only to `Hung`, never `Unhealthy`).
         Box::new(BackendExitDetectionHandler::new()),
-        Box::new(RecoveryDispatcherHandler::new(
-            std::sync::Arc::new(crash_tx),
-            stage2_dispatch_available,
-        )),
+        Box::new(RecoveryDispatcherHandler::new()),
         // #t-777-3: respawn-stuck watchdog — auto-Fresh-restart an agent whose
         // Resume spawn hung (corrupt-session `resume --last`), bounded by a
         // retry cap that escalates a P0 + pause. Recovers via the proven API

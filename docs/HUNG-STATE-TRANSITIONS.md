@@ -462,6 +462,9 @@ reset mechanic.
   + env-var-gated shadow-mode default. Stages 2 and 3 follow-up
   sub-tasks reuse the same dispatcher tick + state machine. See
   `docs/RECOVERY-STAGES.md` for full lifecycle + promotion criteria.
+  **Update (#2549)**: Stage 2/3 (and the dispatcher-driven Stage 3 arm)
+  were later removed — converged to Stage-1-only. See
+  `docs/RECOVERY-STAGES.md`'s header banner for the rationale.
 
 ## Consumer audit
 

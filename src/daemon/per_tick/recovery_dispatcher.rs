@@ -1,21 +1,43 @@
-//! `#685` sub-task 7a Stage 1 — auto-recovery dispatcher.
+//! `#685` sub-task 7a — Stage-1-only auto-recovery dispatcher.
 //!
 //! Decision: `d-20260514030404021793-1`. Three-party consensus
 //! (lead-claude + dev-claude + reviewer-opencode).
 //!
-//! Phase 2 of `#685`: when `check_hang` (sub-task 1) detects `Hung`,
-//! the daemon currently emits a single `tracing::warn!` and does
-//! nothing else. This handler is the first step toward staged
-//! auto-recovery — Stage 1 sends an ESC byte to the agent's PTY
-//! ("simulate operator pressing ESC") and monitors whether the agent
-//! self-recovers within a timeout window.
+//! When `check_hang` (sub-task 1) detects `Hung`, this handler sends an
+//! ESC byte to the agent's PTY ("simulate operator pressing ESC") and
+//! monitors whether the agent self-recovers within a timeout window.
 //!
-//! Stages 2 (auto-restart) and 3 (pause + escalate) are follow-up
-//! sub-tasks (`7b`, `7c`). This module ships the **infrastructure** for
-//! all three stages: the `RecoveryStageState` state machine, per-agent
-//! tracking field on `HealthTracker`, env-var gate, anti-thrash
-//! cooldown. Stages 2/3 will add their dispatch arms but reuse this
-//! tick loop, this state machine, and this telemetry pattern.
+//! #2549 P2 (operator decision `d-20260703021554626467-13`): Stage 2
+//! (auto-restart) and the dispatcher-driven Stage 3 escalation path were
+//! removed — converged to Stage-1-only. Prior to this PR, Stage 2/3 were
+//! shipped but gated OFF by default (`hang_auto_recovery_enabled: false`
+//! and no per-stage env var set); under that default, `Stage2Eligible`
+//! parked indefinitely re-logging a shadow message every tick and NEVER
+//! reached Stage 3 — `stage2_decision`'s `Shadow` arm returned without
+//! mutating `recovery_stage_state`, and the only two paths that ever
+//! advanced past `Stage2Eligible` (`Stage2Pending` timeout,
+//! `EscalateNoConsumer`) both required the Stage 2 gate active. So the
+//! three branches that used to transition into `Stage2Eligible` (Stage 1
+//! timeout, PTY write failure, dead-likely classification) are now
+//! **log-only** — this preserves the default-gate-off behavior exactly
+//! (no new pause/restart side effects for agents that previously just sat
+//! in shadow-logged limbo). See the per-branch comments below.
+//!
+//! One consequence: since nothing in this file transitions into it
+//! anymore, `RecoveryStageState::Stage3Eligible` became permanently
+//! unreachable and was removed along with `Stage2Eligible`/`Stage2Pending`.
+//! `Stage3Pending` / `HealthState::Paused` /
+//! [`crate::health::HealthTracker::enter_paused`] are **untouched** — they
+//! are shared terminal-escalation machinery also used independently by
+//! `RespawnWatchdogHandler` (an unrelated failure mode: a stuck `resume`
+//! spawn, not the Hung ladder), so this dispatcher's `Stage3Pending` arm
+//! stays reachable via that path even though this file no longer
+//! constructs the state itself.
+//!
+//! `recovery_restart_count` (the Stage 2 cumulative-restart cap) is
+//! deleted, not kept for hypothetical future reuse — with Stage 2 gone
+//! nothing increments it, so the cap check was a permanently-dead branch;
+//! git history is the reuse mechanism if Stage 2 is ever revisited.
 //!
 //! ## Tick order
 //!
@@ -35,7 +57,6 @@
 //! (env var unset) emits the same telemetry log but does NOT send the
 //! ESC byte or transition the state machine — observability without
 //! production impact, mirroring the F9 shadow-mode SOP (sub-task 4).
-//! Stages 2/3 follow the same pattern with their own env vars.
 //!
 //! ## Combined-gate three branches
 //!
@@ -46,8 +67,9 @@
 //! - **alive-stuck**: `productive_silence > threshold` && `silent < threshold`
 //!   → fire Stage 1 ESC (agent process reading PTY, just not productive)
 //! - **dead-likely**: `silent > threshold`
-//!   → skip Stage 1, transition directly to `Stage2Eligible`
-//!   (ESC won't help a process that's not reading)
+//!   → skip Stage 1 (ESC won't help a process that's not reading); log
+//!   only, state stays `None` (#2549: was a transition to the now-removed
+//!   `Stage2Eligible`)
 //! - **anomaly**: neither condition holds (agent shouldn't be `Hung`)
 //!   → log warning, leave state unchanged
 //!
@@ -55,8 +77,9 @@
 //!
 //! Decision §1.4 Refinement B — if agent re-enters `Hung` within
 //! `STAGE1_COOLDOWN_DEFAULT_MS` of a recent Stage 1 fire, dispatcher
-//! skips Stage 1 and goes directly to `Stage2Eligible`. Prevents
-//! rapid-fire ESC sending that would mask the underlying issue.
+//! skips re-firing Stage 1; log only, state stays `None` (#2549: was a
+//! transition to the now-removed `Stage2Eligible`). Prevents rapid-fire
+//! ESC sending that would mask the underlying issue.
 
 use super::{PerTickHandler, TickContext};
 use crate::agent;
@@ -69,9 +92,9 @@ use std::time::{Duration, Instant};
 
 /// #1617 (#1593 F1): per-agent snapshot captured under the registry lock
 /// so the recovery state machine — including the Stage-1 blocking PTY
-/// write and the Stage-2/3 notify I/O — runs AFTER the lock is dropped.
-/// `core` + `pty_writer` are both `Arc`, so cloning them out is cheap and
-/// lets the registry guard be released before any blocking work.
+/// write — runs AFTER the lock is dropped. `core` + `pty_writer` are both
+/// `Arc`, so cloning them out is cheap and lets the registry guard be
+/// released before any blocking work.
 struct RecoveryTarget {
     name: String,
     core: Arc<crate::sync_audit::CoreMutex<agent::AgentCore>>,
@@ -89,80 +112,12 @@ const STAGE1_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE1";
 /// audit observability surface.
 const TARGET: &str = "recovery_shadow";
 
-/// `#685` sub-task 7b: env var controlling Stage 2 activation. When
-/// set to `"1"`, the dispatcher emits `AgentExitEvent::Stage2Restart`
-/// to `crash_tx` (active mode). Default unset = shadow mode: same
-/// telemetry, no event emission.
-const STAGE2_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2";
-const STAGE2_MAX_RESTARTS_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS";
-
-/// `#685` sub-task 7c: env var controlling Stage 3 escalation activation.
-/// When set to `"1"`, the dispatcher writes `HealthState::Paused` via
-/// `HealthTracker::enter_paused` (active mode). Default unset = shadow
-/// mode: telegram + tracing only, no state write — operator can observe
-/// the decision pattern before flipping. Mirrors STAGE1 / STAGE2 env
-/// gate pattern.
-const STAGE3_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE3";
-
-pub(crate) struct RecoveryDispatcherHandler {
-    /// `#685` sub-task 7b: handle to the daemon's `crash_tx` channel.
-    /// Stage 1 path (already shipped in 7a) holds but never sends —
-    /// kept for uniform constructor across stages. Stage 2 path uses
-    /// `try_send` to emit `AgentExitEvent::Stage2Restart` events that
-    /// the respawn worker arm (in `daemon/mod.rs:642`) splits on.
-    ///
-    /// `Arc` so the dispatcher can clone-as-needed; channel `Sender` is
-    /// itself cheap-to-clone but `Arc` keeps the surface uniform across
-    /// future stages and avoids leaking `crossbeam_channel::Sender`
-    /// across the trait boundary.
-    crash_tx: std::sync::Arc<crossbeam_channel::Sender<crate::agent::AgentExitEvent>>,
-    /// #1694(a): whether a `Stage2Restart` emitted on `crash_tx` actually has a
-    /// live consumer in THIS runtime. `run_core` wires `crash_rx` →
-    /// `handle_crash_respawn` (true); app-standalone passes a throwaway channel
-    /// whose `rx` is dropped (false), so a Stage2 `try_send` there would silently
-    /// vanish. When false, `handle_stage2_fire` escalates straight to Stage3
-    /// (graceful pause + operator escalation) instead of a no-op restart — the
-    /// M-class silent-drop this whole sprint has been closing. (The real fix —
-    /// Stage2 driving app mode's pane-based respawn — is a follow-up; Stage2 stays
-    /// gated-off by default, so this only fires if an operator enables Stage2 in
-    /// app mode.)
-    stage2_dispatch_available: bool,
-}
+pub(crate) struct RecoveryDispatcherHandler;
 
 impl RecoveryDispatcherHandler {
-    pub(crate) fn new(
-        crash_tx: std::sync::Arc<crossbeam_channel::Sender<crate::agent::AgentExitEvent>>,
-        stage2_dispatch_available: bool,
-    ) -> Self {
-        Self {
-            crash_tx,
-            stage2_dispatch_available,
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
-}
-
-fn stage2_gate_active() -> bool {
-    crate::runtime_config::get().hang_auto_recovery_enabled
-        || std::env::var(STAGE2_ENV_VAR)
-            .map(|v| v == "1")
-            .unwrap_or(false)
-}
-
-fn stage2_max_restarts() -> u32 {
-    match std::env::var(STAGE2_MAX_RESTARTS_ENV_VAR) {
-        Ok(v) => match v.parse::<u32>() {
-            Ok(n) => n,
-            Err(_) => crate::health::STAGE2_MAX_RESTARTS_DEFAULT,
-        },
-        Err(_) => crate::health::STAGE2_MAX_RESTARTS_DEFAULT,
-    }
-}
-
-fn stage3_gate_active() -> bool {
-    crate::runtime_config::get().hang_auto_recovery_enabled
-        || std::env::var(STAGE3_ENV_VAR)
-            .map(|v| v == "1")
-            .unwrap_or(false)
 }
 
 fn stage1_gate_active() -> bool {
@@ -181,7 +136,7 @@ enum Stage1Branch {
     /// `silence < threshold`. ESC is the right action.
     AliveStuck,
     /// Agent is dead-likely — `silence > threshold`. Stage 1 would be
-    /// wasted; transition directly to `Stage2Eligible`.
+    /// wasted (ESC won't help a process not reading its PTY).
     DeadLikely,
     /// Neither condition holds; agent shouldn't be `Hung`. Log warning
     /// but leave dispatcher state untouched.
@@ -209,31 +164,6 @@ fn classify_branch(
     }
 }
 
-/// #1694(a): three-way decision for `handle_stage2_fire`, extracted (like
-/// [`Stage1Branch`]) so the branch logic is unit-testable independent of the
-/// PTY/channel side effects — no AgentHandle harness needed.
-#[derive(Debug, PartialEq, Eq)]
-enum Stage2Decision {
-    /// Gate off — shadow mode: log the would-fire, no send, no transition.
-    Shadow,
-    /// Gate on but no live crash consumer in this runtime (app-standalone) —
-    /// escalate to Stage3 (graceful pause + escalation) rather than silent-drop
-    /// the `Stage2Restart` onto a receiver-less channel.
-    EscalateNoConsumer,
-    /// Gate on + a live consumer — emit the `Stage2Restart` (active mode).
-    Fire,
-}
-
-fn stage2_decision(gate_active: bool, stage2_dispatch_available: bool) -> Stage2Decision {
-    if !gate_active {
-        Stage2Decision::Shadow
-    } else if !stage2_dispatch_available {
-        Stage2Decision::EscalateNoConsumer
-    } else {
-        Stage2Decision::Fire
-    }
-}
-
 impl PerTickHandler for RecoveryDispatcherHandler {
     fn name(&self) -> &'static str {
         "recovery_dispatcher"
@@ -243,18 +173,14 @@ impl PerTickHandler for RecoveryDispatcherHandler {
         let stage1_active = stage1_gate_active();
         let stage1_timeout = Duration::from_millis(STAGE1_TIMEOUT_DEFAULT_MS);
         let stage1_cooldown = Duration::from_millis(STAGE1_COOLDOWN_DEFAULT_MS);
-        let stage2_active = stage2_gate_active();
-        let stage2_timeout = Duration::from_millis(crate::health::STAGE2_TIMEOUT_DEFAULT_MS);
-        let stage2_max = stage2_max_restarts();
-        let stage3_active = stage3_gate_active();
 
         // #1617 (#1593 F1): snapshot each agent's `core` + `pty_writer`
         // (both `Arc`) UNDER the registry lock, then DROP the lock before
         // any per-agent recovery work. The Stage-1 path does a blocking PTY
-        // write and Stages 2/3 do notify I/O — holding the global registry
-        // lock across those is the deadlock class #1593 closed elsewhere:
-        // a hung agent's PTY never drains, the write blocks, and the
-        // supervisor tick stalls holding the registry → whole daemon hangs.
+        // write — holding the global registry lock across that is the
+        // deadlock class #1593 closed elsewhere: a hung agent's PTY never
+        // drains, the write blocks, and the supervisor tick stalls holding
+        // the registry → whole daemon hangs.
         // #941 holder-tracking still wraps the (now brief) snapshot hold.
         let targets: Vec<RecoveryTarget> = {
             let reg = agent::lock_registry_tracked(ctx.registry, "recovery_dispatcher");
@@ -282,7 +208,6 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                     health_state: core.health.state,
                     recovery_stage_state: core.health.recovery_stage_state,
                     last_stage1_fired_at: core.health.last_stage1_fired_at,
-                    recovery_restart_count: core.health.recovery_restart_count,
                     // KEEP-RAW (#2465): the recovery dispatcher is a health-state machine — feeding it
                     // the promoted/observed state could let a stale/false 'Active' hook MASK a genuinely
                     // stuck agent and skip its recovery escalation. Do NOT migrate to operated_state.
@@ -332,40 +257,24 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                     &snapshot,
                     stage1_active,
                     stage1_cooldown,
-                    stage2_max,
                 ),
                 RecoveryStageState::Stage1Pending { entered_at } => {
+                    // #2549: Stage 1 timeout used to escalate to the now-removed
+                    // `Stage2Eligible`. Under the pre-#2549 default (Stage 2 gate
+                    // off), `Stage2Eligible` re-logged a shadow "would-have-fired"
+                    // message every tick and never advanced further — so log-only
+                    // here (state stays `Stage1Pending`, re-logging every tick the
+                    // same way) preserves that default behavior exactly, with zero
+                    // new pause/restart side effects.
                     if entered_at.elapsed() >= stage1_timeout {
                         tracing::info!(
                             target: TARGET,
                             agent = %name,
                             timeout_ms = stage1_timeout.as_millis() as u64,
                             gate_active = stage1_active,
-                            "stage1 timeout expired without recovery — escalating to Stage2Eligible"
+                            "stage1 timeout expired without recovery — no further auto-recovery stage available (Stage 2/3 removed #2549); agent remains Hung pending manual intervention or spontaneous recovery"
                         );
-                        let mut core = target.core.lock();
-                        core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
                     }
-                }
-                RecoveryStageState::Stage2Eligible => {
-                    self.handle_stage2_fire(name, target, &snapshot, stage2_active);
-                }
-                RecoveryStageState::Stage2Pending { entered_at } => {
-                    if entered_at.elapsed() >= stage2_timeout {
-                        tracing::info!(
-                            target: TARGET,
-                            agent = %name,
-                            timeout_ms = stage2_timeout.as_millis() as u64,
-                            gate_active = stage2_active,
-                            recovery_restart_count = snapshot.recovery_restart_count,
-                            "stage2 timeout expired without recovery — escalating to Stage3Eligible"
-                        );
-                        let mut core = target.core.lock();
-                        core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
-                    }
-                }
-                RecoveryStageState::Stage3Eligible => {
-                    self.handle_stage3_escalate(name, target, &snapshot, stage3_active);
                 }
                 RecoveryStageState::Stage3Pending { entered_at } => {
                     // Stage 3 is terminal — no further auto-recovery,
@@ -399,27 +308,7 @@ impl RecoveryDispatcherHandler {
         snapshot: &DispatchSnapshot,
         gate_active: bool,
         cooldown_window: Duration,
-        stage2_max: u32,
     ) {
-        // `#685` sub-task 7b: cumulative restart cap check. If the agent
-        // has already been Stage-2-restarted `stage2_max` times across
-        // prior Hung cycles (decayed by `maybe_decay` per
-        // `STABILITY_WINDOW`), skip Stages 1/2 entirely and escalate
-        // directly to `Stage3Eligible`. Operator intervention required
-        // rather than further automated thrashing.
-        if snapshot.recovery_restart_count >= stage2_max {
-            tracing::info!(
-                target: TARGET,
-                agent = %name,
-                recovery_restart_count = snapshot.recovery_restart_count,
-                stage2_max,
-                "recovery restart cap reached — escalating directly to Stage3Eligible"
-            );
-            let mut core = target.core.lock();
-            core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
-            return;
-        }
-
         let branch = classify_branch(
             snapshot.agent_state,
             snapshot.silent,
@@ -442,26 +331,29 @@ impl RecoveryDispatcherHandler {
                 );
             }
             (Stage1Branch::AliveStuck, true) => {
+                // #2549: used to escalate to the now-removed `Stage2Eligible`.
+                // Under the pre-#2549 default (Stage 2 gate off) that state
+                // just re-logged a shadow message every tick with no further
+                // action, so log-only + leave state at `None` (re-classified
+                // fresh next tick) preserves that behavior exactly.
                 tracing::info!(
                     target: TARGET,
                     agent = %name,
                     cooldown_ms = cooldown_window.as_millis() as u64,
                     gate_active,
-                    "stage1 skipped (cooldown active) — escalating to Stage2Eligible"
+                    "stage1 skipped (cooldown active) — no further auto-recovery stage available (Stage 2/3 removed #2549)"
                 );
-                let mut core = target.core.lock();
-                core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
             }
             (Stage1Branch::DeadLikely, _) => {
+                // #2549: see the cooldown-skip arm above — same log-only
+                // preservation of the pre-#2549 default-gate-off behavior.
                 tracing::info!(
                     target: TARGET,
                     agent = %name,
                     silent_ms = snapshot.silent.as_millis() as u64,
                     gate_active,
-                    "stage1 skipped (dead-likely: silence > threshold) — escalating to Stage2Eligible"
+                    "stage1 skipped (dead-likely: silence > threshold) — no further auto-recovery stage available (Stage 2/3 removed #2549)"
                 );
-                let mut core = target.core.lock();
-                core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
             }
             (Stage1Branch::Anomaly, _) => {
                 tracing::warn!(
@@ -475,190 +367,6 @@ impl RecoveryDispatcherHandler {
             }
         }
     }
-
-    /// Stage 2 fire arm. Emits `AgentExitEvent::Stage2Restart` to the
-    /// respawn worker via `try_send` (channel-full safety: failed send
-    /// does NOT increment counter; state stays `Stage2Eligible` for
-    /// next-tick retry). Telegram notify pre-emit per dev refinement A
-    /// (Stages 2/3 fire telegram; Stage 1 silent on success).
-    ///
-    /// #1339 DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN: the restart this triggers is
-    /// reached ONLY from the per-tick recovery state machine on an internal
-    /// trigger — a Hung-state detection (gated by `hang_auto_recovery_enabled`) —
-    /// never from the API socket. Daemon self-heal (a third trusted principal),
-    /// so the operator-mode gate does NOT apply: a hung agent is still recovered
-    /// in away/sleep. Not agent-invocable (an agent can at most hang ITSELF).
-    fn handle_stage2_fire(
-        &self,
-        name: &str,
-        target: &RecoveryTarget,
-        snapshot: &DispatchSnapshot,
-        gate_active: bool,
-    ) {
-        match stage2_decision(gate_active, self.stage2_dispatch_available) {
-            Stage2Decision::Shadow => {
-                // Emit telemetry but no event send and no state transition.
-                // Operator can observe the decision pattern before flipping
-                // `AGEND_AUTO_RECOVERY_STAGE2=1`.
-                tracing::info!(
-                    target: TARGET,
-                    agent = %name,
-                    recovery_restart_count = snapshot.recovery_restart_count,
-                    silent_ms = snapshot.silent.as_millis() as u64,
-                    silent_productive_ms = snapshot.silent_productive.as_millis() as u64,
-                    gate_active = false,
-                    "stage2 would-have-fired (shadow mode): Stage2Restart event NOT emitted"
-                );
-                return;
-            }
-            Stage2Decision::EscalateNoConsumer => {
-                // #1694(a): Stage 2 auto-restart has no consumer in THIS runtime —
-                // app-standalone passes a throwaway `crash_tx` whose `rx` is
-                // dropped, so `try_send(Stage2Restart)` would silently vanish (the
-                // M-class silent-drop). Escalate straight to Stage3 (graceful pause
-                // + operator escalation, which needs no crash consumer) so the
-                // stuck agent is SURFACED, not dropped. Stage2 stays gated-off by
-                // default, so this only fires if an operator enabled Stage2 in app
-                // mode; the proper fix (Stage2 driving app mode's pane-based
-                // respawn) is a follow-up.
-                tracing::warn!(
-                    target: TARGET,
-                    agent = %name,
-                    recovery_restart_count = snapshot.recovery_restart_count,
-                    "stage2 restart unavailable in this runtime (no crash consumer) — escalating to Stage3 instead of silent-drop"
-                );
-                let mut core = target.core.lock();
-                core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
-                return;
-            }
-            Stage2Decision::Fire => {}
-        }
-
-        // Active mode — emit telegram notify pre-emit so operators have
-        // visibility into the restart even if the channel send fails.
-        // AUDIT2-008: but a persistently-full crash_tx keeps the agent in
-        // Stage2Eligible, so this fire path re-runs every tick. Notify on the
-        // FIRST attempt (and at most once per backoff thereafter), not on every
-        // retry — otherwise it's an operator telegram every ~10s per stuck agent
-        // (and the changing silent_ms in the body even defeats channel dedup).
-        const STAGE2_NOTIFY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
-        let should_notify = {
-            let mut core = target.core.lock();
-            let now = Instant::now();
-            let due = core
-                .health
-                .last_stage2_notify_at
-                .map(|t| now.duration_since(t) >= STAGE2_NOTIFY_BACKOFF)
-                .unwrap_or(true);
-            if due {
-                core.health.last_stage2_notify_at = Some(now);
-            }
-            due
-        };
-        if should_notify {
-            notify_stage2_fire(name, snapshot);
-        }
-
-        // try_send returns `Err(TrySendError::Full)` if the bounded(64)
-        // channel is saturated. Counter NOT incremented on rejection;
-        // state stays `Stage2Eligible` so the next tick retries.
-        match self
-            .crash_tx
-            .try_send(crate::agent::AgentExitEvent::Stage2Restart(
-                name.to_string(),
-            )) {
-            Ok(_) => {
-                tracing::info!(
-                    target: TARGET,
-                    agent = %name,
-                    recovery_restart_count = snapshot.recovery_restart_count,
-                    gate_active = true,
-                    "stage2 fired: Stage2Restart event emitted to respawn worker"
-                );
-                let mut core = target.core.lock();
-                core.health.recovery_stage_state = RecoveryStageState::Stage2Pending {
-                    entered_at: Instant::now(),
-                };
-                core.health.last_stage2_fired_at = Some(Instant::now());
-                // AUDIT2-008: the restart fired and we left Stage2Eligible — reset
-                // the notify backoff so a fresh future Stage-2 episode notifies
-                // immediately rather than being suppressed by this episode's stamp.
-                core.health.last_stage2_notify_at = None;
-                // Counter increment lives on the respawn worker side
-                // (selective-restore arm in `daemon/mod.rs` Stage 2 path)
-                // — it preserves the counter across the spawn boundary
-                // AND increments by 1. This avoids double-counting if
-                // the dispatcher tick fires here and the respawn worker
-                // also increments.
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: TARGET,
-                    agent = %name,
-                    error = ?e,
-                    "stage2 try_send failed (channel full?) — state stays Stage2Eligible for retry"
-                );
-            }
-        }
-    }
-
-    /// Stage 3 escalate arm. Stage 3 is the terminal stage of the
-    /// recovery state machine — after Stage 1 ESC failed and Stage 2
-    /// auto-restart was attempted up to the cumulative cap, the agent
-    /// is escalated to `HealthState::Paused` and the operator is
-    /// notified that manual intervention is required.
-    ///
-    /// Order of operations (atomicity-relevant):
-    /// 1. Pre-emit telegram via `notify_stage3_escalate` — fires in
-    ///    BOTH shadow and active modes so operators have visibility
-    ///    into the decision pattern before flipping the gate to `=1`.
-    /// 2. If `gate_active`: acquire the per-agent lock once and call
-    ///    `core.health.enter_paused(now)` — atomically writes
-    ///    `state = Paused`, `recovery_stage_state = Stage3Pending`,
-    ///    `last_stage3_fired_at = Some(now)`. Next-tick dispatcher
-    ///    lands on the `Stage3Pending` no-op arm and on the top-level
-    ///    `Paused` `continue` guard, so the telegram never re-fires.
-    /// 3. Else (shadow): emit `tracing::info!` with would-have-paused
-    ///    details; no state mutation.
-    ///
-    /// `recovery_restart_count` is NOT reset on entry — per decision
-    /// `enter_paused` documentation, the count is preserved so a
-    /// future operator-unpause that doesn't address the root cause
-    /// immediately re-escalates rather than burning further auto-
-    /// restart budget.
-    fn handle_stage3_escalate(
-        &self,
-        name: &str,
-        target: &RecoveryTarget,
-        snapshot: &DispatchSnapshot,
-        gate_active: bool,
-    ) {
-        // Pre-emit telegram in BOTH modes — operator visibility on
-        // shadow promotions matters as much as on active escalations.
-        notify_stage3_escalate(name, snapshot);
-
-        if gate_active {
-            let now = Instant::now();
-            let mut core = target.core.lock();
-            core.health.enter_paused(now);
-            tracing::info!(
-                target: TARGET,
-                agent = %name,
-                recovery_restart_count = snapshot.recovery_restart_count,
-                gate_active = true,
-                "stage3 fired: HealthState transitioned to Paused via enter_paused"
-            );
-        } else {
-            tracing::info!(
-                target: TARGET,
-                agent = %name,
-                recovery_restart_count = snapshot.recovery_restart_count,
-                silent_ms = snapshot.silent.as_millis() as u64,
-                gate_active = false,
-                "stage3 would-have-fired (shadow mode): Paused write NOT applied"
-            );
-        }
-    }
 }
 
 /// Read-only snapshot of per-agent state captured under a single lock
@@ -668,82 +376,21 @@ struct DispatchSnapshot {
     health_state: HealthState,
     recovery_stage_state: RecoveryStageState,
     last_stage1_fired_at: Option<Instant>,
-    recovery_restart_count: u32,
     agent_state: crate::state::AgentState,
     silent: Duration,
     silent_productive: Duration,
 }
 
-/// Stage 2 telegram notify (pre-emit). Decision §A "Stages 2/3 fire
-/// telegram; Stage 1 silent on success". Operator-actionable content:
-/// agent name + backend + Hung duration + Stage 1 fire correlation +
-/// next-step expectation. Uses existing `gated_notify` so the
-/// info-leak gate prevents leakage when channel is unauthorised.
-fn notify_stage2_fire(name: &str, snapshot: &DispatchSnapshot) {
-    let body = format!(
-        "[recovery] {name}: Stage 2 auto-restart triggered.\n\
-         Hung silence: {silent_ms}ms (productive silence: {prod_ms}ms)\n\
-         Recovery restart count: {count}\n\
-         Next: monitoring 30s for recovery; Stage 3 (pause + operator action) on continued failure.",
-        silent_ms = snapshot.silent.as_millis(),
-        prod_ms = snapshot.silent_productive.as_millis(),
-        count = snapshot.recovery_restart_count,
-    );
-    if let Some(channel) = crate::channel::active_channel() {
-        let _ = crate::channel::gated_notify(
-            channel.as_ref(),
-            name,
-            crate::channel::NotifySeverity::Warn,
-            &body,
-            false,
-        );
-    } else {
-        tracing::debug!(
-            target: TARGET,
-            agent = %name,
-            "stage2 telegram skipped: no active channel"
-        );
-    }
-}
-
-/// Build the Stage 3 escalation telegram body. Extracted so unit
-/// tests can pin the operator-facing wording (decision §3 "dev's
-/// revised 4-line content") independent of the `gated_notify` plumbing.
-fn format_stage3_body(name: &str, recovery_restart_count: u32) -> String {
-    format!(
-        "[recovery ESCALATION] {name}: PAUSED — manual intervention required.\n  \
-         Stage 2 auto-restart fired {count} time(s), all exhausted.\n  \
-         Final state: Paused (no further auto-recovery).\n  \
-         Action: investigate root cause + manual unpause (CLI command pending sub-task).",
-        count = recovery_restart_count,
-    )
-}
-
-/// Stage 3 escalation telegram. Operator-action-required severity =
-/// `NotifySeverity::Error` (per decision §3 dev-grep evidence: enum has
-/// only Info/Warn/Error; Stage 2 = Warn, crash = Error; Stage 3 ≥ crash
-/// since auto-recovery is exhausted and only operator action can
-/// resume). `silent=false` so the operator's channel surfaces it
-/// alongside crash notifications. Uses `gated_notify` so the
-/// info-leak gate prevents leakage when channel is unauthorised.
-fn notify_stage3_escalate(name: &str, snapshot: &DispatchSnapshot) {
-    let body = format_stage3_body(name, snapshot.recovery_restart_count);
-    // #1744-M6: Stage 3 is an Error-severity operator P0 (auto-recovery exhausted,
-    // only operator action resumes) — deliver to EVERY registered channel.
-    // `active_channel()` would silently drop it in a multi-channel fleet. (Stage 2
-    // above stays `Warn` + `active_channel()` — not a P0.) `gated_notify` inside
-    // the helper still enforces the info-leak / authorization gate per channel.
-    crate::channel::notify_all_escalation_channels(
-        name,
-        crate::channel::NotifySeverity::Error,
-        &body,
-        false,
-    );
-}
-
 /// Stage 1 alive-stuck branch — emit ESC byte (or shadow-log it),
 /// transition state machine to `Stage1Pending`, stamp the cooldown
 /// clock.
+///
+/// #1339 DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN: this ESC write is reached
+/// ONLY from the per-tick recovery state machine on an internal trigger — a
+/// Hung-state detection (gated by `hang_auto_recovery_enabled`) — never from
+/// the API socket. Daemon self-heal (a third trusted principal), so the
+/// operator-mode gate does NOT apply: a hung agent is still recovered in
+/// away/sleep. Not agent-invocable (an agent can at most hang ITSELF).
 fn fire_stage1_alive_stuck(
     name: &str,
     target: &RecoveryTarget,
@@ -776,15 +423,25 @@ fn fire_stage1_alive_stuck(
                 );
             }
             Err(e) => {
+                // #2549: used to escalate to the now-removed `Stage2Eligible`.
+                // Falling through to the common `Stage1Pending` tail below
+                // (instead of an early return) is the deliberate fix here —
+                // NOT a leftover no-op. Leaving state at `None` would have
+                // `handle_stage1_entry` re-classify and retry the write
+                // EVERY tick (a retry storm on a persistently-failing PTY,
+                // new behavior the pre-#2549 default never had); landing in
+                // `Stage1Pending` instead makes this a one-shot "attempted,
+                // stop" marker — closest to the pre-#2549 default's
+                // "fails once, then parks" shape. `entered_at`/
+                // `last_stage1_fired_at` below are stamped purely as a
+                // re-fire guard (drives the timeout log + cooldown skip),
+                // NOT a claim that the ESC byte was actually delivered.
                 tracing::warn!(
                     target: TARGET,
                     agent = %name,
                     error = %e,
-                    "stage1 PTY write failed — escalating to Stage2Eligible"
+                    "stage1 PTY write failed — no further auto-recovery stage available (Stage 2/3 removed #2549); parking in Stage1Pending to stop retrying"
                 );
-                let mut core = target.core.lock();
-                core.health.recovery_stage_state = RecoveryStageState::Stage2Eligible;
-                return;
             }
         }
     } else {
@@ -800,6 +457,9 @@ fn fire_stage1_alive_stuck(
         );
     }
 
+    // #2549: entered_at/last_stage1_fired_at are a re-fire guard (timeout log
+    // + cooldown skip), not a success claim — reached on the PTY-write-Err
+    // path too (see the comment there).
     let mut core = target.core.lock();
     core.health.recovery_stage_state = RecoveryStageState::Stage1Pending { entered_at: now };
     core.health.last_stage1_fired_at = Some(now);
@@ -938,19 +598,6 @@ mod tests {
         std::sync::Arc<parking_lot::Mutex<HashMap<String, crate::daemon::AgentConfig>>>,
     );
 
-    /// Sentinel `crash_tx` for tests — bounded(8) sender that nobody
-    /// reads. Tests that only exercise empty-registry / classification
-    /// paths never send through it; tests verifying try_send behaviour
-    /// can drain the matching `Receiver` via `crossbeam_channel::bounded`.
-    fn sentinel_crash_tx() -> std::sync::Arc<crossbeam_channel::Sender<crate::agent::AgentExitEvent>>
-    {
-        let (tx, _rx) = crossbeam_channel::bounded(8);
-        // Leak the receiver so the channel stays open. For tests that
-        // need to drain, use `crossbeam_channel::bounded` directly.
-        std::mem::forget(_rx);
-        std::sync::Arc::new(tx)
-    }
-
     /// Build an empty TickContext for smoke tests. `home` is a unique
     /// tempdir per test to avoid registry/snapshot cross-talk.
     fn empty_ctx() -> EmptyCtxBundle {
@@ -981,7 +628,7 @@ mod tests {
             externals: &externals,
             configs: &configs,
         };
-        RecoveryDispatcherHandler::new(sentinel_crash_tx(), true).run(&ctx);
+        RecoveryDispatcherHandler::new().run(&ctx);
         assert!(registry.lock().is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1051,7 +698,7 @@ mod tests {
     #[test]
     fn name_matches_module() {
         assert_eq!(
-            RecoveryDispatcherHandler::new(sentinel_crash_tx(), true).name(),
+            RecoveryDispatcherHandler::new().name(),
             "recovery_dispatcher"
         );
     }
@@ -1086,7 +733,7 @@ mod tests {
                 externals: &externals,
                 configs: &configs,
             };
-            RecoveryDispatcherHandler::new(sentinel_crash_tx(), true).run(&ctx);
+            RecoveryDispatcherHandler::new().run(&ctx);
             std::fs::remove_dir_all(&home).ok();
         });
     }
@@ -1106,211 +753,115 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // `#685` sub-task 7b Stage 2 tests. Cover the new dispatcher arm
-    // surface: counter cap → Stage3Eligible, channel try_send + no-
-    // increment-on-rejection, decay reduces counter, shadow vs active.
-    // Branch classification + cooldown + spontaneous reset already
-    // pinned by Stage 1 tests above.
+    // #2549 pin tests: the three branches that used to escalate into the
+    // now-removed `Stage2Eligible` are log-only. One test per branch,
+    // each asserting the terminal state + absence of a second (mutating)
+    // action — via a structural source-scan (no AgentHandle/PTY harness
+    // exists for these arms, same constraint as
+    // `recovery_loop_never_holds_registry_across_blocking_io` above).
     // -------------------------------------------------------------------
 
-    fn with_stage2_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
-        // #1812: shared crate-wide env lock (see `with_stage1_gate`).
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(STAGE2_ENV_VAR).ok();
-        unsafe {
-            if active {
-                std::env::set_var(STAGE2_ENV_VAR, "1");
-            } else {
-                std::env::remove_var(STAGE2_ENV_VAR);
-            }
-        }
-        let result = f();
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var(STAGE2_ENV_VAR, v),
-                None => std::env::remove_var(STAGE2_ENV_VAR),
-            }
-        }
-        result
-    }
-
+    /// Branch 1 — Stage 1 timeout (`Stage1Pending` arm in `run()`): must log
+    /// but NOT mutate `recovery_stage_state` (terminal: stays `Stage1Pending`,
+    /// re-logs every tick — same every-tick cadence the pre-#2549 default's
+    /// `Stage2Eligible` shadow-log had, zero new side effects).
     #[test]
-    fn stage2_gate_env_var_round_trip() {
-        // Same shape as Stage 1 env var test — operator can flip
-        // `AGEND_AUTO_RECOVERY_STAGE2=1` without restarting daemon.
-        with_stage2_gate(true, || {
-            assert!(stage2_gate_active());
-        });
-        with_stage2_gate(false, || {
-            assert!(!stage2_gate_active());
-        });
-    }
+    fn stage1_timeout_is_log_only_no_second_action_2549() {
+        let src = include_str!("recovery_dispatcher.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = &src[..src.find(&cfg_test).expect("test mod present")];
 
-    /// #1694(a): the three-way Stage2 decision — the seam that makes
-    /// `handle_stage2_fire`'s no-consumer escalation testable without a full
-    /// AgentHandle/PTY harness (same pattern as `classify_branch`/`Stage1Branch`).
-    #[test]
-    fn stage2_decision_escalates_on_no_consumer_else_fires_1694a() {
-        // Gate OFF → shadow, regardless of consumer (no send, no transition).
-        assert_eq!(stage2_decision(false, true), Stage2Decision::Shadow);
-        assert_eq!(stage2_decision(false, false), Stage2Decision::Shadow);
-        // Gate ON + live consumer (run_core's crash_rx) → Fire (emit Stage2Restart).
-        assert_eq!(stage2_decision(true, true), Stage2Decision::Fire);
-        // Gate ON + NO consumer (app-standalone's throwaway crash_tx) → escalate
-        // to Stage3 instead of silently dropping the restart onto a dead channel.
-        assert_eq!(
-            stage2_decision(true, false),
-            Stage2Decision::EscalateNoConsumer
+        let arm_marker = ["RecoveryStageState::Stage1Pending", " { entered_at } => {"].concat();
+        let astart = prod.find(&arm_marker).expect("Stage1Pending arm present");
+        let arest = &prod[astart..];
+        // Arm ends at the next arm (`Stage3Pending` — the only other variant).
+        let aend = arest
+            .find("RecoveryStageState::Stage3Pending")
+            .expect("Stage3Pending arm follows");
+        let arm_body = &arest[..aend];
+
+        assert!(
+            arm_body.contains("no further auto-recovery stage available"),
+            "must log the terminal-no-escalation message: {arm_body}"
+        );
+        let mutation = ["recovery_stage_state", " ="].concat();
+        assert!(
+            !arm_body.contains(&mutation),
+            "must NOT mutate recovery_stage_state (log-only, terminal): {arm_body}"
         );
     }
 
+    /// Branches 2 — dead-likely classification and cooldown-active skip
+    /// (both arms in `handle_stage1_entry`): must log but NOT touch
+    /// `target.core` (terminal: state stays `None`, re-classified fresh
+    /// next tick — no second action).
     #[test]
-    fn stage2_max_restarts_default_is_three() {
-        // Default cap N=3 per decision §Q1/Q2. Env var override unset
-        // returns the default. #1812: hold the shared crate-wide env lock
-        // — `stage2_max_restarts()` READS env, which races a concurrent
-        // `set_var` from another module's test (e.g. daemon::restart)
-        // just as a write would.
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(STAGE2_MAX_RESTARTS_ENV_VAR).ok();
-        unsafe {
-            std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR);
-        }
+    fn stage1_entry_dead_likely_and_cooldown_skip_are_log_only_2549() {
+        let src = include_str!("recovery_dispatcher.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = &src[..src.find(&cfg_test).expect("test mod present")];
+
+        let start_marker = ["(Stage1Branch::AliveStuck", ", true) => {"].concat();
+        let sstart = prod.find(&start_marker).expect("cooldown-skip arm present");
+        let srest = &prod[sstart..];
+        let end_marker = ["(Stage1Branch::Anomaly", ", _) => {"].concat();
+        let send = srest.find(&end_marker).expect("Anomaly arm follows");
+        // Covers BOTH the cooldown-skip (AliveStuck, true) arm and the
+        // DeadLikely arm — Anomaly is the next (and last) arm in the match.
+        let both_arms = &srest[..send];
+
+        let no_escalation_msg = "no further auto-recovery stage available";
         assert_eq!(
-            stage2_max_restarts(),
-            crate::health::STAGE2_MAX_RESTARTS_DEFAULT
+            both_arms.matches(no_escalation_msg).count(),
+            2,
+            "both the cooldown-skip and dead-likely arms must log the terminal message: {both_arms}"
         );
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var(STAGE2_MAX_RESTARTS_ENV_VAR, v),
-                None => std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR),
-            }
-        }
+        let lock_call = ["target.core", ".lock()"].concat();
+        assert!(
+            !both_arms.contains(&lock_call),
+            "neither arm may touch target.core (log-only, no mutation): {both_arms}"
+        );
     }
 
+    /// Branch 3 — PTY write failure (`fire_stage1_alive_stuck`'s `Err` arm):
+    /// must NOT `return` early (the pre-#2549 escalation path) — falling
+    /// through to the function's common tail is the fix, landing in
+    /// `Stage1Pending` as a one-shot "attempted, stop" marker instead of
+    /// retrying the write every tick.
     #[test]
-    fn stage2_max_restarts_env_override() {
-        // #1812: shared crate-wide env lock + save/restore (see above).
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(STAGE2_MAX_RESTARTS_ENV_VAR).ok();
-        unsafe {
-            std::env::set_var(STAGE2_MAX_RESTARTS_ENV_VAR, "5");
-        }
-        assert_eq!(stage2_max_restarts(), 5);
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var(STAGE2_MAX_RESTARTS_ENV_VAR, v),
-                None => std::env::remove_var(STAGE2_MAX_RESTARTS_ENV_VAR),
-            }
-        }
-    }
+    fn fire_stage1_pty_write_failure_falls_through_to_stage1_pending_2549() {
+        let src = include_str!("recovery_dispatcher.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = &src[..src.find(&cfg_test).expect("test mod present")];
 
-    #[test]
-    fn maybe_decay_reduces_recovery_restart_count_after_stability_window() {
-        // Decay discipline (decision §Delta 3): `maybe_decay_at`
-        // decrements `recovery_restart_count` by 1 when
-        // `last_stage2_fired_at` is older than `STABILITY_WINDOW`.
-        // Mirror crash counter decay shape.
-        //
-        // Cross-platform `Instant` discipline (PR #775 v2): use
-        // `base + offset` + `maybe_decay_at(future_now)` instead of
-        // `Instant::now() - offset`. Windows anchors `Instant::now()` to
-        // system uptime and subtracting from a low-uptime CI VM panics;
-        // `Instant::add` saturates and is safe on all platforms.
-        let mut tracker = crate::health::HealthTracker::new();
-        tracker.recovery_restart_count = 2;
-        let base = Instant::now();
-        tracker.last_stage2_fired_at = Some(base);
-        tracker.maybe_decay_at(base + Duration::from_secs(31 * 60), true);
-        assert_eq!(tracker.recovery_restart_count, 1);
-    }
+        let fire_marker = ["fn fire_stage1", "_alive_stuck"].concat();
+        let fstart = prod.find(&fire_marker).expect("fire fn present");
+        let fire_body = &prod[fstart..];
 
-    #[test]
-    fn maybe_decay_does_not_reduce_recovery_count_within_stability_window() {
-        // Counter stays put if Stage 2 fired recently — agent hasn't
-        // demonstrated stability long enough to forgive prior restart.
-        let mut tracker = crate::health::HealthTracker::new();
-        tracker.recovery_restart_count = 2;
-        let base = Instant::now();
-        tracker.last_stage2_fired_at = Some(base);
-        tracker.maybe_decay_at(base, true);
-        assert_eq!(tracker.recovery_restart_count, 2);
-    }
+        let err_marker = "Err(e) => {";
+        let estart = fire_body.find(err_marker).expect("Err arm present");
+        let erest = &fire_body[estart..];
+        let eend = erest
+            .find("} else {")
+            .expect("shadow-mode else branch follows");
+        let err_arm = &erest[..eend];
 
-    #[test]
-    fn maybe_decay_skips_recovery_count_on_paused_state() {
-        // `HealthState::Paused` guard (sub-task 7a invariant): decay
-        // must NOT exit Paused. Counter also untouched.
-        //
-        // Cross-platform `Instant` discipline (PR #775 v2): use
-        // `base + offset` + `maybe_decay_at(future_now)` — see sibling
-        // test for rationale.
-        let mut tracker = crate::health::HealthTracker::new();
-        tracker.state = HealthState::Paused;
-        tracker.recovery_restart_count = 2;
-        let base = Instant::now();
-        tracker.last_stage2_fired_at = Some(base);
-        tracker.maybe_decay_at(base + Duration::from_secs(31 * 60), true);
-        assert_eq!(tracker.state, HealthState::Paused);
-        assert_eq!(tracker.recovery_restart_count, 2);
-    }
+        // `return;` (not the bare word "return", which also appears in this
+        // test's own explanatory prose above) — an early-return statement.
+        assert!(
+            !err_arm.contains("return;"),
+            "the Err arm must NOT early-return (must fall through to the common Stage1Pending tail): {err_arm}"
+        );
 
-    // Removed `stage2_pending_timeout_drives_stage3_eligible_in_unit_form`: its
-    // two assertions reduced to pure arithmetic facts on locally-constructed
-    // values (`31s >= 30s`, `5s < 30s`) and called no production code, so it
-    // could never catch a regression in the real `entered_at.elapsed() >=
-    // stage2_timeout` dispatcher path. The comment itself deferred the actual
-    // integration coverage; this stub added none.
-
-    // -------------------------------------------------------------------
-    // `#685` sub-task 7c Stage 3 tests. Cover the new dispatcher arm
-    // surface: env gate round-trip, enter_paused atomic invariants,
-    // recovery_restart_count NOT reset on Paused entry (operator-must-
-    // fix-root-cause signal), Stage3Pending idempotent no-op semantics,
-    // and operator-facing telegram content. Decision §7.
-    // -------------------------------------------------------------------
-
-    fn with_stage3_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
-        // #1812: shared crate-wide env lock (see `with_stage1_gate`).
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var(STAGE3_ENV_VAR).ok();
-        unsafe {
-            if active {
-                std::env::set_var(STAGE3_ENV_VAR, "1");
-            } else {
-                std::env::remove_var(STAGE3_ENV_VAR);
-            }
-        }
-        let result = f();
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var(STAGE3_ENV_VAR, v),
-                None => std::env::remove_var(STAGE3_ENV_VAR),
-            }
-        }
-        result
-    }
-
-    #[test]
-    fn stage3_gate_env_var_round_trip() {
-        // Operator can flip `AGEND_AUTO_RECOVERY_STAGE3=1` without
-        // restarting the daemon — same shape as Stage 1 / Stage 2 gate
-        // env tests. Decision §4 shadow-mode default + env var promotion
-        // workflow.
-        with_stage3_gate(true, || {
-            assert!(stage3_gate_active());
-        });
-        with_stage3_gate(false, || {
-            assert!(!stage3_gate_active());
-        });
+        let common_tail = [
+            "core.health.recovery_stage_state = RecoveryStageState::Stage1Pending",
+            " { entered_at: now };",
+        ]
+        .concat();
+        assert!(
+            fire_body.contains(&common_tail),
+            "the function's common tail must unconditionally set Stage1Pending (reached by both Ok and Err paths)"
+        );
     }
 
     #[test]
@@ -1335,66 +886,27 @@ mod tests {
         assert_eq!(tracker.last_stage3_fired_at, Some(now));
     }
 
-    #[test]
-    fn enter_paused_does_not_reset_recovery_restart_count() {
-        // Decision §1 critical invariant: `recovery_restart_count` is
-        // preserved across `enter_paused` to keep the operator-must-fix
-        // signal. If a future operator unpauses the agent without
-        // addressing the root cause and it Hungs again, the dispatcher
-        // cap check immediately escalates to Stage3Eligible rather than
-        // burning further auto-restart budget.
-        let mut tracker = crate::health::HealthTracker::new();
-        tracker.recovery_restart_count = 3;
-        let now = Instant::now();
-        tracker.enter_paused(now);
-        assert_eq!(tracker.recovery_restart_count, 3);
-        assert_eq!(tracker.state, HealthState::Paused);
-    }
-
+    /// #2549: `Stage3Pending`/`enter_paused` are shared terminal-escalation
+    /// machinery — `RespawnWatchdogHandler` calls `enter_paused` independently
+    /// of this dispatcher (an unrelated failure mode, a stuck `resume` spawn).
+    /// This pins that this dispatcher's convergence to Stage-1-only did NOT
+    /// touch that shared path: `Stage3Pending` is still terminal under the
+    /// crate-wide `maybe_decay_at` sweep (dispatcher's own `Stage3Pending` arm
+    /// is an explicit no-op, verified by reading the source — no AgentHandle
+    /// harness exists for the `run()` arm).
     #[test]
     fn stage3_pending_state_no_op_under_maybe_decay() {
-        // Stage 3 is terminal: dispatcher's `Stage3Pending` arm is
-        // explicit no-op, and `maybe_decay_at` honours the
-        // `HealthState::Paused` short-circuit. Together these ensure
-        // that ticking the dispatcher / decay loop while an agent is
-        // Paused does NOT silently mutate state away from Paused or
-        // re-fire Stage 3. Pinned at the decay boundary because that's
-        // the only health-side mutation that runs on every tick;
-        // dispatcher-tick Stage3Pending no-op is verified by reading
-        // the source (no AgentHandle harness exists for the run() arm).
         let mut tracker = crate::health::HealthTracker::new();
         let entered = Instant::now();
         tracker.enter_paused(entered);
-        // Simulate a very long stable window — decay must still not
-        // exit Paused or touch the preserved counter.
-        tracker.recovery_restart_count = 2;
-        tracker.last_stage2_fired_at = Some(entered);
+        // Simulate a very long stable window — decay must still not exit Paused.
         tracker.maybe_decay_at(entered + Duration::from_secs(31 * 60), true);
         assert_eq!(tracker.state, HealthState::Paused);
-        assert_eq!(tracker.recovery_restart_count, 2);
         match tracker.recovery_stage_state {
             RecoveryStageState::Stage3Pending { entered_at } => {
                 assert_eq!(entered_at, entered);
             }
             other => panic!("expected Stage3Pending preserved, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn format_stage3_body_includes_recovery_restart_count_and_action() {
-        // Decision §3 telegram content (dev-revised after grep evidence
-        // cut Backend + N1): operator-facing wording must surface the
-        // exhausted Stage 2 count + manual-unpause action hint. Cuts
-        // Backend (DispatchSnapshot lacks the field) and Stage 1 N1
-        // (HealthTracker doesn't track the count).
-        let body = format_stage3_body("orchestrator", 3);
-        assert!(body.contains("ESCALATION"));
-        assert!(body.contains("orchestrator"));
-        assert!(body.contains("PAUSED"));
-        assert!(body.contains("Stage 2 auto-restart fired 3 time(s)"));
-        assert!(body.contains("manual unpause"));
-        // Negative: must NOT include the cut fields per decision §3.
-        assert!(!body.contains("Backend:"));
-        assert!(!body.contains("Stage 1 ESC"));
     }
 }

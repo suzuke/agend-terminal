@@ -100,85 +100,57 @@ impl HealthState {
 }
 
 /// `#685` sub-task 7a: per-agent recovery dispatcher state machine for
-/// the auto-recovery ladder. Carried inside `HealthTracker` so the
-/// dispatcher can read both `HealthState` and stage progression in one
-/// per-tick lock acquisition. Compile-time exhaustive match in the
+/// the Stage-1-only auto-recovery ladder. Carried inside `HealthTracker`
+/// so the dispatcher can read both `HealthState` and stage progression in
+/// one per-tick lock acquisition. Compile-time exhaustive match in the
 /// dispatcher catches missing-state bugs.
+///
+/// **#2549 P2**: Stage 2 (auto-restart) and the dispatcher-driven Stage 3
+/// escalation path (`Stage2Eligible` / `Stage2Pending` / `Stage3Eligible`)
+/// were removed — see `daemon/per_tick/recovery_dispatcher.rs`'s module
+/// doc for the convergence rationale. `Stage3Pending` and
+/// [`HealthTracker::enter_paused`] stay: they are shared terminal-escalation
+/// machinery also used independently by `RespawnWatchdogHandler`, unrelated
+/// to this ladder.
 ///
 /// **Spontaneous recovery reset** (decision §5 Refinement): when
 /// `health.state` transitions back to `Healthy` (either Stage success
 /// or external recovery), the dispatcher resets `recovery_stage_state`
-/// to `None`. Subsequent `Hung` re-entry begins a fresh sequence —
-/// linear escalation rule restarts from Stage 1.
-///
-/// **Future variant**: a 7th `Disabling { until_operator_unpauses }`
-/// variant is intentionally NOT added in Phase 1 — Stage 3 + Paused
-/// HealthState already covers the operator-action-required terminal
-/// case. Recorded here as a comment-only note for future sub-tasks
-/// that add operator-unpause command surfaces.
+/// to `None`. Subsequent `Hung` re-entry begins a fresh sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Stage2Pending / Stage3Eligible / Stage3Pending: emitted by sub-tasks 7b / 7c
 pub enum RecoveryStageState {
     /// No recovery in progress. Default.
     None,
-    /// Stage 1 ESC dispatched (or shadow-logged); monitoring for recovery.
-    /// `entered_at` drives the Stage 1 timeout window.
+    /// Stage 1 ESC dispatched (or shadow-logged), or Stage 1 was
+    /// adjudicated but had no further automated action available
+    /// (PTY write failed) — monitoring stops here in Stage-1-only mode.
+    /// `entered_at` drives the Stage 1 timeout window / re-fire guard.
     Stage1Pending { entered_at: Instant },
-    /// Stage 1 timed out (or skipped via dead-likely branch). Dispatcher
-    /// will fire Stage 2 on the next tick once 7b ships. Phase 1 logs
-    /// the eligibility transition and stops here.
-    Stage2Eligible,
-    /// Stage 2 restart in progress; monitoring for recovery. (Phase 1
-    /// stub — emitted by 7b when Stage 2 ships.)
-    Stage2Pending { entered_at: Instant },
-    /// Stage 2 timed out. Dispatcher will fire Stage 3 on next tick.
-    Stage3Eligible,
-    /// Stage 3 dispatched (HealthState transitioned to Paused).
-    /// Awaiting operator unpause action. `entered_at` is the
-    /// `Instant` passed to [`HealthTracker::enter_paused`] and is the
-    /// same value stamped into [`HealthTracker::last_stage3_fired_at`]
-    /// — kept on the variant so dispatcher tick-time debug logs can
-    /// report Paused-since duration without reaching back into
-    /// `HealthTracker` (parallel `Stage1Pending` / `Stage2Pending`).
+    /// Terminal (HealthState transitioned to Paused). Awaiting operator
+    /// unpause action. `entered_at` is the `Instant` passed to
+    /// [`HealthTracker::enter_paused`] and is the same value stamped into
+    /// [`HealthTracker::last_stage3_fired_at`] — kept on the variant so
+    /// tick-time debug logs can report Paused-since duration without
+    /// reaching back into `HealthTracker`. Reached only via
+    /// `enter_paused` (shared with `RespawnWatchdogHandler`), never via
+    /// this dispatcher directly in Stage-1-only mode.
     Stage3Pending { entered_at: Instant },
 }
 
 /// Stage 1 default timeout — ESC dispatched, dispatcher waits this long
-/// before declaring failure and transitioning to `Stage2Eligible`.
+/// before declaring failure (Stage-1-only: logged, not escalated further).
 /// Decision §1.4 Delta 1: 10s default (reviewer recommendation: ESC
 /// delivery latency = PTY write + agent process scheduling + Ink TUI
-/// state reset; under load, 5s false-positives Stage 2 escalation).
+/// state reset; under load, 5s false-positived the old Stage 2 escalation).
 /// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
 pub const STAGE1_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 
 /// Stage 1 default cooldown — if agent re-enters Hung within this window
-/// after a recent Stage 1 fire, dispatcher skips Stage 1 (goes directly
-/// to `Stage2Eligible`). Prevents rapid-fire ESC sending that masks
-/// underlying issues. Decision §1.4 Refinement B.
+/// after a recent Stage 1 fire, dispatcher skips re-firing Stage 1.
+/// Prevents rapid-fire ESC sending that masks underlying issues.
+/// Decision §1.4 Refinement B.
 /// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
 pub const STAGE1_COOLDOWN_DEFAULT_MS: u64 = 60_000;
-
-/// Stage 2 default backoff — sleep before `spawn_agent` re-runs in the
-/// respawn worker's Stage 2 arm. Decision §1.4 Delta 2: 1s default
-/// (defensive padding against tight-loop on transient spawn errors —
-/// transient filesystem / network / PTY allocation failures).
-/// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
-pub const STAGE2_BACKOFF_DEFAULT_MS: u64 = 1_000;
-
-/// Stage 2 default monitoring window — how long the dispatcher waits in
-/// `Stage2Pending` for the agent to settle on `Healthy` before
-/// classifying Stage 2 as failed and escalating to `Stage3Eligible`.
-/// Mirrors the 30s window already documented in `docs/RECOVERY-STAGES.md`.
-/// Fixed const (#env-cleanup: was env-overridable; demoted to YAGNI).
-pub const STAGE2_TIMEOUT_DEFAULT_MS: u64 = 30_000;
-
-/// Stage 2 cumulative retry cap — when `recovery_restart_count` reaches
-/// this number across Hung cycles, the dispatcher skips Stages 1/2 on
-/// the next Hung and escalates directly to `Stage3Eligible`. Decision
-/// §Q1/Q2: N=3 default mirrors the issue body's "fails N times → Stage 3"
-/// language with a conservative restart budget before operator intervention.
-/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS`.
-pub const STAGE2_MAX_RESTARTS_DEFAULT: u32 = 3;
 
 /// Returns `true` when `silent_productive` (silence since last productive
 /// output) exceeds the per-`AgentState` threshold. Mirrors the
@@ -399,42 +371,10 @@ pub struct HealthTracker {
     /// `#685` sub-task 7a: timestamp of last Stage 1 ESC fire (or
     /// shadow-log emission). Used by the cooldown guard — if agent
     /// re-enters `Hung` within `STAGE1_COOLDOWN_DEFAULT_MS` of this
-    /// timestamp, dispatcher skips Stage 1 and escalates directly to
-    /// `Stage2Eligible`. `None` means Stage 1 has never fired for this
-    /// agent in the current daemon run.
-    pub last_stage1_fired_at: Option<Instant>,
-    /// `#685` sub-task 7b: cumulative Stage 2 auto-restart count across
-    /// Hung cycles. Increments on each Stage 2 fire that the respawn
-    /// worker successfully consumes (channel `try_send` `Ok`). When
-    /// count reaches `STAGE2_MAX_RESTARTS_DEFAULT`, the dispatcher
-    /// skips Stages 1/2 on the next Hung cycle and escalates directly
-    /// to `Stage3Eligible` — operator must intervene rather than the
-    /// daemon repeatedly thrashing the agent.
-    ///
-    /// Decays via `maybe_decay`: 1 unit per `STABILITY_WINDOW` (30 min)
-    /// of last-crash stability. Mirrors `total_crashes` decay
-    /// discipline so an agent that recovers and stays stable does not
-    /// carry recovery-restart attribution forever.
-    ///
-    /// Preserved selectively across the Stage 2 respawn boundary in
-    /// `daemon/mod.rs` Stage 2 variant arm — fresh `HealthTracker` on
-    /// spawn re-applies this counter (plus crash_times + total_crashes,
-    /// plus the per-class notify cooldowns) so the cap survives the restart
-    /// that the counter itself drove.
-    pub recovery_restart_count: u32,
-    /// `#685` sub-task 7b: timestamp of last Stage 2 auto-restart fire.
-    /// Used to drive `recovery_restart_count` decay alongside
-    /// `crash_times` — `maybe_decay` checks the most recent of the two
-    /// when deciding whether the agent has been stable long enough to
-    /// decrement the recovery counter. `None` means Stage 2 has never
+    /// timestamp, dispatcher skips re-firing Stage 1 (#2549: logs only,
+    /// no further stage to escalate to). `None` means Stage 1 has never
     /// fired for this agent in the current daemon run.
-    pub last_stage2_fired_at: Option<Instant>,
-    /// AUDIT2-008: timestamp of the last Stage-2 operator notification. The
-    /// stage-2 fire path notifies BEFORE `try_send`, and a persistently-full
-    /// `crash_tx` leaves the agent in `Stage2Eligible` so the fire path re-runs
-    /// every tick — without this backoff the operator gets a telegram every ~10s
-    /// per stuck agent. Notify at most once per `STAGE2_NOTIFY_BACKOFF`.
-    pub last_stage2_notify_at: Option<Instant>,
+    pub last_stage1_fired_at: Option<Instant>,
     /// `#685` sub-task 7c: timestamp of last Stage 3 escalation (the
     /// transition into `HealthState::Paused`). Reserved for the future
     /// operator-unpause sub-task — it will read this to display "Paused
@@ -531,9 +471,6 @@ impl HealthTracker {
             rate_limit_self_cleared: false,
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
-            recovery_restart_count: 0,
-            last_stage2_fired_at: None,
-            last_stage2_notify_at: None,
             last_stage3_fired_at: None,
         }
     }
@@ -555,14 +492,6 @@ impl HealthTracker {
     ///    arm rather than re-firing Stage 3.
     /// 3. `last_stage3_fired_at` → `Some(now)` for the future operator-
     ///    unpause sub-task's UX (Paused-since-{duration}).
-    ///
-    /// **`recovery_restart_count` is NOT reset** — preserves the
-    /// operator-must-fix-root-cause signal across a future manual
-    /// unpause. If the post-unpause agent Hungs again without the root
-    /// cause being addressed, the cap check in
-    /// [`crate::daemon::per_tick::recovery_dispatcher`] immediately
-    /// re-escalates to Stage3Eligible rather than burning further
-    /// auto-restart budget.
     ///
     /// DI-friendly signature (parallels [`Self::maybe_decay_at`]) so
     /// tests can supply a deterministic `now`. Production callers
@@ -1056,25 +985,6 @@ impl HealthTracker {
         if self.state == HealthState::Paused {
             return;
         }
-        // `#685` sub-task 7b: decay recovery_restart_count via the same
-        // STABILITY_WINDOW discipline as crash decay. Independent of
-        // crash counter — if agent went through Stage 2 restart without
-        // crashing, last_stage2_fired_at drives the decay clock alone.
-        // Mirrors decision §Delta 3: long-stability decay (NOT
-        // reset-on-Healthy, which oscillates too aggressively).
-        if self.recovery_restart_count > 0 {
-            let last_stage2_idle = self
-                .last_stage2_fired_at
-                .map(|t| now.saturating_duration_since(t) >= STABILITY_WINDOW)
-                .unwrap_or(false);
-            if last_stage2_idle {
-                self.recovery_restart_count = self.recovery_restart_count.saturating_sub(1);
-                // [M1] advance the decay anchor so the NEXT unit needs another full
-                // STABILITY_WINDOW — without this, once one window elapsed every
-                // subsequent tick (~10s) decremented, draining the count in seconds.
-                self.last_stage2_fired_at = Some(now);
-            }
-        }
         if self.total_crashes == 0 {
             return;
         }
@@ -1184,34 +1094,6 @@ mod tests {
         }
         assert_eq!(
             h.total_crashes, 2,
-            "[M1] the next window decays exactly 1 more"
-        );
-    }
-
-    /// [M1] §3.9: the same 1-unit-per-window discipline for `recovery_restart_count`
-    /// (decay anchored on `last_stage2_fired_at`, advanced on each decrement).
-    #[test]
-    fn recovery_restart_count_decay_one_unit_per_window_m1() {
-        let mut h = HealthTracker::new();
-        let base = Instant::now();
-        h.recovery_restart_count = 3;
-        h.last_stage2_fired_at = Some(base);
-
-        let t1 = base + Duration::from_secs(31 * 60);
-        for _ in 0..10 {
-            h.maybe_decay_at(t1, true);
-        }
-        assert_eq!(
-            h.recovery_restart_count, 2,
-            "[M1] recovery count decays at most 1 within one window"
-        );
-
-        let t2 = base + Duration::from_secs(62 * 60);
-        for _ in 0..10 {
-            h.maybe_decay_at(t2, true);
-        }
-        assert_eq!(
-            h.recovery_restart_count, 1,
             "[M1] the next window decays exactly 1 more"
         );
     }
