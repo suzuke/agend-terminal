@@ -42,9 +42,16 @@ pub(super) fn init(config: &FleetConfig) -> Option<Arc<dyn Channel>> {
                 tracing::info!("discord init: skipped (no token / no config)");
                 return;
             };
-            let channel_dyn: Arc<dyn Channel> = Arc::new(channel) as Arc<dyn Channel>;
+            let channel_arc = Arc::new(channel);
+            let channel_dyn: Arc<dyn Channel> = Arc::clone(&channel_arc) as Arc<dyn Channel>;
             crate::channel::register_active_channel(Arc::clone(&channel_dyn));
             tracing::info!("discord init: channel registered");
+            // #2562 PR-1: drain poll_event() -> resolve instance -> inbox.
+            // Kept on the concrete Arc<DiscordChannel> (not the dyn Channel
+            // trait object) so the dispatcher can call Discord-specific
+            // routing (`resolve_instance_for_channel`) without widening the
+            // generic Channel trait's surface for one adapter's needs.
+            crate::channel::discord::spawn_inbound_dispatcher(channel_arc, crate::home_dir());
             attach_pending_registry_when_ready(channel_dyn);
         });
     if let Err(e) = spawn_result {
