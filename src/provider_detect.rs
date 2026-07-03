@@ -161,10 +161,8 @@ pub struct ProviderBlock {
     pub wire_api: Option<String>,
 }
 
-fn provider_block_matches_descriptor(
-    block: &ProviderBlock,
-    descriptor: ModelProviderDescriptor,
-) -> bool {
+fn provider_block_matches_fugu(block: &ProviderBlock) -> bool {
+    let descriptor = FUGU_PROVIDER_DESCRIPTOR;
     block.id.contains(descriptor.provider_id_hint)
         || block
             .base_url
@@ -179,16 +177,13 @@ fn host_from_url(url: &str) -> &str {
 }
 
 /// Parse a codex `config.toml` body and return the first provider block that
-/// matches `descriptor` — either the section id contains the descriptor's
+/// matches the Fugu/Sakana descriptor — either the section id contains
 /// `provider_id_hint` or its `base_url` host matches the descriptor host.
 ///
 /// Lightweight line scanner (no `toml` production dependency): tracks the
 /// current `[section]` header and collects simple `key = "value"` pairs until
 /// the next header. Good enough for detection; values are unquoted leniently.
-pub fn find_provider(
-    config_toml: &str,
-    descriptor: ModelProviderDescriptor,
-) -> Option<ProviderBlock> {
+pub fn find_sakana_provider(config_toml: &str) -> Option<ProviderBlock> {
     let mut blocks: Vec<ProviderBlock> = Vec::new();
     let mut cur: Option<ProviderBlock> = None;
 
@@ -241,23 +236,15 @@ pub fn find_provider(
     }
     flush(&mut cur, &mut blocks);
 
-    blocks
-        .into_iter()
-        .find(|b| provider_block_matches_descriptor(b, descriptor))
+    blocks.into_iter().find(provider_block_matches_fugu)
 }
 
-/// Back-compat helper for the first shipped provider.
-pub fn find_sakana_provider(config_toml: &str) -> Option<ProviderBlock> {
-    find_provider(config_toml, FUGU_PROVIDER_DESCRIPTOR)
-}
-
-/// Does a codex profile body (`<name>.config.toml`) select `descriptor` by
-/// provider id and/or model prefix? Returns the referenced `model_catalog_json`
-/// path when present so the caller can resolve the model list.
-pub fn profile_targets_provider(
-    profile_toml: &str,
-    descriptor: ModelProviderDescriptor,
-) -> Option<Option<String>> {
+/// Does a codex profile body (`<name>.config.toml`) select the Fugu/Sakana
+/// descriptor by provider id and/or model prefix? Returns the referenced
+/// `model_catalog_json` path when present so the caller can resolve the model
+/// list.
+pub fn profile_targets_fugu(profile_toml: &str) -> Option<Option<String>> {
+    let descriptor = FUGU_PROVIDER_DESCRIPTOR;
     let mut provider_matches = false;
     let mut model_matches = false;
     let mut catalog: Option<String> = None;
@@ -286,11 +273,6 @@ pub fn profile_targets_provider(
     } else {
         None
     }
-}
-
-/// Back-compat helper for the first shipped provider.
-pub fn profile_targets_fugu(profile_toml: &str) -> Option<Option<String>> {
-    profile_targets_provider(profile_toml, FUGU_PROVIDER_DESCRIPTOR)
 }
 
 /// Resolve whether a credential is usable from a provider's `env_key`, given an
@@ -795,13 +777,6 @@ mod tests {
         assert!(FIXED_PROVIDER_BACKENDS
             .iter()
             .all(|b| b.reason.contains("not bearer base_url")));
-    }
-
-    #[test]
-    fn generic_descriptor_finds_provider_by_host() {
-        let cfg = "[model_providers.anything]\nbase_url = 'https://api.sakana.ai/v1'\n";
-        let b = find_provider(cfg, FUGU_PROVIDER_DESCRIPTOR).expect("block");
-        assert_eq!(b.id, "anything");
     }
 
     #[test]
