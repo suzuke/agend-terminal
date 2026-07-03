@@ -8,6 +8,7 @@ mod api_server;
 // (`CommandSpec` / `COMMAND_SPECS` / `matching_specs`). `execute` stays
 // `pub(super)` = app-only, so command EXECUTION is not widened.
 pub(crate) mod commands;
+mod discord_hooks;
 mod dispatch;
 mod menu;
 mod mouse;

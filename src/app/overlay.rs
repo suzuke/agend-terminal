@@ -237,6 +237,10 @@ pub(super) fn handle_key(
                                     ctx.home,
                                     &pane,
                                 );
+                                super::discord_hooks::maybe_create_discord_binding(
+                                    ctx.registry,
+                                    &pane,
+                                );
                                 let tab_name = pane.agent_name.clone();
                                 ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
                                 outcome.needs_resize = true;
@@ -301,6 +305,10 @@ pub(super) fn handle_key(
                                         ctx.telegram_state,
                                         ctx.registry,
                                         ctx.home,
+                                        &p,
+                                    );
+                                    super::discord_hooks::maybe_create_discord_binding(
+                                        ctx.registry,
                                         &p,
                                     );
                                     if let Some(tab) = ctx.layout.active_tab_mut() {

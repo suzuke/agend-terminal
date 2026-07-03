@@ -413,6 +413,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                         ctx.home,
                         &pane,
                     );
+                    super::discord_hooks::maybe_create_discord_binding(ctx.registry, &pane);
                     match parts[0] {
                         "vsplit" => {
                             if let Some(tab) = ctx.layout.active_tab_mut() {
