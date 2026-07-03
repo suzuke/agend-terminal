@@ -92,9 +92,8 @@ pub(crate) use shadow_observe::ShadowObserveHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) use supervisor_trackers::{
     AntiStallHandler, AutoReleaseHandler, CanonicalDriftHandler, ConflictNotifyHandler,
-    DecisionBoardTimeoutHandler, DecisionTimeoutHandler, DispatchIdleHandler,
-    DispatchIdleNudgeHandler, HelperStalenessHandler, IdleWatchdogHandler, McpRegistryHandler,
-    RetentionHandler, WaitingOnStaleHandler,
+    DecisionTimeoutHandler, DispatchIdleHandler, HelperStalenessHandler, IdleWatchdogHandler,
+    McpRegistryHandler, RetentionHandler, WaitingOnStaleHandler,
 };
 pub(crate) use thread_dump::ThreadDumpHandler;
 pub(crate) use watchdog::WatchdogHandler;
@@ -429,10 +428,18 @@ pub(crate) fn build_default_handlers(
         // ticks at the identical 10s interval and holds no lock across them, so
         // this is behavior-preserving on unix (both run_core and app mode).
         // Cadence-hoist to the handler (`should_fire`) is W2.4, not W1.1.
+        //
+        // #2549 W2 (P2-2549-SPIKE.md §3d, decision `d-20260702044452277394-4`):
+        // `DecisionTimeoutHandler` now also runs the former
+        // `DecisionBoardTimeoutHandler`'s scan, and `DispatchIdleHandler` now
+        // also runs the former `DispatchIdleNudgeHandler`'s scan — WRAPPER-layer
+        // registration-slot merges only (40 → 38 handlers); the four underlying
+        // tracker modules (dispatch_idle/mod.rs, dispatch_idle/team_nudge.rs,
+        // decision_timeout.rs, decision_board_timeout.rs) are untouched. See
+        // `supervisor_trackers.rs` for the per-scan panic-isolation wrapper.
         Box::new(AntiStallHandler::new()),
         Box::new(IdleWatchdogHandler::new()),
         Box::new(DecisionTimeoutHandler::new()),
-        Box::new(DecisionBoardTimeoutHandler::new()),
         Box::new(HelperStalenessHandler::new()),
         Box::new(McpRegistryHandler::new(daemon_binary_stale)),
         Box::new(WaitingOnStaleHandler::new()),
@@ -440,7 +447,6 @@ pub(crate) fn build_default_handlers(
         Box::new(CanonicalDriftHandler::new()),
         Box::new(AutoReleaseHandler::new()),
         Box::new(DispatchIdleHandler::new()),
-        Box::new(DispatchIdleNudgeHandler::new()),
         Box::new(RetentionHandler::new()),
         // #2127 Phase 1: reclaim board tasks from agents stuck in a non-recoverable
         // usage_limit window (operator decision d-…085112: Phase 1, grace=10min).
