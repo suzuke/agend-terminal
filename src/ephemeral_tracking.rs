@@ -28,6 +28,13 @@
 //! `live_children_snapshot` are still reachable from production `main()` — the
 //! rest is unreachable there but remains fully exercised by this file's own
 //! test suite.
+//!
+//! [`resolve_supported_backend`] (the backend-allowlist security validator) has
+//! zero *production* call path for the same reason — its coverage today is
+//! unit tests plus the synthetic-integration tests that drive it through
+//! [`spawn_and_track`] (the real shared sink) instead of calling it directly.
+//! A real-production-path test is follow-up work once #1967 settles the
+//! spawn entry point's long-term status.
 #![allow(dead_code)]
 
 use crate::store::SchemaVersioned;
@@ -1437,11 +1444,57 @@ mod tests {
             max_iterations: None,
             completion_promise: None,
         };
-        assert!(matches!(
-            spawn_and_track(&home, spec),
-            Err(SpawnError::UnsupportedBackend(_))
-        ));
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::UnsupportedBackend(b)) if b == "bogus"),
+            "fail-closed: the deny error must carry the rejected backend, not just the variant: {res:?}"
+        );
         assert_eq!(list(&home, None).len(), 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ───────── #1967 tail (ephemeral decision d-20260702194736993178-4 / #2548 spike §2.3):
+    // backend-allowlist SYNTHETIC-INTEGRATION coverage ─────────
+    //
+    // `resolve_supported_backend` itself has extensive unit coverage (see
+    // `resolve_supported_backend_rejects_paths_and_canonicalizes` above), but since #2547
+    // retired the only production caller (the `ephemeral spawn` MCP handler), nothing in
+    // `main()` drives it today — the two DENY tests just above and this ALLOW test are the
+    // synthetic-integration proof: they go through the REAL shared sink (`spawn_and_track`),
+    // not the pure function directly, so a future re-wiring (#1967 deciding the spawn
+    // entry's long-term status) inherits a proven call path rather than an isolated unit test.
+
+    /// ALLOW direction: an ALIASED-but-supported backend (`claude-2.1`, never the canonical
+    /// `claude`) must clear gate 0 (the allowlist) through `spawn_and_track` — proving
+    /// `resolve_supported_backend`'s alias canonicalization is actually wired into the shared
+    /// sink, not just correct in isolation. `max_iterations: Some(0)` is invalid and stops the
+    /// call one gate later (0c, loop-param validation) — chosen so the assertion needs no real
+    /// backend binary on PATH: `InvalidLoopParams` (not `UnsupportedBackend`) is the only
+    /// possible outcome if gate 0 accepted the alias; `UnsupportedBackend` would fire instead
+    /// if the alias were NOT resolved. No reserve happens either way (both gates run before
+    /// step 1), so this needs no process cleanup.
+    #[test]
+    fn spawn_and_track_accepts_aliased_backend_proving_allowlist_wiring() {
+        let home = tmp_home("allowlist-integration-allow");
+        let spec = SpawnSpec {
+            workflow_id: "wf".to_string(),
+            backend: "claude-2.1".to_string(),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let res = spawn_and_track(&home, spec);
+        assert!(
+            matches!(&res, Err(SpawnError::InvalidLoopParams(_))),
+            "an aliased-but-supported backend must clear the allowlist gate (0) and fail one \
+             gate later at loop-param validation (0c), NOT UnsupportedBackend — proves \
+             resolve_supported_backend's alias canonicalization is wired into spawn_and_track's \
+             shared sink: {res:?}"
+        );
+        assert_eq!(
+            list(&home, None).len(),
+            0,
+            "rejected before any reserve — no row, no process"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
