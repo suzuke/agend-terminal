@@ -1414,11 +1414,14 @@ mod tests {
     }
 
     /// #995 Bug 3: `fleet_mcp_supported` flag pins which backends ship with
-    /// the `agend-mcp-bridge` working in fleet mode. Currently every
-    /// backend except Agy supports it; Agy is `false` because its MCP
-    /// discovery ignores `<workdir>/.antigravitycli/mcp_config.json`
-    /// mcpServers field (only HOME-level loads, which the scope rule
-    /// at `src/mcp_config.rs:5-11` forbids).
+    /// the `agend-mcp-bridge` working in fleet mode. Agy was `false` under
+    /// #995 Bug 3 because its MCP discovery ignored
+    /// `<workdir>/.antigravitycli/mcp_config.json`'s `mcpServers` field
+    /// (only HOME-level loads, which the scope rule at
+    /// `src/mcp_config.rs:5-11` forbids). #1547 fixed this: Agy now loads
+    /// the bridge via `<workspace>/.agents/mcp_config.json` (the official
+    /// Customization Roots dir), so `fleet_mcp_supported` is `true` for
+    /// every backend except the no-MCP-discovery sentinels (Shell, Raw).
     ///
     /// Daemon spawn path (`src/agent.rs spawn_agent`) emits a
     /// `[fleet-mcp-unsupported]` tracing::warn when this is `false` so

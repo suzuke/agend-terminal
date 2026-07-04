@@ -66,6 +66,12 @@ impl ReconcileBackupsGcHandler {
     }
 }
 
+/// #2616-residual: kept for the `due()`/`work()` convenience-wrapper `run()`
+/// — do NOT register this directly in `build_default_handlers`.
+/// `HourlyGcHandler` already drives this sweep via direct `due()`/`work()`
+/// calls (#2549 W1); a direct registration here would double-execute it
+/// every due tick. Guarded by the source-scan invariant in
+/// `tests/hourly_gc_sub_handlers_not_directly_registered.rs`.
 impl PerTickHandler for ReconcileBackupsGcHandler {
     fn name(&self) -> &'static str {
         "reconcile_backups_gc"
