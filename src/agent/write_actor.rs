@@ -154,6 +154,29 @@
 //! already pairs `register`/`unregister` correctly, the weak-reference
 //! backstop was the smaller, call-site-transparent fix for the ACTUAL gap
 //! (pre-existing test code); a full RAII refactor was not attempted.
+//!
+//! ## Lazy thread spawn (same day, CI-caught): register() no longer starts a thread
+//!
+//! The weak-reference backstop (previous section) makes leaked
+//! registrations eventually self-clean, but "eventually" still means every
+//! leaked registration owns a real OS thread, polling every
+//! [`IDLE_POLL_MS`], for however long it takes the scheduler to give it a
+//! turn to notice. Under CI's Coverage job specifically (a coverage-
+//! instrumented build, `cargo test`'s own default parallelism, and likely
+//! only 2-4 vCPUs) that scheduling latency compounds across however many
+//! pre-existing tests leak a registration (see the previous section) badly
+//! enough that even with the backstop in place, the whole-suite slowdown
+//! only partially recovered (1418s -> 1091s versus `main`'s 74s baseline,
+//! measured directly). Most of these leaked registrations, though, never
+//! actually have a write attempted through them during their test's short
+//! life — [`register`] no longer spawns a thread at all; [`ensure_started`]
+//! does, exactly once (idempotent via `WriterState::started`), on a
+//! writer's FIRST real [`write`] call. A registered-but-never-written-to
+//! writer (the common leaked-test shape) now costs one small heap
+//! allocation and a map entry, not a whole OS thread — the fd-reuse guard
+//! in [`register`] and the [`retire`] cleanup path are both unaffected
+//! (whether a thread was ever spawned for a given entry doesn't change how
+//! it's found/retired).
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -206,16 +229,19 @@ impl Job {
 
 /// A registered writer's live state: its fd, its own dedicated queue, the
 /// shutdown flag its dedicated [`writer_thread`] polls between attempts,
-/// and a `Weak` handle to the `PtyWriter` itself so the thread can detect
-/// "the writer was dropped and nobody called `unregister`" (see the module
-/// doc's "Correctness fix" section) independent of `shutdown`. One
+/// a `Weak` handle to the `PtyWriter` itself so the thread can detect "the
+/// writer was dropped and nobody called `unregister`" (see the module
+/// doc's "Correctness fix" section) independent of `shutdown`, and
+/// `started` (see the module doc's "Lazy thread spawn" section) gating
+/// whether a thread has been spawned for this writer at all yet. One
 /// `Arc<WriterState>` is shared between the enqueuing side
-/// ([`write`]/[`unregister`]) and exactly one background thread.
+/// ([`write`]/[`unregister`]) and at most one background thread.
 struct WriterState {
     fd: RawFd,
     shutdown: AtomicBool,
     queue: Mutex<VecDeque<Job>>,
     liveness: Weak<parking_lot::Mutex<Box<dyn io::Write + Send>>>,
+    started: AtomicBool,
 }
 
 /// `Arc::as_ptr(writer) as usize` (same identity scheme `WRITE_IN_PROGRESS`
@@ -229,11 +255,13 @@ fn writers() -> &'static Mutex<HashMap<usize, Arc<WriterState>>> {
     WRITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register `writer`'s raw fd (via `master.as_raw_fd()`) and spawn its
-/// dedicated writer thread, so future `write_with_timeout` calls for it
-/// route through this actor instead of spawning a disposable
-/// thread-per-write. Call once, right after a `PtyWriter` is constructed
-/// from `master.take_writer()`, while `master` is still available (both
+/// Register `writer`'s raw fd (via `master.as_raw_fd()`) so future
+/// `write_with_timeout` calls for it route through this actor instead of
+/// spawning a disposable thread-per-write. Does NOT spawn this writer's
+/// dedicated thread yet — see the module doc's "Lazy thread spawn" section
+/// and [`ensure_started`], which does that on the first actual [`write`].
+/// Call once, right after a `PtyWriter` is constructed from
+/// `master.take_writer()`, while `master` is still available (both
 /// production spawn sites already hold it at that point). A no-op if
 /// `master.as_raw_fd()` returns `None` (Windows; any backend without a raw
 /// fd) — that writer simply falls back to the historical mechanism,
@@ -254,6 +282,7 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
         shutdown: AtomicBool::new(false),
         queue: Mutex::new(VecDeque::new()),
         liveness: Arc::downgrade(writer),
+        started: AtomicBool::new(false),
     });
 
     let mut ws = writers().lock();
@@ -300,6 +329,26 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
             ));
         }
     }
+    // Deliberately no thread spawned here -- see the module doc's "Lazy
+    // thread spawn" section. [`ensure_started`] spawns one on this writer's
+    // FIRST actual [`write`] call.
+}
+
+/// Spawn `state`'s dedicated thread the first time it's actually needed
+/// (see the module doc's "Lazy thread spawn" section), idempotently: the
+/// `compare_exchange` ensures exactly one spawn per writer even if multiple
+/// callers race to enqueue a write for it concurrently. A no-op on every
+/// call after the first.
+fn ensure_started(key: usize, state: &Arc<WriterState>) {
+    if state
+        .started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return; // already started (or another racing caller just claimed it)
+    }
+    let fd = state.fd;
+    let thread_state = Arc::clone(state);
     // fire-and-forget: this thread is retired by `unregister` flipping
     // `shutdown` (checked once per poll cycle, see `writer_thread`) -- it
     // is intentionally NOT joined. Joining synchronously here (or at
@@ -312,14 +361,17 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
     // (or whether) this thread actually notices `shutdown` and exits.
     if let Err(e) = std::thread::Builder::new()
         .name("agend-pty-writer".into())
-        .spawn(move || writer_thread(key, state))
+        .spawn(move || writer_thread(key, thread_state))
     {
         tracing::error!(
             error = %e,
             fd,
             "write_actor: failed to spawn writer thread — this writer falls back to per-write \
-             TimedOut until a future registration retries spawning"
+             TimedOut until a future write retries spawning"
         );
+        // Allow a future write() call to retry the spawn instead of being
+        // permanently wedged by this one failure.
+        state.started.store(false, Ordering::Release);
     }
 }
 
@@ -374,6 +426,7 @@ pub(crate) fn write(
 ) -> Option<io::Result<()>> {
     let key = Arc::as_ptr(writer) as usize;
     let state = writers().lock().get(&key).cloned()?;
+    ensure_started(key, &state);
     let (tx, rx) = sync_channel(1);
     {
         let mut q = state.queue.lock();
@@ -856,6 +909,16 @@ mod tests {
             fd_for(&writer).is_some(),
             "must be registered right after wedged_pty"
         );
+        // `register` no longer spawns a thread by itself (see the module
+        // doc's "Lazy thread spawn" section) -- a registered-but-never-
+        // written-to writer has nothing to self-retire (no thread exists to
+        // notice the liveness check), and is expected to leave a small,
+        // thread-less map entry until something calls `unregister` (every
+        // production teardown path does). This test is specifically about
+        // the thread-based backstop, so trigger `ensure_started` via one
+        // real write first, matching the writer shapes that actually pay
+        // for a dedicated thread.
+        let _ = write(&writer, b"x".to_vec(), Duration::from_millis(200));
 
         // Drop EVERY strong reference -- no `unregister` call, simulating a
         // teardown path that doesn't know about it.
