@@ -1,6 +1,6 @@
 use super::disk::DISK_READONLY;
 use super::notify::route_notification;
-use super::storage::inbox_path;
+use super::storage::{inbox_path, inbox_path_for_id};
 use super::*;
 use parking_lot::Mutex;
 use std::fs;
@@ -1277,6 +1277,174 @@ fn reclaim_busy_gate_engages_on_uuid_keyed_production_topology() {
         drain(&home, name).is_empty(),
         "a busy agent's in-flight row on a UUID-keyed inbox must not be re-delivered"
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2624 live topology: a name-keyed file and a UUID-keyed file both exist as
+/// REAL, independent files (an id-direct write — e.g. #1902's teardown path —
+/// bypassed `inbox_path_resolved` and created the UUID file directly, while
+/// the name file already had its own row). Before the fix, `drain`/`ack`
+/// always resolved straight to the UUID file and the name file's row was a
+/// permanent, unreachable orphan (`general`'s live `m-…-125`: drain returned
+/// `[]`, `ack` returned `acked:0`, forever).
+#[test]
+fn drain_reaches_orphaned_name_file_row_when_uuid_file_coexists() {
+    let home = tmp_home("2624-dual-file");
+    let name = "general";
+    let uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    write_fleet_with_id(&home, name, uuid);
+
+    let id = crate::types::InstanceId::parse(uuid).unwrap();
+    let id_path = inbox_path_for_id(&home, &id);
+    let name_path = inbox_path(&home, name);
+    fs::create_dir_all(id_path.parent().unwrap()).unwrap();
+
+    // UUID file: real, independent file (mirrors #1902's id-direct write
+    // path) already carrying its own row.
+    let uuid_row = msg()
+        .sender("user:op")
+        .text("uuid-file message")
+        .id("m-uuid-side")
+        .build();
+    fs::write(
+        &id_path,
+        format!("{}\n", serde_json::to_string(&uuid_row).unwrap()),
+    )
+    .unwrap();
+
+    // Name file: real, independent file with its own UNREAD orphan row (the
+    // #2624 live case: general's m-…-125).
+    let orphan = msg()
+        .sender("user:op")
+        .text("orphaned name-file message")
+        .id("m-name-orphan")
+        .build();
+    fs::write(
+        &name_path,
+        format!("{}\n", serde_json::to_string(&orphan).unwrap()),
+    )
+    .unwrap();
+
+    assert!(
+        !fs::symlink_metadata(&name_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "test setup must produce two REAL files, not an already-migrated symlink"
+    );
+
+    // RED (pre-fix behavior): drain resolved straight to the UUID file and
+    // never returned the orphan at all.
+    let drained = drain(&home, name);
+    assert!(
+        drained
+            .iter()
+            .any(|m| m.id.as_deref() == Some("m-name-orphan")),
+        "drain must reach the orphaned name-file row once the dual-file merge \
+         runs, not just the UUID file's own rows"
+    );
+
+    // The pre-existing uuid-file row must survive the merge, unduplicated.
+    let resolved = inbox_path_resolved(&home, name);
+    let merged_content = fs::read_to_string(&resolved).unwrap();
+    assert_eq!(
+        merged_content.matches("m-uuid-side").count(),
+        1,
+        "merge must not duplicate the pre-existing uuid-file row"
+    );
+
+    #[cfg(unix)]
+    {
+        let meta = fs::symlink_metadata(&name_path)
+            .expect("name file must still exist (as a symlink) post-merge");
+        assert!(
+            meta.file_type().is_symlink(),
+            "name file must become a symlink to the id file after merge (unix)"
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert!(
+            !name_path.exists(),
+            "name file must be removed after merge (windows has no symlink here)"
+        );
+    }
+
+    // Settle: ack the freshly-delivered orphan row, then confirm it never
+    // reappears (the #2624 live bug: ack always failed with acked:0 because
+    // the row was never reachable to begin with).
+    let acked = ack(&home, name, Some("m-name-orphan"));
+    assert_eq!(
+        acked, 1,
+        "ack must be able to settle the now-merged orphan row"
+    );
+
+    assert!(
+        drain(&home, name).is_empty(),
+        "a settled row must not be redelivered"
+    );
+
+    // Idempotency: re-resolving (e.g. a second merge trigger from a
+    // concurrent op) must not re-duplicate anything or crash on a symlink
+    // cycle.
+    let resolved_again = inbox_path_resolved(&home, name);
+    assert_eq!(resolved, resolved_again);
+    let content_again = fs::read_to_string(&resolved_again).unwrap();
+    assert_eq!(
+        content_again.matches("m-name-orphan").count(),
+        1,
+        "re-resolving after the merge must not duplicate the merged row"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Crash-safety: simulate a crash between the id-file merge write landing and
+/// the name-file→symlink swap completing (both files still real, both already
+/// carrying the merged row). Re-resolving must complete the swap without
+/// duplicating the row — dedup-by-id makes the merge idempotent regardless of
+/// how many times a partial run is retried.
+#[test]
+fn dual_file_merge_recovers_from_crash_between_id_write_and_name_swap() {
+    let home = tmp_home("2624-dual-file-crash-resume");
+    let name = "general2";
+    let uuid = "cccccccc-dddd-4eee-8fff-000000000000";
+    write_fleet_with_id(&home, name, uuid);
+
+    let id = crate::types::InstanceId::parse(uuid).unwrap();
+    let id_path = inbox_path_for_id(&home, &id);
+    let name_path = inbox_path(&home, name);
+    fs::create_dir_all(id_path.parent().unwrap()).unwrap();
+
+    let row = msg()
+        .sender("user:op")
+        .text("hi")
+        .id("m-crash-resume")
+        .build();
+    let line = format!("{}\n", serde_json::to_string(&row).unwrap());
+
+    // Both files already carry the SAME row — as if a prior run's merge write
+    // landed in the id file but crashed before swapping the name file.
+    fs::write(&id_path, &line).unwrap();
+    fs::write(&name_path, &line).unwrap();
+
+    let resolved = inbox_path_resolved(&home, name);
+    let content = fs::read_to_string(&resolved).unwrap();
+    assert_eq!(
+        content.matches("m-crash-resume").count(),
+        1,
+        "resuming a partially-completed merge must not duplicate the row"
+    );
+
+    #[cfg(unix)]
+    {
+        let meta = fs::symlink_metadata(&name_path).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the interrupted swap must complete on the next resolve"
+        );
+    }
+
     fs::remove_dir_all(&home).ok();
 }
 
