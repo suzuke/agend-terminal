@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 #[cfg(all(unix, test))]
 use std::collections::HashMap;
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use std::os::unix::io::RawFd;
 #[cfg(all(unix, test))]
 use std::path::Path;
@@ -146,32 +146,6 @@ pub fn verify_tcgetpgrp() -> anyhow::Result<i32> {
     } else {
         Err(anyhow::anyhow!("tcgetpgrp returned {pgid}"))
     }
-}
-
-/// herdr-inspired fd-hygiene check (clean-room: this is our own probe, not
-/// herdr's AGPL-3.0 code — see task t-20260704054906745324-67777-4). Spawns a
-/// throwaway PTY + `/bin/sh` child purely as a vehicle to ask "is `fd` (some
-/// fd already open in THIS process) visible in a freshly-exec'd child's own
-/// fd table?" via the POSIX `/dev/fd/N` view (works on both macOS and Linux,
-/// unlike Linux-only `/proc/self/fd`). Returns `true` iff `fd` leaked across
-/// exec — i.e. `false` is the desired/healthy result.
-#[cfg(unix)]
-#[allow(dead_code)]
-fn fd_leaks_into_spawned_child(fd: RawFd) -> anyhow::Result<bool> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-    let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.args(["-c", &format!("test -e /dev/fd/{fd}")]);
-    let mut child = pair.slave.spawn_command(cmd)?;
-    drop(pair.slave);
-    let status = child.wait()?;
-    Ok(status.success())
 }
 
 /// Probe whether ESC byte stops generation on a real backend CLI.
@@ -432,6 +406,35 @@ mod tests {
     fn test_tcgetpgrp_returns_valid_pgid() {
         let pgid = verify_tcgetpgrp().expect("tcgetpgrp must return valid pgid");
         assert!(pgid > 0);
+    }
+
+    /// herdr-inspired fd-hygiene check (clean-room: this is our own probe, not
+    /// herdr's AGPL-3.0 code — see task t-20260704054906745324-67777-4). Test-
+    /// only (review finding on #2613: an earlier version of this lived at
+    /// module scope under plain `#[cfg(unix)]`, which meant it compiled into
+    /// production Unix builds despite being used only by the two tests
+    /// below — moved inside `mod tests` so it's genuinely test-gated).
+    /// Spawns a throwaway PTY + `/bin/sh` child purely as a vehicle to ask
+    /// "is `fd` (some fd already open in THIS process) visible in a
+    /// freshly-exec'd child's own fd table?" via the POSIX `/dev/fd/N` view
+    /// (works on both macOS and Linux, unlike Linux-only `/proc/self/fd`).
+    /// Returns `true` iff `fd` leaked across exec — i.e. `false` is the
+    /// desired/healthy result.
+    fn fd_leaks_into_spawned_child(fd: RawFd) -> anyhow::Result<bool> {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", &format!("test -e /dev/fd/{fd}")]);
+        let mut child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let status = child.wait()?;
+        Ok(status.success())
     }
 
     /// herdr-inspired fd-hygiene regression (t-20260704054906745324-67777-4):
