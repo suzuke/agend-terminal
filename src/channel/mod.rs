@@ -215,6 +215,35 @@ pub fn reset_active_channel_for_test() {
     channels_registry().write().clear();
 }
 
+/// active_channel() multi-channel blind-spot fix (t-20260703164240502572-50899-11):
+/// find which registered channel (if any) already has a binding recorded for
+/// `instance` — read-only, unlike [`Channel::take_binding`]. Where `active_channel`
+/// would return `None` once a fleet runs 2+ channels, this always finds the one
+/// the instance actually belongs to, because [`Channel::has_binding`] is checked
+/// per-channel rather than requiring exactly one channel to be registered fleet-wide.
+pub fn channel_for_instance(instance: &str) -> Option<Arc<dyn Channel>> {
+    channels_registry()
+        .read()
+        .values()
+        .find(|ch| ch.has_binding(instance))
+        .cloned()
+}
+
+/// active_channel() multi-channel blind-spot fix (t-20260703164240502572-50899-11):
+/// drop `name`'s binding on EVERY registered channel, not just "the active" one.
+/// `active_channel()` returns `None` once a fleet runs 2+ channels, so a caller
+/// gating cleanup on it (as `drop_active_binding` and app-mode teardown used to)
+/// silently skips the drop entirely in a multi-channel fleet — the binding (and
+/// whatever platform resource it references) leaks. [`Channel::take_binding`] is
+/// a safe no-op on a channel where `name` has no recorded binding (it returns
+/// `None` and touches nothing), so iterating every registered channel reaches
+/// whichever one `name` actually happens to be bound to.
+pub fn drop_binding_on_all_channels(name: &str) {
+    for ch in channels_registry().read().values() {
+        let _ = ch.take_binding(name);
+    }
+}
+
 /// #966: Outcome of [`ensure_topic_for`] — explicit enum (no
 /// `Option<String>`) so callers must handle each variant. Mirrors the
 /// #962 surface-failures discipline: silent `let _ = ...` patterns
