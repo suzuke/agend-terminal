@@ -2026,7 +2026,7 @@ fn release_full_preserves_unmerged_branch() {
     );
     assert_eq!(
         outcome.branch_cleanup_skipped_reason.as_deref(),
-        Some("branch not merged into main")
+        Some("branch not merged into main and not a squash-merge orphan")
     );
     // Verify branch still exists.
     let branch_exists = std::process::Command::new("git")
@@ -2145,7 +2145,7 @@ fn release_full_absent_worktree_unmerged_branch_preserved() {
     );
     assert_eq!(
         outcome.branch_cleanup_skipped_reason.as_deref(),
-        Some("branch not merged into main")
+        Some("branch not merged into main and not a squash-merge orphan")
     );
     let branch_exists = std::process::Command::new("git")
         .args(["rev-parse", "--verify", "feat/absent-unmerged"])

@@ -212,12 +212,12 @@ fn cleanup_merged_branch(
     // #t-7 (#1824 follow-up): a `git fetch --prune` MUTATES the source repo's
     // remote-tracking refs (refs/remotes/...), so it must NOT run on a dry-run —
     // a dry-run release must be observation-only. The non-dry-run path keeps the
-    // fresh fetch so `is_merged` / `is_gone` below are accurate; the dry-run
+    // fresh fetch so `is_merged` / `squash` below are accurate; the dry-run
     // preview falls back to the existing local refs (best-effort "would delete").
     if !dry_run {
         let remote = crate::git_helpers::primary_remote(source_repo);
-        // #2004: fail-direction is safe (stale remote refs → `is_gone` stays
-        // false → branch kept, self-heals on the next successful fetch), but a
+        // #2004: fail-direction is safe (stale remote refs → `is_merged`/`squash`
+        // stay false → branch kept, self-heals on the next successful fetch), but a
         // persistently failing fetch accumulates undeletable branches invisibly
         // — surface it. Pure logging, the cleanup proceeds on local refs.
         match crate::git_helpers::git_bypass(source_repo, &["fetch", "--prune", &remote]) {
@@ -261,7 +261,10 @@ fn cleanup_merged_branch(
         !is_merged && crate::worktree_cleanup::is_squash_gc_eligible(source_repo, branch, &default);
 
     if !is_merged && !squash {
-        return (false, Some("branch not merged into main".to_string()));
+        return (
+            false,
+            Some("branch not merged into main and not a squash-merge orphan".to_string()),
+        );
     }
 
     if dry_run {

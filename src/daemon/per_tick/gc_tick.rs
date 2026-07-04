@@ -37,6 +37,11 @@ impl PerTickHandler for GcTickHandler {
         if removed > 0 || failed > 0 {
             tracing::info!(removed, failed, "gc_tick: worktree GC complete");
         }
+        // #2550 W5: single driver now owns the whole worktree-GC lifecycle,
+        // including `.trash` purging — previously a separate ~1h-delayed
+        // independent sweep's job (`retention::worktrees::sweep`), now folded
+        // in here on the SAME fire-on-first cadence (no phase lag, decision Q2).
+        crate::daemon::retention::worktrees::purge_trash(ctx.home);
 
         let stale_locks = crate::worktree_pool::gc_stale_ci_watch_locks(ctx.home);
         if stale_locks > 0 {

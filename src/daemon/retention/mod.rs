@@ -56,7 +56,10 @@ impl RetentionSupervisor {
         // Pending-dispatch truth table: `=="0"` → OFF; unset / anything else → ON.
         let cutover = std::env::var("AGEND_RETENTION_CUTOVER").as_deref() != Ok("0");
         let dispatches_swept = pending_dispatches::sweep(home, cutover);
-        let worktrees_swept = worktrees::sweep(home);
+        // #2550 W5: worktree GC archival moved off this ~1h-delayed independent
+        // re-scan onto `gc_run`'s own same-tick archive-fallthrough (fire-on-first
+        // cadence, no phase lag) — see `worktrees::archive_fallthrough`. Nothing
+        // left here for this artifact class.
         // Drop terminal dispatch_tracking rows (completed/orphaned) each cycle so
         // they don't accumulate until the 30-day gc_old_entries backstop.
         let tracking_swept = crate::dispatch_tracking::sweep_terminal_entries(home);
@@ -75,7 +78,6 @@ impl RetentionSupervisor {
             decisions = decisions_swept,
             dispatches = dispatches_swept,
             tracking = tracking_swept,
-            worktrees = worktrees_swept,
             ci_handoff = ci_handoff_swept,
             verdict_buffer = verdict_buffer_swept,
             "retention sweep: cycle complete"
@@ -85,7 +87,7 @@ impl RetentionSupervisor {
             "retention_sweep",
             "supervisor",
             &format!(
-                "decisions={decisions_swept} dispatches={dispatches_swept} tracking={tracking_swept} worktrees={worktrees_swept} ci_handoff={ci_handoff_swept}"
+                "decisions={decisions_swept} dispatches={dispatches_swept} tracking={tracking_swept} ci_handoff={ci_handoff_swept}"
             ),
         );
     }
