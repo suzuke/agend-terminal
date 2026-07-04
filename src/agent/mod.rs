@@ -2630,15 +2630,11 @@ fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<
     None
 }
 
-/// Test-only cross-module registration check (used by `daemon::lifecycle`'s tests).
+/// Test-only cross-module registration check (used by `daemon::lifecycle`'s
+/// Unix-only test — `write_actor` doesn't exist on other platforms).
 #[cfg(all(test, unix))]
 pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
     write_actor::fd_for(writer).is_some()
-}
-
-#[cfg(all(test, not(unix)))]
-pub(crate) fn write_actor_is_registered(_writer: &PtyWriter) -> bool {
-    false
 }
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {

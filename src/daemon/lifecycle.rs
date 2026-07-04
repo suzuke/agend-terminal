@@ -326,7 +326,12 @@ mod tests {
     /// remove it from the agent registry), or a never-written agent's
     /// teardown leaks a stale write_actor entry forever. Pins that this
     /// actually happens, end-to-end through the real `spawn_agent` path.
+    ///
+    /// Unix-only: `write_actor` itself is `#[cfg(unix)]` (no PTY-fd-based
+    /// registration concept applies on Windows), so there's nothing to
+    /// assert here on that platform.
     #[test]
+    #[cfg(unix)]
     fn delete_transaction_unregisters_never_written_writer_2620() {
         let home = tmp_home("delete-unreg");
         let reg = empty_registry();
