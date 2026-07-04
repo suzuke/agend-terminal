@@ -122,6 +122,38 @@
 //! code that knows the exact teardown moment (needed to close the fd-reuse
 //! race window described above); the weak-reference check is the backstop
 //! that makes correctness independent of every caller remembering it.
+//!
+//! **Residual, and why it's bounded**: relying purely on the weak-reference
+//! backstop (no `unregister` call at all — today, only pre-existing test
+//! leaks) reopens a NARROWER version of the fd-reuse race: an orphaned
+//! writer's thread notices `liveness` failed to upgrade only on its own
+//! polling schedule, not synchronously at the moment of drop, so a fd could
+//! in principle be closed and handed to a brand new pty before that
+//! orphaned thread notices. [`register`] closes this down to the same
+//! single-in-flight-syscall residual `unregister` itself already accepts
+//! (not zero, but bounded to at most one syscall, never an unbounded
+//! polling-latency window): it scans the (small — bounded by live writer
+//! count, ~10-15) [`WRITERS`] map for any OTHER entry that already claims
+//! the SAME fd number being registered (only possible if the OS already
+//! closed that entry's writer, since it wouldn't reuse a fd otherwise) and
+//! retires it synchronously before proceeding — see this module's own test
+//! `fd_reuse_race_during_weak_backstop_window_does_not_cross_deliver` for
+//! the regression coverage.
+//!
+//! **Why not full `Drop`-based RAII on `PtyWriter` itself** (making
+//! `unregister` synchronous and automatic everywhere, turning the weak-ref
+//! polling into a pure fallback that should structurally never fire):
+//! `PtyWriter` (`Arc<Mutex<Box<dyn Write + Send>>>`, defined in `mod.rs`) is
+//! a plain type alias, not a distinct type this module owns — `impl Drop`
+//! requires either a newtype wrapper (touching every existing construction
+//! site across the codebase, `Arc::new(Mutex::new(...))` calls that
+//! predate this module) or a `Drop` on the boxed `dyn Write` itself (loses
+//! the writer/master pairing `register` needs, and still wouldn't fire
+//! until the LAST `Arc` clone drops, which is exactly what `Weak::upgrade`
+//! already detects without a wrapper). Given every production call site
+//! already pairs `register`/`unregister` correctly, the weak-reference
+//! backstop was the smaller, call-site-transparent fix for the ACTUAL gap
+//! (pre-existing test code); a full RAII refactor was not attempted.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -223,7 +255,38 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
         queue: Mutex::new(VecDeque::new()),
         liveness: Arc::downgrade(writer),
     });
-    let stale = writers().lock().insert(key, Arc::clone(&state));
+
+    let mut ws = writers().lock();
+    // fd-reuse guard, orthogonal to the same-key check below: the OS only
+    // ever hands `fd` to a brand new open() after fully closing whatever
+    // held it before, so ANY other entry in this map still claiming `fd` is
+    // necessarily orphaned (its writer was dropped -- otherwise the OS
+    // couldn't have reused the number) and hasn't yet noticed via the
+    // `liveness` backstop (see the module doc's "Correctness fix" section).
+    // Retiring it HERE, synchronously, shrinks that backstop's inherent
+    // polling-latency window down to the same single-in-flight-syscall
+    // residual `unregister` itself accepts, instead of leaving it exposed
+    // for up to one whole `IDLE_POLL_MS` cycle (or longer) of that orphaned
+    // thread potentially still servicing writes against the reused fd.
+    let stale_by_fd: Vec<usize> = ws
+        .iter()
+        .filter(|(k, v)| **k != key && v.fd == fd)
+        .map(|(k, _)| *k)
+        .collect();
+    for stale_key in stale_by_fd {
+        if let Some(stale) = ws.remove(&stale_key) {
+            stale.shutdown.store(true, Ordering::Release);
+            for job in stale.queue.lock().drain(..) {
+                job.fail(io::Error::other(
+                    "PTY writer re-registered at this fd number before the orphaned previous \
+                     writer's thread noticed (fd reused)",
+                ));
+            }
+        }
+    }
+
+    let stale = ws.insert(key, Arc::clone(&state));
+    drop(ws);
     // A leftover entry at this exact writer-pointer address means a
     // previous writer was never explicitly `unregister`ed before this new
     // registration (only possible if the allocator reused a freed `Arc`'s
@@ -811,5 +874,71 @@ mod tests {
             "a writer dropped without `unregister` must eventually be reaped by the liveness \
              backstop, not leak its thread + WRITERS entry forever"
         );
+    }
+
+    /// #P1-2607-followup: the narrower fd-reuse race the pure weak-reference
+    /// backstop reopens (see the module doc's "Residual, and why it's
+    /// bounded" section) — writer A is dropped WITHOUT `unregister` (the
+    /// exact pre-existing-test-leak shape this backstop exists for), and a
+    /// new writer B is registered immediately after, racing A's thread
+    /// before it has any chance to notice its `liveness` weak ref failed on
+    /// its own polling schedule. Whether or not the OS actually recycles
+    /// A's exact fd number for B here, the invariant under test is
+    /// unconditional: B's own write must land quickly and correctly,
+    /// verifying `register`'s synchronous by-fd-number retirement (not just
+    /// by-writer-pointer-key) closes this down to the same
+    /// single-in-flight-syscall residual `unregister` itself accepts.
+    #[test]
+    fn fd_reuse_race_during_weak_backstop_window_does_not_cross_deliver() {
+        let _lock = TEST_LOCK.lock();
+        let (writer_a, mut child_a, master_a) = wedged_pty("weak-fd-reuse-a", 10);
+        let filler = vec![b'x'; MAX_QUEUE_BYTES_PER_WRITER];
+        let _ = write(&writer_a, filler, Duration::from_millis(20));
+
+        // Drop EVERYTHING for A -- deliberately no `unregister` call, so
+        // the only path to cleanup is the weak-ref backstop, which hasn't
+        // had a single loop iteration to notice yet.
+        drop(writer_a);
+        drop(master_a);
+        let _ = child_a.kill();
+
+        // Register B immediately -- no delay, maximizing the chance of
+        // racing A's still-orphaned thread (and, if the OS reuses fd
+        // numbers eagerly as observed elsewhere in this suite, likely
+        // landing on the exact same fd number A just freed).
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let cmd = CommandBuilder::new("cat");
+        let mut child_b = pair.slave.spawn_command(cmd).expect("spawn cat");
+        drop(pair.slave);
+        let writer_b: PtyWriter = Arc::new(parking_lot::Mutex::new(
+            pair.master.take_writer().expect("take_writer"),
+        ));
+        register(&writer_b, pair.master.as_ref());
+
+        let start = std::time::Instant::now();
+        let result = write(&writer_b, b"hello\n".to_vec(), Duration::from_secs(2))
+            .expect("registered writer must resolve to Some");
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "writer B must succeed even if it raced an orphaned (leaked, never-unregistered) \
+             writer A's still-live thread for the same fd number: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "writer B must not be delayed by A's leftover backlog even without an explicit \
+             `unregister` on A; took {elapsed:?}"
+        );
+
+        let _ = child_b.kill();
+        unregister(&writer_b);
     }
 }
