@@ -133,6 +133,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "the per-tick rotation handler: PRODUCES the projection via crate::snapshot::save. Not a reader; no decision reads snapshot here.",
     ),
     (
+        "src/inbox/tests.rs",
+        "writer",
+        "#2622 test fixture: writes a synthetic snapshot (crate::snapshot::save/AgentSnapshot) so agent_is_busy reads a deterministic value in reclaim_stale_delivering tests. Not a reader; no production decision reads snapshot here — the whole file is #[cfg(test)]-only via its `mod tests;` declaration in inbox/mod.rs, which the AST scanner (parsing this file standalone) cannot see.",
+    ),
+    (
         "src/daemon/per_tick/mod.rs",
         "per-tick",
         "benign name-clash: `pub(crate) use snapshot::SnapshotRotationHandler` re-exports the SAME-NAMED per_tick child module (crate::daemon::per_tick::snapshot, the rotation handler), NOT the crate::snapshot projection. The conservative bare-root rule cannot resolve the two apart, so this is audited as benign. Reads no snapshot.",
