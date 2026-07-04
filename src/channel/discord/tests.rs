@@ -1213,6 +1213,124 @@ fn discord_keepalive_patch_method_matches_spec() {
     assert_eq!(body["archived"], false, "must set archived=false");
 }
 
+// ── #2562 P4 (PR-2): outbound matrix completion + reconnect pure-fn gap ──
+//
+// Fills the holes a coverage sweep found in the P0-P4 outbound/reconnect
+// tests: send lacked a (method, path) assertion; the empty-text guards and the
+// create_binding category placement branch were unexercised; and the backoff
+// sequence test started at attempt=1, leaving the attempt=0 edge unpinned.
+// (Error-path 4xx->Err coverage is a separate, larger gap — deferred pending a
+// scope decision, since delete/remove_binding don't call `.model()` and
+// twilight's 4xx handling needs its own investigation.)
+
+/// §3.5.10 wire-format completion: POST /channels/{cid}/messages — pins send's
+/// HTTP method + URL path. The existing `discord_send_outbound_body_matches_
+/// spec` uses an inline mock that captures only the body; this closes the
+/// (method, path) columns of send's outbound matrix row via the shared
+/// `mock_http_server` harness.
+#[test]
+fn discord_send_outbound_method_and_path_match_spec() {
+    use crate::channel::Channel;
+    let response_body =
+        include_str!("../../../tests/fixtures/discord-rest-create-message-response.json");
+    let (port, handle, captured) = mock_http_server(200, response_body);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+    let binding = test_binding(290926798999357250);
+    ch.record_binding("test-agent", binding.clone(), "\r".into());
+
+    let result = ch.send(&binding, crate::channel::OutMsg::text("hi"));
+
+    handle.join().expect("mock server");
+    assert!(result.is_ok(), "send must succeed: {:?}", result.err());
+    let req = captured.lock().expect("lock").take().expect("captured");
+    assert_eq!(req.method, "POST", "send must use POST");
+    assert!(
+        req.path.contains("/channels/290926798999357250/messages"),
+        "send path must be /channels/{{cid}}/messages, got: {}",
+        req.path
+    );
+}
+
+/// send() rejects an empty `OutMsg` BEFORE any HTTP call — pins the
+/// attachment-only-deferred guard; no network / http client needed.
+#[test]
+fn discord_send_rejects_empty_text() {
+    use crate::channel::Channel;
+    let (ch, _tx) = super::DiscordChannel::new_for_test();
+    let binding = test_binding(290926798999357250);
+    ch.record_binding("test-agent", binding.clone(), "\r".into());
+
+    let err = ch
+        .send(&binding, crate::channel::OutMsg::text(""))
+        .expect_err("empty send must error");
+    assert!(
+        format!("{err}").contains("no text"),
+        "error must mention empty text, got: {err}"
+    );
+}
+
+/// edit() rejects empty text BEFORE any HTTP call — Discord editMessage
+/// requires non-empty content (adapter guard); no network needed.
+#[test]
+fn discord_edit_rejects_empty_text() {
+    use crate::channel::Channel;
+    let (ch, _tx) = super::DiscordChannel::new_for_test();
+    let msg_ref = test_msg_ref(290926798999357250, "444385199974967099");
+
+    let err = ch
+        .edit(&msg_ref, crate::channel::OutMsg::text(""))
+        .expect_err("empty edit must error");
+    assert!(
+        format!("{err}").contains("empty"),
+        "error must mention empty text, got: {err}"
+    );
+}
+
+/// create_binding honors a `category_id` hint by setting the created channel's
+/// `parent_id` in the request (adapter branch) — pins the previously-untested
+/// category-placement path via the outgoing request body.
+#[test]
+fn discord_create_binding_with_category_id_sets_parent_id() {
+    use crate::channel::Channel;
+    let response_body =
+        include_str!("../../../tests/fixtures/discord-rest-create-guild-channel-response.json");
+    let (port, handle, captured) = mock_http_server(200, response_body);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+
+    let mut opts = crate::channel::BindingOpts::default();
+    opts.extra
+        .insert("category_id".to_string(), "123456789012345678".to_string());
+    let result = ch.create_binding("test-agent", opts);
+
+    handle.join().expect("mock server");
+    assert!(
+        result.is_ok(),
+        "create_binding must succeed: {:?}",
+        result.err()
+    );
+    let req = captured.lock().expect("lock").take().expect("captured");
+    let body: serde_json::Value = serde_json::from_str(&req.body).expect("body must be JSON");
+    assert!(
+        !body["parent_id"].is_null(),
+        "category_id hint must set parent_id in the create-channel request body, got: {}",
+        req.body
+    );
+}
+
+/// #2562 PR-3b boundary: `discord_gateway_backoff_delay(0)`. The supervisor
+/// increments `attempt` before computing the delay, so 0 is the pre-first-
+/// restart value; `saturating_sub(1)` must keep it at the 5s base (no
+/// underflow). The existing sequence test starts at attempt=1; this pins the
+/// attempt=0 edge.
+#[test]
+fn discord_gateway_backoff_delay_attempt_zero_is_base() {
+    assert_eq!(
+        super::discord_gateway_backoff_delay(0),
+        std::time::Duration::from_secs(5),
+        "attempt 0 must yield the 5s base, not underflow"
+    );
+}
+
 /// TLS smoke (network, manual): proves twilight-http 0.17's
 /// rustls-native-roots/ring stack actually completes a real TLS handshake —
 /// the one merge-gate CI can't cover (the spec tests use a plaintext mock
