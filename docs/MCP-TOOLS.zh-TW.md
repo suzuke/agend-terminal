@@ -105,6 +105,7 @@
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
 - 預設為 **compact**（#2475）：每列會移除雜訊較大的 `observed_status.evidence` trail。傳 `verbose: true`（或 `include_evidence: true`）可包含它。
 - **operator_mode**（#2548）：回應也會帶一個頂層的 `operator_mode: {mode, delegate_to, delegate_scope}` 欄位——已退役的 `mode` 工具的讀取端折入這裡，讓 agent 能連同 fleet 狀態一起觀察 operator 的可用性。設定模式仍僅限 CLI（`agend-terminal mode <active|away|sleep>`）。
+- **topic_binding_mode**（#991）：instance 若以 `topic_binding: skip`/`deferred` 建立，每列會帶 `topic_binding_mode` 欄位——`auto`（預設）則省略此欄位，讓 operator 能一次 grep 出刻意不建 topic 的 instance。
 
 ### `set_metadata`
 設定 per-instance 顯示中繼資料。#2547：從原本獨立的 `set_display_name` / `set_description` 工具合併而來。

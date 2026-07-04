@@ -25,6 +25,12 @@ pub(super) fn handle_list_instances_with_runtime(
     };
     let resp = crate::api::list_response(home, &runtime.registry, &runtime.externals);
     if let Some(agents) = resp["result"]["agents"].as_array() {
+        // #991 PR-C: load fleet.yaml ONCE for the whole batch (not per-agent)
+        // so operators can grep "which agents intentionally have no topic"
+        // via `list_instances` — previously only `describe_instance`
+        // (single-instance) exposed this field.
+        let fleet_config =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
         let instances: Vec<Value> = agents
             .iter()
             .filter(|a| {
@@ -37,6 +43,15 @@ pub(super) fn handle_list_instances_with_runtime(
                 merge_metadata(home, name, &mut info);
                 if name == instance_name {
                     info["is_self"] = json!(true);
+                }
+                // Omit when unset (auto default) — matches describe_instance's
+                // existing omission convention, not an explicit "auto" value.
+                if let Some(mode) = fleet_config
+                    .as_ref()
+                    .and_then(|c| c.instances.get(name))
+                    .and_then(|i| i.topic_binding_mode.as_ref())
+                {
+                    info["topic_binding_mode"] = json!(mode);
                 }
                 if !include_evidence {
                     strip_observed_evidence(&mut info);
@@ -194,5 +209,95 @@ mod tests {
                 .any(|agent| agent["name"].as_str() == Some("external-one")),
             "runtime registry result should be returned without depending on the API socket: {result}"
         );
+    }
+
+    fn runtime_with_external_one() -> RuntimeContext {
+        RuntimeContext {
+            registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            externals: Arc::new(parking_lot::Mutex::new(HashMap::from([(
+                "external-one".to_string(),
+                crate::agent::ExternalAgentHandle {
+                    backend_command: "codex".to_string(),
+                    pid: 4242,
+                },
+            )]))),
+        }
+    }
+
+    /// #991 PR-C: `list_instances` must expose `topic_binding_mode` (the
+    /// original acceptance criterion literally names `list_instances`, not
+    /// just `describe_instance` — see BIND-TOPIC-PRERESEARCH.md §1) so an
+    /// operator can grep the whole fleet in one call for intentionally
+    /// topic-less agents.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn list_instances_exposes_topic_binding_mode_991() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-list-topic-binding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  external-one:\n    backend: codex\n    topic_binding_mode: skip\n",
+        )
+        .unwrap();
+        let runtime = runtime_with_external_one();
+
+        let result =
+            handle_list_instances_with_runtime(&home, &json!({}), "caller", Some(&runtime));
+        let instances = result["instances"].as_array().expect("instances array");
+        let agent = instances
+            .iter()
+            .find(|a| a["name"].as_str() == Some("external-one"))
+            .expect("external-one present");
+        assert_eq!(
+            agent["topic_binding_mode"], "skip",
+            "list_instances must surface topic_binding_mode: {agent}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #991 PR-C companion: omitting `topic_binding` in fleet.yaml (the auto
+    /// default) must NOT surface a `topic_binding_mode` key at all — matches
+    /// `describe_instance`'s existing omission convention (not an explicit
+    /// `"auto"` string value).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn list_instances_omits_topic_binding_mode_when_unset_991() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-list-topic-binding-omit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  external-one:\n    backend: codex\n",
+        )
+        .unwrap();
+        let runtime = runtime_with_external_one();
+
+        let result =
+            handle_list_instances_with_runtime(&home, &json!({}), "caller", Some(&runtime));
+        let instances = result["instances"].as_array().expect("instances array");
+        let agent = instances
+            .iter()
+            .find(|a| a["name"].as_str() == Some("external-one"))
+            .expect("external-one present");
+        assert!(
+            agent.get("topic_binding_mode").is_none(),
+            "unset topic_binding must NOT surface a topic_binding_mode key: {agent}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
