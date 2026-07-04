@@ -376,7 +376,11 @@ fn inject_provenance(params: &Value, from: &str, target: &str) {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if let Some(ch) = crate::channel::active_channel() {
+    // Multi-channel-safe (t-20260703164240502572-50899-11): per-`target`
+    // operation, so the right channel is "whichever channel `target` is
+    // bound to", not the `active_channel()` singleton (which returns `None`
+    // once 2+ channels are registered).
+    if let Some(ch) = crate::channel::channel_for_instance(target) {
         if let Err(e) = ch.send_from_agent(
             target,
             crate::channel::AgentOutboundOp::InjectProvenance {

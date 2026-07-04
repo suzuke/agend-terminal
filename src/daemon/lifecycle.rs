@@ -54,13 +54,13 @@ pub fn wait_for_child_exit(child: &ChildArc) -> bool {
     }
 }
 
-/// Drop the active channel's binding for `name`, if any. Channel-agnostic via
-/// the `Channel` trait `take_binding`. No-op when no channel is registered
+/// Drop `name`'s binding on every registered channel. Multi-channel-safe
+/// (t-20260703164240502572-50899-11): `active_channel()` returns `None`
+/// once 2+ channels are registered, which used to make this a silent
+/// no-op in a telegram+discord fleet. No-op when no channel is registered
 /// (e.g. app mode without Telegram init).
 fn drop_active_binding(name: &str) {
-    if let Some(ch) = crate::channel::active_channel() {
-        let _ = ch.take_binding(name);
-    }
+    crate::channel::drop_binding_on_all_channels(name);
 }
 
 /// Tear down all daemon-side state for an agent: kill child + tree, wait for

@@ -56,8 +56,11 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
 
     // Sprint 55 P0-A — prefer-chain: sender's HeartbeatPair.reply_to_channel
     // (Sprint 52 router-layer attribution) wins when present + registered;
-    // fallback to active_channel() singleton when None. Returns structured
-    // error codes so agents can branch on machine-readable signals.
+    // else fall back to whichever channel the sending instance is bound to
+    // (multi-channel-safe, t-20260703164240502572-50899-11 — `active_channel()`
+    // alone returns `None` once 2+ channels are registered); last resort is
+    // the `active_channel()` singleton. Returns structured error codes so
+    // agents can branch on machine-readable signals.
     let snapshot = crate::daemon::heartbeat_pair::snapshot_for(instance_name);
     let ch: Arc<dyn crate::channel::Channel> = match snapshot.reply_to_channel.as_deref() {
         Some(name) => match crate::channel::lookup_channel_by_name(name) {
@@ -76,7 +79,9 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
                 });
             }
         },
-        None => match crate::channel::active_channel() {
+        None => match crate::channel::channel_for_instance(instance_name)
+            .or_else(crate::channel::active_channel)
+        {
             Some(ch) => ch,
             None => {
                 // #1665 Gap D: no channel to reply on — record the send-failure.

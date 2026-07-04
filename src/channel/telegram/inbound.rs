@@ -396,7 +396,11 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         // request's ACK should always reach the operator regardless of mode"
         // semantic is a separate operator-response path, tracked as a follow-up
         // and out of scope here.
-        if let Some(ch) = crate::channel::active_channel() {
+        // Multi-channel-safe (t-20260703164240502572-50899-11): this handler
+        // lives inside telegram/inbound.rs — it's inherently telegram's own
+        // inbound handler, so the ACK belongs on telegram regardless of
+        // which channel `active_channel()` would (or wouldn't) resolve to.
+        if let Some(ch) = crate::channel::lookup_channel_by_name("telegram") {
             let _ = crate::channel::gated_notify(
                 ch.as_ref(),
                 "operator",

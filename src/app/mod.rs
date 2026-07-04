@@ -493,7 +493,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         crate::agent::set_pending_registry(Arc::clone(&registry));
         if let Some(tg) = telegram_state.as_ref() {
             tg.attach_registry(Arc::clone(&registry));
-        } else if let Some(tg) = crate::channel::active_channel() {
+        } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
+            // Multi-channel-safe (t-20260703164240502572-50899-11): this
+            // fallback is telegram-specific (the `tg`/`telegram_state`
+            // naming already assumed it); `active_channel()` would silently
+            // no-op here once discord is also registered.
             tg.attach_registry(Arc::clone(&registry));
         }
     }
@@ -1504,9 +1508,10 @@ fn app_teardown(
         crate::daemon::terminate_agents_parallel(agents);
         let run_dir = crate::daemon::run_dir(home);
         for name in &names {
-            if let Some(ch) = crate::channel::active_channel() {
-                let _ = ch.take_binding(name);
-            }
+            // Multi-channel-safe (t-20260703164240502572-50899-11): drops on
+            // every registered channel instead of only the `active_channel()`
+            // singleton, which silently no-ops in a telegram+discord fleet.
+            crate::channel::drop_binding_on_all_channels(name);
             crate::ipc::remove_port(&run_dir, name);
             crate::event_log::log(home, "delete", name, "delete: app teardown (parallel)");
         }

@@ -1066,7 +1066,11 @@ fn init_daemon_services(
     crate::agent::set_pending_registry(Arc::clone(&registry));
     if let Some(tg) = telegram.as_ref() {
         tg.attach_registry(Arc::clone(&registry));
-    } else if let Some(tg) = crate::channel::active_channel() {
+    } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
+        // Multi-channel-safe (t-20260703164240502572-50899-11): daemon-boot
+        // twin of the app-mode fallback in `app/mod.rs` — telegram-specific
+        // by naming, so `active_channel()` silently no-opping once discord
+        // is also registered would leave telegram's registry attach dead.
         tg.attach_registry(Arc::clone(&registry));
     }
 
