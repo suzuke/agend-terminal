@@ -528,9 +528,14 @@ mod tests {
     fn write_times_out_on_wedged_writer_without_hanging_caller() {
         let _lock = TEST_LOCK.lock();
         let (writer, mut child, _master) = wedged_pty("wedge-timeout", 10);
-        // Fill the queue past the pty's real capacity (prototyped ~1KB on
-        // this platform) so the actor genuinely can't drain it.
-        let filler = vec![b'x'; 4096];
+        // Fill the queue past the pty's real capacity so the actor genuinely
+        // can't drain it. The real kernel pty input queue is platform-
+        // dependent (prototyped ~1KB on macOS; CI's ubuntu-latest runner
+        // accepted a 4096-byte filler without wedging, i.e. Linux's is
+        // larger) -- use the same `MAX_QUEUE_BYTES_PER_WRITER` filler size
+        // the backpressure test below already uses, comfortably exceeding
+        // any realistic platform's real pty buffer.
+        let filler = vec![b'x'; MAX_QUEUE_BYTES_PER_WRITER];
         let _ = write(&writer, filler, Duration::from_millis(500));
 
         let start = std::time::Instant::now();
