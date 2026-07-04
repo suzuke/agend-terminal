@@ -1,12 +1,16 @@
-//! Inbox-maintenance composite: every-60-tick batch of 6 sub-ops gated
+//! Inbox-maintenance composite: every-60-tick batch of sub-ops gated
 //! on a single cadence counter. Extracted verbatim from
 //! `src/daemon/mod.rs:667-728` (pre-T-B3) — sub-ops preserved in the
 //! same order, same call signatures, same gating. The pre-extraction
 //! `static AtomicU64` counter moves onto the struct.
+//!
+//! #2550 W5 PR-3: the `worktree_auto_cleanup` sub-op moved out to its own
+//! [`super::worktree_registry_sweep::WorktreeRegistrySweepHandler`] — it has
+//! nothing to do with inbox maintenance and is semantically GC, but keeps
+//! the SAME 60-tick cadence value (decision Q4: not merged into the 360-tick
+//! GC handler).
 
 use super::{PerTickHandler, TickContext};
-use crate::api::ConfigRegistry;
-use std::path::Path;
 
 pub(crate) struct InboxMaintenanceHandler {
     gate: crate::daemon::cadence_gate::CadenceGate,
@@ -42,48 +46,6 @@ impl PerTickHandler for InboxMaintenanceHandler {
         crate::inbox::reclaim_stale_delivering(ctx.home);
         crate::inbox::check_disk_space(ctx.home);
         crate::daemon::run_task_maintenance(ctx.home);
-        worktree_auto_cleanup(ctx.home, ctx.configs);
-    }
-}
-
-/// Worktree auto-cleanup (runtime registry based): drop branches whose
-/// PRs have merged into main. Logged via `event_log` + tracing on every
-/// removal so operators can audit. Verbatim from the pre-extraction
-/// block at mod.rs:678-717.
-fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry) {
-    let cfgs = configs.lock();
-    let config_data: std::collections::HashMap<
-        String,
-        (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
-    > = cfgs
-        .iter()
-        .map(|(name, cfg)| {
-            (
-                name.clone(),
-                (cfg.working_dir.clone(), cfg.worktree_source.clone()),
-            )
-        })
-        .collect();
-    drop(cfgs);
-    let fleet_dirs: Vec<std::path::PathBuf> =
-        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-            .ok()
-            .map(|c| {
-                c.instance_names()
-                    .iter()
-                    .filter_map(|n| c.resolve_instance(n).and_then(|r| r.working_directory))
-                    .collect()
-            })
-            .unwrap_or_default();
-    let cleaned = crate::worktree_cleanup::sweep_from_registry(&config_data, &fleet_dirs);
-    for (branch, path) in &cleaned {
-        crate::event_log::log(
-            home,
-            "worktree_auto_removed",
-            branch,
-            &format!("path={path}, branch merged into main"),
-        );
-        tracing::info!(branch, path, "worktree auto-removed (branch merged)");
     }
 }
 
