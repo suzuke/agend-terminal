@@ -53,6 +53,24 @@ impl TmpReviewGcHandler {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
         }
     }
+
+    /// #P1-2607 offload seam: cadence check kept ON the tick loop (cheap, no
+    /// drift). `HourlyGcHandler` calls it to decide inclusion in the round.
+    pub(crate) fn due(&self) -> bool {
+        self.gate.fire()
+    }
+
+    /// #P1-2607 offload seam: the sweep body (git worktree removes under `/tmp`),
+    /// run off the tick loop by `HourlyGcHandler`. Behaviour unchanged from the
+    /// pre-offload `run()`.
+    pub(crate) fn work(&self, home: &Path) {
+        let removed =
+            gc_stale_tmp_review_worktrees(home, &std::env::temp_dir(), MIN_AGE, SystemTime::now());
+        if removed > 0 {
+            tracing::info!(target: "tmp_review_gc", removed,
+                "Class2: GC'd stale /tmp worktrees/clones of managed repos");
+        }
+    }
 }
 
 impl PerTickHandler for TmpReviewGcHandler {
@@ -61,18 +79,8 @@ impl PerTickHandler for TmpReviewGcHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.gate.fire() {
-            return;
-        }
-        let removed = gc_stale_tmp_review_worktrees(
-            ctx.home,
-            &std::env::temp_dir(),
-            MIN_AGE,
-            SystemTime::now(),
-        );
-        if removed > 0 {
-            tracing::info!(target: "tmp_review_gc", removed,
-                "Class2: GC'd stale /tmp worktrees/clones of managed repos");
+        if self.due() {
+            self.work(ctx.home);
         }
     }
 }
