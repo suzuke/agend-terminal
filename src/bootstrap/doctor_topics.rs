@@ -184,6 +184,21 @@ fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
         .unwrap_or_default()
 }
 
+/// #991 PR-D r1 (reviewer4 finding on #2633 r0): the Unbound hint's `bind_topic`
+/// invocation example must use the REAL MCP parameter name, not a
+/// hardcoded guess — r0 wrote `instance_name=<name>`, but the actual schema
+/// (`crate::mcp::tools::def_bind_topic`) requires `instance`, so the
+/// copy-pasted hint would have failed with a missing-parameter error if an
+/// operator followed it literally. Reading the schema directly here (rather
+/// than hardcoding "instance" as a second literal) means this can never
+/// silently drift from the real parameter name again, even if it's renamed.
+fn bind_topic_instance_param() -> String {
+    crate::mcp::tools::def_bind_topic()["inputSchema"]["required"][0]
+        .as_str()
+        .unwrap_or("instance")
+        .to_string()
+}
+
 /// Render the report as a human-readable multi-line string.
 pub fn render_human(report: &TopicReport) -> String {
     let mut out = String::new();
@@ -221,9 +236,10 @@ pub fn render_human(report: &TopicReport) -> String {
             })
             .collect();
         out.push_str(&names.join(", "));
-        out.push_str(
-            ") — bind_topic-eligible, run `bind_topic instance_name=<name>` to retrofit\n",
-        );
+        out.push_str(&format!(
+            ") — bind_topic-eligible, run `bind_topic {}=<name>` to retrofit\n",
+            bind_topic_instance_param()
+        ));
     }
     out.push('\n');
     match report.can_manage_topics {
@@ -733,6 +749,33 @@ mod tests {
         assert!(
             out.contains("beta:deferred"),
             "must name + tag the mode: {out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// r0 (reviewer4 finding, #2633): the hint hardcoded `instance_name=`,
+    /// but the real `bind_topic` schema requires `instance` — an operator
+    /// following the hint literally would hit a missing-parameter error.
+    /// Derives the expected param name INDEPENDENTLY from
+    /// `crate::mcp::tools::def_bind_topic`'s own schema (not by re-reading
+    /// `render_human`'s implementation), so a future rename of that schema
+    /// breaks this test loudly instead of the hint silently drifting again.
+    #[test]
+    fn render_human_bind_topic_hint_uses_real_schema_param_name_2633() {
+        let home = tmp_home("render-unbound-param-name");
+        write_registry(&home, &[]);
+        write_fleet_with_binding(&home, &[("beta", None, Some("deferred"))]);
+        let report = classify(&home);
+        let out = render_human(&report);
+
+        let schema = crate::mcp::tools::def_bind_topic();
+        let real_param = schema["inputSchema"]["required"][0]
+            .as_str()
+            .expect("bind_topic schema declares a required instance param");
+        assert!(
+            out.contains(&format!("{real_param}=<name>")),
+            "the retrofit hint must use bind_topic's REAL required parameter \
+             ({real_param:?} per tools::def_bind_topic), not a hardcoded guess: {out}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
