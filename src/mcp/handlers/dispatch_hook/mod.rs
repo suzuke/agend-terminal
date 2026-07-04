@@ -860,7 +860,12 @@ pub(crate) fn ensure_branch_exists(
         let fetch_start = std::time::Instant::now();
         let fetch_out = crate::git_helpers::git_bypass_timeout(
             source,
-            &["fetch", &remote, remote_branch, "--quiet"],
+            &[
+                "fetch",
+                &remote,
+                &format!("+{remote_branch}:refs/remotes/{remote}/{remote_branch}"),
+                "--quiet",
+            ],
             DISPATCH_FETCH_TIMEOUT,
         );
         create_fetched = matches!(&fetch_out, Ok(o) if o.status.success());
