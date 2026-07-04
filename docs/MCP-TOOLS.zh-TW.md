@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（27 個工具）
+# AgEnD MCP Tools Reference — 工具參考（28 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -93,6 +93,13 @@
 - **instance**: 要重啟的 instance
 - mode (resume / fresh), reason, force
 - `fresh` 預設會在 bound worktree 有未提交變更時拒絕（#2476）；請先 commit/push 或留下 task-board handoff，或傳 `force: true`。
+
+### `bind_topic`
+#991：為以 `topic_binding=deferred` 建立的 instance(或 `auto` 模式但最終沒拿到 topic,例如剛好在開機後 ~6 秒 channel 初始化視窗內建立的)補建 Telegram topic。
+- **instance**：要補建 topic 的 instance
+- channel(預設 `telegram`——目前唯一支援的 channel)
+- 冪等:已經有 topic 的 instance 會回傳 `already_bound: true`，不重複建立。
+- 拒絕 `skip` 模式的 instance(`code: not_eligible`)——`skip` 的承諾是「永不建 topic」；若要補建請先改 `topic_binding_mode`。
 
 ### `list_instances`
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。

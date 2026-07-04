@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (27 tools)
+# AgEnD MCP Tools Reference (28 tools)
 
 ## Action-based Tools
 
@@ -93,6 +93,13 @@ Kill and restart an instance. Default mode `resume` preserves conversation state
 - **instance**: instance to restart
 - mode (resume / fresh), reason, force
 - `fresh` refuses by default if the bound worktree has uncommitted changes (#2476); commit/push or leave a task-board handoff first, or pass `force: true`.
+
+### `bind_topic`
+#991: retrofit a Telegram topic for an instance spawned with `topic_binding=deferred` (or `auto` that ended up without one, e.g. spawned during the ~6s post-boot channel-init window).
+- **instance**: instance to bind a topic for
+- channel (defaults to `telegram` — the only channel currently supported)
+- Idempotent: an instance that already has a topic returns `already_bound: true`, no-op.
+- Refuses `skip`-mode instances (`code: not_eligible`) — `skip`'s promise is "no topic, ever"; change `topic_binding_mode` first if you want one.
 
 ### `list_instances`
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
