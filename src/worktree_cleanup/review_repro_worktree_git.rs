@@ -26,6 +26,22 @@ fn git(dir: &Path, args: &[&str]) {
     crate::review_repro_test_util::review_repro_git(dir, args)
 }
 
+/// #2605: seed `home/runtime/<agent>/binding.json` so
+/// `binding::bound_source_repos` (the sweep's repo-discovery source) reports
+/// `source_repo` as live-bound.
+fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    std::fs::create_dir_all(&dir).expect("mkdir runtime dir");
+    std::fs::write(
+        dir.join("binding.json"),
+        serde_json::to_string(&serde_json::json!({
+            "source_repo": source_repo.display().to_string()
+        }))
+        .expect("serialize binding json"),
+    )
+    .expect("write binding.json");
+}
+
 /// True iff `branch` still exists as a local ref in `repo`.
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
@@ -97,13 +113,13 @@ fn prune_keeps_remote_gone_branch_with_unpushed_commits_worktree_git() {
         "precondition: branch must exist before prune"
     );
 
-    let pruned = prune_orphaned_branches(&repo);
+    let pruned = prune_orphaned_branches(&repo, false);
 
     // CORRECT: a remote-gone branch with committed-but-unpushed local work that
     // is NOT in the default branch must be KEPT (its commits are otherwise
     // unrecoverable after `git branch -D`).
     assert!(
-        !pruned.iter().any(|b| b == "feat/unpushed"),
+        !pruned.iter().any(|(b, _)| b == "feat/unpushed"),
         "remote-gone branch with unpushed local commits must NOT be force-deleted: {pruned:?}"
     );
     assert!(
@@ -188,19 +204,25 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
 
     // Drive the phase-1 sweep (auto-cleanup is on by default; set explicitly for
     // determinism — the git-subprocess serialize group prevents an env race).
+    // #2605: also opt into live deletion (default is dry-run) since this test
+    // asserts the worktree dir was actually reclaimed.
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
-    let mut configs: HashMap<String, (Option<PathBuf>, Option<PathBuf>)> = HashMap::new();
-    configs.insert(
-        "other".to_string(),
-        (Some(repo.join("other")), Some(repo.clone())),
-    );
-    let removed = sweep_from_registry(&configs, &[]);
+    std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+    let home = scratch("p1-remote-gone-home");
+    let mut configs: HashMap<String, Option<PathBuf>> = HashMap::new();
+    configs.insert("other".to_string(), Some(repo.join("other")));
+    write_source_repo_binding(&home, "other", &repo);
+    let removed = sweep_from_registry(&home, &configs, &[]);
     std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+    std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
 
     // The stale worktree DIR IS still reclaimed (harmless disk cleanup)...
     assert!(
-        removed.iter().any(|(b, _)| b == "feat/unpushed-wt"),
-        "the stale remote-gone worktree dir must still be reclaimed: {removed:?}"
+        removed
+            .iter()
+            .any(|(b, _, r)| b == "feat/unpushed-wt" && *r == "remote-gone"),
+        "the stale remote-gone worktree dir must still be reclaimed, with an honest \
+         \"remote-gone\" reason (not a hardcoded \"merged\"): {removed:?}"
     );
     // ...but the branch ref (and its committed-but-unpushed commits) MUST survive
     // — phase-1's `branch -D` is gated on merged||squash, not the remote-gone
@@ -213,6 +235,7 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
 
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&remote).ok();
+    std::fs::remove_dir_all(&home).ok();
 }
 
 // ──────────────────────────────────────────────────────────────────────────
