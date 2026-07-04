@@ -736,8 +736,11 @@ fn handle_clean_exit(
 ) {
     tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
     // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+    // #P1-2607-followup (reviewer4, PR #2620): `remove_and_unregister`, not a
+    // bare registry remove — see `daemon::lifecycle::delete_transaction`'s
+    // comment for why.
     if let Some(id) = crate::fleet::resolve_uuid(home, name) {
-        agent::lock_registry(registry).remove(&id);
+        agent::remove_and_unregister(registry, &id);
     }
     configs.lock().remove(name);
 }
