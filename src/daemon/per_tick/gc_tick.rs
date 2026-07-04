@@ -41,6 +41,19 @@ impl PerTickHandler for GcTickHandler {
         // including `.trash` purging — previously a separate ~1h-delayed
         // independent sweep's job (`retention::worktrees::sweep`), now folded
         // in here on the SAME fire-on-first cadence (no phase lag, decision Q2).
+        //
+        // NOTE (behavior change, deliberate, NOT covered by decision Q3's
+        // "gate coverage unchanged"): this call is UNCONDITIONAL, unlike the
+        // old `sweep()` it replaces, which only ran (and so only purged
+        // `.trash`) when `AGEND_WORKTREE_GC=1`. Q3 preserved the gate on the
+        // ARCHIVE-DECISION path (CleanRelease's fallthrough); it says nothing
+        // about cleaning up entries already IN `.trash`, which can land there
+        // via the ForceReclaim path (never gated, before or after this PR) —
+        // in a gate-off install, those entries used to accumulate forever
+        // (nothing ever called `purge_trash`). `AGEND_WORKTREE_GC_TRASH_DAYS`
+        // is the correct, already-independent lever for "how long to keep
+        // `.trash`" (including "never purge": set it very large); coupling
+        // the purge to the unrelated archive-decision gate was itself the gap.
         crate::daemon::retention::worktrees::purge_trash(ctx.home);
 
         let stale_locks = crate::worktree_pool::gc_stale_ci_watch_locks(ctx.home);
@@ -81,6 +94,10 @@ impl PerTickHandler for GcTickHandler {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentRegistry, ExternalRegistry};
+    use parking_lot::Mutex as PLMutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn should_fire_respects_every_n_ticks() {
@@ -90,5 +107,58 @@ mod tests {
         assert!(!handler.gate.fire()); // tick 2
         assert!(handler.gate.fire()); // tick 3
         assert!(!handler.gate.fire()); // tick 4
+    }
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-gc-tick-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// #2550 W5 (seat-2 finding on PR #2599): `purge_trash` is now called
+    /// UNCONDITIONALLY from `gc_tick`, unlike the old standalone `sweep()` it
+    /// replaces, which only purged `.trash` when `AGEND_WORKTREE_GC=1` — a
+    /// gate-off install accumulated `.trash` entries forever (nothing ever
+    /// purged them). Deliberately NOT covered by decision Q3 ("gate coverage
+    /// unchanged" applies to the archive-DECISION path only); this is a
+    /// separate, intentional fix. Proves an aged `.trash` entry is purged by
+    /// a `gc_tick` pass with `AGEND_WORKTREE_GC` left UNSET.
+    #[test]
+    fn purge_trash_runs_regardless_of_worktree_gc_gate_2550_w5() {
+        std::env::remove_var("AGEND_WORKTREE_GC");
+        let home = tmp_home("purge-gate-independent");
+        let trash_dir = home
+            .join(".trash")
+            .join("worktrees")
+            .join("agent-100-000000000"); // secs=100 → ancient, past any retention window
+        std::fs::create_dir_all(&trash_dir).unwrap();
+
+        let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        GcTickHandler::new(1).run(&ctx);
+
+        assert!(
+            !trash_dir.exists(),
+            "an aged .trash entry must be purged by gc_tick even with \
+             AGEND_WORKTREE_GC unset — purge_trash is no longer gated"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

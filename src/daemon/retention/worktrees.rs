@@ -1315,8 +1315,9 @@ mod tests {
     #[test]
     fn gc_run_hard_deletes_clean_release_then_second_pass_is_noop_2550_w1() {
         // Reuse the existing env-var lock: `purge_trash` (called every
-        // `gc_run` pass now) reads `AGEND_WORKTREE_GC_TRASH_DAYS`, so this must
-        // not race a parallel TRASH_DAYS test.
+        // `gc_tick` pass now, unconditionally — see gc_tick.rs) reads
+        // `AGEND_WORKTREE_GC_TRASH_DAYS`, so this must not race a parallel
+        // TRASH_DAYS test.
         let _env_guard = gc_trash_env_guard();
 
         let dir = tmp_home("w1-baseline-clean");
