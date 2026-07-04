@@ -97,13 +97,38 @@
 //! contained entirely within its OWN OS thread — provable by the OS
 //! scheduler, not by application-level lock discipline — and never delays
 //! any other writer's enqueue or service.
+//!
+//! ## Correctness fix (same day, CI-caught): don't rely solely on explicit `unregister`
+//!
+//! `unregister` is only wired at ONE production teardown site
+//! (`cleanup_agent`). Pre-existing test code across the workspace
+//! constructs real agents via `spawn_agent`/`spawn_ephemeral_worker` (which
+//! call [`register`]) and tears them down by simply dropping the handle —
+//! never calling `unregister`. Under `cargo nextest` (this module's own
+//! test suite) that's invisible, since nextest isolates every test in its
+//! own process. But CI's Coverage job uses plain `cargo test`, which runs
+//! ALL unit tests in one shared process — every such leaked registration
+//! left its dedicated thread running (polling every [`IDLE_POLL_MS`])
+//! *for the rest of that process's life*, and the accumulating thread count
+//! measurably slowed the whole suite (19x: 74s on `main` vs 1418s on this
+//! branch) and was strongly correlated with a downstream, CPU/scheduling-
+//! sensitive test (`state::tests::replay_manifest_regression`, which uses
+//! wall-clock `Instant`-based thresholds) intermittently failing. Fix: each
+//! [`WriterState`] also holds a `Weak` reference to the `PtyWriter` Arc
+//! itself; [`writer_thread`] checks it every loop iteration (alongside
+//! `shutdown`) and self-retires the moment the writer's LAST strong
+//! reference is dropped, by ANY teardown path, with no explicit call
+//! required. `unregister` remains the fast, synchronous path or production
+//! code that knows the exact teardown moment (needed to close the fd-reuse
+//! race window described above); the weak-reference check is the backstop
+//! that makes correctness independent of every caller remembering it.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -147,16 +172,18 @@ impl Job {
     }
 }
 
-/// A registered writer's live state: its fd, its own dedicated queue, and
-/// the shutdown flag its dedicated [`writer_thread`] polls between
-/// attempts. One `Arc<WriterState>` is shared between the enqueuing side
-/// ([`write`]/[`unregister`]) and exactly one background thread — see the
-/// module doc's "Architecture revision" section for why this replaced a
-/// single global actor thread.
+/// A registered writer's live state: its fd, its own dedicated queue, the
+/// shutdown flag its dedicated [`writer_thread`] polls between attempts,
+/// and a `Weak` handle to the `PtyWriter` itself so the thread can detect
+/// "the writer was dropped and nobody called `unregister`" (see the module
+/// doc's "Correctness fix" section) independent of `shutdown`. One
+/// `Arc<WriterState>` is shared between the enqueuing side
+/// ([`write`]/[`unregister`]) and exactly one background thread.
 struct WriterState {
     fd: RawFd,
     shutdown: AtomicBool,
     queue: Mutex<VecDeque<Job>>,
+    liveness: Weak<parking_lot::Mutex<Box<dyn io::Write + Send>>>,
 }
 
 /// `Arc::as_ptr(writer) as usize` (same identity scheme `WRITE_IN_PROGRESS`
@@ -194,6 +221,7 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
         fd,
         shutdown: AtomicBool::new(false),
         queue: Mutex::new(VecDeque::new()),
+        liveness: Arc::downgrade(writer),
     });
     let stale = writers().lock().insert(key, Arc::clone(&state));
     // A leftover entry at this exact writer-pointer address means a
@@ -221,7 +249,7 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
     // (or whether) this thread actually notices `shutdown` and exits.
     if let Err(e) = std::thread::Builder::new()
         .name("agend-pty-writer".into())
-        .spawn(move || writer_thread(state))
+        .spawn(move || writer_thread(key, state))
     {
         tracing::error!(
             error = %e,
@@ -308,18 +336,40 @@ pub(crate) fn write(
     })
 }
 
+/// Shared cleanup for both `writer_thread`'s self-retire (shutdown flag OR
+/// dead `liveness` weak ref) and would-be future callers: fail whatever's
+/// left in the queue, then remove `key` from the [`WRITERS`] map -- but
+/// ONLY if the map's CURRENT entry at `key` is still THIS `state` (compares
+/// by `Arc::ptr_eq`). Without that check, a thread retiring late (e.g.
+/// after being stuck mid-syscall) could otherwise delete a BRAND NEW
+/// registration that has since reused the same writer-pointer address.
+fn retire(key: usize, state: &Arc<WriterState>, reason: &str) {
+    for job in state.queue.lock().drain(..) {
+        job.fail(io::Error::new(io::ErrorKind::BrokenPipe, reason));
+    }
+    let mut ws = writers().lock();
+    if ws
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, state))
+    {
+        ws.remove(&key);
+    }
+}
+
 /// A registered writer's dedicated background thread: poll its own fd,
 /// service at most one bounded write per readiness event, repeat. Runs
-/// until [`unregister`] flips `state.shutdown`.
-fn writer_thread(state: Arc<WriterState>) {
+/// until [`unregister`] flips `state.shutdown`, OR (the backstop — see the
+/// module doc's "Correctness fix" section) `state.liveness` fails to
+/// upgrade, meaning the `PtyWriter`'s last strong reference was dropped by
+/// some OTHER teardown path that never called `unregister`.
+fn writer_thread(key: usize, state: Arc<WriterState>) {
     loop {
-        if state.shutdown.load(Ordering::Acquire) {
-            for job in state.queue.lock().drain(..) {
-                job.fail(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "PTY writer torn down before this write completed",
-                ));
-            }
+        if state.shutdown.load(Ordering::Acquire) || state.liveness.upgrade().is_none() {
+            retire(
+                key,
+                &state,
+                "PTY writer torn down before this write completed",
+            );
             return;
         }
 
@@ -718,5 +768,48 @@ mod tests {
 
         let _ = child_b.kill();
         unregister(&writer_b);
+    }
+
+    /// #P1-2607-followup correctness fix: a writer whose caller drops it
+    /// WITHOUT ever calling `unregister` (exactly what several pre-existing
+    /// tests elsewhere in the workspace do, e.g. `agent::tests` constructing
+    /// real agents via `spawn_agent` and just dropping the handle) must not
+    /// leak its dedicated thread forever. Registers a writer, drops every
+    /// strong reference to it (no `unregister` call), and asserts the
+    /// `WRITERS` map entry disappears on its own within a bounded time --
+    /// the `liveness` weak-reference backstop noticing and self-retiring.
+    #[test]
+    fn dropped_writer_without_unregister_is_eventually_reaped() {
+        let _lock = TEST_LOCK.lock();
+        let (writer, mut child, master) = wedged_pty("leak-backstop", 2);
+        // Capture identity BEFORE dropping -- `writers()` is a process-global
+        // map shared with every OTHER test in this binary (this test suite
+        // runs under plain `cargo test`'s shared-process parallelism, not
+        // just this module's own serialized tests), so asserting on the
+        // map's total size would be flaky against concurrently-registered,
+        // unrelated writers. Only this specific key's presence matters.
+        let key = Arc::as_ptr(&writer) as usize;
+        assert!(
+            fd_for(&writer).is_some(),
+            "must be registered right after wedged_pty"
+        );
+
+        // Drop EVERY strong reference -- no `unregister` call, simulating a
+        // teardown path that doesn't know about it.
+        drop(writer);
+        drop(master);
+        let _ = child.kill();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut still_present = writers().lock().contains_key(&key);
+        while still_present && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            still_present = writers().lock().contains_key(&key);
+        }
+        assert!(
+            !still_present,
+            "a writer dropped without `unregister` must eventually be reaped by the liveness \
+             backstop, not leak its thread + WRITERS entry forever"
+        );
     }
 }
