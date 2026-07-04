@@ -339,7 +339,11 @@ fn branch_tip_age(repo_root: &Path, branch: &str) -> Option<Duration> {
 /// it is squash-merged into the default branch AND its tip is older than
 /// [`SQUASH_GC_MIN_TIP_AGE`]. Reuses `branch_sweep`'s detection (git cherry +
 /// #1280 tree-diff fallback) so the auto path matches the operator sweep.
-fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &str) -> bool {
+///
+/// t-...50899-10: `pub(crate)` so `worktree_pool::cleanup_merged_branch` reuses
+/// the SAME squash-safe delete gate this file's `prune_orphaned_branches`
+/// uses, instead of treating a remote-gone branch as independently deletable.
+pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &str) -> bool {
     crate::branch_sweep::is_squash_merged(repo_root, default, branch)
         && branch_tip_age(repo_root, branch).is_some_and(|age| age >= SQUASH_GC_MIN_TIP_AGE)
 }
