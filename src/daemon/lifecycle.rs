@@ -131,9 +131,12 @@ pub fn delete_transaction(
     };
 
     // Step 4: registry remove (after child exit confirmed or timeout).
+    // #P1-2607-followup (reviewer4, PR #2620): must go through
+    // `remove_and_unregister`, not a bare `reg.remove`, so the removed
+    // handle's `write_actor` registration (lazy-spawn: no thread for a
+    // never-written writer) doesn't leak a stale fd-reuse bookkeeping entry.
     if let Some(id) = instance_id {
-        let mut reg = crate::agent::lock_registry(registry);
-        reg.remove(&id);
+        crate::agent::remove_and_unregister(registry, &id);
     }
 
     // Step 5: drop active-channel binding (Sprint 20.5 cross-validation finding).
@@ -225,10 +228,10 @@ impl<'r> Drop for SpawnRollback<'r> {
         }
         // Rollback in reverse insertion order so observers can't see a
         // half-cleaned state with a child but no registry entry, etc.
+        // #P1-2607-followup (reviewer4, PR #2620): `remove_and_unregister`,
+        // not a bare `reg.remove` — see `delete_transaction`'s comment above.
         if let Some(id) = self.instance_id {
-            let mut reg = crate::agent::lock_registry(self.registry);
-            reg.remove(&id);
-            drop(reg);
+            crate::agent::remove_and_unregister(self.registry, &id);
             drop_active_binding(&self.name);
         }
         if let Some(child_arc) = self.child.take() {
@@ -310,6 +313,71 @@ mod tests {
         assert!(
             observed_exit,
             "missing registry entry → wait is vacuous true"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #P1-2607-followup (reviewer4, PR #2620 REJECTED finding): a real
+    /// agent's `pty_writer` is registered with `write_actor` at spawn time,
+    /// but `write_actor::register` is lazy-spawn -- no dedicated thread
+    /// exists for a writer that's never had a write attempted through it,
+    /// so the weak-reference backstop inside that thread never runs for it.
+    /// `delete_transaction` must be the one to unregister it (not just
+    /// remove it from the agent registry), or a never-written agent's
+    /// teardown leaks a stale write_actor entry forever. Pins that this
+    /// actually happens, end-to-end through the real `spawn_agent` path.
+    ///
+    /// Unix-only: `write_actor` itself is `#[cfg(unix)]` (no PTY-fd-based
+    /// registration concept applies on Windows), so there's nothing to
+    /// assert here on that platform.
+    #[test]
+    #[cfg(unix)]
+    fn delete_transaction_unregisters_never_written_writer_2620() {
+        let home = tmp_home("delete-unreg");
+        let reg = empty_registry();
+        let cfg = crate::agent::SpawnConfig {
+            name: "never-written",
+            backend_command: "cat",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let id = crate::agent::spawn_agent(&cfg, &reg).expect("spawn");
+
+        let pty_writer = {
+            let guard = crate::agent::lock_registry(&reg);
+            guard.get(&id).expect("just spawned").pty_writer.clone()
+        };
+        assert!(
+            crate::agent::write_actor_is_registered(&pty_writer),
+            "spawn_agent must register the writer with write_actor"
+        );
+
+        // `delete_transaction` resolves its registry id via
+        // `fleet::resolve_uuid(home, name)`, which reads `home`'s
+        // fleet.yaml -- write the minimal `name -> id` mapping `spawn_agent`
+        // itself would have persisted had it been given this `home`.
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!("instances:\n  never-written:\n    id: \"{}\"\n", id.full()),
+        )
+        .expect("write fleet.yaml");
+
+        // Deliberately never write to it -- exercises the lazy-spawn gap
+        // directly (no thread ever gets started for this writer).
+        delete_transaction(&home, "never-written", &reg, None, true);
+
+        assert!(
+            !crate::agent::write_actor_is_registered(&pty_writer),
+            "delete_transaction must unregister a never-written writer's write_actor \
+             registration, not just remove it from the agent registry"
         );
         std::fs::remove_dir_all(&home).ok();
     }

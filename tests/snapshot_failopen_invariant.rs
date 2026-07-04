@@ -108,6 +108,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "sweep gate; missing -> not-busy -> emit_warn + NudgeAgent. Reversible: a warn/nudge, never a delete.",
     ),
     (
+        "src/inbox/storage.rs",
+        "reader",
+        "#2622 reclaim_stale_delivering busy gate; missing -> not-busy -> reclaim proceeds (today's behavior, unchanged). Reversible: only shifts REDELIVERY TIMING of an already-authoritative inbox row (never invents or drops a message), and is itself hard-capped at RECLAIM_BUSY_HARD_CAP_SECS so a stale/wedged busy signal can't zombie a row in `delivering` forever.",
+    ),
+    (
         "src/daemon/mod.rs",
         "reader",
         "startup diagnostic only: logs 'previous snapshot found' via tracing::info; missing -> skip the log. No action.",
@@ -126,6 +131,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "src/daemon/per_tick/snapshot.rs",
         "writer",
         "the per-tick rotation handler: PRODUCES the projection via crate::snapshot::save. Not a reader; no decision reads snapshot here.",
+    ),
+    (
+        "src/inbox/tests.rs",
+        "writer",
+        "#2622 test fixture: writes a synthetic snapshot (crate::snapshot::save/AgentSnapshot) so agent_is_busy reads a deterministic value in reclaim_stale_delivering tests. Not a reader; no production decision reads snapshot here — the whole file is #[cfg(test)]-only via its `mod tests;` declaration in inbox/mod.rs, which the AST scanner (parsing this file standalone) cannot see.",
     ),
     (
         "src/daemon/per_tick/mod.rs",
