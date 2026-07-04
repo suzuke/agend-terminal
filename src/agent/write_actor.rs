@@ -400,6 +400,33 @@ pub(crate) fn unregister(writer: &PtyWriter) {
     }
 }
 
+/// SINGLE chokepoint for evicting a live `AgentHandle` from `registry`:
+/// removes it and unregisters its `pty_writer` (via [`unregister`]) BEFORE
+/// the handle — and its `pty_writer`/`pty_master` — actually drops.
+///
+/// #P1-2607-followup (reviewer4, PR #2620 REJECTED finding): every
+/// registry-eviction site must go through this, not a bare
+/// `registry.lock().remove(id)` — [`register`] is lazy-spawn (no thread
+/// exists for a writer that's never had a write attempted through it), so
+/// the weak-reference backstop inside [`writer_thread`] never runs for such
+/// a writer; explicit `unregister` at EVERY teardown path is its only
+/// cleanup. A full grep sweep of the codebase's `registry.remove` call
+/// sites found five production sites needing this: `agent::cleanup_agent`,
+/// `daemon::lifecycle::delete_transaction`,
+/// `daemon::lifecycle::SpawnRollback::drop`, `daemon::handle_clean_exit`,
+/// and `app::pane_factory::reap_late_registration_if_shutdown` — all now
+/// route through here (`agent::remove_and_unregister` on Unix).
+pub(crate) fn remove_and_unregister(
+    registry: &super::AgentRegistry,
+    id: &crate::types::InstanceId,
+) -> Option<super::AgentHandle> {
+    let removed = super::lock_registry(registry).remove(id);
+    if let Some(handle) = &removed {
+        unregister(&handle.pty_writer);
+    }
+    removed
+}
+
 /// The registered fd for `writer`, if any. Test/introspection only --
 /// production callers use [`write`] directly (it resolves the writer's
 /// state internally). `pub(super)` so `agent`'s own cross-module test

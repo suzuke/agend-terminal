@@ -2307,30 +2307,21 @@ fn wait_for_process_exit(
     None
 }
 
-/// Remove `id` from `registry` and unregister its `pty_writer` from
-/// `write_actor` BEFORE the removed handle (and its `pty_writer`/
-/// `pty_master`) actually drops — closes the fd-reuse race window
-/// (`write_actor`'s module doc) so a subsequent agent that happens to get
-/// the same OS fd number never inherits this agent's leftover write queue.
-///
-/// #P1-2607-followup (reviewer4, PR #2620 REJECTED finding): this is the
-/// SINGLE chokepoint every registry-eviction site must go through instead
-/// of a bare `lock_registry(registry).remove(id)` — `write_actor::register`
-/// is lazy-spawn (no thread exists for a writer that's never had a write
-/// attempted through it), so the weak-reference backstop inside
-/// `write_actor::writer_thread` never runs for such a writer; an explicit
-/// `unregister` call at EVERY teardown path is the only cleanup for that
-/// case, not just the PTY-read-loop exit path this function used to be the
-/// sole guard for.
+/// Eviction chokepoint -- see `write_actor::remove_and_unregister`'s doc.
+#[cfg(unix)]
 pub(crate) fn remove_and_unregister(
     registry: &AgentRegistry,
     id: &crate::types::InstanceId,
 ) -> Option<AgentHandle> {
-    let removed = lock_registry(registry).remove(id);
-    if let Some(handle) = &removed {
-        unregister_pty_writer(&handle.pty_writer);
-    }
-    removed
+    write_actor::remove_and_unregister(registry, id)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_and_unregister(
+    registry: &AgentRegistry,
+    id: &crate::types::InstanceId,
+) -> Option<AgentHandle> {
+    lock_registry(registry).remove(id)
 }
 
 fn cleanup_agent(
@@ -2626,14 +2617,9 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`; its result
-/// IS the caller's result, use it directly. `None` -> no fd registered
-/// (Windows, where `MasterPty::as_raw_fd()` returns `None`; any
-/// synthetic/test writer that never went through `write_actor::register`)
-/// -- fall through to the thread-per-write mechanism below, byte-identical
-/// to before #P1-2607. A runtime branch, not a compile-time platform split:
-/// on non-Unix this always returns `None` and the fallback runs
-/// unconditionally, unchanged.
+/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its
+/// result directly. `None` -> not registered (Windows; synthetic/test
+/// writer) -- fall through to the thread-per-write mechanism below.
 #[cfg(unix)]
 fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
     write_actor::write(writer, data.to_vec(), PTY_WRITE_TIMEOUT)
@@ -2644,23 +2630,7 @@ fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<
     None
 }
 
-/// Retire `writer`'s `write_actor` registration (if any) at agent teardown,
-/// BEFORE the caller's `AgentHandle` (and its `pty_writer`/`pty_master`) is
-/// actually dropped. A no-op for a writer never registered (Windows; any
-/// writer whose `master.as_raw_fd()` returned `None`) — same runtime-branch
-/// shape as [`try_actor_write`], not a compile-time platform split.
-#[cfg(unix)]
-fn unregister_pty_writer(writer: &PtyWriter) {
-    write_actor::unregister(writer);
-}
-
-#[cfg(not(unix))]
-fn unregister_pty_writer(_writer: &PtyWriter) {}
-
-/// Test-only cross-module introspection: is `writer` currently registered
-/// with `write_actor`? Used by teardown-path tests outside this module
-/// (e.g. `daemon::lifecycle`'s) to verify `remove_and_unregister` actually
-/// unregisters, without exposing `write_actor` internals to production code.
+/// Test-only cross-module registration check (used by `daemon::lifecycle`'s tests).
 #[cfg(all(test, unix))]
 pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
     write_actor::fd_for(writer).is_some()
