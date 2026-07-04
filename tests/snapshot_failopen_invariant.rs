@@ -23,50 +23,86 @@
 //!     snapshot at worst shifts delivery timing, never invents or drops a
 //!     message.
 //!
-//! ## What this test does
+//! ## Detection — a two-layer fence (PR #2612 rework)
 //!
-//! It enumerates every PRODUCTION call site of a snapshot READ primitive
-//! (`snapshot::load`, `snapshot::agent_state_of`, `snapshot::agent_is_busy`;
-//! the writer `snapshot::save` is intentionally out of scope) and asserts each
-//! lives in a file on [`ALLOWED_READERS`], whose entry records the reviewed
-//! reason the read's action is reversible. A NEW reader in an unlisted file
-//! fails this test until its author adds an entry — forcing a fail-open review
-//! at the moment a new snapshot dependency is introduced. This is the same
-//! anti-growth contract as `task_events_invariant` / `spawn_rationale_audit`.
+//! The first cut of this test matched only the literal call form
+//! `snapshot::load(` on a single line. The reviewer (cross-vantage, PR #2612)
+//! correctly rejected it: four ordinary Rust forms read the same primitives yet
+//! slip past a literal-call scan —
+//!   1. `use crate::snapshot::load; ... load(home)`            (direct import)
+//!   2. `use crate::snapshot::{agent_is_busy as busy}; ...`    (aliased import)
+//!   3. `use crate::snapshot as snap; ... snap::agent_is_busy` (module alias)
+//!   4. `let f = crate::snapshot::load; f(home)`               (fn pointer)
 //!
-//! The "never causes an irreversible action" property is therefore enforced by
-//! three layers: (1) this allowlist forces review when a reader is added,
-//! (2) each entry records the reviewed reversibility rationale, and (3) the
-//! behavioral companion below proves the read primitives fail open.
+//! A new reader in any of those forms would silently escape `ALLOWED_READERS`,
+//! turning the anti-growth guard into a false guarantee.
 //!
-//! Behavioral companion: `snapshot_missing_fails_open_for_dispatch_deciders`
-//! (unit test in `src/snapshot.rs`) proves the read primitives return the
+//! The fix makes the scan COMPLETE by combining two layers over production code
+//! (`#[cfg(test)]` regions and comments excluded):
+//!
+//!   Layer 1 — import ban. Production code may reference the snapshot module
+//!   only in FULLY-QUALIFIED form. The import shapes that could bring a read
+//!   primitive into local scope under a name the read-scan can't see are
+//!   banned outright: `use crate::snapshot::{…}` (grouped/aliased), `use
+//!   crate::snapshot as …` (module alias), `use crate::snapshot;` (bare
+//!   module). This kills forms 2 and 3 at the source.
+//!
+//!   Layer 2 — read-reference scan. Any production line naming a read primitive
+//!   in fully-qualified form (`snapshot::load` / `snapshot::agent_state_of` /
+//!   `snapshot::agent_is_busy`, WITHOUT requiring a trailing `(` so fn-pointers
+//!   and single-item imports are caught too) marks its file a reader — which
+//!   must appear in `ALLOWED_READERS`. This catches forms 1 and 4 and every
+//!   current fully-qualified call.
+//!
+//! Given Layer 1, Layer 2's fully-qualified patterns are complete: there is no
+//! way to read a primitive without either a fully-qualified reference (Layer 2)
+//! or a banned import (Layer 1). `scanner_catches_all_bypass_forms` below is the
+//! fence's fence — it proves all four forms are caught.
+//!
+//! (Detection relies on rustfmt-normalized spacing, e.g. `crate::snapshot::`
+//! not `crate :: snapshot ::`; the repo's `cargo fmt --check` CI gate enforces
+//! that normalization, so hand-spaced evasions cannot land.)
+//!
+//! ## The allowlist
+//!
+//! Adding a file to `ALLOWED_READERS` REQUIRES a fail-open review of the new
+//! reader — the list records that the review happened; it does not waive it.
+//! The behavioral companion `snapshot_missing_fails_open_for_dispatch_deciders`
+//! (unit test in `src/snapshot.rs`) proves the primitives themselves return the
 //! conservative sentinel on a missing / corrupt / old-format snapshot. It lives
-//! there rather than here because the `snapshot` module is not on the curated
-//! `lib.rs` public surface — exposing it would be a production change out of
-//! scope for this test-only PR.
+//! there because the `snapshot` module is not on the curated `lib.rs` public
+//! surface; exposing it would be a production change out of scope here.
 //!
-//! Inventory as of origin/main: 7 files, 10 read sites (see `ALLOWED_READERS`).
-//! `#[cfg(test)]` reads (notify / per_tick::snapshot / app) are sliced out.
+//! Inventory as of origin/main: 7 reader files (see `ALLOWED_READERS`). Writers
+//! (`snapshot::save`) and type-only refs (`snapshot::FleetSnapshot`) are not
+//! reads and are intentionally out of scope.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Snapshot READ primitives. Qualified `snapshot::` form only — the writer
-/// `snapshot::save` and the module's own bare internal calls are excluded.
-const READ_PATTERNS: &[&str] = &[
-    "snapshot::load(",
-    "snapshot::agent_state_of(",
-    "snapshot::agent_is_busy(",
+/// Fully-qualified read-primitive references. No trailing `(` — so a fn-pointer
+/// (`let f = crate::snapshot::load;`) and a single-item import
+/// (`use crate::snapshot::load;`) are caught, not just direct calls. The writer
+/// `snapshot::save` and type refs `snapshot::FleetSnapshot` are deliberately
+/// absent (not reads).
+const READ_FN_REFS: &[&str] = &[
+    "snapshot::load",
+    "snapshot::agent_state_of",
+    "snapshot::agent_is_busy",
 ];
 
-/// Every production file allowed to read the snapshot projection, each with the
+/// Import shapes banned in production (Layer 1): each could bring a read
+/// primitive into scope under a name Layer 2's fully-qualified scan cannot see.
+/// Banning them forces every snapshot reference to stay fully-qualified.
+const BANNED_IMPORTS: &[&str] = &[
+    "use crate::snapshot::{",
+    "use crate::snapshot as ",
+    "use crate::snapshot;",
+];
+
+/// Every production file allowed to READ the snapshot projection, each with the
 /// reviewed reason its snapshot-driven action is REVERSIBLE / fail-open.
 /// Suffix-matched against the `src/`-relative path.
-///
-/// Adding an entry REQUIRES a fail-open review of the new reader — this list
-/// records that the review happened; it does not waive it. The bar for every
-/// entry: "a stale / missing snapshot here causes only a reversible action."
 const ALLOWED_READERS: &[(&str, &str)] = &[
     (
         "src/daemon/dispatch_idle/mod.rs",
@@ -144,6 +180,20 @@ fn test_region_lines(content: &str) -> HashSet<usize> {
     out
 }
 
+fn is_comment(line: &str) -> bool {
+    line.trim_start().starts_with("//")
+}
+
+/// Layer 1: a banned import form (grouped/aliased/bare-module snapshot import).
+fn is_banned_import(line: &str) -> bool {
+    BANNED_IMPORTS.iter().any(|b| line.contains(b))
+}
+
+/// Layer 2: a fully-qualified reference to a snapshot READ primitive.
+fn is_read_ref(line: &str) -> bool {
+    READ_FN_REFS.iter().any(|r| line.contains(r))
+}
+
 fn rel_str(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -159,6 +209,7 @@ fn snapshot_stale_never_causes_irreversible_action() {
     collect_rs_files(&src, &mut files);
     files.sort();
 
+    let mut banned: Vec<String> = Vec::new();
     let mut unlisted: Vec<String> = Vec::new();
     let mut matched: HashSet<&str> = HashSet::new();
 
@@ -174,13 +225,17 @@ fn snapshot_stale_never_causes_irreversible_action() {
         let test_lines = test_region_lines(&content);
         for (idx, line) in content.lines().enumerate() {
             let lineno = idx + 1;
-            if test_lines.contains(&lineno) {
+            if test_lines.contains(&lineno) || is_comment(line) {
                 continue;
             }
-            if line.trim_start().starts_with("//") {
+            // Layer 1 (applies to ALL files, allowlisted or not): the bypass-
+            // enabling import forms are forbidden outright.
+            if is_banned_import(line) {
+                banned.push(format!("  {rel}:{lineno}: {}", line.trim()));
                 continue;
             }
-            if !READ_PATTERNS.iter().any(|p| line.contains(p)) {
+            // Layer 2: a fully-qualified read reference marks a reader file.
+            if !is_read_ref(line) {
                 continue;
             }
             match ALLOWED_READERS
@@ -196,8 +251,20 @@ fn snapshot_stale_never_causes_irreversible_action() {
     }
 
     assert!(
+        banned.is_empty(),
+        "Banned snapshot import form(s) in production (Layer 1).\n\n\
+         Reference the snapshot module only in FULLY-QUALIFIED form \
+         (`crate::snapshot::<fn>(...)`). Grouped/aliased/bare-module imports \
+         (`use crate::snapshot::{{…}}`, `use crate::snapshot as …`, \
+         `use crate::snapshot;`) can bring a read primitive into scope under a \
+         name the reader-scan cannot see, defeating the fail-open allowlist.\n\n\
+         Offending line(s):\n{}",
+        banned.join("\n")
+    );
+
+    assert!(
         unlisted.is_empty(),
-        "New snapshot reader(s) outside the fail-open ALLOWLIST.\n\n\
+        "New snapshot reader(s) outside the fail-open ALLOWLIST (Layer 2).\n\n\
          Every reader of the snapshot projection must fail-open: a stale/missing \
          snapshot may cause only a REVERSIBLE action (nudge/warn/log/timing), never \
          an irreversible one (delete/overwrite/fabricated outbound send). Add the \
@@ -217,4 +284,65 @@ fn snapshot_stale_never_causes_irreversible_action() {
         "Stale ALLOWED_READERS entr(y/ies) — no snapshot read found in: {stale:?}.\n\
          Remove the entry (the reader was deleted/moved) to keep the inventory honest.",
     );
+}
+
+/// The fence's fence: prove the two-layer scan catches every read form the
+/// reviewer (PR #2612) showed the literal-call scan missed, and does NOT flag
+/// benign lines. Each `case` is classified by the same predicates the main test
+/// uses; "caught" = Layer 1 (banned import) OR Layer 2 (read ref) on a
+/// non-comment line.
+#[test]
+fn scanner_catches_all_bypass_forms() {
+    fn caught(line: &str) -> bool {
+        !is_comment(line) && (is_banned_import(line) || is_read_ref(line))
+    }
+
+    // Every bypass form the reviewer flagged, plus the baseline call. Each must
+    // be caught on at least one of its lines.
+    let must_catch: &[(&str, &[&str])] = &[
+        ("baseline call", &["let _ = crate::snapshot::load(home);"]),
+        (
+            "form 1: direct import + bare call",
+            &["use crate::snapshot::load;", "    let _ = load(home);"],
+        ),
+        (
+            "form 2: grouped/aliased import",
+            &[
+                "use crate::snapshot::{agent_is_busy as busy};",
+                "    let _ = busy(home, name);",
+            ],
+        ),
+        (
+            "form 3: module alias",
+            &[
+                "use crate::snapshot as snap;",
+                "    let _ = snap::agent_is_busy(home, name);",
+            ],
+        ),
+        (
+            "form 4: fn pointer",
+            &["let f = crate::snapshot::load;", "    let _ = f(home);"],
+        ),
+        (
+            "bare module import + call",
+            &["use crate::snapshot;", "    let _ = snapshot::load(home);"],
+        ),
+    ];
+    for (name, lines) in must_catch {
+        assert!(
+            lines.iter().any(|l| caught(l)),
+            "bypass form NOT caught by the fence: {name}"
+        );
+    }
+
+    // Negative controls: benign lines must NOT be flagged.
+    let must_not_catch: &[&str] = &[
+        "    let snapshotter = build_snapshotter();", // unrelated identifier
+        "// see crate::snapshot::load for the fail-open contract", // comment
+        "    let s: Option<&crate::snapshot::FleetSnapshot> = None;", // type ref, not a read
+        "        crate::snapshot::save(home, &snaps);", // writer, not a read
+    ];
+    for line in must_not_catch {
+        assert!(!caught(line), "benign line wrongly flagged: {line:?}");
+    }
 }
