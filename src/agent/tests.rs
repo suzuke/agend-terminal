@@ -3039,3 +3039,217 @@ fn bootstrap_readiness_no_registry_core_deadlock_real_path() {
         ),
     }
 }
+
+/// t-...14440-6 caller-level integration pin: a single `inject_with_target`
+/// call's chunk sequence (header→N 64-byte body chunks→submit, `mod.rs`'s
+/// typed-inject path) run under CONCURRENT injects to TWO DIFFERENT agents
+/// must not interleave — neither with the other agent's bytes, nor with
+/// itself. Post-#2620 each registered writer gets its own dedicated actor
+/// thread + queue (write_actor.rs's own
+/// `wedged_writer_does_not_block_a_different_healthy_writer` proves
+/// thread-level isolation); this is the caller-level companion — a REAL
+/// two-agent `inject_with_target` race, reading back each pty's ACTUAL
+/// output rather than inspecting the actor's internals.
+#[test]
+#[cfg(unix)]
+fn concurrent_inject_to_different_agents_never_interleaves_2620() {
+    #[allow(clippy::type_complexity)]
+    fn spawn_captured_target(
+        tag: &str,
+    ) -> (
+        InjectTarget,
+        Arc<Mutex<Vec<u8>>>,
+        Box<dyn portable_pty::Child + Send>,
+        Box<dyn portable_pty::MasterPty + Send>,
+    ) {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = portable_pty::CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("stty raw -echo; exec cat");
+        let child = pair.slave.spawn_command(cmd).expect("spawn cat");
+        drop(pair.slave);
+        // Let `stty raw -echo` take effect before writing — mirrors
+        // write_actor.rs's own `wedged_pty()` fixture's post-spawn wait.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let master = pair.master;
+        let mut reader = master.try_clone_reader().expect("clone reader");
+        let writer: PtyWriter = Arc::new(Mutex::new(master.take_writer().expect("take_writer")));
+        write_actor::register(&writer, master.as_ref());
+        // #2620 fd-reuse trap (found empirically while writing this test):
+        // `register` only records `master.as_raw_fd()` — it does NOT keep
+        // `master` alive itself. Dropping `master` here (as this fixture
+        // originally did, by letting `pair.master` fall out of scope) closes
+        // that fd; the very next `openpty()` (the SECOND agent in this test)
+        // can then reuse the exact same fd number, and `register`'s own
+        // fd-reuse guard (working as designed) retires THIS agent's entry as
+        // "orphaned". Production never hits this because `AgentHandle` keeps
+        // `pty_master` alive for the handle's whole lifetime (`agent/mod.rs`'s
+        // `pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>` field) — this
+        // fixture now mirrors that by returning `master` for the caller to hold.
+
+        let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+            vterm: VTerm::new(200, 24),
+            subscribers: Vec::new(),
+            state: StateTracker::new(None),
+            health: HealthTracker::new(),
+            api_activity: crate::agent::ApiActivity::default(),
+            observed_status: None,
+        }));
+
+        // Minimal pty_read_loop stand-in: feeds the vterm (so the typed-inject
+        // readback-confirm poll finds its sentinel promptly instead of always
+        // paying the full 2s fail-open timeout) AND captures the raw bytes
+        // this test asserts on.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let core_reader = Arc::clone(&core);
+        let captured_reader = Arc::clone(&captured);
+        let tag_owned = tag.to_string();
+        std::thread::Builder::new()
+            .name(format!("test-reader-{tag_owned}"))
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            core_reader.lock().vterm.process(&buf[..n]);
+                            captured_reader.lock().extend_from_slice(&buf[..n]);
+                        }
+                    }
+                }
+            })
+            .expect("spawn reader thread");
+
+        let target = InjectTarget {
+            pty_writer: writer,
+            inject_prefix: String::new(),
+            submit_key: "\r".to_string(),
+            typed_inject: true,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            core,
+        };
+        (target, captured, child, master)
+    }
+
+    let (target1, captured1, mut child1, _master1) = spawn_captured_target("agent1");
+    let (target2, captured2, mut child2, _master2) = spawn_captured_target("agent2");
+
+    // Distinctive, order-revealing payloads: 3 chunks' worth (well over the
+    // 64-byte chunk boundary) each, built from a per-agent-unique marker so
+    // ANY cross-contamination (a byte from the OTHER agent's payload) or
+    // internal reordering (duplicated/missing/out-of-sequence chunk) is
+    // directly visible in the final assembled text.
+    let payload1: String = (0..3)
+        .map(|i| format!("[agent1-chunk{i:02}-{}]", "A".repeat(40)))
+        .collect();
+    let payload2: String = (0..3)
+        .map(|i| format!("[agent2-chunk{i:02}-{}]", "B".repeat(40)))
+        .collect();
+
+    let p1 = payload1.clone();
+    let h1 = std::thread::spawn(move || inject_with_target(&target1, p1.as_bytes()));
+    let p2 = payload2.clone();
+    let h2 = std::thread::spawn(move || inject_with_target(&target2, p2.as_bytes()));
+
+    h1.join()
+        .expect("agent1 inject thread")
+        .expect("agent1 inject must succeed");
+    h2.join()
+        .expect("agent2 inject thread")
+        .expect("agent2 inject must succeed");
+
+    // Let the readers drain the final submit-key byte.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let out1 = String::from_utf8_lossy(&captured1.lock()).to_string();
+    let out2 = String::from_utf8_lossy(&captured2.lock()).to_string();
+
+    assert!(
+        out1.contains(&payload1),
+        "agent1's own payload must land intact and in order: got {out1:?}"
+    );
+    assert!(
+        !out1.contains('B'),
+        "agent1's output must NEVER contain any byte from agent2's payload: got {out1:?}"
+    );
+    assert!(
+        out2.contains(&payload2),
+        "agent2's own payload must land intact and in order: got {out2:?}"
+    );
+    assert!(
+        !out2.contains('A'),
+        "agent2's output must NEVER contain any byte from agent1's payload: got {out2:?}"
+    );
+
+    let _ = child1.kill();
+    let _ = child2.kill();
+}
+
+/// t-...14440-6 caller-level integration pin: write_actor.rs's own
+/// `saturated_queue_drops_further_writes_instead_of_growing_unbounded` pins
+/// the actor's drop-vs-block backpressure choice by calling `write_actor::
+/// write` directly. This is the caller-level companion — confirms the SAME
+/// "immediate reject, never wait out the full timeout" property survives
+/// through `write_to_pty` (the production wrapper every caller in
+/// PTY-WRITE-ACTOR-SPIKE.md §1's table actually goes through), not just the
+/// actor's own internal function.
+#[test]
+#[cfg(unix)]
+fn write_to_pty_surfaces_backpressure_reject_immediately_not_after_full_timeout_2620() {
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = portable_pty::CommandBuilder::new("sh");
+    cmd.arg("-c");
+    cmd.arg("stty raw -echo; sleep 30");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn wedged sh");
+    drop(pair.slave);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // #2620 fd-reuse trap (see `concurrent_inject_to_different_agents_never_
+    // interleaves_2620`'s comment): keep `master` alive for the whole test —
+    // production's `AgentHandle.pty_master` does the same.
+    let master = pair.master;
+    let writer: PtyWriter = Arc::new(Mutex::new(master.take_writer().expect("take_writer")));
+    write_actor::register(&writer, master.as_ref());
+
+    // Prime the queue to (approximately) write_actor's cap
+    // (`MAX_QUEUE_BYTES_PER_WRITER`, 1 MiB at time of writing — private to
+    // that module, duplicated here by value). The wedged child never drains
+    // it, so this priming call itself times out — same as write_actor.rs's
+    // own backpressure test's priming step.
+    let _ = write_to_pty(&writer, &vec![b'x'; 1 << 20]);
+
+    // A second, much larger write must be REJECTED immediately (checked at
+    // enqueue time against the current queue depth) — not accepted and left
+    // to wait out the full 5s `PTY_WRITE_TIMEOUT`.
+    let start = std::time::Instant::now();
+    let result = write_to_pty(&writer, &vec![b'y'; 64 * 1024]);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a write to an already-saturated queue must be rejected: {result:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "the saturated-queue rejection must reach the `write_to_pty` caller immediately \
+         (checked at enqueue time), not wait out the full 5s PTY_WRITE_TIMEOUT; took {elapsed:?}"
+    );
+
+    let _ = child.kill();
+}

@@ -3033,6 +3033,82 @@ fn srl_inject_agent_gone_does_not_exhaust_1742() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// t-...14440-6 caller-level integration pin: `InjectOutcome::InjectFailed`
+/// was previously "hard to drive" (see `classify_inject_failure_exhausts_
+/// only_after_max_1742`'s doc comment above — "a PTY write failing while the
+/// agent is still present can't be cheaply mocked"). Post-#2620, it can: spawn
+/// a REAL agent via `spawn_agent` (so `write_actor::register` runs exactly as
+/// in production) onto a permanently-wedged backend (`stty raw -echo; sleep
+/// 30` — never drains stdin), saturate its actor queue, then drive
+/// `inject_continue_gated` for real. Confirms the 3-state enum's third state
+/// is reachable through a genuine failure, not just constructible in a match
+/// arm. Unix-only (real PTY wedge semantics; mirrors the other real-PTY
+/// inject tests in this file).
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn srl_inject_failed_reachable_via_real_wedged_actor_writer_2620() {
+    let home = tmp_home("inject-failed-2620");
+    let name = "wedged-continue-target";
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  {name}:\n    id: {}\n",
+            crate::types::InstanceId::new().full()
+        ),
+    )
+    .expect("seed fleet.yaml");
+
+    let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let wedge_args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
+    let spawn_cfg = crate::agent::SpawnConfig {
+        name,
+        backend_command: "sh",
+        args: &wedge_args,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    crate::agent::spawn_agent(&spawn_cfg, &registry).expect("spawn wedged test agent");
+    // Let `stty raw -echo` take effect — mirrors write_actor.rs's own
+    // `wedged_pty()` fixture's post-spawn wait.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let pty_writer = {
+        let reg = crate::agent::lock_registry(&registry);
+        let id = crate::fleet::resolve_uuid(&home, name).expect("fleet.yaml seeded id");
+        let handle = reg.get(&id).expect("spawned handle must be present");
+        Arc::clone(&handle.pty_writer)
+    };
+    // Saturate the queue (write_actor.rs's MAX_QUEUE_BYTES_PER_WRITER, 1 MiB
+    // at time of writing — duplicated here by value, private to that module)
+    // so `inject_continue_gated`'s own write below genuinely fails.
+    let priming_result = crate::agent::write_to_pty(&pty_writer, &vec![b'x'; 1 << 20]);
+    assert!(
+        priming_result.is_err(),
+        "test invariant: the priming write itself must also see a saturated/wedged queue"
+    );
+
+    let outcome = inject_continue_gated(&home, &registry, name, "test-2620");
+    assert!(
+        matches!(outcome, InjectOutcome::InjectFailed),
+        "a genuinely-present agent whose PTY write fails must report InjectFailed \
+         (distinct from AgentGone) — got {outcome:?}"
+    );
+
+    if let Some(handle) = crate::agent::lock_registry(&registry)
+        .get(&crate::fleet::resolve_uuid(&home, name).expect("id"))
+    {
+        let _ = handle.child.lock().kill();
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #1742: a SUCCESSFUL inject clears any accumulated failure streak and
 /// advances the tiered budget — so a recovered PTY blip doesn't leave the
 /// track one failure away from giving up. Unix-only (mirrors the other PTY
