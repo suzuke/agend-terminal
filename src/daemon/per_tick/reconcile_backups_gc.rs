@@ -44,6 +44,26 @@ impl ReconcileBackupsGcHandler {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
         }
     }
+
+    /// #P1-2607 offload seam: cadence check kept ON the tick loop (cheap, no
+    /// drift). `HourlyGcHandler` calls it to decide inclusion in the round.
+    pub(crate) fn due(&self) -> bool {
+        self.gate.fire()
+    }
+
+    /// #P1-2607 offload seam: the GC body, run off the tick loop by
+    /// `HourlyGcHandler`. Behaviour unchanged from the pre-offload `run()`.
+    pub(crate) fn work(&self, home: &Path) {
+        // The fleet roster disambiguates the `<agent>[-<branch>]-<epoch>` dir name
+        // (hyphenated agent names make a plain split ambiguous). Falls back to a
+        // glob of the runtime dir when the daemon registry is unreachable.
+        let agents = crate::runtime::list_agents_with_fallback(home);
+        let removed = gc_reconcile_backups(home, &agents, MIN_AGE, SystemTime::now());
+        if removed > 0 {
+            tracing::info!(target: "reconcile_backups_gc", removed,
+                "#2234: GC'd aged reconcile-backups (per-agent newest-1 kept)");
+        }
+    }
 }
 
 impl PerTickHandler for ReconcileBackupsGcHandler {
@@ -52,17 +72,8 @@ impl PerTickHandler for ReconcileBackupsGcHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.gate.fire() {
-            return;
-        }
-        // The fleet roster disambiguates the `<agent>[-<branch>]-<epoch>` dir name
-        // (hyphenated agent names make a plain split ambiguous). Falls back to a
-        // glob of the runtime dir when the daemon registry is unreachable.
-        let agents = crate::runtime::list_agents_with_fallback(ctx.home);
-        let removed = gc_reconcile_backups(ctx.home, &agents, MIN_AGE, SystemTime::now());
-        if removed > 0 {
-            tracing::info!(target: "reconcile_backups_gc", removed,
-                "#2234: GC'd aged reconcile-backups (per-agent newest-1 kept)");
+        if self.due() {
+            self.work(ctx.home);
         }
     }
 }
