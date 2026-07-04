@@ -51,6 +51,17 @@ const READ_ROW_CAP: usize = 300;
 /// P2 idempotency keys suppress that duplicate.
 const RECLAIM_TTL_SECS: i64 = 600;
 
+/// #2622: hard upper bound on how long the [`crate::snapshot::agent_is_busy`]
+/// gate (see `reclaim_stale_delivering`) may hold a `delivering` row past
+/// [`RECLAIM_TTL_SECS`] for a still-busy agent, before forcing reclaim
+/// anyway. 6x the base TTL (1 hour) — long enough for a genuinely slow
+/// turn (reading + analyzing + composing a long reply), short enough that a
+/// wedged/stuck-reporting-busy agent doesn't zombie a row in `delivering`
+/// indefinitely. `sweep_expired`'s 30-day unread-tier TTL is the final
+/// backstop regardless (it keys on `read_at.is_none()`, matched whether or
+/// not `delivering_at` is set).
+const RECLAIM_BUSY_HARD_CAP_SECS: i64 = RECLAIM_TTL_SECS * 6;
+
 /// A drained row that the ack-absorption / reply-routing audit
 /// (`has_drained_blocker_for_correlation`) depends on: `read_at` set AND
 /// `kind` ∈ {query, task}. Such rows are exempt from the short read TTL and
@@ -1544,6 +1555,14 @@ pub fn reclaim_stale_delivering(home: &Path) {
             Some(n) => n.to_string(),
             None => continue,
         };
+        // #2622: for the production-default UUID-keyed inbox path, `agent_name`
+        // (the file stem) IS the UUID, not the human name `agent_is_busy` looks
+        // up by (`AgentSnapshot.name`). Resolve once per file (not per row) so
+        // the busy gate actually engages against a UUID-keyed file; a
+        // legacy/unresolvable stem falls back to using it as-is (the name-keyed
+        // topology's stem already IS the human name).
+        let busy_check_name = crate::fleet::resolve_name_by_uuid(home, &agent_name)
+            .unwrap_or_else(|| agent_name.clone());
         // Phase 1 (locked): revert stale delivering rows, collect the reverted
         // MESSAGES (not just ids) so Phase 2 can classify them for the re-nudge gate.
         // #t-…61487: the classifier (`reclaim_renudge_worthy` → `obligation_reason`)
@@ -1574,28 +1593,63 @@ pub fn reclaim_stale_delivering(home: &Path) {
                 // A `delivering` row = read_at None AND delivering_at Some.
                 if msg.read_at.is_none() {
                     if let Some(ref since) = msg.delivering_at {
-                        let stale = chrono::DateTime::parse_from_rfc3339(since)
+                        let elapsed_secs = chrono::DateTime::parse_from_rfc3339(since)
                             .map(|t| {
                                 now.signed_duration_since(t.with_timezone(&chrono::Utc))
                                     .num_seconds()
-                                    > RECLAIM_TTL_SECS
                             })
-                            .unwrap_or(true); // unparseable timestamp → reclaim (fail-safe)
+                            .ok();
+                        let stale = elapsed_secs.is_none_or(|s| s > RECLAIM_TTL_SECS);
                         if stale {
-                            if known_fire_and_forget_kind(&msg) {
-                                // #2482: fire-and-forget rows were already delivered once
-                                // and have no actor blocked on them. Reverting them to
-                                // unread lets poll-reminder/drain resurrect old completed
-                                // PR/CI/status chatter forever. Terminally settle instead.
-                                msg.read_at = Some(now.to_rfc3339());
-                                settled_non_obligations += 1;
+                            // #2622: a genuinely still-working agent can legitimately
+                            // take longer than RECLAIM_TTL_SECS to read + analyze +
+                            // reply to a long message (observed trigger: long-article/
+                            // paper analysis requests). Reclaiming out from under it
+                            // loses the race the agent's own eventual `ack` needs
+                            // (`ack()` only transitions a row CURRENTLY `delivering`),
+                            // which is exactly the #2622 redelivery loop. `agent_is_busy`
+                            // is a fail-open snapshot read — a missing/corrupt snapshot
+                            // means not-busy, so reclaim proceeds exactly as before this
+                            // change (see AUDITED_FILES in
+                            // tests/snapshot_failopen_invariant.rs). Bounded by
+                            // `RECLAIM_BUSY_HARD_CAP_SECS` so a permanently-busy
+                            // illusion (wedged agent) can never zombie a row in
+                            // `delivering` forever; `sweep_expired`'s 30-day unread-tier
+                            // TTL (keyed on `read_at.is_none()`, matched regardless of
+                            // `delivering_at`) is the final backstop either way.
+                            let busy_past_cap =
+                                elapsed_secs.is_none_or(|s| s > RECLAIM_BUSY_HARD_CAP_SECS);
+                            let busy = crate::snapshot::agent_is_busy(home, &busy_check_name);
+                            if busy && !busy_past_cap {
+                                // Still legitimately working — leave `delivering`,
+                                // re-check next sweep.
                             } else {
-                                // Collect the full reverted row: Phase 2 reads `id` (dedup
-                                // forget) + `kind`/`task_id`/`correlation_id` (re-nudge gate).
-                                msg.delivering_at = None; // → unread (re-deliverable)
-                                reverted.push(msg.clone());
+                                if busy {
+                                    tracing::warn!(
+                                        agent = %agent_name,
+                                        msg_id = ?msg.id,
+                                        elapsed_secs = ?elapsed_secs,
+                                        "reclaim: agent still reports busy past the hard \
+                                         cap — forcing reclaim anyway (possible wedge)"
+                                    );
+                                }
+                                if known_fire_and_forget_kind(&msg) {
+                                    // #2482: fire-and-forget rows were already delivered
+                                    // once and have no actor blocked on them. Reverting
+                                    // them to unread lets poll-reminder/drain resurrect
+                                    // old completed PR/CI/status chatter forever.
+                                    // Terminally settle instead.
+                                    msg.read_at = Some(now.to_rfc3339());
+                                    settled_non_obligations += 1;
+                                } else {
+                                    // Collect the full reverted row: Phase 2 reads `id`
+                                    // (dedup forget) + `kind`/`task_id`/`correlation_id`
+                                    // (re-nudge gate).
+                                    msg.delivering_at = None; // → unread (re-deliverable)
+                                    reverted.push(msg.clone());
+                                }
+                                changed = true;
                             }
-                            changed = true;
                         }
                     }
                 }
