@@ -376,7 +376,7 @@ fn inject_provenance(params: &Value, from: &str, target: &str) {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if let Some(ch) = crate::channel::active_channel() {
+    if let Some(ch) = crate::channel::channel_for_instance(target) {
         if let Err(e) = ch.send_from_agent(
             target,
             crate::channel::AgentOutboundOp::InjectProvenance {

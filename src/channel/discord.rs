@@ -1092,6 +1092,18 @@ impl crate::channel::Channel for DiscordChannel {
             .downcast::<DiscordBindingPayload>()
             .map(|p| p.channel_id)
             .unwrap_or(0);
+        // t-20260703164240502572-50899-11 (reviewer4 REJECTED finding): unlike
+        // Telegram (whose create_topic persists to topics.json, a durable
+        // self-healing source `resolve_topic` falls back to), Discord's
+        // has_binding/take_binding read ONLY the in-memory `instance_to_channel`
+        // map — populated ONLY by `record_binding`. Without this call the
+        // channel this just created on the Discord API is unroutable (inbound
+        // can't resolve it) and unreachable for cleanup (`take_binding` finds
+        // nothing). Mirrors `app/discord_hooks.rs::maybe_create_discord_binding`'s
+        // create_binding + record_binding pairing; submit_key fallback matches
+        // that hook's own fallback (no registry/pane context at this layer to
+        // look up the real one).
+        self.record_binding(name, binding, "\r".to_string());
         Ok(crate::channel::TopicRef {
             id: cid.to_string(),
             channel_kind: crate::channel::ChannelKind::Discord,
@@ -2220,6 +2232,49 @@ mod tests {
         assert!(
             body["name"].is_string(),
             "request body must have 'name' field"
+        );
+    }
+
+    /// t-20260703164240502572-50899-11 (reviewer4 REJECTED finding on the
+    /// first #2615 pass): `create_topic` used to call `create_binding` but
+    /// never `record_binding`, so `has_binding`/`take_binding` — which
+    /// `channel_for_instance` (routing) and `drop_binding_on_all_channels`
+    /// (cleanup) both depend on — could never find the channel it just
+    /// created. Pins the fix directly on the production `create_topic` path
+    /// (not just the generic mock in `channel::tests`).
+    #[test]
+    fn discord_create_topic_records_a_binding_that_is_routable_and_cleanable() {
+        use crate::channel::Channel;
+
+        let response_body =
+            include_str!("../../tests/fixtures/discord-rest-create-guild-channel-response.json");
+        let (port, handle, _captured) = mock_http_server(200, response_body);
+        let (ch, _tx) = make_test_channel_with_mock(port);
+
+        assert!(
+            !ch.has_binding("test-agent"),
+            "precondition: no binding before create_topic"
+        );
+
+        let result = ch.create_topic("test-agent");
+        handle.join().expect("mock server");
+        assert!(
+            result.is_ok(),
+            "create_topic must succeed: {:?}",
+            result.err()
+        );
+
+        assert!(
+            ch.has_binding("test-agent"),
+            "create_topic must leave the instance bound — otherwise the \
+             channel it just created is unroutable and uncleanable"
+        );
+
+        let taken = ch.take_binding("test-agent");
+        assert!(taken.is_some(), "the recorded binding must be cleanable");
+        assert!(
+            !ch.has_binding("test-agent"),
+            "binding must be gone after take_binding"
         );
     }
 
