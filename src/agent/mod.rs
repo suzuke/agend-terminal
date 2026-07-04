@@ -2313,7 +2313,15 @@ fn cleanup_agent(
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
 ) {
-    lock_registry(registry).remove(id);
+    let removed = lock_registry(registry).remove(id);
+    // #P1-2607-followup: unregister BEFORE `removed`'s `pty_writer`/`pty_master`
+    // drop at the end of this fn actually closes the underlying fd — closes the
+    // fd-reuse race window (write_actor::FdEntry doc comment) so a subsequent
+    // agent that happens to get the same OS fd number never inherits this
+    // agent's leftover write queue.
+    if let Some(handle) = &removed {
+        unregister_pty_writer(&handle.pty_writer);
+    }
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
     }
@@ -2610,13 +2618,26 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
 /// unconditionally, unchanged.
 #[cfg(unix)]
 fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
-    write_actor::fd_for(writer).map(|fd| write_actor::write(fd, data.to_vec(), PTY_WRITE_TIMEOUT))
+    write_actor::write(writer, data.to_vec(), PTY_WRITE_TIMEOUT)
 }
 
 #[cfg(not(unix))]
 fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
     None
 }
+
+/// Retire `writer`'s `write_actor` registration (if any) at agent teardown,
+/// BEFORE the caller's `AgentHandle` (and its `pty_writer`/`pty_master`) is
+/// actually dropped. A no-op for a writer never registered (Windows; any
+/// writer whose `master.as_raw_fd()` returned `None`) — same runtime-branch
+/// shape as [`try_actor_write`], not a compile-time platform split.
+#[cfg(unix)]
+fn unregister_pty_writer(writer: &PtyWriter) {
+    write_actor::unregister(writer);
+}
+
+#[cfg(not(unix))]
+fn unregister_pty_writer(_writer: &PtyWriter) {}
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
     if let Some(result) = try_actor_write(writer, data) {
