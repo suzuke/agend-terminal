@@ -1084,6 +1084,130 @@ fn reclaim_ttl_boundary() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// Write a minimal fleet snapshot pinning `name`'s `agent_state` so
+/// `crate::snapshot::agent_is_busy` reads a deterministic value in tests
+/// (rather than the fail-open `false` a missing snapshot produces).
+fn write_agent_state_snapshot(home: &Path, name: &str, agent_state: &str) {
+    crate::snapshot::save(
+        home,
+        &[crate::snapshot::AgentSnapshot {
+            name: name.to_string(),
+            backend_command: "claude".to_string(),
+            args: vec![],
+            working_dir: None,
+            submit_key: "\r".to_string(),
+            health_state: "healthy".to_string(),
+            agent_state: agent_state.to_string(),
+            silent_secs: 0,
+            output_silent_secs: 0,
+        }],
+    );
+}
+
+/// #2622: a genuinely busy (still-working) agent's past-TTL `delivering` row
+/// must NOT be reclaimed — reclaiming out from under it loses the race the
+/// agent's own eventual `ack` needs, which is exactly the #2622 redelivery
+/// loop (long-analysis tasks legitimately exceed `RECLAIM_TTL_SECS`).
+#[test]
+fn reclaim_leaves_busy_agent_delivering_untouched_past_ttl() {
+    let home = tmp_home("2622-busy-no-reclaim");
+    write_agent_state_snapshot(&home, "a", "active");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("user:op")
+            .text("long analysis request")
+            .id("m-busy")
+            .delivering_at(&secs_ago(660)) // past RECLAIM_TTL_SECS (600), under the hard cap
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    // Still delivering (not reverted to unread) — proves reclaim itself left
+    // the row untouched, independent of drain()'s own implicit-ack side
+    // effect on a re-drain of an already-delivering row.
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    let m: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        m.delivering_at.is_some(),
+        "a busy agent's in-flight row must not be reclaimed"
+    );
+
+    // A drain must NOT re-deliver it (it was never reverted to unread).
+    assert!(
+        drain(&home, "a").is_empty(),
+        "a busy agent's in-flight row must not be re-delivered"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2622 symmetry check: an explicit non-busy snapshot (not just a missing
+/// one) still gets the pre-#2622 600s TTL behavior — the busy gate only ever
+/// WITHHOLDS reclaim, never triggers it early or differently for idle agents.
+#[test]
+fn reclaim_still_reclaims_idle_agent_past_ttl() {
+    let home = tmp_home("2622-idle-still-reclaims");
+    write_agent_state_snapshot(&home, "a", "idle");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("user:op")
+            .text("short message")
+            .id("m-idle")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    let redelivered = drain(&home, "a");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "an idle agent's stale delivering row must still be reclaimed+re-delivered, unchanged from pre-#2622 behavior"
+    );
+    assert_eq!(redelivered[0].id.as_deref(), Some("m-idle"));
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2622 hard cap: a `delivering` row past `RECLAIM_BUSY_HARD_CAP_SECS`
+/// (6x `RECLAIM_TTL_SECS`) is force-reclaimed even if the agent still
+/// reports busy — a permanently-busy illusion (wedged agent) must never
+/// zombie a row in `delivering` forever.
+#[test]
+fn reclaim_forces_past_busy_hard_cap() {
+    let home = tmp_home("2622-busy-hard-cap");
+    write_agent_state_snapshot(&home, "a", "active");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("user:op")
+            .text("wedged turn")
+            .id("m-wedged")
+            .delivering_at(&secs_ago(3660)) // past the 3600s (6x RECLAIM_TTL_SECS) hard cap
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    let redelivered = drain(&home, "a");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "a row past the busy hard cap must be force-reclaimed even while the \
+         agent reports busy"
+    );
+    assert_eq!(redelivered[0].id.as_deref(), Some("m-wedged"));
+    fs::remove_dir_all(&home).ok();
+}
+
 /// 並發 sweep+drain+ack 不雙 reclaim: under concurrent drain + reclaim + ack on
 /// the same inbox (all serialized by `with_inbox_lock`), every message is
 /// returned AT MOST ONCE across all drains — no double-deliver, no double-reclaim.
@@ -1408,6 +1532,49 @@ fn test_sweep_unread_30d() {
     assert!(
         lines[0].contains("m-unread-recent"),
         "recent unread must survive"
+    );
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2622: `sweep_expired`'s 30-day unread-tier TTL keys on `read_at.is_none()`
+/// alone — matched whether or not `delivering_at` is ALSO set. This is the
+/// final backstop against the new busy-gate in `reclaim_stale_delivering`
+/// holding a row in `delivering` indefinitely for an agent that always
+/// reports busy: even if reclaim never reverts it, this sweep still drops it
+/// after 30 days.
+#[test]
+fn sweep_expired_drops_stale_delivering_row_past_30d() {
+    let home = tmp_home("sweep-delivering-30d");
+    let inbox_dir = home.join("inbox");
+    fs::create_dir_all(&inbox_dir).ok();
+
+    let old_ts = (chrono::Utc::now() - chrono::Duration::days(35)).to_rfc3339();
+    let delivering_old = format!(
+        r#"{{"schema_version":1,"id":"m-delivering-old","from":"a","text":"stuck","kind":null,"timestamp":"{old_ts}","delivering_at":"{old_ts}"}}"#
+    );
+    fs::write(
+        inbox_dir.join("agent1.jsonl"),
+        format!("{delivering_old}\n"),
+    )
+    .ok();
+
+    sweep_expired(&home);
+
+    // The sole surviving-nothing case: sweep_expired removes the file
+    // entirely when no rows remain (rather than leaving it empty).
+    let lines: Vec<String> = fs::read_to_string(inbox_dir.join("agent1.jsonl"))
+        .map(|c| {
+            c.lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        lines.is_empty(),
+        "a >30d-old delivering (never-processed) row must still be swept, \
+         regardless of the #2622 busy gate on reclaim_stale_delivering"
     );
 
     fs::remove_dir_all(&home).ok();

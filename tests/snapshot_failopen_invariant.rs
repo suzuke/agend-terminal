@@ -108,6 +108,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "sweep gate; missing -> not-busy -> emit_warn + NudgeAgent. Reversible: a warn/nudge, never a delete.",
     ),
     (
+        "src/inbox/storage.rs",
+        "reader",
+        "#2622 reclaim_stale_delivering busy gate; missing -> not-busy -> reclaim proceeds (today's behavior, unchanged). Reversible: only shifts REDELIVERY TIMING of an already-authoritative inbox row (never invents or drops a message), and is itself hard-capped at RECLAIM_BUSY_HARD_CAP_SECS so a stale/wedged busy signal can't zombie a row in `delivering` forever.",
+    ),
+    (
         "src/daemon/mod.rs",
         "reader",
         "startup diagnostic only: logs 'previous snapshot found' via tracing::info; missing -> skip the log. No action.",
