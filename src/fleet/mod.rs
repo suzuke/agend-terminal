@@ -66,6 +66,23 @@ pub fn resolve_uuid(home: &Path, name: &str) -> Option<crate::types::InstanceId>
         })
 }
 
+/// #2622: reverse of [`resolve_uuid`] — given an instance's UUID (as it
+/// appears in a UUID-keyed file stem, e.g. `inbox/{uuid}.jsonl`), find its
+/// human name in fleet.yaml. `None` when no instance's `id` matches
+/// (offline/unknown instance, or a legacy name-keyed topology where the
+/// caller already has the human name and doesn't need reversal). Callers
+/// that scan by file stem (which is the UUID for the production-default
+/// UUID-keyed inbox path, but the human name for the legacy name-keyed one)
+/// need this to reach name-keyed lookups like
+/// [`crate::snapshot::agent_is_busy`], which are keyed by human name, not UUID.
+pub fn resolve_name_by_uuid(home: &Path, uuid: &str) -> Option<String> {
+    let cfg = FleetConfig::load(&fleet_yaml_path(home)).ok()?;
+    cfg.instances
+        .iter()
+        .find(|(_, i)| i.id.as_deref() == Some(uuid))
+        .map(|(name, _)| name.clone())
+}
+
 /// #1488: is `name` a currently-known fleet instance? True iff fleet.yaml has
 /// an `instances:` entry for it (regardless of whether it has a parseable id or
 /// is currently running). Unlike [`resolve_uuid`], this does not require an id
