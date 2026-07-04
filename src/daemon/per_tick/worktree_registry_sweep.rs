@@ -76,15 +76,16 @@ impl PerTickHandler for WorktreeRegistrySweepHandler {
         let in_flight = Arc::clone(&self.in_flight);
         // fire-and-forget: #P1-2607 — moves the potentially-slow sweep
         // (git subprocess per candidate branch) off the daemon's main tick
-        // loop. No JoinHandle is kept; completion is signaled via
-        // `in_flight` (cleared once the sweep returns) and results remain
-        // fully observable via tracing + event_log per candidate, same as
-        // before this offload.
+        // loop. No JoinHandle is kept; completion is signaled via `in_flight`,
+        // released by `ClearOnDrop` on the sweep's return OR an unwinding panic
+        // (so a panicking round can't wedge the guard true forever). Results
+        // remain fully observable via tracing + event_log per candidate, same
+        // as before this offload.
         std::thread::spawn(move || {
+            let _guard = super::ClearOnDrop::new(in_flight);
             #[cfg(test)]
             test_hooks::maybe_delay();
             worktree_auto_cleanup(&home, &configs);
-            in_flight.store(false, Ordering::Release);
         });
     }
 }
