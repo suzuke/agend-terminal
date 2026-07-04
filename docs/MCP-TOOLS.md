@@ -105,6 +105,7 @@ Kill and restart an instance. Default mode `resume` preserves conversation state
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
 - **compact by default** (#2475): each row drops the noisy `observed_status.evidence` trail. Pass `verbose: true` (or `include_evidence: true`) to include it.
 - **operator_mode** (#2548): the response also carries a top-level `operator_mode: {mode, delegate_to, delegate_scope}` field — the retired `mode` tool's read side folded in here, so agents can observe operator availability alongside fleet state. Setting the mode stays CLI-only (`agend-terminal mode <active|away|sleep>`).
+- **topic_binding_mode** (#991): each row carries `topic_binding_mode` when the instance was spawned with `topic_binding: skip`/`deferred` — omitted for `auto` (the default), so an operator can grep the fleet for intentionally topic-less agents.
 
 ### `set_metadata`
 Set per-instance display metadata. #2547: merged from the former standalone `set_display_name` / `set_description` tools.
