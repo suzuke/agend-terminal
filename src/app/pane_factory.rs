@@ -673,13 +673,14 @@ fn reap_late_registration_if_shutdown(
     if !shutting_down {
         return false;
     }
-    let drained: Vec<(String, crate::daemon::ChildHandle)> = {
-        let mut reg = agent::lock_registry(registry);
-        reg.remove(&instance_id)
+    // #P1-2607-followup (reviewer4, PR #2620): `remove_and_unregister`, not a
+    // bare registry remove — see `daemon::lifecycle::delete_transaction`'s
+    // comment for why.
+    let drained: Vec<(String, crate::daemon::ChildHandle)> =
+        agent::remove_and_unregister(registry, &instance_id)
             .map(|h| (h.name.to_string(), h.child))
             .into_iter()
-            .collect()
-    };
+            .collect();
     crate::daemon::terminate_agents_parallel(drained);
     true
 }

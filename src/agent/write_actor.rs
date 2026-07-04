@@ -402,9 +402,11 @@ pub(crate) fn unregister(writer: &PtyWriter) {
 
 /// The registered fd for `writer`, if any. Test/introspection only --
 /// production callers use [`write`] directly (it resolves the writer's
-/// state internally).
+/// state internally). `pub(super)` so `agent`'s own cross-module test
+/// helpers (e.g. verifying `daemon::lifecycle`'s teardown paths actually
+/// unregister) can reach it too, not just this module's own tests.
 #[cfg(test)]
-fn fd_for(writer: &PtyWriter) -> Option<RawFd> {
+pub(super) fn fd_for(writer: &PtyWriter) -> Option<RawFd> {
     let key = Arc::as_ptr(writer) as usize;
     writers().lock().get(&key).map(|s| s.fd)
 }

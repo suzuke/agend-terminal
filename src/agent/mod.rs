@@ -2307,21 +2307,39 @@ fn wait_for_process_exit(
     None
 }
 
+/// Remove `id` from `registry` and unregister its `pty_writer` from
+/// `write_actor` BEFORE the removed handle (and its `pty_writer`/
+/// `pty_master`) actually drops — closes the fd-reuse race window
+/// (`write_actor`'s module doc) so a subsequent agent that happens to get
+/// the same OS fd number never inherits this agent's leftover write queue.
+///
+/// #P1-2607-followup (reviewer4, PR #2620 REJECTED finding): this is the
+/// SINGLE chokepoint every registry-eviction site must go through instead
+/// of a bare `lock_registry(registry).remove(id)` — `write_actor::register`
+/// is lazy-spawn (no thread exists for a writer that's never had a write
+/// attempted through it), so the weak-reference backstop inside
+/// `write_actor::writer_thread` never runs for such a writer; an explicit
+/// `unregister` call at EVERY teardown path is the only cleanup for that
+/// case, not just the PTY-read-loop exit path this function used to be the
+/// sole guard for.
+pub(crate) fn remove_and_unregister(
+    registry: &AgentRegistry,
+    id: &crate::types::InstanceId,
+) -> Option<AgentHandle> {
+    let removed = lock_registry(registry).remove(id);
+    if let Some(handle) = &removed {
+        unregister_pty_writer(&handle.pty_writer);
+    }
+    removed
+}
+
 fn cleanup_agent(
     name: &str,
     id: &crate::types::InstanceId,
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
 ) {
-    let removed = lock_registry(registry).remove(id);
-    // #P1-2607-followup: unregister BEFORE `removed`'s `pty_writer`/`pty_master`
-    // drop at the end of this fn actually closes the underlying fd — closes the
-    // fd-reuse race window (write_actor::FdEntry doc comment) so a subsequent
-    // agent that happens to get the same OS fd number never inherits this
-    // agent's leftover write queue.
-    if let Some(handle) = &removed {
-        unregister_pty_writer(&handle.pty_writer);
-    }
+    remove_and_unregister(registry, id);
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
     }
@@ -2638,6 +2656,20 @@ fn unregister_pty_writer(writer: &PtyWriter) {
 
 #[cfg(not(unix))]
 fn unregister_pty_writer(_writer: &PtyWriter) {}
+
+/// Test-only cross-module introspection: is `writer` currently registered
+/// with `write_actor`? Used by teardown-path tests outside this module
+/// (e.g. `daemon::lifecycle`'s) to verify `remove_and_unregister` actually
+/// unregisters, without exposing `write_actor` internals to production code.
+#[cfg(all(test, unix))]
+pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
+    write_actor::fd_for(writer).is_some()
+}
+
+#[cfg(all(test, not(unix)))]
+pub(crate) fn write_actor_is_registered(_writer: &PtyWriter) -> bool {
+    false
+}
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
     if let Some(result) = try_actor_write(writer, data) {
