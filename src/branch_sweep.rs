@@ -404,6 +404,7 @@ pub(crate) fn emit_delete_batch(
         .iter()
         .chain(categories.squash_merged.iter())
         .chain(categories.stale_idle.iter())
+        .chain(categories.reviewer_checkout.iter())
         .chain(categories.active_unknown.iter())
     {
         name_to_candidate.insert(cand.name.as_str(), cand);
@@ -415,6 +416,8 @@ pub(crate) fn emit_delete_batch(
             "squash_merged"
         } else if categories.stale_idle.iter().any(|c| c.name == name) {
             "stale_idle"
+        } else if categories.reviewer_checkout.iter().any(|c| c.name == name) {
+            "reviewer_checkout"
         } else {
             "active_unknown"
         }
@@ -893,6 +896,68 @@ mod tests {
             applied, 0,
             "unknown confirm_ids yield 0 deletions, not errors"
         );
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// t-20260704115315460591-14440-0 (#817 behavior gap): a `reviewer_checkout`
+    /// candidate is NOT an unknown confirm_id — it's a recognized category, part
+    /// of `deletable_ids()`'s own documented default-deletable list, and it
+    /// survives the handler's `all_ids()` validation before ever reaching
+    /// `emit_delete_batch`. Unlike `test_branch_sweep_apply_skips_unknown_
+    /// confirm_id`'s intentional "typo confirm_id → silent no-op" contract,
+    /// this must behave like `clean_merged`/`squash_merged`: real delete-or-log,
+    /// never a silent no-op. Production incident (2026-07-04): dry-run listed
+    /// 24 `review/*` branches as candidates, apply=true confirmed them, but
+    /// `applied` didn't count them and no event-log entry appeared — the
+    /// operator had no signal the branches survived.
+    #[test]
+    fn test_branch_sweep_apply_deletes_reviewer_checkout_candidate_2620() {
+        let repo = setup_repo("apply_reviewer_checkout");
+        let home = repo.parent().unwrap().to_path_buf();
+        // Unmerged on purpose — reviewer_checkout is classified by NAME
+        // pattern alone (scan()'s bucket 0, checked before merge-status),
+        // so an unmerged residue branch must still be a REAL candidate.
+        create_branch_with_commit(&repo, "tmp_pr_review", "reviewer checkout residue");
+
+        let now = chrono::Utc::now();
+        let cats = scan(&repo, "main", STALE_IDLE_DEFAULT_DAYS, now).expect("scan");
+        assert_eq!(
+            cats.reviewer_checkout.len(),
+            1,
+            "precondition: review/123 must classify as reviewer_checkout: {cats:?}"
+        );
+        assert!(
+            cats.deletable_ids().contains(&"tmp_pr_review".to_string()),
+            "precondition: reviewer_checkout is in the default deletable list"
+        );
+
+        let mut confirm = std::collections::HashSet::new();
+        confirm.insert("tmp_pr_review".to_string());
+        let applied = emit_delete_batch(&home, &repo, &cats, &confirm, "reviewer-checkout probe")
+            .expect("emit");
+
+        assert_eq!(
+            applied, 1,
+            "a confirmed reviewer_checkout candidate must actually be deleted, \
+             not silently dropped like an unrecognized confirm_id"
+        );
+        let post = enumerate_branches(&repo).expect("enumerate");
+        assert!(
+            !post.iter().any(|b| b.name == "tmp_pr_review"),
+            "review/123 must actually be gone from the repo"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("branch_sweep_apply") && log.contains("tmp_pr_review"),
+            "a real delete must leave the same audit trail as any other category, \
+             not silence: {log}"
+        );
+        assert!(
+            log.contains("category=reviewer_checkout"),
+            "the audit trail must name the correct category, not fall through to \
+             active_unknown: {log}"
+        );
+
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
