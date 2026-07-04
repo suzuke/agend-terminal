@@ -396,19 +396,37 @@ pub fn sweep_from_registry(
 /// clears this floor on the next sweep.
 const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// #1750-B3: age of `branch`'s tip commit (committer date), or `None` if it
-/// can't be resolved. `%ct` is a unix timestamp (seconds), so no date parsing.
-fn branch_tip_age(repo_root: &Path, branch: &str) -> Option<Duration> {
+/// #1750-B3/#P1-2607: `branch`'s tip SHA + committer-date unix timestamp, in
+/// ONE `git log` call (`%H%x09%ct`) — was two separate concerns (a `rev-parse`
+/// for the SHA, a `log --format=%ct` for the age) collapsed into one spawn,
+/// since #P1-2607's cache needs the tip SHA as its key anyway.
+fn branch_tip_info(repo_root: &Path, branch: &str) -> Option<(String, u64)> {
     // W1.2: git_cmd → trimmed stdout; spawn-error + non-zero both collapse to `None`.
-    let ts_str =
-        crate::git_helpers::git_cmd(repo_root, &["log", "-1", "--format=%ct", branch]).ok()?;
+    let out = crate::git_helpers::git_cmd(repo_root, &["log", "-1", "--format=%H%x09%ct", branch])
+        .ok()?;
+    let (sha, ts_str) = out.split_once('\t')?;
     let ts: u64 = ts_str.parse().ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(Duration::from_secs(now.saturating_sub(ts)))
+    Some((sha.to_string(), ts))
 }
+
+/// #P1-2607: process-wide cache of the STRUCTURAL squash-merged check (git
+/// cherry + #1280 tree-diff fallback), keyed by `(repo, branch, tip_sha)`.
+/// A fixed tip's relationship to `default` never changes, so once computed
+/// for a given tip it is reused for free on every later sweep round — the
+/// branch naturally falls out of cache (new key) the moment its tip moves,
+/// no explicit invalidation needed. Entries for long-deleted branches are
+/// never looked up again and just sit unused; at realistic branch-churn
+/// rates that's a few KB over the daemon's lifetime, not worth evicting.
+///
+/// This is the fix for the #2607 freeze incident: `sweep_from_registry`'s
+/// dry-run mode never consumes candidates, so — before this cache — EVERY
+/// ~10-minute sweep round re-ran the expensive cherry/tree-diff check for
+/// ALL 172 accumulated candidates from scratch (83s, synchronously blocking
+/// the daemon's main tick loop). With this cache, only a candidate whose tip
+/// actually moved since the last round pays that cost again.
+type SquashCacheKey = (PathBuf, String, String);
+static SQUASH_MERGED_CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<SquashCacheKey, bool>>> =
+    std::sync::OnceLock::new();
 
 /// #1750-B3: is `branch` a squash-merge orphan eligible for auto-GC? True when
 /// it is squash-merged into the default branch AND its tip is older than
@@ -418,9 +436,34 @@ fn branch_tip_age(repo_root: &Path, branch: &str) -> Option<Duration> {
 /// t-...50899-10: `pub(crate)` so `worktree_pool::cleanup_merged_branch` reuses
 /// the SAME squash-safe delete gate this file's `prune_orphaned_branches`
 /// uses, instead of treating a remote-gone branch as independently deletable.
+///
+/// #P1-2607: age is checked FIRST off the one mandatory `branch_tip_info`
+/// call (short-circuits the expensive squash check for branches too young
+/// to qualify regardless — a bonus, not just a cache hit) and the
+/// structural squash-merged result is cache-checked by tip SHA before
+/// falling back to the real `is_squash_merged` computation. Same final
+/// boolean as the pre-#P1-2607 `is_squash_merged(..) && age(..)` — only the
+/// evaluation order and repeat-call cost changed.
 pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &str) -> bool {
-    crate::branch_sweep::is_squash_merged(repo_root, default, branch)
-        && branch_tip_age(repo_root, branch).is_some_and(|age| age >= SQUASH_GC_MIN_TIP_AGE)
+    let Some((tip_sha, tip_ts)) = branch_tip_info(repo_root, branch) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if Duration::from_secs(now.saturating_sub(tip_ts)) < SQUASH_GC_MIN_TIP_AGE {
+        return false;
+    }
+
+    let key = (repo_root.to_path_buf(), branch.to_string(), tip_sha);
+    let cache = SQUASH_MERGED_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(&cached) = cache.lock().get(&key) {
+        return cached;
+    }
+    let result = crate::branch_sweep::is_squash_merged(repo_root, default, branch);
+    cache.lock().insert(key, result);
+    result
 }
 
 /// Run `git worktree prune` then delete local branches whose remote tracking
@@ -1034,6 +1077,76 @@ mod tests {
             crate::git_helpers::git_ok(&repo, &["rev-parse", "--verify", "feat/merged"]),
             "#2605: dry-run must NOT actually delete the branch"
         );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #P1-2607: squash-eligibility tip-SHA cache ──
+
+    /// The #2607-freeze incident's second fix: `is_squash_gc_eligible`'s
+    /// expensive structural check must be reused across calls for the SAME
+    /// tip, not re-run every sweep round. Proven by inserting a cache entry
+    /// for a fixed tip, then observing that a second call for that EXACT
+    /// tip does not add another entry (the branch-keyed set is unique per
+    /// test repo path, so this is immune to interference from other tests
+    /// sharing the same process-wide cache).
+    #[test]
+    fn is_squash_gc_eligible_reuses_cache_for_same_tip_p1_2607() {
+        let repo = setup_test_repo("p1-2607-cache");
+        make_squash_orphan(&repo, "feat/cache-me", "2024-01-01T00:00:00 +0000");
+        let (tip_sha, _) = branch_tip_info(&repo, "feat/cache-me")
+            .expect("tip info must resolve for an existing branch");
+        let key = (repo.clone(), "feat/cache-me".to_string(), tip_sha);
+
+        let cache = SQUASH_MERGED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        assert!(
+            !cache.lock().contains_key(&key),
+            "precondition: this fresh tip must not already be cached"
+        );
+
+        assert!(is_squash_gc_eligible(&repo, "feat/cache-me", "main"));
+        assert!(
+            cache.lock().contains_key(&key),
+            "first call must populate the cache for this (repo, branch, tip_sha)"
+        );
+
+        // Second call for the identical tip: must still be true (cache hit),
+        // and must not have replaced the entry with a different key (the
+        // tip hasn't moved, so the key is unchanged).
+        assert!(is_squash_gc_eligible(&repo, "feat/cache-me", "main"));
+        assert!(cache.lock().contains_key(&key));
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A branch's tip moving (new commit) must fall out of the OLD cache
+    /// entry and be re-evaluated fresh under its NEW tip-SHA key — the
+    /// cache must never pin a branch to a stale verdict once its tip
+    /// changes.
+    #[test]
+    fn is_squash_gc_eligible_recomputes_after_tip_moves_p1_2607() {
+        let repo = setup_test_repo("p1-2607-cache-move");
+        make_squash_orphan(&repo, "feat/moves", "2024-01-01T00:00:00 +0000");
+        let (old_tip, _) = branch_tip_info(&repo, "feat/moves").expect("tip info must resolve");
+        assert!(is_squash_gc_eligible(&repo, "feat/moves", "main"));
+
+        // Move the tip: a fresh, unmerged, TOO-YOUNG commit — must now be
+        // ineligible (age floor), proving the stale cache entry (keyed on
+        // the OLD tip) is not consulted for the new tip.
+        git_in(&repo, &["checkout", "feat/moves"]);
+        std::fs::write(repo.join("more.txt"), "more").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "new unmerged work"]); // now-dated tip
+        git_in(&repo, &["checkout", "main"]);
+        let (new_tip, _) = branch_tip_info(&repo, "feat/moves").expect("tip info must resolve");
+        assert_ne!(old_tip, new_tip, "precondition: the tip must have moved");
+
+        assert!(
+            !is_squash_gc_eligible(&repo, "feat/moves", "main"),
+            "after the tip moves to a fresh young commit, eligibility must be \
+             re-derived under the NEW tip key, not answered from the OLD tip's \
+             cached (stale) verdict"
+        );
+
         std::fs::remove_dir_all(&repo).ok();
     }
 }
