@@ -9,128 +9,119 @@
 //!
 //! ## Irreversible-vs-reversible boundary (what this invariant guards)
 //!
-//! IRREVERSIBLE (forbidden on a snapshot read):
-//!   - deleting or overwriting a source-of-truth store (worktree, branch,
-//!     task / inbox / decision file), or
-//!   - fabricating an OUTBOUND send (a Telegram / Discord / PTY message that
-//!     would not exist under a correct snapshot).
+//! IRREVERSIBLE (forbidden on a snapshot read): deleting/overwriting a
+//! source-of-truth store (worktree, branch, task/inbox/decision file), or
+//! fabricating an OUTBOUND send (a Telegram/Discord/PTY message that would not
+//! exist under a correct snapshot).
 //!
-//! REVERSIBLE / acceptable (fail-open):
-//!   - a nudge, a warn, a log line, a re-nudge, or
-//!   - delivering an ALREADY-AUTHORITATIVE inbox message whose TIMING (not
-//!     existence) the snapshot gates — the payload is owned by the inbox
-//!     source-of-truth and is bounded by the `MAX_DEFER` cap, so a stale
-//!     snapshot at worst shifts delivery timing, never invents or drops a
-//!     message.
+//! REVERSIBLE / acceptable (fail-open): a nudge, a warn, a log line, a
+//! re-nudge, or delivering an ALREADY-AUTHORITATIVE inbox message whose TIMING
+//! (not existence) the snapshot gates — the payload is owned by the inbox
+//! source-of-truth and is bounded by `MAX_DEFER`, so a stale snapshot at worst
+//! shifts delivery timing, never invents or drops a message.
 //!
-//! ## Detection — a two-layer fence (PR #2612 rework)
+//! ## Detection — a `syn` AST walk (PR #2612 rework #2)
 //!
-//! The first cut of this test matched only the literal call form
-//! `snapshot::load(` on a single line. The reviewer (cross-vantage, PR #2612)
-//! correctly rejected it: four ordinary Rust forms read the same primitives yet
-//! slip past a literal-call scan —
-//!   1. `use crate::snapshot::load; ... load(home)`            (direct import)
-//!   2. `use crate::snapshot::{agent_is_busy as busy}; ...`    (aliased import)
-//!   3. `use crate::snapshot as snap; ... snap::agent_is_busy` (module alias)
-//!   4. `let f = crate::snapshot::load; f(home)`               (fn pointer)
+//! The first two cuts scanned source text for literal call/import substrings.
+//! Both were defeated: the reviewer (cross-vantage) injected real production
+//! readers that string scanning missed — first alias/bare-call/fn-pointer
+//! forms, then crate-level grouped imports `use crate::{snapshot as snap};`
+//! and `use crate::{snapshot::{load}};`. Rust's `use` grammar (grouped,
+//! nested, aliased, glob, arbitrary spacing, multi-line) cannot be enumerated
+//! with literal substrings — that is a METHOD failure, not a patch gap.
 //!
-//! A new reader in any of those forms would silently escape `ALLOWED_READERS`,
-//! turning the anti-growth guard into a false guarantee.
+//! This cut parses each production file with `syn` and walks the AST, which
+//! NORMALIZES every syntactic variant into the same tree. A file is a
+//! "snapshot projection user" iff it contains, OUTSIDE `#[cfg(test)]`:
+//!   - a `use` tree that imports from `crate::snapshot` (any form — path,
+//!     name, rename, grouped, nested, glob), OR
+//!   - an expression/type path with consecutive segments `crate :: snapshot`.
 //!
-//! The fix makes the scan COMPLETE by combining two layers over production code
-//! (`#[cfg(test)]` regions and comments excluded):
+//! Every such file must appear in [`AUDITED_FILES`] with a role.
 //!
-//!   Layer 1 — import ban. Production code may reference the snapshot module
-//!   only in FULLY-QUALIFIED form. The import shapes that could bring a read
-//!   primitive into local scope under a name the read-scan can't see are
-//!   banned outright: `use crate::snapshot::{…}` (grouped/aliased), `use
-//!   crate::snapshot as …` (module alias), `use crate::snapshot;` (bare
-//!   module). This kills forms 2 and 3 at the source.
+//! ## Completeness argument (name-resolution-free)
 //!
-//!   Layer 2 — read-reference scan. Any production line naming a read primitive
-//!   in fully-qualified form (`snapshot::load` / `snapshot::agent_state_of` /
-//!   `snapshot::agent_is_busy`, WITHOUT requiring a trailing `(` so fn-pointers
-//!   and single-item imports are caught too) marks its file a reader — which
-//!   must appear in `ALLOWED_READERS`. This catches forms 1 and 4 and every
-//!   current fully-qualified call.
+//! To read the projection a file must, in ITS OWN text, either (a) import a
+//! primitive/the module — caught by the use-tree walk regardless of grouping —
+//! or (b) name it fully-qualified `crate::snapshot::…` — caught by the path
+//! walk. No cross-file name resolution is needed: the reference is always
+//! LOCAL to the reading file. The only two ways to reference the projection
+//! WITHOUT the local token are closed by bans below, both currently at zero
+//! violations:
+//!   1. a `pub`/`pub(crate)` RE-EXPORT of `crate::snapshot` (would let a
+//!      token-free downstream file read via the alias) — banned; the
+//!      re-exporting file itself is caught, so the ban is enforceable there.
+//!   2. aliasing the crate root, `use crate as c; c::snapshot::…` — banned.
 //!
-//! Given Layer 1, Layer 2's fully-qualified patterns are complete: there is no
-//! way to read a primitive without either a fully-qualified reference (Layer 2)
-//! or a banned import (Layer 1). `scanner_catches_all_bypass_forms` below is the
-//! fence's fence — it proves all four forms are caught.
+//! Root-anchoring on `crate::snapshot` excludes the unrelated, identically
+//! named `crate::daemon::per_tick::snapshot` rotation module.
 //!
-//! (Detection relies on rustfmt-normalized spacing, e.g. `crate::snapshot::`
-//! not `crate :: snapshot ::`; the repo's `cargo fmt --check` CI gate enforces
-//! that normalization, so hand-spaced evasions cannot land.)
+//! Residual limits (accepted, mirroring `enqueue_drop_invariant`'s honest
+//! limits): a read manufactured entirely inside a macro body defined in
+//! another file, or via `build.rs`/`include!`, is out of scope for an
+//! AST-of-source scan. None exist and such a form would be extraordinary.
+//!
+//! `scanner_catches_all_bypass_forms` below is the fence's fence: it proves
+//! all six reviewer forms plus glob/multi-line are caught and the bans fire.
 //!
 //! ## The allowlist
 //!
-//! Adding a file to `ALLOWED_READERS` REQUIRES a fail-open review of the new
-//! reader — the list records that the review happened; it does not waive it.
-//! The behavioral companion `snapshot_missing_fails_open_for_dispatch_deciders`
-//! (unit test in `src/snapshot.rs`) proves the primitives themselves return the
-//! conservative sentinel on a missing / corrupt / old-format snapshot. It lives
-//! there because the `snapshot` module is not on the curated `lib.rs` public
-//! surface; exposing it would be a production change out of scope here.
-//!
-//! Inventory as of origin/main: 7 reader files (see `ALLOWED_READERS`). Writers
-//! (`snapshot::save`) and type-only refs (`snapshot::FleetSnapshot`) are not
-//! reads and are intentionally out of scope.
+//! Adding a file to `AUDITED_FILES` REQUIRES review of the new user — for a
+//! `reader`, a fail-open review; the list records that review, it does not
+//! waive it. The behavioral companion
+//! `snapshot_missing_fails_open_for_dispatch_deciders` (unit test in
+//! `src/snapshot.rs`) proves the primitives return the conservative sentinel
+//! on a missing/corrupt/old-format snapshot; it lives there because the
+//! `snapshot` module is not on the curated `lib.rs` surface.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use syn::visit::{self, Visit};
 
-/// Fully-qualified read-primitive references. No trailing `(` — so a fn-pointer
-/// (`let f = crate::snapshot::load;`) and a single-item import
-/// (`use crate::snapshot::load;`) are caught, not just direct calls. The writer
-/// `snapshot::save` and type refs `snapshot::FleetSnapshot` are deliberately
-/// absent (not reads).
-const READ_FN_REFS: &[&str] = &[
-    "snapshot::load",
-    "snapshot::agent_state_of",
-    "snapshot::agent_is_busy",
-];
-
-/// Import shapes banned in production (Layer 1): each could bring a read
-/// primitive into scope under a name Layer 2's fully-qualified scan cannot see.
-/// Banning them forces every snapshot reference to stay fully-qualified.
-const BANNED_IMPORTS: &[&str] = &[
-    "use crate::snapshot::{",
-    "use crate::snapshot as ",
-    "use crate::snapshot;",
-];
-
-/// Every production file allowed to READ the snapshot projection, each with the
-/// reviewed reason its snapshot-driven action is REVERSIBLE / fail-open.
-/// Suffix-matched against the `src/`-relative path.
-const ALLOWED_READERS: &[(&str, &str)] = &[
+/// Every production file that references the `crate::snapshot` projection, with
+/// its role. `reader` entries carry the reviewed reason a stale/missing
+/// snapshot drives only a REVERSIBLE action; `writer`/`type-user` produce or
+/// type the projection and do not read it for a decision. Suffix-matched
+/// against the `src/`-relative path.
+const AUDITED_FILES: &[(&str, &str, &str)] = &[
     (
         "src/daemon/dispatch_idle/mod.rs",
+        "reader",
         "idle silence gate; missing -> target_is_working=false -> still FIRES the nudge (fail-open by design, #1516). Reversible: a nudge.",
     ),
     (
         "src/inbox/notify.rs",
-        "inject defer/drain TIMING gate; missing -> not-busy -> inject now (bounded by MAX_DEFER). Payload is authoritative from the inbox source-of-truth; the snapshot gates timing, not existence.",
+        "reader",
+        "inject defer/drain TIMING gate; missing -> not-busy -> inject now (bounded by MAX_DEFER). Payload authoritative from the inbox source-of-truth; the snapshot gates timing, not existence.",
     ),
     (
         "src/daemon/handoff_timeout_watchdog.rs",
+        "reader",
         "re-nudge gate + telemetry; missing -> not-busy -> re-nudge. Reversible: a nudge.",
     ),
     (
         "src/reply_ledger.rs",
+        "reader",
         "sweep gate; missing -> not-busy -> emit_warn + NudgeAgent. Reversible: a warn/nudge, never a delete.",
     ),
     (
         "src/daemon/mod.rs",
-        "startup diagnostic only: logs 'previous snapshot found' via tracing::info; missing -> skip the log. No action at all.",
+        "reader",
+        "startup diagnostic only: logs 'previous snapshot found' via tracing::info; missing -> skip the log. No action.",
     ),
     (
         "src/api/handlers/query.rs",
+        "reader",
         "read-only: builds the status query response; missing -> empty {agents:[], timestamp:null}. No mutation.",
     ),
     (
         "src/bugreport.rs",
-        "read-only: renders the snapshot section of a bug report; missing -> section shows nothing. No mutation.",
+        "reader",
+        "read-only: renders the snapshot section of a bug report; missing -> section empty. No mutation.",
+    ),
+    (
+        "src/daemon/per_tick/snapshot.rs",
+        "writer",
+        "the per-tick rotation handler: PRODUCES the projection via crate::snapshot::save. Not a reader; no decision reads snapshot here.",
     ),
 ];
 
@@ -148,57 +139,119 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// 1-based line numbers inside `#[cfg(test)] mod` regions (brace-depth tracked),
-/// so in-file test modules are sliced out. Mirrors the proven helper in
-/// `tests/enqueue_drop_invariant.rs::test_region_lines`.
-fn test_region_lines(content: &str) -> HashSet<usize> {
-    let mut out = HashSet::new();
-    let mut depth: i32 = 0;
-    let mut pending_cfg_test = false;
-    let mut region_depth: Option<i32> = None;
-    for (i, line) in content.lines().enumerate() {
-        let t = line.trim();
-        if region_depth.is_none() {
-            if t.starts_with("#[cfg(test)]") {
-                pending_cfg_test = true;
-            } else if pending_cfg_test && t.contains("mod ") && line.contains('{') {
-                region_depth = Some(depth);
-                pending_cfg_test = false;
-            }
-        }
-        if region_depth.is_some_and(|d| depth >= d) {
-            out.insert(i + 1);
-        }
-        let next = depth + line.matches('{').count() as i32 - line.matches('}').count() as i32;
-        if let Some(d) = region_depth {
-            if next <= d {
-                region_depth = None;
-            }
-        }
-        depth = next;
-    }
-    out
-}
-
-fn is_comment(line: &str) -> bool {
-    line.trim_start().starts_with("//")
-}
-
-/// Layer 1: a banned import form (grouped/aliased/bare-module snapshot import).
-fn is_banned_import(line: &str) -> bool {
-    BANNED_IMPORTS.iter().any(|b| line.contains(b))
-}
-
-/// Layer 2: a fully-qualified reference to a snapshot READ primitive.
-fn is_read_ref(line: &str) -> bool {
-    READ_FN_REFS.iter().any(|r| line.contains(r))
-}
-
 fn rel_str(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// True if any attribute is `#[cfg(test)]` (or a `cfg(...)` mentioning `test`).
+fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string().contains("test"))
+    })
+}
+
+/// Given a use-subtree positioned immediately after the `crate` root, does it
+/// bring the `snapshot` projection module (or something under it) into scope?
+fn after_crate_is_snapshot(t: &syn::UseTree) -> bool {
+    match t {
+        syn::UseTree::Path(p) => p.ident == "snapshot",
+        syn::UseTree::Name(n) => n.ident == "snapshot",
+        syn::UseTree::Rename(r) => r.ident == "snapshot",
+        syn::UseTree::Group(g) => g.items.iter().any(after_crate_is_snapshot),
+        // `use crate::*;` glob-imports the crate root, which includes
+        // `snapshot`; treat conservatively as a hit.
+        syn::UseTree::Glob(_) => true,
+    }
+}
+
+/// True if this use tree imports from `crate::snapshot` in any form.
+fn use_tree_hits_projection(t: &syn::UseTree) -> bool {
+    match t {
+        syn::UseTree::Path(p) if p.ident == "crate" => after_crate_is_snapshot(&p.tree),
+        // A leading group, e.g. `use {crate::snapshot, ...};`.
+        syn::UseTree::Group(g) => g.items.iter().any(use_tree_hits_projection),
+        _ => false,
+    }
+}
+
+/// True if this use tree aliases the crate root, e.g. `use crate as c;` — a
+/// token-free escape hatch (`c::snapshot::…`) that the ban forbids.
+fn use_tree_aliases_crate_root(t: &syn::UseTree) -> bool {
+    match t {
+        syn::UseTree::Rename(r) => r.ident == "crate",
+        syn::UseTree::Group(g) => g.items.iter().any(use_tree_aliases_crate_root),
+        _ => false,
+    }
+}
+
+/// True if a path names consecutive segments `crate :: snapshot` (the
+/// projection), excluding the identically named `…::per_tick::snapshot`.
+fn path_is_crate_snapshot(p: &syn::Path) -> bool {
+    let idents: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+    idents
+        .windows(2)
+        .any(|w| w[0] == "crate" && w[1] == "snapshot")
+}
+
+#[derive(Default)]
+struct Scan {
+    refs_projection: bool,
+    reexports_projection: bool,
+    aliases_crate_root: bool,
+}
+
+impl<'ast> Visit<'ast> for Scan {
+    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+        if has_cfg_test(&i.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, i);
+    }
+    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+        if has_cfg_test(&i.attrs) {
+            return;
+        }
+        visit::visit_item_fn(self, i);
+    }
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        if has_cfg_test(&i.attrs) {
+            return;
+        }
+        visit::visit_item_impl(self, i);
+    }
+    fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+        if has_cfg_test(&i.attrs) {
+            return;
+        }
+        if use_tree_aliases_crate_root(&i.tree) {
+            self.aliases_crate_root = true;
+        }
+        if use_tree_hits_projection(&i.tree) {
+            self.refs_projection = true;
+            // pub / pub(crate) / pub(super) etc. re-export reaches other files.
+            if !matches!(i.vis, syn::Visibility::Inherited) {
+                self.reexports_projection = true;
+            }
+        }
+        visit::visit_item_use(self, i);
+    }
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        if path_is_crate_snapshot(p) {
+            self.refs_projection = true;
+        }
+        visit::visit_path(self, p);
+    }
+}
+
+fn scan_file(content: &str) -> Result<Scan, syn::Error> {
+    let ast = syn::parse_file(content)?;
+    let mut scan = Scan::default();
+    scan.visit_file(&ast);
+    Ok(scan)
 }
 
 #[test]
@@ -209,9 +262,10 @@ fn snapshot_stale_never_causes_irreversible_action() {
     collect_rs_files(&src, &mut files);
     files.sort();
 
+    let mut parse_failures: Vec<String> = Vec::new();
     let mut banned: Vec<String> = Vec::new();
-    let mut unlisted: Vec<String> = Vec::new();
-    let mut matched: HashSet<&str> = HashSet::new();
+    let mut unaudited: Vec<String> = Vec::new();
+    let mut matched: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for f in &files {
         let rel = rel_str(f, root);
@@ -222,127 +276,153 @@ fn snapshot_stale_never_causes_irreversible_action() {
         let Ok(content) = std::fs::read_to_string(f) else {
             continue;
         };
-        let test_lines = test_region_lines(&content);
-        for (idx, line) in content.lines().enumerate() {
-            let lineno = idx + 1;
-            if test_lines.contains(&lineno) || is_comment(line) {
+        let scan = match scan_file(&content) {
+            Ok(s) => s,
+            // A file we cannot parse could hide a reader — surface it, never
+            // silently skip.
+            Err(e) => {
+                parse_failures.push(format!("  {rel}: {e}"));
                 continue;
             }
-            // Layer 1 (applies to ALL files, allowlisted or not): the bypass-
-            // enabling import forms are forbidden outright.
-            if is_banned_import(line) {
-                banned.push(format!("  {rel}:{lineno}: {}", line.trim()));
-                continue;
-            }
-            // Layer 2: a fully-qualified read reference marks a reader file.
-            if !is_read_ref(line) {
-                continue;
-            }
-            match ALLOWED_READERS
+        };
+        if scan.reexports_projection {
+            banned.push(format!(
+                "  {rel}: pub/pub(crate) re-export of crate::snapshot"
+            ));
+        }
+        if scan.aliases_crate_root {
+            banned.push(format!("  {rel}: crate-root alias `use crate as …`"));
+        }
+        if scan.refs_projection {
+            match AUDITED_FILES
                 .iter()
-                .find(|(suffix, _)| rel.ends_with(suffix))
+                .find(|(suffix, _, _)| rel.ends_with(suffix))
             {
-                Some((suffix, _)) => {
+                Some((suffix, _, _)) => {
                     matched.insert(*suffix);
                 }
-                None => unlisted.push(format!("  {rel}:{lineno}: {}", line.trim())),
+                None => unaudited.push(format!("  {rel}")),
             }
         }
     }
 
     assert!(
+        parse_failures.is_empty(),
+        "Could not parse these source files with syn (a reader could hide in \
+         one). Fix the parse or narrow the walk:\n{}",
+        parse_failures.join("\n")
+    );
+
+    assert!(
         banned.is_empty(),
-        "Banned snapshot import form(s) in production (Layer 1).\n\n\
-         Reference the snapshot module only in FULLY-QUALIFIED form \
-         (`crate::snapshot::<fn>(...)`). Grouped/aliased/bare-module imports \
-         (`use crate::snapshot::{{…}}`, `use crate::snapshot as …`, \
-         `use crate::snapshot;`) can bring a read primitive into scope under a \
-         name the reader-scan cannot see, defeating the fail-open allowlist.\n\n\
-         Offending line(s):\n{}",
+        "Forbidden snapshot reference form(s) in production.\n\n\
+         A `pub`/`pub(crate)` re-export of crate::snapshot, or a crate-root \
+         alias, lets a downstream file read the projection WITHOUT any local \
+         `snapshot` reference — defeating the audited-files completeness \
+         argument. Reference the projection only in fully-qualified, \
+         non-re-exported form.\n\n{}",
         banned.join("\n")
     );
 
     assert!(
-        unlisted.is_empty(),
-        "New snapshot reader(s) outside the fail-open ALLOWLIST (Layer 2).\n\n\
-         Every reader of the snapshot projection must fail-open: a stale/missing \
-         snapshot may cause only a REVERSIBLE action (nudge/warn/log/timing), never \
-         an irreversible one (delete/overwrite/fabricated outbound send). Add the \
-         site to ALLOWED_READERS in this file WITH a one-line reversibility \
-         rationale — and only after confirming the read actually fails open.\n\n\
-         Unlisted read site(s):\n{}",
-        unlisted.join("\n")
+        unaudited.is_empty(),
+        "Production file(s) reference crate::snapshot but are not in \
+         AUDITED_FILES.\n\n\
+         Any reader of the snapshot projection must fail-open: a stale/missing \
+         snapshot may cause only a REVERSIBLE action (nudge/warn/log/timing), \
+         never an irreversible one. Add each file to AUDITED_FILES in this test \
+         with a role (reader/writer/type-user) and — for a reader — a one-line \
+         reversibility rationale, only after confirming it fails open.\n\n{}",
+        unaudited.join("\n")
     );
 
-    let stale: Vec<&str> = ALLOWED_READERS
+    let stale: Vec<&str> = AUDITED_FILES
         .iter()
-        .map(|(s, _)| *s)
+        .map(|(s, _, _)| *s)
         .filter(|s| !matched.contains(s))
         .collect();
     assert!(
         stale.is_empty(),
-        "Stale ALLOWED_READERS entr(y/ies) — no snapshot read found in: {stale:?}.\n\
-         Remove the entry (the reader was deleted/moved) to keep the inventory honest.",
+        "Stale AUDITED_FILES entr(y/ies) — no crate::snapshot reference found \
+         in: {stale:?}. Remove the entry to keep the inventory honest.",
     );
 }
 
-/// The fence's fence: prove the two-layer scan catches every read form the
-/// reviewer (PR #2612) showed the literal-call scan missed, and does NOT flag
-/// benign lines. Each `case` is classified by the same predicates the main test
-/// uses; "caught" = Layer 1 (banned import) OR Layer 2 (read ref) on a
-/// non-comment line.
+/// The fence's fence: prove the AST walk catches every read form the reviewer
+/// showed the string scans missed (and the crate-level grouped/nested/glob/
+/// multi-line variants), that the bans fire, and that benign non-projection
+/// references are not flagged.
 #[test]
 fn scanner_catches_all_bypass_forms() {
-    fn caught(line: &str) -> bool {
-        !is_comment(line) && (is_banned_import(line) || is_read_ref(line))
+    let caught = |src: &str| -> bool {
+        let s = scan_file(src).expect("parse snippet");
+        s.refs_projection || s.reexports_projection || s.aliases_crate_root
+    };
+
+    // Every read form must be caught. Forms 1-4 are the first review's; forms
+    // 5-6 are the crate-level grouped imports the second review injected;
+    // 7-8 harden glob and multi-line grouping.
+    let read_forms: &[(&str, &str)] = &[
+        ("baseline call", "fn f(h: &std::path::Path) { let _ = crate::snapshot::load(h); }"),
+        ("form1 direct import", "use crate::snapshot::load;\nfn f(h: &std::path::Path){ let _ = load(h); }"),
+        ("form2 grouped alias", "use crate::snapshot::{agent_is_busy as busy};\nfn f(h:&std::path::Path){ let _=busy(h,\"a\"); }"),
+        ("form3 module alias", "use crate::snapshot as snap;\nfn f(h:&std::path::Path){ let _=snap::agent_is_busy(h,\"a\"); }"),
+        ("form4 fn pointer", "fn f(h:&std::path::Path){ let g = crate::snapshot::load; let _=g(h); }"),
+        ("form5 crate-grouped alias", "use crate::{snapshot as snap};\nfn f(h:&std::path::Path){ let _=snap::load(h); }"),
+        ("form6 crate-grouped nested", "use crate::{snapshot::{load}};\nfn f(h:&std::path::Path){ let _=load(h); }"),
+        ("form7 crate glob", "use crate::*;\nfn f(h:&std::path::Path){ let _=snapshot::load(h); }"),
+        ("form8 multiline group", "use crate::{\n    snapshot::agent_is_busy,\n    fmt_util,\n};\nfn f(h:&std::path::Path){ let _=agent_is_busy(h,\"a\"); }"),
+    ];
+    for (name, src) in read_forms {
+        assert!(caught(src), "read form NOT caught by the AST fence: {name}");
     }
 
-    // Every bypass form the reviewer flagged, plus the baseline call. Each must
-    // be caught on at least one of its lines.
-    let must_catch: &[(&str, &[&str])] = &[
-        ("baseline call", &["let _ = crate::snapshot::load(home);"]),
+    // Token-free escape hatches must be caught as bans.
+    let ban_forms: &[(&str, &str)] = &[
+        ("pub re-export fn", "pub use crate::snapshot::load;"),
         (
-            "form 1: direct import + bare call",
-            &["use crate::snapshot::load;", "    let _ = load(home);"],
+            "pub(crate) re-export module",
+            "pub(crate) use crate::snapshot as snap;",
         ),
         (
-            "form 2: grouped/aliased import",
-            &[
-                "use crate::snapshot::{agent_is_busy as busy};",
-                "    let _ = busy(home, name);",
-            ],
-        ),
-        (
-            "form 3: module alias",
-            &[
-                "use crate::snapshot as snap;",
-                "    let _ = snap::agent_is_busy(home, name);",
-            ],
-        ),
-        (
-            "form 4: fn pointer",
-            &["let f = crate::snapshot::load;", "    let _ = f(home);"],
-        ),
-        (
-            "bare module import + call",
-            &["use crate::snapshot;", "    let _ = snapshot::load(home);"],
+            "crate-root alias",
+            "use crate as c;\nfn f(h:&std::path::Path){ let _=c::snapshot::load(h); }",
         ),
     ];
-    for (name, lines) in must_catch {
+    for (name, src) in ban_forms {
+        let s = scan_file(src).expect("parse snippet");
         assert!(
-            lines.iter().any(|l| caught(l)),
-            "bypass form NOT caught by the fence: {name}"
+            s.reexports_projection || s.aliases_crate_root,
+            "escape-hatch form not banned: {name}"
         );
     }
 
-    // Negative controls: benign lines must NOT be flagged.
-    let must_not_catch: &[&str] = &[
-        "    let snapshotter = build_snapshotter();", // unrelated identifier
-        "// see crate::snapshot::load for the fail-open contract", // comment
-        "    let s: Option<&crate::snapshot::FleetSnapshot> = None;", // type ref, not a read
-        "        crate::snapshot::save(home, &snaps);", // writer, not a read
+    // Benign references must NOT be flagged: the identically named per_tick
+    // rotation module, an unrelated identifier, a foreign Snapshot type, and a
+    // comment (syn drops comments entirely).
+    let benign: &[(&str, &str)] = &[
+        (
+            "per_tick::snapshot module",
+            "use crate::daemon::per_tick::snapshot::SnapshotRotationHandler;",
+        ),
+        (
+            "per_tick bare re-export",
+            "pub(crate) use snapshot::SnapshotRotationHandler;",
+        ),
+        (
+            "unrelated identifier",
+            "fn f(){ let snapshot_count = 3; let _ = snapshot_count; }",
+        ),
+        (
+            "foreign Snapshot type",
+            "fn f(x: other_crate::Snapshot){ let _ = x; }",
+        ),
+        (
+            "comment mention only",
+            "// reads crate::snapshot::load elsewhere\nfn f(){}",
+        ),
     ];
-    for line in must_not_catch {
-        assert!(!caught(line), "benign line wrongly flagged: {line:?}");
+    for (name, src) in benign {
+        assert!(!caught(src), "benign reference wrongly flagged: {name}");
     }
 }
