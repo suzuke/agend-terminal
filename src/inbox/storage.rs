@@ -1555,6 +1555,14 @@ pub fn reclaim_stale_delivering(home: &Path) {
             Some(n) => n.to_string(),
             None => continue,
         };
+        // #2622: for the production-default UUID-keyed inbox path, `agent_name`
+        // (the file stem) IS the UUID, not the human name `agent_is_busy` looks
+        // up by (`AgentSnapshot.name`). Resolve once per file (not per row) so
+        // the busy gate actually engages against a UUID-keyed file; a
+        // legacy/unresolvable stem falls back to using it as-is (the name-keyed
+        // topology's stem already IS the human name).
+        let busy_check_name = crate::fleet::resolve_name_by_uuid(home, &agent_name)
+            .unwrap_or_else(|| agent_name.clone());
         // Phase 1 (locked): revert stale delivering rows, collect the reverted
         // MESSAGES (not just ids) so Phase 2 can classify them for the re-nudge gate.
         // #t-…61487: the classifier (`reclaim_renudge_worthy` → `obligation_reason`)
@@ -1611,7 +1619,7 @@ pub fn reclaim_stale_delivering(home: &Path) {
                             // `delivering_at`) is the final backstop either way.
                             let busy_past_cap =
                                 elapsed_secs.is_none_or(|s| s > RECLAIM_BUSY_HARD_CAP_SECS);
-                            let busy = crate::snapshot::agent_is_busy(home, &agent_name);
+                            let busy = crate::snapshot::agent_is_busy(home, &busy_check_name);
                             if busy && !busy_past_cap {
                                 // Still legitimately working — leave `delivering`,
                                 // re-check next sweep.

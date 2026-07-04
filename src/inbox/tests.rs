@@ -1208,6 +1208,78 @@ fn reclaim_forces_past_busy_hard_cap() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// Write a minimal fleet.yaml so `fleet::resolve_uuid(home, name)` returns
+/// `uuid` — making `name` an "id-native" instance whose inbox lives at the
+/// UUID path (`inbox_path_resolved`), matching the production-default
+/// topology (mirrors `storage/review_repro_inbox_notify.rs`'s identical
+/// helper, private to that submodule).
+fn write_fleet_with_id(home: &Path, name: &str, uuid: &str) {
+    let yaml = format!("instances:\n  {name}:\n    id: {uuid}\n");
+    fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("write fleet.yaml");
+}
+
+/// #2622 (lead pre-vet finding): the busy gate must engage on the
+/// PRODUCTION-DEFAULT UUID-keyed inbox topology, not just the legacy
+/// name-keyed one the earlier tests in this file used (which incidentally
+/// bypassed the bug — no fleet.yaml means `resolve_uuid` returns `None`,
+/// so the file stem IS already the human name `agent_is_busy` expects). A
+/// UUID-keyed inbox's file stem is the UUID; `reclaim_stale_delivering`
+/// must reverse-resolve it to the human name (`fleet::resolve_name_by_uuid`)
+/// before checking `agent_is_busy`, or the check always misses (UUID never
+/// equals any `AgentSnapshot.name`) and silently fails open to "not busy" —
+/// a no-op gate for exactly the topology #2622's motivating case (general's
+/// UUID-keyed inbox) actually uses.
+#[test]
+fn reclaim_busy_gate_engages_on_uuid_keyed_production_topology() {
+    let home = tmp_home("2622-uuid-topology-busy");
+    let name = "general";
+    let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    write_fleet_with_id(&home, name, uuid);
+    // Snapshot is keyed by the HUMAN name (matches production: AgentSnapshot
+    // is written with the fleet-facing name, never the UUID).
+    write_agent_state_snapshot(&home, name, "active");
+
+    // enqueue/drain via the human name route through inbox_path_resolved to
+    // the UUID-keyed file — exactly like a real id-native instance.
+    enqueue(
+        &home,
+        name,
+        msg()
+            .sender("user:op")
+            .text("long analysis request")
+            .id("m-uuid-busy")
+            .delivering_at(&secs_ago(660)) // past RECLAIM_TTL_SECS (600), under the hard cap
+            .build(),
+    )
+    .unwrap();
+
+    // Sanity: this really is the UUID-keyed path, not a `<name>.jsonl`.
+    let resolved = inbox_path_resolved(&home, name);
+    assert!(
+        resolved.to_string_lossy().contains(uuid),
+        "test setup must produce a UUID-keyed inbox path, got {}",
+        resolved.display()
+    );
+
+    reclaim_stale_delivering(&home);
+
+    // Still delivering (not reverted) — the busy gate must have engaged
+    // even though the file stem it saw was the UUID, not "general".
+    let content = fs::read_to_string(&resolved).unwrap();
+    let m: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        m.delivering_at.is_some(),
+        "busy gate must engage on the UUID-keyed production topology, not \
+         just the legacy name-keyed one"
+    );
+
+    assert!(
+        drain(&home, name).is_empty(),
+        "a busy agent's in-flight row on a UUID-keyed inbox must not be re-delivered"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 /// 並發 sweep+drain+ack 不雙 reclaim: under concurrent drain + reclaim + ack on
 /// the same inbox (all serialized by `with_inbox_lock`), every message is
 /// returned AT MOST ONCE across all drains — no double-deliver, no double-reclaim.
