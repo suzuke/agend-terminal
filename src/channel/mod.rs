@@ -1086,6 +1086,11 @@ mod tests {
             self.topic_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.create_topic_ok {
+                // Mirrors the fixed Discord adapter contract
+                // (t-20260703164240502572-50899-11 reviewer4 finding): a
+                // successful create_topic must leave the instance bound, or
+                // the channel it just created is unroutable and uncleanable.
+                self.bound.lock().insert(name.to_string());
                 Ok(TopicRef {
                     id: format!("{}-{name}", self.kind),
                     channel_kind: ChannelKind::Telegram,
@@ -1162,6 +1167,46 @@ mod tests {
         );
         assert_eq!(tg.topic_calls(), 1, "telegram must get a create_topic call");
         assert_eq!(dc.topic_calls(), 1, "discord must get a create_topic call");
+
+        reset_active_channel_for_test();
+    }
+
+    /// reviewer4 REJECTED finding on the first #2615 pass: fan-out alone isn't
+    /// enough — a channel whose `create_topic` creates the platform resource
+    /// but never calls `record_binding` (the real bug found in
+    /// `DiscordChannel::create_topic`) leaves that channel unroutable
+    /// (`channel_for_instance`/inbound can't find it) and uncleanable
+    /// (`drop_binding_on_all_channels`'s `take_binding` finds nothing). Pins
+    /// the now-fixed contract end-to-end: every channel `ensure_topic_for`
+    /// fanned out to must have `has_binding(instance) == true` immediately
+    /// after, and `drop_binding_on_all_channels` must clear all of them.
+    #[test]
+    fn ensure_topic_for_created_topic_is_bound_and_cleanable_on_every_channel() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+
+        let tg = BindingTopicChannel::arc("telegram-bind", true);
+        let dc = BindingTopicChannel::arc("discord-bind", true);
+        register_active_channel(tg.clone());
+        register_active_channel(dc.clone());
+
+        ensure_topic_for("agent-w");
+
+        assert!(
+            tg.is_bound("agent-w"),
+            "telegram must be routable/cleanable after create_topic"
+        );
+        assert!(
+            dc.is_bound("agent-w"),
+            "discord must be routable/cleanable after create_topic — this is \
+             exactly the reviewer4 finding: create_topic alone left Discord \
+             unbound"
+        );
+
+        drop_binding_on_all_channels("agent-w");
+
+        assert!(!tg.is_bound("agent-w"), "cleanup must reach telegram");
+        assert!(!dc.is_bound("agent-w"), "cleanup must reach discord");
 
         reset_active_channel_for_test();
     }
