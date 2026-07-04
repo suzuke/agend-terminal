@@ -121,6 +121,87 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }
 }
 
+/// #991: outcome of a `bind_topic` retrofit call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindTopicOutcome {
+    /// Topic created; fleet.yaml + topics.json updated.
+    Bound(i32),
+    /// Instance already had a topic — idempotent no-op, nothing written.
+    AlreadyBound(i32),
+    /// `topic_binding_mode` is `"skip"` — retrofit refused.
+    NotEligible { reason: String },
+    /// `instance_name` not found in fleet.yaml.
+    InstanceNotFound,
+    /// Telegram channel unavailable (no bot token, unconfigured, or the
+    /// ~6s post-boot `telegram_init` window — see
+    /// BIND-TOPIC-PRERESEARCH.md §3).
+    ChannelUnavailable,
+    /// Telegram API call failed (network / rate limit / other).
+    ApiError(String),
+}
+
+/// #991 Phase 2: retrofit a Telegram topic for an instance that was spawned
+/// with `topic_binding=deferred` (or any mode that ended up without a topic).
+/// Operator-triggered via the `bind_topic` MCP action — not automatic, so
+/// unlike the spawn-time path a `ChannelUnavailable` here is a structured,
+/// caller-visible result the operator can simply retry (no silent-skip
+/// window concern — see BIND-TOPIC-PRERESEARCH.md §3).
+///
+/// `topic_binding_mode == "skip"` is refused (`NotEligible`): skip's literal
+/// promise is "no topic, ever" — retrofitting it silently would defeat the
+/// point of recording that choice explicitly in fleet.yaml. To bind a
+/// skip-mode instance, change its `topic_binding_mode` first, then call this.
+pub fn bind_topic_for_instance(home: &std::path::Path, instance_name: &str) -> BindTopicOutcome {
+    let Ok(config) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
+        return BindTopicOutcome::InstanceNotFound;
+    };
+    let Some(inst) = config.instances.get(instance_name) else {
+        return BindTopicOutcome::InstanceNotFound;
+    };
+    if inst.topic_binding_mode.as_deref() == Some("skip") {
+        return BindTopicOutcome::NotEligible {
+            reason: format!(
+                "instance '{instance_name}' is in skip mode (topic_binding_mode: skip) — \
+                 change topic_binding_mode before binding a topic"
+            ),
+        };
+    }
+    if let Some(tid) = lookup_topic_for_instance(home, instance_name) {
+        return BindTopicOutcome::AlreadyBound(tid);
+    }
+    match create_topic_for_instance(home, instance_name) {
+        Some(tid) => {
+            if let Err(e) = crate::fleet::update_instance_field(
+                home,
+                instance_name,
+                "topic_id",
+                serde_yaml_ng::Value::Number(tid.into()),
+            ) {
+                tracing::warn!(
+                    instance = %instance_name, topic_id = tid, error = %e,
+                    "bind_topic: topics.json updated but fleet.yaml topic_id write failed"
+                );
+            }
+            BindTopicOutcome::Bound(tid)
+        }
+        None => {
+            // `create_topic_for_instance` collapses "no channel" and "API
+            // error" into a single `None` (see its own doc comment — internal
+            // callers don't need the distinction). `bind_topic` is an
+            // operator-facing action that does, so re-derive the channel
+            // check here (cheap: local fleet.yaml/env read, no network)
+            // rather than plumbing a richer return type through every
+            // existing caller of `create_topic_for_instance`.
+            match super::resolve_channel_only_from(home) {
+                Ok(_) => BindTopicOutcome::ApiError(
+                    "telegram API call failed creating the topic — see daemon logs".to_string(),
+                ),
+                Err(_) => BindTopicOutcome::ChannelUnavailable,
+            }
+        }
+    }
+}
+
 /// Sprint 59 Wave 2 PR-IMPL (F2 — α-shared helper): query whether
 /// the bot has `can_manage_topics` permission in the chat. Returns
 /// `false` on any error path (network failure / not-an-admin /
@@ -518,6 +599,101 @@ mod tests {
         let home = tmp_home("create_no_config");
         let result = create_topic_for_instance(&home, "new-agent");
         assert!(result.is_none(), "no config → no topic creation");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #991 bind_topic_for_instance ─────────────────────────────────
+
+    #[test]
+    fn bind_topic_for_instance_not_found_when_no_fleet_yaml() {
+        let home = tmp_home("bind-no-fleet-yaml");
+        let result = bind_topic_for_instance(&home, "ghost");
+        assert_eq!(result, BindTopicOutcome::InstanceNotFound);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_topic_for_instance_not_found_when_instance_missing() {
+        let home = tmp_home("bind-instance-missing");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  other:\n    backend: claude\n",
+        )
+        .unwrap();
+        let result = bind_topic_for_instance(&home, "ghost");
+        assert_eq!(result, BindTopicOutcome::InstanceNotFound);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_topic_for_instance_refuses_skip_mode_991() {
+        let home = tmp_home("bind-skip-refused");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  internal-only:\n    backend: claude\n    topic_binding_mode: skip\n",
+        )
+        .unwrap();
+        let result = bind_topic_for_instance(&home, "internal-only");
+        match result {
+            BindTopicOutcome::NotEligible { reason } => {
+                assert!(
+                    reason.contains("skip"),
+                    "NotEligible reason must explain the skip-mode refusal: {reason}"
+                );
+            }
+            other => panic!("expected NotEligible, got {other:?}"),
+        }
+        // Refusal must not touch topics.json.
+        assert_eq!(lookup_topic_for_instance(&home, "internal-only"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_topic_for_instance_already_bound_is_idempotent_991() {
+        let home = tmp_home("bind-already-bound");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  deferred-agent:\n    backend: claude\n    topic_binding_mode: deferred\n",
+        )
+        .unwrap();
+        register_topic(&home, 501, "deferred-agent").unwrap();
+        let result = bind_topic_for_instance(&home, "deferred-agent");
+        assert_eq!(result, BindTopicOutcome::AlreadyBound(501));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_topic_for_instance_channel_unavailable_without_config_991() {
+        let home = tmp_home("bind-no-channel");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  deferred-agent:\n    backend: claude\n    topic_binding_mode: deferred\n",
+        )
+        .unwrap();
+        // No `channel:` section → resolve_channel_only_from errors.
+        let result = bind_topic_for_instance(&home, "deferred-agent");
+        assert_eq!(result, BindTopicOutcome::ChannelUnavailable);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_topic_for_instance_auto_mode_without_topic_is_eligible_991() {
+        // #991 design note (BIND-TOPIC-PRERESEARCH.md §1): only `skip` is
+        // refused. An `auto`-mode instance that ended up without a topic
+        // (e.g. spawned during the ~6s post-boot window) is a legitimate
+        // bind_topic target too — this pins that `auto` is NOT rejected.
+        let home = tmp_home("bind-auto-eligible");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  auto-agent:\n    backend: claude\n",
+        )
+        .unwrap();
+        let result = bind_topic_for_instance(&home, "auto-agent");
+        assert_eq!(
+            result,
+            BindTopicOutcome::ChannelUnavailable,
+            "auto-mode instance must reach the channel-resolution step, not be refused as NotEligible"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

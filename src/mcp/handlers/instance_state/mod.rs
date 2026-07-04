@@ -288,6 +288,51 @@ pub(super) fn handle_delete_instance(
     }
 }
 
+/// #991 Phase 2: retrofit a Telegram topic for a `deferred`/`auto`-without-
+/// topic instance. See `bind_topic_for_instance` for the core logic and
+/// `BindTopicOutcome`'s variants for the exact result shapes below.
+///
+/// `channel` is optional and defaults to `"telegram"` — the only channel
+/// this action supports today. An explicit non-telegram value gets a clear
+/// "not yet supported" error rather than silently misrouting or falling back
+/// to the ambiguous `active_channel()` (ARCH note: BIND-TOPIC-PRERESEARCH.md
+/// §4 — that resolver returns `None` whenever 0 OR MULTIPLE channels are
+/// registered, a pre-existing, separately-tracked bug this action avoids by
+/// never calling it).
+pub(super) fn handle_bind_topic(home: &Path, args: &Value) -> Value {
+    let name = match super::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    crate::validate_name_or_err!(name);
+    if let Some(channel) = args["channel"].as_str() {
+        if channel != "telegram" {
+            return json!({
+                "error": format!("bind_topic: channel '{channel}' not yet supported (only 'telegram')"),
+                "code": "channel_not_supported"
+            });
+        }
+    }
+    use crate::channel::telegram::BindTopicOutcome;
+    match crate::channel::telegram::bind_topic_for_instance(home, name) {
+        BindTopicOutcome::Bound(tid) => json!({"bound": true, "topic_id": tid}),
+        BindTopicOutcome::AlreadyBound(tid) => {
+            json!({"bound": true, "topic_id": tid, "already_bound": true})
+        }
+        BindTopicOutcome::NotEligible { reason } => {
+            json!({"error": reason, "code": "not_eligible"})
+        }
+        BindTopicOutcome::InstanceNotFound => {
+            json!({"error": format!("instance '{name}' not found"), "code": "instance_not_found"})
+        }
+        BindTopicOutcome::ChannelUnavailable => json!({
+            "error": "telegram channel not ready yet — retry in a few seconds",
+            "code": "channel_unavailable"
+        }),
+        BindTopicOutcome::ApiError(e) => json!({"error": e, "code": "api_error"}),
+    }
+}
+
 pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,

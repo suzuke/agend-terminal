@@ -208,6 +208,7 @@ adapter!(
     instance::handle_delete_instance
 );
 adapter!(dispatch_start_instance, ha, instance::handle_start_instance);
+adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
 adapter!(
     dispatch_restart_instance,
     ha,
@@ -393,6 +394,7 @@ mod tests {
                 "delete_instance",
                 "start_instance",
                 "restart_instance",
+                "bind_topic",
                 "interrupt",
                 "set_metadata",
                 "set_waiting_on",
@@ -413,7 +415,7 @@ mod tests {
                 "binding_state",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 27);
+        assert_eq!(crate::mcp::registry::all().len(), 28);
     }
 
     #[test]

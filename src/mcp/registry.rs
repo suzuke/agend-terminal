@@ -232,7 +232,7 @@ pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, t
             .any(|entry| entry.name == tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 27] = [
+static ALL_TOOLS: [ToolEntry; 28] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -288,6 +288,12 @@ static ALL_TOOLS: [ToolEntry; 27] = [
         name: "restart_instance",
         definition: super::tools::def_restart_instance,
         handler: super::handlers::dispatch::dispatch_restart_instance,
+        class: ToolClass::SIDE_EFFECT,
+    },
+    ToolEntry {
+        name: "bind_topic",
+        definition: super::tools::def_bind_topic,
+        handler: super::handlers::dispatch::dispatch_bind_topic,
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {

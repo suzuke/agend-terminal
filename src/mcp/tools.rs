@@ -130,6 +130,14 @@ pub(crate) fn def_start_instance() -> Value {
         "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Name of the existing instance to start"}}, "required": ["instance"]}})
 }
 
+pub(crate) fn def_bind_topic() -> Value {
+    json!({"name": "bind_topic", "description": "#991: retrofit a Telegram topic for an instance spawned with topic_binding=deferred (or auto that ended up without one). Refuses skip-mode instances (change topic_binding_mode first). Idempotent — already-bound instances return already_bound:true, no-op.",
+        "inputSchema": {"type": "object", "properties": {
+            "instance": {"type": "string", "description": "Name of the existing instance to bind a topic for"},
+            "channel": {"type": "string", "description": "Channel to bind on. Defaults to 'telegram' — the only channel currently supported."}
+        }, "required": ["instance"]}})
+}
+
 pub(crate) fn def_restart_instance() -> Value {
     json!({"name": "restart_instance", "description": "Kill and restart an instance. Default mode 'resume' preserves conversation state; 'fresh' starts clean.",
         "inputSchema": {"type": "object", "properties": {
@@ -606,7 +614,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            27,
+            28,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -614,7 +622,8 @@ mod tests {
              (#2547, removed from registry) = 33; - tui_screenshot/gc_dry_run/tokens/watchdog \
              (#2548 Wave1-PR1, removed or moved to CLI) = 29; - mode/force_release_worktree \
              (#2548 Wave1-PR2, mode folded into list_instances, force_release_worktree merged \
-             into release_worktree(force:true)) = 27. Current tools: {:?}",
+             into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28. \
+             Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
