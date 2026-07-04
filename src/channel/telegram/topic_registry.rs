@@ -696,4 +696,59 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #991 dual-write end-to-end: pins that a `Bound` outcome leaves
+    /// fleet.yaml's `topic_id` field and topics.json's reverse mapping
+    /// mutually consistent. `create_topic_for_instance`'s success path makes
+    /// a real Telegram Bot API call with no injectable seam in this codebase
+    /// (no wiremock/mockito dependency, no test double for `teloxide::Bot`),
+    /// so this test drives the exact two writes `bind_topic_for_instance`'s
+    /// `Bound` branch performs — `register_topic` (topics.json, done inside
+    /// `create_topic_for_instance` on a real success) then
+    /// `update_instance_field(.., "topic_id", ..)` (fleet.yaml, done by
+    /// `bind_topic_for_instance` itself) — rather than forcing the branch
+    /// through a live API call. See BIND-TOPIC-PRERESEARCH.md's "Phase 2 已裁
+    /// 事項" note on this test boundary.
+    #[test]
+    fn bind_topic_dual_write_persists_fleet_yaml_and_topics_json_991() {
+        let home = tmp_home("bind-dual-write");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  deferred-agent:\n    backend: claude\n    topic_binding_mode: deferred\n",
+        )
+        .unwrap();
+
+        let tid = 777;
+        register_topic(&home, tid, "deferred-agent").unwrap();
+        crate::fleet::update_instance_field(
+            &home,
+            "deferred-agent",
+            "topic_id",
+            serde_yaml_ng::Value::Number(tid.into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lookup_topic_for_instance(&home, "deferred-agent"),
+            Some(tid),
+            "topics.json half of the dual write must resolve back to the instance"
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("reload fleet.yaml");
+        assert_eq!(
+            reloaded
+                .instances
+                .get("deferred-agent")
+                .and_then(|i| i.topic_id),
+            Some(tid),
+            "fleet.yaml half of the dual write must persist topic_id through a fresh reload"
+        );
+
+        // Both halves landed → a subsequent bind_topic call must see the
+        // instance as already bound (idempotent, no re-create).
+        let result = bind_topic_for_instance(&home, "deferred-agent");
+        assert_eq!(result, BindTopicOutcome::AlreadyBound(tid));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

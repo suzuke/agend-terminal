@@ -496,3 +496,121 @@ fn self_kick_flag_set_only_by_fresh_restart_fail_safe_default() {
     let initial = json!({"name": "dev", "backend": "claude", "layout": "tab"});
     assert!(!initial["self_kick_on_ready"].as_bool().unwrap_or(false));
 }
+
+// ── #991 handle_bind_topic (MCP JSON-envelope mapping) ──────────────────
+// `bind_topic_for_instance`'s own outcomes are pinned in
+// `channel::telegram::topic_registry`'s tests; these tests cover the layer
+// on top — args validation and the `BindTopicOutcome` → JSON `code`/`error`
+// mapping the handler itself owns.
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn tmp_home_for_bind_topic(tag: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "agend-991-bind-topic-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
+#[test]
+fn bind_topic_missing_instance_arg_991() {
+    let home = tmp_home_for_bind_topic("missing-arg");
+    let resp = handle_bind_topic(&home, &json!({}));
+    assert_eq!(resp["error"], "missing 'instance'");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_topic_rejects_invalid_instance_name_991() {
+    let home = tmp_home_for_bind_topic("invalid-name");
+    let resp = handle_bind_topic(&home, &json!({"instance": "bad name!"}));
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("invalid characters"),
+        "expected an invalid-characters error, got: {resp}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bind_topic_rejects_unsupported_channel_991() {
+    let home = tmp_home_for_bind_topic("bad-channel");
+    let resp = handle_bind_topic(
+        &home,
+        &json!({"instance": "someagent", "channel": "discord"}),
+    );
+    assert_eq!(resp["code"], "channel_not_supported");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("discord"),
+        "error should name the rejected channel: {resp}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn bind_topic_instance_not_found_991() {
+    let home = tmp_home_for_bind_topic("not-found");
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    let resp = handle_bind_topic(&home, &json!({"instance": "ghost"}));
+    assert_eq!(resp["code"], "instance_not_found");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn bind_topic_skip_mode_via_handler_991() {
+    let home = tmp_home_for_bind_topic("skip-mode");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  internal-only:\n    backend: claude\n    topic_binding_mode: skip\n",
+    )
+    .unwrap();
+    let resp = handle_bind_topic(&home, &json!({"instance": "internal-only"}));
+    assert_eq!(resp["code"], "not_eligible");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn bind_topic_already_bound_via_handler_991() {
+    let home = tmp_home_for_bind_topic("already-bound");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  deferred-agent:\n    backend: claude\n    topic_binding_mode: deferred\n",
+    )
+    .unwrap();
+    crate::channel::telegram::register_topic(&home, 501, "deferred-agent").unwrap();
+    // Explicit channel="telegram" must behave identically to the default.
+    let resp = handle_bind_topic(
+        &home,
+        &json!({"instance": "deferred-agent", "channel": "telegram"}),
+    );
+    assert_eq!(resp["bound"], true);
+    assert_eq!(resp["topic_id"], 501);
+    assert_eq!(resp["already_bound"], true);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn bind_topic_channel_unavailable_via_handler_991() {
+    let home = tmp_home_for_bind_topic("channel-unavailable");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  deferred-agent:\n    backend: claude\n    topic_binding_mode: deferred\n",
+    )
+    .unwrap();
+    // No `channel:` section in fleet.yaml → resolve_channel_only_from errors.
+    let resp = handle_bind_topic(&home, &json!({"instance": "deferred-agent"}));
+    assert_eq!(resp["code"], "channel_unavailable");
+    std::fs::remove_dir_all(&home).ok();
+}
