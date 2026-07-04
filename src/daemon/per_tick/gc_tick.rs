@@ -130,10 +130,15 @@ mod tests {
     /// purged them). Deliberately NOT covered by decision Q3 ("gate coverage
     /// unchanged" applies to the archive-DECISION path only); this is a
     /// separate, intentional fix. Proves an aged `.trash` entry is purged by
-    /// a `gc_tick` pass with `AGEND_WORKTREE_GC` left UNSET.
+    /// a `gc_tick` pass regardless of `AGEND_WORKTREE_GC` — deliberately does
+    /// NOT touch that process-global env var itself (would race
+    /// `retention::worktrees`'s own gate tests under plain multi-threaded
+    /// `cargo test`, across a private per-file mutex nextest doesn't need but
+    /// plain `cargo test` would): this test's `home` has zero GC candidates,
+    /// so `gc_run` never even reaches the gate check either way — only
+    /// `purge_trash`'s own unconditional call is under test here.
     #[test]
     fn purge_trash_runs_regardless_of_worktree_gc_gate_2550_w5() {
-        std::env::remove_var("AGEND_WORKTREE_GC");
         let home = tmp_home("purge-gate-independent");
         let trash_dir = home
             .join(".trash")

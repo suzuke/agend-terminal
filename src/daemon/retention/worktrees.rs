@@ -1482,6 +1482,12 @@ mod tests {
     /// Q3), so the candidate is left on disk, not silently lost.
     #[test]
     fn gc_run_archive_fallthrough_stays_off_by_default_2550_w5() {
+        // reviewer3 (#2599): without this guard, plain multi-threaded `cargo
+        // test` races this test's "AGEND_WORKTREE_GC unset" assumption against
+        // the gate-ON test above setting the same process-global env var —
+        // nextest isolates env vars per test process so it never saw this,
+        // but plain `cargo test` flaked 3/3.
+        let _env_guard = gc_trash_env_guard();
         let dir = tmp_home("w1-q1-gate-off");
         let repo = setup_git_repo(&dir);
         let lease =
