@@ -94,10 +94,22 @@ pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {
         return inbox_path(home, name);
     };
     let id_path = home.join("inbox").join(format!("{}.jsonl", id.full()));
+    let name_path = inbox_path(home, name);
     if id_path.exists() {
+        // #2624: an id-direct write (bypassing this resolver — e.g. #1902's
+        // teardown path) can leave BOTH files real and independent. Merge the
+        // name file's rows in before short-circuiting to the id file, or they
+        // become permanent orphans: unreachable to drain/ack/clear (which all
+        // route through here), yet still visible to directory-scan readers
+        // (get_thread/find_message/renudge) — an un-settleable re-nudge loop.
+        // Skip when `id_path` is ITSELF a symlink (the classic opposite-
+        // direction migration below) — merging then would create a
+        // name→id→name symlink cycle.
+        if !is_symlink(&id_path) {
+            merge_dual_inbox_files_if_needed(&id_path, &name_path);
+        }
         return id_path;
     }
-    let name_path = inbox_path(home, name);
     if name_path.exists() {
         // Migrate: create symlink from id-based to name-based (or copy on Windows)
         if let Some(parent) = id_path.parent() {
@@ -115,6 +127,136 @@ pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {
     }
     // New instance — use id-based path directly
     id_path
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// #2624: merges an orphaned name-keyed inbox file's rows into the id-keyed
+/// file, then atomically replaces the name file with a symlink to the id file
+/// (Windows: removes it — this codebase's Windows migration already uses a
+/// one-way `fs::copy` rather than symlinks, so there is no link to keep in
+/// sync). Deduped by message `id`, falling back to exact-line dedup for
+/// id-less legacy rows, so a row present in both files — or a re-run after a
+/// crash mid-merge — is never duplicated.
+///
+/// Idempotent + crash-safe: dedup-by-id means a re-run after a crash between
+/// the id-file write and the name-file swap recomputes to "nothing new to
+/// append" and just retries the swap — never duplicates, never drops a row.
+/// Runs under its own lock file, distinct from [`with_inbox_lock`]'s per-op
+/// flock (which the caller acquires AFTER this function returns — see
+/// `with_inbox_lock`), so the two can't deadlock each other.
+fn merge_dual_inbox_files_if_needed(id_path: &Path, name_path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(name_path) else {
+        return; // name file doesn't exist — nothing to merge
+    };
+    if meta.file_type().is_symlink() {
+        return; // already migrated (#2624 direction)
+    }
+
+    let lock_path = id_path.with_extension("jsonl.merge.lock");
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+        return;
+    };
+
+    // Re-check under the lock: another thread/process may have completed the
+    // swap between our unlocked stat above and acquiring this lock.
+    let Ok(meta) = std::fs::symlink_metadata(name_path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+
+    let Ok(name_content) = std::fs::read_to_string(name_path) else {
+        return;
+    };
+    let id_content = std::fs::read_to_string(id_path).unwrap_or_default();
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_lines = std::collections::HashSet::new();
+    for line in id_content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        seen_lines.insert(line);
+        if let Some(id) = extract_msg_id(line) {
+            seen_ids.insert(id);
+        }
+    }
+
+    let mut extra: Vec<&str> = Vec::new();
+    for line in name_content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match extract_msg_id(line) {
+            Some(id) => {
+                if !seen_ids.insert(id) {
+                    continue; // already in the id file — dedup, not a real addition
+                }
+            }
+            None => {
+                if !seen_lines.insert(line) {
+                    continue; // exact-duplicate id-less legacy row
+                }
+            }
+        }
+        extra.push(line);
+    }
+
+    if !extra.is_empty() {
+        let tmp = id_path.with_extension("jsonl.tmp");
+        let result = (|| -> anyhow::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            for line in id_content.lines().filter(|l| !l.trim().is_empty()) {
+                writeln!(f, "{line}")?;
+            }
+            for line in &extra {
+                writeln!(f, "{line}")?;
+            }
+            f.sync_all()?;
+            std::fs::rename(&tmp, id_path)?;
+            crate::store::fsync_parent_dir(id_path);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "inbox #2624 dual-file merge write-back failed");
+            return; // don't swap the name file if the merge write didn't land
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let tmp_link = name_path.with_extension("jsonl.symlink_tmp");
+        let _ = std::fs::remove_file(&tmp_link);
+        if std::os::unix::fs::symlink(id_path, &tmp_link).is_ok() {
+            let _ = std::fs::rename(&tmp_link, name_path);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(name_path);
+    }
+}
+
+/// Cheap `id`-only probe for [`merge_dual_inbox_files_if_needed`]'s dedup.
+/// `id` is genuinely optional (`#[serde(default)]`, matching
+/// [`InboxMessage::id`]) since legacy pre-`ensure_msg_id` rows lack it.
+fn extract_msg_id(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct IdOnly {
+        #[serde(default)]
+        id: Option<String>,
+    }
+    serde_json::from_str::<IdOnly>(line).ok().and_then(|v| v.id)
 }
 
 /// Acquire a per-agent flock and run `f` with the inbox path.
