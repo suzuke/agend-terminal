@@ -60,6 +60,7 @@
 | Git 行為 | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | daemon 對被啟動 agent 的 git 環境做了哪些修改 |
 | 相容性政策 | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | `$AGEND_HOME` 底下磁碟格式的穩定性保證 |
 | 已知問題 | [EN](KNOWN_ISSUES.md) | [中文](KNOWN_ISSUES.zh-TW.md) | 刻意暫緩的項目——開 issue 前請先看 |
+| Backend 能力矩陣 | [EN](BACKEND-CAPABILITY-MATRIX.md) | [中文](BACKEND-CAPABILITY-MATRIX.zh-TW.md) | 逐 backend 的 state 訊號、context/resume/MCP 支援、已知脆弱點——誠實標示依據或標記未查證 |
 | Skills 參考 | [EN](SKILLS.md) | [中文](SKILLS.zh-TW.md) | skill 目錄與 lock 格式 |
 | 啟動流程 | [EN](launch-flows.md) | [中文](launch-flows.zh-TW.md) | 啟動 daemon 的每一種方式；冷啟動 vs 熱啟動 |
 | 秘訣：乾淨的 Claude Instance | [EN](RECIPE-clean-claude-instance.md) | [中文](RECIPE-clean-claude-instance.zh-TW.md) | 啟動不含全域指令的 Claude Code agent |

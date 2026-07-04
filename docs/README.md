@@ -61,6 +61,7 @@ process notes are English-only.
 | Git Behavior | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | What the daemon changes in a spawned agent's git env |
 | Compatibility Policy | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | On-disk format stability guarantees under `$AGEND_HOME` |
 | Known Issues | [EN](KNOWN_ISSUES.md) | [中文](KNOWN_ISSUES.zh-TW.md) | Intentionally-deferred items — check before filing an issue |
+| Backend Capability Matrix | [EN](BACKEND-CAPABILITY-MATRIX.md) | [中文](BACKEND-CAPABILITY-MATRIX.zh-TW.md) | Per-backend state signal, context/resume/MCP support, and known fragile points — honestly cited or marked unverified |
 | Skills Reference | [EN](SKILLS.md) | [中文](SKILLS.zh-TW.md) | The skills catalog and lock format |
 | Launch Flows | [EN](launch-flows.md) | [中文](launch-flows.zh-TW.md) | Every way to start the daemon; cold vs warm start |
 | Recipe: Clean Claude Instance | [EN](RECIPE-clean-claude-instance.md) | [中文](RECIPE-clean-claude-instance.zh-TW.md) | Spawning a Claude Code agent without global instructions |
