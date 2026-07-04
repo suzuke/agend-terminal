@@ -609,6 +609,9 @@ mod tests {
     /// agent (`stty raw -echo; sleep 30` — never drains stdin) instead of a
     /// healthy shell, so a caller can force a genuine PTY write failure
     /// through the real `write_actor::register`ed production path (#2620).
+    /// `cfg`-gated with its sole caller below (Unix-only) to avoid an
+    /// unused-fn warning on Windows.
+    #[cfg(not(target_os = "windows"))]
     fn test_ctx_with_wedged_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
         let home = Box::new(std::env::temp_dir().join(format!(
             "agend-api-inst-wedged-{}-{}",
@@ -670,7 +673,11 @@ mod tests {
     /// saturates the target's real write_actor queue first (same recipe as
     /// `recovery_dispatcher`'s #2620 caller pin), so the raw inject below is
     /// guaranteed to hit the `Err` arm.
+    ///
+    /// Unix-only: the wedge fixture (`sh -c "stty raw -echo; sleep 30"`) and
+    /// `write_actor` itself don't exist on Windows.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn handle_inject_returns_ok_false_on_genuine_actor_write_failure_2620() {
         let name = "wedged-inject-target";
         let (ctx, home) = test_ctx_with_wedged_agent(name);

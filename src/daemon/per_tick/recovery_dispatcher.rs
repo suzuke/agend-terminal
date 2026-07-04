@@ -870,7 +870,9 @@ mod tests {
     /// DROPS this file's custom `target: TARGET` ("recovery_shadow") events —
     /// same gotcha `state::tests::capture_all_logs` documents (verified
     /// empirically there too) — so an unfiltered subscriber is installed for
-    /// the closure's duration instead.
+    /// the closure's duration instead. `cfg`-gated with its sole caller below
+    /// (Unix-only) to avoid an unused-fn warning on Windows.
+    #[cfg(not(target_os = "windows"))]
     fn capture_all_logs<F: FnOnce()>(f: F) -> String {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
@@ -920,7 +922,12 @@ mod tests {
     /// write failure here has nothing left to escalate to; it falls
     /// through to `Stage1Pending` (a one-shot "attempted, stop" marker),
     /// which is what this test pins.
+    ///
+    /// Unix-only: the wedge fixture (`sh -c "stty raw -echo; sleep 30"`) and
+    /// `write_actor` itself don't exist on Windows (mirrors the other
+    /// real-PTY-wedge tests in this codebase).
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn fire_stage1_pty_write_failure_lands_in_stage1_pending_real_actor_2620() {
         let registry: agent::AgentRegistry =
             std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
