@@ -25,6 +25,9 @@ use dismiss::{
 
 pub mod deleting;
 
+#[cfg(unix)]
+mod write_actor;
+
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Core state for one agent — protected by a single Mutex for atomic operations.
@@ -1264,6 +1267,11 @@ pub fn spawn_agent(
             .take_writer()
             .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
     ));
+    // #P1-2607: register before `pair.master` moves into `pty_master` below
+    // (still available here) so this writer's future writes route through
+    // the poll-driven actor instead of a disposable thread-per-write.
+    #[cfg(unix)]
+    write_actor::register(&pty_writer, pair.master.as_ref());
     let mut pty_reader = pair
         .master
         .try_clone_reader()
@@ -1642,6 +1650,12 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
                 .take_writer()
                 .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
         ));
+        // #P1-2607: register before `pair.master` moves into `pty_master`
+        // below (still available here) so this writer's future writes
+        // route through the poll-driven actor instead of a disposable
+        // thread-per-write.
+        #[cfg(unix)]
+        write_actor::register(&pty_writer, pair.master.as_ref());
         let mut pty_reader = pair
             .master
             .try_clone_reader()
@@ -2562,9 +2576,22 @@ fn handle_pty_close(
 /// if it doesn't complete within the timeout, returns TimedOut error.
 /// Uses an AtomicBool guard to prevent thread accumulation: if a previous
 /// write is still stuck, returns TimedOut immediately without spawning.
+///
+/// #P1-2607 (t-...67777-5): superseded, for any `writer` registered with
+/// `write_actor` (every real PTY on Unix — see `write_actor::register`, called
+/// at both production agent-spawn sites), by a single shared poll-driven
+/// actor thread instead of a disposable thread per write. This function's
+/// thread-per-write body below is now the FALLBACK for an unregistered
+/// writer (Windows, where `MasterPty::as_raw_fd()` returns `None`; any
+/// synthetic/test writer never passed through `register`) — unchanged.
 const PTY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Per-writer in-progress guard. Keyed by Arc identity (pointer address).
+/// Only consulted by the fallback (unregistered-writer) path below — the
+/// write_actor path has its own per-writer queueing that makes this guard
+/// unnecessary (a second write to a busy writer queues instead of needing
+/// to fail-fast to avoid thread pile-up, since there is no per-write thread
+/// to pile up anymore).
 static WRITE_IN_PROGRESS: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::OnceLock::new();
@@ -2573,7 +2600,29 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`; its result
+/// IS the caller's result, use it directly. `None` -> no fd registered
+/// (Windows, where `MasterPty::as_raw_fd()` returns `None`; any
+/// synthetic/test writer that never went through `write_actor::register`)
+/// -- fall through to the thread-per-write mechanism below, byte-identical
+/// to before #P1-2607. A runtime branch, not a compile-time platform split:
+/// on non-Unix this always returns `None` and the fallback runs
+/// unconditionally, unchanged.
+#[cfg(unix)]
+fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
+    write_actor::fd_for(writer).map(|fd| write_actor::write(fd, data.to_vec(), PTY_WRITE_TIMEOUT))
+}
+
+#[cfg(not(unix))]
+fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
+    None
+}
+
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
+    if let Some(result) = try_actor_write(writer, data) {
+        return result;
+    }
+
     let key = Arc::as_ptr(writer) as usize;
 
     // If a previous write is still stuck, fail fast.
