@@ -41,6 +41,40 @@ const FALLBACK_RECIPIENT: &str = "lead";
 /// Inbox kind of a CI handoff message.
 const HANDOFF_KIND: &str = "ci-ready-for-action";
 
+/// #26795: if `correlation`'s (`owner/repo@branch`) PR is already known to be
+/// merge-blocked (REJECTED verdict or Draft) per the CACHED `pr_state`
+/// snapshot, resolve its `ci_handoff_track` entry and report `true`. Read-only
+/// from `ci_watch`'s perspective — this never touches the watch registry or
+/// makes a GitHub call, only reads whatever `pr_state::record_verdict` last
+/// wrote when a reviewer's report was processed. Returns `false` (no-op) if
+/// no `pr_state` file exists yet for this correlation, or its verdict isn't
+/// blocking.
+fn resolve_if_merge_blocked(home: &Path, correlation: &str) -> bool {
+    let Some((repo, branch)) = correlation.split_once('@') else {
+        return false;
+    };
+    let blocked = crate::daemon::pr_state::with_pr_state(home, repo, branch, |s| {
+        crate::daemon::pr_state::is_ci_ready_merge_blocked(s)
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if blocked {
+        tracing::info!(
+            tag = "#26795-track-merge-blocked",
+            %correlation,
+            "ci-handoff track resolved — pr_state cache shows REJECTED/Draft; \
+             re-nudging further would be pure noise"
+        );
+        crate::daemon::ci_handoff_track::resolve_by_correlation(
+            home,
+            correlation,
+            "pr_merge_blocked_inline",
+        );
+    }
+    blocked
+}
+
 /// Scan every fleet instance for `ci-ready-for-action` handoffs it received but
 /// never read; (1) #1859: RE-NUDGE the target itself (daemon-side redelivery) and
 /// (2) escalate timed-out ones to the target's team lead. `last_escalated` /
@@ -119,6 +153,22 @@ pub(crate) fn scan_and_emit_with<F>(
             let corr = track.correlation.clone();
             let key = (target.clone(), corr.clone());
             active.insert(key.clone());
+
+            // #26795: a PR already known to be merge-blocked (REJECTED verdict /
+            // Draft) is unactionable by the target no matter how many times we
+            // re-nudge — resolve right here instead of relying on the SEPARATE
+            // `pr_state::scanner` tick to (maybe) reach the same conclusion.
+            // That tick's own resolve path, like `resolve_head_advanced` below,
+            // depends on an active `ci_watch` continuing to refresh state for
+            // this branch; once polling stops (superseded / no active watch —
+            // the exact orphan-track class this fixes), neither ever fires
+            // again except the 24h backstop. This check reads the CACHED
+            // `pr_state` snapshot instead — written the moment a reviewer's
+            // report is processed (`pr_state::record_verdict`), independent of
+            // `ci_watch` state entirely. No GitHub call, no new dependency.
+            if resolve_if_merge_blocked(home, &corr) {
+                continue;
+            }
 
             // (1) #1859 Fix A: daemon-side RE-NUDGE of the target itself. The
             // poller's actionable `[ci-ready-for-action]` wake can be deferred
@@ -738,6 +788,86 @@ mod tests {
         assert_eq!(
             count, 1,
             "2 unread handoffs for one idle target must collapse to a single re-nudge: {nudged:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Write a `pr_state` file with `verdict_state = Rejected` for `repo@branch`
+    /// — mirrors what `pr_state::mod::record_verdict` writes the moment a
+    /// reviewer's REJECTED report is processed, independent of whether any
+    /// `ci_watch` is currently active for that branch (the write itself doesn't
+    /// touch the watch registry at all).
+    fn seed_rejected_pr_state(home: &Path, repo: &str, branch: &str, head_sha: &str) {
+        use crate::daemon::pr_state::{
+            CiState, DraftState, MergeState, PrState, ReviewClass, VerdictState,
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::daemon::pr_state::with_pr_state_or_create(
+            home,
+            repo,
+            branch,
+            || PrState {
+                repo: repo.to_string(),
+                pr_number: 1,
+                branch: branch.to_string(),
+                head_sha: head_sha.to_string(),
+                pr_author: "dev".to_string(),
+                subscribers: vec!["reviewer".to_string()],
+                ci_state: CiState::Pending,
+                verdict_state: VerdictState::None,
+                merge_state: MergeState::NotReady,
+                draft_state: DraftState::Ready,
+                review_class: ReviewClass::Single,
+                ready_emitted_for_sha: None,
+                auto_armed: false,
+                auto_armed_for_sha: None,
+                auto_armed_at: None,
+                last_gh_poll_at: None,
+                gh_poll_failures: 0,
+                last_gh_state: None,
+                closed_unmerged_pending: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            |s| {
+                s.verdict_state = VerdictState::Rejected {
+                    reviewer: "reviewer".to_string(),
+                    reviewed_head: head_sha.to_string(),
+                    reason: None,
+                };
+            },
+        )
+        .unwrap();
+    }
+
+    /// #26795 RED baseline (Phase 1 RCA — REJECTED-head orphan track class):
+    /// a `ci-ready-for-action` track whose PR was REJECTED (verdict already
+    /// recorded in the pr_state cache, independent of any active `ci_watch`)
+    /// must not keep re-nudging — the outcome is already known and unactionable
+    /// by the target. Pre-fix, the watchdog has no idea the PR is
+    /// merge-blocked (it only scans `ci_handoff_track`, never cross-checks
+    /// `pr_state`), so this currently FAILS (renudge fires anyway) — this is
+    /// the RED baseline; the fix makes it pass without touching the
+    /// `RENUDGE_AFTER_MINS`/`RENUDGE_INTERVAL_MINS` gating itself.
+    #[test]
+    fn renudge_skips_when_pr_state_shows_merge_blocked() {
+        let home = tmp_home("merge-blocked");
+        write_fleet(&home);
+        seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_rejected_pr_state(&home, "o/r", "feat", "sha-A");
+
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            !nudged.contains(&"reviewer".to_string()),
+            "a REJECTED (merge-blocked) PR's ci-ready handoff must not keep \
+             re-nudging — the pr_state cache already shows the outcome, \
+             independent of ci_watch state: {nudged:?}"
         );
         std::fs::remove_dir_all(home).ok();
     }
