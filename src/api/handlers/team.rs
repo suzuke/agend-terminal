@@ -83,6 +83,31 @@ fn plan_member_names(
     names
 }
 
+/// #991 PR-B: build each planned member's fleet.yaml entry — extracted from
+/// `handle_create_team`'s Phase 1 so `topic_binding_mode` propagation is
+/// unit-testable without going through Phase 2's real PTY spawn (`spawn_one`
+/// has no direct test coverage anywhere in this codebase — it forks a real
+/// process).
+fn build_member_entries(
+    planned: &[(String, String, std::path::PathBuf)],
+    topic_binding_mode: Option<&str>,
+) -> Vec<(String, crate::fleet::InstanceYamlEntry)> {
+    planned
+        .iter()
+        .map(|(name, be, wd)| {
+            (
+                name.clone(),
+                crate::fleet::InstanceYamlEntry {
+                    backend: Some(be.clone()),
+                    working_directory: Some(wd.display().to_string()),
+                    topic_binding_mode: topic_binding_mode.map(String::from),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     let team_name = match params["name"].as_str() {
@@ -101,10 +126,19 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         vec![backend; count]
     };
     let count = per_member_backends.len();
+    // #991 PR-B: team-level default, shared by every spawned member — same
+    // "skip"/"deferred" filter as the single-instance create_instance path
+    // (mcp/handlers/instance_state/spawn.rs); anything else (including
+    // "auto") stays None (unchanged auto-create default).
+    let topic_binding_mode: Option<String> = params["topic_binding"]
+        .as_str()
+        .filter(|s| matches!(*s, "skip" | "deferred"))
+        .map(String::from);
     tracing::info!(
         team = team_name,
         count,
         backends = ?per_member_backends,
+        topic_binding_mode = ?topic_binding_mode,
         "CREATE_TEAM begin"
     );
 
@@ -138,19 +172,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     }
 
     if !planned.is_empty() {
-        let entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = planned
-            .iter()
-            .map(|(name, be, wd)| {
-                (
-                    name.clone(),
-                    crate::fleet::InstanceYamlEntry {
-                        backend: Some(be.clone()),
-                        working_directory: Some(wd.display().to_string()),
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
+        let entries = build_member_entries(&planned, topic_binding_mode.as_deref());
         let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
             entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
         if let Err(e) = crate::fleet::add_instances_to_yaml(ctx.home, &refs) {
@@ -209,17 +231,32 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                 // warn (Pushback B: prior `let _ = ch.create_topic()`
                 // swallowed errors, same antipattern as pre-#962 silent
                 // persist).
-                match crate::channel::ensure_topic_for(inst_name) {
-                    crate::channel::TopicOutcome::Created(_)
-                    | crate::channel::TopicOutcome::NoChannel => {}
-                    crate::channel::TopicOutcome::Failed(err) => {
-                        tracing::warn!(
-                            team = team_name,
-                            member = %inst_name,
-                            error = %err,
-                            "CREATE_TEAM: channel exists but create_topic failed; \
-                             member spawn proceeds without topic"
-                        );
+                // #991 PR-B: skip/deferred opts the whole team out — mirrors
+                // the single-instance gate in api/handlers/instance.rs
+                // (handle_spawn). Without this, topic_binding_mode was
+                // correctly persisted to fleet.yaml above but a topic got
+                // created anyway (this path calls agent_ops::spawn_one
+                // directly, bypassing handle_spawn's existing gate).
+                if let Some(mode) = topic_binding_mode.as_deref() {
+                    tracing::info!(
+                        team = team_name,
+                        member = %inst_name,
+                        topic_binding_mode = mode,
+                        "CREATE_TEAM: skipping topic creation (opted out)"
+                    );
+                } else {
+                    match crate::channel::ensure_topic_for(inst_name) {
+                        crate::channel::TopicOutcome::Created(_)
+                        | crate::channel::TopicOutcome::NoChannel => {}
+                        crate::channel::TopicOutcome::Failed(err) => {
+                            tracing::warn!(
+                                team = team_name,
+                                member = %inst_name,
+                                error = %err,
+                                "CREATE_TEAM: channel exists but create_topic failed; \
+                                 member spawn proceeds without topic"
+                            );
+                        }
                     }
                 }
                 spawned.push((inst_name.clone(), backend.clone()));
@@ -515,6 +552,39 @@ mod tests_1964 {
         // Fresh team: starts at 1 and increments WITHIN one call.
         let names = plan_member_names(&fleet, "fresh", 2, |_| false);
         assert_eq!(names, vec!["fresh-1".to_string(), "fresh-2".to_string()]);
+    }
+
+    /// #991 PR-B: every planned member's fleet.yaml entry carries the
+    /// team-level `topic_binding_mode` (or None when the caller didn't opt
+    /// out — unchanged auto-create default).
+    #[test]
+    fn build_member_entries_carries_topic_binding_mode_991() {
+        let planned = vec![
+            (
+                "sqd-1".to_string(),
+                "claude".to_string(),
+                std::path::PathBuf::from("/tmp/sqd-1"),
+            ),
+            (
+                "sqd-2".to_string(),
+                "claude".to_string(),
+                std::path::PathBuf::from("/tmp/sqd-2"),
+            ),
+        ];
+
+        let skip_entries = build_member_entries(&planned, Some("skip"));
+        assert_eq!(skip_entries.len(), 2);
+        for (_, e) in &skip_entries {
+            assert_eq!(e.topic_binding_mode.as_deref(), Some("skip"));
+        }
+
+        let auto_entries = build_member_entries(&planned, None);
+        for (_, e) in &auto_entries {
+            assert!(
+                e.topic_binding_mode.is_none(),
+                "omitted topic_binding must stay None (auto default)"
+            );
+        }
     }
 
     /// #1964 Bug 2 (the live repro shape): CREATE_TEAM on an EXISTING team
