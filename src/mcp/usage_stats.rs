@@ -407,6 +407,76 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// t-20260702101119069418-7916-3: a 20-day production sample showed 2.5%
+    /// of lines in this file failing to parse — corruption shaped like
+    /// concurrent-writer interleaving (a torn line with another writer's
+    /// bytes injected mid-line). `append_line_with_policy` already serializes
+    /// via `crate::store::acquire_file_lock` (added by #2353, 8 days after
+    /// this file's original unprotected launch — the corrupted sample almost
+    /// certainly comes from that now-closed window). This test locks the
+    /// CURRENT lock-protected behavior in place: many threads racing
+    /// `record()` concurrently must never produce a torn/interleaved line —
+    /// every appended line parses as valid JSON, and none are lost.
+    #[test]
+    fn record_concurrent_writers_produce_zero_torn_lines_2620() {
+        let home = tmp_home("concurrent-record");
+        let threads = 50;
+
+        let home_arc = std::sync::Arc::new(home.clone());
+        let mut handles = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let h = std::sync::Arc::clone(&home_arc);
+            handles.push(std::thread::spawn(move || {
+                // `action` is recorded VERBATIM (build_line lifts args.action
+                // as-is, unlike opt_params which only records PARAM NAMES,
+                // not values) — a unique per-thread marker that survives into
+                // the written line, so a torn/interleaved line is directly
+                // detectable by parse failure or a missing/duplicate marker.
+                record(&h, "task", &json!({"action": format!("thread-{i}")}));
+            }));
+        }
+        for h in handles {
+            h.join().expect("record thread must not panic");
+        }
+
+        let body = std::fs::read_to_string(stats_path(&home)).expect("stats file written");
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            threads,
+            "every concurrent record() call must produce exactly one surviving line, \
+             not lost or merged with another: got {} lines, expected {threads}",
+            lines.len()
+        );
+
+        let mut seen_markers = std::collections::HashSet::new();
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!(
+                    "line {i} must parse as valid JSON (a parse failure here IS the torn-line \
+                     corruption this test guards against): {e}\nline={line:?}"
+                )
+            });
+            let marker = parsed["action"]
+                .as_str()
+                .expect("action recorded as this thread's unique marker")
+                .to_string();
+            assert!(
+                seen_markers.insert(marker.clone()),
+                "each thread's marker must appear exactly once — a duplicate means a line was \
+                 doubly-counted or a torn line coincidentally still parsed: {marker}"
+            );
+        }
+        assert_eq!(
+            seen_markers.len(),
+            threads,
+            "every thread's distinct marker must be present — a missing one means its line \
+             was silently lost or corrupted beyond parseability"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     fn tmp_home(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "agend-usage-{name}-{}-{:?}",
