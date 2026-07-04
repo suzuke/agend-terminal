@@ -232,7 +232,16 @@ fn create_instance_entries(
                 ready_pattern: yaml_str(inst_val, "ready_pattern"),
                 command: yaml_str(inst_val, "command"),
                 worktree: inst_val.get("worktree").and_then(|v| v.as_bool()),
-                topic_binding_mode: None,
+                // #991 PR-B: was hardcoded None → a template's `topic_binding:
+                // skip`/`deferred` was silently dropped. Same filter as the
+                // `create_instance` MCP path (spawn.rs): only "skip"/"deferred"
+                // persist, anything else (including "auto" or an invalid value)
+                // is None — unchanged auto default.
+                topic_binding_mode: inst_val
+                    .get("topic_binding")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| matches!(*s, "skip" | "deferred"))
+                    .map(String::from),
                 created_by: None, // no single ACL creator for templated instances
             },
         ));
@@ -359,6 +368,14 @@ fn spawn_instances(
             if !env.is_empty() {
                 params["env"] = serde_json::to_value(env).unwrap_or(serde_json::Value::Null);
             }
+        }
+        // #991 PR-B: forward the template-derived topic_binding_mode so
+        // handle_spawn's existing skip/deferred gate (api/handlers/
+        // instance.rs) actually honors it — without this, the field landed
+        // correctly in fleet.yaml (create_instance_entries) but a topic got
+        // created anyway (SPAWN defaults topic_binding to "auto" when absent).
+        if let Some(ref tb) = entry.topic_binding_mode {
+            params["topic_binding"] = serde_json::json!(tb);
         }
         let spawn_result = crate::api::call(
             home,
@@ -1301,6 +1318,65 @@ templates:
         assert!(
             inst.command.is_none(),
             "command must stay None when template only declared `backend:`"
+        );
+        assert!(
+            inst.topic_binding_mode.is_none(),
+            "#991: topic_binding_mode must stay None (auto default) when template doesn't declare `topic_binding`"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #991 PR-B: a deployment template's per-instance `topic_binding: skip`/
+    /// `deferred` must persist to fleet.yaml — mirrors the same filter
+    /// `create_instance` uses (mcp/handlers/instance_state/spawn.rs): only
+    /// "skip"/"deferred" persist, an invalid value is silently treated as
+    /// unset (auto default), same as an invalid `create_instance` call.
+    #[test]
+    fn deploy_persists_topic_binding_into_fleet_yaml() {
+        let home = tmp_home("topic_binding_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      quiet:
+        backend: claude
+        topic_binding: skip
+      retrofit:
+        backend: claude
+        topic_binding: deferred
+      bogus:
+        backend: claude
+        topic_binding: not_a_real_mode
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert_eq!(
+            reloaded
+                .instances
+                .get("dev-quiet")
+                .and_then(|i| i.topic_binding_mode.clone()),
+            Some("skip".to_string())
+        );
+        assert_eq!(
+            reloaded
+                .instances
+                .get("dev-retrofit")
+                .and_then(|i| i.topic_binding_mode.clone()),
+            Some("deferred".to_string())
+        );
+        assert_eq!(
+            reloaded
+                .instances
+                .get("dev-bogus")
+                .and_then(|i| i.topic_binding_mode.clone()),
+            None,
+            "an invalid topic_binding value must not persist — same as an invalid create_instance call"
         );
         std::fs::remove_dir_all(&home).ok();
     }

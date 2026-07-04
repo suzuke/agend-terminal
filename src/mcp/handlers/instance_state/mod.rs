@@ -102,6 +102,11 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                 "name": team_name,
                 "backends": per_member_backends,
                 "description": args.get("description"),
+                // #991 PR-B: team-level default (all spawned members share
+                // it) — forwarded to handle_create_team, which persists +
+                // gates topic creation the same way handle_spawn does for
+                // single-instance create_instance.
+                "topic_binding": args.get("topic_binding"),
             }}),
         ) {
             Ok(resp) if resp["ok"].as_bool() == Some(true) => {
