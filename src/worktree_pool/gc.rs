@@ -699,9 +699,10 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // t-worktree-leak PR-2 (codex gap ① CRITICAL): a force-reclaim candidate MUST
     // NEVER be hard-deleted. Route it through the SINGLE safe deletion path
     // (retention's `maybe_remove_candidate`: pre-archive liveness re-check +
-    // atomic archive-to-trash + unbind + LOUD confidence ALERT), so the daemon
-    // `gc_run` path and the retention sweep cannot diverge into an irrecoverable
-    // delete. Clean-release candidates keep the historical hard-delete below.
+    // atomic archive-to-trash + unbind + LOUD confidence ALERT), so this path
+    // and the clean-release archive-fallthrough below cannot diverge into an
+    // irrecoverable delete. Clean-release candidates keep the historical
+    // hard-delete below (ungated, unconditional — decision Q3).
     if candidate.kind == GcKind::ForceReclaim {
         use crate::daemon::retention::worktrees::{maybe_remove_candidate, RemovalOutcome};
         let outcome = maybe_remove_candidate(home, candidate);
@@ -724,12 +725,18 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     let _lock = match crate::store::acquire_file_lock(&lock_path) {
         Ok(l) => l,
         Err(e) => {
-            return GcResult {
-                path: wt_path.clone(),
-                agent: candidate.agent.clone(),
-                removed: false,
-                error: Some(format!("skipped: binding lock acquisition failed: {e}")),
-            };
+            // #2550 W5 (decision d-20260703062722787157-1, Q1): the ORIGINAL
+            // two-tick fallback (this skip, caught later by an independent
+            // retention sweep) is decided intentional defense-in-depth — kept,
+            // but as an IMMEDIATE same-pass fallthrough instead of waiting for
+            // a separately-cadenced re-scan. This candidate is still eligible
+            // (we haven't re-validated yet, but the ONLY reason we're here is
+            // lock contention, not invalidity) — hand it to the archive path.
+            return archive_fallthrough_result(
+                home,
+                candidate,
+                format!("skipped: binding lock acquisition failed: {e}"),
+            );
         }
     };
 
@@ -737,6 +744,11 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // changed since gc_candidates() enumerated this worktree. t-worktree-leak
     // PR-2: re-snapshot liveness here too, so a force-reclaim candidate whose
     // agent came back to life between enumeration and removal is spared (fencing).
+    //
+    // NOTE: unlike the lock-failure and later branches, a re-validation
+    // failure means the candidate is NO LONGER ELIGIBLE (rebound / re-pinned /
+    // grace state changed) — a fresh gc_candidates() scan wouldn't find it
+    // either, so this does NOT fall through to the archive path.
     let live_agents: std::collections::HashSet<String> =
         crate::runtime::list_agents_with_fallback(home)
             .into_iter()
@@ -756,26 +768,16 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // disk; the remove_dir_all fallback then physically deletes the dir but
     // CANNOT prune the owning repo's registry (the prune is keyed on
     // source_repo) → a prunable-registry leak that blocks re-lease. If the
-    // owning repo can't be resolved, skip rather than run git cwd-less; a later
-    // pass reclaims it once `.git` is resolvable.
+    // owning repo can't be resolved, fall through to the archive path (still
+    // eligible, just couldn't act) rather than run git cwd-less.
     let Some(source_repo) = resolve_source_repo(wt_path) else {
-        return GcResult {
-            path: wt_path.clone(),
-            agent: candidate.agent.clone(),
-            removed: false,
-            error: Some(
-                "skipped: owning source repo unresolved — refusing to run \
-                 `git worktree remove` without the owning-repo cwd"
-                    .to_string(),
-            ),
-        };
-    };
-
-    let mut result = GcResult {
-        path: wt_path.clone(),
-        agent: candidate.agent.clone(),
-        removed: false,
-        error: None,
+        return archive_fallthrough_result(
+            home,
+            candidate,
+            "skipped: owning source repo unresolved — refusing to run \
+             `git worktree remove` without the owning-repo cwd"
+                .to_string(),
+        );
     };
 
     // git-raw-allowed: kept raw (not git_cmd) per the decided #2128 migration
@@ -790,9 +792,12 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     .env("AGEND_GIT_BYPASS", "1")
     .current_dir(&source_repo);
     match cmd.output() {
-        Ok(o) if o.status.success() => {
-            result.removed = true;
-        }
+        Ok(o) if o.status.success() => GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: true,
+            error: None,
+        },
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
             tracing::warn!(
@@ -805,9 +810,20 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
             if !wt_path.exists() {
                 // W1.2: best-effort prune (result already ignored).
                 let _ = crate::git_helpers::git_ok(&source_repo, &["worktree", "prune"]);
-                result.removed = true;
+                GcResult {
+                    path: wt_path.clone(),
+                    agent: candidate.agent.clone(),
+                    removed: true,
+                    error: None,
+                }
             } else {
-                result.error = Some(format!("git worktree remove failed: {stderr}"));
+                // Both `git worktree remove` and `remove_dir_all` failed — the
+                // worktree is still on disk and still eligible. Fall through.
+                archive_fallthrough_result(
+                    home,
+                    candidate,
+                    format!("git worktree remove failed: {stderr}"),
+                )
             }
         }
         Err(e) => {
@@ -817,10 +833,30 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
                 error = %e,
                 "gc: git command failed"
             );
-            result.error = Some(format!("git command failed: {e}"));
+            archive_fallthrough_result(home, candidate, format!("git command failed: {e}"))
         }
     }
-    result
+}
+
+/// #2550 W5: hand a still-eligible CleanRelease candidate the hard-delete
+/// attempt could not act on to the (gated) archive path, translating the
+/// `RemovalOutcome` into this function's `GcResult` shape.
+fn archive_fallthrough_result(
+    home: &Path,
+    candidate: &GcCandidate,
+    hard_delete_skip_reason: String,
+) -> GcResult {
+    use crate::daemon::retention::worktrees::{archive_fallthrough, RemovalOutcome};
+    let outcome = archive_fallthrough(home, candidate, hard_delete_skip_reason);
+    GcResult {
+        path: candidate.path.clone(),
+        agent: candidate.agent.clone(),
+        removed: matches!(outcome, RemovalOutcome::Removed),
+        error: match outcome {
+            RemovalOutcome::Skipped { reason } => Some(reason),
+            RemovalOutcome::Removed => None,
+        },
+    }
 }
 
 /// Resolve the source (owning) repo from a worktree's `.git` file.

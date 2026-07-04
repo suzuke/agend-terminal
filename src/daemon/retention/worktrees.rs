@@ -403,7 +403,12 @@ fn emit_force_reclaim_alert(
 /// Purge `.trash/worktrees/*` entries older than `AGEND_WORKTREE_GC_TRASH_DAYS`
 /// days (default 7). `days=0` purges every entry — including those archived
 /// earlier in this same sweep tick.
-pub(super) fn purge_trash(home: &Path) {
+///
+/// #2550 W5: `pub(crate)` — the old standalone `sweep()` called this at the
+/// end of its own scan; now that GC is a single driver, `gc_tick` calls it
+/// directly after `gc_run` on the SAME (fire-on-first) cadence `sweep()` used
+/// to run on independently (fire-on-Nth) — same frequency, no phase lag.
+pub(crate) fn purge_trash(home: &Path) {
     let root = trash_root(home);
     if !root.exists() {
         return;
@@ -452,44 +457,72 @@ pub(super) fn purge_trash(home: &Path) {
     }
 }
 
-/// Sweep worktree GC candidates. Gated on `AGEND_WORKTREE_GC=1`. Archives
-/// clean orphan worktrees to `.trash`, then purges `.trash` entries older
-/// than the retention window (N=0 → same-tick purge).
-/// Returns the number of worktrees archived this tick.
-pub(super) fn sweep(home: &Path) -> usize {
-    if std::env::var("AGEND_WORKTREE_GC").as_deref() != Ok("1") {
-        return 0;
+/// #2550 W5: is the worktree-GC archive path enabled? Same `AGEND_WORKTREE_GC=1`
+/// opt-in gate the old standalone `sweep()` used — gate coverage is
+/// deliberately UNCHANGED by the W5 unification (decision d-20260704035059093740-0
+/// Q3): a CleanRelease hard-delete attempt stays unconditional, but the
+/// same-pass archive-fallthrough for a candidate the hard-delete attempt
+/// couldn't act on (`worktree_pool::gc_remove_one`) only fires when this is on.
+pub(crate) fn worktree_gc_archive_gate_enabled() -> bool {
+    std::env::var("AGEND_WORKTREE_GC").as_deref() == Ok("1")
+}
+
+/// Archive a single already-classified candidate this tick's hard-delete
+/// attempt could not act on (lock contention, unresolved owning repo, or the
+/// `git worktree remove` + `remove_dir_all` fallback both failing) — NOT for a
+/// candidate re-validation found no longer eligible (that candidate is
+/// correctly gone, not retried). Gated on [`worktree_gc_archive_gate_enabled`].
+/// This is the single remaining piece of the old standalone `sweep()`'s job:
+/// the OTHER piece (re-scanning every candidate independently on its own
+/// ~1h-delayed cadence) is now redundant — `gc_run`'s own fresh
+/// `gc_candidates()` scan already covers every candidate every tick, so a
+/// second independent scan added nothing but the ~1h phase lag decision Q2
+/// fixed (P3-2550-SPIKE.md §2a, decision d-20260703062722787157-1).
+pub(crate) fn archive_fallthrough(
+    home: &Path,
+    candidate: &crate::worktree_pool::GcCandidate,
+    hard_delete_skip_reason: String,
+) -> RemovalOutcome {
+    if !worktree_gc_archive_gate_enabled() {
+        return RemovalOutcome::Skipped {
+            reason: hard_delete_skip_reason,
+        };
     }
-    let candidates = crate::worktree_pool::gc_candidates(home);
-    let mut removed = 0;
-    for c in &candidates {
-        match maybe_remove_candidate(home, c) {
-            RemovalOutcome::Removed => {
-                removed += 1;
-                tracing::info!(
-                    agent = %c.agent,
-                    path = %c.path.display(),
-                    "retention: worktree archived"
-                );
-                crate::event_log::log(
-                    home,
-                    "retention_worktree_archived",
-                    &c.agent,
-                    &format!("path={}", c.path.display()),
-                );
-            }
-            RemovalOutcome::Skipped { ref reason } => {
-                crate::event_log::log(
-                    home,
-                    "retention_worktree_skipped",
-                    &c.agent,
-                    &format!("path={} reason={reason}", c.path.display()),
-                );
+    match maybe_remove_candidate(home, candidate) {
+        RemovalOutcome::Removed => {
+            tracing::info!(
+                agent = %candidate.agent,
+                path = %candidate.path.display(),
+                "gc: hard-delete skipped, archive-fallthrough succeeded"
+            );
+            crate::event_log::log(
+                home,
+                "retention_worktree_archived",
+                &candidate.agent,
+                &format!(
+                    "path={} (archive-fallthrough after: {hard_delete_skip_reason})",
+                    candidate.path.display()
+                ),
+            );
+            RemovalOutcome::Removed
+        }
+        RemovalOutcome::Skipped { reason } => {
+            crate::event_log::log(
+                home,
+                "retention_worktree_skipped",
+                &candidate.agent,
+                &format!(
+                    "path={} reason={hard_delete_skip_reason}; archive-fallthrough also skipped: {reason}",
+                    candidate.path.display()
+                ),
+            );
+            RemovalOutcome::Skipped {
+                reason: format!(
+                    "{hard_delete_skip_reason}; archive-fallthrough also skipped: {reason}"
+                ),
             }
         }
     }
-    purge_trash(home);
-    removed
 }
 
 #[cfg(test)]
@@ -1274,16 +1307,18 @@ mod tests {
 
     /// Baseline (no forced skip): `gc_run` hard-deletes a CleanRelease candidate
     /// through the real `gc_candidates()` discovery path — confirms it lands
-    /// NOWHERE in `.trash` (a genuine hard delete, not the retention path's
-    /// archive), and that `sweep`'s own fresh re-scan afterward finds nothing left
-    /// to do (no double-processing).
+    /// NOWHERE in `.trash` (a genuine hard delete, not the archive path), and
+    /// that a SECOND `gc_run` pass finds nothing left to do (no
+    /// double-processing). #2550 W5: there is no more standalone `sweep()` to
+    /// call separately — `gc_run` is the single driver, so idempotency is
+    /// checked by invoking it again.
     #[test]
-    fn gc_run_hard_deletes_clean_release_then_sweep_is_noop_2550_w1() {
-        // `sweep` (unlike `gc_run`) is gated on `AGEND_WORKTREE_GC=1` and calls
-        // `purge_trash`, which reads `AGEND_WORKTREE_GC_TRASH_DAYS` — reuse the
-        // existing env-var lock so this doesn't race a parallel TRASH_DAYS test.
+    fn gc_run_hard_deletes_clean_release_then_second_pass_is_noop_2550_w1() {
+        // Reuse the existing env-var lock: `purge_trash` (called every
+        // `gc_tick` pass now, unconditionally — see gc_tick.rs) reads
+        // `AGEND_WORKTREE_GC_TRASH_DAYS`, so this must not race a parallel
+        // TRASH_DAYS test.
         let _env_guard = gc_trash_env_guard();
-        std::env::set_var("AGEND_WORKTREE_GC", "1");
 
         let dir = tmp_home("w1-baseline-clean");
         let repo = setup_git_repo(&dir);
@@ -1317,12 +1352,11 @@ mod tests {
             "CleanRelease via gc_run is a HARD delete — must NOT land in .trash"
         );
 
-        let removed_by_sweep = sweep(&dir);
-        assert_eq!(
-            removed_by_sweep, 0,
-            "nothing left for retention sweep on its own fresh re-scan — gc_run already handled it"
+        let second_pass = crate::worktree_pool::gc_run(&dir);
+        assert!(
+            !second_pass.iter().any(|r| r.agent == "dev-baseline"),
+            "nothing left for a second gc_run pass to find — already handled: {second_pass:?}"
         );
-        std::env::remove_var("AGEND_WORKTREE_GC");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1375,21 +1409,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **The Q1 pin** (P3-2550-SPIKE.md §2a, decision d-20260703062722787157-1):
-    /// when `gc_run`'s own hard-delete path SKIPS a CleanRelease candidate, the
-    /// retention `sweep` running later in the SAME tick must catch it and archive
-    /// it — this two-stage fallback is now a decided, intentional piece of defense
-    /// -in-depth (not an accidental side effect of two independent scanners), and
-    /// this test is what W5's unification must not regress.
+    /// **The Q1 pin** (P3-2550-SPIKE.md §2a, decision d-20260703062722787157-1;
+    /// re-scoped for the W5 unification per decision d-20260704035059093740-0):
+    /// when `gc_run`'s own hard-delete path can't act on a still-eligible
+    /// CleanRelease candidate, the SAME `gc_run` call's archive-fallthrough
+    /// must catch it — this two-stage fallback is decided intentional
+    /// defense-in-depth (not an accidental side effect of two independent
+    /// scanners), now delivered within one pass instead of waiting for a
+    /// separately-cadenced re-scan. This test is what W5's unification must
+    /// not regress; gated on `AGEND_WORKTREE_GC=1` per decision Q3 (gate
+    /// coverage unchanged — this is the same gate the old standalone `sweep()`
+    /// checked).
     ///
     /// Forces the skip by making `gc_run`'s OWN binding-lock acquisition
-    /// (gc.rs:753-758) fail with a genuine I/O error — NOT lock contention:
-    /// `acquire_file_lock` is a BLOCKING flock, so holding the lock ourselves on
-    /// the same thread before calling `gc_run` would deadlock the test. Putting a
-    /// REGULAR FILE where the lock's parent directory must be created reproduces
-    /// gc.rs:758's `Err` arm deterministically and non-blockingly.
+    /// (gc.rs's CleanRelease branch) fail with a genuine I/O error — NOT lock
+    /// contention: `acquire_file_lock` is a BLOCKING flock, so holding the
+    /// lock ourselves on the same thread before calling `gc_run` would
+    /// deadlock the test. Putting a REGULAR FILE where the lock's parent
+    /// directory must be created reproduces that `Err` arm deterministically
+    /// and non-blockingly. The blocking file is left in place through the
+    /// archive-fallthrough on purpose: `maybe_remove_candidate` never touches
+    /// this lock for a CleanRelease candidate (see its own doc comment), so
+    /// the fallthrough must succeed in the SAME call even though the
+    /// underlying condition never "resolved" — proving this is a genuinely
+    /// different, lock-independent recovery path, not a delayed retry of the
+    /// same one.
     #[test]
-    fn gc_run_skip_then_sweep_retry_archives_clean_release_1053_1058_1170() {
+    fn gc_run_archive_fallthrough_catches_clean_release_hard_delete_skip_1053_1058_1170() {
         // See the baseline test above for why this lock + env var is needed.
         let _env_guard = gc_trash_env_guard();
         std::env::set_var("AGEND_WORKTREE_GC", "1");
@@ -1408,24 +1454,9 @@ mod tests {
         let gc_results = crate::worktree_pool::gc_run(&dir);
         let this_result = gc_results.iter().find(|r| r.agent == "dev-q1");
         assert!(
-            this_result.is_some_and(|r| !r.removed),
-            "gc_run must SKIP when its own binding-lock acquisition fails: {gc_results:?}"
-        );
-        assert!(
-            lease.path.exists(),
-            "skipped candidate must still be on disk right after gc_run"
-        );
-
-        // Clear the blocking condition (the transient failure has "resolved") and
-        // let retention's sweep retry — it does NOT take this lock for
-        // CleanRelease (maybe_remove_candidate's own doc: "Clean-release archives
-        // via this fn only from the retention sweep ... we scope the lock to the
-        // force-reclaim branch to avoid changing clean-release's locking").
-        std::fs::remove_file(&agent_runtime_dir).unwrap();
-        let removed_by_sweep = sweep(&dir);
-        assert_eq!(
-            removed_by_sweep, 1,
-            "retention sweep must catch the CleanRelease candidate gc_run skipped"
+            this_result.is_some_and(|r| r.removed),
+            "gc_run's hard-delete attempt must SKIP (lock acquisition fails), but the \
+             SAME call's archive-fallthrough must still remove it: {gc_results:?}"
         );
         assert!(!lease.path.exists(), "gone from its original location");
         let archived = std::fs::read_dir(dir.join(".trash").join("worktrees"))
@@ -1436,10 +1467,46 @@ mod tests {
             .unwrap_or(false);
         assert!(
             archived,
-            "the retry must ARCHIVE (not hard-delete) — pinning the two-stage \
+            "the fallthrough must ARCHIVE (not hard-delete) — pinning the two-stage \
              fallback decision d-20260703062722787157-1 as intentional defense-in-depth"
         );
         std::env::remove_var("AGEND_WORKTREE_GC");
+        let _ = std::fs::remove_file(&agent_runtime_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same scenario, but with `AGEND_WORKTREE_GC` left unset — decision Q3
+    /// (gate coverage unchanged): the archive-fallthrough must NOT fire by
+    /// default, matching the old standalone `sweep()`'s gate exactly. The
+    /// hard-delete attempt itself stays unconditional either way (decision
+    /// Q3), so the candidate is left on disk, not silently lost.
+    #[test]
+    fn gc_run_archive_fallthrough_stays_off_by_default_2550_w5() {
+        let dir = tmp_home("w1-q1-gate-off");
+        let repo = setup_git_repo(&dir);
+        let lease =
+            crate::worktree_pool::lease(&dir, &repo, "dev-q1-gate-off", "feat/q1").expect("lease");
+        crate::binding::unbind(&dir, "dev-q1-gate-off");
+        let released = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        backdate_marker(&lease.path, "dev-q1-gate-off", "feat/q1", Some(&released));
+
+        let agent_runtime_dir = crate::paths::runtime_dir(&dir).join("dev-q1-gate-off");
+        std::fs::create_dir_all(agent_runtime_dir.parent().unwrap()).unwrap();
+        std::fs::write(&agent_runtime_dir, "blocking-file").unwrap();
+
+        // AGEND_WORKTREE_GC deliberately NOT set here.
+        let gc_results = crate::worktree_pool::gc_run(&dir);
+        let this_result = gc_results.iter().find(|r| r.agent == "dev-q1-gate-off");
+        assert!(
+            this_result.is_some_and(|r| !r.removed),
+            "with the gate off, the candidate must be SKIPPED, not archived: {gc_results:?}"
+        );
+        assert!(
+            lease.path.exists(),
+            "candidate must still be on disk — no silent loss, just left for a later pass"
+        );
+
+        let _ = std::fs::remove_file(&agent_runtime_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
