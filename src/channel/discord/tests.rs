@@ -1331,6 +1331,112 @@ fn discord_gateway_backoff_delay_attempt_zero_is_base() {
     );
 }
 
+// ── #2562 P4 (PR-3): outbound error-path — a rejected REST call surfaces Err ──
+//
+// The one systematic hole the P0–P2 outbound tests left: every method asserted
+// the happy path, none asserted that a rejected request (4xx) becomes an `Err`
+// rather than being silently treated as success. This matters most for
+// `delete`/`remove_binding`, which only do `.await?` (no `.model()`); a spike
+// confirmed against the vendored twilight-http 0.17.1 source
+// (`response/future.rs:381-404`) that the request future checks the status
+// BEFORE body deserialization — `is_success()` → `Ok`, `TOO_MANY_REQUESTS`
+// (429) → retry, every other non-2xx → an Error stage yielding
+// `Err(ErrorType::Response { status })`. So `.await?` correctly propagates a
+// 4xx; these tests pin that current-and-correct behavior. A plain 404 (not
+// 429/5xx) is used deliberately: twilight does NOT retry it, so the
+// single-request `mock_http_server` is sufficient.
+
+/// Discord API error body (Unknown Channel) the mock returns with the 404.
+const DISCORD_404_BODY: &str = r#"{"message":"Unknown Channel","code":10003}"#;
+
+/// send(): a 404 from create-message must surface as Err, never a silent success.
+#[test]
+fn discord_send_errors_on_4xx() {
+    use crate::channel::Channel;
+    let (port, handle, _captured) = mock_http_server(404, DISCORD_404_BODY);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+    let binding = test_binding(290926798999357250);
+    ch.record_binding("test-agent", binding.clone(), "\r".into());
+
+    let result = ch.send(&binding, crate::channel::OutMsg::text("hi"));
+
+    let _ = handle.join();
+    assert!(
+        result.is_err(),
+        "send must surface a 4xx as Err, got Ok: {result:?}"
+    );
+}
+
+/// edit(): a 404 from edit-message must surface as Err.
+#[test]
+fn discord_edit_errors_on_4xx() {
+    use crate::channel::Channel;
+    let (port, handle, _captured) = mock_http_server(404, DISCORD_404_BODY);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+    let msg_ref = test_msg_ref(290926798999357250, "444385199974967099");
+
+    let result = ch.edit(&msg_ref, crate::channel::OutMsg::text("x"));
+
+    let _ = handle.join();
+    assert!(
+        result.is_err(),
+        "edit must surface a 4xx as Err, got: {result:?}"
+    );
+}
+
+/// delete(): a 404 must surface as Err. Critical guard — delete only does
+/// `.await?` (no `.model()`), so this pins that the status-carrying request
+/// future still errors and is not silently swallowed.
+#[test]
+fn discord_delete_errors_on_4xx() {
+    use crate::channel::Channel;
+    let (port, handle, _captured) = mock_http_server(404, DISCORD_404_BODY);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+    let msg_ref = test_msg_ref(290926798999357250, "444385199974967099");
+
+    let result = ch.delete(&msg_ref);
+
+    let _ = handle.join();
+    assert!(
+        result.is_err(),
+        "delete must surface a 4xx as Err (no .model() call), got: {result:?}"
+    );
+}
+
+/// create_binding(): a 404 from create-guild-channel must surface as Err.
+#[test]
+fn discord_create_binding_errors_on_4xx() {
+    use crate::channel::Channel;
+    let (port, handle, _captured) = mock_http_server(404, DISCORD_404_BODY);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+
+    let result = ch.create_binding("test-agent", crate::channel::BindingOpts::default());
+
+    let _ = handle.join();
+    assert!(
+        result.is_err(),
+        "create_binding must surface a 4xx as Err, got: {result:?}"
+    );
+}
+
+/// remove_binding(): a 404 must surface as Err. Same critical guard as delete —
+/// only `.await?`, no `.model()`.
+#[test]
+fn discord_remove_binding_errors_on_4xx() {
+    use crate::channel::Channel;
+    let (port, handle, _captured) = mock_http_server(404, DISCORD_404_BODY);
+    let (ch, _tx) = make_test_channel_with_mock(port);
+    let binding = test_binding(290926798999357250);
+
+    let result = ch.remove_binding(&binding);
+
+    let _ = handle.join();
+    assert!(
+        result.is_err(),
+        "remove_binding must surface a 4xx as Err (no .model() call), got: {result:?}"
+    );
+}
+
 /// TLS smoke (network, manual): proves twilight-http 0.17's
 /// rustls-native-roots/ring stack actually completes a real TLS handshake —
 /// the one merge-gate CI can't cover (the spec tests use a plaintext mock
