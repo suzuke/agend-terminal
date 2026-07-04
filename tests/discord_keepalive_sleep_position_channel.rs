@@ -1,7 +1,7 @@
 //! channel-LOW-3 repro (static invariant): the Discord keepalive loop in
-//! `start_keepalive` (src/channel/discord.rs) must NOT `std::thread::sleep` the
-//! full `KEEPALIVE_INTERVAL_SECS` BEFORE doing any keepalive work on the first
-//! iteration.
+//! `start_keepalive` (src/channel/discord/keepalive.rs) must NOT
+//! `std::thread::sleep` the full `KEEPALIVE_INTERVAL_SECS` BEFORE doing any
+//! keepalive work on the first iteration.
 //!
 //! WHY THIS IS A BUG: the loop body opens with
 //! `std::thread::sleep(Duration::from_secs(KEEPALIVE_INTERVAL_SECS))` (30 min),
@@ -31,16 +31,17 @@ use std::path::PathBuf;
 
 #[test]
 fn discord_keepalive_does_not_sleep_before_first_refresh_channel() {
-    let discord = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/discord.rs");
+    let discord =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/channel/discord/keepalive.rs");
     let content = std::fs::read_to_string(&discord)
-        .expect("channel-LOW-3: src/channel/discord.rs must exist");
+        .expect("channel-LOW-3: src/channel/discord/keepalive.rs must exist");
     let lines: Vec<&str> = content.lines().collect();
 
     // 1. Locate `start_keepalive`.
     let fn_idx = lines
         .iter()
         .position(|l| l.contains("fn start_keepalive"))
-        .expect("channel-LOW-3: start_keepalive must exist in discord.rs");
+        .expect("channel-LOW-3: start_keepalive must exist in discord/keepalive.rs");
 
     // 2. Find the loop opener after the fn (the keepalive refresh loop).
     let loop_idx = (fn_idx..lines.len())
