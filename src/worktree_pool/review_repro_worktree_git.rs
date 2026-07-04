@@ -126,3 +126,141 @@ fn evaluate_candidate_derives_real_agent_for_slash_branch_worktree_git() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// t-...50899-10 (CR-2026-06-14 parity, data-loss): cleanup_merged_branch's
+// delete gate was `!is_merged && !is_gone` — a remote-tracking ref being gone
+// was an INDEPENDENT delete trigger, with no squash verification (unlike
+// worktree_cleanup.rs's prune_orphaned_branches, already fixed by
+// CR-2026-06-14 to require `merged || is_squash_gc_eligible`). A branch
+// pushed once, then its remote deleted (e.g. squash-merge on GitHub), that
+// keeps accruing LOCAL commits never re-pushed was reaped by `git branch -D`
+// — those unmerged local commits are unrecoverable. CORRECT: a remote-gone
+// branch carrying commits NOT reachable from default must be KEPT.
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cleanup_merged_branch_keeps_remote_gone_branch_with_unpushed_commits_worktree_git() {
+    // A bare "remote" + a clone, so `branch.<name>.remote` is real.
+    let remote = scratch("cmb-remote-gone-bare");
+    git(&remote, &["init", "--bare", "-b", "main"]);
+
+    let repo = scratch("cmb-remote-gone-clone");
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            &remote.display().to_string(),
+            &repo.display().to_string(),
+        ])
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .expect("git clone");
+
+    git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+
+    // Feature branch: push it (configures upstream), then add MORE local
+    // commits that are never re-pushed.
+    git(&repo, &["checkout", "-b", "feat/unpushed"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "first (pushed)"]);
+    git(&repo, &["push", "-u", "origin", "feat/unpushed"]);
+    git(
+        &repo,
+        &["commit", "--allow-empty", "-m", "unpushed local work"],
+    );
+    git(&repo, &["checkout", "main"]);
+
+    // Remote head deleted (e.g. PR closed / branch removed) — cleanup_merged_branch
+    // itself runs `fetch --prune` on the non-dry-run path, so is_gone will be true.
+    git(&remote, &["branch", "-D", "feat/unpushed"]);
+
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/unpushed", false);
+    assert!(
+        !deleted,
+        "must NOT delete a remote-gone branch carrying unpushed local commits \
+         (data-loss risk t-...50899-10): {reason:?}"
+    );
+    let ref_exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/feat/unpushed"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(ref_exists, "branch ref must still exist locally after skip");
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&remote).ok();
+}
+
+/// Closes the loop on the fix above: a branch that IS genuinely squash-merged
+/// (every commit's patch already applied to default) AND old enough to clear
+/// `SQUASH_GC_MIN_TIP_AGE`, with its remote gone, must still be deletable —
+/// proving the new gate reuses `is_squash_gc_eligible` rather than silently
+/// disabling remote-gone cleanup altogether.
+#[test]
+fn cleanup_merged_branch_still_deletes_aged_squash_merged_remote_gone_branch_worktree_git() {
+    let remote = scratch("cmb-squash-gone-bare");
+    git(&remote, &["init", "--bare", "-b", "main"]);
+
+    let repo = scratch("cmb-squash-gone-clone");
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            &remote.display().to_string(),
+            &repo.display().to_string(),
+        ])
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .expect("git clone");
+
+    git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+
+    // Branch tip is backdated past SQUASH_GC_MIN_TIP_AGE (24h) so the
+    // heuristic squash detection clears its age floor.
+    let old_date = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+    git(&repo, &["checkout", "-b", "feat/squashed"]);
+    std::fs::write(repo.join("feat.txt"), "feat content\n").expect("write");
+    git(&repo, &["add", "feat.txt"]);
+    std::process::Command::new("git")
+        .args(["commit", "-m", "feat: squashed body"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .env("GIT_AUTHOR_DATE", &old_date)
+        .env("GIT_COMMITTER_DATE", &old_date)
+        .output()
+        .expect("git commit dated");
+    git(&repo, &["push", "-u", "origin", "feat/squashed"]);
+
+    // Squash-apply feat/squashed's diff onto main as a separate commit (mirrors
+    // GitHub's "Squash and merge"), then simulate the remote branch deletion
+    // that follows a squash-merge.
+    git(&repo, &["checkout", "main"]);
+    git(&repo, &["cherry-pick", "--no-commit", "feat/squashed"]);
+    git(&repo, &["commit", "-m", "squash: feat/squashed body"]);
+    git(&repo, &["push", "origin", "main"]);
+    git(&remote, &["branch", "-D", "feat/squashed"]);
+
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/squashed", false);
+    assert!(
+        deleted,
+        "a genuinely squash-merged, aged, remote-gone branch must still be \
+         reaped via is_squash_gc_eligible: {reason:?}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&remote).ok();
+}

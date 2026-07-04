@@ -182,13 +182,19 @@ pub struct ReleaseOutcome {
 
 /// Delete the local branch ref after worktree release, IFF:
 /// - `managed_verified` is true (caller confirmed .agend-managed marker)
-/// - Branch is merged into main OR remote tracking ref is gone
+/// - Branch is merged into main (ancestor) OR a squash-merge orphan whose tip
+///   clears the age floor (`is_squash_gc_eligible`)
 ///
 /// SAFETY: This function ONLY receives the branch from the daemon's own
 /// binding record. User-checkout branches never reach here because
-/// release_full early-returns on unmanaged worktrees. The merge-base
-/// check below prevents deletion of unmerged branches regardless of
-/// the managed_verified flag (#1249).
+/// release_full early-returns on unmanaged worktrees. The merge-base check
+/// below prevents deletion of unmerged branches regardless of the
+/// managed_verified flag (#1249). t-...50899-10 (CR-2026-06-14 parity): a
+/// remote-tracking ref being gone is NOT by itself proof the branch's work is
+/// preserved — a branch pushed once, then its remote deleted by a squash
+/// merge, that keeps accruing unpushed local commits afterward is
+/// remote-gone yet carries committed-but-unpushed work `git branch -D` would
+/// destroy irrecoverably. Mirrors `worktree_cleanup.rs::prune_orphaned_branches`.
 ///
 /// Returns `(deleted, skip_reason)`:
 /// - `(true, None)` — branch was deleted
@@ -245,30 +251,16 @@ fn cleanup_merged_branch(
         &["merge-base", "--is-ancestor", branch, &default],
     );
 
-    let is_gone = {
-        let remote_name = crate::git_helpers::git_bypass(
-            source_repo,
-            &["config", &format!("branch.{branch}.remote")],
-        )
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-        if !remote_name.is_empty() {
-            let remote_ref = format!("refs/remotes/{remote_name}/{branch}");
-            let exists = crate::git_helpers::git_bypass(
-                source_repo,
-                &["rev-parse", "--verify", &remote_ref],
-            )
-            .map(|o| o.status.success())
-            .unwrap_or(true);
-            !exists
-        } else {
-            false
-        }
-    };
+    // t-...50899-10 / CR-2026-06-14 parity: `is_gone` (remote-tracking ref
+    // deleted) is no longer an independent delete trigger — a remote-gone
+    // branch carrying commits NOT reachable from `default` (unpushed local
+    // work) must be KEPT. Delete only when the branch's work is provably in
+    // `default`: merged (ancestor) or squash-merged (age-gated heuristic),
+    // same gate `worktree_cleanup.rs::prune_orphaned_branches` uses.
+    let squash =
+        !is_merged && crate::worktree_cleanup::is_squash_gc_eligible(source_repo, branch, &default);
 
-    if !is_merged && !is_gone {
+    if !is_merged && !squash {
         return (false, Some("branch not merged into main".to_string()));
     }
 
