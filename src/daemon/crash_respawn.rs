@@ -533,7 +533,6 @@ mod deleted_gate_tests_1913 {
                 args: vec![],
                 env: None,
                 working_dir: None,
-                worktree_source: None,
                 submit_key: "\r".to_string(),
             },
         );
@@ -623,7 +622,6 @@ mod deleted_gate_tests_1913 {
             args: vec![],
             env: None,
             working_dir: None,
-            worktree_source: None,
             submit_key: "\r".to_string(),
         };
 

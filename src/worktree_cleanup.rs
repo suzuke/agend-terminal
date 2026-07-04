@@ -3,9 +3,22 @@
 //! On by default; gated **opt-out** via `AGEND_WORKTREE_AUTO_CLEANUP=0`
 //! (any other value, or unset, leaves it enabled — see `auto_cleanup_enabled`).
 //! Sweeps worktrees whose branches are merged into main OR whose remote
-//! tracking ref has been deleted (squash-merged PRs), using the daemon's
-//! live AgentConfig registry to find repos and detect in-use worktrees.
-//! Also prunes orphaned local branches with no worktree.
+//! tracking ref has been deleted (squash-merged PRs), using live
+//! `binding.json` state (`binding::bound_source_repos`) to find repos and the
+//! daemon's AgentConfig registry to detect in-use worktrees. Also prunes
+//! orphaned local branches with no worktree.
+//!
+//! #2605: repo discovery used to come from `AgentConfig.worktree_source`, a
+//! spawn-time cache keyed on the LEGACY `{repo}/.worktrees/...` layout — under
+//! the current workspace-spawn + post-spawn-bind architecture this was always
+//! empty, so this module's git-mutating paths have never actually run against
+//! the canonical repo in production (see `BRANCH-AUDIT-20260704.md`). Fixing
+//! repo discovery activates a delete path with zero production track record,
+//! so real deletion is additionally gated **opt-in** via
+//! `AGEND_WORKTREE_PRUNE_LIVE=1` (see `prune_live_enabled`) — default is
+//! dry-run: candidates are logged (`tracing` + `event_log`), nothing is
+//! deleted, until an operator diffs the dry-run output against a fresh audit
+//! and flips the gate.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -19,6 +32,23 @@ pub fn auto_cleanup_enabled() -> bool {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+/// #2605 first-activation safety gate: returns true only when
+/// `AGEND_WORKTREE_PRUNE_LIVE` is explicitly set to "1". Unlike
+/// `auto_cleanup_enabled` (opt-out, already-trusted feature), this is
+/// deliberately **opt-in** and independent of it — the repo-discovery fix this
+/// gate ships alongside activates a `git branch -D` / `git worktree remove`
+/// path that has never run against the canonical repo before, so it must not
+/// go live merely because the already-on `AGEND_WORKTREE_AUTO_CLEANUP` default
+/// stays on. While this returns false, `sweep_from_registry` computes the
+/// exact same eligibility (squash gate, worktree-occupancy fail-closed check)
+/// but skips every mutating git call, logging would-delete candidates
+/// instead.
+pub fn prune_live_enabled() -> bool {
+    std::env::var("AGEND_WORKTREE_PRUNE_LIVE")
+        .ok()
+        .is_some_and(|v| v == "1")
 }
 
 /// Entry for a git worktree.
@@ -127,12 +157,20 @@ fn is_worktree_dirty(worktree_path: &Path) -> bool {
 ///
 /// On Windows, retries up to 3 times with exponential backoff (200ms, 400ms)
 /// to absorb transient EACCES from file locks held by preceding git processes.
+///
+/// #2605: `dry_run` skips both git calls entirely and reports success (as if
+/// removed) so the caller's candidate list reflects what WOULD happen —
+/// see `prune_live_enabled`.
 fn remove_worktree(
     repo_root: &Path,
     worktree_path: &str,
     branch: &str,
     delete_branch: bool,
+    dry_run: bool,
 ) -> bool {
+    if dry_run {
+        return true;
+    }
     let max_attempts: u32 = if cfg!(windows) { 3 } else { 1 };
     let mut wt_ok = false;
     for attempt in 0..max_attempts {
@@ -208,49 +246,78 @@ fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
     })
 }
 
-/// Runtime-based sweep: uses AgentConfig data to find repos and detect in-use worktrees.
+/// Runtime-based sweep: uses live `binding.json` state to find repos and
+/// AgentConfig working_dirs to detect in-use worktrees.
 ///
-/// `configs`: map of agent name → (working_dir, worktree_source) from daemon's live registry.
+/// `home`: daemon home — repo discovery reads every live agent's
+/// `binding.json` fresh via `binding::bound_source_repos` (#2605; self-heals
+/// for binds that happen after spawn, unlike the old spawn-time cache).
+/// `configs`: map of agent name → working_dir from daemon's live registry.
 /// `fleet_dirs`: fallback working_directories from fleet.yaml for stopped agents.
 ///
-/// Returns list of (branch, path, repo) that were removed.
+/// Returns list of (branch, path, reason) that were removed — or, while
+/// `prune_live_enabled()` is false, that WOULD have been removed (dry-run
+/// candidates; no git mutation beyond the always-on `fetch --prune` below).
+/// `reason` is one of `"merged"` / `"remote-gone"` / `"squash-merged"` — the
+/// ACTUAL eligibility signal, not a hardcoded guess (#2605 review finding:
+/// the dry-run/audit-diff this PR exists for is meaningless if every
+/// candidate claims to be "merged" regardless of why it was really swept).
+/// `path` is `"(no worktree)"` for phase-2 orphan branches, which never had
+/// one — never an empty string standing in for a real value.
 pub fn sweep_from_registry(
-    configs: &HashMap<String, (Option<PathBuf>, Option<PathBuf>)>,
+    home: &Path,
+    configs: &HashMap<String, Option<PathBuf>>,
     fleet_dirs: &[PathBuf],
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, &'static str)> {
     if !auto_cleanup_enabled() {
         return Vec::new();
     }
+    let dry_run = !prune_live_enabled();
 
-    // Collect unique source repos from active configs
-    let mut repos: HashSet<PathBuf> = HashSet::new();
-    let mut active_dirs: Vec<PathBuf> = Vec::new();
-
-    for (working_dir, worktree_source) in configs.values() {
-        if let Some(src) = worktree_source {
-            repos.insert(src.clone());
-        }
-        if let Some(wd) = working_dir {
-            active_dirs.push(wd.clone());
-        }
-    }
+    let repos: HashSet<PathBuf> = crate::binding::bound_source_repos(home)
+        .into_iter()
+        .collect();
+    let mut active_dirs: Vec<PathBuf> = configs.values().flatten().cloned().collect();
     // Add fleet.yaml dirs as fallback for stopped agents
     active_dirs.extend(fleet_dirs.iter().cloned());
 
     let mut removed = Vec::new();
 
     for repo in &repos {
-        // Prune stale remote refs before remote-gone detection
+        // #2605: fetch runs UNCONDITIONALLY, including during dry_run — unlike
+        // e.g. `worktree_pool::cleanup_merged_branch`'s dry-run-skips-fetch
+        // convention, this sweep's dry-run window exists partly to observe the
+        // fetch itself: `repos` was always empty before #2605, so this
+        // background `fetch --prune` has never actually run against the
+        // canonical repo in production. The operator needs to see its real
+        // behavior (including failures) during the observation period.
+        //
+        // #2004: fail-direction is safe (stale local refs → merge/gone checks
+        // below run on possibly-stale data, never MORE aggressive than
+        // reality — a real merge/squash is never missed by staying stale, it
+        // just waits for the next successful fetch), but a persistently
+        // failing fetch accumulates undeletable branches invisibly — surface
+        // it. Pure logging, the sweep proceeds on local refs.
         let remote = crate::git_helpers::primary_remote(repo);
-        // git-raw-allowed: NETWORK op — `git_cmd` hardcodes LOCAL_GIT_TIMEOUT (60s),
-        // too tight for a fetch; use the raw form (already AGEND_GIT_BYPASS) rather
-        // than shoehorn a network op through the local helper. (A `git_cmd_network`
-        // variant is YAGNI for this single fire-and-forget fetch.)
-        let _ = Command::new("git")
-            .args(["fetch", "--prune", &remote])
-            .current_dir(repo)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output();
+        match crate::git_helpers::git_bypass(repo, &["fetch", "--prune", &remote]) {
+            Ok(o) if !o.status.success() => {
+                tracing::warn!(
+                    repo = %repo.display(),
+                    remote = %remote,
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "fetch --prune failed during worktree/branch sweep — merge/gone checks run on possibly-stale local refs"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo.display(),
+                    remote = %remote,
+                    error = %e,
+                    "fetch --prune could not run during worktree/branch sweep — merge/gone checks run on possibly-stale local refs"
+                );
+            }
+            Ok(_) => {}
+        }
 
         // CR-2026-06-14: needed to decide whether a stale worktree's branch is
         // safe to `branch -D` (its work is in the default branch) vs must be kept
@@ -289,24 +356,32 @@ pub fn sweep_from_registry(
             // committed-but-unpushed ones). The worktree dir is still reclaimed.
             let branch_safe_to_delete =
                 merged || is_squash_gc_eligible(repo, &entry.branch, &default);
+            let reason = if merged { "merged" } else { "remote-gone" };
 
             tracing::info!(
                 branch = %entry.branch,
                 path = %entry.path,
-                reason = if merged { "merged" } else { "remote-gone" },
+                reason,
                 delete_branch = branch_safe_to_delete,
+                dry_run,
                 "removing stale worktree"
             );
-            if remove_worktree(repo, &entry.path, &entry.branch, branch_safe_to_delete) {
-                removed.push((entry.branch.clone(), entry.path.clone()));
+            if remove_worktree(
+                repo,
+                &entry.path,
+                &entry.branch,
+                branch_safe_to_delete,
+                dry_run,
+            ) {
+                removed.push((entry.branch.clone(), entry.path.clone(), reason));
             }
         }
 
         // Phase 2: prune orphaned branches (no worktree, remote gone or merged)
-        prune_stale_worktrees(repo);
-        let pruned = prune_orphaned_branches(repo);
-        for branch in pruned {
-            removed.push((branch, String::new()));
+        prune_stale_worktrees(repo, dry_run);
+        let pruned = prune_orphaned_branches(repo, dry_run);
+        for (branch, reason) in pruned {
+            removed.push((branch, "(no worktree)".to_string(), reason));
         }
     }
     removed
@@ -351,7 +426,12 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
 /// Run `git worktree prune` then delete local branches whose remote tracking
 /// ref is gone, that are merged into main, or that are squash-merge orphans
 /// (#1750-B3). Skips branches checked out in any worktree.
-fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
+///
+/// #2605: `dry_run` computes the exact same eligibility (merged/squash gate,
+/// worktree-occupancy skip) but skips the actual `git branch -D` — eligible
+/// branches are still returned (with their real reason: `"merged"` or
+/// `"squash-merged"`) so the caller can log/audit the candidate list.
+fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'static str)> {
     let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
     let wt_branches: HashSet<String> = list_worktrees(repo_root)
@@ -395,18 +475,30 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
         if !merged && !squash {
             continue;
         }
-        let ok = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
+        let ok = dry_run || crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
         if ok {
             let reason = if merged { "merged" } else { "squash-merged" };
-            tracing::info!(branch, reason, "pruned orphaned branch");
-            pruned.push(branch.clone());
+            if dry_run {
+                tracing::info!(branch, reason, "would prune orphaned branch (dry-run)");
+            } else {
+                tracing::info!(branch, reason, "pruned orphaned branch");
+            }
+            pruned.push((branch.clone(), reason));
         }
     }
     pruned
 }
 
 /// Run `git worktree prune` to clean stale worktree bookkeeping entries.
-fn prune_stale_worktrees(repo_root: &Path) {
+///
+/// #2605: `dry_run` skips this entirely — it's admin-metadata-only (no branch
+/// or file content is touched), but the first-activation gate treats ANY git
+/// mutation as out of scope for the observation window, not just data-loss-risk
+/// ones, to keep the dry-run/live boundary a single simple rule.
+fn prune_stale_worktrees(repo_root: &Path, dry_run: bool) {
+    if dry_run {
+        return;
+    }
     // W1.2: best-effort prune (result was already ignored).
     let _ = crate::git_helpers::git_ok(repo_root, &["worktree", "prune"]);
 }
@@ -449,6 +541,36 @@ mod tests {
             .expect("git");
     }
 
+    /// #2605: fake daemon `home` for `bound_source_repos` — repo discovery now
+    /// reads live `binding.json` state instead of the old configs-tuple field.
+    fn tmp_home(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-wt-v2-home-{}-{}-{}",
+            tag,
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// Seed `home/runtime/<agent>/binding.json` so `binding::bound_source_repos`
+    /// reports `source_repo` as a live-bound repo.
+    fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::to_string(&serde_json::json!({
+                "source_repo": source_repo.display().to_string()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_flag_disabled_default() {
         let _lock = ENV_LOCK.lock();
@@ -472,14 +594,79 @@ mod tests {
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
     }
 
+    // ── #2605: first-activation safety gate ──
+
+    #[test]
+    fn prune_live_disabled_by_default() {
+        let _lock = ENV_LOCK.lock();
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        assert!(
+            !prune_live_enabled(),
+            "must default to dry-run — this path has zero production track record"
+        );
+    }
+
+    #[test]
+    fn prune_live_disabled_for_non_1_value() {
+        let _lock = ENV_LOCK.lock();
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "true");
+        assert!(
+            !prune_live_enabled(),
+            "opt-in gate must require the exact value \"1\", not any truthy-looking string"
+        );
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+    }
+
+    #[test]
+    fn prune_live_enabled_when_set_to_1() {
+        let _lock = ENV_LOCK.lock();
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        assert!(prune_live_enabled());
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+    }
+
     #[test]
     fn test_sweep_noop_when_flag_disabled() {
         let _lock = ENV_LOCK.lock();
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
+        let home = tmp_home("noop-disabled");
         let configs = HashMap::new();
-        let removed = sweep_from_registry(&configs, &[]);
+        let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(removed.is_empty());
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_dry_run_by_default_identifies_but_does_not_delete() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("v2-dry-run");
+        git_in(&repo, &["branch", "feat/done"]);
+        let wt = repo.join("wt-done");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
+        );
+        git_in(&repo, &["merge", "feat/done"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE"); // explicit: default dry-run
+        let home = tmp_home("v2-dry-run");
+        let mut configs = HashMap::new();
+        configs.insert("other-agent".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        assert!(
+            removed.iter().any(|(b, _, _)| b == "feat/done"),
+            "dry-run must still report the candidate: {removed:?}"
+        );
+        assert!(
+            wt.exists(),
+            "dry-run (AGEND_WORKTREE_PRUNE_LIVE unset) must NOT actually remove the worktree"
+        );
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -495,19 +682,21 @@ mod tests {
         git_in(&repo, &["merge", "feat/done"]);
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1"); // exercise real deletion
+        let home = tmp_home("v2-merged");
         // No active agent using this worktree
         let mut configs = HashMap::new();
-        configs.insert(
-            "other-agent".to_string(),
-            (Some(repo.join("other")), Some(repo.clone())),
-        );
-        let removed = sweep_from_registry(&configs, &[]);
+        configs.insert("other-agent".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(
-            removed.iter().any(|(b, _)| b == "feat/done"),
+            removed.iter().any(|(b, _, _)| b == "feat/done"),
             "merged worktree must be removed: {removed:?}"
         );
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -524,15 +713,17 @@ mod tests {
         std::fs::write(wt.join("uncommitted.txt"), "dirty").ok();
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("v2-dirty");
         let mut configs = HashMap::new();
-        configs.insert(
-            "agent".to_string(),
-            (Some(repo.join("other")), Some(repo.clone())),
-        );
-        let removed = sweep_from_registry(&configs, &[]);
+        configs.insert("agent".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(removed.is_empty(), "dirty worktree must NOT be removed");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -550,22 +741,25 @@ mod tests {
         git_in(&wt, &["commit", "-m", "wip"]);
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("v2-unmerged");
         let mut configs = HashMap::new();
-        configs.insert(
-            "agent".to_string(),
-            (Some(repo.join("other")), Some(repo.clone())),
-        );
-        let removed = sweep_from_registry(&configs, &[]);
+        configs.insert("agent".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(removed.is_empty(), "unmerged worktree must NOT be removed");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     #[cfg(unix)] // Windows path format — t-20260424173948421544-1
     fn test_v2_active_runtime_worktree_not_removed_under_bootstrap_redirect() {
         // Production shape: agent's working_dir is <repo>/.worktrees/<agent>,
-        // worktree_source is <repo>. Sweep must NOT remove the active worktree.
+        // and the repo is discovered via a live binding.json (#2605). Sweep
+        // must NOT remove the active worktree.
         let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-active");
         git_in(&repo, &["branch", "feat/active"]);
@@ -578,20 +772,22 @@ mod tests {
         // Merged + clean, but agent is actively using this worktree
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("v2-active");
         let mut configs = HashMap::new();
         // Agent's working_dir points to the worktree (bootstrap redirect)
-        configs.insert(
-            "active-agent".to_string(),
-            (Some(wt.clone()), Some(repo.clone())),
-        );
-        let removed = sweep_from_registry(&configs, &[]);
+        configs.insert("active-agent".to_string(), Some(wt.clone()));
+        write_source_repo_binding(&home, "active-agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(
             removed.is_empty(),
             "active agent worktree must NOT be removed: {removed:?}"
         );
         assert!(wt.exists(), "worktree dir must still exist");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -663,19 +859,25 @@ mod tests {
         );
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("v2-remote-gone");
         let mut configs = HashMap::new();
-        configs.insert(
-            "other".to_string(),
-            (Some(repo.join("other")), Some(repo.clone())),
-        );
-        let removed = sweep_from_registry(&configs, &[]);
+        configs.insert("other".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "other", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(
-            removed.iter().any(|(b, _)| b == "feat/squashed"),
-            "remote-gone worktree must be removed: {removed:?}"
+            removed
+                .iter()
+                .any(|(b, _, r)| b == "feat/squashed" && *r == "remote-gone"),
+            "#2605 review finding: a remote-gone worktree's removal event must carry \
+             reason \"remote-gone\", NOT a hardcoded \"merged\" — the whole point of \
+             the dry-run/audit-diff is an honest reason per candidate: {removed:?}"
         );
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&remote_dir).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── #1750-B3: local squash-merge orphan auto-GC ──
@@ -730,10 +932,13 @@ mod tests {
             "no remote configured"
         );
 
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            pruned.iter().any(|b| b == "feat/squash-old"),
-            "#1750-B3: a squash-merged orphan past the age floor must be auto-GC'd, got: {pruned:?}"
+            pruned
+                .iter()
+                .any(|(b, r)| b == "feat/squash-old" && *r == "squash-merged"),
+            "#1750-B3/#2605: a squash-merged orphan past the age floor must be auto-GC'd \
+             with reason \"squash-merged\" (not \"merged\"), got: {pruned:?}"
         );
         std::fs::remove_dir_all(&repo).ok();
     }
@@ -758,9 +963,9 @@ mod tests {
             crate::branch_sweep::is_squash_merged(&repo, "main", "feat/squash-new"),
             "precondition: detected as squash-merged"
         );
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            !pruned.iter().any(|b| b == "feat/squash-new"),
+            !pruned.iter().any(|(b, _)| b == "feat/squash-new"),
             "#1750-B3: a squash-merged branch under the tip-age floor must NOT be GC'd yet"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -781,9 +986,9 @@ mod tests {
             !crate::branch_sweep::is_squash_merged(&repo, "main", "feat/wip"),
             "precondition: NOT squash-merged"
         );
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            !pruned.iter().any(|b| b == "feat/wip"),
+            !pruned.iter().any(|(b, _)| b == "feat/wip"),
             "#1750-B3: a real unmerged branch must NOT be GC'd"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -801,10 +1006,33 @@ mod tests {
             &["worktree", "add", wt.to_str().unwrap(), "feat/squash-wt"],
         );
 
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            !pruned.iter().any(|b| b == "feat/squash-wt"),
+            !pruned.iter().any(|(b, _)| b == "feat/squash-wt"),
             "#1750-B3: a squash-merged branch checked out in a worktree must NOT be GC'd"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn prune_orphaned_branches_dry_run_reports_but_keeps_branch_2605() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("b3-dry-run");
+        // A genuinely merged (fast-forward) branch — unambiguously eligible.
+        git_in(&repo, &["branch", "feat/merged"]);
+        git_in(&repo, &["merge", "feat/merged"]);
+
+        let pruned = prune_orphaned_branches(&repo, true);
+        assert!(
+            pruned
+                .iter()
+                .any(|(b, r)| b == "feat/merged" && *r == "merged"),
+            "#2605: dry-run must still report the eligible candidate with its real \
+             reason (\"merged\"): {pruned:?}"
+        );
+        assert!(
+            crate::git_helpers::git_ok(&repo, &["rev-parse", "--verify", "feat/merged"]),
+            "#2605: dry-run must NOT actually delete the branch"
         );
         std::fs::remove_dir_all(&repo).ok();
     }

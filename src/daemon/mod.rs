@@ -273,8 +273,6 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub working_dir: Option<PathBuf>,
-    /// Original repo root (before worktree redirect).
-    pub worktree_source: Option<PathBuf>,
     pub submit_key: String,
 }
 
@@ -1673,9 +1671,6 @@ fn spawn_and_register_agent(
         );
         return Ok(());
     }
-    let worktree_source = working_dir
-        .as_ref()
-        .and_then(|wd| crate::worktree::source_repo_of(wd));
     configs.lock().insert(
         name.clone(),
         AgentConfig {
@@ -1684,7 +1679,6 @@ fn spawn_and_register_agent(
             args: args.clone(),
             env: env.clone(),
             working_dir: working_dir.clone(),
-            worktree_source,
             submit_key: submit_key.clone(),
         },
     );
@@ -2228,7 +2222,6 @@ mod tests {
                 args: vec![],
                 env: None,
                 working_dir: None,
-                worktree_source: None,
                 submit_key: "\r".into(),
             },
         );

@@ -43,19 +43,19 @@ impl PerTickHandler for WorktreeRegistrySweepHandler {
 /// PRs have merged into main. Logged via `event_log` + tracing on every
 /// removal so operators can audit. Verbatim from `inbox_maintenance.rs`
 /// (was verbatim from the pre-extraction block at mod.rs:678-717).
+///
+/// #2605: repo discovery moved to live `binding.json` state
+/// (`sweep_from_registry` reads it via `home`) instead of the removed
+/// `AgentConfig.worktree_source` cache. Real deletion is additionally gated by
+/// `worktree_cleanup::prune_live_enabled` (default off) — while off, the same
+/// candidates are identified but not deleted, and are logged under a distinct
+/// dry-run event kind so an operator can diff them against a fresh audit
+/// before opting in.
 fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry) {
     let cfgs = configs.lock();
-    let config_data: std::collections::HashMap<
-        String,
-        (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
-    > = cfgs
+    let config_data: std::collections::HashMap<String, Option<std::path::PathBuf>> = cfgs
         .iter()
-        .map(|(name, cfg)| {
-            (
-                name.clone(),
-                (cfg.working_dir.clone(), cfg.worktree_source.clone()),
-            )
-        })
+        .map(|(name, cfg)| (name.clone(), cfg.working_dir.clone()))
         .collect();
     drop(cfgs);
     let fleet_dirs: Vec<std::path::PathBuf> =
@@ -68,15 +68,30 @@ fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry) {
                     .collect()
             })
             .unwrap_or_default();
-    let cleaned = crate::worktree_cleanup::sweep_from_registry(&config_data, &fleet_dirs);
-    for (branch, path) in &cleaned {
-        crate::event_log::log(
-            home,
-            "worktree_auto_removed",
-            branch,
-            &format!("path={path}, branch merged into main"),
-        );
-        tracing::info!(branch, path, "worktree auto-removed (branch merged)");
+    let cleaned = crate::worktree_cleanup::sweep_from_registry(home, &config_data, &fleet_dirs);
+    let dry_run = !crate::worktree_cleanup::prune_live_enabled();
+    let event_kind = if dry_run {
+        "worktree_prune_dry_run_candidate"
+    } else {
+        "worktree_auto_removed"
+    };
+    for (branch, path, reason) in &cleaned {
+        let detail = if dry_run {
+            format!("path={path}, reason={reason} (dry-run candidate, not deleted)")
+        } else {
+            format!("path={path}, reason={reason}")
+        };
+        crate::event_log::log(home, event_kind, branch, &detail);
+        if dry_run {
+            tracing::info!(
+                branch,
+                path,
+                reason,
+                "worktree prune candidate (dry-run, not deleted)"
+            );
+        } else {
+            tracing::info!(branch, path, reason, "worktree auto-removed");
+        }
     }
 }
 
