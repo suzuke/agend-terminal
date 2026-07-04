@@ -19,7 +19,6 @@ pub(crate) mod gateway;
 pub(crate) mod inbound;
 pub(crate) mod keepalive;
 pub(crate) mod protocol;
-pub(crate) mod send;
 pub(crate) mod state;
 
 #[cfg(test)]
@@ -31,5 +30,4 @@ pub(crate) use gateway::*;
 pub(crate) use inbound::*;
 pub(crate) use keepalive::*;
 pub(crate) use protocol::*;
-pub(crate) use send::*;
 pub(crate) use state::*;
