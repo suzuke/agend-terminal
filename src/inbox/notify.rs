@@ -519,13 +519,38 @@ pub(crate) fn renudge_actionable_unread(
     home: &Path,
     target: &str,
     kind: &str,
-    unread_count: usize,
+    pending_count: usize,
 ) {
     let now_field = operator_now_field();
-    let pointer = build_pending_pointer("renudge", kind, "system:ci", unread_count, &now_field);
+    let pointer = build_renudge_pointer("renudge", kind, "system:ci", pending_count, &now_field);
     if let Err(e) = inject_with_submit(home, target, &pointer) {
         tracing::debug!(%target, error = %e, "renudge_actionable_unread: inject failed");
     }
+}
+
+/// #26795: renudge-specific pointer — same shape as [`build_pending_pointer`]
+/// but labels the count honestly as `pending_handoffs`, not `inbox`. The
+/// renudge pointer's count is the target's pending `ci_handoff_track`
+/// entries; nothing is ever enqueued to the inbox for this (see
+/// `renudge_actionable_unread`'s doc comment above), so the shared
+/// formatter's `inbox={N}` + `(use inbox tool)` wording sent the receiving
+/// agent to `inbox drain` looking for a message that was never there.
+fn build_renudge_pointer(
+    id: &str,
+    kind: &str,
+    from_short: &str,
+    pending_count: usize,
+    now_field: &str,
+) -> String {
+    format!(
+        "{} id={} kind={} from={} pending_handoffs={} {} (use `ci action=status` to check)",
+        PENDING_HEADER_PREFIX,
+        sanitize_header_value(id),
+        sanitize_header_value(kind),
+        sanitize_header_value(from_short),
+        pending_count,
+        now_field,
+    )
 }
 
 /// #1335: convenience wrapper for the common daemon notification pattern:
@@ -1011,6 +1036,30 @@ mod actionable_wake_tests {
             1,
             NOW
         )));
+    }
+
+    /// #26795: the renudge pointer must not claim `inbox=N` — nothing is ever
+    /// enqueued to the inbox for a renudge (see `renudge_actionable_unread`),
+    /// so that field was sending agents to `inbox drain` looking for a
+    /// message that was never there. Still recognized as an actionable wake
+    /// (same `kind=ci-ready-for-action ` match `notification_is_actionable_
+    /// wake` uses) since the underlying handoff is genuinely actionable.
+    #[test]
+    fn renudge_pointer_does_not_claim_inbox_count() {
+        let pointer =
+            super::build_renudge_pointer("renudge", "ci-ready-for-action", "system:ci", 2, NOW);
+        assert!(
+            !pointer.contains("inbox="),
+            "renudge pointer must not claim an inbox count: {pointer}"
+        );
+        assert!(
+            pointer.contains("pending_handoffs=2"),
+            "renudge pointer must honestly label the pending-track count: {pointer}"
+        );
+        assert!(
+            is_actionable(&pointer),
+            "a ci-ready-for-action renudge must still be an actionable wake: {pointer}"
+        );
     }
 }
 
