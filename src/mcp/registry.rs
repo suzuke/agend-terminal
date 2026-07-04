@@ -430,12 +430,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_27_byte_identical() {
+    fn full_capability_roles_surface_all_28_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            27,
-            "registry baseline is 27 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27)"
+            28,
+            "registry baseline is 28 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27; #991 Phase 2: + bind_topic = 27->28)"
         );
         for role in [
             None,
@@ -447,7 +447,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 27 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 28 tools in registry order (default-all-open)"
             );
         }
     }

@@ -1094,6 +1094,7 @@ mod tests {
             "list_instances",
             "delete_instance",
             "start_instance",
+            "bind_topic",
             "interrupt",
             "set_metadata",
             "move_pane",
