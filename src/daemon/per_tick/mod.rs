@@ -72,6 +72,7 @@ pub(crate) mod thread_dump;
 pub(crate) mod tmp_review_gc;
 pub(crate) mod watchdog;
 pub(crate) mod workspace_boundary_sweep;
+pub(crate) mod worktree_registry_sweep;
 
 pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
@@ -99,6 +100,7 @@ pub(crate) use supervisor_trackers::{
 };
 pub(crate) use thread_dump::ThreadDumpHandler;
 pub(crate) use watchdog::WatchdogHandler;
+pub(crate) use worktree_registry_sweep::WorktreeRegistrySweepHandler;
 
 /// Shared per-tick context. Field types match what the daemon main loop
 /// holds verbatim — the trait is pure relocation, not abstraction. New
@@ -380,6 +382,15 @@ pub(crate) fn build_default_handlers(
         // used to provide for these 4 separately). All four run in app mode
         // too (not allowlisted out) since the live daemon is app-mode.
         Box::new(HourlyGcHandler::new(360)),
+        // #2550 W5 PR-3: worktree-registry auto-cleanup (branches whose PRs
+        // merged into main, via the runtime config registry — a different
+        // mechanism from the marker-based GC candidates above). Extracted
+        // out of InboxMaintenanceHandler (unrelated to inbox concerns,
+        // semantically GC) but kept on its OWN 60-tick cadence — SAME value
+        // as when it lived inside InboxMaintenanceHandler — per decision Q4:
+        // folding it into HourlyGcHandler's 360-tick cadence would regress
+        // its cleanup latency from ~10min to ~1h.
+        Box::new(WorktreeRegistrySweepHandler::new(60)),
         // #1967 Phase-1 (PR1): reap ephemeral workers every ~1min (6 ticks) —
         // removes/terminates terminal, max-wall-TTL-expired (cost guard), or
         // already-dead workers. Runs in app mode too (not allowlisted out); the
