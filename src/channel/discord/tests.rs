@@ -1274,3 +1274,206 @@ fn build_http_client_does_not_panic_on_bare_thread() {
          real call site)"
     );
 }
+
+// ── #2562 P4: inbound mock-gateway E2E harness ──
+//
+// These wire the two previously-separate halves — `gateway_event_to_channel_
+// event` (fixture Event → ChannelEvent) and `dispatch_channel_event`
+// (ChannelEvent → inbox) — into ONE chain that runs through the adapter's real
+// mpsc queue (`poll_event`), so a synthetic Discord gateway message is driven
+// end-to-end into the target instance's inbox with no live gateway, creds, or
+// network. This is the CI regression that replaces the manual "operator sends a
+// real message, watch it appear in the inbox" smoke. The `#[ignore]`d
+// `tls_handshake_smoke_real_discord` above stays as the one manual TLS-reach
+// smoke — it is not what these replace. Per this codebase's precedent (Telegram
+// tests its dispatch loop's BODY, not the thread), these drive `poll_event` +
+// `dispatch_channel_event` directly rather than `spawn_inbound_dispatcher`'s
+// sleep loop, avoiding timing flakiness.
+
+/// Write a minimal fleet.yaml so `fleet::resolve_uuid(home, name)` returns
+/// `uuid` — making `name` an id-native instance whose inbox lives at the UUID
+/// path (`inbox_path_resolved`), not the legacy `<name>.jsonl` path. Mirrors
+/// `inbox::storage::review_repro_inbox_notify::write_fleet_with_id`.
+fn write_fleet_with_id(home: &std::path::Path, name: &str, uuid: &str) {
+    let yaml = format!("instances:\n  {name}:\n    id: {uuid}\n");
+    std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("write fleet.yaml");
+}
+
+/// Build a real `twilight_gateway::Event::MessageCreate` from the captured
+/// wire-format fixture, overriding channel_id / author id / content so a test
+/// can control routing, the allowlist gate, and the short/long persist split
+/// while every other field stays spec-conformant.
+fn message_create_event(channel_id: u64, author_id: u64, content: &str) -> twilight_gateway::Event {
+    let fixture = include_str!("../../../tests/fixtures/discord-gateway-message-create.json");
+    let frame: serde_json::Value =
+        serde_json::from_str(fixture).expect("fixture must parse as JSON");
+    let mut d = frame.get("d").expect("fixture must have 'd' field").clone();
+    d["channel_id"] = serde_json::json!(channel_id.to_string());
+    d["author"]["id"] = serde_json::json!(author_id.to_string());
+    d["content"] = serde_json::json!(content);
+    let msg: twilight_model::channel::Message =
+        serde_json::from_value(d).expect("overridden fixture must parse as Message");
+    twilight_gateway::Event::MessageCreate(Box::new(
+        twilight_model::gateway::payload::incoming::MessageCreate(msg),
+    ))
+}
+
+/// End-to-end inbound on an id-native (UUID-keyed) topology: gateway
+/// MessageCreate → `gateway_event_to_channel_event` → the adapter's real mpsc
+/// queue → `poll_event` → `dispatch_channel_event` → the bound instance's
+/// inbox, asserted via the production resolver (`inbox::drain`) AND the on-disk
+/// UUID path. Closes the #2623/#2624 class: a name-keyed test passes while the
+/// UUID production path (`inbox_path_resolved` when fleet.yaml has an id) is
+/// never exercised. Uses a ≥200-char message so it takes the persist path
+/// (short messages are PTY-inject-only and need live daemon state this test
+/// doesn't have — same reason the routing tests above assert via log).
+#[test]
+fn inbound_e2e_gateway_message_reaches_uuid_keyed_inbox() {
+    let channel_id = 290926798999357250_u64;
+    let author_id = 82198898841029460_i64;
+    let allowlist = Some(vec![author_id]);
+    let long_text = "e2e uuid-keyed ".repeat(20); // ≥ 200 chars → persisted
+
+    let (ch, tx) = super::DiscordChannel::new_for_test();
+    let name = "dev-agent";
+    let home = dispatch_test_home("e2e-uuid");
+    let uuid = "33333333-4444-4555-8666-777777777777";
+    write_fleet_with_id(&home, name, uuid);
+    let binding = crate::channel::BindingRef::new(
+        "discord",
+        Some(format!("DC#{channel_id}")),
+        super::DiscordBindingPayload { channel_id },
+    );
+    crate::channel::Channel::record_binding(&ch, name, binding, "\r".into());
+
+    let event = message_create_event(channel_id, author_id as u64, &long_text);
+    let mapped = super::gateway_event_to_channel_event(event, &allowlist)
+        .expect("allowlisted MessageCreate must map to MessageIn");
+    tx.send(mapped)
+        .expect("push mapped event onto the adapter mpsc queue");
+    let polled =
+        crate::channel::Channel::poll_event(&ch).expect("poll_event must drain the queued event");
+    super::dispatch_channel_event(&ch, &home, polled);
+
+    // Success criterion: the message reaches the bound instance's inbox via the
+    // production read path (`drain` → `inbox_path_resolved`).
+    let msgs = crate::inbox::drain(&home, name);
+    assert!(
+        msgs.iter().any(|m| m.text == long_text),
+        "gateway message must land in the bound instance's resolved inbox; \
+         got {} msg(s), lengths: {:?}",
+        msgs.len(),
+        msgs.iter().map(|m| m.text.len()).collect::<Vec<_>>()
+    );
+    // #2623 topology guard: it persisted to <uuid>.jsonl, never <name>.jsonl.
+    let uuid_path = home.join("inbox").join(format!("{uuid}.jsonl"));
+    let name_path = home.join("inbox").join(format!("{name}.jsonl"));
+    assert!(
+        uuid_path.exists(),
+        "id-native instance must persist to the UUID inbox: {}",
+        uuid_path.display()
+    );
+    assert!(
+        !name_path.exists(),
+        "id-native instance must NOT create a legacy <name>.jsonl inbox: {}",
+        name_path.display()
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// End-to-end inbound for an UNBOUND channel: a MessageCreate whose channel_id
+/// was never `record_binding`-ed must fall back to the `"general"` instance and
+/// actually be DELIVERED there — the resolver-returns-"general" unit test above
+/// only proves the routing decision, not that the fallback message reaches
+/// general's inbox. Name-keyed topology (general has no fleet.yaml id), the
+/// complement of the UUID-keyed test above.
+#[test]
+fn inbound_e2e_unbound_channel_falls_back_to_general_inbox() {
+    let channel_id = 555000555000_u64; // never bound
+    let author_id = 82198898841029460_i64;
+    let allowlist = Some(vec![author_id]);
+    let long_text = "e2e general-fallback ".repeat(15); // ≥ 200 chars → persisted
+
+    let (ch, tx) = super::DiscordChannel::new_for_test();
+    let home = dispatch_test_home("e2e-general");
+
+    let event = message_create_event(channel_id, author_id as u64, &long_text);
+    let mapped = super::gateway_event_to_channel_event(event, &allowlist)
+        .expect("allowlisted MessageCreate must map to MessageIn");
+    tx.send(mapped).expect("push onto the adapter mpsc queue");
+    let polled =
+        crate::channel::Channel::poll_event(&ch).expect("poll_event must drain the queued event");
+    super::dispatch_channel_event(&ch, &home, polled);
+
+    let msgs = crate::inbox::drain(&home, "general");
+    assert!(
+        msgs.iter().any(|m| m.text == long_text),
+        "unbound-channel message must be delivered to the 'general' fallback inbox; \
+         got {} msg(s)",
+        msgs.len()
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The bootstrap seam `init_from_config_with_source` assembles a live
+/// `DiscordChannel` from `ChannelConfig::Discord` (token env → allowlist →
+/// channel construction → event-source wiring) WITHOUT opening a real gateway.
+/// Substituting a test source that pushes one mapped fixture event proves the
+/// config→inbox assembly the manual smoke used to guard: the fleet.yaml
+/// allowlist gates correctly and events flow through to the bound inbox.
+#[test]
+#[serial]
+fn init_from_config_with_source_wires_config_to_inbox() {
+    let channel_id = 290926798999357250_u64;
+    let author_id = 82198898841029460_i64;
+    let token_env = "AGEND_TEST_DISCORD_TOKEN_P4";
+    let long_text = "bootstrap-assembled e2e ".repeat(12); // ≥ 200 chars
+
+    // #[serial]-guarded; removed right after construction consumes it.
+    std::env::set_var(token_env, "Bot dummy-p4-token");
+    let config = crate::fleet::FleetConfig {
+        channel: Some(crate::fleet::ChannelConfig::Discord {
+            bot_token_env: token_env.to_string(),
+            guild_id: 42,
+            user_allowlist: Some(vec![author_id]),
+        }),
+        ..Default::default()
+    };
+
+    // The injected source stands in for spawn_gateway_supervisor: it receives
+    // the SAME (token, intents, allowlist, tx) production feeds, and pushes one
+    // mapped fixture event instead of opening a socket. Gating on the passed-in
+    // `allowlist` proves the fleet.yaml allowlist was wired through.
+    let text = long_text.clone();
+    let ch =
+        super::init_from_config_with_source(&config, move |_token, _intents, allowlist, tx| {
+            let event = message_create_event(channel_id, author_id as u64, &text);
+            if let Some(msg) = super::gateway_event_to_channel_event(event, &allowlist) {
+                let _ = tx.send(msg);
+            }
+        })
+        .expect("configured Discord channel must assemble to Some");
+    std::env::remove_var(token_env);
+
+    // Route the queued event through the production dispatch path.
+    let name = "dev-agent";
+    let home = dispatch_test_home("e2e-bootstrap");
+    let binding = crate::channel::BindingRef::new(
+        "discord",
+        Some(format!("DC#{channel_id}")),
+        super::DiscordBindingPayload { channel_id },
+    );
+    crate::channel::Channel::record_binding(&ch, name, binding, "\r".into());
+    let polled = crate::channel::Channel::poll_event(&ch)
+        .expect("bootstrap-wired source must have queued the event");
+    super::dispatch_channel_event(&ch, &home, polled);
+
+    let msgs = crate::inbox::drain(&home, name);
+    assert!(
+        msgs.iter().any(|m| m.text == long_text),
+        "config-assembled channel must route the allowlisted event to the inbox; \
+         got {} msg(s)",
+        msgs.len()
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
