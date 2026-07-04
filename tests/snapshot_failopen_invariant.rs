@@ -20,49 +20,53 @@
 //! source-of-truth and is bounded by `MAX_DEFER`, so a stale snapshot at worst
 //! shifts delivery timing, never invents or drops a message.
 //!
-//! ## Detection — a `syn` AST walk (PR #2612 rework #2)
+//! ## Detection — a `syn` AST walk (PR #2612 rework #3)
 //!
-//! The first two cuts scanned source text for literal call/import substrings.
-//! Both were defeated: the reviewer (cross-vantage) injected real production
-//! readers that string scanning missed — first alias/bare-call/fn-pointer
-//! forms, then crate-level grouped imports `use crate::{snapshot as snap};`
-//! and `use crate::{snapshot::{load}};`. Rust's `use` grammar (grouped,
-//! nested, aliased, glob, arbitrary spacing, multi-line) cannot be enumerated
-//! with literal substrings — that is a METHOD failure, not a patch gap.
+//! Earlier cuts scanned source text for literal substrings and were defeated by
+//! ordinary Rust the reviewer injected: alias/bare-call/fn-pointer, then
+//! crate-level grouped imports. Rust's `use` grammar cannot be enumerated with
+//! literal substrings — that is a METHOD failure. This cut parses each file
+//! with `syn`, which NORMALIZES every syntactic variant into the same tree.
 //!
-//! This cut parses each production file with `syn` and walks the AST, which
-//! NORMALIZES every syntactic variant into the same tree. A file is a
-//! "snapshot projection user" iff it contains, OUTSIDE `#[cfg(test)]`:
-//!   - a `use` tree that imports from `crate::snapshot` (any form — path,
-//!     name, rename, grouped, nested, glob), OR
-//!   - an expression/type path with consecutive segments `crate :: snapshot`.
+//! A file is a "snapshot projection user" iff, OUTSIDE `#[cfg(test)]`, it has a
+//! use-tree or an expression/type path that names the `crate::snapshot`
+//! projection module under any of the FOUR Rust module-path roots:
+//!   - `crate` — PRECISE: `snapshot` must sit directly under `crate`, which
+//!     excludes the identically named `crate::…::per_tick::snapshot` rotation
+//!     module.
+//!   - `super` / `self` — CONSERVATIVE: any `snapshot` path segment counts;
+//!     module depth is NOT resolved (wide is stable), so a false hit becomes a
+//!     benign audited entry. (A glob such as `use super::*;` is NOT matched —
+//!     any real read it enables is a bare `snapshot::X` path caught below.)
+//!   - bare `snapshot` root — CONSERVATIVE: reachable-as-projection only from
+//!     the crate root (`main.rs`/`lib.rs` declare `mod snapshot;`); elsewhere a
+//!     same-named child module (per_tick), which audits benignly.
 //!
 //! Every such file must appear in [`AUDITED_FILES`] with a role.
 //!
 //! ## Completeness argument (name-resolution-free)
 //!
-//! To read the projection a file must, in ITS OWN text, either (a) import a
-//! primitive/the module — caught by the use-tree walk regardless of grouping —
-//! or (b) name it fully-qualified `crate::snapshot::…` — caught by the path
-//! walk. No cross-file name resolution is needed: the reference is always
-//! LOCAL to the reading file. The only two ways to reference the projection
-//! WITHOUT the local token are closed by bans below, both currently at zero
-//! violations:
-//!   1. a `pub`/`pub(crate)` RE-EXPORT of `crate::snapshot` (would let a
-//!      token-free downstream file read via the alias) — banned; the
-//!      re-exporting file itself is caught, so the ban is enforceable there.
-//!   2. aliasing the crate root, `use crate as c; c::snapshot::…` — banned.
-//!
-//! Root-anchoring on `crate::snapshot` excludes the unrelated, identically
-//! named `crate::daemon::per_tick::snapshot` rotation module.
+//! To read the projection a file must, in ITS OWN text, name the module — and
+//! the module's name is `snapshot`, reachable only via one of the four roots
+//! above (Rust 2018+ forbids a bare non-rooted `use` of a local module, and
+//! `::snapshot` would be a nonexistent extern crate). All four are matched, so
+//! the reference is always caught LOCALLY; no cross-file resolution is needed.
+//! The only token-free escapes are closed:
+//!   - a `pub`/`pub(crate)` RE-EXPORT of `crate::snapshot` (precise-crate form)
+//!     is auto-banned; the re-exporting file is itself caught, so the ban is
+//!     enforceable there.
+//!   - aliasing the crate root, `use crate as c; c::snapshot::…`, is banned.
 //!
 //! Residual limits (accepted, mirroring `enqueue_drop_invariant`'s honest
-//! limits): a read manufactured entirely inside a macro body defined in
-//! another file, or via `build.rs`/`include!`, is out of scope for an
-//! AST-of-source scan. None exist and such a form would be extraordinary.
+//! limits): a `pub` re-export via a `super`/`self`/bare root is flagged as an
+//! audited file (so it is REVIEWED) but not auto-banned — distinguishing it
+//! from the benign per_tick re-export needs module resolution; a reviewer
+//! catches a leaky re-export at audit time. A read manufactured entirely inside
+//! a macro body defined in another file, or via `build.rs`/`include!`, is out
+//! of scope for an AST-of-source scan. None of these exist today.
 //!
 //! `scanner_catches_all_bypass_forms` below is the fence's fence: it proves
-//! all six reviewer forms plus glob/multi-line are caught and the bans fire.
+//! every reviewer form across all four roots is caught and the bans fire.
 //!
 //! ## The allowlist
 //!
@@ -70,18 +74,18 @@
 //! `reader`, a fail-open review; the list records that review, it does not
 //! waive it. The behavioral companion
 //! `snapshot_missing_fails_open_for_dispatch_deciders` (unit test in
-//! `src/snapshot.rs`) proves the primitives return the conservative sentinel
-//! on a missing/corrupt/old-format snapshot; it lives there because the
-//! `snapshot` module is not on the curated `lib.rs` surface.
+//! `src/snapshot.rs`) proves the primitives return the conservative sentinel on
+//! a missing/corrupt/old-format snapshot; it lives there because the `snapshot`
+//! module is not on the curated `lib.rs` surface.
 
 use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 
 /// Every production file that references the `crate::snapshot` projection, with
 /// its role. `reader` entries carry the reviewed reason a stale/missing
-/// snapshot drives only a REVERSIBLE action; `writer`/`type-user` produce or
-/// type the projection and do not read it for a decision. Suffix-matched
-/// against the `src/`-relative path.
+/// snapshot drives only a REVERSIBLE action; `writer`/`type-user`/`per-tick`
+/// produce, type, or merely name-clash with the projection and do not read it
+/// for a decision. Suffix-matched against the `src/`-relative path.
 const AUDITED_FILES: &[(&str, &str, &str)] = &[
     (
         "src/daemon/dispatch_idle/mod.rs",
@@ -123,6 +127,11 @@ const AUDITED_FILES: &[(&str, &str, &str)] = &[
         "writer",
         "the per-tick rotation handler: PRODUCES the projection via crate::snapshot::save. Not a reader; no decision reads snapshot here.",
     ),
+    (
+        "src/daemon/per_tick/mod.rs",
+        "per-tick",
+        "benign name-clash: `pub(crate) use snapshot::SnapshotRotationHandler` re-exports the SAME-NAMED per_tick child module (crate::daemon::per_tick::snapshot, the rotation handler), NOT the crate::snapshot projection. The conservative bare-root rule cannot resolve the two apart, so this is audited as benign. Reads no snapshot.",
+    ),
 ];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -154,32 +163,90 @@ fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// Given a use-subtree positioned immediately after the `crate` root, does it
-/// bring the `snapshot` projection module (or something under it) into scope?
+/// Does a use-tree name a `snapshot` segment anywhere in it?
+fn use_tree_names_snapshot(t: &syn::UseTree) -> bool {
+    match t {
+        syn::UseTree::Path(p) => p.ident == "snapshot" || use_tree_names_snapshot(&p.tree),
+        syn::UseTree::Name(n) => n.ident == "snapshot",
+        syn::UseTree::Rename(r) => r.ident == "snapshot",
+        syn::UseTree::Group(g) => g.items.iter().any(use_tree_names_snapshot),
+        syn::UseTree::Glob(_) => false,
+    }
+}
+
+/// Immediately after `crate`, does the subtree name the `snapshot` projection
+/// module directly? (Precise: excludes `crate::…::per_tick::snapshot`.)
 fn after_crate_is_snapshot(t: &syn::UseTree) -> bool {
     match t {
         syn::UseTree::Path(p) => p.ident == "snapshot",
         syn::UseTree::Name(n) => n.ident == "snapshot",
         syn::UseTree::Rename(r) => r.ident == "snapshot",
         syn::UseTree::Group(g) => g.items.iter().any(after_crate_is_snapshot),
-        // `use crate::*;` glob-imports the crate root, which includes
-        // `snapshot`; treat conservatively as a hit.
-        syn::UseTree::Glob(_) => true,
+        // A glob (`use crate::*;`) is NOT matched here: it does not name
+        // `snapshot`, and any actual read it enables is a bare `snapshot::X`
+        // path caught by `path_hit`. Flagging every glob would be noise.
+        syn::UseTree::Glob(_) => false,
     }
 }
 
-/// True if this use tree imports from `crate::snapshot` in any form.
-fn use_tree_hits_projection(t: &syn::UseTree) -> bool {
+/// A match against the projection: `any` = referenced at all; `precise_crate` =
+/// via the unambiguous `crate::snapshot` form (the only form that is auto-banned
+/// when re-exported).
+#[derive(Default, Clone, Copy)]
+struct Hit {
+    any: bool,
+    precise_crate: bool,
+}
+
+impl Hit {
+    fn merge(self, o: Hit) -> Hit {
+        Hit {
+            any: self.any || o.any,
+            precise_crate: self.precise_crate || o.precise_crate,
+        }
+    }
+}
+
+fn use_tree_hit(t: &syn::UseTree) -> Hit {
     match t {
-        syn::UseTree::Path(p) if p.ident == "crate" => after_crate_is_snapshot(&p.tree),
-        // A leading group, e.g. `use {crate::snapshot, ...};`.
-        syn::UseTree::Group(g) => g.items.iter().any(use_tree_hits_projection),
-        _ => false,
+        syn::UseTree::Path(p) if p.ident == "crate" => {
+            let precise = after_crate_is_snapshot(&p.tree);
+            Hit {
+                any: precise,
+                precise_crate: precise,
+            }
+        }
+        // super::/self:: rooted — conservative (module depth unresolved): the
+        // subtree must NAME `snapshot` (e.g. `use super::snapshot`). A super/self
+        // glob is not matched — a real read through it is a bare `snapshot::X`
+        // path caught by `path_hit`.
+        syn::UseTree::Path(p) if p.ident == "super" || p.ident == "self" => Hit {
+            any: use_tree_names_snapshot(&p.tree),
+            precise_crate: false,
+        },
+        // Bare `snapshot` root (crate-root child, or same-named per_tick child).
+        syn::UseTree::Path(p) if p.ident == "snapshot" => Hit {
+            any: true,
+            precise_crate: false,
+        },
+        syn::UseTree::Name(n) if n.ident == "snapshot" => Hit {
+            any: true,
+            precise_crate: false,
+        },
+        syn::UseTree::Rename(r) if r.ident == "snapshot" => Hit {
+            any: true,
+            precise_crate: false,
+        },
+        syn::UseTree::Group(g) => g
+            .items
+            .iter()
+            .map(use_tree_hit)
+            .fold(Hit::default(), Hit::merge),
+        _ => Hit::default(),
     }
 }
 
-/// True if this use tree aliases the crate root, e.g. `use crate as c;` — a
-/// token-free escape hatch (`c::snapshot::…`) that the ban forbids.
+/// True if this use tree aliases the crate root, e.g. `use crate as c;`.
 fn use_tree_aliases_crate_root(t: &syn::UseTree) -> bool {
     match t {
         syn::UseTree::Rename(r) => r.ident == "crate",
@@ -188,13 +255,32 @@ fn use_tree_aliases_crate_root(t: &syn::UseTree) -> bool {
     }
 }
 
-/// True if a path names consecutive segments `crate :: snapshot` (the
-/// projection), excluding the identically named `…::per_tick::snapshot`.
-fn path_is_crate_snapshot(p: &syn::Path) -> bool {
-    let idents: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
-    idents
+fn path_hit(p: &syn::Path) -> Hit {
+    let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+    if segs
         .windows(2)
         .any(|w| w[0] == "crate" && w[1] == "snapshot")
+    {
+        return Hit {
+            any: true,
+            precise_crate: true,
+        };
+    }
+    // Conservative: `snapshot` used as a MODULE segment — i.e. `snapshot::X`
+    // (module access), NOT a terminal `snapshot` (a variable/fn/field named
+    // snapshot). Rooted at super/self, or bare `snapshot` as the first segment.
+    let n = segs.len();
+    if n >= 2 {
+        let first = segs[0].as_str();
+        let snapshot_as_module = segs[..n - 1].iter().any(|s| s == "snapshot");
+        if snapshot_as_module && matches!(first, "super" | "self" | "snapshot") {
+            return Hit {
+                any: true,
+                precise_crate: false,
+            };
+        }
+    }
+    Hit::default()
 }
 
 #[derive(Default)]
@@ -230,17 +316,21 @@ impl<'ast> Visit<'ast> for Scan {
         if use_tree_aliases_crate_root(&i.tree) {
             self.aliases_crate_root = true;
         }
-        if use_tree_hits_projection(&i.tree) {
+        let hit = use_tree_hit(&i.tree);
+        if hit.any {
             self.refs_projection = true;
-            // pub / pub(crate) / pub(super) etc. re-export reaches other files.
-            if !matches!(i.vis, syn::Visibility::Inherited) {
+            // Auto-ban a re-export only for the unambiguous crate::snapshot
+            // form (a super/self/bare pub re-export cannot be told apart from
+            // the benign per_tick one without resolution — it is audited, not
+            // auto-banned; see the module doc's residual limits).
+            if hit.precise_crate && !matches!(i.vis, syn::Visibility::Inherited) {
                 self.reexports_projection = true;
             }
         }
         visit::visit_item_use(self, i);
     }
     fn visit_path(&mut self, p: &'ast syn::Path) {
-        if path_is_crate_snapshot(p) {
+        if path_hit(p).any {
             self.refs_projection = true;
         }
         visit::visit_path(self, p);
@@ -278,8 +368,6 @@ fn snapshot_stale_never_causes_irreversible_action() {
         };
         let scan = match scan_file(&content) {
             Ok(s) => s,
-            // A file we cannot parse could hide a reader — surface it, never
-            // silently skip.
             Err(e) => {
                 parse_failures.push(format!("  {rel}: {e}"));
                 continue;
@@ -309,7 +397,7 @@ fn snapshot_stale_never_causes_irreversible_action() {
     assert!(
         parse_failures.is_empty(),
         "Could not parse these source files with syn (a reader could hide in \
-         one). Fix the parse or narrow the walk:\n{}",
+         one):\n{}",
         parse_failures.join("\n")
     );
 
@@ -318,8 +406,7 @@ fn snapshot_stale_never_causes_irreversible_action() {
         "Forbidden snapshot reference form(s) in production.\n\n\
          A `pub`/`pub(crate)` re-export of crate::snapshot, or a crate-root \
          alias, lets a downstream file read the projection WITHOUT any local \
-         `snapshot` reference — defeating the audited-files completeness \
-         argument. Reference the projection only in fully-qualified, \
+         `snapshot` reference. Reference the projection only in fully-qualified, \
          non-re-exported form.\n\n{}",
         banned.join("\n")
     );
@@ -330,9 +417,9 @@ fn snapshot_stale_never_causes_irreversible_action() {
          AUDITED_FILES.\n\n\
          Any reader of the snapshot projection must fail-open: a stale/missing \
          snapshot may cause only a REVERSIBLE action (nudge/warn/log/timing), \
-         never an irreversible one. Add each file to AUDITED_FILES in this test \
-         with a role (reader/writer/type-user) and — for a reader — a one-line \
-         reversibility rationale, only after confirming it fails open.\n\n{}",
+         never an irreversible one. Add each file to AUDITED_FILES with a role \
+         (reader/writer/type-user) and — for a reader — a one-line reversibility \
+         rationale, only after confirming it fails open.\n\n{}",
         unaudited.join("\n")
     );
 
@@ -348,10 +435,9 @@ fn snapshot_stale_never_causes_irreversible_action() {
     );
 }
 
-/// The fence's fence: prove the AST walk catches every read form the reviewer
-/// showed the string scans missed (and the crate-level grouped/nested/glob/
-/// multi-line variants), that the bans fire, and that benign non-projection
-/// references are not flagged.
+/// The fence's fence: prove the AST walk catches every read form across all
+/// four module-path roots (crate / super / self / bare), that the bans fire,
+/// and that benign non-projection references are not flagged.
 #[test]
 fn scanner_catches_all_bypass_forms() {
     let caught = |src: &str| -> bool {
@@ -359,9 +445,9 @@ fn scanner_catches_all_bypass_forms() {
         s.refs_projection || s.reexports_projection || s.aliases_crate_root
     };
 
-    // Every read form must be caught. Forms 1-4 are the first review's; forms
-    // 5-6 are the crate-level grouped imports the second review injected;
-    // 7-8 harden glob and multi-line grouping.
+    // Every read form must be caught. Forms 1-4: first review. 5-6: crate-level
+    // grouped imports (second review). 7-8: glob / multi-line. 9-12: the
+    // super/self/bare roots (third review — 9 is reviewer4's exact injection).
     let read_forms: &[(&str, &str)] = &[
         ("baseline call", "fn f(h: &std::path::Path) { let _ = crate::snapshot::load(h); }"),
         ("form1 direct import", "use crate::snapshot::load;\nfn f(h: &std::path::Path){ let _ = load(h); }"),
@@ -372,6 +458,12 @@ fn scanner_catches_all_bypass_forms() {
         ("form6 crate-grouped nested", "use crate::{snapshot::{load}};\nfn f(h:&std::path::Path){ let _=load(h); }"),
         ("form7 crate glob", "use crate::*;\nfn f(h:&std::path::Path){ let _=snapshot::load(h); }"),
         ("form8 multiline group", "use crate::{\n    snapshot::agent_is_busy,\n    fmt_util,\n};\nfn f(h:&std::path::Path){ let _=agent_is_busy(h,\"a\"); }"),
+        ("form9 super import (reviewer4)", "use super::snapshot;\nfn f(h:&std::path::Path){ let _=snapshot::agent_is_busy(h,\"a\"); }"),
+        ("form10 self import", "use self::snapshot;\nfn f(h:&std::path::Path){ let _=snapshot::load(h); }"),
+        ("form11 super multi-level path", "fn f(h:&std::path::Path){ let _=super::super::snapshot::load(h); }"),
+        ("form12 bare path", "fn f(h:&std::path::Path){ let _=snapshot::load(h); }"),
+        ("form13 super path call", "fn f(h:&std::path::Path){ let _=super::snapshot::agent_is_busy(h,\"a\"); }"),
+        ("form14 super glob", "use super::*;\nfn f(h:&std::path::Path){ let _=snapshot::load(h); }"),
     ];
     for (name, src) in read_forms {
         assert!(caught(src), "read form NOT caught by the AST fence: {name}");
@@ -398,16 +490,21 @@ fn scanner_catches_all_bypass_forms() {
     }
 
     // Benign references must NOT be flagged: the identically named per_tick
-    // rotation module, an unrelated identifier, a foreign Snapshot type, and a
-    // comment (syn drops comments entirely).
+    // rotation module addressed via a crate/bare path, a `snapshot`-PREFIXED
+    // identifier (not the module), an unrelated identifier, a foreign Snapshot
+    // type, and a comment (syn drops comments).
     let benign: &[(&str, &str)] = &[
         (
-            "per_tick::snapshot module",
+            "per_tick via crate path",
             "use crate::daemon::per_tick::snapshot::SnapshotRotationHandler;",
         ),
         (
-            "per_tick bare re-export",
-            "pub(crate) use snapshot::SnapshotRotationHandler;",
+            "per_tick via bare path",
+            "fn f(){ let _ = daemon::per_tick::snapshot::timings(); }",
+        ),
+        (
+            "snapshot-prefixed fn ident",
+            "fn f(){ let _ = super::snapshot_handler_timings(); }",
         ),
         (
             "unrelated identifier",
