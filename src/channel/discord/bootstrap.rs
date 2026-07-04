@@ -50,6 +50,31 @@ pub(super) fn build_http_client(token: String) -> twilight_http::Client {
 /// `channel::telegram::init_from_config`'s not-configured contract so
 /// callers can treat both channels symmetrically.
 pub fn init_from_config(config: &crate::fleet::FleetConfig) -> Option<DiscordChannel> {
+    // Production event source: open the real gateway. The config→channel
+    // assembly lives in `init_from_config_with_source`; this default path is
+    // byte-identical to the pre-#2562-P4 inline body.
+    init_from_config_with_source(config, |token, intents, allowlist, tx| {
+        spawn_gateway_supervisor(token, intents, allowlist, tx);
+    })
+}
+
+/// #2562 P4 test-injection seam for [`init_from_config`]. `start_source`
+/// receives exactly the `(token, intents, allowlist, tx)` production feeds to
+/// [`spawn_gateway_supervisor`], but lets a test substitute a source that
+/// pushes fixture events into `tx` instead of opening a live WebSocket — giving
+/// the config→allowlist→channel→inbox assembly (the path the manual smoke used
+/// to guard) CI coverage without real Discord creds/network. The production
+/// caller ([`init_from_config`]) passes `spawn_gateway_supervisor` unchanged,
+/// so its behavior is byte-identical.
+pub(crate) fn init_from_config_with_source(
+    config: &crate::fleet::FleetConfig,
+    start_source: impl FnOnce(
+        String,
+        twilight_model::gateway::Intents,
+        Option<Vec<i64>>,
+        mpsc::Sender<ChannelEvent>,
+    ),
+) -> Option<DiscordChannel> {
     let (bot_token_env, guild_id, user_allowlist) = match config.channel.as_ref()? {
         crate::fleet::ChannelConfig::Telegram { .. } => return None,
         crate::fleet::ChannelConfig::Discord {
@@ -78,7 +103,7 @@ pub fn init_from_config(config: &crate::fleet::FleetConfig) -> Option<DiscordCha
     // stays correct even if an operator pastes an already-prefixed token)
     // — pass the raw token to both, per their documented contract.
     let (tx, rx) = mpsc::channel();
-    spawn_gateway_supervisor(token.clone(), discord_intents(), user_allowlist.clone(), tx);
+    start_source(token.clone(), discord_intents(), user_allowlist.clone(), tx);
     let http_client = std::sync::Arc::new(build_http_client(token));
     Some(DiscordChannel::new(
         rx,
