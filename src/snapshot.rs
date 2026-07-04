@@ -245,4 +245,93 @@ mod tests {
         );
         fs::remove_dir_all(&home).ok();
     }
+
+    /// [fugu §3.4] The snapshot read primitives that every dispatch decider
+    /// reads through must return the CONSERVATIVE sentinel when the snapshot is
+    /// missing, corrupt, or written in an older format — so the decider fails
+    /// OPEN (proceeds / fires / injects) instead of suppressing on stale data.
+    ///
+    /// Sentinel -> decider effect it drives (see docs/SOURCE-OF-TRUTH.md):
+    ///   `load() == None`           -> dispatch_idle fires; startup-log / status
+    ///                                 query / bugreport degrade to empty.
+    ///   `agent_state_of() == None` -> inbox inject does NOT defer (injects).
+    ///   `agent_is_busy() == false` -> handoff re-nudges; reply-ledger nudges;
+    ///                                 inbox injects.
+    ///
+    /// Irreversibility boundary: every one of those effects is REVERSIBLE (a
+    /// nudge, or an already-authoritative inbox delivery). A stale snapshot must
+    /// never drive an irreversible action (delete / overwrite / fabricated
+    /// outbound send). The source-scan companion
+    /// `snapshot_stale_never_causes_irreversible_action`
+    /// (tests/snapshot_failopen_invariant.rs) enforces that no un-reviewed
+    /// reader is added.
+    #[test]
+    fn snapshot_missing_fails_open_for_dispatch_deciders() {
+        let home = tmp_home("failopen");
+        // Start from a guaranteed-absent snapshot.
+        fs::remove_dir_all(&home).ok();
+        fs::create_dir_all(&home).ok();
+
+        // (a) Missing snapshot -> conservative sentinels, no panic.
+        assert!(load(&home).is_none(), "missing snapshot -> load None");
+        assert!(
+            agent_state_of(&home, "a").is_none(),
+            "missing snapshot -> agent_state_of None"
+        );
+        assert!(
+            !agent_is_busy(&home, "a"),
+            "missing snapshot MUST read as NOT busy (fail-open: deciders proceed)"
+        );
+
+        // (b) Corrupt snapshot.json -> still None / not-busy, still no panic.
+        fs::write(home.join("snapshot.json"), b"{ this is not valid json")
+            .expect("write corrupt snapshot");
+        assert!(load(&home).is_none(), "corrupt snapshot -> load None");
+        assert!(
+            !agent_is_busy(&home, "a"),
+            "corrupt snapshot MUST fail-open to NOT busy"
+        );
+
+        // (c) Valid snapshot, agent absent -> not busy (unknown != busy).
+        save(&home, &[make_agent("present", "active")]);
+        assert!(
+            !agent_is_busy(&home, "absent"),
+            "unknown agent -> NOT busy (fail-open)"
+        );
+        // Sanity: the sentinel is not a blanket false — a known active agent
+        // still reads busy, so fail-open never masks real state.
+        assert!(
+            agent_is_busy(&home, "present"),
+            "known active agent reads busy"
+        );
+
+        // (d) Old-format snapshot missing silent_secs / output_silent_secs ->
+        // serde default i64::MAX ("very silent" -> the idle watchdog fires
+        // rather than suppressing). This is the field-level fail-open base.
+        let old_format = concat!(
+            r#"{"timestamp":"2020-01-01T00:00:00Z","agents":[{"#,
+            r#""name":"legacy","backend_command":"claude","args":[],"#,
+            r#""working_dir":null,"submit_key":"\r","health_state":"healthy","#,
+            r#""agent_state":"idle"}]}"#
+        );
+        fs::write(home.join("snapshot.json"), old_format).expect("write old-format snapshot");
+        let snap = load(&home).expect("old-format snapshot must still deserialize");
+        let a = snap
+            .agents
+            .iter()
+            .find(|a| a.name == "legacy")
+            .expect("legacy agent present");
+        assert_eq!(
+            a.silent_secs,
+            i64::MAX,
+            "missing silent_secs MUST default to i64::MAX (fail-open)"
+        );
+        assert_eq!(
+            a.output_silent_secs,
+            i64::MAX,
+            "missing output_silent_secs MUST default to i64::MAX (fail-open)"
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
 }

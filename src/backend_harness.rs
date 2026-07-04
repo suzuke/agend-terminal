@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(all(unix, test))]
 use std::collections::HashMap;
 #[cfg(all(unix, test))]
+use std::os::unix::io::RawFd;
+#[cfg(all(unix, test))]
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -404,6 +406,96 @@ mod tests {
     fn test_tcgetpgrp_returns_valid_pgid() {
         let pgid = verify_tcgetpgrp().expect("tcgetpgrp must return valid pgid");
         assert!(pgid > 0);
+    }
+
+    /// herdr-inspired fd-hygiene check (clean-room: this is our own probe, not
+    /// herdr's AGPL-3.0 code — see task t-20260704054906745324-67777-4). Test-
+    /// only (review finding on #2613: an earlier version of this lived at
+    /// module scope under plain `#[cfg(unix)]`, which meant it compiled into
+    /// production Unix builds despite being used only by the two tests
+    /// below — moved inside `mod tests` so it's genuinely test-gated).
+    /// Spawns a throwaway PTY + `/bin/sh` child purely as a vehicle to ask
+    /// "is `fd` (some fd already open in THIS process) visible in a
+    /// freshly-exec'd child's own fd table?" via the POSIX `/dev/fd/N` view
+    /// (works on both macOS and Linux, unlike Linux-only `/proc/self/fd`).
+    /// Returns `true` iff `fd` leaked across exec — i.e. `false` is the
+    /// desired/healthy result.
+    fn fd_leaks_into_spawned_child(fd: RawFd) -> anyhow::Result<bool> {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", &format!("test -e /dev/fd/{fd}")]);
+        let mut child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let status = child.wait()?;
+        Ok(status.success())
+    }
+
+    /// herdr-inspired fd-hygiene regression (t-20260704054906745324-67777-4):
+    /// pins that a PTY master fd does NOT survive into a freshly-spawned
+    /// child's fd table. Verified (BIND-TOPIC-PRERESEARCH.md-style code
+    /// citation, not a guess): `portable-pty` 0.9.0's `unix.rs::openpty()`
+    /// already calls `cloexec()` on both master and slave immediately after
+    /// `libc::openpty()`, and every clone path (`try_clone_reader`,
+    /// `take_writer`, and the `filedescriptor` crate's `as_stdio` used to wire
+    /// up the child's own stdio) goes through `F_DUPFD_CLOEXEC` — this test
+    /// exists to CATCH A REGRESSION (e.g. a portable-pty downgrade, or a
+    /// future direct fd duplication in our own code that bypasses the safe
+    /// path), not because the fd currently leaks.
+    #[test]
+    fn pty_master_fd_does_not_leak_into_spawned_child() {
+        use portable_pty::{native_pty_system, PtySize};
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let master_fd = pair.master.as_raw_fd().expect("master must have a raw fd");
+        let leaked =
+            fd_leaks_into_spawned_child(master_fd).expect("fd-leak probe spawn must succeed");
+        assert!(
+            !leaked,
+            "PTY master fd {master_fd} is visible in a freshly-spawned child's fd \
+             table — CLOEXEC regression (portable-pty should have closed it across exec)"
+        );
+    }
+
+    /// Control group for the test above: proves `fd_leaks_into_spawned_child`
+    /// can actually detect an fd that IS open in the child (not a probe that
+    /// always trivially reports "closed" regardless of input). fd 1 (stdout)
+    /// is guaranteed to be open in any spawned child — it's what the child
+    /// shell's own stdout is dup'd onto.
+    ///
+    /// Note: an earlier version of this test tried to manufacture a leak via
+    /// a raw `libc::dup()` WITHOUT cloexec, expecting it to survive into the
+    /// child. It didn't — `fd_leaks_into_spawned_child` correctly reported
+    /// `false`. Root cause (verified by reading `portable-pty` 0.9.0's
+    /// `unix.rs::spawn_command`, MIT-licensed, not herdr's code):
+    /// `spawn_command`'s `pre_exec` calls `close_random_fds()` unconditionally
+    /// — a blanket enumerate-`/dev/fd`-and-`close(2)`-everything-≥3
+    /// sweep (added for a Big-Sur Cocoa fd-leak class, per its doc comment),
+    /// independent of and stronger than per-fd `CLOEXEC`. There is no way to
+    /// leak an arbitrary fd across this spawn path short of fd 0/1/2
+    /// themselves — hence this control group checks one of those instead.
+    #[test]
+    fn fd_leak_probe_detects_fds_that_are_genuinely_open_control_group() {
+        let visible = fd_leaks_into_spawned_child(1).expect("fd-leak probe spawn must succeed");
+        assert!(
+            visible,
+            "fd 1 (stdout) must be visible in ANY spawned child — if this is false, \
+             the leak-detection probe itself is broken, not the thing it's supposed \
+             to be testing"
+        );
     }
 
     #[test]

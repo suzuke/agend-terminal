@@ -321,25 +321,26 @@ struct Binding {
     worktree: Option<String>,
 }
 
+/// #2550 W3 item #8: read a file iff its HMAC `<path>.sig` sidecar verifies
+/// (#1651) — fail-closed to `None` on missing/tampered. Deduped from
+/// `read_binding` + `load_protected_refs`; the `verify` call is unchanged.
+fn read_hmac_verified(home: &str, path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let tag = std::fs::read_to_string(format!("{}.sig", path.display())).unwrap_or_default();
+    integrity_core::verify(Path::new(home), content.as_bytes(), &tag).then_some(content)
+}
+
 fn read_binding(home: &str, agent: &str) -> Binding {
     let dir = PathBuf::from(home).join("runtime").join(agent);
     let path = dir.join("binding.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Binding::default(),
-    };
-    // #1651: verify the HMAC sidecar BEFORE trusting the binding (esp. its
-    // `branch` push-authority). A blind self-authorization rewrite — an injected
-    // agent editing its own `binding.json` without the key — fails verify, so we
-    // treat the agent as UNBOUND (fail-closed → `deny_unbound_else_chdir` denies
-    // mutating ops, the SAME path a parse failure already takes). Missing sidecar
-    // / missing key / mismatch all fail closed. Defense-in-depth against injection
-    // blind-write, NOT a security boundary: a same-uid agent could read the key
-    // and re-sign (accepted); true sealing needs OS-isolation (parked #1653).
-    let tag = std::fs::read_to_string(dir.join("binding.json.sig")).unwrap_or_default();
-    if !integrity_core::verify(Path::new(home), content.as_bytes(), &tag) {
+    // #1651: trust the binding (esp. its `branch` push-authority) ONLY if the
+    // HMAC sidecar verifies — an injected agent blind-rewriting its own
+    // `binding.json` without the key fails verify → treated UNBOUND (fail-closed,
+    // same as a parse failure). Defense-in-depth against injection blind-write,
+    // NOT a boundary: a same-uid agent could re-sign (OS-sealing parked #1653).
+    let Some(content) = read_hmac_verified(home, &path) else {
         return Binding::default();
-    }
+    };
     let v: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(_) => return Binding::default(), // parse failure = unbound (fail-safe)
@@ -1971,14 +1972,11 @@ fn load_protected_refs(home: &str) -> Vec<String> {
         .map(|s| s.to_string())
         .collect();
     let path = PathBuf::from(home).join("policy.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return refs; // missing → hardcode floor (the common default)
+    // #1651 sidecar (shared with read_binding): missing / tampered / unsigned →
+    // fail-closed to the hardcode floor (override ignored).
+    let Some(content) = read_hmac_verified(home, &path) else {
+        return refs;
     };
-    let tag =
-        std::fs::read_to_string(PathBuf::from(home).join("policy.toml.sig")).unwrap_or_default();
-    if !integrity_core::verify(Path::new(home), content.as_bytes(), &tag) {
-        return refs; // tampered / unsigned → fail-closed (override ignored)
-    }
     refs.extend(parse_protected_refs(&content));
     refs
 }

@@ -273,8 +273,6 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub working_dir: Option<PathBuf>,
-    /// Original repo root (before worktree redirect).
-    pub worktree_source: Option<PathBuf>,
     pub submit_key: String,
 }
 
@@ -1068,7 +1066,11 @@ fn init_daemon_services(
     crate::agent::set_pending_registry(Arc::clone(&registry));
     if let Some(tg) = telegram.as_ref() {
         tg.attach_registry(Arc::clone(&registry));
-    } else if let Some(tg) = crate::channel::active_channel() {
+    } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
+        // Multi-channel-safe (t-20260703164240502572-50899-11): daemon-boot
+        // twin of the app-mode fallback in `app/mod.rs` — telegram-specific
+        // by naming, so `active_channel()` silently no-opping once discord
+        // is also registered would leave telegram's registry attach dead.
         tg.attach_registry(Arc::clone(&registry));
     }
 
@@ -1673,9 +1675,6 @@ fn spawn_and_register_agent(
         );
         return Ok(());
     }
-    let worktree_source = working_dir
-        .as_ref()
-        .and_then(|wd| crate::worktree::source_repo_of(wd));
     configs.lock().insert(
         name.clone(),
         AgentConfig {
@@ -1684,7 +1683,6 @@ fn spawn_and_register_agent(
             args: args.clone(),
             env: env.clone(),
             working_dir: working_dir.clone(),
-            worktree_source,
             submit_key: submit_key.clone(),
         },
     );
@@ -2228,7 +2226,6 @@ mod tests {
                 args: vec![],
                 env: None,
                 working_dir: None,
-                worktree_source: None,
                 submit_key: "\r".into(),
             },
         );

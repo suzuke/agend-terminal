@@ -89,18 +89,36 @@ impl WorkspaceBoundarySweepHandler {
         *seen = current.into_keys().collect();
         (appeared, resolved)
     }
+
+    /// #P1-2607 offload seam: cadence check kept ON the tick loop (cheap, no
+    /// drift). `HourlyGcHandler` calls it to decide inclusion in the offloaded
+    /// round. Preserves this handler's boot-grace (the gate itself carries it).
+    pub(crate) fn due(&self) -> bool {
+        self.gate.fire()
+    }
+
+    /// #P1-2607 offload seam: the sweep body, run off the tick loop by
+    /// `HourlyGcHandler`. Behaviour unchanged from the pre-offload `run()`.
+    pub(crate) fn work(&self, home: &Path) {
+        self.sweep_once(home);
+    }
 }
 
+/// #2616-residual: kept for the `due()`/`work()` convenience-wrapper `run()`
+/// — do NOT register this directly in `build_default_handlers`.
+/// `HourlyGcHandler` already drives this sweep via direct `due()`/`work()`
+/// calls (#2549 W1); a direct registration here would double-execute it
+/// every due tick. Guarded by the source-scan invariant in
+/// `tests/hourly_gc_sub_handlers_not_directly_registered.rs`.
 impl PerTickHandler for WorkspaceBoundarySweepHandler {
     fn name(&self) -> &'static str {
         "workspace_boundary_sweep"
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
-        if !self.gate.fire() {
-            return;
+        if self.due() {
+            self.work(ctx.home);
         }
-        self.sweep_once(ctx.home);
     }
 }
 

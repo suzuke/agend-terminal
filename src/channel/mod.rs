@@ -215,6 +215,35 @@ pub fn reset_active_channel_for_test() {
     channels_registry().write().clear();
 }
 
+/// active_channel() multi-channel blind-spot fix (t-20260703164240502572-50899-11):
+/// find which registered channel (if any) already has a binding recorded for
+/// `instance` — read-only, unlike [`Channel::take_binding`]. Where `active_channel`
+/// would return `None` once a fleet runs 2+ channels, this always finds the one
+/// the instance actually belongs to, because [`Channel::has_binding`] is checked
+/// per-channel rather than requiring exactly one channel to be registered fleet-wide.
+pub fn channel_for_instance(instance: &str) -> Option<Arc<dyn Channel>> {
+    channels_registry()
+        .read()
+        .values()
+        .find(|ch| ch.has_binding(instance))
+        .cloned()
+}
+
+/// active_channel() multi-channel blind-spot fix (t-20260703164240502572-50899-11):
+/// drop `name`'s binding on EVERY registered channel, not just "the active" one.
+/// `active_channel()` returns `None` once a fleet runs 2+ channels, so a caller
+/// gating cleanup on it (as `drop_active_binding` and app-mode teardown used to)
+/// silently skips the drop entirely in a multi-channel fleet — the binding (and
+/// whatever platform resource it references) leaks. [`Channel::take_binding`] is
+/// a safe no-op on a channel where `name` has no recorded binding (it returns
+/// `None` and touches nothing), so iterating every registered channel reaches
+/// whichever one `name` actually happens to be bound to.
+pub fn drop_binding_on_all_channels(name: &str) {
+    for ch in channels_registry().read().values() {
+        let _ = ch.take_binding(name);
+    }
+}
+
 /// #966: Outcome of [`ensure_topic_for`] — explicit enum (no
 /// `Option<String>`) so callers must handle each variant. Mirrors the
 /// #962 surface-failures discipline: silent `let _ = ...` patterns
@@ -236,9 +265,10 @@ pub enum TopicOutcome {
     Failed(String),
 }
 
-/// #966 hub fn: look up the active channel AT CALL-TIME (not from a
+/// #966 hub fn: look up the registered channels AT CALL-TIME (not from a
 /// cached `Option<Arc<dyn Channel>>` snapshot) and ensure a topic
-/// exists for `name`. Replaces three replicated call sites:
+/// exists for `name` on EVERY registered channel. Replaces three
+/// replicated call sites:
 ///
 /// - `src/api/handlers/instance.rs` (handle_spawn — MCP / deploy_template / api caller)
 /// - `src/api/handlers/team.rs` (team mode)
@@ -249,15 +279,42 @@ pub enum TopicOutcome {
 /// `Option<Arc<dyn Channel>>` are commonly `None`; the channel registers
 /// ~6s later via `register_active_channel`. Cached-snapshot callers
 /// silently no-op forever for that startup window's instances.
-/// `ensure_topic_for` queries `active_channel()` fresh on every call so
-/// the post-init channel is picked up automatically.
+/// `ensure_topic_for` queries the registry fresh on every call so the
+/// post-init channel is picked up automatically.
+///
+/// **Multi-channel fan-out** (t-20260703164240502572-50899-11): this used
+/// to gate on the `active_channel()` singleton, which returns `None` once
+/// 2+ channels are registered — in a telegram+discord fleet, new
+/// instances got NO topic anywhere. The TUI's own pane-create hooks
+/// (`app/telegram_hooks.rs`, `app/discord_hooks.rs`) already call
+/// `lookup_channel_by_name` for each channel explicitly and unconditionally
+/// — i.e. fan-out to every registered channel is the established norm, not
+/// a new policy. This converges `ensure_topic_for` onto that precedent:
+/// `create_topic` is attempted on every registered channel; the 3 callers
+/// only consume a single [`TopicOutcome`], so the result is `Created` with
+/// the first channel's topic id if ANY channel succeeded, `NoChannel` if
+/// the registry was empty, or `Failed` only if the registry was non-empty
+/// and EVERY channel failed.
 pub fn ensure_topic_for(name: &str) -> TopicOutcome {
-    match active_channel() {
-        None => TopicOutcome::NoChannel,
-        Some(ch) => match ch.create_topic(name) {
-            Ok(topic) => TopicOutcome::Created(topic.id),
-            Err(e) => TopicOutcome::Failed(format!("{e}")),
-        },
+    let channels: Vec<Arc<dyn Channel>> = channels_registry().read().values().cloned().collect();
+    if channels.is_empty() {
+        return TopicOutcome::NoChannel;
+    }
+    let mut first_success: Option<String> = None;
+    let mut errors: Vec<String> = Vec::new();
+    for ch in channels {
+        match ch.create_topic(name) {
+            Ok(topic) => {
+                if first_success.is_none() {
+                    first_success = Some(topic.id);
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e}", ch.kind())),
+        }
+    }
+    match first_success {
+        Some(id) => TopicOutcome::Created(id),
+        None => TopicOutcome::Failed(errors.join("; ")),
     }
 }
 
@@ -943,5 +1000,239 @@ mod tests {
             err.to_string().contains("send_from_agent"),
             "error must name the missing method: {err}"
         );
+    }
+
+    // ── t-20260703164240502572-50899-11: multi-channel behavior tests ──
+    // Pins the two remaining bug classes from the active_channel() survey:
+    // (a) delete/drop-binding must reach whichever channel actually holds
+    //     the binding, not just "the" active_channel() singleton; (b)
+    //     ensure_topic_for must fan out topic creation to every registered
+    //     channel, not just one.
+
+    /// Recording channel with real (stateful) `has_binding`/`take_binding`
+    /// and a configurable `create_topic` outcome — `KindedRecording` above
+    /// only mocks `notify`, and `MockChannel`/`RecordingChannel` hardcode
+    /// `has_binding` to `false`, so none of the existing mocks can pin
+    /// either fix.
+    struct BindingTopicChannel {
+        kind: &'static str,
+        caps: ChannelCapabilities,
+        bound: parking_lot::Mutex<std::collections::HashSet<String>>,
+        topic_calls: std::sync::atomic::AtomicUsize,
+        create_topic_ok: bool,
+    }
+
+    impl BindingTopicChannel {
+        fn arc(kind: &'static str, create_topic_ok: bool) -> Arc<Self> {
+            Arc::new(Self {
+                kind,
+                caps: ChannelCapabilities::default(),
+                bound: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                topic_calls: std::sync::atomic::AtomicUsize::new(0),
+                create_topic_ok,
+            })
+        }
+        fn bind(&self, instance: &str) {
+            self.bound.lock().insert(instance.to_string());
+        }
+        fn is_bound(&self, instance: &str) -> bool {
+            self.bound.lock().contains(instance)
+        }
+        fn topic_calls(&self) -> usize {
+            self.topic_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Channel for BindingTopicChannel {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn caps(&self) -> &ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<ChannelEvent> {
+            None
+        }
+        fn send(&self, _: &BindingRef, _: OutMsg) -> Result<MsgRef> {
+            anyhow::bail!("mock")
+        }
+        fn edit(&self, _: &MsgRef, _: OutMsg) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn delete(&self, _: &MsgRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn create_binding(&self, _: &str, _: BindingOpts) -> Result<BindingRef> {
+            anyhow::bail!("mock")
+        }
+        fn remove_binding(&self, _: &BindingRef) -> Result<()> {
+            Ok(())
+        }
+        fn has_binding(&self, instance: &str) -> bool {
+            self.bound.lock().contains(instance)
+        }
+        fn record_binding(&self, instance: &str, _: BindingRef, _: String) {
+            self.bound.lock().insert(instance.to_string());
+        }
+        fn take_binding(&self, instance: &str) -> Option<BindingRef> {
+            if self.bound.lock().remove(instance) {
+                Some(BindingRef::new(self.kind, None, ()))
+            } else {
+                None
+            }
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+        fn create_topic(&self, name: &str) -> std::result::Result<TopicRef, ChannelError> {
+            self.topic_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.create_topic_ok {
+                // Mirrors the fixed Discord adapter contract
+                // (t-20260703164240502572-50899-11 reviewer4 finding): a
+                // successful create_topic must leave the instance bound, or
+                // the channel it just created is unroutable and uncleanable.
+                self.bound.lock().insert(name.to_string());
+                Ok(TopicRef {
+                    id: format!("{}-{name}", self.kind),
+                    channel_kind: ChannelKind::Telegram,
+                })
+            } else {
+                Err(ChannelError::Other(anyhow::anyhow!(
+                    "mock create_topic failure"
+                )))
+            }
+        }
+    }
+
+    /// Fix #1/#2 (`drop_active_binding` / app-teardown loop): both now call
+    /// `drop_binding_on_all_channels`, which must clear the binding
+    /// regardless of which registered channel actually holds it — the bug
+    /// was gating cleanup on `active_channel()`, which returns `None` with
+    /// 2+ channels registered and so silently skipped the drop entirely.
+    #[test]
+    fn drop_binding_on_all_channels_clears_binding_on_whichever_channel_holds_it() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+
+        let tg = BindingTopicChannel::arc("telegram-drop", true);
+        let dc = BindingTopicChannel::arc("discord-drop", true);
+        register_active_channel(tg.clone());
+        register_active_channel(dc.clone());
+        assert!(
+            active_channel().is_none(),
+            "precondition: 2 channels registered"
+        );
+
+        // Instance is bound on discord only (e.g. it joined via Discord).
+        dc.bind("agent-x");
+        assert!(!tg.is_bound("agent-x"));
+        assert!(dc.is_bound("agent-x"));
+
+        drop_binding_on_all_channels("agent-x");
+
+        assert!(
+            !dc.is_bound("agent-x"),
+            "binding must be cleared on the channel that actually held it"
+        );
+        assert!(
+            !tg.is_bound("agent-x"),
+            "no-op on the channel that never had a binding"
+        );
+
+        reset_active_channel_for_test();
+    }
+
+    /// Fix #3 (`ensure_topic_for`): must create a topic on EVERY registered
+    /// channel in a multi-channel fleet, not just the `active_channel()`
+    /// singleton (which returns `None` with 2+ channels — new instances
+    /// used to get no topic anywhere).
+    #[test]
+    fn ensure_topic_for_fans_out_to_every_registered_channel() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+
+        let tg = BindingTopicChannel::arc("telegram-topic", true);
+        let dc = BindingTopicChannel::arc("discord-topic", true);
+        register_active_channel(tg.clone());
+        register_active_channel(dc.clone());
+        assert!(
+            active_channel().is_none(),
+            "precondition: 2 channels registered"
+        );
+
+        let outcome = ensure_topic_for("agent-y");
+
+        assert!(
+            matches!(outcome, TopicOutcome::Created(_)),
+            "expected Created, got {outcome:?}"
+        );
+        assert_eq!(tg.topic_calls(), 1, "telegram must get a create_topic call");
+        assert_eq!(dc.topic_calls(), 1, "discord must get a create_topic call");
+
+        reset_active_channel_for_test();
+    }
+
+    /// reviewer4 REJECTED finding on the first #2615 pass: fan-out alone isn't
+    /// enough — a channel whose `create_topic` creates the platform resource
+    /// but never calls `record_binding` (the real bug found in
+    /// `DiscordChannel::create_topic`) leaves that channel unroutable
+    /// (`channel_for_instance`/inbound can't find it) and uncleanable
+    /// (`drop_binding_on_all_channels`'s `take_binding` finds nothing). Pins
+    /// the now-fixed contract end-to-end: every channel `ensure_topic_for`
+    /// fanned out to must have `has_binding(instance) == true` immediately
+    /// after, and `drop_binding_on_all_channels` must clear all of them.
+    #[test]
+    fn ensure_topic_for_created_topic_is_bound_and_cleanable_on_every_channel() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+
+        let tg = BindingTopicChannel::arc("telegram-bind", true);
+        let dc = BindingTopicChannel::arc("discord-bind", true);
+        register_active_channel(tg.clone());
+        register_active_channel(dc.clone());
+
+        ensure_topic_for("agent-w");
+
+        assert!(
+            tg.is_bound("agent-w"),
+            "telegram must be routable/cleanable after create_topic"
+        );
+        assert!(
+            dc.is_bound("agent-w"),
+            "discord must be routable/cleanable after create_topic — this is \
+             exactly the reviewer4 finding: create_topic alone left Discord \
+             unbound"
+        );
+
+        drop_binding_on_all_channels("agent-w");
+
+        assert!(!tg.is_bound("agent-w"), "cleanup must reach telegram");
+        assert!(!dc.is_bound("agent-w"), "cleanup must reach discord");
+
+        reset_active_channel_for_test();
+    }
+
+    /// Zero channels → `NoChannel` (happy path, unchanged). All-channels-fail
+    /// → `Failed`, only when the registry is non-empty.
+    #[test]
+    fn ensure_topic_for_no_channel_and_all_fail_cases() {
+        let _g = m6_registry_guard();
+        reset_active_channel_for_test();
+
+        assert_eq!(ensure_topic_for("agent-z"), TopicOutcome::NoChannel);
+
+        let tg = BindingTopicChannel::arc("telegram-fail", false);
+        let dc = BindingTopicChannel::arc("discord-fail", false);
+        register_active_channel(tg.clone());
+        register_active_channel(dc.clone());
+
+        let outcome = ensure_topic_for("agent-z");
+        assert!(
+            matches!(outcome, TopicOutcome::Failed(_)),
+            "all channels failing must produce Failed, got {outcome:?}"
+        );
+        assert_eq!(tg.topic_calls(), 1);
+        assert_eq!(dc.topic_calls(), 1);
+
+        reset_active_channel_for_test();
     }
 }

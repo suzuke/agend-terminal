@@ -40,25 +40,6 @@ pub fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
-/// Recover the source repo path from a worktree working directory.
-///
-/// Sprint 57 Wave 4 (#546 Item 4): post-migration, source_repo
-/// CANNOT be derived from worktree path alone (worktrees live under
-/// `$AGEND_HOME/worktrees/<agent>/<branch>/` external to the source
-/// repo). Production code reads `binding.source_repo` directly.
-/// This helper is retained for legacy-layout detection only — it
-/// matches the pre-Wave-4 `{source_repo}/.worktrees/{name}` layout
-/// and returns `None` for the new layout.
-pub fn source_repo_of(working_dir: &Path) -> Option<PathBuf> {
-    if !working_dir
-        .components()
-        .any(|c| c.as_os_str() == ".worktrees")
-    {
-        return None;
-    }
-    working_dir.parent()?.parent().map(|p| p.to_path_buf())
-}
-
 /// Check if a git repo has at least one commit (valid HEAD).
 fn has_commits(repo_dir: &Path) -> bool {
     // W1.2: LOCAL bool check via git_ok (was bypass+`.map(success).unwrap_or(false)`

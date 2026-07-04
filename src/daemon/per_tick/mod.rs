@@ -146,6 +146,30 @@ pub(crate) fn in_boot_grace(created_at: std::time::Instant) -> bool {
     created_at.elapsed() < NOTIFICATION_BOOT_GRACE
 }
 
+/// Releases an in-flight re-entrancy flag on drop — so a panic inside an
+/// offloaded sweep's background thread still clears the guard. Without it, the
+/// manual `in_flight.store(false)` at the end of the spawned closure is skipped
+/// when the closure unwinds, leaving `in_flight` stuck `true` forever and the
+/// sweep permanently skipped. Shared by the per-tick offload handlers
+/// (`worktree_registry_sweep`, `hourly_gc`). #P1-2607 / #2614 follow-up
+/// (reviewer non-blocking suggestion).
+pub(crate) struct ClearOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ClearOnDrop {
+    /// Takes the shared flag; call AFTER the loop-side re-entrancy `swap(true)`.
+    /// The flag is released (`store(false)`) when this guard drops — on normal
+    /// completion OR an unwinding panic.
+    pub(crate) fn new(in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self(in_flight)
+    }
+}
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 // ── #941: per-handler timing observability ─────────────────────────────
 //
 // `HANDLER_TIMING` accumulates per-handler wall-clock stats so the
@@ -727,6 +751,36 @@ mod tests {
         assert_eq!(
             panic_payload_str(&other_payload),
             "<non-string panic payload>"
+        );
+    }
+
+    /// #P1-2607 / #2614 follow-up: `ClearOnDrop` releases the in-flight guard on
+    /// BOTH normal completion and an unwinding panic — the panic path is the
+    /// whole point (the old manual `store(false)` was skipped on unwind, wedging
+    /// the guard `true` forever). Proves both.
+    #[test]
+    fn clear_on_drop_releases_flag_on_normal_and_panic() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Normal scope exit.
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _g = ClearOnDrop::new(Arc::clone(&flag));
+        }
+        assert!(!flag.load(Ordering::Acquire), "guard clears on normal drop");
+
+        // Unwinding panic — the guard must STILL clear.
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag2 = Arc::clone(&flag);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ClearOnDrop::new(flag2);
+            panic!("boom");
+        }));
+        assert!(res.is_err(), "the closure panicked");
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "guard MUST clear on an unwinding panic — the whole reason it exists"
         );
     }
 }

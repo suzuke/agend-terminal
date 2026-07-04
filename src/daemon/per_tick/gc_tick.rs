@@ -3,6 +3,7 @@
 //! Also cleans up stale ci-watch lock files.
 
 use super::{PerTickHandler, TickContext};
+use std::path::Path;
 
 pub(crate) struct GcTickHandler {
     gate: crate::daemon::cadence_gate::CadenceGate,
@@ -20,18 +21,19 @@ impl GcTickHandler {
             target_sweep_armed: std::sync::atomic::AtomicBool::new(false),
         }
     }
-}
 
-impl PerTickHandler for GcTickHandler {
-    fn name(&self) -> &'static str {
-        "gc_tick"
+    /// #P1-2607 offload seam: the cadence check, kept ON the daemon tick loop
+    /// (cheap, so gate advancement never drifts). `HourlyGcHandler` calls this
+    /// to decide whether to include this sweep in the offloaded round.
+    pub(crate) fn due(&self) -> bool {
+        self.gate.fire()
     }
 
-    fn run(&self, ctx: &TickContext<'_>) {
-        if !self.gate.fire() {
-            return;
-        }
-        let results = crate::worktree_pool::gc_run(ctx.home);
+    /// #P1-2607 offload seam: the (potentially-slow) sweep body, split out so
+    /// `HourlyGcHandler` runs it in a background thread. Behaviour is unchanged
+    /// from the pre-offload `run()` — only its call site moves off the tick loop.
+    pub(crate) fn work(&self, home: &Path) {
+        let results = crate::worktree_pool::gc_run(home);
         let removed = results.iter().filter(|r| r.removed).count();
         let failed = results.iter().filter(|r| !r.removed).count();
         if removed > 0 || failed > 0 {
@@ -54,9 +56,9 @@ impl PerTickHandler for GcTickHandler {
         // is the correct, already-independent lever for "how long to keep
         // `.trash`" (including "never purge": set it very large); coupling
         // the purge to the unrelated archive-decision gate was itself the gap.
-        crate::daemon::retention::worktrees::purge_trash(ctx.home);
+        crate::daemon::retention::worktrees::purge_trash(home);
 
-        let stale_locks = crate::worktree_pool::gc_stale_ci_watch_locks(ctx.home);
+        let stale_locks = crate::worktree_pool::gc_stale_ci_watch_locks(home);
         if stale_locks > 0 {
             tracing::info!(stale_locks, "gc_tick: stale ci-watch locks cleaned");
         }
@@ -71,7 +73,7 @@ impl PerTickHandler for GcTickHandler {
             .swap(true, std::sync::atomic::Ordering::Relaxed);
         if armed {
             if let Some((max_age, min_size)) = crate::worktree_pool::target_gc_config() {
-                let swept = crate::worktree_pool::target_sweep_run(ctx.home, max_age, min_size);
+                let swept = crate::worktree_pool::target_sweep_run(home, max_age, min_size);
                 let reclaimed = swept.iter().filter(|r| r.removed).count();
                 if reclaimed > 0 {
                     let freed: u64 = swept
@@ -86,6 +88,24 @@ impl PerTickHandler for GcTickHandler {
                     );
                 }
             }
+        }
+    }
+}
+
+/// #2616-residual: kept for `due()`/`work()`'s convenience-wrapper `run()`
+/// (exercised by this file's own tests) — do NOT register this directly in
+/// `build_default_handlers`. `HourlyGcHandler` already drives this sweep via
+/// direct `due()`/`work()` calls (#2549 W1); a direct registration here would
+/// double-execute it every due tick. Guarded by the source-scan invariant in
+/// `tests/hourly_gc_sub_handlers_not_directly_registered.rs`.
+impl PerTickHandler for GcTickHandler {
+    fn name(&self) -> &'static str {
+        "gc_tick"
+    }
+
+    fn run(&self, ctx: &TickContext<'_>) {
+        if self.due() {
+            self.work(ctx.home);
         }
     }
 }
