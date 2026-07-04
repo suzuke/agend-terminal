@@ -410,21 +410,26 @@ fn branch_tip_info(repo_root: &Path, branch: &str) -> Option<(String, u64)> {
 }
 
 /// #P1-2607: process-wide cache of the STRUCTURAL squash-merged check (git
-/// cherry + #1280 tree-diff fallback), keyed by `(repo, branch, tip_sha)`.
-/// A fixed tip's relationship to `default` never changes, so once computed
-/// for a given tip it is reused for free on every later sweep round — the
-/// branch naturally falls out of cache (new key) the moment its tip moves,
-/// no explicit invalidation needed. Entries for long-deleted branches are
-/// never looked up again and just sit unused; at realistic branch-churn
-/// rates that's a few KB over the daemon's lifetime, not worth evicting.
+/// cherry + #1280 tree-diff fallback), keyed by `(repo, branch, tip_sha,
+/// default_tip_sha)`. A branch's relationship to `default` depends on BOTH
+/// tips — `default` advancing to absorb the branch's patch (a real
+/// squash-merge landing) flips a previously-false verdict to true even
+/// though the branch's own tip never moved. #2614: the key used to omit
+/// `default_tip_sha`, so that transition was cached as permanently
+/// ineligible once checked before the squash-merge landed — live prune
+/// never reaped the branch and dry-run systematically under-reported it.
+/// Entries for long-deleted branches or superseded `default` tips are never
+/// looked up again and just sit unused; at realistic branch-churn rates
+/// that's a few KB over the daemon's lifetime, not worth evicting.
 ///
 /// This is the fix for the #2607 freeze incident: `sweep_from_registry`'s
 /// dry-run mode never consumes candidates, so — before this cache — EVERY
 /// ~10-minute sweep round re-ran the expensive cherry/tree-diff check for
 /// ALL 172 accumulated candidates from scratch (83s, synchronously blocking
 /// the daemon's main tick loop). With this cache, only a candidate whose tip
-/// actually moved since the last round pays that cost again.
-type SquashCacheKey = (PathBuf, String, String);
+/// (or `default`'s tip) actually moved since the last round pays that cost
+/// again.
+type SquashCacheKey = (PathBuf, String, String, String);
 static SQUASH_MERGED_CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<SquashCacheKey, bool>>> =
     std::sync::OnceLock::new();
 
@@ -444,6 +449,11 @@ static SQUASH_MERGED_CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<Squas
 /// falling back to the real `is_squash_merged` computation. Same final
 /// boolean as the pre-#P1-2607 `is_squash_merged(..) && age(..)` — only the
 /// evaluation order and repeat-call cost changed.
+///
+/// #2614: `default`'s tip is also resolved unconditionally (one more cheap
+/// `branch_tip_info` spawn, NOT the expensive cherry/tree-diff check) and
+/// folded into the cache key — if `default` can't be resolved, fail closed
+/// (not eligible) rather than caching under an incomplete key.
 pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &str) -> bool {
     let Some((tip_sha, tip_ts)) = branch_tip_info(repo_root, branch) else {
         return false;
@@ -455,8 +465,16 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
     if Duration::from_secs(now.saturating_sub(tip_ts)) < SQUASH_GC_MIN_TIP_AGE {
         return false;
     }
+    let Some((default_tip_sha, _)) = branch_tip_info(repo_root, default) else {
+        return false;
+    };
 
-    let key = (repo_root.to_path_buf(), branch.to_string(), tip_sha);
+    let key = (
+        repo_root.to_path_buf(),
+        branch.to_string(),
+        tip_sha,
+        default_tip_sha,
+    );
     let cache = SQUASH_MERGED_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     if let Some(&cached) = cache.lock().get(&key) {
         return cached;
@@ -1095,7 +1113,14 @@ mod tests {
         make_squash_orphan(&repo, "feat/cache-me", "2024-01-01T00:00:00 +0000");
         let (tip_sha, _) = branch_tip_info(&repo, "feat/cache-me")
             .expect("tip info must resolve for an existing branch");
-        let key = (repo.clone(), "feat/cache-me".to_string(), tip_sha);
+        let (default_tip_sha, _) =
+            branch_tip_info(&repo, "main").expect("tip info must resolve for main");
+        let key = (
+            repo.clone(),
+            "feat/cache-me".to_string(),
+            tip_sha,
+            default_tip_sha,
+        );
 
         let cache = SQUASH_MERGED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         assert!(
@@ -1145,6 +1170,54 @@ mod tests {
             "after the tip moves to a fresh young commit, eligibility must be \
              re-derived under the NEW tip key, not answered from the OLD tip's \
              cached (stale) verdict"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2614: `is_squash_merged`'s verdict for a FIXED branch tip depends on
+    /// `default`'s content too — a branch not yet reflected in `default` is
+    /// (correctly) ineligible, but once `default` absorbs the branch's patch
+    /// (a real squash-merge), the SAME branch tip becomes eligible. The old
+    /// 3-tuple cache key `(repo, branch, tip_sha)` ignored `default`'s tip
+    /// entirely, so this transition was cached as permanently ineligible —
+    /// live prune would never reap the branch and dry-run would systematically
+    /// under-report it.
+    #[test]
+    fn is_squash_gc_eligible_recomputes_after_default_tip_moves_2614() {
+        let repo = setup_test_repo("2614-default-tip-move");
+        git_in(&repo, &["checkout", "-b", "feat/lagging"]);
+        std::fs::write(repo.join("feat.txt"), "feature").ok();
+        git_in(&repo, &["add", "."]);
+        git_commit_dated(&repo, "feature work", "2024-01-01T00:00:00 +0000");
+        git_in(&repo, &["checkout", "main"]);
+
+        let (branch_tip, _) =
+            branch_tip_info(&repo, "feat/lagging").expect("tip info must resolve");
+
+        // Precondition: `main` hasn't absorbed the branch's patch yet — not
+        // squash-merged. This (false) verdict is what gets cached.
+        assert!(
+            !is_squash_gc_eligible(&repo, "feat/lagging", "main"),
+            "precondition: branch not yet reflected in default → ineligible"
+        );
+
+        // Advance `main` the way a real squash-merge PR does — cherry-pick the
+        // branch's patch. The branch's OWN tip does not move.
+        git_in(&repo, &["cherry-pick", "feat/lagging"]);
+        let (branch_tip_after, _) =
+            branch_tip_info(&repo, "feat/lagging").expect("tip info must resolve");
+        assert_eq!(
+            branch_tip, branch_tip_after,
+            "precondition: branch's own tip must NOT move — only `main` advances"
+        );
+
+        assert!(
+            is_squash_gc_eligible(&repo, "feat/lagging", "main"),
+            "#2614: once `main` absorbs the branch's patch, eligibility must be \
+             RECOMPUTED — `default`'s tip is part of the cache key, so a stale \
+             entry keyed only on branch tip must not keep returning the old \
+             (false) verdict forever"
         );
 
         std::fs::remove_dir_all(&repo).ok();
