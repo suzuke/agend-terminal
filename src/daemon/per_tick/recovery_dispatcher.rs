@@ -409,7 +409,8 @@ fn fire_stage1_alive_stuck(
         // lock was dropped (the caller snapshots `target.pty_writer` under
         // the lock, then releases it) — so a stuck write can no longer
         // stall the supervisor tick / wedge the daemon. A timeout surfaces
-        // as `Err`, which escalates to Stage 2 just like a write error.
+        // as `Err`, handled below — #2549 removed Stage 2, so this no
+        // longer escalates anywhere; it falls through to `Stage1Pending`.
         let write_result = agent::write_to_pty(&target.pty_writer, b"\x1b");
         match write_result {
             Ok(_) => {
@@ -861,6 +862,151 @@ mod tests {
         assert!(
             fire_body.contains(&common_tail),
             "the function's common tail must unconditionally set Stage1Pending (reached by both Ok and Err paths)"
+        );
+    }
+
+    /// Capture ALL tracing events (any target, TRACE+) emitted while `f` runs.
+    /// `tracing_test::traced_test`'s default filter is crate-path-scoped and
+    /// DROPS this file's custom `target: TARGET` ("recovery_shadow") events —
+    /// same gotcha `state::tests::capture_all_logs` documents (verified
+    /// empirically there too) — so an unfiltered subscriber is installed for
+    /// the closure's duration instead. `cfg`-gated with its sole caller below
+    /// (Unix-only) to avoid an unused-fn warning on Windows.
+    #[cfg(not(target_os = "windows"))]
+    fn capture_all_logs<F: FnOnce()>(f: F) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture buf mutex")
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(Buf(buf.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = buf.lock().expect("capture buf mutex").clone();
+        String::from_utf8(bytes).expect("capture buf is utf8")
+    }
+
+    /// t-...14440-6 caller-level integration pin (companion to the
+    /// structural scan above): drives `fire_stage1_alive_stuck`'s Err arm
+    /// through a REAL registered writer — spawned via the actual
+    /// `spawn_agent` production path, so `write_actor::register` runs
+    /// exactly as it does in production (#2620) — with its queue saturated
+    /// so the ESC byte write genuinely fails, not a structural stand-in.
+    ///
+    /// NOTE for readers cross-checking against PTY-WRITE-ACTOR-SPIKE.md §2:
+    /// the spike's item ① expected this failure to "escalate to Stage 2" —
+    /// that was already stale when written. Stage 2/3 were removed in
+    /// #2549 P2 (commit 97960ce8), before write_actor (#2620) existed, so a
+    /// write failure here has nothing left to escalate to; it falls
+    /// through to `Stage1Pending` (a one-shot "attempted, stop" marker),
+    /// which is what this test pins.
+    ///
+    /// Unix-only: the wedge fixture (`sh -c "stty raw -echo; sleep 30"`) and
+    /// `write_actor` itself don't exist on Windows (mirrors the other
+    /// real-PTY-wedge tests in this codebase).
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn fire_stage1_pty_write_failure_lands_in_stage1_pending_real_actor_2620() {
+        let registry: agent::AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
+        let cfg = agent::SpawnConfig {
+            name: "wedged-esc-target",
+            backend_command: "sh",
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let id = agent::spawn_agent(&cfg, &registry).expect("wedged shell must spawn");
+        // Let `stty raw -echo` take effect before writing — mirrors
+        // write_actor.rs's own `wedged_pty()` fixture's post-spawn wait.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (core, pty_writer) = {
+            let reg = registry.lock();
+            let handle = reg.get(&id).expect("spawned handle must be present");
+            (
+                std::sync::Arc::clone(&handle.core),
+                std::sync::Arc::clone(&handle.pty_writer),
+            )
+        };
+
+        // Saturate the actor's per-writer queue so the ESC byte write below
+        // genuinely fails. A single write LARGER than the cap is rejected
+        // outright at enqueue time (never queued at all) — priming with
+        // exactly write_actor's cap (`MAX_QUEUE_BYTES_PER_WRITER`, 1 MiB at
+        // time of writing — private to write_actor.rs, so duplicated here
+        // by value) is what actually gets a near-full job INTO the queue.
+        // The wedged child never drains it, so the follow-up 1-byte ESC
+        // write either hits the instant backpressure reject (if the tiny
+        // real kernel-pty buffer hasn't drained any headroom yet) or queues
+        // behind it and times out after `PTY_WRITE_TIMEOUT` (5s) — either
+        // way, a genuine `Err`, not a race against an empty queue. Confirmed
+        // empirically (both outcomes observed as `Err` under this setup).
+        let priming_result = agent::write_to_pty(&pty_writer, &vec![b'x'; 1 << 20]);
+        assert!(
+            priming_result.is_err(),
+            "test invariant: the priming write itself must also see a saturated/wedged queue"
+        );
+
+        let target = RecoveryTarget {
+            name: "wedged-esc-target".to_string(),
+            core: std::sync::Arc::clone(&core),
+            pty_writer,
+        };
+        let logs = capture_all_logs(|| {
+            fire_stage1_alive_stuck(
+                "wedged-esc-target",
+                &target,
+                true, // gate_active
+                Duration::from_secs(200),
+                Duration::from_secs(200),
+            );
+        });
+
+        // Confirm the Err arm was actually the one that ran — the common
+        // tail below sets Stage1Pending unconditionally on BOTH Ok and Err,
+        // so the state alone can't distinguish a genuine write failure from
+        // a write that happened to succeed against an empty queue.
+        assert!(
+            logs.contains("stage1 PTY write failed"),
+            "the ESC write must have genuinely failed (logged warn), not silently succeeded: {logs}"
+        );
+
+        let state = core.lock().health.recovery_stage_state;
+        assert!(
+            matches!(state, RecoveryStageState::Stage1Pending { .. }),
+            "a genuine PTY write failure must still land in Stage1Pending — nothing left to \
+             escalate to post-#2549; got {state:?}"
         );
     }
 

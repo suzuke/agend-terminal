@@ -605,6 +605,114 @@ mod tests {
         }
     }
 
+    /// Sibling of [`test_ctx_with_agent`]: spawns a REAL, permanently-wedged
+    /// agent (`stty raw -echo; sleep 30` — never drains stdin) instead of a
+    /// healthy shell, so a caller can force a genuine PTY write failure
+    /// through the real `write_actor::register`ed production path (#2620).
+    /// `cfg`-gated with its sole caller below (Unix-only) to avoid an
+    /// unused-fn warning on Windows.
+    #[cfg(not(target_os = "windows"))]
+    fn test_ctx_with_wedged_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
+        let home = Box::new(std::env::temp_dir().join(format!(
+            "agend-api-inst-wedged-{}-{}",
+            name,
+            std::process::id()
+        )));
+        std::fs::create_dir_all(home.as_ref()).ok();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home.as_ref()),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n",
+                crate::types::InstanceId::new().full()
+            ),
+        )
+        .ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+
+        let wedge_args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
+        let spawn_cfg = agent::SpawnConfig {
+            name,
+            backend_command: "sh",
+            args: &wedge_args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(home.as_ref()),
+            crash_tx: None,
+            shutdown: None,
+        };
+        agent::spawn_agent(&spawn_cfg, registry).expect("spawn wedged test agent");
+        // Let `stty raw -echo` take effect — mirrors write_actor.rs's own
+        // `wedged_pty()` fixture's post-spawn wait.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let home_ref: &'static std::path::Path = Box::leak(home.clone());
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        (ctx, home)
+    }
+
+    /// t-...14440-6 caller-level integration pin: the API INJECT handler's
+    /// `{"ok":false,"error":...}` shape (instance.rs:57, post-#2620) survives
+    /// a GENUINE write failure through the real actor-mediated path — not a
+    /// panic, not a hang, not a silently-`true` response. Backpressure-
+    /// saturates the target's real write_actor queue first (same recipe as
+    /// `recovery_dispatcher`'s #2620 caller pin), so the raw inject below is
+    /// guaranteed to hit the `Err` arm.
+    ///
+    /// Unix-only: the wedge fixture (`sh -c "stty raw -echo; sleep 30"`) and
+    /// `write_actor` itself don't exist on Windows.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn handle_inject_returns_ok_false_on_genuine_actor_write_failure_2620() {
+        let name = "wedged-inject-target";
+        let (ctx, home) = test_ctx_with_wedged_agent(name);
+
+        let pty_writer = {
+            let reg = agent::lock_registry(ctx.registry);
+            let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet.yaml seeded id");
+            let handle = reg.get(&id).expect("spawned handle must be present");
+            Arc::clone(&handle.pty_writer)
+        };
+        // Saturate the queue (see write_actor.rs's MAX_QUEUE_BYTES_PER_WRITER,
+        // 1 MiB at time of writing — duplicated here by value, private to
+        // that module) so the handler's own write below genuinely fails.
+        let priming_result = agent::write_to_pty(&pty_writer, &vec![b'x'; 1 << 20]);
+        assert!(
+            priming_result.is_err(),
+            "test invariant: the priming write itself must also see a saturated/wedged queue"
+        );
+
+        let resp = handle_inject(&json!({"name": name, "data": "x", "raw": true}), &ctx);
+
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "a genuine write failure must surface as ok:false, not panic/hang: {resp:?}"
+        );
+        assert!(
+            resp["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "the false response must carry a non-empty error string: {resp:?}"
+        );
+
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
     /// t-90 (direction-b common case): a name already held by an EXTERNAL agent
     /// must NOT be spawnable as a managed agent — `handle_spawn` rejects it at
     /// the external check (Option B) BEFORE any registry lock or spawn.
