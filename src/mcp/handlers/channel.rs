@@ -54,41 +54,85 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         return json!({"error": "No fleet.yaml — cannot send reply"});
     }
 
-    // Sprint 55 P0-A — prefer-chain: sender's HeartbeatPair.reply_to_channel
-    // (Sprint 52 router-layer attribution) wins when present + registered;
-    // else fall back to whichever channel the sending instance is bound to
-    // (multi-channel-safe, t-20260703164240502572-50899-11 — `active_channel()`
-    // alone returns `None` once 2+ channels are registered); last resort is
-    // the `active_channel()` singleton. Returns structured error codes so
-    // agents can branch on machine-readable signals.
-    let snapshot = crate::daemon::heartbeat_pair::snapshot_for(instance_name);
-    let ch: Arc<dyn crate::channel::Channel> = match snapshot.reply_to_channel.as_deref() {
-        Some(name) => match crate::channel::lookup_channel_by_name(name) {
+    // #2622 PR-3: an explicit `message_id` routes by THAT message's own
+    // channel (from its inbox row) instead of the process-global prefer-chain
+    // below — the targeted-reply path (Fork C: a late reply to an
+    // old/reclaimed message must land on ITS channel even when the sender's
+    // CURRENT `reply_to_channel` tag has moved on or gone stale). No
+    // `message_id` → byte-identical to the pre-#2622 prefer-chain.
+    let message_id = args["message_id"].as_str().filter(|s| !s.is_empty());
+    let ch: Arc<dyn crate::channel::Channel> = if let Some(msg_id) = message_id {
+        let Some(row) = crate::inbox::storage::find_message(home, msg_id) else {
+            crate::reply_ledger::record_reply_outcome(instance_name, false);
+            return json!({
+                "error": format!("message '{msg_id}' not found in any inbox"),
+                "code": "message_not_found"
+            });
+        };
+        let Some(kind) = row.channel else {
+            crate::reply_ledger::record_reply_outcome(instance_name, false);
+            return json!({
+                "error": format!(
+                    "message '{msg_id}' has no channel — cannot route a targeted reply"
+                ),
+                "code": "message_has_no_channel"
+            });
+        };
+        let channel_name = match kind {
+            crate::channel::ChannelKind::Telegram => "telegram",
+            crate::channel::ChannelKind::Discord => "discord",
+        };
+        match crate::channel::lookup_channel_by_name(channel_name) {
             Some(ch) => ch,
             None => {
                 tracing::warn!(
-                    from = %instance_name, channel = %name,
-                    "reply_to_channel tagged but not registered — divergence"
+                    from = %instance_name, channel = %channel_name,
+                    "targeted reply's channel not registered — divergence"
                 );
-                // #1665 Gap D: the agent tried to reply but the channel is
-                // unreachable — record the send-failure (never blocks the reply).
                 crate::reply_ledger::record_reply_outcome(instance_name, false);
                 return json!({
-                    "error": format!("reply_to_channel '{name}' not registered or offline"),
+                    "error": format!("channel '{channel_name}' not registered or offline"),
                     "code": "reply_channel_unavailable"
                 });
             }
-        },
-        None => match crate::channel::channel_for_instance(instance_name)
-            .or_else(crate::channel::active_channel)
-        {
-            Some(ch) => ch,
-            None => {
-                // #1665 Gap D: no channel to reply on — record the send-failure.
-                crate::reply_ledger::record_reply_outcome(instance_name, false);
-                return json!({"error": "no active channel", "code": "no_active_channel"});
-            }
-        },
+        }
+    } else {
+        // Sprint 55 P0-A — prefer-chain: sender's HeartbeatPair.reply_to_channel
+        // (Sprint 52 router-layer attribution) wins when present + registered;
+        // else fall back to whichever channel the sending instance is bound to
+        // (multi-channel-safe, t-20260703164240502572-50899-11 — `active_channel()`
+        // alone returns `None` once 2+ channels are registered); last resort is
+        // the `active_channel()` singleton. Returns structured error codes so
+        // agents can branch on machine-readable signals.
+        let snapshot = crate::daemon::heartbeat_pair::snapshot_for(instance_name);
+        match snapshot.reply_to_channel.as_deref() {
+            Some(name) => match crate::channel::lookup_channel_by_name(name) {
+                Some(ch) => ch,
+                None => {
+                    tracing::warn!(
+                        from = %instance_name, channel = %name,
+                        "reply_to_channel tagged but not registered — divergence"
+                    );
+                    // #1665 Gap D: the agent tried to reply but the channel is
+                    // unreachable — record the send-failure (never blocks the reply).
+                    crate::reply_ledger::record_reply_outcome(instance_name, false);
+                    return json!({
+                        "error": format!("reply_to_channel '{name}' not registered or offline"),
+                        "code": "reply_channel_unavailable"
+                    });
+                }
+            },
+            None => match crate::channel::channel_for_instance(instance_name)
+                .or_else(crate::channel::active_channel)
+            {
+                Some(ch) => ch,
+                None => {
+                    // #1665 Gap D: no channel to reply on — record the send-failure.
+                    crate::reply_ledger::record_reply_outcome(instance_name, false);
+                    return json!({"error": "no active channel", "code": "no_active_channel"});
+                }
+            },
+        }
     };
     // #969 RC2 fix: set mirror_skip BEFORE the send. Pre-fix this set
     // ran in the Ok arm AFTER ch.send_from_agent returned; on the
@@ -116,6 +160,13 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         Ok(msg) => {
             // #1665: reply delivered — closes the user-turn (no warn at sweep).
             crate::reply_ledger::record_reply_outcome(instance_name, true);
+            // #2622 PR-3 Fork C: a targeted reply also settles the persistent
+            // row (unconditionally — a `read` row is a no-op, an `unread`/
+            // `delivering` row is marked read) so an old/reclaimed message
+            // stops redelivering once it's actually been answered.
+            if let Some(msg_id) = message_id {
+                crate::inbox::storage::settle_read_by_id(home, instance_name, msg_id);
+            }
             // Sprint 59 Wave 1 PR-4: surface the pending-decision /
             // resolved-decision IDs so caller observability is
             // complete (operator can reference IDs, agent can verify
