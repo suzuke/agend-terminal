@@ -561,3 +561,186 @@ fn discharge_for_one_agent_must_not_suppress_same_text_for_another_agent() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2622 PR-3: `reply` optional `message_id` — targeted-channel routing ──
+
+/// Like [`enqueue_channel_msg`] but lets the test pick the row's channel kind
+/// (the shared helper hardcodes Telegram — these tests need a row whose
+/// channel DIFFERS from whatever the prefer-chain would otherwise pick, to
+/// prove the `message_id` path overrides it).
+fn enqueue_channel_msg_with_kind(
+    home: &std::path::Path,
+    agent: &str,
+    id: &str,
+    from: &str,
+    text: &str,
+    kind: crate::channel::ChannelKind,
+) {
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 1,
+        id: Some(id.into()),
+        from: from.into(),
+        text: text.into(),
+        kind: None,
+        timestamp: "2026-06-22T16:41:45Z".into(),
+        channel: Some(kind),
+        ..Default::default()
+    };
+    crate::inbox::enqueue(home, agent, msg).expect("test setup: enqueue must succeed");
+}
+
+/// The core PR-3 fix: a `message_id` routes by THAT message's own channel
+/// (from its inbox row), not the sender's process-global `reply_to_channel`
+/// tag — so a late reply to an old/reclaimed message lands correctly even
+/// when the agent's CURRENT tag points somewhere else (or somewhere broken).
+#[test]
+fn reply_with_message_id_routes_by_row_channel_not_prefer_chain_2622() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let agent = "reply-mid-routes-2622";
+    let home = tmp_home("reply-mid-routes");
+    // The sender's CURRENT tag points at telegram, which is registered but
+    // deliberately incapable — proves the targeted path does NOT consult it.
+    crate::channel::register_active_channel(MockChannel::arc(
+        "telegram",
+        ReplyOutcome::NotSupported,
+    ));
+    crate::channel::register_active_channel(MockChannel::arc("discord", ReplyOutcome::Ok));
+    set_reply_to(agent, Some("telegram"));
+
+    enqueue_channel_msg_with_kind(
+        &home,
+        agent,
+        "m-old-1",
+        "user:op",
+        "old question",
+        crate::channel::ChannelKind::Discord,
+    );
+
+    let result = super::handle_reply(
+        &home,
+        &serde_json::json!({"message": "answer", "message_id": "m-old-1"}),
+        agent,
+    );
+    assert_eq!(
+        result["message_id"], "mock-msg-1",
+        "must route via the row's OWN channel (discord), not the stale telegram tag: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// No `message_id` → byte-identical to the pre-#2622 prefer-chain: the same
+/// stale telegram tag now DOES get consulted and its incapability surfaces.
+#[test]
+fn reply_without_message_id_still_uses_prefer_chain_2622() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let agent = "reply-mid-backcompat-2622";
+    let home = tmp_home("reply-mid-backcompat");
+    crate::channel::register_active_channel(MockChannel::arc(
+        "telegram",
+        ReplyOutcome::NotSupported,
+    ));
+    crate::channel::register_active_channel(MockChannel::arc("discord", ReplyOutcome::Ok));
+    set_reply_to(agent, Some("telegram"));
+
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "answer"}), agent);
+    assert_eq!(
+        result["code"], "channel_capability_unsupported",
+        "omitting message_id must still hit the tagged (incapable) channel: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Fork C: on send success, a targeted reply also settles the persistent row
+/// (unconditionally — an `unread` row from an old/reclaimed message is the
+/// core use case) so it stops redelivering.
+#[test]
+fn reply_with_message_id_settles_the_row_on_success_2622() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let agent = "reply-mid-settles-2622";
+    let home = tmp_home("reply-mid-settles");
+    crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
+
+    enqueue_channel_msg(&home, agent, "m-settle-1", "user:op", "old question");
+    assert!(
+        crate::inbox::storage::find_message(&home, "m-settle-1")
+            .and_then(|m| m.read_at)
+            .is_none(),
+        "precondition: the row starts unread"
+    );
+
+    let result = super::handle_reply(
+        &home,
+        &serde_json::json!({"message": "answer", "message_id": "m-settle-1"}),
+        agent,
+    );
+    assert_eq!(
+        result["message_id"], "mock-msg-1",
+        "reply must succeed: {result}"
+    );
+    assert!(
+        crate::inbox::storage::find_message(&home, "m-settle-1")
+            .and_then(|m| m.read_at)
+            .is_some(),
+        "a successful targeted reply must settle the row so it stops redelivering"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// An unknown `message_id` must error, never silently fall back to the
+/// prefer-chain (that would silently answer on the WRONG channel).
+#[test]
+fn reply_with_unknown_message_id_errors_2622() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let agent = "reply-mid-unknown-2622";
+    let home = tmp_home("reply-mid-unknown");
+    crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
+
+    let result = super::handle_reply(
+        &home,
+        &serde_json::json!({"message": "answer", "message_id": "m-nope"}),
+        agent,
+    );
+    assert_eq!(
+        result["code"], "message_not_found",
+        "an unknown message_id must error, not silently fall back: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A row with no recorded channel (e.g. a non-channel inbox message) can't be
+/// targeted-routed — must error, never silently fall back to the prefer-chain.
+#[test]
+fn reply_with_message_id_missing_channel_on_row_errors_2622() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let agent = "reply-mid-nochannel-2622";
+    let home = tmp_home("reply-mid-nochannel");
+    crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
+
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 1,
+        id: Some("m-nochannel-1".into()),
+        from: "peer".into(),
+        text: "not a channel message".into(),
+        kind: Some("update".into()),
+        timestamp: "2026-06-22T16:41:45Z".into(),
+        channel: None,
+        ..Default::default()
+    };
+    crate::inbox::enqueue(&home, agent, msg).expect("test setup: enqueue must succeed");
+
+    let result = super::handle_reply(
+        &home,
+        &serde_json::json!({"message": "answer", "message_id": "m-nochannel-1"}),
+        agent,
+    );
+    assert_eq!(
+        result["code"], "message_has_no_channel",
+        "a channel-less row must error, not silently fall back: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
