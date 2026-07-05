@@ -69,10 +69,31 @@ pub struct ClassifiedTopic {
     pub class: TopicClass,
 }
 
+/// #991 PR-D: a fleet.yaml instance eligible for the `bind_topic` MCP
+/// action — no topics.json entry yet, and not `skip` mode (which
+/// `bind_topic_for_instance`, topic_registry.rs:154, permanently refuses).
+/// Structurally separate from [`ClassifiedTopic`] (sourced from fleet.yaml,
+/// not topics.json — there is no `topic_id` to report yet, that's the
+/// point) rather than a third [`TopicClass`] variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundEntry {
+    pub instance_name: String,
+    /// Verbatim `topic_binding_mode` from fleet.yaml — `Some("deferred")`,
+    /// `Some("auto")`, or `None` (unset, defaults to auto behavior). Lets an
+    /// operator distinguish a deliberately-deferred instance from an
+    /// `auto`-mode one that missed its topic at spawn (e.g. the ~6s
+    /// post-boot window) — the latter may be a symptom worth investigating,
+    /// not just a state to retrofit.
+    pub topic_binding_mode: Option<String>,
+}
+
 /// Classification report — sorted by topic_id for stable output.
 #[derive(Debug, Clone, Default)]
 pub struct TopicReport {
     pub entries: Vec<ClassifiedTopic>,
+    /// #991 PR-D: bind_topic-eligible fleet.yaml instances with no topic
+    /// yet. Sorted by instance name for stable output.
+    pub unbound: Vec<UnboundEntry>,
     /// `can_manage_topics` permission status; `None` when the
     /// telegram channel is unconfigured/unavailable. `--cleanup`
     /// chat-mutating operations gated on `Some(true)`.
@@ -95,6 +116,9 @@ pub fn classify(home: &Path) -> TopicReport {
         .as_ref()
         .map(|c| c.instances.keys().cloned().collect())
         .unwrap_or_default();
+    // Snapshot BEFORE `registry.into_iter()` consumes it below.
+    let bound_instance_names: std::collections::HashSet<String> =
+        registry.values().cloned().collect();
 
     let mut entries: Vec<ClassifiedTopic> = registry
         .into_iter()
@@ -114,8 +138,32 @@ pub fn classify(home: &Path) -> TopicReport {
         .collect();
     entries.sort_by_key(|e| e.topic_id);
 
+    // #991 PR-D: Unbound — mirrors `bind_topic_for_instance`'s real
+    // eligibility rule (topic_registry.rs:154): not `skip` mode AND no
+    // topic yet. Deliberately broader than PRERESEARCH's original
+    // "deferred only" wording — an `auto`-mode instance that missed its
+    // topic at spawn is equally bind_topic-eligible.
+    let mut unbound: Vec<UnboundEntry> = fleet
+        .as_ref()
+        .map(|c| {
+            c.instances
+                .iter()
+                .filter(|(name, inst)| {
+                    inst.topic_binding_mode.as_deref() != Some("skip")
+                        && !bound_instance_names.contains(name.as_str())
+                })
+                .map(|(name, inst)| UnboundEntry {
+                    instance_name: name.clone(),
+                    topic_binding_mode: inst.topic_binding_mode.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    unbound.sort_by(|a, b| a.instance_name.cmp(&b.instance_name));
+
     TopicReport {
         entries,
+        unbound,
         can_manage_topics: None,
     }
 }
@@ -134,6 +182,21 @@ fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// #991 PR-D r1 (reviewer4 finding on #2633 r0): the Unbound hint's `bind_topic`
+/// invocation example must use the REAL MCP parameter name, not a
+/// hardcoded guess — r0 wrote `instance_name=<name>`, but the actual schema
+/// (`crate::mcp::tools::def_bind_topic`) requires `instance`, so the
+/// copy-pasted hint would have failed with a missing-parameter error if an
+/// operator followed it literally. Reading the schema directly here (rather
+/// than hardcoding "instance" as a second literal) means this can never
+/// silently drift from the real parameter name again, even if it's renamed.
+fn bind_topic_instance_param() -> String {
+    crate::mcp::tools::def_bind_topic()["inputSchema"]["required"][0]
+        .as_str()
+        .unwrap_or("instance")
+        .to_string()
 }
 
 /// Render the report as a human-readable multi-line string.
@@ -158,6 +221,25 @@ pub fn render_human(report: &TopicReport) -> String {
                 .collect();
             out.push_str(&format!("({})\n", names.join(", ")));
         }
+    }
+    if !report.unbound.is_empty() {
+        out.push_str(&format!("  {} unbound (", report.unbound.len()));
+        let names: Vec<String> = report
+            .unbound
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}",
+                    e.instance_name,
+                    e.topic_binding_mode.as_deref().unwrap_or("auto")
+                )
+            })
+            .collect();
+        out.push_str(&names.join(", "));
+        out.push_str(&format!(
+            ") — bind_topic-eligible, run `bind_topic {}=<name>` to retrofit\n",
+            bind_topic_instance_param()
+        ));
     }
     out.push('\n');
     match report.can_manage_topics {
@@ -197,14 +279,31 @@ pub fn render_json(report: &TopicReport) -> String {
             })
         })
         .collect();
+    let unbound: Vec<serde_json::Value> = report
+        .unbound
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "instance_name": e.instance_name,
+                "topic_binding_mode": e.topic_binding_mode,
+            })
+        })
+        .collect();
     let counts = serde_json::json!({
         "live": report.count_by_class(TopicClass::Live),
         "orphan": report.count_by_class(TopicClass::Orphan),
+        "unbound": report.unbound.len(),
         "total": report.entries.len(),
     });
     let payload = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "entries": entries,
+        // #991 PR-D: bind_topic-eligible fleet.yaml instances with no topic
+        // yet — see `UnboundEntry` doc comment. NOT part of `entries`
+        // (sourced from fleet.yaml, not topics.json — no topic_id exists),
+        // and excluded from `counts.total` (which still only counts the
+        // topics.json-derived live/orphan taxonomy).
+        "unbound": unbound,
         "counts": counts,
         "can_manage_topics": report.can_manage_topics,
         "limitation_note": "stale_chat class unavailable per Telegram Bot API forum-topic enumeration gap (Sprint 59 Wave 2 PR-IMPL F2)",
@@ -529,5 +628,169 @@ mod tests {
     fn class_as_str_round_trips_to_taxonomy_names() {
         assert_eq!(TopicClass::Live.as_str(), "live");
         assert_eq!(TopicClass::Orphan.as_str(), "orphan");
+    }
+
+    // ── #991 PR-D: Unbound (bind_topic-eligible) classification ──
+
+    /// Sibling of `write_fleet` with an explicit `topic_binding_mode`.
+    fn write_fleet_with_binding(home: &Path, instances: &[(&str, Option<i32>, Option<&str>)]) {
+        let mut yaml = String::from("instances:\n");
+        for (name, tid, mode) in instances {
+            yaml.push_str(&format!("  {name}:\n"));
+            yaml.push_str("    backend: claude\n");
+            if let Some(t) = tid {
+                yaml.push_str(&format!("    topic_id: {t}\n"));
+            }
+            if let Some(m) = mode {
+                yaml.push_str(&format!("    topic_binding_mode: {m}\n"));
+            }
+        }
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    /// A `deferred`-mode instance with no topics.json entry is the
+    /// textbook Unbound case (PR-D's original motivating example).
+    #[test]
+    fn classify_unbound_deferred_instance_without_topic_991() {
+        let home = tmp_home("unbound-deferred");
+        write_registry(&home, &[]);
+        write_fleet_with_binding(&home, &[("beta", None, Some("deferred"))]);
+        let report = classify(&home);
+        assert_eq!(report.unbound.len(), 1, "report={report:?}");
+        assert_eq!(report.unbound[0].instance_name, "beta");
+        assert_eq!(
+            report.unbound[0].topic_binding_mode.as_deref(),
+            Some("deferred")
+        );
+    }
+
+    /// Real `bind_topic_for_instance` eligibility (topic_registry.rs:154) is
+    /// "not skip AND no topic yet" — broader than PRERESEARCH's original
+    /// "deferred only" wording. An `auto`-mode instance that ended up
+    /// without a topic (e.g. the ~6s post-boot window) is equally
+    /// bind_topic-eligible and must appear in Unbound too, or the class
+    /// undercounts exactly the actionable set it exists to surface.
+    #[test]
+    fn classify_unbound_includes_auto_mode_missing_topic_991() {
+        let home = tmp_home("unbound-auto");
+        write_registry(&home, &[]);
+        // No topic_binding_mode at all == "auto" (the documented default).
+        write_fleet_with_binding(&home, &[("gamma", None, None)]);
+        let report = classify(&home);
+        assert_eq!(report.unbound.len(), 1, "report={report:?}");
+        assert_eq!(report.unbound[0].instance_name, "gamma");
+        assert_eq!(
+            report.unbound[0].topic_binding_mode, None,
+            "unset mode recorded as None (\"auto\" is the display default, not a stored value)"
+        );
+    }
+
+    /// `skip` mode is explicitly refused by `bind_topic_for_instance`
+    /// ("skip's literal promise is no topic, ever") — must NEVER appear in
+    /// Unbound regardless of missing a topics.json entry.
+    #[test]
+    fn classify_skip_mode_never_unbound_991() {
+        let home = tmp_home("unbound-skip-excluded");
+        write_registry(&home, &[]);
+        write_fleet_with_binding(&home, &[("delta", None, Some("skip"))]);
+        let report = classify(&home);
+        assert!(
+            report.unbound.is_empty(),
+            "skip-mode instances must never be Unbound: {report:?}"
+        );
+    }
+
+    /// An instance that already has a topics.json entry is bound, not
+    /// Unbound — regardless of its topic_binding_mode.
+    #[test]
+    fn classify_already_bound_instance_not_unbound_991() {
+        let home = tmp_home("unbound-already-bound");
+        write_registry(&home, &[(42, "epsilon")]);
+        write_fleet_with_binding(&home, &[("epsilon", Some(42), Some("deferred"))]);
+        let report = classify(&home);
+        assert!(
+            report.unbound.is_empty(),
+            "an already-bound instance must not double-count as Unbound: {report:?}"
+        );
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].class, TopicClass::Live);
+    }
+
+    /// Adding Unbound must not perturb the existing Live/Orphan taxonomy —
+    /// a mixed fleet classifies each instance into exactly the right bucket.
+    #[test]
+    fn classify_unbound_coexists_with_live_and_orphan_991() {
+        let home = tmp_home("unbound-mixed");
+        // tid=1 is reserved (General/fleet-binding topic, excluded from
+        // `entries` entirely) — use non-reserved ids for real test instances.
+        write_registry(&home, &[(10, "live-one"), (20, "orphan-one")]);
+        write_fleet_with_binding(
+            &home,
+            &[
+                ("live-one", Some(10), None),
+                ("deferred-one", None, Some("deferred")),
+            ],
+        );
+        let report = classify(&home);
+        assert_eq!(report.count_by_class(TopicClass::Live), 1);
+        assert_eq!(report.count_by_class(TopicClass::Orphan), 1);
+        assert_eq!(report.unbound.len(), 1);
+        assert_eq!(report.unbound[0].instance_name, "deferred-one");
+    }
+
+    #[test]
+    fn render_human_shows_unbound_section() {
+        let home = tmp_home("render-unbound");
+        write_registry(&home, &[]);
+        write_fleet_with_binding(&home, &[("beta", None, Some("deferred"))]);
+        let report = classify(&home);
+        let out = render_human(&report);
+        assert!(out.contains("unbound"), "must show unbound section: {out}");
+        assert!(
+            out.contains("beta:deferred"),
+            "must name + tag the mode: {out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// r0 (reviewer4 finding, #2633): the hint hardcoded `instance_name=`,
+    /// but the real `bind_topic` schema requires `instance` — an operator
+    /// following the hint literally would hit a missing-parameter error.
+    /// Derives the expected param name INDEPENDENTLY from
+    /// `crate::mcp::tools::def_bind_topic`'s own schema (not by re-reading
+    /// `render_human`'s implementation), so a future rename of that schema
+    /// breaks this test loudly instead of the hint silently drifting again.
+    #[test]
+    fn render_human_bind_topic_hint_uses_real_schema_param_name_2633() {
+        let home = tmp_home("render-unbound-param-name");
+        write_registry(&home, &[]);
+        write_fleet_with_binding(&home, &[("beta", None, Some("deferred"))]);
+        let report = classify(&home);
+        let out = render_human(&report);
+
+        let schema = crate::mcp::tools::def_bind_topic();
+        let real_param = schema["inputSchema"]["required"][0]
+            .as_str()
+            .expect("bind_topic schema declares a required instance param");
+        assert!(
+            out.contains(&format!("{real_param}=<name>")),
+            "the retrofit hint must use bind_topic's REAL required parameter \
+             ({real_param:?} per tools::def_bind_topic), not a hardcoded guess: {out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn render_json_includes_unbound_array_and_count() {
+        let home = tmp_home("render-json-unbound");
+        write_registry(&home, &[]);
+        write_fleet_with_binding(&home, &[("beta", None, Some("deferred"))]);
+        let report = classify(&home);
+        let json_str = render_json(&report);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["counts"]["unbound"], 1);
+        assert_eq!(parsed["unbound"][0]["instance_name"], "beta");
+        assert_eq!(parsed["unbound"][0]["topic_binding_mode"], "deferred");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
