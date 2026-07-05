@@ -557,6 +557,127 @@ instances:
     fs::remove_dir_all(&dir).ok();
 }
 
+// ── #2642 P6 PR-1: `configured_channels()` canonical unified view ──
+// The accessor is purely additive (normalize's field mutations are untouched
+// and pinned by the tests above), so a single-channel production fleet stays
+// byte-identical. PR-2 wires bootstrap/init to consume this view.
+
+#[test]
+fn configured_channels_singular_is_one_entry_byte_identical() {
+    // Production shape: only `channel:` set. The view must return exactly that
+    // one channel (keyed by type), and must NOT have mutated the fields.
+    let dir = std::env::temp_dir().join(format!("agend-fleet-cc-singular-{}", std::process::id()));
+    let path = write_fleet(
+        &dir,
+        r#"
+channel:
+  type: telegram
+  bot_token_env: PROD_TOKEN
+  group_id: -100
+instances: {}
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    // Field values untouched (byte-identical to the singular-only input).
+    assert!(config.channel.is_some(), "singular channel preserved");
+    assert!(
+        config.channels.is_none(),
+        "no plural map synthesized into the field"
+    );
+    // Unified view: exactly the one singular channel, keyed by its type.
+    let view = config.configured_channels();
+    assert_eq!(view.len(), 1, "singular is a 1-entry view");
+    assert_eq!(view[0].0, "telegram", "synthetic key is the channel type");
+    match view[0].1 {
+        ChannelConfig::Telegram { bot_token_env, .. } => assert_eq!(bot_token_env, "PROD_TOKEN"),
+        other => panic!("expected the singular telegram channel, got {other:?}"),
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn configured_channels_plural_returns_all_sorted_incl_mixed_types() {
+    // The coexistence unlock: `channels:` with telegram + discord must surface
+    // BOTH (not just the first-by-name that `normalize()` collapses into
+    // `channel`), sorted by key for determinism.
+    let dir = std::env::temp_dir().join(format!("agend-fleet-cc-plural-{}", std::process::id()));
+    let path = write_fleet(
+        &dir,
+        r#"
+channels:
+  z-telegram:
+    type: telegram
+    bot_token_env: TG_TOKEN
+    group_id: -100
+  a-discord:
+    type: discord
+    bot_token_env: DC_TOKEN
+    guild_id: 999
+instances: {}
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    let view = config.configured_channels();
+    let keys: Vec<&str> = view.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["a-discord", "z-telegram"],
+        "all entries, sorted by key"
+    );
+    assert!(
+        matches!(view[0].1, ChannelConfig::Discord { .. }),
+        "a-discord is discord"
+    );
+    assert!(
+        matches!(view[1].1, ChannelConfig::Telegram { .. }),
+        "z-telegram is telegram"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn configured_channels_empty_when_no_channel() {
+    let dir = std::env::temp_dir().join(format!("agend-fleet-cc-none-{}", std::process::id()));
+    let path = write_fleet(&dir, "instances: {}\n");
+    let config = FleetConfig::load(&path).expect("load");
+    assert!(config.configured_channels().is_empty());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn configured_channels_prefers_plural_when_both_set() {
+    // Mixing `channel:` + `channels:` is not a supported multi-channel config
+    // (the field docs say "prefer channels going forward"). The unified view
+    // treats the explicit plural map as authoritative; the legacy `channel:`
+    // field is left untouched for un-migrated singular readers (pinned by
+    // `test_channel_singular_wins_when_both_set`).
+    let dir = std::env::temp_dir().join(format!("agend-fleet-cc-both-{}", std::process::id()));
+    let path = write_fleet(
+        &dir,
+        r#"
+channel:
+  type: telegram
+  bot_token_env: SINGULAR_TOKEN
+  group_id: -111
+channels:
+  plural-entry:
+    type: telegram
+    bot_token_env: PLURAL_TOKEN
+    group_id: -222
+instances: {}
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    let view = config.configured_channels();
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].0, "plural-entry");
+    match view[0].1 {
+        ChannelConfig::Telegram { bot_token_env, .. } => assert_eq!(bot_token_env, "PLURAL_TOKEN"),
+        other => panic!("expected plural telegram entry, got {other:?}"),
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn test_channel_config_default_mode() {
     let dir = std::env::temp_dir().join(format!("agend-fleet-defmode-{}", std::process::id()));
