@@ -11,6 +11,18 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     let text = args["message"].as_str().unwrap_or("").to_string();
     tracing::info!(from = %instance_name, %text, "reply");
 
+    // Reply-to correlation: carry the sending turn's task context (when the
+    // agent passes it) into the sent_ledger so a later operator reply-to can be
+    // resolved back to this message's task. Absent on interactive replies → None.
+    let reply_task_id = args["task_id"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let reply_correlation_id = args["correlation_id"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+
     // Sprint 59 Wave 1 PR-4 ((B) decision default with timeout):
     // dual-purpose hook on every reply call.
     //
@@ -155,7 +167,11 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     });
     match ch.send_from_agent(
         instance_name,
-        crate::channel::AgentOutboundOp::Reply { text },
+        crate::channel::AgentOutboundOp::Reply {
+            text,
+            task_id: reply_task_id,
+            correlation_id: reply_correlation_id,
+        },
     ) {
         Ok(msg) => {
             // #1665: reply delivered — closes the user-turn (no warn at sweep).

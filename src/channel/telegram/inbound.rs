@@ -10,6 +10,29 @@ use super::poll_supervisor;
 use super::state::{lock_state, TelegramState};
 use super::topic_registry::load_topic_registry;
 
+/// #2570: resolve an operator quote-reply to its [`inbox::ReplyTargetContext`]
+/// via the sent_ledger, keyed by `(quoted message_id, this chat_id)` — Telegram
+/// message_ids repeat across chats, so the chat scope is required. `None` on a
+/// miss (a message sent before a pre-ledger restart, or a quote of a non-bot
+/// message); the agent still gets `in_reply_to_excerpt` (graceful degrade).
+/// Extracted from the inbound handler so the enrichment is unit-testable end to
+/// end (ledger record → quote-reply resolution → context).
+fn resolve_reply_target(
+    home: &std::path::Path,
+    quoted_msg_id: &str,
+    chat_id: &str,
+) -> Option<inbox::ReplyTargetContext> {
+    crate::sent_ledger::global(home)
+        .lookup(quoted_msg_id, Some(chat_id))
+        .map(|e| inbox::ReplyTargetContext {
+            sent_by_agent: e.agent,
+            task_id: e.task_id,
+            correlation_id: e.correlation_id,
+            excerpt: e.excerpt,
+            sent_ts: e.ts,
+        })
+}
+
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
 ///
 /// Supervisor loop (#2200): drives teloxide's `try_dispatch_with_listener`,
@@ -329,6 +352,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     attachments: vec![],
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
+                    reply_target: None,
                     superseded_by: None,
                     from_id: None,
                     broadcast_context: None,
@@ -600,8 +624,31 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // AGEND_POINTER_ONLY_INJECT=1: all messages go inbox + hint (unchanged).
     let is_short = is_short_inject(&text, &attachments);
     let pointer_only = inbox::notify::pointer_only_inject();
+    // Reply-to correlation (block ④): a SHORT message that QUOTE-REPLIES a bot
+    // message must NOT take the PTY-only bypass — that path builds no
+    // InboxMessage, so the `reply_to` (and its sent_ledger correlation) would be
+    // dropped. Force it through the inbox-enqueue branch so the quote is
+    // captured + enriched. Plain short messages (no reply_to) keep the exact
+    // PTY-only inject behaviour (the #2293 arm_channel_turn path is untouched).
+    let has_reply_to = msg.reply_to_message().is_some();
 
-    if is_short && !pointer_only {
+    if is_short && !pointer_only && !has_reply_to {
+        // #2293 progress-mirror fix: the inbox-drain path arms reply_to_channel +
+        // the delivery obligation for channel messages, but this SHORT-message
+        // PTY-inject path never drains — so without arming here the mirror's
+        // active-turn gate (reply_to_channel + pending_user_turn) never fires for
+        // short operator turns. Arm symmetrically with the drain path, BEFORE the
+        // inject (username/text are borrowed here, then moved into the notify call).
+        crate::reply_ledger::arm_channel_turn(
+            &home,
+            &instance_name,
+            crate::channel::ChannelKind::Telegram,
+            None,
+            None,
+            None,
+            Some(username),
+            Some(text.as_str()),
+        );
         inbox::notify_agent_with_attachments(
             &home,
             &instance_name,
@@ -611,6 +658,16 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         );
     } else {
         let notify_attachments = attachments.clone();
+        // Reply-to correlation: if the operator quote-replied to a message the
+        // bot previously sent, resolve it via the sent_ledger to surface who
+        // sent it + its task context. Key is (quoted message_id, this chat_id) —
+        // Telegram message_ids repeat across chats. A miss (e.g. sent before a
+        // pre-ledger restart, or a non-bot quote) leaves `reply_target = None`;
+        // the agent still gets `in_reply_to_excerpt` (graceful degrade).
+        let reply_chat_id = msg.chat.id.0.to_string();
+        let reply_target = msg
+            .reply_to_message()
+            .and_then(|r| resolve_reply_target(&home, &r.id.0.to_string(), &reply_chat_id));
         let msg_obj = InboxMessage {
             schema_version: 0,
             id: None,
@@ -639,6 +696,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     .unwrap_or("unknown");
                 inbox::build_excerpt(text, author)
             }),
+            reply_target,
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
@@ -943,6 +1001,44 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #2570 (reviewer5 coverage gap): end-to-end inbound quote-reply enrichment.
+    /// A bot-sent message recorded in the sent_ledger (as telegram/adapter.rs
+    /// does on reply-send), then an operator quote-reply to it, resolves to a
+    /// full ReplyTargetContext — the feature's raison d'être. Also pins the two
+    /// graceful-degrade misses (cross-chat, unknown id → None).
+    #[test]
+    fn inbound_quote_reply_enriches_reply_target_from_ledger_2570() {
+        let home = tmp_home("reply-target-enrich");
+        // The outbound reply-send records this row (mirrors telegram/adapter.rs).
+        crate::sent_ledger::global(&home).record(
+            &home,
+            crate::sent_ledger::SentEntry::new(
+                "500",
+                "dev-agent",
+                "telegram",
+                Some("-100".into()),
+                Some(7),
+                "the deployed fix is live",
+                Some("t-123".into()),
+                Some("corr-9".into()),
+            ),
+        );
+        // Operator quote-replies to message 500 in chat -100 → full enrichment.
+        let ctx = resolve_reply_target(&home, "500", "-100").expect("quote-reply must enrich");
+        assert_eq!(ctx.sent_by_agent, "dev-agent");
+        assert_eq!(ctx.task_id.as_deref(), Some("t-123"));
+        assert_eq!(ctx.correlation_id.as_deref(), Some("corr-9"));
+        assert_eq!(ctx.excerpt, "the deployed fix is live");
+        assert!(!ctx.sent_ts.is_empty(), "sent_ts must be populated");
+        // Chat-scope isolation: same message_id in a different chat → miss.
+        assert!(
+            resolve_reply_target(&home, "500", "-999").is_none(),
+            "message_id must not resolve across chats"
+        );
+        // Unknown quoted message → miss (reply_target stays None, graceful degrade).
+        assert!(resolve_reply_target(&home, "404", "-100").is_none());
     }
 
     /// `TelegramState` with the given allowlist and an empty topic map (so
