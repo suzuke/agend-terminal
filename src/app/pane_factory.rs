@@ -1132,6 +1132,11 @@ pub(super) fn create_remote_pane(
     let (fwd_tx, pane_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let tx = wakeup_tx.clone();
     let thread_name = format!("{name}_remote_fwd");
+    // fire-and-forget: no JoinHandle — this thread is reaped on pane close by
+    // `BridgeClient::drop`, which `shutdown`s the shared socket so this parked
+    // `read_tagged_frame` returns `Err` and the loop breaks (#2406-followup
+    // t-20260622073457027138-41860-19). Crossbeam cancel cannot interrupt a
+    // blocking socket read, hence the socket-shutdown reap.
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || loop {
@@ -1178,13 +1183,13 @@ pub(super) fn create_remote_pane(
         source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
         offthread: None,
         // Remote panes forward from a dup'd socket reader, not a crossbeam agent
-        // `rx`, so candidate-B's cancel channel does not apply here. NOTE: this
-        // does NOT mean remote is reaped — the remote forwarder
-        // (`{name}_remote_fwd`) blocks in `read_tagged_frame` and still has the
-        // SAME pre-existing quiet-close linger: a pane close drops only the writer
-        // fd while the dup'd reader holds the TCP open (no FIN). Reaping it needs
-        // `shutdown(Shutdown::Read)`, which crossbeam cancel cannot do. Tracked in
-        // follow-up t-20260622073457027138-41860-19.
+        // `rx`, so candidate-B's cancel channel does not apply here — the remote
+        // forwarder (`{name}_remote_fwd`) is instead reaped by
+        // `BridgeClient::drop` on pane close: it `shutdown`s the shared socket so
+        // the forwarder's blocking `read_tagged_frame` returns and the thread
+        // exits (crossbeam cancel cannot interrupt a blocking socket read). This
+        // closes the pre-existing quiet-close linger from
+        // t-20260622073457027138-41860-19 (#2406-followup).
         _fwd_cancel: None,
     })
 }
