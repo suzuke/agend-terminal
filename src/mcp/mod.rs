@@ -11,6 +11,9 @@ pub(crate) mod registry;
 pub mod tools;
 pub mod usage_stats;
 
+#[cfg(test)]
+mod per_tool_arg_invariant;
+
 use serde_json::Value;
 
 pub(crate) fn execute_tool_with_runtime(
