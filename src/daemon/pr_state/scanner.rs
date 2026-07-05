@@ -763,6 +763,7 @@ mod tests {
             "o/r@b",
             &chrono::Utc::now().to_rfc3339(),
             Some("abcdef0"),
+            None,
         );
 
         let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(42, "b")])]);
@@ -800,6 +801,7 @@ mod tests {
             "o/r@b",
             &chrono::Utc::now().to_rfc3339(),
             Some("abcdef1"),
+            None,
         );
 
         let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(43, "b")])]);

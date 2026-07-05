@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (28 tools)
+# AgEnD MCP Tools Reference (29 tools)
 
 ## Action-based Tools
 
@@ -133,6 +133,12 @@ Read visible text from a target instance's PTY scrollback (ANSI stripped).
 - **instance**: instance name
 - lines (default 100, max 10000)
 - `to_file: true` (#2478) writes the full snapshot under `$AGEND_HOME/captures/` and returns only a compact summary + path, keeping diagnostic dumps out of context.
+
+### `instance`
+#2550: folded **read-only** alias for the per-name instance tools. Read-only only — the standalone `list_instances` / `pane_snapshot` tools remain available unchanged, and structural lifecycle (create/delete/start/restart/move_pane) stays on its own tools.
+- **action**: list / pane_snapshot
+- action=list ≡ `list_instances` (optional `instance` for one instance's detail; `verbose` / `include_evidence` for the full evidence trail)
+- action=pane_snapshot ≡ `pane_snapshot` (`instance` required; `lines`, `to_file`, `head`)
 
 ## Worktree & Binding
 

@@ -2127,6 +2127,11 @@ fn persist_watch_state(
                             // so a later head move can invalidate it (head-aware
                             // resolve).
                             Some(&pr.current_sha),
+                            // #2412-follow-up: a standard `kind=report` carries
+                            // `correlation_id=t-...`, not `repo@branch` — record
+                            // this dispatch's task id too so
+                            // `resolve_by_correlation` can match either key.
+                            task_id,
                         );
                     }
                 }

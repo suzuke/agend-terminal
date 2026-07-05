@@ -524,12 +524,14 @@ mod tests {
             "o/r@b",
             "2026-06-10T00:00:00Z",
             None,
+            None,
         );
         crate::daemon::ci_handoff_track::record(
             &home,
             "reviewer",
             "o/r@b",
             "2026-06-10T00:00:00Z",
+            None,
             None,
         );
 

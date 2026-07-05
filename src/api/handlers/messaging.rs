@@ -505,7 +505,7 @@ fn process_verdicts(home: &Path, from: &str, msg: &crate::inbox::InboxMessage) {
     }
 }
 
-fn track_dispatch(
+pub(crate) fn track_dispatch(
     home: &Path,
     params: &Value,
     from: &str,
