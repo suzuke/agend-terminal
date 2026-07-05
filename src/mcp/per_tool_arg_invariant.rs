@@ -476,31 +476,16 @@ fn find_violations(
 /// tool's declaration can never satisfy them (the #2648 blind spot this whole
 /// module closes). Each entry is a latent read the union check hid; convert to a
 /// schema declaration instead if the param becomes a primary agent surface.
-const PER_TOOL_ALLOWLIST: &[(&str, &str, &str)] = &[
-    // `ci action=watch` persists task_id as a back-link on the watch sidecar
-    // (watch.rs:163). It is PRIMARILY dispatch-injected by the auto-watch hook
-    // (dispatch_hook/auto_watch.rs:39, from dispatch_auto_bind_lease); the manual
-    // pass-through the comment mentions is a secondary affordance, not the
-    // primary agent surface. Declaring it in def_ci (discoverability) would pull
-    // in the #1933 consumption table — deferred to follow-up task
-    // t-20260705161926295621-30532-2 ①; allow-listed here.
-    (
-        "ci",
-        "task_id",
-        "dispatch-injected watch back-link (auto_watch.rs:39); secondary manual pass-through; schema-declaration deferred to t-20260705161926295621-30532-2 ①",
-    ),
-    // `ci action=unwatch` reads `instance` as an OPTIONAL caller-identity override
-    // for selective subscription removal (watch.rs:261), falling back to the
-    // validated sender (`instance_name`). Caller-identity, not a primary tool
-    // param — and whether agent A may drop agent B's subscription is an authority
-    // question deferred to follow-up task t-20260705161926295621-30532-2 ②;
-    // allow-listed here rather than advertised.
-    (
-        "ci",
-        "instance",
-        "optional caller-identity override for selective unwatch (watch.rs:261); falls back to validated sender; isolation/authority review deferred to t-20260705161926295621-30532-2 ②",
-    ),
-];
+// Currently EMPTY: the two original `ci` entries (watch `task_id`, unwatch
+// `instance`) were resolved by follow-up task t-20260705161926295621-30532-2 —
+// ① `task_id` is now declared in `def_ci`'s schema (discoverability), and ②
+// the unwatch `instance` cross-agent override was removed (decision
+// d-20260705165815268234-1), so `handle_unwatch_ci` no longer reads it. The
+// #2648 invariant now self-verifies both. New entries go here `(tool, key,
+// reason)` only for a genuinely-internal entry-handler read that is NOT an
+// agent-facing schema param for THAT tool; prefer a schema declaration when the
+// param is a real agent surface.
+const PER_TOOL_ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 fn per_tool_allow_set() -> BTreeSet<(String, String)> {
     PER_TOOL_ALLOWLIST

@@ -361,12 +361,12 @@ fn ci_unwatch_unknown_caller_is_noop_keeps_watch() {
 
 #[test]
 fn ci_unwatch_explicit_empty_instance_keeps_other_subscribers() {
-    // H4 hardening (CR-2026-06-14): an agent-supplied EXPLICIT empty
-    // `instance:""` arg must not reach the empty-caller `subscribers.clear()`
-    // branch (same blast radius as the original H4 bug). The
-    // `.filter(|s| !s.is_empty())` drops the empty arg so resolution falls
-    // through to the validated caller (instance_name) — removing only the
-    // caller. Without the filter, caller="" wipes every other subscriber.
+    // H4 hardening (CR-2026-06-14), now reinforced by
+    // t-20260705161926295621-30532-2 ②: an agent-supplied `instance` arg must
+    // not reach the empty-caller `subscribers.clear()` branch. Since the
+    // `instance` override was removed (caller is ALWAYS the validated sender),
+    // the arg is ignored entirely — caller resolves to instance_name ("lead"),
+    // removing only "lead". Guards the clear-all edge stays closed.
     let home = std::env::temp_dir().join(format!("agend-unwatch-empty-arg-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
     let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-test"});
@@ -390,6 +390,40 @@ fn ci_unwatch_explicit_empty_instance_keeps_other_subscribers() {
     assert!(
         !subs.iter().any(|s| s == "lead"),
         "lead (the validated caller) should be removed. got {subs:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ci_unwatch_instance_arg_cannot_drop_another_agents_subscription_30532() {
+    // #2622-followup t-20260705161926295621-30532-2 ② (decision
+    // d-20260705165815268234-1): the former `args["instance"]` override let
+    // agent A pass `instance="agent-B"` to silently drop B's CI-watch
+    // subscription (and resolve B's ci-handoff obligation track) — an
+    // unauthenticated cross-agent state change, the #2622 obligation-loss
+    // class. The override is REMOVED: caller is ALWAYS the validated sender, so
+    // a forged `instance` arg naming another agent is ignored and B stays
+    // subscribed. Pins the new self-only semantics against regression.
+    let home = std::env::temp_dir().join(format!("agend-unwatch-xagent-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repository": "owner/repo", "branch": "feat-xagent"});
+    // B subscribes to the watch.
+    handle_watch_ci(&home, &args, "agent-b");
+
+    // A (validated sender) tries to unwatch B by naming it in the instance arg.
+    let unwatch_args = serde_json::json!({
+        "repository": "owner/repo",
+        "branch": "feat-xagent",
+        "instance": "agent-b",
+    });
+    handle_unwatch_ci(&home, &unwatch_args, "agent-a");
+
+    let path = watch_path_for(&home, "owner/repo", "feat-xagent");
+    let subs = crate::daemon::ci_watch::parse_subscribers(&read_watch(&path));
+    assert!(
+        subs.iter().any(|s| s == "agent-b"),
+        "A must NOT be able to drop B's subscription via a forged `instance` arg \
+         (caller is the validated sender); got {subs:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
