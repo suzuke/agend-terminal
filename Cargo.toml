@@ -202,7 +202,7 @@ toml = "1.1"
 # extract the AGEND_SUPERVISED sentinel out of its structural env block —
 # the templates are plain text the prod code substitutes into, so these
 # crates are test-only (mirrors the `toml` dev-dep convention above).
-plist = "1.7"
+plist = "1.10"
 rust-ini = "0.21"
 # Sprint 54 P1-A — `tests/cargo_include_invariant.rs` matches resolved
 # `include_str!` paths against `[package].include` glob patterns
