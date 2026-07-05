@@ -228,6 +228,11 @@ fn settle_group_locked(p: &mut crate::daemon::heartbeat_pair::HeartbeatPair, key
 ///   state preserved — it is the same obligation, not a fresh one);
 /// - otherwise → fresh obligation, superseding any different pending turn
 ///   (the old turn is dropped without escalation — the user moved on).
+// #2622: `home` was added for the durable-discharge guard, tipping the arg
+// count to 8. The params are the inbound message's identity fields (each
+// distinct, none groupable into a struct without churning the single drain
+// call site) — an allow is cleaner than a one-use params struct here.
+#[allow(clippy::too_many_arguments)]
 pub fn arm(
     home: &Path,
     name: &str,
