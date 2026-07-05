@@ -2292,6 +2292,59 @@ fn send_valid_request_kinds_pass_validation_2620() {
     }
 }
 
+/// reviewer4 (#2639 r0 probe): `args["request_kind"].as_str()?` treated a
+/// PRESENT-but-non-string value the same as an ABSENT field — both hit the
+/// `?` early-return and passed validation, so `request_kind: 123` silently
+/// reached `inbox_fallback` delivery instead of an error. Malformed is worse
+/// than a typo and must reject, not downgrade to a plain send.
+#[test]
+fn send_non_string_request_kind_rejected_2639() {
+    let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
+    let args = json!({"instance": "dev", "message": "hi", "request_kind": 123});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err.contains("request_kind must be a string"),
+        "a non-string request_kind must be rejected, not silently downgraded \
+         to a plain send: {result}"
+    );
+}
+
+/// Sibling of the above for JSON `null` — `Value::Null.as_str()` also
+/// returns `None`, so it hit the same conflation and must reject too.
+#[test]
+fn send_null_request_kind_rejected_2639() {
+    let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
+    let args = json!({"instance": "dev", "message": "hi", "request_kind": null});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err.contains("request_kind must be a string"),
+        "a null request_kind must be rejected like any other non-string, not \
+         silently downgraded to a plain send: {result}"
+    );
+}
+
+/// An ABSENT `request_kind` (key not present at all) must still pass —
+/// this is the deliberate "plain message" case the gate must not break.
+#[test]
+fn send_absent_request_kind_still_passes_2639() {
+    let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
+    let args = json!({"instance": "dev", "message": "hi"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !err.contains("request_kind"),
+        "an absent request_kind must still be treated as a valid plain send: {result}"
+    );
+}
+
 // --- Sprint 33 PR-3: pane_snapshot tests ---
 
 #[test]
