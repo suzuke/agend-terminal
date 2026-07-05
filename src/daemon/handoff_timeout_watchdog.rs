@@ -349,6 +349,7 @@ mod tests {
             corr,
             &(chrono::Utc::now() - chrono::Duration::minutes(age_min)).to_rfc3339(),
             None, // #2008: head-awareness not exercised by the watchdog tests
+            None,
         );
     }
 
@@ -578,6 +579,7 @@ mod tests {
             "reviewer",
             "o/r@abandoned",
             &(chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339(),
+            None,
             None,
         );
         let nudged = run_watchdog(
