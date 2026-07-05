@@ -901,7 +901,13 @@ pub(super) fn pane_title_segments(
     if pane.pending_decision_count > 0 {
         segments.push((
             " 🔴".to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            // pane-label-bg-lost: inherit the surrounding title's background
+            // (and any other modifier, e.g. the repeat-mode/drag-state
+            // overrides above) instead of Style::default() — the marker is
+            // one segment in a visually continuous label band, not a
+            // standalone badge like the `[N]` notification count above,
+            // which deliberately uses its own contrasting bg.
+            title_style.fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
     // #1713/#1523 diagnostic (runtime_config.show_pane_state, default off): append
