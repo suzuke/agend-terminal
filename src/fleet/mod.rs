@@ -520,11 +520,11 @@ pub struct InstanceConfig {
     /// #991: topic binding mode — controls whether a Telegram topic is
     /// created at spawn time. `None` or `Some("auto")` = current behavior.
     /// `Some("skip")` = no topic ever (this is the fully-supported case).
-    /// `Some("deferred")` = no topic at spawn — but there is currently NO
-    /// retrofit mechanism (`bind_topic` was never implemented; #991 is still
-    /// open on that half). An instance spawned with `deferred` has no
-    /// product-level path to gaining a topic later short of manual
-    /// intervention. Do not rely on this mode expecting a later bind.
+    /// `Some("deferred")` = no topic at spawn — retrofit via the `bind_topic`
+    /// MCP action (`channel::telegram::bind_topic_for_instance`), which also
+    /// accepts an `auto`-mode instance that ended up without a topic (e.g.
+    /// the ~6s post-boot `telegram_init` window). `doctor_topics`'s
+    /// `Unbound` class surfaces exactly this bind_topic-eligible set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic_binding_mode: Option<String>,
     /// Per-instance idle timeout in seconds. When set, the idle watchdog
