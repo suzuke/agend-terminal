@@ -254,15 +254,20 @@ pub(crate) fn handle_unwatch_ci(home: &Path, args: &Value, instance_name: &str) 
         None => return json!({"error": "missing 'repository'"}),
     };
     let branch = args["branch"].as_str().unwrap_or("main");
-    // Caller identity for selective removal (H4, CR-2026-06-14): the VALIDATED
-    // sender when `instance` arg is absent/empty (`.filter`, mirroring the
-    // sibling cleanup handlers) — NOT a daemon `std::env::var` read (was EMPTY in
-    // the daemon → the empty-caller `subscribers.clear()` path below).
-    let caller = args["instance"]
-        .as_str()
-        .map(String::from)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| instance_name.to_string());
+    // Caller identity for selective removal is ALWAYS the MCP-validated sender.
+    // (#2622-followup t-20260705161926295621-30532-2 ②, decision
+    // d-20260705165815268234-1): the former `args["instance"]` override was an
+    // unauthenticated cross-agent footgun — agent A could pass
+    // `instance="agent-B"` to silently drop B's CI-watch subscription AND
+    // resolve B's ci-handoff obligation track (the #2622 obligation-loss class,
+    // B never notified). It had no production caller, no test, and was
+    // undeclared in the schema, so it is REMOVED rather than gated (name-based
+    // cross-agent authority is the #1575 class). A legitimate "clean a dead
+    // agent's subscription" need would be a separate authenticated + audited
+    // surface, not a silent arg on a general agent tool. The empty-caller
+    // `subscribers.clear()` path below stays as a defensive fallback (an MCP
+    // call always supplies a non-empty validated sender).
+    let caller = instance_name.to_string();
     // #t-92758 P2: unwatch is also the lead's dismiss path for a stuck ci-ready —
     // clear the caller's own ci-handoff track for this repo@branch so the re-nudge
     // watchdog stops (previously unwatch removed the watch subscription but NOT the

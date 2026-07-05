@@ -59,7 +59,12 @@ const AWAITING_ENGAGEMENT_WINDOW_MS: i64 = 15_000;
 /// indefinitely and still notifies; a transient blip clears before the window
 /// and never does. 90s = ~3× the observed 31s self-heal, with margin. Sibling to
 /// `AWAITING_STABILITY` (#1552); classification/retry/timers are untouched.
-const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
+///
+/// t-...30532-0: `pub(crate)` so `per_tick::respawn_watchdog`'s auth-expiry
+/// classifier reuses this SAME window (single source of truth) rather than
+/// copying the 90s — both gates defend the identical content-FP boundary on the
+/// identical `StateTracker::since` continuous-`AuthError` signal.
+pub(crate) const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
 /// #1696: tiered retry budget. Phase A burst (5/15/30s) handles instant jitter;
 /// Phase B backoff (1m/2m/5m) handles minute-scale proxy faults; Phase C
 /// sustained (10m × 6 = 1hr) keeps a "pilot light" through a long outage. The
