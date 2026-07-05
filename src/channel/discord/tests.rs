@@ -1701,3 +1701,58 @@ fn init_from_config_with_source_wires_config_to_inbox() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #2642 coexistence: a telegram+discord fleet must still assemble the Discord
+/// channel via the same #2625 bootstrap seam. Discord init now resolves its OWN
+/// entry (`discord_channel()`) from the unified multi-channel view instead of
+/// the singular `config.channel`, so the presence of telegram — even sorted
+/// FIRST (`a-telegram` < `z-discord`, the exact state that collapses the singular
+/// primary to telegram) — no longer returns None and skips discord.
+#[test]
+#[serial]
+fn discord_init_assembles_alongside_telegram_2642() {
+    let channel_id = 290926798999357250_u64;
+    let author_id = 82198898841029460_i64;
+    let token_env = "AGEND_TEST_DISCORD_TOKEN_2642";
+    let text = "coexistence bootstrap e2e ".repeat(10); // ≥ 200 chars
+
+    std::env::set_var(token_env, "Bot dummy-2642-token");
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        "a-telegram".to_string(),
+        crate::fleet::ChannelConfig::Telegram {
+            bot_token_env: "AGEND_TEST_TG_2642".into(),
+            group_id: -1,
+            mode: "topic".into(),
+            user_allowlist: Some(vec![]),
+            fleet_binding: None,
+        },
+    );
+    channels.insert(
+        "z-discord".to_string(),
+        crate::fleet::ChannelConfig::Discord {
+            bot_token_env: token_env.to_string(),
+            guild_id: 42,
+            user_allowlist: Some(vec![author_id]),
+        },
+    );
+    let config = crate::fleet::FleetConfig {
+        channels: Some(channels),
+        ..Default::default()
+    };
+
+    let inner = text.clone();
+    let ch =
+        super::init_from_config_with_source(&config, move |_token, _intents, allowlist, tx| {
+            let event = message_create_event(channel_id, author_id as u64, &inner);
+            if let Some(msg) = super::gateway_event_to_channel_event(event, &allowlist) {
+                let _ = tx.send(msg);
+            }
+        });
+    std::env::remove_var(token_env);
+
+    assert!(
+        ch.is_some(),
+        "discord must assemble from a telegram+discord fleet (coexistence) even though telegram sorts first"
+    );
+}

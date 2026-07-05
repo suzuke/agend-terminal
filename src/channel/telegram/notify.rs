@@ -52,7 +52,10 @@ fn notify_telegram_inner(
     disable_notification: bool,
 ) -> Option<()> {
     let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
-    let (token, group_id, topic_id) = match &config.channel {
+    // #2642: resolve Telegram from the unified multi-channel view (not the
+    // singular `config.channel`) so a telegram+discord fleet still notifies via
+    // Telegram regardless of sort order. Single-channel telegram is byte-identical.
+    let (token, group_id, topic_id) = match config.telegram_channel() {
         Some(crate::fleet::ChannelConfig::Telegram {
             bot_token_env,
             group_id,
@@ -65,8 +68,7 @@ fn notify_telegram_inner(
             ),
             Err(_) => return None,
         },
-        Some(crate::fleet::ChannelConfig::Discord { .. }) => return None,
-        None => return None,
+        _ => return None,
     };
 
     // #969: channel-wide dedup. If this (telegram, instance, topic,
