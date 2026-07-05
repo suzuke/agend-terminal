@@ -315,7 +315,8 @@ pub(crate) fn def_ci() -> Value {
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Instance or instances to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to each target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
             "ci_provider": {"type": "string", "description": "watch: CI provider override — `github` (default) or `bitbucket_cloud`. `bitbucket_server` is rejected (not yet supported). Persisted on the watch sidecar."},
-            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."}
+            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
+            "task_id": {"type": "string", "description": "watch: optional task id to bind this watch to. Persisted on the watch sidecar as a back-link so the `[ci-ready-for-action]` the daemon emits on CI pass carries a structured reference to the originating task. Normally injected by the dispatch auto-watch (dispatch_auto_bind_lease); a manual `ci action=watch` caller may also pass it to bind the watch to a specific task (#1031)."}
         }, "required": ["action"]}})
 }
 
@@ -1018,6 +1019,7 @@ mod tests {
             ("ci", "review_class", "ci/mod.rs dual-review gate (#972)"),
             ("ci", "ci_provider", "ci/mod.rs provider override"),
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
+            ("ci", "task_id", "ci/watch.rs:163 handle_watch_ci watch back-link (#1031)"),
             // ── repo ──
             ("repo", "action", "ci/mod.rs routing"),
             ("repo", "pr", "ci/mod.rs handle_merge_repo"),
