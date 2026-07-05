@@ -190,6 +190,19 @@ pub(crate) fn def_pane_snapshot() -> Value {
         }, "required": ["instance"]}})
 }
 
+pub(crate) fn def_instance() -> Value {
+    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances` (all active instances; pass `instance` for one instance's detail, `verbose`/`include_evidence` for the full evidence trail); action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Read-only only — structural lifecycle (create/delete/start/restart/move_pane) stays on the standalone tools, and the per-name `list_instances` / `pane_snapshot` tools remain available unchanged.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "pane_snapshot"]},
+            "instance": {"type": "string", "description": "action=list: optional — return detail for this one instance. action=pane_snapshot: required — the instance to snapshot."},
+            "verbose": {"type": "boolean", "description": "action=list: include the per-instance `observed_status.evidence` trail (omitted by default)."},
+            "include_evidence": {"type": "boolean", "description": "action=list: alias of `verbose`."},
+            "lines": {"type": "integer", "description": "action=pane_snapshot: number of lines to return/capture (default 100, max 10000)."},
+            "to_file": {"type": "boolean", "description": "action=pane_snapshot: write the full snapshot to $AGEND_HOME/captures/ and return only a summary + path."},
+            "head": {"type": "integer", "description": "action=pane_snapshot to_file summary: leading lines in the returned preview (default 40)."}
+        }, "required": ["action"]}})
+}
+
 pub(crate) fn def_decision() -> Value {
     json!({"name": "decision", "description": "Manage decisions. Actions: post, list, update, answer. #2305: `post` with `needs_answer:true` (+ `options`, `allow_free_text`) creates an async pending QUESTION the operator answers later; `answer` (id + answer) records the operator's choice and notifies the decision author.",
         "inputSchema": {"type": "object", "properties": {
@@ -614,7 +627,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            28,
+            29,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -622,7 +635,8 @@ mod tests {
              (#2547, removed from registry) = 33; - tui_screenshot/gc_dry_run/tokens/watchdog \
              (#2548 Wave1-PR1, removed or moved to CLI) = 29; - mode/force_release_worktree \
              (#2548 Wave1-PR2, mode folded into list_instances, force_release_worktree merged \
-             into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28. \
+             into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
+             + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -1099,6 +1113,7 @@ mod tests {
             "set_metadata",
             "move_pane",
             "pane_snapshot",
+            "instance",
             "restart_daemon",
             "binding_state",
         ];
