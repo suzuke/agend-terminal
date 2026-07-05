@@ -838,12 +838,17 @@ mod tests {
         let home = tmp_home("send-to-fallback-kind");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  worker:\n    backend: claude\n",
+            "instances:\n  sf2620t:\n    backend: claude\n",
         )
         .unwrap();
         let from = Sender::new("sender").expect("valid sender");
 
-        let result = send_to(&home, &from, "worker", "hello", "query", None);
+        // t-20260705005551919287-14440-22 (dev3 heartbeat_pair sweep): NOT the
+        // generic "worker" fixture name — this fallback path writes
+        // `heartbeat_pair["worker"]`, colliding under plain `cargo test`'s
+        // shared process with dispatch_idle's #1516 tests reading that same
+        // process-global (non-`home`-scoped) registry entry.
+        let result = send_to(&home, &from, "sf2620t", "hello", "query", None);
         assert_eq!(
             result.get("delivery_mode").and_then(|d| d.as_str()),
             Some("inbox_fallback"),
@@ -851,7 +856,7 @@ mod tests {
              fallback path (not skip past it): {result}"
         );
 
-        let msgs = crate::inbox::drain(&home, "worker");
+        let msgs = crate::inbox::drain(&home, "sf2620t");
         assert_eq!(msgs.len(), 1, "fallback must still enqueue the message");
         assert_eq!(
             msgs[0].kind.as_deref(),
