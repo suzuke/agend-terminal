@@ -883,6 +883,77 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     })
 }
 
+/// #2622 PR-2: settle the single row `msg_id` to `read` regardless of its
+/// current state (`unread` OR `delivering`) — the discharge path uses this so a
+/// discharged channel message stops redelivering (unlike [`ack`], which only
+/// transitions a `delivering` row; a discharged obligation's row is typically
+/// `unread`). Idempotent (an already-`read` row is a no-op). Returns whether a
+/// row was newly marked read. Same flock + atomic tmp+rename + forward-schema
+/// preservation as [`ack`].
+pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
+    let path = inbox_path_resolved(home, name);
+    if !path.exists() {
+        return false;
+    }
+    with_inbox_lock(home, name, |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut all: Vec<InboxMessage> = Vec::new();
+        let mut preserved_forward: Vec<String> = Vec::new();
+        let mut settled = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if msg.schema_version > InboxMessage::CURRENT_VERSION {
+                preserved_forward.push(line.to_string());
+                continue;
+            }
+            if msg.id.as_deref() == Some(msg_id) && msg.read_at.is_none() {
+                msg.read_at = Some(now.clone());
+                settled = true;
+            }
+            all.push(msg);
+        }
+        if settled {
+            let tmp = path.with_extension("jsonl.tmp");
+            let r = (|| -> anyhow::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                for m in &all {
+                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                for raw in &preserved_forward {
+                    writeln!(f, "{raw}")?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&tmp, path)?;
+                crate::store::fsync_parent_dir(path);
+                Ok(())
+            })();
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "inbox settle_read_by_id write-back failed");
+                return false;
+            }
+        }
+        settled
+    })
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "inbox settle_read_by_id lock failed");
+        false
+    })
+}
+
 /// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
 /// transitioning them to `processed` so [`reclaim_stale_delivering`] will not
 /// revert them to `unread` for re-delivery.

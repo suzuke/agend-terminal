@@ -149,6 +149,143 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     }
 }
 
+/// #2622 PR-2: agent self-discharge of a channel-reply obligation — the
+/// deliberate exit for a message that will not be (or no longer needs to be)
+/// answered on its channel (the live case: `m-…-125`, an operator message 13
+/// days stale). Durably records the discharge so `reply_ledger::arm` never
+/// re-opens the obligation (even across redelivery + daemon restart), stops the
+/// currently-armed nudge ladder, settles the persistent inbox row, and LOUDLY
+/// notifies the operator (channel fan-out; inbox fallback) so this can never be
+/// a silent backdoor.
+///
+/// ## Why this is always the AGENT path (architecture note for review)
+///
+/// An MCP tool handler is reached ONLY via `method::MCP_TOOL` — agent transport
+/// (`operator_gate.rs:145`). The operator's surface is direct API methods (they
+/// early-`Ok` at the gate, never reaching MCP dispatch) and telegram inbound
+/// (routed to an agent inbox/PTY, not an MCP call). So this handler's caller is
+/// ALWAYS an agent; there is no operator branch to make here, and testing
+/// `instance_name == "operator"` would be a forgeable backdoor (an agent can
+/// name itself `operator` — the exact #1575 identity-trust bypass the gate
+/// exists to close). Operator-authorized (unrestricted) discharge is therefore
+/// a separate, deferred surface (a telegram operator keyword / direct method),
+/// per the vetted design. Consequently self-discharge is CONSTRAINED: a
+/// non-empty `reason` is mandatory and the operator is always notified —
+/// converting "silent no-reply" into "explicit, reasoned, operator-notified
+/// no-reply."
+pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let msg_id = match args["message_id"].as_str().filter(|s| !s.is_empty()) {
+        Some(m) => m,
+        None => {
+            return json!({
+                "error": "discharge requires a non-empty 'message_id'",
+                "code": "missing_message_id"
+            })
+        }
+    };
+    // Anti-backdoor gate: agent self-discharge is LOUD — a reason is mandatory
+    // so the operator learns WHY their message was closed reply-less.
+    let reason = match args["reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(r) => r,
+        None => {
+            return json!({
+                "error": "discharge requires a non-empty 'reason' \
+                          (self-discharge is audited + operator-notified)",
+                "code": "missing_reason"
+            })
+        }
+    };
+
+    // Resolve the obligation identity from the message row — the discharge must
+    // name a real message. `group_key` is computed the SAME way `arm` does, so
+    // the durable record keys the arm-guard exactly (incl. an operator resend of
+    // the same text: same group_key, new id).
+    let Some(row) = crate::inbox::storage::find_message(home, msg_id) else {
+        return json!({
+            "error": format!("message '{msg_id}' not found in any inbox"),
+            "code": "message_not_found"
+        });
+    };
+    let group_key = crate::reply_ledger::group_key(Some(&row.from), Some(&row.text));
+
+    // (1) Durable ledger — the structural exit (arm never re-opens this group).
+    if let Err(e) = crate::daemon::channel_reply_discharge::record_discharge(
+        home,
+        group_key.as_deref(),
+        msg_id,
+        instance_name,
+        Some(reason),
+    ) {
+        return json!({
+            "error": format!("failed to record discharge: {e}"),
+            "code": "ledger_write_failed"
+        });
+    }
+    // (2) Stop the CURRENTLY-armed ladder now (strict no-op if the live turn is
+    // a DIFFERENT obligation — never clobber an unrelated pending reply).
+    let cleared_turn =
+        crate::reply_ledger::discharge_turn_if_matches(instance_name, msg_id, group_key.as_deref());
+    // (3) Settle the persistent row so it stops redelivering (handles the
+    // typical `unread` state, unlike `ack` which is `delivering`-only).
+    let settled_row = crate::inbox::storage::settle_read_by_id(home, instance_name, msg_id);
+
+    // (4) LOUD notice — the operator owns the right-to-know. Primary: fan out to
+    // every operator channel (channel send → no inbox row → structurally zero
+    // obligation loop). Fallback (no channel registered → returns 0): an inbox
+    // row to the discharging agent's team lead, kind=`channel-reply-discharged`
+    // (fire-and-forget from birth — it can't itself become an obligation).
+    let notice = format!(
+        "[channel-reply-discharged] {instance_name} closed message {msg_id} \
+         without a channel reply — reason: {reason}"
+    );
+    let dispatched = crate::channel::notify_all_escalation_channels(
+        instance_name,
+        crate::channel::NotifySeverity::Info,
+        &notice,
+        false,
+    );
+    let notified_via = if dispatched > 0 {
+        "channel"
+    } else {
+        if let Some(lead) =
+            crate::fleet::team_orchestrator_for(home, instance_name).filter(|l| l != instance_name)
+        {
+            let _ = crate::inbox::notify_system(
+                home,
+                &lead,
+                "system:channel-reply-discharge",
+                "channel-reply-discharged",
+                notice.clone(),
+                None,
+                None,
+            );
+        }
+        "inbox_fallback"
+    };
+    // (5) event_log — the third independent audit copy (ledger + notice + log).
+    crate::event_log::log(
+        home,
+        "channel_reply_discharged",
+        instance_name,
+        &format!(
+            "msg_id={msg_id} cleared_turn={cleared_turn} settled_row={settled_row} \
+             notified_via={notified_via} reason={reason}"
+        ),
+    );
+
+    json!({
+        "discharged": true,
+        "message_id": msg_id,
+        "cleared_turn": cleared_turn,
+        "settled_row": settled_row,
+        "notified_via": notified_via
+    })
+}
+
 pub(super) fn handle_download_attachment(home: &Path, args: &Value, instance_name: &str) -> Value {
     let file_id = match args["file_id"].as_str() {
         Some(f) => f,

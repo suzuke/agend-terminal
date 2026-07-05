@@ -337,6 +337,31 @@ pub fn clear_turn(name: &str) {
     });
 }
 
+/// #2622 PR-2: clear the live obligation IFF it is the one being discharged
+/// (identified by `msg_id` — matches the group's primary/member ids — or
+/// `group_key`). The durable discharge ledger stops FUTURE re-arms; this stops
+/// the CURRENTLY-armed turn's nudge ladder immediately. A strict no-op when the
+/// live turn is a DIFFERENT obligation — it must never clobber an unrelated
+/// pending reply (that would be the silent-loss the whole ledger guards
+/// against). Returns whether it cleared. Infallible.
+pub(crate) fn discharge_turn_if_matches(name: &str, msg_id: &str, group_key: Option<&str>) -> bool {
+    let mut cleared = false;
+    crate::daemon::heartbeat_pair::update_with(name, |p| {
+        let is_match = p.pending_user_turn.as_ref().is_some_and(|t| {
+            (group_key.is_some() && t.group_key.as_deref() == group_key)
+                || t.inbound_msg_id.as_deref() == Some(msg_id)
+                || t.group_msg_ids.iter().any(|m| m == msg_id)
+        });
+        if is_match {
+            if let Some(t) = p.pending_user_turn.take() {
+                settle_group_locked(p, t.group_key.as_deref());
+            }
+            cleared = true;
+        }
+    });
+    cleared
+}
+
 /// Pure closure classifier — no side effects, fully unit-testable.
 fn classify(mirror_dispatched_for_turn: bool, turn: &PendingUserTurn) -> Closure {
     if mirror_dispatched_for_turn || turn.reply_outcome == ReplyOutcome::Delivered {

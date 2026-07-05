@@ -323,3 +323,181 @@ fn no_fleet_yaml_reply_exit_records_send_failed_gap_d_1665() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2622 PR-2c: inbox action=discharge (channel-reply obligation) ────────
+
+/// Enqueue a channel (user) message into `agent`'s inbox and return its id.
+fn enqueue_channel_msg(home: &std::path::Path, agent: &str, id: &str, from: &str, text: &str) {
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 1,
+        id: Some(id.into()),
+        from: from.into(),
+        text: text.into(),
+        kind: None,
+        timestamp: "2026-06-22T16:41:45Z".into(),
+        channel: Some(crate::channel::ChannelKind::Telegram),
+        ..Default::default()
+    };
+    crate::inbox::enqueue(home, agent, msg).unwrap();
+}
+
+#[test]
+fn discharge_requires_message_id_and_reason_2622() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-args");
+    // Missing message_id.
+    let r = super::handle_discharge(&home, &serde_json::json!({"reason": "x"}), "alpha");
+    assert_eq!(
+        r["code"], "missing_message_id",
+        "no message_id → error: {r}"
+    );
+    // Missing / empty reason (the anti-backdoor gate).
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({"message_id": "m-1", "reason": "  "}),
+        "alpha",
+    );
+    assert_eq!(
+        r["code"], "missing_reason",
+        "self-discharge without a reason must be rejected (loud, never silent): {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn discharge_unknown_message_errors_2622() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-unknown");
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({"message_id": "m-nope", "reason": "stale"}),
+        "alpha",
+    );
+    assert_eq!(
+        r["code"], "message_not_found",
+        "discharging a message not in any inbox must error, not silently succeed: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn discharge_records_ledger_stops_rearm_and_settles_row_2622() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-core");
+    let agent = "discharge-core-agent-2622";
+    let text = "please analyze this 13-day-old paper";
+    enqueue_channel_msg(&home, agent, "m-125", "user:op", text);
+    // Arm the obligation (as a drain would), then drain to clear the unread→
+    // delivering bookkeeping so the row is in a realistic post-drain state.
+    crate::reply_ledger::arm(
+        &home,
+        agent,
+        crate::channel::ChannelKind::Telegram,
+        Some("m-125".into()),
+        None,
+        None,
+        Some("user:op"),
+        Some(text),
+    );
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for(agent)
+            .pending_user_turn
+            .is_some(),
+        "precondition: obligation armed"
+    );
+
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({
+            "message_id": "m-125",
+            "reason": "stale, operator no longer needs an answer"
+        }),
+        agent,
+    );
+    assert_eq!(r["discharged"], true, "discharge must succeed: {r}");
+    assert_eq!(
+        r["cleared_turn"], true,
+        "the live matching turn must be cleared: {r}"
+    );
+
+    // (1) Ledger recorded — future arms are suppressed.
+    let gk = crate::reply_ledger::group_key(Some("user:op"), Some(text));
+    assert!(
+        crate::daemon::channel_reply_discharge::is_discharged(&home, gk.as_deref(), "m-125")
+            .is_some(),
+        "the discharge must be durably recorded"
+    );
+    // (2) The nudge ladder is stopped now.
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for(agent)
+            .pending_user_turn
+            .is_none(),
+        "the live obligation's turn must be cleared by the discharge"
+    );
+    // (3) A redelivery re-arm is blocked (the -125 loop is broken).
+    crate::reply_ledger::arm(
+        &home,
+        agent,
+        crate::channel::ChannelKind::Telegram,
+        Some("m-125".into()),
+        None,
+        None,
+        Some("user:op"),
+        Some(text),
+    );
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for(agent)
+            .pending_user_turn
+            .is_none(),
+        "a discharged obligation must never re-arm on redelivery"
+    );
+    // (4) The persistent row is settled (no longer unread → stops redelivering).
+    assert!(
+        crate::inbox::storage::find_message(&home, "m-125")
+            .and_then(|m| m.read_at)
+            .is_some(),
+        "the discharged row must be marked read so it stops redelivering"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn discharge_does_not_clobber_a_different_live_obligation_2622() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-noclobber");
+    let agent = "discharge-noclobber-agent-2622";
+    // Live obligation A.
+    enqueue_channel_msg(&home, agent, "m-A", "user:op", "question A");
+    crate::reply_ledger::arm(
+        &home,
+        agent,
+        crate::channel::ChannelKind::Telegram,
+        Some("m-A".into()),
+        None,
+        None,
+        Some("user:op"),
+        Some("question A"),
+    );
+    // A DIFFERENT message B exists in the inbox; discharge B.
+    enqueue_channel_msg(&home, agent, "m-B", "user:op", "unrelated question B");
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({"message_id": "m-B", "reason": "handled B another way"}),
+        agent,
+    );
+    assert_eq!(r["discharged"], true);
+    assert_eq!(
+        r["cleared_turn"], false,
+        "discharging B must NOT clear A's live turn: {r}"
+    );
+    // A's obligation survives untouched.
+    let turn = crate::daemon::heartbeat_pair::snapshot_for(agent)
+        .pending_user_turn
+        .expect("A's live obligation must survive discharging an unrelated message B");
+    assert_eq!(
+        turn.inbound_msg_id.as_deref(),
+        Some("m-A"),
+        "the surviving turn must still be A's"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
