@@ -29,7 +29,9 @@ pub(crate) fn def_reply() -> Value {
             "message": {"type": "string", "description": "The reply text to send to the user."},
             "message_id": {"type": "string", "description": "#2622 PR-3: target an original inbox message by id. When set, routes by THAT message's own channel (instead of the process-global reply_to_channel prefer-chain) and, on send success, settles that row so it stops redelivering. Omit for the default prefer-chain behavior."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
-            "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
+            "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
+            "task_id": {"type": "string", "description": "Optional task-board id ('t-...') this reply relates to. Recorded in the sent-message ledger so a later operator quote-reply (reply-to) to this message can be correlated back to its task. Omit for ordinary interactive replies with no task context."},
+            "correlation_id": {"type": "string", "description": "Optional correlation id for this reply, recorded alongside task_id in the sent-message ledger for reply-to correlation. Omit when not applicable."}
         }, "required": ["message"]}})
 }
 
@@ -315,7 +317,8 @@ pub(crate) fn def_ci() -> Value {
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Instance or instances to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to each target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
             "ci_provider": {"type": "string", "description": "watch: CI provider override — `github` (default) or `bitbucket_cloud`. `bitbucket_server` is rejected (not yet supported). Persisted on the watch sidecar."},
-            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."}
+            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
+            "task_id": {"type": "string", "description": "watch: optional task id to bind this watch to. Persisted on the watch sidecar as a back-link so the `[ci-ready-for-action]` the daemon emits on CI pass carries a structured reference to the originating task. Normally injected by the dispatch auto-watch (dispatch_auto_bind_lease); a manual `ci action=watch` caller may also pass it to bind the watch to a specific task (#1031)."}
         }, "required": ["action"]}})
 }
 
@@ -1018,6 +1021,7 @@ mod tests {
             ("ci", "review_class", "ci/mod.rs dual-review gate (#972)"),
             ("ci", "ci_provider", "ci/mod.rs provider override"),
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
+            ("ci", "task_id", "ci/watch.rs:163 handle_watch_ci watch back-link (#1031)"),
             // ── repo ──
             ("repo", "action", "ci/mod.rs routing"),
             ("repo", "pr", "ci/mod.rs handle_merge_repo"),

@@ -102,6 +102,15 @@ pub struct InboxMessage {
     /// Excerpt of the replied-to message (first 200 chars + author tag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to_excerpt: Option<String>,
+    /// Reply-to correlation (Telegram): when the operator quote-replied to a
+    /// message the bot previously SENT and that message is found in the
+    /// `sent_ledger`, this carries who sent it and its task context — so the
+    /// agent knows exactly which prior message + task the operator is responding
+    /// to. `None` when the quote isn't in the ledger (e.g. sent before a restart
+    /// that predates the ledger, or not a bot message) → the agent still has
+    /// `in_reply_to_excerpt` (graceful degrade).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_target: Option<ReplyTargetContext>,
     /// ID of a newer message that supersedes this one (e.g. ci-watch SHA update).
     /// Messages with superseded_by set are excluded from drain by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +149,25 @@ pub struct InboxMessage {
     /// this flag is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<bool>,
+}
+
+/// Reply-to correlation context for a quoted bot message (resolved from the
+/// `sent_ledger`). Kept as its own struct rather than reusing the top-level
+/// `task_id`/`correlation_id` fields, which carry THIS message's own dispatch
+/// context — overloading them would conflate "this inbound's task" with "the
+/// quoted message's task".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyTargetContext {
+    /// Which agent originally sent the quoted message.
+    pub sent_by_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Excerpt of the original sent message.
+    pub excerpt: String,
+    /// When the quoted message was sent (RFC3339).
+    pub sent_ts: String,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).

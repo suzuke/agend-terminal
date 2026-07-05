@@ -251,16 +251,14 @@ fn build_message(
         from: format!("from:{}", vs.from),
         from_id: vs.from_resolved.as_ref().map(|(id, _)| id.full()),
         text: vs.text.to_string(),
-        kind: params
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        kind: params["kind"].as_str().map(String::from),
         timestamp: chrono::Utc::now().to_rfc3339(),
         channel: None,
         delivery_mode: None,
         attachments: vec![],
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
+        reply_target: None,
         superseded_by: None,
         broadcast_context: params
             .get("broadcast_context")
@@ -2260,6 +2258,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            reply_target: None,
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
@@ -2357,6 +2356,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            reply_target: None,
             superseded_by: None,
             from_id: None,
             broadcast_context: None,

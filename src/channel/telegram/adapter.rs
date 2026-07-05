@@ -374,9 +374,35 @@ impl crate::channel::Channel for TelegramChannel {
 
         let home = lock_state(&self.state).home.clone();
         match op {
-            crate::channel::AgentOutboundOp::Reply { text } => {
-                let (msg_id, _chat_id) =
+            crate::channel::AgentOutboundOp::Reply {
+                text,
+                task_id,
+                correlation_id,
+            } => {
+                let (msg_id, chat_id) =
                     try_telegram_reply_from(&home, agent, &text).map_err(ChannelError::Other)?;
+                // Reply-to correlation: record the sent message so a later
+                // operator reply-to can be resolved back to it + its task.
+                // `msg_id == 0` means the channel-dedup synthesized a success
+                // (the real send already happened / is in flight) — skip those
+                // to avoid a bogus id=0 ledger entry. Infallible (IRON RULE).
+                if msg_id != 0 {
+                    let topic_id =
+                        crate::channel::telegram::lookup_topic_for_instance(&home, agent);
+                    crate::sent_ledger::global(&home).record(
+                        &home,
+                        crate::sent_ledger::SentEntry::new(
+                            msg_id.to_string(),
+                            agent,
+                            "telegram",
+                            Some(chat_id.to_string()),
+                            topic_id,
+                            &text,
+                            task_id,
+                            correlation_id,
+                        ),
+                    );
+                }
                 Ok(crate::channel::MsgRef {
                     binding: crate::channel::BindingRef::new(
                         "telegram",
@@ -559,6 +585,8 @@ mod tests {
                 "reply",
                 crate::channel::AgentOutboundOp::Reply {
                     text: "leak".to_string(),
+                    task_id: None,
+                    correlation_id: None,
                 },
             ),
             (

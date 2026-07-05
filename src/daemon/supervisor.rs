@@ -59,7 +59,12 @@ const AWAITING_ENGAGEMENT_WINDOW_MS: i64 = 15_000;
 /// indefinitely and still notifies; a transient blip clears before the window
 /// and never does. 90s = ~3× the observed 31s self-heal, with margin. Sibling to
 /// `AWAITING_STABILITY` (#1552); classification/retry/timers are untouched.
-const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
+///
+/// t-...30532-0: `pub(crate)` so `per_tick::respawn_watchdog`'s auth-expiry
+/// classifier reuses this SAME window (single source of truth) rather than
+/// copying the 90s — both gates defend the identical content-FP boundary on the
+/// identical `StateTracker::since` continuous-`AuthError` signal.
+pub(crate) const AUTH_ERROR_NOTIFY_STABILITY: Duration = Duration::from_secs(90);
 /// #1696: tiered retry budget. Phase A burst (5/15/30s) handles instant jitter;
 /// Phase B backoff (1m/2m/5m) handles minute-scale proxy faults; Phase C
 /// sustained (10m × 6 = 1hr) keeps a "pilot light" through a long outage. The
@@ -371,6 +376,10 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             // #842: same eviction cadence for the bridge↔daemon idempotent-
             // retry dedup cache. Sibling sweep, same 10-min TTL window.
             crate::api::request_dedup::global().sweep_expired();
+            // Reply-to correlation: prune the sent-message ledger (14-day TTL +
+            // per-agent FIFO cap). Self-throttled to an hourly rewrite, so this
+            // 10s-cadence call is cheap on the off-ticks.
+            crate::sent_ledger::global(&home).maybe_gc(&home);
 
             // #1923 G4/G5: prune per-agent in-memory tracker state for agents no
             // longer in the registry (deleted / redeployed), mirroring the #1470
@@ -1404,6 +1413,7 @@ fn enqueue_reply_ledger_lead_escalation(
         attachments: vec![],
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
+        reply_target: None,
         superseded_by: None,
         from_id: None,
         broadcast_context: None,

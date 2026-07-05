@@ -469,8 +469,16 @@ pub trait Channel: Send + Sync {
 ///   (renders "@from delegated to @target" tag in target's topic)
 #[derive(Debug, Clone)]
 pub enum AgentOutboundOp {
-    /// Free-form reply into the agent's bound topic.
-    Reply { text: String },
+    /// Free-form reply into the agent's bound topic. `task_id`/`correlation_id`
+    /// carry the sending turn's task context when known (the `reply` MCP tool
+    /// may pass them); they are recorded in the `sent_ledger` so a later
+    /// operator reply-to can be correlated back to this message's task. Most
+    /// interactive replies legitimately carry neither (→ `None`).
+    Reply {
+        text: String,
+        task_id: Option<String>,
+        correlation_id: Option<String>,
+    },
     /// Emoji reaction on a previously-observed message. `message_id` is
     /// `None` when the agent reacts to its most recent inbound message
     /// (resolved via `metadata/{instance}.json` `last_message_id`).
@@ -989,6 +997,8 @@ mod tests {
                 "agent1",
                 AgentOutboundOp::Reply {
                     text: "hi".to_string(),
+                    task_id: None,
+                    correlation_id: None,
                 },
             )
             .expect_err("default must be NotSupported");

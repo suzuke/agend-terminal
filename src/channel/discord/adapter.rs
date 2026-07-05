@@ -460,7 +460,7 @@ impl crate::channel::Channel for DiscordChannel {
 
         // Step 2: dispatch.
         match op {
-            crate::channel::AgentOutboundOp::Reply { text } => {
+            crate::channel::AgentOutboundOp::Reply { text, .. } => {
                 let cid = self.state.lock().instance_to_channel.get(agent).copied();
                 let cid = cid.ok_or_else(|| {
                     ChannelError::Other(anyhow::anyhow!("no discord binding for '{agent}'"))
