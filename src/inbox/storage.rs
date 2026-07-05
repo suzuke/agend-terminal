@@ -305,6 +305,17 @@ fn inbox_files(home: &Path) -> impl Iterator<Item = PathBuf> {
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
 }
 
+/// #2604: the agent names with an inbox file (the `*.jsonl` file stems under
+/// `home/inbox`). The offline-unread watchdog iterates these to reach agents
+/// that are NOT in the live registry (offline / never-existed) — the exact set
+/// `poll_reminder` (registry-driven) can never see. A `read_dir` error yields an
+/// empty iteration, same as [`inbox_files`].
+pub fn inbox_agent_names(home: &Path) -> Vec<String> {
+    inbox_files(home)
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect()
+}
+
 /// Enqueue a message — in-place flock'd append + fsync (O(1) JSONL append).
 ///
 /// NOT crash-atomic: enqueue appends in place — no tmp+rename (only the
@@ -1442,6 +1453,63 @@ pub fn obligation_reason(home: &Path, msg: &InboxMessage) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// #2604: per-agent split of ACTIONABLE-UNREAD messages into real OBLIGATIONS
+/// (query / open task, via [`obligation_reason`]) vs the raw unread total, plus
+/// the timestamp of the OLDEST obligation (the escalation watermark).
+///
+/// The offline-target escalation watchdog
+/// ([`crate::daemon::per_tick::offline_unread_alert`]) keys the operator P0 on
+/// the OBLIGATION watermark, not raw unread: a fire-and-forget report/update
+/// piling up for an offline agent is not lost work (post-#2636 those kinds are
+/// classified non-obligation), so it must never trip an Error-severity page.
+/// `raw_unread_total` is carried only as context for the alert body.
+///
+/// LOCK-DISCIPLINE (mirrors [`unread_count`] + the [`obligation_reason`] warning):
+/// reads the inbox file WITHOUT [`with_inbox_lock`] and calls [`obligation_reason`]
+/// (task-board IO for `kind=task`). Safe ONLY because the per-tick caller runs it
+/// unlocked — calling it inside an inbox flock is the #1617 fleet-stall class.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnreadObligationSummary {
+    /// Actionable-unread rows that are real obligations (query / open task).
+    pub obligation_count: usize,
+    /// Timestamp of the oldest obligation row — `None` when `obligation_count == 0`.
+    pub oldest_obligation: Option<chrono::DateTime<chrono::Utc>>,
+    /// All actionable-unread rows (obligations + fire-and-forget), context only.
+    pub raw_unread_total: usize,
+}
+
+pub fn unread_obligation_summary(home: &Path, name: &str) -> UnreadObligationSummary {
+    let path = inbox_path_resolved(home, name);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return UnreadObligationSummary::default(),
+    };
+    let mut summary = UnreadObligationSummary::default();
+    for line in content.lines() {
+        let msg: InboxMessage = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Actionable-unread filter — the SAME predicate as `UnreadProbe::is_unread`
+        // (storage.rs, post-#2299): a delivering (in-flight) / superseded (silently
+        // retired by drain) / read row is not actionable unread.
+        if msg.read_at.is_some() || msg.delivering_at.is_some() || msg.superseded_by.is_some() {
+            continue;
+        }
+        summary.raw_unread_total += 1;
+        if obligation_reason(home, &msg).is_some() {
+            summary.obligation_count += 1;
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
+                let ts_utc = ts.with_timezone(&chrono::Utc);
+                if summary.oldest_obligation.is_none_or(|t| t > ts_utc) {
+                    summary.oldest_obligation = Some(ts_utc);
+                }
+            }
+        }
+    }
+    summary
 }
 
 /// #t-…61487: is a reverted (stale-`delivering` → unread) row worth RE-ARMING the

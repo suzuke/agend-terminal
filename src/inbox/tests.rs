@@ -4665,3 +4665,116 @@ fn ack_by_correlation_idempotent() {
 
     fs::remove_dir_all(&home).ok();
 }
+
+// ── #2604: unread_obligation_summary (offline-target escalation input) ──
+
+/// Core split: only real obligations (query / open task) count toward the
+/// escalation watermark; fire-and-forget (report / update) rides in
+/// raw_unread_total only. `oldest_obligation` is the EARLIEST obligation ts.
+#[test]
+fn unread_obligation_summary_splits_obligations_from_fire_and_forget_2604() {
+    let home = tmp_home("oblig-split");
+    // Two obligations (query) at distinct timestamps + two fire-and-forget.
+    enqueue(
+        &home,
+        "off",
+        msg()
+            .sender("lead")
+            .kind("query")
+            .timestamp("2025-06-01T00:00:00Z")
+            .text("newer q")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "off",
+        msg()
+            .sender("lead")
+            .kind("query")
+            .timestamp("2025-01-01T00:00:00Z")
+            .text("older q")
+            .build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "off",
+        msg().sender("x").kind("report").text("r").build(),
+    )
+    .unwrap();
+    enqueue(
+        &home,
+        "off",
+        msg().sender("x").kind("update").text("u").build(),
+    )
+    .unwrap();
+
+    let s = unread_obligation_summary(&home, "off");
+    assert_eq!(s.obligation_count, 2, "only the 2 queries are obligations");
+    assert_eq!(
+        s.raw_unread_total, 4,
+        "raw total counts all 4 actionable-unread rows"
+    );
+    let oldest = s.oldest_obligation.expect("has an obligation");
+    assert_eq!(
+        oldest,
+        chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        "oldest_obligation is the EARLIEST obligation ts, not the fire-and-forget"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// A read (drained) obligation is not actionable unread — excluded from both
+/// the obligation count and the raw total (same predicate as unread_count).
+#[test]
+fn unread_obligation_summary_excludes_read_row_2604() {
+    let home = tmp_home("oblig-read");
+    enqueue(
+        &home,
+        "off",
+        msg()
+            .sender("lead")
+            .kind("query")
+            .id("q-read")
+            .text("will read")
+            .build(),
+    )
+    .unwrap();
+    // Drain stamps read_at on the first query.
+    let drained = drain(&home, "off");
+    assert_eq!(drained.len(), 1);
+    // A second, still-unread obligation.
+    enqueue(
+        &home,
+        "off",
+        msg()
+            .sender("lead")
+            .kind("query")
+            .id("q-live")
+            .text("still unread")
+            .build(),
+    )
+    .unwrap();
+
+    let s = unread_obligation_summary(&home, "off");
+    assert_eq!(
+        s.obligation_count, 1,
+        "the drained (read) obligation must not count, only the live unread one"
+    );
+    assert_eq!(s.raw_unread_total, 1);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// No inbox file → zeroed summary (never panics), matching unread_count.
+#[test]
+fn unread_obligation_summary_empty_inbox_is_default_2604() {
+    let home = tmp_home("oblig-empty");
+    let s = unread_obligation_summary(&home, "nobody");
+    assert_eq!(s.obligation_count, 0);
+    assert_eq!(s.raw_unread_total, 0);
+    assert!(s.oldest_obligation.is_none());
+    fs::remove_dir_all(&home).ok();
+}
