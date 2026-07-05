@@ -3504,8 +3504,8 @@ mod tests {
     fn working_target_does_not_fire_1516() {
         let home = tmp_home("gate-working");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        let id = write_pending_at(&home, "lead", "1516-gate-working", Some("t-w"), "task", 600, issued);
-        crate::snapshot::save(&home, &[mk_agent_snapshot("1516-gate-working", "active")]);
+        let id = write_pending_at(&home, "lead", "gt1516w", Some("t-w"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot("gt1516w", "active")]);
 
         scan_and_emit(&home);
 
@@ -3533,8 +3533,8 @@ mod tests {
     fn idle_target_still_fires_1516() {
         let home = tmp_home("gate-idle");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        let id = write_pending_at(&home, "lead", "1516-gate-idle", Some("t-i"), "task", 600, issued);
-        crate::snapshot::save(&home, &[mk_agent_snapshot("1516-gate-idle", "idle")]);
+        let id = write_pending_at(&home, "lead", "gt1516i", Some("t-i"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot("gt1516i", "idle")]);
 
         // #1658: a snapshot present + not-working debounces — fires on the
         // DEBOUNCE_SCANS-th consecutive idle scan, not the first.
@@ -3562,7 +3562,7 @@ mod tests {
     fn no_snapshot_falls_back_to_firing_1516() {
         let home = tmp_home("gate-nosnap");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        write_pending_at(&home, "lead", "1516-gate-nosnap", Some("t-n"), "task", 600, issued);
+        write_pending_at(&home, "lead", "gt1516n", Some("t-n"), "task", 600, issued);
         // No snapshot.json written.
         scan_and_emit(&home);
         assert!(
