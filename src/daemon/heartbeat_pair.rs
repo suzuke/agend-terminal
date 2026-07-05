@@ -96,6 +96,42 @@ pub struct HeartbeatPair {
 /// Per-instance lock registry. Keys are agent names (per
 /// `agent::validate_name`); values are the pair locks. Entries are created
 /// lazily on first access via [`pair_for`].
+///
+/// ## Test hazard: process-global, NOT home-scoped, NO reset primitive
+///
+/// This registry is keyed by name ALONE — unlike almost every other piece of
+/// daemon state, it has no `home`/tmp-dir isolation, and there is no
+/// `#[cfg(test)]` reset. Every `#[test]` in the SAME test binary that uses
+/// the same agent-name fixture (e.g. `"worker"`) shares the exact same
+/// `HeartbeatPair` entry, even when each test otherwise uses its own
+/// isolated `tmp_home`. Under `cargo nextest` this is invisible (one process
+/// per test), but under plain `cargo test` (a single shared process — what
+/// CI's `Coverage` job runs) it is a REAL cross-test-file pollution vector:
+/// a test that writes a field this registry tracks (`heartbeat_at_ms`,
+/// `last_input_at_ms`, `waiting_on_since_ms`, `reply_to_channel`, …) via
+/// [`update_with`] or one of its wrappers (`set_waiting_on`, `notify_agent`,
+/// the MCP dispatch chokepoint's implicit-heartbeat bump, `reply_ledger`,
+/// …) leaves that state behind for any LATER test — in any other file, in
+/// any order — that reads the same name via [`snapshot_for`].
+///
+/// Confirmed incident (2026-07-05): `dispatch_idle`'s `#1516` gate tests
+/// (`working_target_does_not_fire_1516` / `idle_target_still_fires_1516` /
+/// `no_snapshot_falls_back_to_firing_1516`, `src/daemon/dispatch_idle/mod.rs`)
+/// all read `"worker"`'s pair via `target_is_working`/
+/// `target_has_active_waiting_on`; a test elsewhere in the binary that
+/// writes to `"worker"`'s pair (e.g. via the `agent_ops::send_to` fallback
+/// path, which calls `inbox::notify_agent` and bumps `last_input_at_ms`)
+/// makes the idle-target test observe a falsely-fresh "working" signal and
+/// wrongly suppress the nudge — deterministic under plain `cargo test`,
+/// invisible under `nextest`. See t-20260705040009178430-63933-1's inventory
+/// for the full audit of which test files/fixture names actually touch this
+/// registry (most fixture-name string collisions across the tree do NOT —
+/// they're unrelated data that happens to share a literal like `"worker"`).
+///
+/// **If you add a test that touches this registry: give the agent-name
+/// fixture a name unique across the WHOLE crate** (e.g. suffix it with the
+/// issue/PR number, as the tests above do), not just unique within your
+/// file — that's the only mitigation in place today.
 fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<HeartbeatPair>>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<HeartbeatPair>>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -104,6 +140,9 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<HeartbeatPair>>>> {
 /// Get (or lazily create) the pair lock for `name`. Subsequent calls with
 /// the same name return the same `Arc` so writers and readers share the
 /// same `Mutex`.
+///
+/// Test authors: see [`registry`]'s doc comment for a real cross-test-file
+/// pollution hazard before picking a fixture agent name.
 pub fn pair_for(name: &str) -> Arc<Mutex<HeartbeatPair>> {
     let mut map = registry().lock();
     map.entry(name.to_string()).or_default().clone()
@@ -111,6 +150,9 @@ pub fn pair_for(name: &str) -> Arc<Mutex<HeartbeatPair>> {
 
 /// Helper: load the pair as a snapshot. Acquires lock briefly, copies the
 /// `Copy` struct, releases. Use when the caller only needs a read view.
+///
+/// Test authors: see [`registry`]'s doc comment for a real cross-test-file
+/// pollution hazard before picking a fixture agent name.
 pub fn snapshot_for(name: &str) -> HeartbeatPair {
     crate::sync_audit::assert_lock_tier(3, "heartbeat_pair");
     let pair = pair_for(name);
@@ -122,6 +164,9 @@ pub fn snapshot_for(name: &str) -> HeartbeatPair {
 /// Callers that also persist to disk MUST call `save_metadata_batch`
 /// AFTER this fn returns (lock-ordering rule: pair lock is leaf-level;
 /// disk I/O happens outside the lock).
+///
+/// Test authors: see [`registry`]'s doc comment for a real cross-test-file
+/// pollution hazard before picking a fixture agent name.
 pub fn update_with<F>(name: &str, f: F)
 where
     F: FnOnce(&mut HeartbeatPair),
