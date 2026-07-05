@@ -277,7 +277,7 @@ pub(crate) fn list(home: &Path) -> Vec<(PathBuf, CiHandoffTrack)> {
 pub(crate) fn resolve_by_correlation(home: &Path, correlation: &str, reason: &str) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
-        if track.correlation == correlation
+        if (track.correlation == correlation || track.task_id.as_deref() == Some(correlation))
             && remove_if_unchanged(
                 home,
                 &path,
