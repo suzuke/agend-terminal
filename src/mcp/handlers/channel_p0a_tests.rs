@@ -338,7 +338,7 @@ fn enqueue_channel_msg(home: &std::path::Path, agent: &str, id: &str, from: &str
         channel: Some(crate::channel::ChannelKind::Telegram),
         ..Default::default()
     };
-    crate::inbox::enqueue(home, agent, msg).unwrap();
+    crate::inbox::enqueue(home, agent, msg).expect("test setup: enqueue must succeed");
 }
 
 #[test]
