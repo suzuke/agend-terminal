@@ -423,7 +423,7 @@ fn discharge_records_ledger_stops_rearm_and_settles_row_2622() {
     // (1) Ledger recorded — future arms are suppressed.
     let gk = crate::reply_ledger::group_key(Some("user:op"), Some(text));
     assert!(
-        crate::daemon::channel_reply_discharge::is_discharged(&home, gk.as_deref(), "m-125")
+        crate::daemon::channel_reply_discharge::is_discharged(&home, agent, gk.as_deref(), "m-125")
             .is_some(),
         "the discharge must be durably recorded"
     );
@@ -498,6 +498,66 @@ fn discharge_does_not_clobber_a_different_live_obligation_2622() {
         turn.inbound_msg_id.as_deref(),
         Some("m-A"),
         "the surviving turn must still be A's"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2622 reviewer4 r0 REJECTED finding: the durable discharge ledger was keyed
+/// globally by `group_key`/`message_id` with no recipient/agent dimension, so
+/// one agent's self-discharge of a message could suppress a DIFFERENT agent's
+/// independent channel-reply obligation sharing the same sender+text. End-to-end
+/// through the real `handle_discharge` entry point (not a unit-level ledger call).
+#[test]
+fn discharge_for_one_agent_must_not_suppress_same_text_for_another_agent() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-cross-agent-2622");
+    let agent_a = "discharge-cross-agent-a-2622";
+    let agent_b = "discharge-cross-agent-b-2622";
+    let text = "please analyze this 13-day-old paper";
+
+    // Agent A receives and self-discharges its own obligation.
+    enqueue_channel_msg(&home, agent_a, "m-a-1", "user:op", text);
+    crate::reply_ledger::arm(
+        &home,
+        agent_a,
+        crate::channel::ChannelKind::Telegram,
+        Some("m-a-1".into()),
+        None,
+        None,
+        Some("user:op"),
+        Some(text),
+    );
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({
+            "message_id": "m-a-1",
+            "reason": "handled out of band"
+        }),
+        agent_a,
+    );
+    assert_eq!(
+        r["discharged"], true,
+        "agent A's discharge must succeed: {r}"
+    );
+
+    // Agent B receives an INDEPENDENT message — same sender+text (same
+    // group_key), different message_id — its obligation must still arm.
+    enqueue_channel_msg(&home, agent_b, "m-b-1", "user:op", text);
+    crate::reply_ledger::arm(
+        &home,
+        agent_b,
+        crate::channel::ChannelKind::Telegram,
+        Some("m-b-1".into()),
+        None,
+        None,
+        Some("user:op"),
+        Some(text),
+    );
+    assert!(
+        crate::daemon::heartbeat_pair::snapshot_for(agent_b)
+            .pending_user_turn
+            .is_some(),
+        "a discharge by/for agent A must not suppress agent B's independent channel-reply obligation with the same sender+text"
     );
     std::fs::remove_dir_all(&home).ok();
 }

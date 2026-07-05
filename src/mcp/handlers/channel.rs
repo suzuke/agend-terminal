@@ -213,8 +213,13 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
     let group_key = crate::reply_ledger::group_key(Some(&row.from), Some(&row.text));
 
     // (1) Durable ledger — the structural exit (arm never re-opens this group).
+    // Keyed by `instance_name` too (#2622 reviewer4 r0): self-discharge is
+    // always the caller closing its OWN obligation, so the caller IS the
+    // recipient-agent dimension that scopes the key — a different agent's
+    // same-sender/same-text obligation must never be suppressed by this call.
     if let Err(e) = crate::daemon::channel_reply_discharge::record_discharge(
         home,
+        instance_name,
         group_key.as_deref(),
         msg_id,
         instance_name,

@@ -249,11 +249,14 @@ pub fn arm(
     // provide (a message redelivering past that window otherwise re-arms
     // forever, the -125 loop). This is the exact durable parallel of the
     // in-memory `settled_reply_groups` suppression below, keyed the same way
-    // (`group_key`, message_id fallback). Checked BEFORE `update_with` so the
-    // disk read stays OFF the heartbeat_pair leaf lock (#1617 discipline).
+    // (`group_key`, message_id fallback) PLUS `name` (#2622 reviewer4 r0: the
+    // durable key is scoped per-recipient-agent so one agent's discharge of a
+    // message never suppresses a different agent's same-group_key
+    // obligation). Checked BEFORE `update_with` so the disk read stays OFF
+    // the heartbeat_pair leaf lock (#1617 discipline).
     if key.is_some() || inbound_msg_id.is_some() {
         let mid = inbound_msg_id.as_deref().unwrap_or("");
-        if crate::daemon::channel_reply_discharge::is_discharged(home, key.as_deref(), mid)
+        if crate::daemon::channel_reply_discharge::is_discharged(home, name, key.as_deref(), mid)
             .is_some()
         {
             tracing::debug!(
@@ -701,6 +704,7 @@ mod tests {
         // Discharge the obligation FIRST (as the discharge primitive will).
         crate::daemon::channel_reply_discharge::record_discharge(
             &home,
+            agent,
             gk.as_deref(),
             "m-125",
             agent,
@@ -768,6 +772,50 @@ mod tests {
                 .pending_user_turn
                 .is_some(),
             "a live (undischarged) obligation must still arm normally"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2622 reviewer4 r0 fix: a discharge recorded for one agent must not
+    /// suppress a DIFFERENT agent's independent obligation that shares the
+    /// same sender+text (`group_key`) but a different `message_id`. This is
+    /// the exact cross-agent silent-loss hole the global (non-agent-scoped)
+    /// discharge key created.
+    #[test]
+    fn arm_for_one_agent_does_not_suppress_same_text_for_another_agent_2622() {
+        let home = tmp_home("arm-guard-cross-agent");
+        let agent_a = "reply-ledger-arm-cross-agent-a-2622";
+        let agent_b = "reply-ledger-arm-cross-agent-b-2622";
+        let text = "please analyze this 13-day-old paper";
+        let gk = group_key(Some("user:op"), Some(text));
+
+        crate::daemon::channel_reply_discharge::record_discharge(
+            &home,
+            agent_a,
+            gk.as_deref(),
+            "m-a-1",
+            agent_a,
+            Some("handled out of band"),
+        )
+        .unwrap();
+
+        // Agent B's independent obligation (same sender+text, different id)
+        // must still arm — agent A's discharge is scoped to agent A only.
+        arm(
+            &home,
+            agent_b,
+            ChannelKind::Telegram,
+            Some("m-b-1".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some(text),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent_b)
+                .pending_user_turn
+                .is_some(),
+            "agent B's same-text obligation must not be suppressed by agent A's discharge"
         );
         std::fs::remove_dir_all(&home).ok();
     }
