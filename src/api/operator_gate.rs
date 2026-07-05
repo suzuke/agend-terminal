@@ -87,6 +87,21 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
             Some("display_name") | Some("description") => AlwaysAllow,
             _ => AbsolutelyNever,
         },
+
+        // #2550 P0: the folded `instance` tool (dormant until P1) — authority is
+        // per-action, sourced from the shared registry policy so this gate,
+        // the retry classifier, and the role guard cannot drift. A structural
+        // action (delete/start/restart/move_pane) stays never-delegate exactly
+        // as its pre-fold per-name tool did; a missing/unfolded action
+        // fail-closes to never-delegate.
+        "instance" => match action.and_then(crate::mcp::registry::instance_action_policy) {
+            Some(p) => match p.authority {
+                crate::mcp::registry::InstanceAuthority::AlwaysAllow => AlwaysAllow,
+                crate::mcp::registry::InstanceAuthority::DelegateScoped => DelegateScoped,
+                crate::mcp::registry::InstanceAuthority::AbsolutelyNever => AbsolutelyNever,
+            },
+            None => AbsolutelyNever,
+        },
         "config" => match action {
             Some("set") => AbsolutelyNever,
             _ => AlwaysAllow, // list / get
@@ -339,6 +354,66 @@ mod tests {
             &active
         )
         .is_ok());
+    }
+
+    /// #2550 P0: the same #1575 exploit routed through the FOLDED `instance`
+    /// tool (`{tool: instance, arguments: {action: restart|delete|…}}`) must be
+    /// denied identically. The gate authority is per-action via the shared
+    /// registry policy, so folding `restart` into `instance` does NOT reopen the
+    /// bypass — the structural action stays never-delegate for an agent.
+    #[test]
+    fn agent_instance_structural_action_exploit_is_denied() {
+        for st in [away(), sleep_with("fixup-lead", &[])] {
+            for action in ["restart", "delete", "start", "move_pane"] {
+                let exploit = json!({
+                    "tool": "instance",
+                    "instance": "",
+                    "arguments": {"action": action, "name": "victim-agent"}
+                });
+                assert!(
+                    check_operation_allowed("mcp_tool", &exploit, &st).is_err(),
+                    "instance(action={action}) structural op must be denied for an agent in {:?}",
+                    st.mode
+                );
+            }
+        }
+    }
+
+    /// #2550 P0: `classify` maps folded `instance` actions byte-equivalently to
+    /// their pre-fold per-name tools — structural = never-delegate, read = allow,
+    /// bind_topic = delegate-scoped (the fallback its per-name form hit), and a
+    /// missing/unfolded action fail-closes to never-delegate.
+    #[test]
+    fn classify_instance_actions_match_per_name_authority() {
+        use OpClass::*;
+        assert!(matches!(classify("instance", Some("list")), AlwaysAllow));
+        assert!(matches!(
+            classify("instance", Some("pane_snapshot")),
+            AlwaysAllow
+        ));
+        assert!(matches!(
+            classify("instance", Some("set_waiting_on")),
+            AlwaysAllow
+        ));
+        assert!(matches!(
+            classify("instance", Some("interrupt")),
+            AlwaysAllow
+        ));
+        assert!(matches!(
+            classify("instance", Some("bind_topic")),
+            DelegateScoped
+        ));
+        for a in ["delete", "start", "restart", "move_pane"] {
+            assert!(
+                matches!(classify("instance", Some(a)), AbsolutelyNever),
+                "instance({a}) must be never-delegate"
+            );
+        }
+        assert!(matches!(classify("instance", None), AbsolutelyNever));
+        assert!(matches!(
+            classify("instance", Some("bogus")),
+            AbsolutelyNever
+        ));
     }
 
     // ── An agent must never change operator authority (mode set), in ANY mode. ──
