@@ -1101,6 +1101,57 @@ mod tests {
     }
 
     #[test]
+    fn pane_title_decision_marker_inherits_label_background_pane_label_bg_lost() {
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 1,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        // Mirrors `render_pane`'s real focused-pane `title_style` construction
+        // (a solid background band, black text, bold) — the two prior tests
+        // above pass `Style::default()` (no background), which can't catch a
+        // background-inheritance regression because `Style::default()` has no
+        // background to inherit in the first place.
+        let title_style = Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let segments = pane_title_segments(&pane, title_style, AgentState::Idle, false);
+        let (_, icon_style) = segments
+            .iter()
+            .find(|(text, _)| text.contains('🔴'))
+            .expect("pending decision marker segment must be present");
+        assert_eq!(
+            icon_style.bg,
+            Some(Color::Cyan),
+            "the 🔴 marker must inherit the surrounding title's background, \
+             not fall back to the terminal default (breaks the visually \
+             continuous label band)"
+        );
+        assert_eq!(
+            icon_style.fg,
+            Some(Color::Red),
+            "the marker itself must stay red (only the background should \
+             inherit from the title)"
+        );
+    }
+
+    #[test]
     fn pane_title_no_decision_marker_when_zero_2313() {
         let pane = Pane {
             agent_name: "agent".into(),
