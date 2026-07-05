@@ -14,7 +14,7 @@
 //! payload consumed via [`framing::read_tagged_frame`].
 
 use anyhow::{Context, Result};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::time::Duration;
 
@@ -116,6 +116,24 @@ impl BridgeClient {
     }
 }
 
+impl Drop for BridgeClient {
+    /// #2406-followup (t-20260622073457027138-41860-19): reap the remote pane
+    /// forwarder on pane close. The `{name}_remote_fwd` thread parks in
+    /// `read_tagged_frame` on the dup'd reader (`take_reader`'s `try_clone`);
+    /// with a QUIET remote agent and no keepalive, that read blocks forever, and
+    /// dropping only the writer fd would leave the connection open (no FIN).
+    /// `writer` and the forwarder's reader are two fds of the SAME connection,
+    /// so `shutdown` on `writer` acts on the connection and returns the parked
+    /// read (→ the forwarder's `Err` arm → thread exits). A `BridgeClient` is
+    /// created once per pane and never replaced in place — a reconnect builds a
+    /// NEW pane/client and drops the old one — so this only ever shuts the
+    /// pane's OWN (old) socket. The Err is swallowed deliberately: the socket
+    /// may already be dead (peer gone / double shutdown) and Drop must not panic.
+    fn drop(&mut self) {
+        let _ = self.writer.shutdown(Shutdown::Both);
+    }
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -177,5 +195,59 @@ mod tests {
 
         drop(accept); // detached; the sleep finishes on its own
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2406-followup (t-20260622073457027138-41860-19): a remote pane forwarder
+    /// parks in `read_tagged_frame` on the dup'd reader (`take_reader`). Under a
+    /// QUIET server (no frames, no keepalive) that read blocks forever; dropping
+    /// the `BridgeClient` must `shutdown` the shared socket so the parked read
+    /// returns and the forwarder thread EXITS — the quiet-close linger fix.
+    #[test]
+    fn drop_shuts_socket_unblocking_parked_forwarder_reader_41860() {
+        let listener = TcpListener::bind((crate::ipc::LOOPBACK, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // QUIET server: accept and block on its own read — never sends a frame.
+        // Its read returns EOF once the client shuts the socket down, so it exits.
+        let server = std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                let _ = conn.read(&mut buf);
+            }
+        });
+
+        // Client socket + a dup'd reader for the forwarder (mirrors take_reader's
+        // try_clone: two fds of the SAME connection).
+        let stream = TcpStream::connect(addr).unwrap();
+        let reader = stream.try_clone().unwrap();
+        let mut client = BridgeClient {
+            writer: stream,
+            reader: Some(reader),
+        };
+        let mut fwd_reader = client.take_reader().unwrap();
+
+        // The forwarder parks in read_tagged_frame (quiet server → blocks) and
+        // signals when it finally returns and exits.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let forwarder = std::thread::spawn(move || {
+            let _ = framing::read_tagged_frame(&mut fwd_reader);
+            let _ = done_tx.send(());
+        });
+        // Let the forwarder actually reach the blocking read before we shut down.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Drop the BridgeClient → Drop shuts the shared socket down.
+        drop(client);
+
+        // Generous timeout (CI can be slow, esp. under load): the assertion is
+        // that the forwarder EXITS, not how fast. Without the Drop-shutdown this
+        // read blocks forever and the recv times out.
+        let exited = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        assert!(
+            exited,
+            "forwarder must exit after BridgeClient drop shuts the shared socket down"
+        );
+        forwarder.join().ok();
+        server.join().ok();
     }
 }
