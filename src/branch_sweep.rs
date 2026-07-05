@@ -254,9 +254,39 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
     ) else {
         return false;
     };
-    // True iff any merged PR's HEAD SHA matches the local branch tip.
-    prs.iter()
-        .any(|s| s.head_ref_oid.as_deref() == Some(local_sha.as_str()))
+    // True iff any merged PR's HEAD SHA matches the local branch tip, or the
+    // local tip is a strict ancestor of that HEAD SHA — see
+    // `local_sha_matches_merged_head` for why the ancestor case matters.
+    prs.iter().any(|s| {
+        s.head_ref_oid
+            .as_deref()
+            .is_some_and(|oid| local_sha_matches_merged_head(repo, &local_sha, oid))
+    })
+}
+
+/// True iff `head_ref_oid` (a merged PR's recorded HEAD SHA) equals
+/// `local_sha`, or `local_sha` is a strict ancestor of it.
+///
+/// t-20260704054810920172-67777-3: main's now-default strict-up-to-date
+/// branch protection means a required "Update branch" sync commit lands on
+/// the remote HEAD before the squash-merge — but this sweep's
+/// `fetch --prune` only refreshes remote-tracking refs, never fast-forwards
+/// the local branch ref itself, so `local_sha` stays one sync-commit behind
+/// `head_ref_oid` forever once the remote branch is deleted. is-ancestor
+/// accepts "local's own work is a strict prefix of what was actually merged"
+/// as proof; the caller's `state: "merged"` filter already guarantees
+/// `head_ref_oid` came from an actually-merged PR, so no unmerged work can
+/// ever satisfy this check (reflexive when equal, so this strictly extends
+/// rather than replaces the old exact-match behavior). Fails CLOSED (not a
+/// match) if the ancestor check itself errors — e.g. `head_ref_oid`'s commit
+/// no longer exists locally after the remote branch's deletion — via
+/// `git_ok`'s exit-code-0-only success semantics.
+fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &str) -> bool {
+    head_ref_oid == local_sha
+        || crate::git_helpers::git_ok(
+            repo,
+            &["merge-base", "--is-ancestor", local_sha, head_ref_oid],
+        )
 }
 
 /// Extract "owner/repo" from a GitHub remote URL.
@@ -729,6 +759,108 @@ mod tests {
              via a DIFFERENT, cheaper signal instead (remote-tracking-ref-gone,\
              see worktree_cleanup.rs's is_remote_gone / worktree_pool.rs's \
              is_gone), not by adopting this file's cherry+diff(+gh API) method"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    // t-20260704054810920172-67777-3: `local_sha_matches_merged_head`
+    // regression coverage. main's now-default strict-up-to-date branch
+    // protection means a required "Update branch" sync commit lands on the
+    // remote HEAD before squash-merge, but this sweep's `fetch --prune`
+    // never fast-forwards the local branch ref — so `local_sha` (this
+    // sweep's only source of truth) stays one sync-commit behind the
+    // merged PR's real `head_ref_oid` forever once the remote branch is
+    // deleted. These pin the new is-ancestor acceptance without needing a
+    // live GitHub API / ScmProvider mock — `local_sha_matches_merged_head`
+    // takes both SHAs directly.
+
+    #[test]
+    fn local_sha_matches_merged_head_true_for_strict_ancestor_2637() {
+        let repo = setup_repo("ancestor_true");
+        let local_sha = create_branch_with_commit(&repo, "feat-d", "feat: d body");
+        // Simulate the "Update branch" sync commit landing on the remote
+        // HEAD after `local_sha` was last touched — one more commit on top,
+        // never fetched back into the local branch ref.
+        git_run(&repo, &["checkout", "feat-d"]);
+        std::fs::write(repo.join("sync.txt"), "update-branch sync\n").expect("write");
+        git_run(&repo, &["add", "sync.txt"]);
+        git_run(&repo, &["commit", "-m", "sync with main"]);
+        let head_ref_oid = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        git_run(&repo, &["checkout", "main"]);
+
+        assert!(
+            local_sha_matches_merged_head(&repo, &local_sha, &head_ref_oid),
+            "local_sha strictly behind the actually-merged head_ref_oid (the \
+             update-branch sync gap) must still match"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn local_sha_matches_merged_head_false_for_divergent_unmerged_commit_2637() {
+        let repo = setup_repo("ancestor_false");
+        let merged_base = create_branch_with_commit(&repo, "feat-e", "feat: e body");
+        // `head_ref_oid`: what actually got merged (one commit past the
+        // shared base).
+        git_run(&repo, &["checkout", "feat-e"]);
+        std::fs::write(repo.join("merged.txt"), "this landed in main\n").expect("write");
+        git_run(&repo, &["add", "merged.txt"]);
+        git_run(&repo, &["commit", "-m", "merged work"]);
+        let head_ref_oid = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        // `local_sha`: a DIFFERENT, never-merged commit branched off the
+        // same shared base — diverged, not an ancestor of head_ref_oid.
+        git_run(&repo, &["checkout", "-b", "feat-e-local", &merged_base]);
+        std::fs::write(repo.join("unmerged.txt"), "this never landed\n").expect("write");
+        git_run(&repo, &["add", "unmerged.txt"]);
+        git_run(&repo, &["commit", "-m", "unmerged local-only work"]);
+        let local_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        git_run(&repo, &["checkout", "main"]);
+
+        assert!(
+            !local_sha_matches_merged_head(&repo, &local_sha, &head_ref_oid),
+            "a local_sha carrying real unmerged work outside head_ref_oid's \
+             history must NOT match — this is the false-positive guard: \
+             is-ancestor must never wrongly clear a branch with unpushed work"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn local_sha_matches_merged_head_true_for_exact_equal_2637() {
+        let repo = setup_repo("ancestor_equal");
+        let sha = create_branch_with_commit(&repo, "feat-f", "feat: f body");
+
+        assert!(
+            local_sha_matches_merged_head(&repo, &sha, &sha),
+            "the pre-existing exact-SHA-match behavior must still hold"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn local_sha_matches_merged_head_false_when_head_ref_oid_unknown_locally_2637() {
+        let repo = setup_repo("ancestor_missing_object");
+        let local_sha = create_branch_with_commit(&repo, "feat-g", "feat: g body");
+
+        assert!(
+            !local_sha_matches_merged_head(
+                &repo,
+                &local_sha,
+                "0000000000000000000000000000000000dead"
+            ),
+            "an is-ancestor check against an object git doesn't have locally \
+             (e.g. a deleted remote branch's newest commit, never fetched) \
+             must fail CLOSED — not treated as a match"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
