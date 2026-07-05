@@ -140,10 +140,30 @@ impl SentLedger {
     /// Record a sent message: append one JSONL line AND update the in-memory
     /// map. Infallible — a write error is logged and swallowed (IRON RULE), the
     /// in-memory entry is still inserted so the current process can resolve it.
+    ///
+    /// Lock discipline (reviewer5 #2570): `state` is held across BOTH the disk
+    /// append AND the in-memory insert, making `record` mutually exclusive with
+    /// [`gc_at`](Self::gc_at) (which holds `state` across its rewrite + rename).
+    /// Without it, a record that appends-then-blocks-on-`state` could have its
+    /// just-persisted row clobbered by a GC rewrite built from the pre-record
+    /// map — the durable row is lost and the operator's quote-reply degrades
+    /// after a daemon restart, defeating the whole point of a *persistent*
+    /// ledger. This ledger writes one row per outbound reply, so holding the
+    /// lock across the small append I/O is acceptable. Either interleaving is
+    /// now safe: record-first → GC's map includes the row; GC-first → record
+    /// appends onto the freshly compacted file.
     pub fn record(&self, home: &Path, entry: SentEntry) {
-        self.append_line(home, &entry);
-        if let Ok(mut s) = self.state.lock() {
-            s.insert(key_of(&entry.message_id, entry.chat_id.as_deref()), entry);
+        match self.state.lock() {
+            Ok(mut s) => {
+                // append (borrows `entry`) before insert (moves it).
+                self.append_line(home, &entry);
+                s.insert(key_of(&entry.message_id, entry.chat_id.as_deref()), entry);
+            }
+            // IRON RULE: a poisoned lock must NOT drop an acknowledged send's
+            // durable row. Still append — GC also bails on a poisoned `state`
+            // (see `gc_at`), so there is no concurrent rewrite to race here.
+            // Only the in-memory insert is forgone.
+            Err(_) => self.append_line(home, &entry),
         }
     }
 
@@ -386,6 +406,54 @@ mod tests {
         let mut e = entry(message_id, agent, chat);
         e.ts = ts.to_string();
         e
+    }
+
+    /// reviewer5 #2570: a `record()` append must NEVER be clobbered by a
+    /// concurrent GC rewrite. Reproduces the exact interleaving deterministically:
+    /// hold `state` (as `gc_at` does across its rewrite+rename), let a concurrent
+    /// `record` reach its critical section, then perform the clobbering rewrite
+    /// from a snapshot that lacks the racy row.
+    ///
+    /// - Pre-fix `record` appended OUTSIDE the lock → the row is already on disk
+    ///   when we rewrite → clobbered → gone after reload (this test FAILS).
+    /// - Post-fix `record` takes `state` FIRST → it blocks here and appends only
+    ///   AFTER our rewrite → the row survives on disk (this test PASSES).
+    ///
+    /// A purely probabilistic two-thread loop can NOT catch this: the in-memory
+    /// map converges and a later GC re-persists every row, so a plain "reload
+    /// after join" is healed by eventual consistency — the loss is only
+    /// observable as a clobber with no subsequent re-GC (i.e. across a restart).
+    #[test]
+    fn record_not_clobbered_by_concurrent_gc_rewrite_2570() {
+        let home = tmp_home("race-2570");
+        let ledger = std::sync::Arc::new(SentLedger::default());
+        // Seed a row so the ledger file exists with prior content.
+        ledger.record(&home, entry("seed", "general", Some("-100")));
+
+        // Hold `state` exactly as `gc_at` does across its rewrite+rename.
+        let guard = ledger.state.lock().unwrap();
+
+        let (l, h) = (ledger.clone(), home.clone());
+        let recorder = std::thread::spawn(move || {
+            l.record(&h, entry("racy", "general", Some("-100")));
+        });
+        // Let the recorder reach record(): pre-fix it appends "racy" here (before
+        // our rewrite); post-fix it blocks on `state` and appends only later.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        // The GC publish: rewrite from a snapshot WITHOUT "racy" (never inserted
+        // under the lock). Mirrors gc_at → rewrite → rename over the live file.
+        ledger.rewrite(&home, &guard);
+        drop(guard); // release; the recorder now proceeds.
+        recorder.join().unwrap();
+
+        let reloaded = SentLedger::default();
+        reloaded.load(&home);
+        assert!(
+            reloaded.lookup("racy", Some("-100")).is_some(),
+            "a concurrently-recorded row must survive a GC rewrite ON DISK (reviewer5 #2570)"
+        );
+        assert!(reloaded.lookup("seed", Some("-100")).is_some());
     }
 
     #[test]

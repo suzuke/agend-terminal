@@ -10,6 +10,29 @@ use super::poll_supervisor;
 use super::state::{lock_state, TelegramState};
 use super::topic_registry::load_topic_registry;
 
+/// #2570: resolve an operator quote-reply to its [`inbox::ReplyTargetContext`]
+/// via the sent_ledger, keyed by `(quoted message_id, this chat_id)` — Telegram
+/// message_ids repeat across chats, so the chat scope is required. `None` on a
+/// miss (a message sent before a pre-ledger restart, or a quote of a non-bot
+/// message); the agent still gets `in_reply_to_excerpt` (graceful degrade).
+/// Extracted from the inbound handler so the enrichment is unit-testable end to
+/// end (ledger record → quote-reply resolution → context).
+fn resolve_reply_target(
+    home: &std::path::Path,
+    quoted_msg_id: &str,
+    chat_id: &str,
+) -> Option<inbox::ReplyTargetContext> {
+    crate::sent_ledger::global(home)
+        .lookup(quoted_msg_id, Some(chat_id))
+        .map(|e| inbox::ReplyTargetContext {
+            sent_by_agent: e.agent,
+            task_id: e.task_id,
+            correlation_id: e.correlation_id,
+            excerpt: e.excerpt,
+            sent_ts: e.ts,
+        })
+}
+
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
 ///
 /// Supervisor loop (#2200): drives teloxide's `try_dispatch_with_listener`,
@@ -644,17 +667,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         let reply_chat_id = msg.chat.id.0.to_string();
         let reply_target = msg
             .reply_to_message()
-            .and_then(|r| {
-                crate::sent_ledger::global(&home)
-                    .lookup(&r.id.0.to_string(), Some(reply_chat_id.as_str()))
-            })
-            .map(|e| crate::inbox::ReplyTargetContext {
-                sent_by_agent: e.agent,
-                task_id: e.task_id,
-                correlation_id: e.correlation_id,
-                excerpt: e.excerpt,
-                sent_ts: e.ts,
-            });
+            .and_then(|r| resolve_reply_target(&home, &r.id.0.to_string(), &reply_chat_id));
         let msg_obj = InboxMessage {
             schema_version: 0,
             id: None,
@@ -988,6 +1001,44 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// #2570 (reviewer5 coverage gap): end-to-end inbound quote-reply enrichment.
+    /// A bot-sent message recorded in the sent_ledger (as telegram/adapter.rs
+    /// does on reply-send), then an operator quote-reply to it, resolves to a
+    /// full ReplyTargetContext — the feature's raison d'être. Also pins the two
+    /// graceful-degrade misses (cross-chat, unknown id → None).
+    #[test]
+    fn inbound_quote_reply_enriches_reply_target_from_ledger_2570() {
+        let home = tmp_home("reply-target-enrich");
+        // The outbound reply-send records this row (mirrors telegram/adapter.rs).
+        crate::sent_ledger::global(&home).record(
+            &home,
+            crate::sent_ledger::SentEntry::new(
+                "500",
+                "dev-agent",
+                "telegram",
+                Some("-100".into()),
+                Some(7),
+                "the deployed fix is live",
+                Some("t-123".into()),
+                Some("corr-9".into()),
+            ),
+        );
+        // Operator quote-replies to message 500 in chat -100 → full enrichment.
+        let ctx = resolve_reply_target(&home, "500", "-100").expect("quote-reply must enrich");
+        assert_eq!(ctx.sent_by_agent, "dev-agent");
+        assert_eq!(ctx.task_id.as_deref(), Some("t-123"));
+        assert_eq!(ctx.correlation_id.as_deref(), Some("corr-9"));
+        assert_eq!(ctx.excerpt, "the deployed fix is live");
+        assert!(!ctx.sent_ts.is_empty(), "sent_ts must be populated");
+        // Chat-scope isolation: same message_id in a different chat → miss.
+        assert!(
+            resolve_reply_target(&home, "500", "-999").is_none(),
+            "message_id must not resolve across chats"
+        );
+        // Unknown quoted message → miss (reply_target stays None, graceful degrade).
+        assert!(resolve_reply_target(&home, "404", "-100").is_none());
     }
 
     /// `TelegramState` with the given allowlist and an empty topic map (so
