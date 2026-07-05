@@ -10,6 +10,25 @@ fn ci_watches_dir_returns_expected_path() {
     );
 }
 
+/// Pattern-A follow-up (t-20260621072505708315-50793-7): pin `CiOutcome`'s
+/// mapping before it replaces the raw `== Some("...")` sites — `Other` must
+/// preserve the raw conclusion string (the poller's `[ci-ended] …: {other}`
+/// display depends on it).
+#[test]
+fn ci_outcome_from_maps_pending_success_failure_other() {
+    assert_eq!(CiOutcome::from(None), CiOutcome::Pending);
+    assert_eq!(CiOutcome::from(Some("success")), CiOutcome::Success);
+    assert_eq!(CiOutcome::from(Some("failure")), CiOutcome::Failure);
+    assert_eq!(
+        CiOutcome::from(Some("cancelled")),
+        CiOutcome::Other("cancelled".to_string())
+    );
+    assert_eq!(
+        CiOutcome::from(Some("timed_out")),
+        CiOutcome::Other("timed_out".to_string())
+    );
+}
+
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -965,6 +984,32 @@ fn test_inbox_body_success_has_url_no_detail() {
     assert!(
         !body.contains("checklist"),
         "success body must not have checklist: {body}"
+    );
+}
+
+/// Pattern-A follow-up (t-20260621072505708315-50793-7): pin that a
+/// non-failure, non-success conclusion (e.g. "cancelled") takes the SAME
+/// generic body path as "success" — no Detail:/checklist. The CiOutcome
+/// conversion at this site splits on `Failure` vs not-`Failure`, so this
+/// must keep holding for every `Other` value, not just "success".
+#[test]
+fn test_inbox_body_other_conclusion_takes_success_shaped_path() {
+    let body = build_inbox_body(
+        "[ci-ended] o/r@main: cancelled",
+        "cancelled",
+        None,
+        "https://github.com/o/r/actions/runs/999",
+        Some(999),
+        None,
+    );
+    assert!(body.contains("URL: https://"), "body must have URL: {body}");
+    assert!(
+        !body.contains("Detail:"),
+        "non-failure body must not have Detail: {body}"
+    );
+    assert!(
+        !body.contains("checklist"),
+        "non-failure body must not have checklist: {body}"
     );
 }
 
@@ -4154,6 +4199,42 @@ fn github_check_pr_terminal_uses_owner_prefix_in_head_query() {
         !path.contains("head=feat/foo&"),
         "URL must NOT use bare `head={{branch}}` (the silent-drop bug); got: {path}"
     );
+}
+
+/// Pattern-A follow-up (t-20260621072505708315-50793-7): pin
+/// `GitHubCiProvider::fetch_failure_summary` finding the failed step before
+/// its `step["conclusion"].as_str() == Some("failure")` site converts to
+/// `CiOutcome`. No prior direct test covered the GitHub provider's summary
+/// path (only GitLab/Bitbucket had one — see
+/// `gitlab_fetch_failure_summary_finds_failed_job` below).
+#[test]
+fn github_fetch_failure_summary_finds_failed_step() {
+    let body = r#"{
+        "jobs": [{
+            "name": "build",
+            "steps": [
+                {"name": "Checkout", "conclusion": "success"},
+                {"name": "Run tests", "conclusion": "failure"}
+            ]
+        }]
+    }"#;
+    let (port, handle, captured) = github_mock_server(body);
+    let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+        .expect("provider");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 48));
+
+    handle.join().expect("mock");
+    let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+    assert!(
+        path.contains("/repos/foo/bar/actions/runs/48/jobs"),
+        "path: {path}"
+    );
+    assert_eq!(summary, "build / Run tests", "summary: {summary}");
 }
 
 #[test]
