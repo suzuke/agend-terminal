@@ -182,9 +182,12 @@ enum Situation {
 
 /// Pure classifier for one agent, so the auth-vs-stuck precedence is
 /// unit-testable without a registry. AUTH TAKES PRECEDENCE: it is recognised via
-/// the EXISTING detection (`backend_profile.rs` regex → `AgentState::AuthError`,
-/// red-anchor FP-guarded — we reuse that signal rather than re-implement loose
-/// string matching at this layer, so the FP boundary is inherited for free). It
+/// the EXISTING detection (`backend_profile.rs` regex → `AgentState::AuthError`).
+/// t-...30532-0: that regex is red-anchor-guarded but the STATE it drives is
+/// still content-FP-prone at the instant level (a transient blip flips it, ~31s
+/// self-heal observed), so AuthExpired is additionally gated on the supervisor's
+/// `AUTH_ERROR_NOTIFY_STABILITY` continuous-held window — the same FP defence the
+/// #1523 re-auth alert uses — rather than trusting the bare instant signal. It
 /// is gated to `Resume` to stay inside this watchdog's domain (the module force-
 /// restarts only `Resume` spawns) and disjoint from the supervisor's general
 /// AuthError flow. `AuthError` and `Starting/Restarting` are different
@@ -196,7 +199,22 @@ fn classify(
     silent: Duration,
     timeout: Duration,
 ) -> Situation {
-    if spawn_mode == SpawnMode::Resume && state == AgentState::AuthError {
+    if spawn_mode == SpawnMode::Resume
+        && state == AgentState::AuthError
+        && since_elapsed >= crate::daemon::supervisor::AUTH_ERROR_NOTIFY_STABILITY
+    {
+        // t-...30532-0 (reviewer5 REJECTED): the `AuthError` STATE is content-FP-
+        // prone at the instant level — transient PTY content flips it cosmetically
+        // (an instance self-healed back to Thinking in ~31s), so firing on the
+        // bare signal blip-pages the operator AND blindly skips the auto-Fresh
+        // that would have recovered it. Gate on the SAME stability window the
+        // supervisor's #1523 re-auth alert uses: only page once AuthError has been
+        // held CONTINUOUSLY past it. `since_elapsed` is `state.since.elapsed()`,
+        // reset on every transition (state/mod.rs `record_set`), so it is exactly
+        // the continuous-`AuthError` held-duration — a flicker out-and-back never
+        // accumulates. UNDER the window: fall through — `is_stuck_resume` needs
+        // `Starting`/`Restarting` (never `AuthError`), so this lands on `Ignore`
+        // and the blip is left to self-heal, no page, no auto-Fresh interference.
         return Situation::AuthExpired;
     }
     if is_stuck_resume(spawn_mode, state, since_elapsed, silent, timeout) {
@@ -605,14 +623,15 @@ mod tests {
     // ── auth-expiry classification (route away from auto-Fresh) ─────────
 
     #[test]
-    fn classify_auth_error_on_resume_is_auth_expired() {
-        // An AuthError agent spawned via Resume must be routed to the operator
-        // page, NOT the auto-Fresh ladder (respawn can't re-authenticate).
+    fn classify_auth_error_on_resume_held_past_window_is_auth_expired() {
+        // An AuthError agent spawned via Resume, held CONTINUOUSLY past the
+        // stability window, is a real auth expiry → operator page, NOT the
+        // auto-Fresh ladder (respawn can't re-authenticate).
         assert_eq!(
             classify(
                 SpawnMode::Resume,
                 AgentState::AuthError,
-                Duration::from_secs(120),
+                Duration::from_secs(120), // > 90s window
                 Duration::from_secs(120),
                 RESPAWN_STUCK_TIMEOUT,
             ),
@@ -620,19 +639,53 @@ mod tests {
         );
     }
 
+    /// t-...30532-0 (reviewer5 REJECTED, flipped): a SHORT-lived AuthError blip
+    /// (under the stability window) must NOT immediately page the operator or
+    /// skip auto-Fresh — `AuthError` is content-FP-prone (~31s self-heal seen), so
+    /// it must fall through and be left to self-heal. Pre-fix this returned
+    /// `AuthExpired` off a 1s signal (the merged defect). `AuthError` isn't
+    /// `Starting`/`Restarting`, so `is_stuck_resume` can't catch it either → `Ignore`.
     #[test]
-    fn classify_auth_error_takes_precedence_over_timing() {
-        // Even well within the stuck timeout, AuthError is auth-expiry — the
-        // timing gates are irrelevant once the auth signal is present.
+    fn classify_auth_error_under_stability_window_is_ignored_not_paged() {
         assert_eq!(
             classify(
                 SpawnMode::Resume,
                 AgentState::AuthError,
-                Duration::from_secs(1),
+                Duration::from_secs(1), // << 90s window — a transient blip
                 Duration::from_secs(1),
                 RESPAWN_STUCK_TIMEOUT,
             ),
-            Situation::AuthExpired
+            Situation::Ignore,
+            "a sub-window AuthError blip must self-heal, not page + skip auto-Fresh"
+        );
+    }
+
+    /// Boundary pin on the reused supervisor window (single source of truth): at
+    /// exactly `AUTH_ERROR_NOTIFY_STABILITY` it pages; one tick under, it doesn't.
+    #[test]
+    fn classify_auth_error_window_boundary() {
+        let window = crate::daemon::supervisor::AUTH_ERROR_NOTIFY_STABILITY;
+        assert_eq!(
+            classify(
+                SpawnMode::Resume,
+                AgentState::AuthError,
+                window,
+                window,
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::AuthExpired,
+            "held == window → page"
+        );
+        assert_eq!(
+            classify(
+                SpawnMode::Resume,
+                AgentState::AuthError,
+                window - Duration::from_millis(1),
+                window - Duration::from_millis(1),
+                RESPAWN_STUCK_TIMEOUT,
+            ),
+            Situation::Ignore,
+            "held one tick under window → do not page yet"
         );
     }
 
