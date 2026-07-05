@@ -9,6 +9,7 @@
 mod anti_stall;
 mod dispatch;
 mod evidence_gate;
+mod request_kind_gate;
 mod sha_gate;
 mod triaged_gate;
 
@@ -22,6 +23,10 @@ pub(super) use sha_gate::{check_sha_gate, fetch_pr_head_sha};
 
 // Send-invariant gate (handle_unified_send).
 pub(super) use anti_stall::enforce_send_invariants;
+
+// t-20260705005551919287-14440-22: request_kind enum validation
+// (handle_unified_send / handle_broadcast).
+pub(super) use request_kind_gate::validate_request_kind;
 
 // Delegate-task pre-send gates (handle_delegate_task).
 pub(super) use dispatch::run_dispatch_pre_checks;
