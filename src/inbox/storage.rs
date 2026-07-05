@@ -1526,6 +1526,14 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
                 | "review-verdict"
                 | "dispatch_idle_long_running"
                 | "dispatch_idle_nudge"
+                // #2622 PR-2: the operator-facing notice emitted when an agent
+                // self-discharges a channel-reply obligation. Pure FYI — no
+                // reply owed, no actor blocked (same fire-and-forget shape as
+                // dispatch_idle_long_running). Classified fire-and-forget FROM
+                // BIRTH so this "an obligation was closed" notice can never
+                // itself become a nagging un-dischargeable obligation and
+                // regenerate the loop it reports on (the fb2461 lesson).
+                | "channel-reply-discharged"
         )
     )
 }
@@ -1562,6 +1570,11 @@ fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
                 // long enough to race the reclaim-TTL in the first place.
                 | "dispatch_idle_long_running"
                 | "dispatch_idle_nudge"
+                // #2622 PR-2: the self-discharge operator notice — settle on
+                // first drain (same pure-daemon-notification shape). Paired
+                // with the `known_fire_and_forget_kind` entry above so the
+                // notice is inert on BOTH the drain-settle and reclaim paths.
+                | "channel-reply-discharged"
         )
     )
 }

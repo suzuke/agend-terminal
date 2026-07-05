@@ -882,6 +882,14 @@ fn drain_auto_acks_daemon_notifications() {
             "[team-watchdog] FYI: 'lead' dispatch has been quiet 900s. No \
              action needed if you're mid-task.",
         ),
+        // #2622 PR-2: the self-discharge operator notice must be fire-and-forget
+        // from birth (else it re-creates the loop it reports on — fb2461).
+        (
+            "channel-reply-discharged",
+            "system:channel-reply-discharge",
+            "[channel-reply-discharged] general closed m-125 without a reply — \
+             reason: stale, operator no longer needs an answer.",
+        ),
     ] {
         let home = tmp_home(&format!("drain-{kind}-auto-ack"));
         let id = format!("m-{kind}");
@@ -1020,6 +1028,9 @@ fn reclaim_settles_stale_delivering_for_newly_audited_fire_and_forget_kinds() {
         "pr-ready-for-merge",
         "pr-closed-unmerged",
         "review-verdict",
+        // #2622 PR-2: the self-discharge operator notice — reclaim-level
+        // consistency (in both #2636 lists from birth).
+        "channel-reply-discharged",
     ] {
         let home = tmp_home(&format!("reclaim-faf-{kind}"));
         enqueue(
