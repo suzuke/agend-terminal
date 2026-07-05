@@ -7,7 +7,9 @@ use std::path::Path;
 
 use super::send_envelope::SendEnvelope;
 use super::{
-    comms_gates::{enforce_send_invariants, record_triaged_if_present, validate_triaged},
+    comms_gates::{
+        enforce_send_invariants, record_triaged_if_present, validate_request_kind, validate_triaged,
+    },
     err_needs_identity, is_ok_result,
 };
 
@@ -17,6 +19,9 @@ use super::{
 pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let mut args = args.clone();
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
+        return err;
+    }
+    if let Some(err) = validate_request_kind(&args) {
         return err;
     }
     // Broadcast mode: targets/team/tags present
@@ -601,6 +606,12 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("broadcast");
     };
+    // Also validated in `handle_unified_send` before routing here — repeated
+    // so a direct call to this handler (bypassing the unified dispatch) is
+    // still covered.
+    if let Some(err) = validate_request_kind(args) {
+        return err;
+    }
     let message = match args["message"].as_str() {
         Some(m) => m,
         None => return json!({"error": "missing 'message'"}),

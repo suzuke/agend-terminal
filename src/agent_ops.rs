@@ -103,13 +103,19 @@ pub fn send_to(
                 return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {e})")});
             }
             let submit_key = get_submit_key(home, target);
+            // t-20260705005551919287-14440-22: preserve the ORIGINAL `kind`
+            // on the fallback path — it was hardcoded to `None` here even
+            // though the API-reachable path above threads it through via
+            // `"kind": kind`. A task/query silently landing as kind=None
+            // loses its obligation classification (poll-reminder doesn't
+            // re-arm for it).
             crate::inbox::deliver(
                 home,
                 target,
                 &crate::inbox::NotifySource::Agent(from_str),
                 text,
                 &submit_key,
-                None,
+                Some(kind.to_string()),
                 broadcast_context.cloned(),
             );
             json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {e}")})
@@ -810,6 +816,49 @@ mod tests {
             result.get("delivery_mode").and_then(|d| d.as_str()),
             Some("inbox_fallback"),
             "must NOT report success when the message was lost"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-20260705005551919287-14440-22: `send_to`'s API-down fallback hardcoded
+    /// `kind: None` when handing off to `inbox::deliver` — losing the ORIGINAL
+    /// message kind (`"query"`/`"task"`/etc, threaded through fine on the
+    /// API-reachable path via the `"kind": kind` param) the instant the daemon
+    /// API is unreachable. Real production callers pass a real kind here
+    /// (`handle_request_information` → `"query"`; `handle_broadcast` → the
+    /// caller's `request_kind`, which can be `"task"`/`"query"`) — a query/task
+    /// silently landing as kind=None means its obligation classification is
+    /// lost (poll-reminder doesn't re-arm for it), not just cosmetic.
+    ///
+    /// No live daemon exists in this test's fresh `tmp_home`, so `api::call`
+    /// fails deterministically and `send_to` takes the fallback path for real
+    /// — not a mocked substitute for it.
+    #[test]
+    fn send_to_fallback_preserves_original_kind_not_none_2620() {
+        let home = tmp_home("send-to-fallback-kind");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker:\n    backend: claude\n",
+        )
+        .unwrap();
+        let from = Sender::new("sender").expect("valid sender");
+
+        let result = send_to(&home, &from, "worker", "hello", "query", None);
+        assert_eq!(
+            result.get("delivery_mode").and_then(|d| d.as_str()),
+            Some("inbox_fallback"),
+            "test invariant: no daemon running in this tmp_home, must hit the \
+             fallback path (not skip past it): {result}"
+        );
+
+        let msgs = crate::inbox::drain(&home, "worker");
+        assert_eq!(msgs.len(), 1, "fallback must still enqueue the message");
+        assert_eq!(
+            msgs[0].kind.as_deref(),
+            Some("query"),
+            "the fallback delivery must preserve the ORIGINAL kind passed to \
+             send_to, not silently drop it to None: {:?}",
+            msgs[0]
         );
         std::fs::remove_dir_all(&home).ok();
     }
