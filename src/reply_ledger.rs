@@ -43,6 +43,7 @@
 //! the fallback for turns that never clear. See `/tmp/1665-spike.md`.
 
 use crate::channel::ChannelKind;
+use std::path::Path;
 
 /// Outcome of the agent's explicit `reply` attempt this turn (Gap D tracking).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -185,7 +186,7 @@ fn channel_kind_str(c: ChannelKind) -> &'static str {
 /// `sender|hash(normalized text)`. Normalization: trim, collapse internal
 /// whitespace, lowercase — so a resend with stray spacing still groups.
 /// `None` (no usable text) disables grouping for the message.
-fn group_key(from: Option<&str>, text: Option<&str>) -> Option<String> {
+pub(crate) fn group_key(from: Option<&str>, text: Option<&str>) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let text = text?.trim();
     if text.is_empty() {
@@ -228,6 +229,7 @@ fn settle_group_locked(p: &mut crate::daemon::heartbeat_pair::HeartbeatPair, key
 /// - otherwise → fresh obligation, superseding any different pending turn
 ///   (the old turn is dropped without escalation — the user moved on).
 pub fn arm(
+    home: &Path,
     name: &str,
     channel: ChannelKind,
     inbound_msg_id: Option<String>,
@@ -237,6 +239,27 @@ pub fn arm(
     text: Option<&str>,
 ) {
     let key = group_key(from, text);
+    // #2622 PR-2: a durably-discharged obligation must NEVER re-open — the
+    // structural exit the in-memory `settled_reply_groups` (600 s TTL) can't
+    // provide (a message redelivering past that window otherwise re-arms
+    // forever, the -125 loop). This is the exact durable parallel of the
+    // in-memory `settled_reply_groups` suppression below, keyed the same way
+    // (`group_key`, message_id fallback). Checked BEFORE `update_with` so the
+    // disk read stays OFF the heartbeat_pair leaf lock (#1617 discipline).
+    if key.is_some() || inbound_msg_id.is_some() {
+        let mid = inbound_msg_id.as_deref().unwrap_or("");
+        if crate::daemon::channel_reply_discharge::is_discharged(home, key.as_deref(), mid)
+            .is_some()
+        {
+            tracing::debug!(
+                target: "reply_ledger",
+                agent = %name,
+                msg_id = ?inbound_msg_id,
+                "durably discharged obligation — not re-armed (#2622)"
+            );
+            return;
+        }
+    }
     let now = crate::daemon::heartbeat_pair::now_ms() as i64;
     let name_owned = name.to_string();
     crate::daemon::heartbeat_pair::update_with(name, move |p| {
@@ -615,7 +638,13 @@ mod tests {
     }
 
     fn arm_user(name: &str, msg_id: &str, text: &str) {
+        // Most ledger tests don't exercise the #2622 discharge guard, so a
+        // throwaway home with no discharge records is fine (is_discharged →
+        // None → arms as before). The dedicated guard test below uses a real
+        // home it writes a discharge into.
+        let home = tmp_home("arm-user-nodischarge");
         arm(
+            &home,
             name,
             ChannelKind::Telegram,
             Some(msg_id.into()),
@@ -624,6 +653,93 @@ mod tests {
             Some("user:op"),
             Some(text),
         );
+    }
+
+    /// #2622 PR-2 arm guard: a durably-discharged obligation must NOT re-arm,
+    /// even when a redelivery drains it again — the structural exit the
+    /// in-memory `settled_reply_groups` (600 s TTL) cannot provide. Keyed by
+    /// `group_key` (the same key `arm`'s in-memory suppression uses), so an
+    /// operator resend of the same text (same group, new id) also stays
+    /// discharged.
+    #[test]
+    fn arm_skips_a_durably_discharged_obligation_2622() {
+        let home = tmp_home("arm-guard-discharged");
+        let agent = "reply-ledger-arm-guard-2622";
+        let text = "please analyze this 13-day-old paper";
+        let gk = group_key(Some("user:op"), Some(text));
+
+        // Discharge the obligation FIRST (as the discharge primitive will).
+        crate::daemon::channel_reply_discharge::record_discharge(
+            &home,
+            gk.as_deref(),
+            "m-125",
+            agent,
+            Some("stale, operator no longer needs an answer"),
+        )
+        .unwrap();
+
+        // A redelivery drains it again → arm. It must NOT open an obligation.
+        arm(
+            &home,
+            agent,
+            ChannelKind::Telegram,
+            Some("m-125".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some(text),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent)
+                .pending_user_turn
+                .is_none(),
+            "a durably-discharged obligation must not re-arm on redelivery"
+        );
+
+        // Same text, DIFFERENT message id (operator resend) — same group_key,
+        // still discharged, still no obligation.
+        arm(
+            &home,
+            agent,
+            ChannelKind::Telegram,
+            Some("m-999".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some(text),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent)
+                .pending_user_turn
+                .is_none(),
+            "an operator resend (same group_key, new id) of a discharged obligation must not re-arm"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Control: an UNdischarged obligation still arms normally (the guard must
+    /// not suppress live obligations).
+    #[test]
+    fn arm_still_opens_an_undischarged_obligation_2622() {
+        let home = tmp_home("arm-guard-live");
+        let agent = "reply-ledger-arm-live-2622";
+        arm(
+            &home,
+            agent,
+            ChannelKind::Telegram,
+            Some("m-live".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some("a fresh question"),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent)
+                .pending_user_turn
+                .is_some(),
+            "a live (undischarged) obligation must still arm normally"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── classify (pure) ─────────────────────────────────────────────────

@@ -774,6 +774,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     // supersedes (the user moved on, never escalate the old turn).
     for m in newly_delivered_msgs.iter().filter(|m| m.channel.is_some()) {
         crate::reply_ledger::arm(
+            home,
             name,
             *m.channel.as_ref().expect("checked"),
             m.id.clone(),

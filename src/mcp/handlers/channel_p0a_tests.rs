@@ -296,6 +296,7 @@ fn no_fleet_yaml_reply_exit_records_send_failed_gap_d_1665() {
     std::fs::remove_file(home.join("fleet.yaml")).ok();
     let agent = "reply-ledger-nofleet-1665";
     crate::reply_ledger::arm(
+        &home,
         agent,
         crate::channel::ChannelKind::Telegram,
         Some("m-1".into()),
