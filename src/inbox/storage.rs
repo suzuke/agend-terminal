@@ -1508,6 +1508,23 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
                 | "ci-watch-resumed"
                 | "poll"
                 | "pr-merged"
+                // #2412 follow-up (kind-taxonomy audit): the rest of the
+                // pr-state FYI class (already fire-and-forget in
+                // `auto_ack_on_drain_kind` since #2506, but missing here —
+                // an inconsistency with no live impact today since
+                // `auto_ack_on_drain_kind` settles them before reclaim ever
+                // sees a stale `delivering` row of these kinds, but a
+                // legacy/older-daemon-written row could still reach this
+                // check) plus the two dispatch_idle notification subtypes
+                // (one-shot-by-design at the source — team_nudge's
+                // `nudge_sent_at` / dispatch_idle's `long_running_escalated`
+                // latch never re-fire the same notice — see
+                // `auto_ack_on_drain_kind` below for the primary fix).
+                | "pr-closed-unmerged"
+                | "pr-ready-for-merge"
+                | "review-verdict"
+                | "dispatch_idle_long_running"
+                | "dispatch_idle_nudge"
         )
     )
 }
@@ -1533,6 +1550,17 @@ fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
                 | "pr-closed-unmerged"
                 | "pr-ready-for-merge"
                 | "review-verdict"
+                // #2412 follow-up: primary fix for the live 58-minute
+                // poll-reminder loop sample — both kinds are one-shot
+                // daemon-generated FYI with no recipient action expected
+                // (dispatch_idle_long_running: "Long run EXPECTED -> no
+                // action"; dispatch_idle_nudge: "No action needed if
+                // you're mid-task"). Settling on first drain, same as the
+                // ci-watch/pr-state pure-daemon-notification precedent
+                // above, means the row never enters `delivering` limbo
+                // long enough to race the reclaim-TTL in the first place.
+                | "dispatch_idle_long_running"
+                | "dispatch_idle_nudge"
         )
     )
 }
