@@ -107,9 +107,31 @@ pub(crate) fn record_discharge(
     discharged_by: &str,
     reason: Option<&str>,
 ) -> anyhow::Result<()> {
-    // PR-1 RED stub — real disk-durable RMW lands in the GREEN commit.
-    let _ = (home, group_key, message_id, discharged_by, reason);
-    Ok(())
+    let key = discharge_key(group_key, message_id);
+    let path = ledger_path(home, &key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
+    let mut record: DischargeRecord = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| DischargeRecord {
+            discharged_by: String::new(),
+            discharged_at: String::new(),
+            reason: None,
+            group_key: group_key.filter(|s| !s.is_empty()).map(String::from),
+            message_ids: Vec::new(),
+        });
+    record.discharged_by = discharged_by.to_string();
+    record.discharged_at = chrono::Utc::now().to_rfc3339();
+    record.reason = reason.filter(|s| !s.is_empty()).map(String::from);
+    record.group_key = group_key.filter(|s| !s.is_empty()).map(String::from);
+    if !record.message_ids.iter().any(|m| m == message_id) {
+        record.message_ids.push(message_id.to_string());
+    }
+    crate::store::save_atomic(&path, &record)
 }
 
 /// Look up whether the obligation identified by `(group_key, message_id)` has
@@ -121,9 +143,11 @@ pub(crate) fn is_discharged(
     group_key: Option<&str>,
     message_id: &str,
 ) -> Option<DischargeRecord> {
-    // PR-1 RED stub — real lookup lands in the GREEN commit.
-    let _ = (home, group_key, message_id);
-    None
+    let key = discharge_key(group_key, message_id);
+    let path = ledger_path(home, &key);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
 }
 
 #[cfg(test)]
