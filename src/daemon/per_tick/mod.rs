@@ -59,6 +59,7 @@ pub(crate) mod inject_delivery;
 pub(crate) mod log_rotation;
 pub(crate) mod notification_flush;
 pub(crate) mod notification_watchdogs;
+pub(crate) mod offline_unread_alert;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state_scan;
 pub(crate) mod reclaim;
@@ -368,6 +369,13 @@ pub(crate) fn build_default_handlers(
         Box::new(CiWatchPollHandler::new()),
         Box::new(PrStateScanHandler::new()),
         Box::new(InboxMaintenanceHandler::new(60)),
+        // #2604: offline-target unread-obligation escalation. Same 60-tick
+        // cadence as the inbox sweep it races — an offline/nonexistent target's
+        // pending obligations get an operator P0 before `sweep_expired`'s 30-day
+        // TTL silently drops them. Independent handler (self-owned dedup latch),
+        // NOT folded into InboxMaintenanceHandler (that composite takes only
+        // ctx.home; this needs ctx.registry to tell offline from online).
+        Box::new(offline_unread_alert::OfflineUnreadAlertHandler::new(60)),
         // #2549 W3: PollReminder (30 ticks) + InboxStuck watchdog (#1491(A), 30
         // ticks — every agent receiving but not draining its inbox; notifies lead,
         // no auto-restart) + HandoffTimeout watchdog (#1491(B), 12 ticks — #1859
