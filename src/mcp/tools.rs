@@ -27,6 +27,7 @@ pub(crate) fn def_reply() -> Value {
     json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
         "inputSchema": {"type": "object", "properties": {
             "message": {"type": "string", "description": "The reply text to send to the user."},
+            "message_id": {"type": "string", "description": "#2622 PR-3: target an original inbox message by id. When set, routes by THAT message's own channel (instead of the process-global reply_to_channel prefer-chain) and, on send success, settles that row so it stops redelivering. Omit for the default prefer-chain behavior."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
             "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
         }, "required": ["message"]}})
@@ -501,6 +502,34 @@ mod tests {
         assert!(
             !required_strs.contains(&"target_pane"),
             "target_pane must stay optional"
+        );
+    }
+
+    #[test]
+    fn reply_has_message_id_param_2622() {
+        // #2622 PR-3 reviewer5 r0: handle_reply reads args["message_id"] and
+        // implements the targeted-channel-routing path, but the schema never
+        // declared it — an MCP client validating against the advertised
+        // inputSchema has no way to pass `message_id`, so the capability is
+        // unreachable exactly like #2539's repo force/force_reason gap above.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let reply = tools
+            .iter()
+            .find(|t| t["name"] == "reply")
+            .expect("reply tool not found");
+        let props = &reply["inputSchema"]["properties"];
+        assert!(
+            props["message_id"].is_object(),
+            "reply tool must declare 'message_id' so MCP clients can target an original message"
+        );
+        let required_strs: Vec<&str> = reply["inputSchema"]["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !required_strs.contains(&"message_id"),
+            "message_id must stay optional (backward-compat: omitting it is byte-identical)"
         );
     }
 
