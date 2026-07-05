@@ -130,6 +130,7 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "list_instances",
             "binding_state",
             "pane_snapshot",
+            "instance",
             "task",
             "decision",
             "ci",
@@ -151,6 +152,7 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "list_instances",
             "binding_state",
             "pane_snapshot",
+            "instance",
             "task",
             "decision",
             "ci",
@@ -173,6 +175,7 @@ const ROLE_TOOL_SUBSETS: &[(&str, &[&str])] = &[
             "list_instances",
             "binding_state",
             "pane_snapshot",
+            "instance",
             "task",
             "decision",
             "config",
@@ -344,7 +347,7 @@ pub(crate) fn tool_allowed_for_role_action(
     tool_allowed_for_role(role_kind, tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 28] = [
+static ALL_TOOLS: [ToolEntry; 29] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -437,6 +440,19 @@ static ALL_TOOLS: [ToolEntry; 28] = [
         definition: super::tools::def_pane_snapshot,
         handler: super::handlers::dispatch::dispatch_pane_snapshot,
         class: ToolClass::READ_ONLY,
+    },
+    // #2550 P1: folded read-only alias for list_instances + pane_snapshot. The
+    // ToolClass is deliberately RETRY_SAFE (not READ_ONLY): the folded tool is a
+    // forward-looking mixed read/write surface (P2+ will add mutating actions), so
+    // a name-level disk-skip would wrongly apply to future mutations. The read
+    // disk-skip optimization is traded away; the security-relevant classification
+    // is (name,action)-aware (side_effect_on_timeout_for / operator_gate / role
+    // guard), independent of this ToolClass.
+    ToolEntry {
+        name: "instance",
+        definition: super::tools::def_instance,
+        handler: super::handlers::dispatch::dispatch_instance,
+        class: ToolClass::RETRY_SAFE,
     },
     // ── Decision ──
     ToolEntry {
@@ -643,12 +659,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_28_byte_identical() {
+    fn full_capability_roles_surface_all_29_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            28,
-            "registry baseline is 28 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27; #991 Phase 2: + bind_topic = 27->28)"
+            29,
+            "registry baseline is 29 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27; #991 Phase 2: + bind_topic = 27->28; #2550 P1: + instance (folded read-only alias) = 28->29)"
         );
         for role in [
             None,
@@ -660,7 +676,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 28 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 29 tools in registry order (default-all-open)"
             );
         }
     }
@@ -775,6 +791,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #2550 P1: the folded `instance` read actions must track the LIVE per-name
+    /// registry entries, not just hardcoded literals. If a future change flips
+    /// `list_instances` / `pane_snapshot` to side-effect-on-timeout, this fails —
+    /// forcing the fold's policy to stay in lockstep with the tool it aliases.
+    #[test]
+    fn folded_instance_read_actions_track_live_per_name_side_effect() {
+        assert_eq!(
+            side_effect_on_timeout_for("instance", Some("list")),
+            side_effect_on_timeout("list_instances"),
+            "instance(list) side-effect must track live list_instances"
+        );
+        assert_eq!(
+            side_effect_on_timeout_for("instance", Some("pane_snapshot")),
+            side_effect_on_timeout("pane_snapshot"),
+            "instance(pane_snapshot) side-effect must track live pane_snapshot"
+        );
+    }
+
+    /// #2550 P1: now that the tool is registered, the curated read roles SEE the
+    /// folded `instance` tool (its read actions are their legitimate surface). The
+    /// #2158 guard (`instance_role_guard_blocks_structural_for_read_roles`) still
+    /// blocks the structural actions per-action — visibility here is read-only.
+    #[test]
+    fn read_roles_gain_folded_instance_visibility() {
+        for role in [RoleKind::Reviewer, RoleKind::Planner, RoleKind::Explorer] {
+            assert!(
+                names(Some(role)).contains(&"instance"),
+                "read role {role:?} must see the folded instance tool"
+            );
+        }
+        // Registered → default-all-open full-capability roles see it too.
+        assert!(names(None).contains(&"instance"));
     }
 
     /// Parse the `### `name`` tool-section headers from a MCP-TOOLS doc body.

@@ -196,6 +196,25 @@ macro_rules! action_adapter {
 pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_list_instances_with_runtime(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
 }
+
+/// #2550 P1: folded READ-ONLY `instance` tool. Custom (not `action_adapter!`)
+/// because `list` needs the runtime context (`handle_list_instances_with_runtime`),
+/// a handler shape the shared `adapter!` macro doesn't cover. Only the read
+/// actions are wired here and the schema's `action` enum keeps structural actions
+/// off this tool; the three (name,action)-aware classifiers (operator_gate,
+/// side-effect-on-timeout, role guard) independently enforce the read-only policy.
+pub(crate) fn dispatch_instance(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "list" => instance::handle_list_instances_with_runtime(
+            ctx.home,
+            ctx.args,
+            ctx.instance_name,
+            ctx.runtime,
+        ),
+        "pane_snapshot" => instance::handle_pane_snapshot(ctx.home, ctx.args),
+        other => json!({"error": format!("unknown instance action: {other}")}),
+    }
+}
 adapter!(
     dispatch_create_instance,
     hai,
@@ -400,6 +419,7 @@ mod tests {
                 "set_waiting_on",
                 "move_pane",
                 "pane_snapshot",
+                "instance",
                 "decision",
                 "task",
                 "restart_daemon",
@@ -415,7 +435,7 @@ mod tests {
                 "binding_state",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 28);
+        assert_eq!(crate::mcp::registry::all().len(), 29);
     }
 
     #[test]
@@ -504,6 +524,93 @@ mod tests {
             err.contains("unknown") || err.contains("action"),
             "expected unknown-action error from base; got: {v:?}"
         );
+    }
+
+    /// #2550 P1: the folded `instance` tool routes its read actions AND produces
+    /// byte-identical results to the standalone per-name tools (the alias
+    /// contract). `runtime:None` + a temp home makes both paths deterministic:
+    /// `list` short-circuits to the compact `list_agents()` view, `pane_snapshot`
+    /// converges on the same handler once an `instance` is supplied — same
+    /// handler, same args modulo the ignored `action` key.
+    ///
+    /// NOTE the ONE deliberate divergence (asserted separately below): a MISSING
+    /// `instance` for pane_snapshot is caught by the SCHEMA layer for the per-name
+    /// tool (`required:["instance"]`) but by the HANDLER's `require_instance` for
+    /// the folded tool (`required:["action"]`, union-schema limitation). Both
+    /// reject; only the error string differs. That's why we pin equivalence with
+    /// `instance` PRESENT (both pass schema validation → identical handler call).
+    #[test]
+    fn folded_instance_read_actions_alias_per_name_tools() {
+        let home = std::env::temp_dir();
+
+        // action=list ≡ list_instances (neither declares a required `instance`, so
+        // both pass schema validation and return the full compact list).
+        let list_args = json!({"action": "list"});
+        let ctx = ctx_for(&home, &list_args, "");
+        let via_instance = try_dispatch("instance", &ctx).expect("instance(list) must route");
+        let plain_args = json!({});
+        let ctx = ctx_for(&home, &plain_args, "");
+        let via_name = try_dispatch("list_instances", &ctx).expect("list_instances must route");
+        assert_eq!(
+            via_instance, via_name,
+            "instance(action=list) must be byte-identical to list_instances"
+        );
+
+        // action=pane_snapshot ≡ pane_snapshot, with `instance` supplied so both
+        // clear schema validation and converge on the identical handler call.
+        let snap_args = json!({"action": "pane_snapshot", "instance": "alias-probe"});
+        let ctx = ctx_for(&home, &snap_args, "");
+        let via_instance =
+            try_dispatch("instance", &ctx).expect("instance(pane_snapshot) must route");
+        let plain_args = json!({"instance": "alias-probe"});
+        let ctx = ctx_for(&home, &plain_args, "");
+        let via_name = try_dispatch("pane_snapshot", &ctx).expect("pane_snapshot must route");
+        assert_eq!(
+            via_instance, via_name,
+            "instance(action=pane_snapshot, instance=…) must be byte-identical to pane_snapshot(instance=…)"
+        );
+    }
+
+    /// #2550 P1: the ONE intentional divergence — a MISSING `instance` for
+    /// pane_snapshot is rejected at a DIFFERENT layer (schema vs handler) between
+    /// the per-name and folded tools, because the folded schema can only require
+    /// `action` (union limitation). Both still reject; this pins that neither
+    /// silently accepts, documenting the layer difference.
+    #[test]
+    fn folded_instance_pane_snapshot_missing_instance_rejected_both_paths() {
+        let home = std::env::temp_dir();
+        let via_instance = try_dispatch(
+            "instance",
+            &ctx_for(&home, &json!({"action": "pane_snapshot"}), ""),
+        )
+        .expect("instance must route");
+        let via_name =
+            try_dispatch("pane_snapshot", &ctx_for(&home, &json!({}), "")).expect("must route");
+        for (label, v) in [("folded", &via_instance), ("per-name", &via_name)] {
+            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            assert!(
+                err.contains("instance"),
+                "{label} pane_snapshot without instance must error about 'instance'; got: {v:?}"
+            );
+        }
+    }
+
+    /// A structural / unknown action on the folded tool never reaches a handler —
+    /// it falls through to the tool-specific unknown-action error (the schema's
+    /// `action` enum already blocks it upstream; this is the dispatch backstop).
+    #[test]
+    fn folded_instance_unknown_action_errors() {
+        let home = std::env::temp_dir();
+        for action in ["delete", "restart", "bogus"] {
+            let args = json!({ "action": action });
+            let ctx = ctx_for(&home, &args, "");
+            let v = try_dispatch("instance", &ctx).expect("instance must still return Some");
+            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            assert!(
+                err.contains("unknown instance action"),
+                "instance({action}) must be an unknown-action error; got: {v:?}"
+            );
+        }
     }
 
     #[test]

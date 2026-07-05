@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（28 個工具）
+# AgEnD MCP Tools Reference — 工具參考（29 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -133,6 +133,12 @@
 - **instance**: instance 名稱
 - lines（預設 100，最大 10000）
 - `to_file: true`（#2478）會把完整 snapshot 寫到 `$AGEND_HOME/captures/`，tool 只回精簡摘要與路徑，避免診斷 dump 灌進 context。
+
+### `instance`
+#2550：per-name instance 工具的 folded **唯讀** alias。只開唯讀 action——原本的 `list_instances` / `pane_snapshot` 工具原樣保留，結構性生命週期（create/delete/start/restart/move_pane）仍留在各自的獨立工具。
+- **action**: list / pane_snapshot
+- action=list ≡ `list_instances`（可選 `instance` 取單一 instance 詳情；`verbose` / `include_evidence` 取完整 evidence trail）
+- action=pane_snapshot ≡ `pane_snapshot`（`instance` 必填；`lines`、`to_file`、`head`）
 
 ## Worktree 與 Binding（Worktree & Binding）
 
