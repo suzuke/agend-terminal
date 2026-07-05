@@ -11,18 +11,18 @@ use std::path::Path;
 
 /// Derive Telegram status from an already-loaded FleetConfig (no disk I/O).
 pub(super) fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> TelegramStatus {
-    match config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            ref bot_token_env, ..
-        }) => {
+    // #2642: resolve Telegram from the unified multi-channel view so the TUI
+    // status is correct in a telegram+discord fleet (not only when Telegram is
+    // the first-sorted / singular channel). Single-channel telegram unchanged.
+    match config.telegram_channel() {
+        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, .. }) => {
             if std::env::var(bot_token_env).is_ok() {
                 TelegramStatus::Connected
             } else {
                 TelegramStatus::NoToken
             }
         }
-        None => TelegramStatus::NotConfigured,
-        Some(crate::fleet::ChannelConfig::Discord { .. }) => TelegramStatus::NotConfigured,
+        _ => TelegramStatus::NotConfigured,
     }
 }
 

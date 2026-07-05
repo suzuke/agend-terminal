@@ -24,15 +24,19 @@ pub fn init_from_config(
     home: &Path,
     submit_keys: HashMap<String, String>,
 ) -> Option<Arc<Mutex<TelegramState>>> {
-    let (bot_token_env, group_id, user_allowlist, fleet_binding) = match config.channel.as_ref()? {
-        ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            user_allowlist,
-            fleet_binding,
-            ..
-        } => (bot_token_env, group_id, user_allowlist, fleet_binding),
-        ChannelConfig::Discord { .. } => return None,
+    // #2642: resolve the Telegram channel from the unified multi-channel view
+    // (not the singular `config.channel`), so a telegram+discord fleet still
+    // finds Telegram regardless of which entry normalize collapsed into
+    // `channel`. Single-channel telegram → exactly `config.channel` (unchanged).
+    let Some(ChannelConfig::Telegram {
+        bot_token_env,
+        group_id,
+        user_allowlist,
+        fleet_binding,
+        ..
+    }) = config.telegram_channel()
+    else {
+        return None;
     };
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
