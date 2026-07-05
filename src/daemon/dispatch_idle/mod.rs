@@ -1575,6 +1575,20 @@ mod tests {
         dir
     }
 
+    /// #1516 gate tests key off `target_has_active_waiting_on`, which reads
+    /// `heartbeat_pair`'s process-global (`static OnceLock`) registry keyed
+    /// by literal agent name — NOT scoped to `home`. A literal `"worker"`
+    /// target collides with the same generic fixture name used by ~14 other
+    /// test files across the crate; any of them setting `waiting_on` on
+    /// "worker" pollutes these tests regardless of `home` isolation (t-20260705005551919287-14440-22
+    /// Coverage-job flake, confirmed via base-vs-branch A/B). Unique per call
+    /// (same PID+counter shape as `tmp_home`) so no other test can share the key.
+    fn unique_target(tag: &str) -> String {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("gate-target-{}-{}-{}", std::process::id(), tag, id)
+    }
+
     /// Write a backdated pending sidecar directly (bypasses
     /// `record_dispatch`) so timeout scenarios don't require sleeping.
     fn write_pending_at(
@@ -3503,9 +3517,10 @@ mod tests {
     #[test]
     fn working_target_does_not_fire_1516() {
         let home = tmp_home("gate-working");
+        let target = unique_target("working");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        let id = write_pending_at(&home, "lead", "worker", Some("t-w"), "task", 600, issued);
-        crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "active")]);
+        let id = write_pending_at(&home, "lead", &target, Some("t-w"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot(&target, "active")]);
 
         scan_and_emit(&home);
 
@@ -3532,9 +3547,10 @@ mod tests {
     #[test]
     fn idle_target_still_fires_1516() {
         let home = tmp_home("gate-idle");
+        let target = unique_target("idle");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        let id = write_pending_at(&home, "lead", "worker", Some("t-i"), "task", 600, issued);
-        crate::snapshot::save(&home, &[mk_agent_snapshot("worker", "idle")]);
+        let id = write_pending_at(&home, "lead", &target, Some("t-i"), "task", 600, issued);
+        crate::snapshot::save(&home, &[mk_agent_snapshot(&target, "idle")]);
 
         // #1658: a snapshot present + not-working debounces — fires on the
         // DEBOUNCE_SCANS-th consecutive idle scan, not the first.
@@ -3561,8 +3577,9 @@ mod tests {
     #[test]
     fn no_snapshot_falls_back_to_firing_1516() {
         let home = tmp_home("gate-nosnap");
+        let target = unique_target("nosnap");
         let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        write_pending_at(&home, "lead", "worker", Some("t-n"), "task", 600, issued);
+        write_pending_at(&home, "lead", &target, Some("t-n"), "task", 600, issued);
         // No snapshot.json written.
         scan_and_emit(&home);
         assert!(
