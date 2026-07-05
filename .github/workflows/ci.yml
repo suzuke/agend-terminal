@@ -87,6 +87,13 @@ jobs:
       # CI-verified. `cargo check` (type-check only, no codegen) is enough to
       # catch dep/API breakage and is fast. Linux-only — the conflict is
       # platform-independent.
+      #
+      # t-...26515-3: do NOT delete this as "redundant now that the test job runs
+      # `--features tray,discord`". This checks the DISTINCT `discord`-WITHOUT-
+      # `tray` combination (a valid headless server build). discord code that
+      # accidentally references a tray-gated item compiles fine under the test
+      # job's `tray,discord` but breaks under `discord` alone — this step is the
+      # only thing guarding that feature-matrix corner.
       - name: Discord feature compiles (#1478)
         if: runner.os == 'Linux'
         timeout-minutes: 15
@@ -110,11 +117,21 @@ jobs:
         with:
           tool: nextest
 
-      - name: Tests (unit + integration + tray) [nextest — names a hung test, #1784/#1893]
+      # t-...26515-3 (#2642 follow-up): `discord` folded into the test feature
+      # set so the ~59 `channel::discord::*` tests (P4 mock-gateway #2625/#2628/
+      # #2629 + #2646 coexistence) actually EXECUTE on all 3 OSes — previously
+      # discord was compile-gated only (`cargo check --features discord`, below)
+      # and its tests never ran in CI. Measured delta: +~49s incremental compile
+      # (twilight ×3 crates) + ~1.1s exec — negligible vs the full build. The
+      # standalone `cargo check --features discord` step is DELIBERATELY KEPT: it
+      # checks the DIFFERENT `discord`-WITHOUT-`tray` combination (a valid
+      # headless server build), catching discord code that accidentally leans on
+      # a tray-gated item — which `tray,discord` here would compile straight past.
+      - name: Tests (unit + integration + tray + discord) [nextest — names a hung test, #1784/#1893]
         timeout-minutes: 30
         env:
           AGEND_LOCK_AUDIT: "1"
-        run: cargo nextest run --features tray --profile ci
+        run: cargo nextest run --features tray,discord --profile ci
 
       - name: CLI smoke (Phase C.5)
         timeout-minutes: 10
