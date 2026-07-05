@@ -785,6 +785,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     // supersedes (the user moved on, never escalate the old turn).
     for m in newly_delivered_msgs.iter().filter(|m| m.channel.is_some()) {
         crate::reply_ledger::arm(
+            home,
             name,
             *m.channel.as_ref().expect("checked"),
             m.id.clone(),
@@ -890,6 +891,77 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox ack lock failed");
         0
+    })
+}
+
+/// #2622 PR-2: settle the single row `msg_id` to `read` regardless of its
+/// current state (`unread` OR `delivering`) — the discharge path uses this so a
+/// discharged channel message stops redelivering (unlike [`ack`], which only
+/// transitions a `delivering` row; a discharged obligation's row is typically
+/// `unread`). Idempotent (an already-`read` row is a no-op). Returns whether a
+/// row was newly marked read. Same flock + atomic tmp+rename + forward-schema
+/// preservation as [`ack`].
+pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
+    let path = inbox_path_resolved(home, name);
+    if !path.exists() {
+        return false;
+    }
+    with_inbox_lock(home, name, |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut all: Vec<InboxMessage> = Vec::new();
+        let mut preserved_forward: Vec<String> = Vec::new();
+        let mut settled = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if msg.schema_version > InboxMessage::CURRENT_VERSION {
+                preserved_forward.push(line.to_string());
+                continue;
+            }
+            if msg.id.as_deref() == Some(msg_id) && msg.read_at.is_none() {
+                msg.read_at = Some(now.clone());
+                settled = true;
+            }
+            all.push(msg);
+        }
+        if settled {
+            let tmp = path.with_extension("jsonl.tmp");
+            let r = (|| -> anyhow::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                for m in &all {
+                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                for raw in &preserved_forward {
+                    writeln!(f, "{raw}")?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&tmp, path)?;
+                crate::store::fsync_parent_dir(path);
+                Ok(())
+            })();
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "inbox settle_read_by_id write-back failed");
+                return false;
+            }
+        }
+        settled
+    })
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "inbox settle_read_by_id lock failed");
+        false
     })
 }
 
@@ -1593,6 +1665,14 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
                 | "review-verdict"
                 | "dispatch_idle_long_running"
                 | "dispatch_idle_nudge"
+                // #2622 PR-2: the operator-facing notice emitted when an agent
+                // self-discharges a channel-reply obligation. Pure FYI — no
+                // reply owed, no actor blocked (same fire-and-forget shape as
+                // dispatch_idle_long_running). Classified fire-and-forget FROM
+                // BIRTH so this "an obligation was closed" notice can never
+                // itself become a nagging un-dischargeable obligation and
+                // regenerate the loop it reports on (the fb2461 lesson).
+                | "channel-reply-discharged"
         )
     )
 }
@@ -1629,6 +1709,11 @@ fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
                 // long enough to race the reclaim-TTL in the first place.
                 | "dispatch_idle_long_running"
                 | "dispatch_idle_nudge"
+                // #2622 PR-2: the self-discharge operator notice — settle on
+                // first drain (same pure-daemon-notification shape). Paired
+                // with the `known_fire_and_forget_kind` entry above so the
+                // notice is inert on BOTH the drain-settle and reclaim paths.
+                | "channel-reply-discharged"
         )
     )
 }

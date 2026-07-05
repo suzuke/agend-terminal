@@ -6,10 +6,6 @@ pub(crate) mod auto_release;
 pub(crate) mod boot_sweep;
 pub(crate) mod cadence_gate;
 pub(crate) mod canonical_drift;
-// #2622 PR-1: data layer only — production consumers (`reply_ledger::arm`
-// pre-arm guard, the discharge MCP primitive) are wired in PR-2. Its
-// `pub(crate)` fns are test-exercised only until then.
-#[allow(dead_code)]
 pub(crate) mod channel_reply_discharge;
 pub(crate) mod ci_handoff_track;
 pub(crate) mod ci_watch;

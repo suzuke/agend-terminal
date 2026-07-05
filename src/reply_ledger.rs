@@ -43,6 +43,7 @@
 //! the fallback for turns that never clear. See `/tmp/1665-spike.md`.
 
 use crate::channel::ChannelKind;
+use std::path::Path;
 
 /// Outcome of the agent's explicit `reply` attempt this turn (Gap D tracking).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -185,7 +186,7 @@ fn channel_kind_str(c: ChannelKind) -> &'static str {
 /// `sender|hash(normalized text)`. Normalization: trim, collapse internal
 /// whitespace, lowercase — so a resend with stray spacing still groups.
 /// `None` (no usable text) disables grouping for the message.
-fn group_key(from: Option<&str>, text: Option<&str>) -> Option<String> {
+pub(crate) fn group_key(from: Option<&str>, text: Option<&str>) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let text = text?.trim();
     if text.is_empty() {
@@ -227,7 +228,13 @@ fn settle_group_locked(p: &mut crate::daemon::heartbeat_pair::HeartbeatPair, key
 ///   state preserved — it is the same obligation, not a fresh one);
 /// - otherwise → fresh obligation, superseding any different pending turn
 ///   (the old turn is dropped without escalation — the user moved on).
+// #2622: `home` was added for the durable-discharge guard, tipping the arg
+// count to 8. The params are the inbound message's identity fields (each
+// distinct, none groupable into a struct without churning the single drain
+// call site) — an allow is cleaner than a one-use params struct here.
+#[allow(clippy::too_many_arguments)]
 pub fn arm(
+    home: &Path,
     name: &str,
     channel: ChannelKind,
     inbound_msg_id: Option<String>,
@@ -237,6 +244,30 @@ pub fn arm(
     text: Option<&str>,
 ) {
     let key = group_key(from, text);
+    // #2622 PR-2: a durably-discharged obligation must NEVER re-open — the
+    // structural exit the in-memory `settled_reply_groups` (600 s TTL) can't
+    // provide (a message redelivering past that window otherwise re-arms
+    // forever, the -125 loop). This is the exact durable parallel of the
+    // in-memory `settled_reply_groups` suppression below, keyed the same way
+    // (`group_key`, message_id fallback) PLUS `name` (#2622 reviewer4 r0: the
+    // durable key is scoped per-recipient-agent so one agent's discharge of a
+    // message never suppresses a different agent's same-group_key
+    // obligation). Checked BEFORE `update_with` so the disk read stays OFF
+    // the heartbeat_pair leaf lock (#1617 discipline).
+    if key.is_some() || inbound_msg_id.is_some() {
+        let mid = inbound_msg_id.as_deref().unwrap_or("");
+        if crate::daemon::channel_reply_discharge::is_discharged(home, name, key.as_deref(), mid)
+            .is_some()
+        {
+            tracing::debug!(
+                target: "reply_ledger",
+                agent = %name,
+                msg_id = ?inbound_msg_id,
+                "durably discharged obligation — not re-armed (#2622)"
+            );
+            return;
+        }
+    }
     let now = crate::daemon::heartbeat_pair::now_ms() as i64;
     let name_owned = name.to_string();
     crate::daemon::heartbeat_pair::update_with(name, move |p| {
@@ -312,6 +343,31 @@ pub fn clear_turn(name: &str) {
             settle_group_locked(p, t.group_key.as_deref());
         }
     });
+}
+
+/// #2622 PR-2: clear the live obligation IFF it is the one being discharged
+/// (identified by `msg_id` — matches the group's primary/member ids — or
+/// `group_key`). The durable discharge ledger stops FUTURE re-arms; this stops
+/// the CURRENTLY-armed turn's nudge ladder immediately. A strict no-op when the
+/// live turn is a DIFFERENT obligation — it must never clobber an unrelated
+/// pending reply (that would be the silent-loss the whole ledger guards
+/// against). Returns whether it cleared. Infallible.
+pub(crate) fn discharge_turn_if_matches(name: &str, msg_id: &str, group_key: Option<&str>) -> bool {
+    let mut cleared = false;
+    crate::daemon::heartbeat_pair::update_with(name, |p| {
+        let is_match = p.pending_user_turn.as_ref().is_some_and(|t| {
+            (group_key.is_some() && t.group_key.as_deref() == group_key)
+                || t.inbound_msg_id.as_deref() == Some(msg_id)
+                || t.group_msg_ids.iter().any(|m| m == msg_id)
+        });
+        if is_match {
+            if let Some(t) = p.pending_user_turn.take() {
+                settle_group_locked(p, t.group_key.as_deref());
+            }
+            cleared = true;
+        }
+    });
+    cleared
 }
 
 /// Pure closure classifier — no side effects, fully unit-testable.
@@ -615,7 +671,13 @@ mod tests {
     }
 
     fn arm_user(name: &str, msg_id: &str, text: &str) {
+        // Most ledger tests don't exercise the #2622 discharge guard, so a
+        // throwaway home with no discharge records is fine (is_discharged →
+        // None → arms as before). The dedicated guard test below uses a real
+        // home it writes a discharge into.
+        let home = tmp_home("arm-user-nodischarge");
         arm(
+            &home,
             name,
             ChannelKind::Telegram,
             Some(msg_id.into()),
@@ -624,6 +686,138 @@ mod tests {
             Some("user:op"),
             Some(text),
         );
+    }
+
+    /// #2622 PR-2 arm guard: a durably-discharged obligation must NOT re-arm,
+    /// even when a redelivery drains it again — the structural exit the
+    /// in-memory `settled_reply_groups` (600 s TTL) cannot provide. Keyed by
+    /// `group_key` (the same key `arm`'s in-memory suppression uses), so an
+    /// operator resend of the same text (same group, new id) also stays
+    /// discharged.
+    #[test]
+    fn arm_skips_a_durably_discharged_obligation_2622() {
+        let home = tmp_home("arm-guard-discharged");
+        let agent = "reply-ledger-arm-guard-2622";
+        let text = "please analyze this 13-day-old paper";
+        let gk = group_key(Some("user:op"), Some(text));
+
+        // Discharge the obligation FIRST (as the discharge primitive will).
+        crate::daemon::channel_reply_discharge::record_discharge(
+            &home,
+            agent,
+            gk.as_deref(),
+            "m-125",
+            agent,
+            Some("stale, operator no longer needs an answer"),
+        )
+        .unwrap();
+
+        // A redelivery drains it again → arm. It must NOT open an obligation.
+        arm(
+            &home,
+            agent,
+            ChannelKind::Telegram,
+            Some("m-125".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some(text),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent)
+                .pending_user_turn
+                .is_none(),
+            "a durably-discharged obligation must not re-arm on redelivery"
+        );
+
+        // Same text, DIFFERENT message id (operator resend) — same group_key,
+        // still discharged, still no obligation.
+        arm(
+            &home,
+            agent,
+            ChannelKind::Telegram,
+            Some("m-999".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some(text),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent)
+                .pending_user_turn
+                .is_none(),
+            "an operator resend (same group_key, new id) of a discharged obligation must not re-arm"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Control: an UNdischarged obligation still arms normally (the guard must
+    /// not suppress live obligations).
+    #[test]
+    fn arm_still_opens_an_undischarged_obligation_2622() {
+        let home = tmp_home("arm-guard-live");
+        let agent = "reply-ledger-arm-live-2622";
+        arm(
+            &home,
+            agent,
+            ChannelKind::Telegram,
+            Some("m-live".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some("a fresh question"),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent)
+                .pending_user_turn
+                .is_some(),
+            "a live (undischarged) obligation must still arm normally"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2622 reviewer4 r0 fix: a discharge recorded for one agent must not
+    /// suppress a DIFFERENT agent's independent obligation that shares the
+    /// same sender+text (`group_key`) but a different `message_id`. This is
+    /// the exact cross-agent silent-loss hole the global (non-agent-scoped)
+    /// discharge key created.
+    #[test]
+    fn arm_for_one_agent_does_not_suppress_same_text_for_another_agent_2622() {
+        let home = tmp_home("arm-guard-cross-agent");
+        let agent_a = "reply-ledger-arm-cross-agent-a-2622";
+        let agent_b = "reply-ledger-arm-cross-agent-b-2622";
+        let text = "please analyze this 13-day-old paper";
+        let gk = group_key(Some("user:op"), Some(text));
+
+        crate::daemon::channel_reply_discharge::record_discharge(
+            &home,
+            agent_a,
+            gk.as_deref(),
+            "m-a-1",
+            agent_a,
+            Some("handled out of band"),
+        )
+        .unwrap();
+
+        // Agent B's independent obligation (same sender+text, different id)
+        // must still arm — agent A's discharge is scoped to agent A only.
+        arm(
+            &home,
+            agent_b,
+            ChannelKind::Telegram,
+            Some("m-b-1".into()),
+            Some("chat1".into()),
+            None,
+            Some("user:op"),
+            Some(text),
+        );
+        assert!(
+            crate::daemon::heartbeat_pair::snapshot_for(agent_b)
+                .pending_user_turn
+                .is_some(),
+            "agent B's same-text obligation must not be suppressed by agent A's discharge"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // ── classify (pure) ─────────────────────────────────────────────────
