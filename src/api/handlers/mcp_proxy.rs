@@ -58,8 +58,8 @@ pub(crate) fn tool_timeout(tool: &str) -> Duration {
 /// `task_id` (a repeat is an illegal-transition no-op), and `create_instance`
 /// is keyed on the instance name (a repeat errors, no second spawn). `send` /
 /// `reply` / `decision`-post have NO natural key — they rely on this gate.
-fn is_side_effect_tool(tool: &str) -> bool {
-    crate::mcp::registry::side_effect_on_timeout(tool)
+fn is_side_effect_tool(tool: &str, action: Option<&str>) -> bool {
+    crate::mcp::registry::side_effect_on_timeout_for(tool, action)
 }
 
 /// Stable hash of `(tool, args)` for the timeout instrument. NOT used for any
@@ -77,8 +77,13 @@ fn content_key(tool: &str, args: &Value) -> u64 {
 /// Build the response for a tool that exceeded its timeout budget. Side-effect
 /// tools → `accepted_in_progress` (don't resend); read/idempotent tools → the
 /// retryable `timed out` error. Emits the `#r3-1-timeout-probe` instrument.
-fn timeout_response(tool: &str, timeout: Duration, content_key: u64) -> Value {
-    let side_effect = is_side_effect_tool(tool);
+fn timeout_response(
+    tool: &str,
+    action: Option<&str>,
+    timeout: Duration,
+    content_key: u64,
+) -> Value {
+    let side_effect = is_side_effect_tool(tool, action);
     // #r3-1 instrument ("doubt → add log"): this PR's effect (agent stops
     // retrying) is only observable after a daemon restart (self-dogfood
     // anti-pattern), so log every timeout with a stable content_key. If the
@@ -121,12 +126,16 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
     };
     let args = params["arguments"].clone();
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let instance = params["instance"].as_str().unwrap_or("").to_string();
     let role_kind = match role_kind_for_instance(ctx.home, &instance, "tool call") {
         Ok(role_kind) => role_kind,
         Err(resp) => return resp,
     };
-    if !crate::mcp::registry::tool_allowed_for_role(role_kind, tool) {
+    if !crate::mcp::registry::tool_allowed_for_role_action(role_kind, tool, action.as_deref()) {
         return json!({
             "ok": false,
             "error": format!(
@@ -144,6 +153,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         args,
         instance,
         timeout,
+        action,
         move |tool, args, instance| {
             crate::mcp::execute_tool_with_runtime(tool, args, instance, runtime)
         },
@@ -158,6 +168,7 @@ fn handle_mcp_tool_inner(
     args: Value,
     instance: String,
     timeout: Duration,
+    action: Option<String>,
     exec: impl FnOnce(&str, &Value, &str) -> Value + Send + 'static,
 ) -> Value {
     let key = content_key(tool, &args);
@@ -184,7 +195,9 @@ fn handle_mcp_tool_inner(
     match handle {
         Ok(_) => match rx.recv_timeout(timeout) {
             Ok(result) => json!({"ok": true, "result": result}),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => timeout_response(tool, timeout, key),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timeout_response(tool, action.as_deref(), timeout, key)
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 json!({"ok": false, "error": format!("tool '{tool}' thread panicked")})
             }
@@ -335,7 +348,10 @@ mod tests {
             "repo",
             "restart_daemon",
         ] {
-            assert!(is_side_effect_tool(t), "{t} must be treated as side-effect");
+            assert!(
+                is_side_effect_tool(t, None),
+                "{t} must be treated as side-effect"
+            );
         }
         // Read / idempotent tools → false (keep retryable error).
         for t in [
@@ -351,12 +367,40 @@ mod tests {
             "release_worktree",
             "ci",
         ] {
-            assert!(!is_side_effect_tool(t), "{t} must stay retry-safe");
+            assert!(!is_side_effect_tool(t, None), "{t} must stay retry-safe");
         }
         // NEW / unknown tools default to side-effect (conservative).
         assert!(
-            is_side_effect_tool("some_future_tool"),
+            is_side_effect_tool("some_future_tool", None),
             "unknown defaults to side-effect"
+        );
+
+        // #2550 P0: the folded `instance` tool is per-action (dormant until P1):
+        // structural actions stay side-effect (no double delete/restart on a
+        // timed-out call), read actions stay retry-safe (the real result is
+        // needed). Byte-equivalent to today's per-name tools.
+        for a in [
+            "delete",
+            "restart",
+            "start",
+            "move_pane",
+            "bind_topic",
+            "interrupt",
+        ] {
+            assert!(
+                is_side_effect_tool("instance", Some(a)),
+                "instance(action={a}) must be side-effect"
+            );
+        }
+        for a in ["list", "pane_snapshot", "set_waiting_on"] {
+            assert!(
+                !is_side_effect_tool("instance", Some(a)),
+                "instance(action={a}) must stay retry-safe"
+            );
+        }
+        assert!(
+            is_side_effect_tool("instance", None),
+            "instance with no action fail-closes to side-effect"
         );
     }
 
@@ -375,6 +419,7 @@ mod tests {
             json!({"instance": "x", "message": "hi"}),
             "caller".to_string(),
             Duration::from_millis(20),
+            None,
             slow,
         );
         assert_eq!(
@@ -401,6 +446,7 @@ mod tests {
             json!({}),
             "caller".to_string(),
             Duration::from_millis(20),
+            None,
             slow,
         );
         assert_eq!(
@@ -423,6 +469,7 @@ mod tests {
             json!({}),
             "caller".to_string(),
             Duration::from_secs(5),
+            None,
             fast,
         );
         assert_eq!(resp["ok"], true);
