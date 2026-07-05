@@ -31,7 +31,6 @@ const GRANDFATHERED: &[(&str, usize)] = &[
     ("src/daemon/dispatch_idle/mod.rs", 3962),
     ("src/app/mod.rs", 3457),
     ("src/daemon/pr_state/mod.rs", 3428),
-    ("src/api/handlers/messaging.rs", 3239),
     ("src/daemon/mod.rs", 3217),
     ("src/agent/mod.rs", 3216),
     ("src/vterm.rs", 3103),
