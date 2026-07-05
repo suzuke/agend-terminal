@@ -232,6 +232,118 @@ pub(crate) fn tool_allowed_for_role(role_kind: Option<crate::fleet::RoleKind>, t
             .any(|entry| entry.name == tool)
 }
 
+// ── #2550 P0: instance-family action policy (single source of truth) ──
+//
+// Once the `instance` tool folds the per-name instance lifecycle tools (P1+),
+// the three name-based classifiers below — operator_gate authority
+// (`api::operator_gate::classify`), retry side-effect
+// (`side_effect_on_timeout_for`), and role visibility/deny
+// (`tool_allowed_for_role_action`) — must agree on each action's policy or they
+// drift into a security hole (#2158: role that may `instance(action=list)` must
+// NOT thereby gain `instance(action=delete)`). This table is that shared source
+// of truth. Until the `instance` tool actually ships, it is DORMANT (no caller
+// passes `tool == "instance"`), and every value below is chosen to be
+// byte-equivalent to the CURRENT per-name tool's classifier (pinned by the unit
+// tests in this module). Excludes `create`/`restart_daemon` (operator decision:
+// stay standalone) and `set_metadata` (already action-bearing; folding deferred).
+
+/// operator_gate authority for a folded instance action, expressed in a
+/// registry-local enum so `mcp` need not depend on `api::operator_gate`
+/// (`operator_gate` maps this onto its own `OpClass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstanceAuthority {
+    AlwaysAllow,
+    DelegateScoped,
+    AbsolutelyNever,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InstanceActionPolicy {
+    pub authority: InstanceAuthority,
+    pub side_effect_on_timeout: bool,
+    pub timeout: ToolTimeoutClass,
+    /// Whether the read/report roles (reviewer/planner/explorer) may use this
+    /// action — mirrors the pre-fold per-name membership in `ROLE_TOOL_SUBSETS`.
+    pub read_role_allowed: bool,
+}
+
+/// Policy for a folded `instance` action; `None` for any action NOT folded into
+/// the `instance` tool (create / restart_daemon / set_metadata / unknown).
+pub(crate) fn instance_action_policy(action: &str) -> Option<InstanceActionPolicy> {
+    use InstanceAuthority::*;
+    use ToolTimeoutClass::*;
+    let p = |authority, side_effect_on_timeout, timeout, read_role_allowed| {
+        Some(InstanceActionPolicy {
+            authority,
+            side_effect_on_timeout,
+            timeout,
+            read_role_allowed,
+        })
+    };
+    // Values MUST mirror the current per-name tool (byte-equivalent); see the
+    // baseline table in the unit tests below.
+    match action {
+        "list" => p(AlwaysAllow, false, Fast, true), // list_instances
+        "pane_snapshot" => p(AlwaysAllow, false, Default, true), // pane_snapshot
+        "set_waiting_on" => p(AlwaysAllow, false, Fast, true), // set_waiting_on
+        "interrupt" => p(AlwaysAllow, true, Default, false), // interrupt
+        "bind_topic" => p(DelegateScoped, true, Default, false), // bind_topic (gate fallback)
+        "move_pane" => p(AbsolutelyNever, true, Default, false), // move_pane
+        "delete" => p(AbsolutelyNever, true, Default, false), // delete_instance
+        "start" => p(AbsolutelyNever, true, Default, false), // start_instance
+        "restart" => p(AbsolutelyNever, true, Default, false), // restart_instance
+        _ => None,
+    }
+}
+
+/// (name, action)-aware [`side_effect_on_timeout`]. For the folded `instance`
+/// tool, per-action; otherwise byte-identical to `side_effect_on_timeout(name)`.
+/// An `instance` call with an unknown/unfolded action stays conservative
+/// (side-effect = true), matching the pre-existing unknown-tool default.
+pub(crate) fn side_effect_on_timeout_for(name: &str, action: Option<&str>) -> bool {
+    if name == "instance" {
+        return action
+            .and_then(instance_action_policy)
+            .map(|p| p.side_effect_on_timeout)
+            .unwrap_or(true);
+    }
+    side_effect_on_timeout(name)
+}
+
+/// Whether `role_kind` narrows to a curated read/report subset (reviewer /
+/// planner / explorer) rather than the full-capability all-open surface.
+fn role_has_read_subset(role_kind: Option<crate::fleet::RoleKind>) -> bool {
+    use crate::fleet::RoleKind;
+    matches!(
+        role_kind,
+        Some(RoleKind::Reviewer) | Some(RoleKind::Planner) | Some(RoleKind::Explorer)
+    )
+}
+
+/// (name, action)-aware [`tool_allowed_for_role`] (the #2158 privilege-escalation
+/// guard). For the folded `instance` tool, a curated read/report role is allowed
+/// ONLY the `read_role_allowed` actions (e.g. `list`/`pane_snapshot`), never a
+/// structural action (`delete`/`restart`/…) — so folding `list` into the same
+/// tool as `delete` cannot silently widen a restricted role. Full-capability
+/// roles keep the full surface. For any non-`instance` tool this is
+/// byte-identical to `tool_allowed_for_role(role_kind, tool)`.
+pub(crate) fn tool_allowed_for_role_action(
+    role_kind: Option<crate::fleet::RoleKind>,
+    tool: &str,
+    action: Option<&str>,
+) -> bool {
+    if tool == "instance" {
+        if !role_has_read_subset(role_kind) {
+            return true; // full-capability role → all instance actions
+        }
+        return action
+            .and_then(instance_action_policy)
+            .map(|p| p.read_role_allowed)
+            .unwrap_or(false);
+    }
+    tool_allowed_for_role(role_kind, tool)
+}
+
 static ALL_TOOLS: [ToolEntry; 28] = [
     // ── Channel ──
     ToolEntry {
@@ -420,6 +532,107 @@ static ALL_TOOLS: [ToolEntry; 28] = [
 mod tests {
     use super::*;
     use crate::fleet::RoleKind;
+
+    /// #2550 P0 byte-equivalence: each folded `instance` action's policy equals
+    /// the CURRENT per-name tool's three classifiers (the instance tool is
+    /// dormant until P1). Baseline read from ALL_TOOLS + operator_gate +
+    /// ROLE_TOOL_SUBSETS — if a per-name tool's class changes, this must too.
+    #[test]
+    fn instance_action_policy_matches_per_name_baseline() {
+        use InstanceAuthority::*;
+        use ToolTimeoutClass::*;
+        // (action, authority, side_effect_on_timeout, timeout, read_role_allowed)
+        let cases: &[(&str, InstanceAuthority, bool, ToolTimeoutClass, bool)] = &[
+            ("list", AlwaysAllow, false, Fast, true),
+            ("pane_snapshot", AlwaysAllow, false, Default, true),
+            ("set_waiting_on", AlwaysAllow, false, Fast, true),
+            ("interrupt", AlwaysAllow, true, Default, false),
+            ("bind_topic", DelegateScoped, true, Default, false),
+            ("move_pane", AbsolutelyNever, true, Default, false),
+            ("delete", AbsolutelyNever, true, Default, false),
+            ("start", AbsolutelyNever, true, Default, false),
+            ("restart", AbsolutelyNever, true, Default, false),
+        ];
+        for (a, auth, se, to, rr) in cases {
+            let p = instance_action_policy(a).unwrap_or_else(|| panic!("no policy for {a}"));
+            assert_eq!(p.authority, *auth, "{a} authority");
+            assert_eq!(p.side_effect_on_timeout, *se, "{a} side_effect");
+            assert_eq!(p.timeout, *to, "{a} timeout");
+            assert_eq!(p.read_role_allowed, *rr, "{a} read_role");
+            assert_eq!(
+                side_effect_on_timeout_for("instance", Some(a)),
+                *se,
+                "{a} variant"
+            );
+        }
+        // create / restart_daemon (operator: standalone) + set_metadata (already
+        // action-bearing) + unknown are NOT folded → no policy.
+        for a in ["create", "restart_daemon", "set_metadata", "bogus"] {
+            assert!(
+                instance_action_policy(a).is_none(),
+                "{a} must not be folded"
+            );
+        }
+    }
+
+    /// The (name,action)-aware variants IGNORE action for every non-`instance`
+    /// tool → byte-identical to the name-only classifiers (zero behavior change
+    /// before the alias ships).
+    #[test]
+    fn non_instance_classifiers_ignore_action() {
+        for name in ["send", "delete_instance", "list_instances", "inbox", "task"] {
+            assert_eq!(
+                side_effect_on_timeout_for(name, Some("x")),
+                side_effect_on_timeout(name),
+                "{name} side_effect"
+            );
+            assert_eq!(
+                side_effect_on_timeout_for(name, None),
+                side_effect_on_timeout(name)
+            );
+        }
+    }
+
+    /// #2158 privilege-escalation guard: a curated read role may
+    /// `instance(list/pane_snapshot/set_waiting_on)` but NEVER a structural
+    /// action — folding `list` and `delete` into one tool must not widen the role.
+    #[test]
+    fn instance_role_guard_blocks_structural_for_read_roles() {
+        let rev = Some(RoleKind::Reviewer);
+        for a in ["list", "pane_snapshot", "set_waiting_on"] {
+            assert!(
+                tool_allowed_for_role_action(rev, "instance", Some(a)),
+                "reviewer must keep instance({a})"
+            );
+        }
+        for a in [
+            "delete",
+            "restart",
+            "start",
+            "move_pane",
+            "bind_topic",
+            "interrupt",
+        ] {
+            assert!(
+                !tool_allowed_for_role_action(rev, "instance", Some(a)),
+                "reviewer must NOT gain instance({a}) via the folded tool"
+            );
+        }
+        assert!(!tool_allowed_for_role_action(rev, "instance", None));
+        // Full-capability role (undeclared) keeps every instance action.
+        for a in ["delete", "list", "restart"] {
+            assert!(tool_allowed_for_role_action(None, "instance", Some(a)));
+        }
+        // Non-instance tools: byte-identical to the name-only guard.
+        assert_eq!(
+            tool_allowed_for_role_action(rev, "delete_instance", Some("x")),
+            tool_allowed_for_role(rev, "delete_instance")
+        );
+        assert_eq!(
+            tool_allowed_for_role_action(rev, "list_instances", None),
+            tool_allowed_for_role(rev, "list_instances")
+        );
+    }
 
     fn names(role: Option<RoleKind>) -> Vec<&'static str> {
         tool_subset_for_role(role).iter().map(|e| e.name).collect()
