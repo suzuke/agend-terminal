@@ -310,6 +310,22 @@ pub enum ChannelConfig {
     },
 }
 
+impl ChannelConfig {
+    /// Stable channel-type discriminant (`"telegram"` / `"discord"`), matching
+    /// the serde `type:` tag. Used as the synthetic map key when a singular
+    /// `channel:` is surfaced through the plural [`FleetConfig::configured_channels`]
+    /// view (#2642), and for per-channel log context.
+    // #2642 PR-1 lands the API; bootstrap/init consume it in PR-2. Until then it
+    // is exercised only by tests, so silence the bin-target dead_code lint.
+    #[allow(dead_code)]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ChannelConfig::Telegram { .. } => "telegram",
+            ChannelConfig::Discord { .. } => "discord",
+        }
+    }
+}
+
 /// Where fleet activity gets mirrored on a channel. Accepts two YAML
 /// forms for operator ergonomics:
 ///
@@ -714,6 +730,39 @@ impl FleetConfig {
                 }
             }
         }
+    }
+
+    /// #2642: canonical unified view of every configured channel, so
+    /// multi-channel consumers (bootstrap, per-channel `init_from_config`)
+    /// iterate one list instead of branching on singular-vs-plural.
+    ///
+    /// - `channels:` (plural) present and non-empty → all entries, sorted by
+    ///   key for deterministic order (this is what unlocks telegram+discord
+    ///   coexistence in PR-2).
+    /// - else singular `channel:` → a single `(type_name, cfg)` entry (the
+    ///   "singular is a 1-entry map" contract).
+    /// - else (no channel configured) → empty.
+    ///
+    /// Non-mutating: reads only the fields `normalize()` already populated, so
+    /// a single-channel fleet is byte-identical — every existing call site
+    /// still reads `self.channel` directly, and this view returns exactly that
+    /// one channel.
+    // #2642 PR-1 lands the API; bootstrap/init consume it in PR-2. Until then it
+    // is exercised only by tests, so silence the bin-target dead_code lint.
+    #[allow(dead_code)]
+    pub fn configured_channels(&self) -> Vec<(String, &ChannelConfig)> {
+        if let Some(map) = self.channels.as_ref() {
+            if !map.is_empty() {
+                let mut entries: Vec<(String, &ChannelConfig)> =
+                    map.iter().map(|(k, v)| (k.clone(), v)).collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                return entries;
+            }
+        }
+        if let Some(cfg) = self.channel.as_ref() {
+            return vec![(cfg.type_name().to_string(), cfg)];
+        }
+        Vec::new()
     }
 
     /// Resolve an instance config by merging with defaults + backend preset.
