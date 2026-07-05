@@ -678,6 +678,126 @@ instances: {}
     fs::remove_dir_all(&dir).ok();
 }
 
+// ── #2642 PR-2: telegram_channel()/discord_channel() typed resolvers ──
+// These replace the singular `config.channel` reads at init / creds / notify /
+// TUI-status. The hard-constraint pins: a single-channel telegram fleet
+// resolves EXACTLY as before; the coexistence pins prove telegram+discord
+// resolve independently regardless of sort order.
+
+#[test]
+fn telegram_channel_single_is_byte_identical_and_no_discord() {
+    // Production shape: single telegram. telegram_channel() resolves it; a
+    // discord consumer sees None (discord_init skips) — identical to today.
+    let dir = std::env::temp_dir().join(format!("agend-fleet-tc-single-{}", std::process::id()));
+    let path = write_fleet(
+        &dir,
+        r#"
+channel:
+  type: telegram
+  bot_token_env: PROD_TOKEN
+  group_id: -100
+instances: {}
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    match config.telegram_channel() {
+        Some(ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => {
+            assert_eq!(bot_token_env, "PROD_TOKEN");
+            assert_eq!(*group_id, -100);
+        }
+        other => panic!("telegram_channel() must resolve the single telegram, got {other:?}"),
+    }
+    assert!(
+        config.discord_channel().is_none(),
+        "no discord → discord_init skips"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn both_channels_resolve_independently_in_coexistence() {
+    // The coexistence unlock: a telegram+discord fleet resolves EACH channel to
+    // its own entry (this is what lets both init_from_config register).
+    let dir = std::env::temp_dir().join(format!("agend-fleet-tc-coexist-{}", std::process::id()));
+    let path = write_fleet(
+        &dir,
+        r#"
+channels:
+  tg:
+    type: telegram
+    bot_token_env: TG_TOKEN
+    group_id: -100
+  dc:
+    type: discord
+    bot_token_env: DC_TOKEN
+    guild_id: 999
+instances: {}
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    match config.telegram_channel() {
+        Some(ChannelConfig::Telegram { bot_token_env, .. }) => {
+            assert_eq!(bot_token_env, "TG_TOKEN")
+        }
+        other => panic!("expected telegram, got {other:?}"),
+    }
+    match config.discord_channel() {
+        Some(ChannelConfig::Discord {
+            bot_token_env,
+            guild_id,
+            ..
+        }) => {
+            assert_eq!(bot_token_env, "DC_TOKEN");
+            assert_eq!(*guild_id, 999);
+        }
+        other => panic!("expected discord, got {other:?}"),
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn telegram_resolves_even_when_discord_sorts_first() {
+    // The exact bug PR-2 fixes: normalize collapses `channel` to the FIRST entry
+    // by name ("a-discord" < "z-telegram"), so the singular `config.channel`
+    // would be Discord — the pre-#2642 telegram readers would then see "no
+    // telegram" and go silent. telegram_channel() resolves telegram regardless.
+    let dir = std::env::temp_dir().join(format!("agend-fleet-tc-order-{}", std::process::id()));
+    let path = write_fleet(
+        &dir,
+        r#"
+channels:
+  a-discord:
+    type: discord
+    bot_token_env: DC_TOKEN
+    guild_id: 42
+  z-telegram:
+    type: telegram
+    bot_token_env: TG_TOKEN
+    group_id: -7
+instances: {}
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    // Sanity: the collapsed singular primary IS the discord (first by name) —
+    // exactly the state that used to hide telegram from the singular readers.
+    assert!(
+        matches!(config.channel, Some(ChannelConfig::Discord { .. })),
+        "collapsed primary is the first-sorted (discord)"
+    );
+    // But the typed resolver still finds telegram.
+    match config.telegram_channel() {
+        Some(ChannelConfig::Telegram { bot_token_env, .. }) => {
+            assert_eq!(bot_token_env, "TG_TOKEN")
+        }
+        other => panic!("telegram must resolve despite discord sorting first, got {other:?}"),
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn test_channel_config_default_mode() {
     let dir = std::env::temp_dir().join(format!("agend-fleet-defmode-{}", std::process::id()));

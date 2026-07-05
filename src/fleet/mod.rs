@@ -159,9 +159,12 @@ pub struct FleetConfig {
     pub channel: Option<ChannelConfig>,
     /// Named channel configurations. Each key is a user-chosen name
     /// (e.g. `tg-main`, `discord-ops`) and the value follows the same
-    /// tagged `type: telegram` shape as the singular form. Multi-channel
-    /// routing is wired in a later PR; for now, this is a parser-level
-    /// extension that normalizes back into [`FleetConfig::channel`].
+    /// tagged `type: telegram` shape as the singular form. #2642: this is the
+    /// canonical multi-channel set — every declared channel is registered
+    /// (telegram+discord coexist) via [`FleetConfig::configured_channels`],
+    /// which each channel's `init_from_config` consumes. `normalize()` still
+    /// collapses the first entry (by name) into [`FleetConfig::channel`] as a
+    /// back-compat primary for the readers that use the singular field.
     #[serde(default)]
     pub channels: Option<HashMap<String, ChannelConfig>>,
     /// Template definitions for batch deployment.
@@ -315,9 +318,6 @@ impl ChannelConfig {
     /// the serde `type:` tag. Used as the synthetic map key when a singular
     /// `channel:` is surfaced through the plural [`FleetConfig::configured_channels`]
     /// view (#2642), and for per-channel log context.
-    // #2642 PR-1 lands the API; bootstrap/init consume it in PR-2. Until then it
-    // is exercised only by tests, so silence the bin-target dead_code lint.
-    #[allow(dead_code)]
     pub fn type_name(&self) -> &'static str {
         match self {
             ChannelConfig::Telegram { .. } => "telegram",
@@ -702,28 +702,21 @@ impl FleetConfig {
             }
         }
 
-        // Channel dual-accept: if the user wrote only `channels:` (plural
-        // map), collapse the first entry — sorted by name for determinism
-        // — into the legacy `channel:` field so existing call sites keep
-        // working unchanged. Multi-channel routing is wired in a later PR;
-        // until then, we pick one and log a warning when more than one is
-        // declared. When `channel:` is already set, plural is a no-op and
-        // runtime behavior is byte-identical to today.
+        // Back-compat primary channel. `channels:` (plural) is the canonical
+        // multi-channel set — surfaced via `configured_channels()` and consumed
+        // by each channel's `init_from_config` (#2642), so every declared channel
+        // now registers (telegram+discord coexist). For the readers that still
+        // use the singular `self.channel` (presence checks, doctor, persisted-id
+        // reload), collapse the first entry — sorted by name for determinism —
+        // into `channel` as the primary. Type-specific resolvers use
+        // `telegram_channel()` / `discord_channel()`, so they are unaffected by
+        // which entry lands here. When `channel:` is already set, plural is a
+        // no-op and single-channel behavior is byte-identical to today.
         if self.channel.is_none() {
             if let Some(map) = self.channels.as_ref() {
                 let mut names: Vec<&String> = map.keys().collect();
                 names.sort();
                 if let Some(first) = names.first().copied() {
-                    if names.len() > 1 {
-                        tracing::warn!(
-                            count = names.len(),
-                            picked = %first,
-                            "fleet.yaml declares {} channels but multi-channel routing \
-                             is not yet wired; using first entry by name. Follow-up PR \
-                             in T1 will merge inbound streams across all channels.",
-                            names.len(),
-                        );
-                    }
                     if let Some(cfg) = map.get(first) {
                         self.channel = Some(cfg.clone());
                     }
@@ -747,9 +740,6 @@ impl FleetConfig {
     /// a single-channel fleet is byte-identical — every existing call site
     /// still reads `self.channel` directly, and this view returns exactly that
     /// one channel.
-    // #2642 PR-1 lands the API; bootstrap/init consume it in PR-2. Until then it
-    // is exercised only by tests, so silence the bin-target dead_code lint.
-    #[allow(dead_code)]
     pub fn configured_channels(&self) -> Vec<(String, &ChannelConfig)> {
         if let Some(map) = self.channels.as_ref() {
             if !map.is_empty() {
@@ -763,6 +753,30 @@ impl FleetConfig {
             return vec![(cfg.type_name().to_string(), cfg)];
         }
         Vec::new()
+    }
+
+    /// #2642: the first configured Telegram channel, resolved from the unified
+    /// [`configured_channels`](Self::configured_channels) view rather than the
+    /// singular `self.channel` — so a telegram+discord fleet resolves Telegram
+    /// independently of which entry `normalize()` collapsed into `channel`
+    /// (sort order no longer decides which single channel "wins"). For a
+    /// single-channel telegram fleet this is exactly `self.channel`, byte-
+    /// identical to the pre-#2642 singular reads it replaces (init / creds /
+    /// notify / TUI status).
+    pub fn telegram_channel(&self) -> Option<&ChannelConfig> {
+        self.configured_channels()
+            .into_iter()
+            .map(|(_, c)| c)
+            .find(|c| matches!(c, ChannelConfig::Telegram { .. }))
+    }
+
+    /// #2642: the first configured Discord channel — Discord counterpart of
+    /// [`telegram_channel`](Self::telegram_channel).
+    pub fn discord_channel(&self) -> Option<&ChannelConfig> {
+        self.configured_channels()
+            .into_iter()
+            .map(|(_, c)| c)
+            .find(|c| matches!(c, ChannelConfig::Discord { .. }))
     }
 
     /// Resolve an instance config by merging with defaults + backend preset.

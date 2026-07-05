@@ -75,14 +75,19 @@ pub(crate) fn init_from_config_with_source(
         mpsc::Sender<ChannelEvent>,
     ),
 ) -> Option<DiscordChannel> {
-    let (bot_token_env, guild_id, user_allowlist) = match config.channel.as_ref()? {
-        crate::fleet::ChannelConfig::Telegram { .. } => return None,
-        crate::fleet::ChannelConfig::Discord {
-            bot_token_env,
-            guild_id,
-            user_allowlist,
-        } => (bot_token_env, *guild_id, user_allowlist.clone()),
+    // #2642: resolve the Discord channel from the unified multi-channel view
+    // (not the singular `config.channel`), so a telegram+discord fleet inits
+    // Discord even when Telegram is also present or sorts first.
+    let Some(crate::fleet::ChannelConfig::Discord {
+        bot_token_env,
+        guild_id,
+        user_allowlist,
+    }) = config.discord_channel()
+    else {
+        return None;
     };
+    let guild_id = *guild_id;
+    let user_allowlist = user_allowlist.clone();
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
         Err(_) => {
