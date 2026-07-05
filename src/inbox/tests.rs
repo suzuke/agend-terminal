@@ -862,6 +862,26 @@ fn drain_auto_acks_daemon_notifications() {
             "system:pr-state",
             "[review-verdict] owner/repo@branch: VERIFIED",
         ),
+        // #2412 follow-up (kind-taxonomy audit): the live bug sample — a
+        // dispatcher drains a "still active, just long" confirm, never
+        // explicitly acks it (there is nothing to act on), and the reclaim-TTL
+        // then reverted it to unread, re-nagging poll-reminder every cycle
+        // until a manual `inbox action=ack`. Both dispatch_idle subtypes are
+        // one-shot-by-design at the source (team_nudge's `nudge_sent_at` /
+        // dispatch_idle's `long_running_escalated` latch never re-fire the
+        // same notice), so seeing it once via drain is sufficient closure.
+        (
+            "dispatch_idle_long_running",
+            "system:dispatch_idle",
+            "[dispatch_idle_long_running] dispatch d-1 from 'lead' -> 'dev' - \
+             Long run EXPECTED -> no action; it resolves when the report arrives.",
+        ),
+        (
+            "dispatch_idle_nudge",
+            "system:dispatch-watchdog",
+            "[team-watchdog] FYI: 'lead' dispatch has been quiet 900s. No \
+             action needed if you're mid-task.",
+        ),
     ] {
         let home = tmp_home(&format!("drain-{kind}-auto-ack"));
         let id = format!("m-{kind}");
@@ -978,6 +998,92 @@ fn reclaim_settles_legacy_stale_pr_merged_delivering_row() {
         persisted.delivering_at.is_some(),
         "settle stamps read_at; delivering_at may remain as historical audit"
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2412 follow-up (kind-taxonomy audit): reclaim-level consistency for the
+/// kinds this task adds to `known_fire_and_forget_kind`. In normal operation
+/// these never actually reach a stale-`delivering` row — `auto_ack_on_drain_kind`
+/// already settles them on first drain (see `drain_auto_acks_daemon_notifications`),
+/// and `pr-ready-for-merge`/`pr-closed-unmerged`/`review-verdict` were already
+/// covered by `auto_ack_on_drain_kind` alone (#2506) even before this task —
+/// but a row written by an OLDER daemon build (pre-fix, still `delivering`) or
+/// any other path that leaves one of these kinds in `delivering` must still be
+/// settled by reclaim rather than looping forever. Belt-and-suspenders: proves
+/// `known_fire_and_forget_kind` (not just `auto_ack_on_drain_kind`) now also
+/// recognises the full pr-state FYI class plus the two new dispatch_idle kinds.
+#[test]
+fn reclaim_settles_stale_delivering_for_newly_audited_fire_and_forget_kinds() {
+    for kind in [
+        "dispatch_idle_long_running",
+        "dispatch_idle_nudge",
+        "pr-ready-for-merge",
+        "pr-closed-unmerged",
+        "review-verdict",
+    ] {
+        let home = tmp_home(&format!("reclaim-faf-{kind}"));
+        enqueue(
+            &home,
+            "a",
+            msg()
+                .sender("system:test")
+                .text_owned(format!("[{kind}] legacy stale delivering row"))
+                .kind(kind)
+                .id(&format!("m-{kind}-stale"))
+                .delivering_at(&secs_ago(660))
+                .build(),
+        )
+        .unwrap();
+
+        reclaim_stale_delivering(&home);
+
+        assert!(
+            drain(&home, "a").is_empty(),
+            "{kind}: stale delivering row must be settled, not re-delivered"
+        );
+        let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+        let persisted: InboxMessage =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(
+            persisted.read_at.is_some(),
+            "{kind}: reclaim must settle (stamp read_at), not revert to unread"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #2412 follow-up (kind-taxonomy audit) — control/regression guard: a kind
+/// this audit deliberately did NOT reclassify (genuinely actionable, per its
+/// own message text — "Handling is NOT automated... consider a handoff") must
+/// keep the pre-audit conservative behavior: a stale delivering row reverts to
+/// unread and is re-delivered, exactly like an unrecognised kind. Guards
+/// against over-broadening `known_fire_and_forget_kind` while auditing it.
+#[test]
+fn reclaim_still_redelivers_context_alert_conservatively() {
+    let home = tmp_home("reclaim-context-alert-conservative");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("system:context_alert")
+            .text("[context_alert] agent at 92% context — consider a handoff + restart")
+            .kind("context_alert")
+            .id("m-context-alert-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    let redelivered = drain(&home, "a");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "context_alert is a genuine action item and must still be re-delivered \
+         after reclaim, not silently settled"
+    );
+    assert_eq!(redelivered[0].id.as_deref(), Some("m-context-alert-stale"));
     fs::remove_dir_all(&home).ok();
 }
 
