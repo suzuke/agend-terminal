@@ -3181,3 +3181,115 @@ fn denylist_not_falsely_blocked_on_master_default_repo_2390() {
     );
     let _ = std::fs::remove_dir_all(wt.parent().unwrap());
 }
+
+/// #2662 reviewer4 repro fixture: BOTH `origin/main` and `origin/master` exist,
+/// actual default = master, `origin/HEAD` unset, and `origin/main` carries a
+/// trust-root file (`fleet.yaml`) absent from master. `feat/test` is based on
+/// origin/main. Returns the worktree.
+fn build_repo_ambiguous_dual_trunk_2390(tag: &str) -> std::path::PathBuf {
+    let id = format!(
+        "{}-{tag}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let base = std::env::temp_dir().join(format!("agend-2390-ambig-{id}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let origin_bare = base.join("origin.git");
+    let worktree = base.join("worktree");
+    assert!(git_run_2379(
+        &[
+            "init",
+            "--bare",
+            "-b",
+            "master",
+            origin_bare.to_str().unwrap()
+        ],
+        &base
+    )
+    .status
+    .success());
+    assert!(git_run_2379(
+        &[
+            "clone",
+            origin_bare.to_str().unwrap(),
+            worktree.to_str().unwrap()
+        ],
+        &base
+    )
+    .status
+    .success());
+    git_run_2379(&["config", "user.name", "test"], &worktree);
+    git_run_2379(&["config", "user.email", "test@test.local"], &worktree);
+    git_run_2379(&["config", "commit.gpgsign", "false"], &worktree);
+    std::fs::write(worktree.join("README.md"), "initial\n").unwrap();
+    assert!(git_run_2379(&["add", "README.md"], &worktree)
+        .status
+        .success());
+    assert!(git_run_2379(&["commit", "-m", "initial"], &worktree)
+        .status
+        .success());
+    assert!(git_run_2379(&["push", "origin", "master"], &worktree)
+        .status
+        .success());
+    // A NON-default `main` that carries a trust-root file absent from master.
+    assert!(git_run_2379(&["checkout", "-b", "main"], &worktree)
+        .status
+        .success());
+    std::fs::write(worktree.join("fleet.yaml"), "stolen\n").unwrap();
+    assert!(git_run_2379(&["add", "-f", "fleet.yaml"], &worktree)
+        .status
+        .success());
+    assert!(git_run_2379(
+        &["commit", "-m", "trust-root on non-default main"],
+        &worktree
+    )
+    .status
+    .success());
+    assert!(git_run_2379(&["push", "origin", "main"], &worktree)
+        .status
+        .success());
+    // Ambiguity: both origin/main + origin/master exist, origin/HEAD unset.
+    git_run_2379(&["remote", "set-head", "origin", "-d"], &worktree);
+    assert!(
+        git_run_2379(&["checkout", "-b", "feat/test", "origin/main"], &worktree)
+            .status
+            .success()
+    );
+    worktree
+}
+
+/// #2662: dual-trunk ambiguity (both origin/main + origin/master, origin/HEAD
+/// unset) is UNRESOLVABLE → `Err`, so the denylist stays fail-closed rather than
+/// blindly picking `main`. Joins `git-subprocess`.
+#[test]
+fn resolve_default_branch_base_ambiguous_dual_trunk_errs_2390() {
+    let wt = build_repo_ambiguous_dual_trunk_2390("resolve");
+    let got = git_refs::resolve_default_branch_base(wt.to_str().unwrap());
+    assert!(
+        got.as_ref().err().is_some_and(|e| e.contains("ambiguous")),
+        "both trunks + unset origin/HEAD must be Err(ambiguous), got: {got:?}"
+    );
+    let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+}
+
+/// #2662 reviewer4 fail-open repro (RED before the exactly-one fix, GREEN after):
+/// with a trust-root file present only on non-default `origin/main`, blindly
+/// picking `main` scanned `origin/main..HEAD` and MISSED it (returned None =
+/// allow). The ambiguous state must instead fail CLOSED. Joins `git-subprocess`.
+#[test]
+fn denylist_fails_closed_on_ambiguous_dual_trunk_2390() {
+    let wt = build_repo_ambiguous_dual_trunk_2390("denylist");
+    let violation = push_trust_root_denylist_violation(wt.to_str().unwrap());
+    assert!(
+        violation
+            .as_deref()
+            .is_some_and(|r| r.contains("fail-closed")),
+        "ambiguous dual-trunk must FAIL CLOSED (not silently pick main and miss a \
+             trust-root file only visible from the true default base), got: {violation:?}"
+    );
+    let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+}

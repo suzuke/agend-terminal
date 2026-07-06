@@ -16,11 +16,14 @@ use std::process::Command;
 ///    literal `"origin/HEAD"` (looks like success) instead of failing when the
 ///    ref is unset, which is the common case in managed worktrees that never ran
 ///    `git remote set-head`.
-/// 2. Existence-probe the conventional trunks `origin/main` then `origin/master`.
-///    This is why a normal clone (origin/HEAD unset but origin/main present)
-///    keeps working.
+/// 2. Existence-probe the conventional trunks — but only when EXACTLY ONE of
+///    `origin/main` / `origin/master` exists (a normal clone with origin/HEAD
+///    unset but one trunk present keeps working). BOTH present is ambiguous — we
+///    can't tell the default and must NOT guess `main` (that could scan the wrong
+///    base and miss a trust-root file), so it fails to path 3 (#2662).
 /// 3. Otherwise `Err` — the caller fails CLOSED (denylist) / no-ops (cleanup), so
-///    a truly-undeterminable base stays safe. Remedy: `git remote set-head origin -a`.
+///    an undeterminable OR ambiguous base stays safe. Remedy (resolves both):
+///    `git remote set-head origin -a`.
 ///
 /// Deliberately does NOT consult the branch's `@{upstream}`: post-push it points
 /// at the branch's OWN remote ref, so diffing against it would shrink the denylist
@@ -41,24 +44,26 @@ pub fn resolve_default_branch_base(worktree: &str) -> Result<String, String> {
             }
         }
     }
-    // 2. Conventional-trunk existence probe. `.output()` (not `.status()`) so the
-    //    rev-parse SHA never leaks onto the shim's stdout.
-    for cand in ["origin/main", "origin/master"] {
-        let exists = Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{cand}^{{commit}}"),
-            ])
-            .current_dir(worktree)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if exists {
-            return Ok(cand.to_string());
+    // 2. Conventional-trunk existence probe — use it ONLY when EXACTLY ONE of
+    //    origin/main / origin/master exists. If BOTH exist we cannot tell which is
+    //    the default (origin/HEAD would have said, but it's unset), so we FAIL
+    //    rather than guess: blindly picking the non-default trunk could scan
+    //    `<wrong-trunk>..HEAD` and OMIT a trust-root commit reachable only from the
+    //    true default — a fail-open false-negative in the denylist (#2662).
+    match (
+        trunk_exists(worktree, "origin/main"),
+        trunk_exists(worktree, "origin/master"),
+    ) {
+        (true, false) => return Ok("origin/main".to_string()),
+        (false, true) => return Ok("origin/master".to_string()),
+        (true, true) => {
+            return Err(
+                "ambiguous default branch: both origin/main and origin/master \
+                        exist and origin/HEAD is unset — cannot safely pick the trunk"
+                    .to_string(),
+            )
         }
+        (false, false) => {}
     }
     // 3. Undeterminable.
     Err(
@@ -66,4 +71,21 @@ pub fn resolve_default_branch_base(worktree: &str) -> Result<String, String> {
          origin/main nor origin/master exists"
             .to_string(),
     )
+}
+
+/// Does `<rev>` resolve to a commit in `worktree`? `.output()` (not `.status()`)
+/// so the `rev-parse` SHA never leaks onto the shim's stdout.
+fn trunk_exists(worktree: &str, rev: &str) -> bool {
+    Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
