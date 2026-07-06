@@ -15,26 +15,24 @@ use serde_json::{json, Value};
 /// here). Without this, a `repo release` on a canonical / bare / separate-git-dir
 /// repo deletes the ENTIRE repo (the 2026-07-06 canonical-deletion incident).
 fn is_linked_worktree(p: &std::path::Path) -> bool {
-    let Some(dir) = p.to_str() else {
-        return false;
-    };
-    let out = match std::process::Command::new("git")
-        .args([
-            "-C",
-            dir,
+    // Route through the sanctioned `git_helpers::git_cmd` (always-bypass, bounded)
+    // — a raw git subprocess here would trip the daemon-git invariant
+    // (tests/daemon_git_helper_invariant.rs). `git_cmd` runs from `p` as its cwd,
+    // so no `-C` is needed; `--path-format=absolute` makes git-dir/common-dir
+    // directly comparable.
+    let Ok(out) = crate::git_helpers::git_cmd(
+        p,
+        &[
             "rev-parse",
             "--path-format=absolute",
             "--git-dir",
             "--git-common-dir",
             "--is-bare-repository",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return false, // not a repo / git failed → unclassifiable → refuse
+        ],
+    ) else {
+        return false; // not a repo / git failed → unclassifiable → refuse (fail-safe)
     };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
     match lines.as_slice() {
         [git_dir, common_dir, is_bare] => git_dir != common_dir && *is_bare == "false",
         _ => false, // unexpected output shape → refuse
