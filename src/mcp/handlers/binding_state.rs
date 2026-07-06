@@ -116,6 +116,36 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         let worktree_valid = worktree_exists_on_disk
             && (wt_path.join(".git").exists() || wt_path.join(".agend-managed").exists());
 
+        // #t-…83936-4: `worktree_valid` above checks that the worktree's `.git`
+        // EXISTS, but a linked worktree's `.git` is a POINTER file
+        // (`gitdir: <canonical>/.git/worktrees/<name>`) — it survives even after
+        // the canonical it points to is deleted, so `.git`-exists is falsely
+        // "valid". `worktree_resolves` does the REAL liveness check (canonical
+        // present + is a git repo, AND the worktree's gitdir actually resolves).
+        // ADDITIVE (lead Q1): `worktree_valid` semantics are untouched so existing
+        // rebuild-decision consumers don't shift; callers that need strictness read
+        // `worktree_resolves` / `invalid_reason`. All paths are ABSOLUTE (from
+        // binding.json), so `metadata`/`git -C` resolve by path, never cwd — this
+        // is what lets it catch the case where the daemon's own cwd is the deleted
+        // canonical (the 40-min-silent incident). Same class as the dev3
+        // dangling-.git hazard (t-…83936-2), folded in here.
+        let source_repo = b["source_repo"].as_str().unwrap_or("");
+        let canonical_present = !source_repo.is_empty()
+            && std::fs::metadata(source_repo).is_ok()
+            && crate::git_helpers::git_ok(Path::new(source_repo), &["rev-parse", "--git-dir"]);
+        let gitdir_resolves = worktree_exists_on_disk
+            && crate::git_helpers::git_ok(wt_path, &["rev-parse", "--git-dir"]);
+        let worktree_resolves = canonical_present && gitdir_resolves;
+        let invalid_reason: Option<&str> = if !worktree_exists_on_disk {
+            Some("worktree_missing")
+        } else if !canonical_present {
+            Some("canonical_missing")
+        } else if !gitdir_resolves {
+            Some("gitdir_dangling")
+        } else {
+            None
+        };
+
         // Cross-branch holders: any other agent currently bound to
         // the same branch (should be 0 — `dispatch_auto_bind_lease`'s
         // P0-1.5 cross-agent uniqueness check enforces this — but
@@ -133,6 +163,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "issued_at": b["issued_at"].as_str().unwrap_or(""),
             "worktree_exists_on_disk": worktree_exists_on_disk,
             "worktree_valid": worktree_valid,
+            "worktree_resolves": worktree_resolves,
+            "invalid_reason": invalid_reason,
             "marker_present": marker_present,
             "ci_watches": ci_watches,
             "bind_in_flight": bind_in_flight,
@@ -204,6 +236,14 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
     out.sort();
     out
 }
+
+// #t-…83936-4 protection ① liveness tests (worktree_resolves / invalid_reason)
+// live in a sibling file loaded via `#[path]` so binding_state.rs stays under
+// the MCP-handler LOC ceiling (file_size_invariant skips "*test*"-named files) —
+// the Sprint 54/55 file_size_invariant pattern also used by channel.rs.
+#[cfg(test)]
+#[path = "binding_state_liveness_tests.rs"]
+mod liveness_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
