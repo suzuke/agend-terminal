@@ -579,6 +579,95 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #t-…61487 PRODUCTION-IDENTITY regression (complement of `reclaim_rearms_*`,
+    /// which only covers the legacy name-keyed inbox — no fleet.yaml means
+    /// `resolve_uuid` returns `None` and the file stem already IS the human name,
+    /// incidentally bypassing this bug). The production-default topology is
+    /// UUID-keyed (mirrors `reclaim_busy_gate_engages_on_uuid_keyed_production_topology`
+    /// in `inbox::tests`): `reclaim_stale_delivering`'s `agent_name` (the file stem)
+    /// is the UUID, but the poll-reminder ledger (`should_notify_and_record`/
+    /// `remove_agent`) is keyed by `handle.name` (the human name, per
+    /// `collect_poll_reminders`). Pre-fix, the re-arm call at the end of
+    /// `reclaim_stale_delivering` passed the raw UUID `agent_name` instead of the
+    /// already-resolved human name — a no-op against the name-keyed ledger, so a
+    /// restored-count-equals-last-notified obligation was silently swallowed
+    /// (the exact silent re-arm loss #t-…61487 exists to close, just on the
+    /// UUID-native path #2299's original fix never covered).
+    #[test]
+    fn reclaim_rearms_poll_reminder_for_uuid_keyed_production_topology() {
+        let home = tmp_home("reclaim-rearm-uuid");
+        let name = "uuid-rearm-agent";
+        let uuid = "dddddddd-eeee-4fff-8000-111111111111";
+        // fleet.yaml makes `name` id-native — its inbox lives at the UUID path,
+        // matching the production-default topology (mirrors
+        // `inbox::tests::write_fleet_with_id`, private to that submodule).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {name}:\n    id: {uuid}\n"),
+        )
+        .expect("write fleet.yaml");
+
+        let registry = mock_registry(name, AgentState::Idle);
+
+        // Prior state: the poll-reminder last notified this agent (keyed by the
+        // HUMAN NAME, matching collect_poll_reminders' `handle.name` key) at
+        // count 3.
+        reset_dedup(name);
+        assert!(
+            should_notify_and_record(name, 3),
+            "seed: record last-notified count = 3"
+        );
+
+        // 3 stale OBLIGATION (query) rows enqueued through the public API, which
+        // resolves through `inbox_path_resolved` to the UUID-keyed file — exactly
+        // like a real id-native instance (not the name-keyed `{name}.jsonl`
+        // `seed_stale_delivering` writes for the legacy-topology test above).
+        for i in 0..3 {
+            crate::inbox::enqueue(
+                &home,
+                name,
+                crate::inbox::InboxMessage {
+                    schema_version: 1,
+                    id: Some(format!("m-{name}-{i}")),
+                    from: "test".into(),
+                    text: format!("msg {i}"),
+                    kind: Some("query".to_string()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    delivering_at: Some(
+                        (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("enqueue stale delivering row");
+        }
+
+        // Reclaim reverts the stale delivering rows back to unread (count → 3).
+        crate::inbox::storage::reclaim_stale_delivering(&home);
+
+        // Restored count (3) EQUALS the last-notified count (3). Pre-fix, the
+        // re-arm no-op'd (UUID never matches the name-keyed ledger) so this was
+        // deduped to nothing; the fix resolves the UUID back to `name` before
+        // calling `remove_agent`, re-arming the reminder → re-page.
+        let v = collect_poll_reminders(&home, &registry);
+        assert_eq!(
+            v.len(),
+            1,
+            "reclaim on a UUID-keyed inbox must re-arm the poll-reminder for the \
+             resolved HUMAN NAME, not no-op against a UUID that never matches the \
+             name-keyed ledger"
+        );
+        assert_eq!(v[0].0, name);
+        assert!(
+            v[0].1.contains("unread=3"),
+            "reminder reflects the restored count, got: {}",
+            v[0].1
+        );
+
+        reset_dedup(name);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #t-…61487 THE NOISE FIX (complement of `reclaim_rearms_*`): a stale-`delivering`
     /// REPORT (a non-obligation — the fire-and-forget kind that re-paged every ~2h)
     /// reclaimed back to unread must NOT re-arm the poll-reminder, so the idle agent is

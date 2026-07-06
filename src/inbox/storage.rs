@@ -2046,8 +2046,17 @@ pub fn reclaim_stale_delivering(home: &Path) {
         // still holds for obligations. `reclaim_renudge_worthy` does task-board IO
         // (`obligation_reason`) → it runs HERE (unlocked), never under
         // `with_inbox_lock` (#1617 stall class).
+        //
+        // #t-…61487 (pre-existing #2299-class residual): the poll-reminder ledger
+        // (`should_notify_and_record`/`remove_agent`) is keyed by the HUMAN NAME
+        // (`collect_poll_reminders` uses `handle.name`), never the raw file stem.
+        // For a UUID-keyed inbox `agent_name` IS the UUID — passing it here no-ops
+        // against the name-keyed ledger and the re-arm silently fails to fire.
+        // Reuse `busy_check_name` (already resolved once per file, above) so this
+        // matches the same human name the ledger is keyed by; a legacy/unresolvable
+        // stem falls back to itself exactly as `busy_check_name` already does.
         if reverted.iter().any(|m| reclaim_renudge_worthy(home, m)) {
-            crate::daemon::poll_reminder::remove_agent(&agent_name);
+            crate::daemon::poll_reminder::remove_agent(&busy_check_name);
         }
     }
 }
