@@ -64,7 +64,6 @@ pub(crate) fn def_send() -> Value {
             "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
             "artifacts": {"type": "string"},
             "branch": {"type": "string"},
-            "sequencing": {"type": "string", "enum": ["parallel", "sequential", "sequential-merge-only"], "description": "Task execution order constraint"},
             "eta_minutes": {"type": "integer", "description": "Expected completion time in minutes"},
             "reporting_cadence": {"type": "string", "enum": ["per-pr", "wave-end", "both"], "description": "When implementer should report back"},
             "worktree_binding_required": {"type": "boolean", "description": "Whether target must bind to a worktree before starting"},
@@ -1095,11 +1094,6 @@ mod tests {
         // Intentionally-deferred passthrough: advertised by design, Phase-2
         // consuming mechanism deferred. MUST carry a roadmap ref.
         const DEFERRED: &[(&str, &str, &str)] = &[
-            (
-                "send",
-                "sequencing",
-                "#649 Phase-1 passthrough; Phase-2 task-ordering scheduler deferred",
-            ),
             (
                 "send",
                 "eta_minutes",

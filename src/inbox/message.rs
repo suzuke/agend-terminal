@@ -128,8 +128,6 @@ pub struct InboxMessage {
     pub broadcast_context: Option<BroadcastContext>,
     /// Dispatch schema fields (Issue #649, Phase 1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sequencing: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta_minutes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporting_cadence: Option<String>,

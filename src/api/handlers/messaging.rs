@@ -263,7 +263,6 @@ fn build_message(
         broadcast_context: params
             .get("broadcast_context")
             .and_then(|v| serde_json::from_value::<crate::inbox::BroadcastContext>(v.clone()).ok()),
-        sequencing: params["sequencing"].as_str().map(String::from),
         eta_minutes: params["eta_minutes"].as_u64().map(|v| v as u32),
         reporting_cadence: params["reporting_cadence"].as_str().map(String::from),
         worktree_binding_required: params["worktree_binding_required"].as_bool(),

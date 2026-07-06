@@ -121,7 +121,7 @@ pub(super) fn handle_send_to_instance(
             // Centralised fallback (Sprint 40 T-7 B4). #1024/#1833 fix: the
             // fallback now carries the SAME directive set as `params` (shared
             // SendEnvelope projection) — it previously dropped reviewed_head +
-            // sequencing/eta/cadence/worktree_binding, a latent verdict-correlation
+            // eta/cadence/worktree_binding, a latent verdict-correlation
             // gap when a verdict send hit the API-down path.
             let mut resolved_thread = thread_id.map(String::from);
             let resolved_parent = parent_id.map(String::from);
