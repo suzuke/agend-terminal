@@ -570,6 +570,17 @@ pub(crate) fn track_dispatch(
         ) {
             let _ = crate::tasks::link_branch_to_task(home, corr, branch);
         }
+        // #35896-11 ①: if the DISPATCHER (`from`) holds a ci-ready handoff for this
+        // work, delegating it (this kind=task dispatch) IS their discharge → resolve
+        // their OWN track. Matches the reused task id (our review-dispatch convention
+        // reuses the implementer's id — see `resolve_delegated`) or the dispatched
+        // branch. Stops the dispatcher-role re-nudge (the #35896-11 acceptance core).
+        let _ = crate::daemon::ci_handoff_track::resolve_delegated(
+            home,
+            from,
+            outbound_corr,
+            params["branch"].as_str(),
+        );
     } else if kind_str == "report" {
         // #1525: clear the dispatch-idle sidecar with the SAME key the record
         // path uses — `correlation_id.or(task_id)` (see the kind=task branch
