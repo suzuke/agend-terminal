@@ -562,6 +562,125 @@ fn discharge_for_one_agent_must_not_suppress_same_text_for_another_agent() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #35896-11 ② (PR-A DUAL): discharging a `ci-ready-for-action` handoff must
+/// ALSO resolve the discharging agent's ci_handoff_track (the renudge/escalation
+/// watchdog's sidecar) — so the ONE `inbox action=discharge` verb silences BOTH
+/// the poll_reminder AND the watchdog. TARGET-scoped: a co-subscriber's track on
+/// the SAME branch survives (only the caller's own obligation clears). Pre-② the
+/// verb never touched ci_handoff_track, so BOTH tracks survived every discharge.
+#[test]
+fn discharge_of_ci_ready_resolves_only_callers_handoff_track_35896_11() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-ci-ready-track");
+    let target = "discharge-ciready-target-35896";
+    let cosub = "discharge-ciready-cosub-35896";
+    let corr = "o/r@feat-x";
+
+    // The ci-ready handoff exactly as poller.rs builds it (kind + repo@branch
+    // correlation_id), sitting in the discharging TARGET's inbox.
+    crate::inbox::enqueue(
+        &home,
+        target,
+        crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-ciready-1".into()),
+            from: "system:ci-watch".into(),
+            text: format!("[ci-ready-for-action] {corr}: CI passed, your turn."),
+            kind: Some("ci-ready-for-action".into()),
+            correlation_id: Some(corr.into()),
+            timestamp: "2026-07-06T00:00:00Z".into(),
+            ..Default::default()
+        },
+    )
+    .expect("test setup: enqueue ci-ready must succeed");
+
+    // Two tracks on the SAME branch: the discharging target's + a co-subscriber's.
+    crate::daemon::ci_handoff_track::record(
+        &home,
+        target,
+        corr,
+        "2026-07-06T00:00:00Z",
+        None,
+        None,
+    );
+    crate::daemon::ci_handoff_track::record(&home, cosub, corr, "2026-07-06T00:00:00Z", None, None);
+    assert_eq!(
+        crate::daemon::ci_handoff_track::list(&home).len(),
+        2,
+        "precondition: two tracks recorded"
+    );
+
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({
+            "message_id": "m-ciready-1",
+            "reason": "delegated the review by hand"
+        }),
+        target,
+    );
+    assert_eq!(r["discharged"], true, "discharge must succeed: {r}");
+    assert_eq!(
+        r["handoff_resolved"], 1,
+        "the discharge must resolve exactly the caller's ci-handoff track: {r}"
+    );
+
+    // Target's track cleared; co-subscriber's same-branch track survives.
+    let left = crate::daemon::ci_handoff_track::list(&home);
+    assert_eq!(
+        left.len(),
+        1,
+        "only the co-subscriber's track must remain: {left:?}"
+    );
+    assert_eq!(
+        left[0].1.target, cosub,
+        "the surviving track must be the co-subscriber's (target-scoped resolve)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #35896-11 ② negative: discharging a NON-ci-ready message (an ordinary
+/// channel obligation) must never touch ci_handoff_track — the kind gate keeps
+/// the watchdog wire scoped to genuine handoffs.
+#[test]
+fn discharge_of_non_ci_ready_message_leaves_handoff_tracks_intact_35896_11() {
+    let _g = registry_guard();
+    let home = tmp_home("discharge-non-ci-ready-track");
+    let agent = "discharge-nonci-agent-35896";
+    enqueue_channel_msg(
+        &home,
+        agent,
+        "m-plain",
+        "user:op",
+        "a plain operator question",
+    );
+    // A live ci-handoff track for the same agent on some branch.
+    crate::daemon::ci_handoff_track::record(
+        &home,
+        agent,
+        "o/r@feat-y",
+        "2026-07-06T00:00:00Z",
+        None,
+        None,
+    );
+
+    let r = super::handle_discharge(
+        &home,
+        &serde_json::json!({"message_id": "m-plain", "reason": "answered out of band"}),
+        agent,
+    );
+    assert_eq!(r["discharged"], true, "discharge must succeed: {r}");
+    assert_eq!(
+        r["handoff_resolved"], 0,
+        "a non-ci-ready discharge must not resolve any handoff track: {r}"
+    );
+    assert_eq!(
+        crate::daemon::ci_handoff_track::list(&home).len(),
+        1,
+        "the unrelated ci-handoff track must survive a non-ci-ready discharge"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── #2622 PR-3: `reply` optional `message_id` — targeted-channel routing ──
 
 /// Like [`enqueue_channel_msg`] but lets the test pick the row's channel kind
