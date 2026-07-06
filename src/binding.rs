@@ -711,6 +711,12 @@ pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
     repos
 }
 
+// #t-…81457-1: the worktree-occupancy equivalent of `bound_source_repos`
+// lives in `worktree_cleanup` (its only consumer) as
+// `bound_worktree_paths_or_ambiguous` — it needs to distinguish "no
+// binding.json" from "unreadable/corrupt binding.json" for the delete-path
+// fail-closed requirement, unlike this module's existing scan helpers.
+
 /// Read the current binding for an agent.
 /// Hot path: returns from in-memory index (read lock). Cold path
 /// (first access per agent): acquires write lock, double-checks,
