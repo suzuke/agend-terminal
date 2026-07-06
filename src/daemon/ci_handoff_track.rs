@@ -335,7 +335,10 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
 /// co-subscriber's handoff for the same branch is left intact.
 ///
 /// Matches by `corr` against the track's `task_id` OR `correlation` (PRIMARY
-/// path), and opportunistically by the dispatched `branch` (`@branch` suffix).
+/// path), and opportunistically by the dispatched `branch` — but the branch
+/// fallback resolves ONLY when it uniquely identifies a single track (#2667 F2:
+/// a bare `@branch` suffix has no repo dimension, so 2+ matches across repos are
+/// ambiguous → resolve none by branch, never a cross-repo false-stop).
 ///
 /// **Convention dependency**: the primary path relies on the fleet's
 /// review-dispatch convention REUSING the implementer's original task id (never
@@ -352,20 +355,41 @@ pub(crate) fn resolve_delegated(
     branch: Option<&str>,
 ) -> usize {
     let branch_suffix = branch.filter(|b| !b.is_empty()).map(|b| format!("@{b}"));
-    let mut resolved = 0;
-    for (path, track) in list(home) {
-        if track.target != from {
-            continue;
-        }
-        let corr_hit =
-            corr.is_some_and(|c| track.task_id.as_deref() == Some(c) || track.correlation == c);
-        let branch_hit = branch_suffix
+    let corr_hit = |t: &CiHandoffTrack| {
+        corr.is_some_and(|c| t.task_id.as_deref() == Some(c) || t.correlation == c)
+    };
+    let branch_hit = |t: &CiHandoffTrack| {
+        branch_suffix
             .as_deref()
-            .is_some_and(|s| track.correlation.ends_with(s));
-        if (corr_hit || branch_hit)
+            .is_some_and(|s| t.correlation.ends_with(s))
+    };
+
+    // Target-scoped: only the dispatcher's OWN tracks are eligible (a
+    // co-subscriber's handoff for the same branch must survive).
+    let own: Vec<(PathBuf, CiHandoffTrack)> = list(home)
+        .into_iter()
+        .filter(|(_, t)| t.target == from)
+        .collect();
+
+    // #2667 F2 (reviewer5, isolation): the branch fallback compares only
+    // `ends_with("@{branch}")` — it has NO repo dimension, so a same-named branch
+    // in two repos both match. If the dispatcher holds such handoffs in 2+ repos, a
+    // single delegation would false-stop ALL of them = silent cross-repo obligation
+    // loss. Mirror #2662's exactly-one fail-safe: a branch match is a valid
+    // discharge signal ONLY when it uniquely identifies one track; 2+ branch matches
+    // = ambiguity → resolve NONE by branch (prefer a missed stop over a wrong one —
+    // the precise task_id/full-correlation path and the explicit `inbox
+    // action=discharge` gesture back-stop the residual). The corr path stays precise
+    // (a task id / full `owner/repo@branch` names exactly one work item).
+    let branch_unique = own.iter().filter(|(_, t)| branch_hit(t)).count() == 1;
+
+    let mut resolved = 0;
+    for (path, track) in &own {
+        let is_hit = corr_hit(track) || (branch_unique && branch_hit(track));
+        if is_hit
             && remove_if_unchanged(
                 home,
-                &path,
+                path,
                 &track.target,
                 &track.correlation,
                 &track.sent_at,
@@ -678,6 +702,125 @@ mod tests {
         assert_eq!(
             resolve_delegated(&home, "lead", Some("t-nope"), Some("fix/other")),
             0
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2667 F1 (reviewer4): the `resolve_delegated` CALL SITE must fire only for a
+    /// kind=TASK delegation — a kind=query carrying the same correlation is NOT a
+    /// delegation and must never discharge the dispatcher's ci-ready track
+    /// (obligation loss). Real-entry test: drives `track_dispatch` (the gate), not
+    /// the resolver directly — the direct-resolver tests above can't see the gate.
+    #[test]
+    fn track_dispatch_resolves_delegated_only_for_task_kind_not_query_2667() {
+        let home = tmp_home("track-dispatch-kind-gate");
+        let mk = |kind: &str| crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some(format!("m-{kind}")),
+            from: "lead".into(),
+            text: format!("[dispatch] {kind}"),
+            kind: Some(kind.into()),
+            correlation_id: Some("o/r@feat".into()),
+            timestamp: "2026-07-06T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let params = serde_json::json!({});
+        record(
+            &home,
+            "lead",
+            "o/r@feat",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-x"),
+        );
+
+        // kind=query with the SAME correlation → track MUST survive.
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &params,
+            "lead",
+            "reviewer",
+            &mk("query"),
+        );
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "a kind=query is not a delegation — the dispatcher's ci-ready track must survive"
+        );
+
+        // kind=task with the same correlation IS the delegation → resolves it.
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &params,
+            "lead",
+            "reviewer",
+            &mk("task"),
+        );
+        assert_eq!(
+            list(&home).len(),
+            0,
+            "a kind=task dispatch IS the delegation discharge — the dispatcher's own track resolves"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2667 F2 (reviewer5, isolation): the opportunistic branch fallback compares
+    /// only `ends_with(\"@{branch}\")` — NO repo dimension. A dispatcher holding a
+    /// same-named branch handoff in TWO repos would lose BOTH on one delegation
+    /// (silent cross-repo obligation loss). Mirror #2662's exactly-one fail-safe:
+    /// the branch signal resolves ONLY when it disambiguates to a single track;
+    /// 2+ branch matches = ambiguity → resolve none by branch (the precise task_id
+    /// path + explicit discharge back-stop the residual).
+    #[test]
+    fn resolve_delegated_branch_fallback_exactly_one_cross_repo_isolation_2667() {
+        let home = tmp_home("delegated-xrepo");
+        // Same branch name `shared` pending in two different repos.
+        record(
+            &home,
+            "lead",
+            "o/r1@shared",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-r1"),
+        );
+        record(
+            &home,
+            "lead",
+            "o/r2@shared",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-r2"),
+        );
+
+        // A delegation carrying only the AMBIGUOUS branch (corr matches neither):
+        // `@shared` matches both repos → ambiguous → resolve NOTHING (fail-safe).
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-unrelated"), Some("shared")),
+            0,
+            "ambiguous cross-repo branch match must resolve nothing (exactly-one fail-safe)"
+        );
+        assert_eq!(
+            list(&home).len(),
+            2,
+            "both same-branch tracks survive an ambiguous branch-only delegation"
+        );
+
+        // The PRECISE reused task_id names exactly one repo's work → resolves only
+        // that track, leaving the other repo's same-branch handoff intact.
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-r1"), Some("shared")),
+            1,
+            "the reused task_id disambiguates to exactly one repo's track"
+        );
+        let left = list(&home);
+        assert_eq!(
+            left.len(),
+            1,
+            "only r1's track resolved; r2's same-branch handoff survives"
+        );
+        assert_eq!(
+            left[0].1.correlation, "o/r2@shared",
+            "the surviving track must be the OTHER repo's (no cross-repo bleed)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
