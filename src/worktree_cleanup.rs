@@ -92,10 +92,30 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     let default = crate::git_helpers::default_branch(repo_root);
     // W1.2: git_ok = always-bypass + bounded, true iff exit-0 (the
     // `output().map(success).unwrap_or(false)` idiom, byte-for-byte).
-    crate::git_helpers::git_ok(
+    if !crate::git_helpers::git_ok(
         repo_root,
         &["merge-base", "--is-ancestor", branch, &default],
-    )
+    ) {
+        return false;
+    }
+    // #t-…81457-1: is-ancestor is trivially TRUE when `branch`'s tip IS
+    // `default`'s tip — indistinguishable, from git state alone, between a
+    // brand-new zero-commit branch (nothing ever merged — dev3's PRUNE_LIVE
+    // incident) and a genuinely fast-forward-merged branch (whose tip
+    // legitimately became identical to default's). There is no git-content
+    // signal that tells these apart. Reuse the SAME `SQUASH_GC_MIN_TIP_AGE`
+    // floor the squash path already relies on for the identical reason: only
+    // trust "merged" once the shared tip has sat for a while, giving a
+    // just-created branch's binding-registry entry (fix #1, the primary
+    // defense) time to be observed even if that check somehow lagged.
+    let Some((_, tip_ts)) = branch_tip_info(repo_root, branch) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Duration::from_secs(now.saturating_sub(tip_ts)) >= SQUASH_GC_MIN_TIP_AGE
 }
 
 /// Check if a branch's remote tracking ref has been deleted (i.e. the PR was
@@ -114,6 +134,25 @@ fn is_remote_gone(repo_root: &Path, branch: &str) -> bool {
         // No remote configured — not a remote-tracking branch, don't treat as "gone"
         return false;
     };
+    // #t-…81457-1: `refs/remotes/{remote}/{branch}`'s absence only means "the
+    // remote branch was deleted" when the branch was ever tracking THAT same
+    // remote branch to begin with. `bind_self`'s branch creation (`git branch
+    // <name> origin/main`) auto-sets `branch.<name>.merge = refs/heads/main`
+    // (tracks origin/main, not a same-named remote branch) — a branch that's
+    // simply never been pushed under its own name would otherwise be
+    // conflated with "was pushed, remote then deleted" and misclassified as
+    // gone. Self-reproduced live: this agent's own fresh worktree and
+    // gapfix-dev2's were both reaped this way within ~70s of bind, before
+    // either had pushed. Require the upstream `merge` ref to actually be
+    // `refs/heads/<branch>` first; on any ambiguity (missing/mismatched)
+    // prefer NOT concluding gone — a false negative just waits for the next
+    // sweep once the branch is genuinely pushed-then-orphaned, a false
+    // positive is an irrecoverable delete.
+    let merge_ref =
+        crate::git_helpers::git_cmd(repo_root, &["config", &format!("branch.{branch}.merge")]).ok();
+    if merge_ref.as_deref() != Some(format!("refs/heads/{branch}").as_str()) {
+        return false;
+    }
     // Check if the remote ref still exists
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
     // git-raw-allowed: error→EXISTS (`unwrap_or(true)`) is a deliberate safe
@@ -280,6 +319,13 @@ pub fn sweep_from_registry(
     let mut active_dirs: Vec<PathBuf> = configs.values().flatten().cloned().collect();
     // Add fleet.yaml dirs as fallback for stopped agents
     active_dirs.extend(fleet_dirs.iter().cloned());
+    // #t-…81457-1: `configs` (in-memory AgentConfig.working_dir) is a SEPARATE
+    // registry from binding.json, updated on its own schedule — a worktree the
+    // daemon itself just auto-bound (binding.json written) can be invisible to
+    // `configs` until it catches up. binding.json is read fresh every call and
+    // is authoritative for "is anyone bound here right now", so feed it into
+    // the same occupancy check directly instead of relying solely on `configs`.
+    active_dirs.extend(crate::binding::bound_worktree_paths(home));
 
     let mut removed = Vec::new();
 
@@ -602,6 +648,19 @@ mod tests {
             .expect("git");
     }
 
+    /// #t-…81457-1: build a branch with a single OLD dated commit (checked out
+    /// then back to main), so `is_branch_merged`'s age gate treats it as
+    /// genuinely merged rather than a suspiciously-fresh zero-commit branch.
+    /// Mirrors `make_squash_orphan`'s dating approach but for a plain
+    /// fast-forward-mergeable branch (no divergence from main).
+    fn make_old_dated_branch(repo: &Path, branch: &str, tip_date: &str) {
+        git_in(repo, &["checkout", "-b", branch]);
+        std::fs::write(repo.join("feat.txt"), "feature").ok();
+        git_in(repo, &["add", "."]);
+        git_commit_dated(repo, "feature work", tip_date);
+        git_in(repo, &["checkout", "main"]);
+    }
+
     /// #2605: fake daemon `home` for `bound_source_repos` — repo discovery now
     /// reads live `binding.json` state instead of the old configs-tuple field.
     fn tmp_home(tag: &str) -> PathBuf {
@@ -702,7 +761,11 @@ mod tests {
     fn test_sweep_dry_run_by_default_identifies_but_does_not_delete() {
         let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-dry-run");
-        git_in(&repo, &["branch", "feat/done"]);
+        // #t-…81457-1: `is_branch_merged` now age-gates on the shared tip's
+        // commit date (indistinguishable, from git state alone, between a
+        // zero-commit branch and a genuinely ff-merged one) — give feat/done
+        // an OLD dated commit so it clears the gate like a real merged branch.
+        make_old_dated_branch(&repo, "feat/done", "2024-01-01T00:00:00 +0000");
         let wt = repo.join("wt-done");
         git_in(
             &repo,
@@ -734,7 +797,9 @@ mod tests {
     fn test_v2_merged_worktree_removed() {
         let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-merged");
-        git_in(&repo, &["branch", "feat/done"]);
+        // #t-…81457-1: see the "v2-dry-run" test above for why this needs an
+        // old dated commit now.
+        make_old_dated_branch(&repo, "feat/done", "2024-01-01T00:00:00 +0000");
         let wt = repo.join("wt-done");
         git_in(
             &repo,
@@ -861,7 +926,13 @@ mod tests {
     /// both). `write_source_repo_binding` (above) only sets `source_repo`,
     /// which is enough for repo-discovery tests but not for exercising
     /// worktree-occupancy via the binding registry.
-    fn write_full_binding(home: &Path, agent: &str, branch: &str, source_repo: &Path, worktree: &Path) {
+    fn write_full_binding(
+        home: &Path,
+        agent: &str,
+        branch: &str,
+        source_repo: &Path,
+        worktree: &Path,
+    ) {
         let dir = crate::paths::runtime_dir(home).join(agent);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -910,7 +981,10 @@ mod tests {
              when `configs` hasn't caught up yet (the exact dev3 PRUNE_LIVE \
              incident): {removed:?}"
         );
-        assert!(wt.exists(), "the live-bound worktree directory must survive");
+        assert!(
+            wt.exists(),
+            "the live-bound worktree directory must survive"
+        );
 
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
@@ -951,7 +1025,12 @@ mod tests {
         let wt = repo.join("wt-fresh-no-commits");
         git_in(
             &repo,
-            &["worktree", "add", wt.to_str().unwrap(), "feat/fresh-no-commits"],
+            &[
+                "worktree",
+                "add",
+                wt.to_str().unwrap(),
+                "feat/fresh-no-commits",
+            ],
         );
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
@@ -1263,7 +1342,8 @@ mod tests {
         let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("b3-dry-run");
         // A genuinely merged (fast-forward) branch — unambiguously eligible.
-        git_in(&repo, &["branch", "feat/merged"]);
+        // #t-…81457-1: old dated commit so it clears is_branch_merged's age gate.
+        make_old_dated_branch(&repo, "feat/merged", "2024-01-01T00:00:00 +0000");
         git_in(&repo, &["merge", "feat/merged"]);
 
         let pruned = prune_orphaned_branches(&repo, true);
