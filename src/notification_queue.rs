@@ -368,8 +368,7 @@ pub fn enqueue_coalesced_auto(home: &Path, agent_name: &str, text: &str) -> anyh
         return append_queued(home, agent_name, &new_msg);
     };
     // Serialize vs the drainer; lock held → plain append (no coalesce, no loss).
-    let Ok(Some(_lock)) = crate::store::try_acquire_file_lock(&drain_lock_path(home, agent_name))
-    else {
+    let Ok(Some(_lock)) = acquire_drain_lock(&drain_lock_path(home, agent_name)) else {
         return append_queued(home, agent_name, &new_msg);
     };
     let path = queue_path(home, agent_name);
@@ -473,6 +472,98 @@ fn drain_lock_path(home: &Path, agent_name: &str) -> PathBuf {
     queue_path(home, agent_name).with_extension("drain.lock")
 }
 
+/// Acquire the per-agent drain lock. Production is a direct pass-through to
+/// [`crate::store::try_acquire_file_lock`] — byte-identical.
+///
+/// In `#[cfg(test)]` builds it (a) honors a path-keyed `force_contention` seam
+/// so a test can simulate a peer holding the lock with NO real thread or timing
+/// window, and (b) RETRIES PAST a transient `Err` (an `EMFILE` hiccup from the
+/// Coverage job's llvm-cov fd pressure — the lock is FREE, the `open()` just
+/// failed) so an UNCONTENDED acquire is deterministic. `Ok(None)` (a real peer
+/// holds the OS lock) is returned immediately, never retried, so contention
+/// semantics are unchanged. The retry is BOUNDED: after `ACQUIRE_RETRIES` the
+/// original `Err` is PROPAGATED (a genuine, non-transient open failure surfaces
+/// loudly as the caller's contended/`Unavailable` path — never an infinite
+/// hang). This is the root fix for the #2028/#2072/#2074/#2333/#2383 flake
+/// family, where `Err`-under-fd-pressure was misread as contention and broke
+/// strict-outcome assertions.
+fn acquire_drain_lock(lock_path: &Path) -> anyhow::Result<Option<crate::store::FileFlockGuard>> {
+    #[cfg(not(test))]
+    {
+        crate::store::try_acquire_file_lock(lock_path)
+    }
+    #[cfg(test)]
+    {
+        test_hooks::note_acquire_attempt(lock_path);
+        if test_hooks::force_contention(lock_path) {
+            return Ok(None);
+        }
+        let mut result = crate::store::try_acquire_file_lock(lock_path);
+        let mut retries = 0;
+        while result.is_err() && retries < test_hooks::ACQUIRE_RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            result = crate::store::try_acquire_file_lock(lock_path);
+            retries += 1;
+        }
+        result
+    }
+}
+
+/// Path-keyed test seams for the drain-lock acquire. Keyed by the lock PATH
+/// (every test uses a unique `home` → unique path) so arming/counting for one
+/// test never touches another running in parallel — no `serial` needed.
+#[cfg(test)]
+mod test_hooks {
+    use parking_lot::Mutex;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    /// Upper bound on retries past a transient `Err`; ~128ms at 2ms/step. Past
+    /// this the original `Err` propagates (loud real-failure, never a hang).
+    pub(super) const ACQUIRE_RETRIES: u32 = 64;
+
+    /// Lock paths whose acquire must deterministically read as held (`Ok(None)`).
+    static FORCED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+    /// Per-path count of acquire ATTEMPTS (one per `acquire_drain_lock` call,
+    /// NOT per internal Err-retry) so a test asserts structural properties like
+    /// "true-empty drained in exactly one attempt" without a wall-clock bound.
+    static ATTEMPTS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+    pub(super) fn note_acquire_attempt(p: &Path) {
+        *ATTEMPTS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .entry(p.to_path_buf())
+            .or_insert(0) += 1;
+    }
+    pub(super) fn acquire_attempts(p: &Path) -> u64 {
+        ATTEMPTS
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(p).copied())
+            .unwrap_or(0)
+    }
+    pub(super) fn reset_acquire_attempts(p: &Path) {
+        if let Some(m) = ATTEMPTS.lock().as_mut() {
+            m.remove(p);
+        }
+    }
+    pub(super) fn force_contention(p: &Path) -> bool {
+        FORCED.lock().as_ref().is_some_and(|s| s.contains(p))
+    }
+    pub(super) fn arm_contention(p: &Path) {
+        FORCED
+            .lock()
+            .get_or_insert_with(HashSet::new)
+            .insert(p.to_path_buf());
+    }
+    pub(super) fn clear_contention(p: &Path) {
+        if let Some(s) = FORCED.lock().as_mut() {
+            s.remove(p);
+        }
+    }
+}
+
 /// Claim-exclusive drain. The TUI flush loop and the daemon's per-tick
 /// `notification_flush` handler run in DIFFERENT processes and may drain the
 /// same agent concurrently, so the whole critical section is serialized by a
@@ -540,9 +631,7 @@ pub(crate) fn try_drain_with_stale_threshold(
     agent_name: &str,
     stale_ms: u128,
 ) -> DrainAttempt {
-    let Ok(Some(_drain_lock)) =
-        crate::store::try_acquire_file_lock(&drain_lock_path(home, agent_name))
-    else {
+    let Ok(Some(_drain_lock)) = acquire_drain_lock(&drain_lock_path(home, agent_name)) else {
         return DrainAttempt::Unavailable;
     };
     let mut out = Vec::new();
@@ -826,41 +915,28 @@ mod tests {
     #[test]
     fn drain_settled_retries_through_transient_lock_contention_2072() {
         // Deterministic reproduction of the #2072 coverage-flake MECHANISM:
-        // while a peer holds the drain lock, a one-shot `drain()` returns empty
+        // while the drain lock reads as held, a one-shot `drain()` returns empty
         // (#2028 `Unavailable→empty`), so a test that trusts it indexes an empty
         // vec → index panic (the live failure at `again[0]`). `drain_settled`
         // must RETRY across the contention window and recover the item once the
-        // lock frees — exactly what the production flusher does next tick.
-        use std::sync::mpsc;
+        // lock frees — exactly what the production flusher does next tick. The
+        // contention is injected via the path-keyed `force_contention` seam (no
+        // peer thread, no timing window), so it's immune to llvm-cov timing.
         let home = tmp_home("transient_lock_2072");
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).ok();
         enqueue(&home, "a", "delayed").expect("enqueue");
+        let lp = drain_lock_path(&home, "a");
 
-        let (held_tx, held_rx) = mpsc::channel::<()>();
-        let (go_tx, go_rx) = mpsc::channel::<()>();
-        let lock_path = drain_lock_path(&home, "a");
-        let peer = std::thread::spawn(move || {
-            let guard = crate::store::try_acquire_file_lock(&lock_path)
-                .expect("lock op")
-                .expect("peer acquires drain lock");
-            held_tx.send(()).expect("signal held");
-            // Hold until the test has observed the contention, then release
-            // inside `drain_settled`'s retry window.
-            go_rx.recv().expect("await go");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            drop(guard);
-        });
-
-        held_rx.recv().expect("peer holds the lock");
-        // A one-shot drain while the lock is held is empty — the exact trap.
+        test_hooks::arm_contention(&lp);
+        // A one-shot drain while the lock reads held is empty — the exact trap.
         assert!(
             drain(&home, "a").is_empty(),
             "one-shot drain under contention returns empty (#2028 Unavailable→empty)"
         );
-        go_tx.send(()).expect("let the peer schedule its release");
+        test_hooks::clear_contention(&lp);
+
         let got = drain_settled(&home, "a", 1);
-        peer.join().ok();
         assert_eq!(
             got.len(),
             1,
@@ -1376,21 +1452,29 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
-    /// drain_one outlasts a SHORT contention window (the healthy-peer shape:
-    /// a live flusher holds the lock for the duration of a rename+read). The
-    /// hold here (15ms) is well inside drain_one's retry budget (5×10ms), so
-    /// margins are wide, not timing-fragile.
+    /// drain_one outlasts a contention window (the healthy-peer shape: a live
+    /// flusher holds the lock for the duration of a rename+read). Deterministic:
+    /// the contention is injected via the path-keyed `force_contention` seam and
+    /// released only AFTER `drain_one` has provably hit the held lock at least
+    /// once (a structural wait on the acquire-attempt counter, not a wall-clock
+    /// sleep), so it genuinely RETRIES through the contention before succeeding —
+    /// with no timing bet for llvm-cov to stretch.
     #[test]
     fn drain_one_retries_through_short_contention_2028() {
         let home = tmp_home("drain-one-retry");
         enqueue(&home, "a", "the-item").expect("enqueue");
-        let guard = crate::store::try_acquire_file_lock(&drain_lock_path(&home, "a"))
-            .expect("lock open")
-            .expect("lock acquired");
+        let lp = drain_lock_path(&home, "a");
+        test_hooks::reset_acquire_attempts(&lp);
+        test_hooks::arm_contention(&lp);
         let h = home.clone();
         let worker = std::thread::spawn(move || drain_one(&h, "a"));
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        drop(guard);
+        // Wait until drain_one has attempted (and hit the held lock) at least
+        // once, then release — proves the retry path without a fixed sleep.
+        let lp_wait = lp.clone();
+        while test_hooks::acquire_attempts(&lp_wait) < 1 {
+            std::thread::yield_now();
+        }
+        test_hooks::clear_contention(&lp);
         let popped = worker.join().expect("join");
         assert_eq!(
             popped
@@ -1406,11 +1490,16 @@ mod tests {
     #[test]
     fn drain_one_true_empty_is_immediate_none_2028() {
         let home = tmp_home("drain-one-empty");
-        let start = std::time::Instant::now();
+        let lp = drain_lock_path(&home, "a");
+        test_hooks::reset_acquire_attempts(&lp);
         assert!(drain_one(&home, "a").is_none());
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(40),
-            "true empty must not burn the retry budget"
+        // Structural (not wall-clock) proof the retry budget wasn't burned: a
+        // truly-empty queue acquires the lock exactly ONCE and returns — the
+        // retry loop only engages on Unavailable, never on a real empty drain.
+        assert_eq!(
+            test_hooks::acquire_attempts(&lp),
+            1,
+            "true-empty must drain in exactly one attempt, not burn the retry budget"
         );
         std::fs::remove_dir_all(home).ok();
     }
