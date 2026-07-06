@@ -18,7 +18,9 @@
 //! 1/K (`AGEND_SHADOW_RECONCILE_SAMPLE`, default 60) and stamped `weight=K`, so
 //! the offline denominator (total decisive ticks) = Σ`weight` — an unbiased
 //! Horvitz–Thompson estimate. Output rotates into daily files
-//! `shadow-reconcile.<YYYY-MM-DD>.jsonl`; a total-size budget reaps oldest days.
+//! `shadow-reconcile.<YYYY-MM-DD>.jsonl`; each day file is a HARD byte cap
+//! (stop-write past the budget, drops counted so the offline join sees the gap —
+//! 寧 drop 別漲), and oldest days are reaped to bound the cross-day total.
 
 use super::evidence::{Authority, Confidence};
 use super::gate;
@@ -30,9 +32,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
-/// Total on-disk budget across all `shadow-reconcile.*.jsonl` day files; oldest
-/// days are reaped past it. ~1 MB/day at 13 agents (PR body) ⇒ ~50 days headroom.
-const BUDGET_BYTES: u64 = 50 * 1024 * 1024;
+/// Default byte budget, applied BOTH as the per-active-day file cap (stop-write
+/// past it — reviewer4 #2664 F2) AND as the cross-day total reaped by oldest-first
+/// GC. Env-overridable via `AGEND_SHADOW_RECONCILE_BUDGET_BYTES`. ~1 MB/day at 13
+/// agents (PR body).
+const DEFAULT_BUDGET_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Default agreement sample rate: 1 in K steady agreeing ticks is logged.
 const DEFAULT_SAMPLE_RATE: u64 = 60;
@@ -150,23 +154,75 @@ pub(crate) fn record(
     }
 }
 
+fn budget_bytes() -> u64 {
+    std::env::var("AGEND_SHADOW_RECONCILE_BUDGET_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_BUDGET_BYTES)
+}
+
+/// Per-active-day write accounting for the budget cap (reviewer4 #2664 F2). An
+/// in-memory byte counter gates every append cheaply; once the active day file
+/// would exceed the budget we STOP writing and count the drop (寧 drop 別漲),
+/// rather than delete the newest file or let it grow unbounded.
+#[derive(Default)]
+struct DayWrite {
+    date: String,
+    bytes: u64,
+    dropped: u64,
+    warned: bool,
+}
+
+static DAY: LazyLock<Mutex<DayWrite>> = LazyLock::new(|| Mutex::new(DayWrite::default()));
+
 fn append(home: &Path, ts: &str, line: &str) {
     // `ts` is rfc3339 (`YYYY-MM-DDT…`); its first 10 chars are the UTC date.
     let date = ts.get(..10).unwrap_or("0000-00-00");
     let path = home.join(format!("shadow-reconcile.{date}.jsonl"));
-    let new_day = !path.exists();
+    let need = line.len() as u64 + 1; // +1 for the trailing newline
+    let budget = budget_bytes();
+
+    let mut d = DAY.lock();
+    if d.date != date {
+        // Day rolled over: recalibrate the counter from any pre-existing file,
+        // reset the drop/warn flags, and reap oldest day files to bound the
+        // cross-day total (never the newest — that's what the per-append cap below
+        // guards instead).
+        d.date = date.to_string();
+        d.bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        d.dropped = 0;
+        d.warned = false;
+        enforce_budget(home, budget);
+    }
+    if d.bytes.saturating_add(need) > budget {
+        // The in-memory counter says we'd cross the cap — stat once to calibrate
+        // against the real file (跨越門檻才 stat 校準) before committing to a drop.
+        d.bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(d.bytes);
+        if d.bytes.saturating_add(need) > budget {
+            d.dropped += 1;
+            if !d.warned {
+                d.warned = true;
+                tracing::warn!(
+                    tag = "#shadow-observer",
+                    date = %date,
+                    budget_bytes = budget,
+                    "shadow-reconcile day file hit its byte budget — DROPPING further \
+                     records today (寧 drop 別漲); offline join: a gap follows the last \
+                     record for this day"
+                );
+            }
+            return;
+        }
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
         use std::io::Write;
-        let _ = writeln!(f, "{line}");
-    }
-    // Enforce the disk budget only when a new day file first appears — O(1) per
-    // day, not per write.
-    if new_day {
-        enforce_budget(home, BUDGET_BYTES);
+        if writeln!(f, "{line}").is_ok() {
+            d.bytes = d.bytes.saturating_add(need);
+        }
     }
 }
 
@@ -367,6 +423,42 @@ mod tests {
             home.join("shadow-reconcile.2026-01-03.jsonl").exists(),
             "newest kept"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2664 F2: the ACTIVE day file is a hard byte cap — once an append would push
+    /// it past the budget, further records are DROPPED (not written, not grown) and
+    /// counted so the offline join sees the gap. Drives `append` directly with a tiny
+    /// budget for determinism (each "aaaa" line = 5 bytes incl. newline; budget 10 ⇒
+    /// 2 fit, the rest drop).
+    #[test]
+    #[serial]
+    fn active_day_append_stops_at_budget_and_counts_drops() {
+        std::env::set_var("AGEND_SHADOW_RECONCILE_BUDGET_BYTES", "10");
+        *DAY.lock() = DayWrite::default(); // isolate from any prior test's day state
+        let home = tmp_home("budget-cap");
+        let ts = "2026-09-09T12:00:00+00:00";
+        for _ in 0..5 {
+            append(&home, ts, "aaaa");
+        }
+        let path = home.join("shadow-reconcile.2026-09-09.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            content.lines().count(),
+            2,
+            "only 2 lines fit under the 10-byte budget: {content:?}"
+        );
+        assert!(
+            std::fs::metadata(&path).unwrap().len() <= 10,
+            "active day file must never exceed the budget"
+        );
+        assert_eq!(
+            DAY.lock().dropped,
+            3,
+            "3 of 5 records dropped after the cap"
+        );
+        std::env::remove_var("AGEND_SHADOW_RECONCILE_BUDGET_BYTES");
+        *DAY.lock() = DayWrite::default();
         std::fs::remove_dir_all(&home).ok();
     }
 }

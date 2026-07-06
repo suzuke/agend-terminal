@@ -26,6 +26,11 @@ use crate::state::AgentState;
 use crate::sync_audit::CoreMutex;
 use std::sync::Arc;
 
+/// One agent's per-tick snapshot: `(name, core, child_alive, backend_command)`.
+/// `backend_command` is `Some` ONLY when the reconcile campaign is on (#2664 F1) —
+/// off-campaign it stays `None`, so no per-agent `String` clone happens.
+type TickAgentSnapshot = (String, Arc<CoreMutex<AgentCore>>, bool, Option<String>);
+
 /// Per-tick reduce driver. Stateless: the per-agent accumulators live in the shadow
 /// module's runtime registry (keyed by name, pruned on despawn), so nothing here needs
 /// interior mutability.
@@ -52,7 +57,13 @@ impl PerTickHandler for ShadowObserveHandler {
         // it before touching any per-agent core lock (never hold the registry lock
         // across another lock — mirrors `api_activity_probe::probe_once`). child_alive
         // is read here (its own `child.lock()`) so the reduce loop needs only core.lock.
-        let mut agents: Vec<(String, Arc<CoreMutex<AgentCore>>, bool, String)> = {
+        // #2413 (a): campaign-gated (default-off) reconcile telemetry. Read the flag
+        // ONCE, up front — so when it's off the snapshot below allocates NOTHING extra:
+        // the per-agent `backend_command` clone lives STRUCTURALLY inside
+        // `reconcile.then(...)`, so it can never run off-campaign (reviewer4 #2664 F1 —
+        // a type/branch guarantee, not an ordering convention).
+        let reconcile = crate::daemon::shadow::reconcile_log::enabled();
+        let mut agents: Vec<TickAgentSnapshot> = {
             let reg = crate::agent::lock_registry(ctx.registry);
             reg.values()
                 .map(|h| {
@@ -61,7 +72,7 @@ impl PerTickHandler for ShadowObserveHandler {
                         h.name.to_string(),
                         Arc::clone(&h.core),
                         child_alive,
-                        h.backend_command.clone(),
+                        reconcile.then(|| h.backend_command.clone()),
                     )
                 })
                 .collect()
@@ -77,14 +88,11 @@ impl PerTickHandler for ShadowObserveHandler {
         agents.extend(
             crate::ephemeral_tracking::live_children_snapshot()
                 .into_iter()
-                .map(|w| (w.worker_id, w.core, w.child_alive, String::new())),
+                .map(|w| (w.worker_id, w.core, w.child_alive, None)),
         );
         if agents.is_empty() {
             return;
         }
-        // #2413 (a): campaign-gated (default-off) reconcile telemetry. Checked once
-        // per tick so a disabled campaign costs one env read, not one per agent.
-        let reconcile = crate::daemon::shadow::reconcile_log::enabled();
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         for (name, core, child_alive, backend_command) in &agents {
             // Read the screen + liveness inputs under one core.lock(), drop it, run the
@@ -107,7 +115,7 @@ impl PerTickHandler for ShadowObserveHandler {
                 crate::daemon::shadow::reconcile_log::record(
                     ctx.home,
                     name,
-                    backend_command,
+                    backend_command.as_deref().unwrap_or(""),
                     raw_state,
                     screen,
                     &status,
@@ -292,6 +300,47 @@ mod tests {
             "flag-OFF ⇒ no reduce ⇒ observed_status stays None"
         );
         shadow::forget_agent(&name);
+    }
+
+    /// #2664 F1: exercise the FULL `ShadowObserveHandler::run` with the shadow
+    /// observer ON but the reconcile campaign flag OFF (default). The prior
+    /// `disabled_writes_nothing` test only drove `record()` directly, so it couldn't
+    /// cover the per-tick hot path; this asserts the whole run writes NO reconcile
+    /// file when off — paired with the structural `Option` guarantee (the per-agent
+    /// `backend_command` clone lives inside `reconcile.then(...)`, so it cannot run
+    /// off-campaign). Reconcile-off short-circuits before any file/budget work, so
+    /// this is independent of the day/budget statics.
+    #[test]
+    #[serial(shadow_observer)]
+    fn run_path_reconcile_off_writes_no_reconcile_file() {
+        let home =
+            std::env::temp_dir().join(format!("agend-recon-runpath-off-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs = Arc::new(PLMutex::new(HashMap::new()));
+        let (registry, _core, name, _reader) = one_agent_registry("shadow-recon-off");
+        let token = shadow::new_session_token().unwrap();
+        shadow::register(&token, &name);
+        shadow::push(&name, Evidence::hook(EvidenceKind::TurnStarted, 1_000));
+
+        std::env::remove_var("AGEND_SHADOW_RECONCILE_LOG"); // default OFF
+        with_flag(true, || {
+            // shadow observer ON ⇒ run() executes the full snapshot + per-agent loop
+            let ctx = ctx_for(&home, &registry, &externals, &configs);
+            ShadowObserveHandler::new().run(&ctx);
+        });
+
+        let wrote_reconcile = std::fs::read_dir(&home).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("shadow-reconcile.")
+        });
+        assert!(
+            !wrote_reconcile,
+            "reconcile OFF ⇒ the full run() path must write no shadow-reconcile file"
+        );
+        shadow::forget_agent(&name);
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// Representative confirm-first: flag-ON, a buffered `TurnStarted` (episode open) +
