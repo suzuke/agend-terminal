@@ -711,6 +711,31 @@ pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
     repos
 }
 
+/// #t-…81457-1: the distinct `worktree` paths of every LIVE bound branch (each
+/// `runtime/<agent>/binding.json`'s `worktree`), read fresh from disk every
+/// call — mirrors `bound_source_repos`'s self-healing shape.
+///
+/// worktree-reclaim's occupancy check (`worktree_cleanup::is_in_use`) only
+/// consulted the daemon's in-memory `AgentConfig.working_dir` registry, a
+/// SEPARATE, independently-updated signal from `binding.json` — a worktree the
+/// daemon itself auto-bound moments ago (binding.json written) can be invisible
+/// to that check until the in-memory registry catches up, so the sweep reaps a
+/// worktree the daemon knows is live. Feeding these paths into the same
+/// occupancy check closes that gap: binding.json is authoritative and always
+/// current, no registry-sync race possible.
+pub fn bound_worktree_paths(home: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for (_, v) in binding_scan_all(home) {
+        if let Some(wt) = v["worktree"].as_str() {
+            let path = std::path::PathBuf::from(wt);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 /// Read the current binding for an agent.
 /// Hot path: returns from in-memory index (read lock). Cold path
 /// (first access per agent): acquires write lock, double-checks,

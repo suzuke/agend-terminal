@@ -851,6 +851,189 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── #t-…81457-1 (PRUNE_LIVE first-day false positives): three independent
+    // occupancy/eligibility gaps found live on 2026-07-06 within the first
+    // sweep tick after PRUNE_LIVE went on. Each RED test below reproduces one
+    // class against the pre-fix code. ──
+
+    /// Seed `home/runtime/<agent>/binding.json` with BOTH `source_repo` and
+    /// `worktree` — the real production shape (`binding::bind`'s writer sets
+    /// both). `write_source_repo_binding` (above) only sets `source_repo`,
+    /// which is enough for repo-discovery tests but not for exercising
+    /// worktree-occupancy via the binding registry.
+    fn write_full_binding(home: &Path, agent: &str, branch: &str, source_repo: &Path, worktree: &Path) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::to_string(&serde_json::json!({
+                "branch": branch,
+                "source_repo": source_repo.display().to_string(),
+                "worktree": worktree.display().to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// #t-…81457-1 primary fix: a worktree with a LIVE `binding.json` entry
+    /// must never be swept, even when the daemon's in-memory `configs`
+    /// (AgentConfig.working_dir) registry hasn't caught up yet — the exact
+    /// dev3 PRUNE_LIVE incident (auto-bind at 11:04, sweep at 11:08, `configs`
+    /// still empty for that agent). Pre-fix, `is_in_use` only ever consulted
+    /// `configs`/`fleet_dirs`, never `binding.json`, so this worktree — merged
+    /// AND clean, exactly like dev3's — was eligible and got removed.
+    #[test]
+    fn sweep_skips_worktree_known_only_via_binding_json_not_yet_in_configs_registry() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("binding-only-occupancy");
+        git_in(&repo, &["branch", "feat/fresh-bind"]);
+        let wt = repo.join("wt-fresh-bind");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/fresh-bind"],
+        );
+        git_in(&repo, &["merge", "feat/fresh-bind"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("binding-only-occupancy");
+        // `configs` deliberately EMPTY — the in-memory registry hasn't caught
+        // up to the fresh bind yet. binding.json is the only live signal.
+        let configs: HashMap<String, Option<PathBuf>> = HashMap::new();
+        write_full_binding(&home, "dev3", "feat/fresh-bind", &repo, &wt);
+
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        assert!(
+            removed.is_empty(),
+            "a worktree with a LIVE binding.json entry must never be swept, even \
+             when `configs` hasn't caught up yet (the exact dev3 PRUNE_LIVE \
+             incident): {removed:?}"
+        );
+        assert!(wt.exists(), "the live-bound worktree directory must survive");
+
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…81457-1 depth fix #1: `is_branch_merged`'s is-ancestor check is
+    /// trivially true for a branch whose tip is IDENTICAL to the default
+    /// branch (zero commits ever made) — nothing has actually been merged,
+    /// there's nothing to merge. This is a unit-level pin on the exact
+    /// function so the fix can't regress even if the occupancy fix (above)
+    /// changes shape later — "單靠 ① 未來 binding 生命週期一變又漏" (lead).
+    #[test]
+    fn is_branch_merged_rejects_zero_commit_branch_tip_equals_default() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("zero-commit-merged-unit");
+        git_in(&repo, &["branch", "feat/never-touched"]);
+
+        assert!(
+            !is_branch_merged(&repo, "feat/never-touched"),
+            "a branch whose tip is IDENTICAL to main (zero commits, nothing ever \
+             diverged) must not be classified as merged — there is nothing to merge"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #t-…81457-1 depth fix #1, integration level: the same zero-commit
+    /// scenario through the full sweep, with NO occupancy signal at all (no
+    /// binding, no configs) — isolates this fix from the binding-registry fix
+    /// above. This is dev3's actual incident mechanics minus the binding gap.
+    #[test]
+    fn sweep_does_not_treat_zero_commit_worktree_as_merged() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("zero-commit-sweep");
+        git_in(&repo, &["branch", "feat/fresh-no-commits"]);
+        let wt = repo.join("wt-fresh-no-commits");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/fresh-no-commits"],
+        );
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("zero-commit-sweep");
+        let configs: HashMap<String, Option<PathBuf>> = HashMap::new();
+        write_source_repo_binding(&home, "other-agent", &repo); // repo discovery only
+
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        assert!(
+            removed.is_empty(),
+            "a zero-commit branch (tip==main, nothing diverged) must not be \
+             classified merged just because is-ancestor is trivially true: {removed:?}"
+        );
+        assert!(wt.exists());
+
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…81457-1 depth fix #2, LIVE self-reproduced incident: production
+    /// branch creation (`bind_self`'s `ensure_branch_fetch` → `git branch
+    /// <name> origin/main`) auto-sets upstream tracking to `origin/main`
+    /// (`branch.<name>.merge = refs/heads/main`), NOT to a same-named remote
+    /// branch — because the branch has never been pushed under its own name.
+    /// `is_remote_gone`'s `refs/remotes/{remote}/{branch}` existence check
+    /// assumes the upstream mirrors the LOCAL branch's own name; it never does
+    /// for a from-origin/main tracked branch, so a legitimately-never-pushed
+    /// branch is misclassified as "remote gone". Self-reproduced live: this
+    /// agent's own fresh worktree AND gapfix-dev2's were both
+    /// `worktree_auto_removed reason=remote-gone` within ~70s of bind, before
+    /// either had pushed (event-log confirmed, same tick).
+    #[test]
+    fn is_remote_gone_does_not_misfire_for_never_pushed_branch_tracking_main() {
+        let _lock = ENV_LOCK.lock();
+        let remote_dir = std::env::temp_dir().join(format!(
+            "agend-wt-v2-neverpushed-remote-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&remote_dir).ok();
+        git_in(&remote_dir, &["init", "--bare", "-b", "main"]);
+
+        let repo = std::env::temp_dir().join(format!(
+            "agend-wt-v2-neverpushed-clone-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&repo);
+        Command::new("git")
+            .args([
+                "clone",
+                remote_dir.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ])
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("clone");
+        std::fs::write(repo.join("README.md"), "init").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "init"]);
+        git_in(&repo, &["push", "-u", "origin", "main"]);
+
+        // Production shape: `git branch <name> origin/main`, NEVER pushed
+        // under its own name.
+        git_in(&repo, &["branch", "fix/never-pushed", "origin/main"]);
+
+        assert!(
+            !is_remote_gone(&repo, "fix/never-pushed"),
+            "a branch that tracks origin/main (never pushed under its own name) \
+             must NOT be classified remote-gone — refs/remotes/origin/<name> was \
+             never supposed to exist for it in the first place"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&remote_dir).ok();
+    }
+
     #[test]
     fn test_v2_remote_gone_worktree_removed() {
         // Simulate squash-merge: branch is NOT merged (different hash) but
