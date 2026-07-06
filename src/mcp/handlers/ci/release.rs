@@ -1,5 +1,44 @@
 use serde_json::{json, Value};
 
+/// #t-…83936-6 P0 (data-loss incident): is `p` a TRUE linked git worktree — the
+/// ONLY shape `handle_release_repo`'s `remove_dir_all` fallback may delete?
+///
+/// GIT is the source of truth, NOT a filesystem heuristic. A `.git`-is-a-file
+/// test can't tell a linked worktree from a `--separate-git-dir` MAIN tree —
+/// both have a gitlink file (reviewer4); a `.git`-is-a-dir blacklist missed BARE
+/// repos (reviewer5). A linked worktree is the UNIQUE shape whose per-worktree
+/// git-dir (`.../worktrees/<name>`) differs from the shared common-dir (the main
+/// `.git`) AND that is non-bare. For main / bare / separate-git-dir-main, git-dir
+/// == common-dir. Any git failure or unexpected output ⇒ `false` (FAIL-SAFE:
+/// prefer a false reject over deleting a repo; a stale/orphan worktree whose
+/// admin entry was pruned is left for other cleanup, never `remove_dir_all`'d
+/// here). Without this, a `repo release` on a canonical / bare / separate-git-dir
+/// repo deletes the ENTIRE repo (the 2026-07-06 canonical-deletion incident).
+fn is_linked_worktree(p: &std::path::Path) -> bool {
+    // Route through the sanctioned `git_helpers::git_cmd` (always-bypass, bounded)
+    // — a raw git subprocess here would trip the daemon-git invariant
+    // (tests/daemon_git_helper_invariant.rs). `git_cmd` runs from `p` as its cwd,
+    // so no `-C` is needed; `--path-format=absolute` makes git-dir/common-dir
+    // directly comparable.
+    let Ok(out) = crate::git_helpers::git_cmd(
+        p,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+            "--is-bare-repository",
+        ],
+    ) else {
+        return false; // not a repo / git failed → unclassifiable → refuse (fail-safe)
+    };
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    match lines.as_slice() {
+        [git_dir, common_dir, is_bare] => git_dir != common_dir && *is_bare == "false",
+        _ => false, // unexpected output shape → refuse
+    }
+}
+
 /// Reject paths that would be dangerous to `remove_dir_all`.
 /// Validate and canonicalize a release path. Returns canonical absolute
 /// path on success, or error message on rejection.
@@ -52,6 +91,17 @@ pub(crate) fn validate_release_path(path_str: &str) -> Result<std::path::PathBuf
     }
     if canonical.components().count() < 3 {
         return Err(format!("rejected: too shallow: {}", canonical.display()));
+    }
+    // #t-…83936-6 P0: WHITELIST — the only safely-releasable shape is a LINKED
+    // worktree (`.git` is a gitlink file). Refuse main (`.git` is a dir), bare (no
+    // `.git` child — it IS a git dir), and non-repo dirs, else the `remove_dir_all`
+    // fallback nukes the whole source repo (canonical-deletion incident; reviewer5
+    // bare-repo bypass of the earlier blacklist).
+    if !is_linked_worktree(&canonical) {
+        return Err(format!(
+            "rejected: not a releasable linked worktree (main/bare/non-repo): {}",
+            canonical.display()
+        ));
     }
     Ok(canonical)
 }
@@ -110,11 +160,18 @@ pub(crate) fn handle_release_repo(args: &Value) -> Value {
     ) {
         Ok(o) if o.status.success() => return json!({"path": path}),
         Ok(o) => {
-            let _ = std::fs::remove_dir_all(&canonical);
+            // #t-…83936-6 depth guard (WHITELIST): only `remove_dir_all` a LINKED
+            // worktree, even if `git worktree remove` failed and validate was
+            // somehow bypassed — this fallback is what deleted the canonical/bare.
+            if is_linked_worktree(&canonical) {
+                let _ = std::fs::remove_dir_all(&canonical);
+            }
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
         Err(_) => {
-            let _ = std::fs::remove_dir_all(&canonical);
+            if is_linked_worktree(&canonical) {
+                let _ = std::fs::remove_dir_all(&canonical);
+            }
             json!({"path": path})
         }
     };
