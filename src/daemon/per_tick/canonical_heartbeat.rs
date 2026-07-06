@@ -176,6 +176,13 @@ mod tests {
     /// exactly the incident, where the daemon's cwd was the orphaned canonical.
     /// A future refactor to a `.`/cwd-relative check would silently reintroduce
     /// the 40-min blind spot; this pins against that.
+    ///
+    /// `#[cfg(unix)]`: the hazard being pinned is a POSIX semantic — an orphaned
+    /// inode keeps answering cwd-relative lookups after its dir is unlinked.
+    /// Windows LOCKS the process cwd, so it cannot even be deleted (the fixture's
+    /// `remove_dir_all(cwd)` errors) and the blind spot cannot occur there. The
+    /// production check is cross-platform; only this simulation is Unix-only.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn flags_missing_repo_even_when_cwd_is_deleted() {
