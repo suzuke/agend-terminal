@@ -181,12 +181,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::PtyWriter;
 
@@ -236,12 +236,29 @@ impl Job {
 /// whether a thread has been spawned for this writer at all yet. One
 /// `Arc<WriterState>` is shared between the enqueuing side
 /// ([`write`]/[`unregister`]) and at most one background thread.
+///
+/// `queue_notify` (#2620 fix) pairs with `queue`: [`writer_thread`] parks on
+/// it instead of calling `poll()` while `queue` is empty (a healthy PTY fd
+/// is essentially ALWAYS `POLLOUT`-ready, so polling with nothing to write
+/// would busy-spin at 100% CPU — see [`writer_thread`]'s doc). [`write`]
+/// notifies it after enqueuing; [`unregister`] and `register`'s stale-entry
+/// cleanup notify it after flipping `shutdown`, so a parked thread retires
+/// promptly instead of waiting out a full `IDLE_POLL_MS`.
 struct WriterState {
     fd: RawFd,
     shutdown: AtomicBool,
     queue: Mutex<VecDeque<Job>>,
+    queue_notify: Condvar,
     liveness: Weak<parking_lot::Mutex<Box<dyn io::Write + Send>>>,
     started: AtomicBool,
+    /// Test-only observability: counts real `poll()` syscalls issued by
+    /// [`writer_thread`]. Always present (not `#[cfg(test)]`) to keep the
+    /// struct literal simple; the increment is one relaxed atomic op on an
+    /// already-syscall-bound path, immaterial next to the `poll()` itself.
+    /// See `tests::idle_writer_never_polls_while_queue_stays_empty` — the
+    /// direct regression-proof that an empty queue costs ZERO `poll()`
+    /// calls, not merely "fewer".
+    poll_calls: AtomicU64,
 }
 
 /// `Arc::as_ptr(writer) as usize` (same identity scheme `WRITE_IN_PROGRESS`
@@ -281,8 +298,10 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
         fd,
         shutdown: AtomicBool::new(false),
         queue: Mutex::new(VecDeque::new()),
+        queue_notify: Condvar::new(),
         liveness: Arc::downgrade(writer),
         started: AtomicBool::new(false),
+        poll_calls: AtomicU64::new(0),
     });
 
     let mut ws = writers().lock();
@@ -311,6 +330,9 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
                      writer's thread noticed (fd reused)",
                 ));
             }
+            // #2620: wake a possibly-parked thread immediately rather than
+            // making it wait out a full IDLE_POLL_MS to notice `shutdown`.
+            stale.queue_notify.notify_one();
         }
     }
 
@@ -328,6 +350,8 @@ pub(crate) fn register(writer: &PtyWriter, master: &dyn portable_pty::MasterPty)
                 "PTY writer re-registered at this address before the previous write completed",
             ));
         }
+        // #2620: see the stale_by_fd loop above for why this notify matters.
+        stale.queue_notify.notify_one();
     }
     // Deliberately no thread spawned here -- see the module doc's "Lazy
     // thread spawn" section. [`ensure_started`] spawns one on this writer's
@@ -398,6 +422,9 @@ pub(crate) fn unregister(writer: &PtyWriter) {
             "PTY writer torn down before this write completed",
         ));
     }
+    // #2620: wake a parked writer_thread immediately so it retires now
+    // instead of waiting out a full IDLE_POLL_MS to notice `shutdown`.
+    state.queue_notify.notify_one();
 }
 
 /// SINGLE chokepoint for evicting a live `AgentHandle` from `registry`:
@@ -438,6 +465,17 @@ pub(super) fn fd_for(writer: &PtyWriter) -> Option<RawFd> {
     writers().lock().get(&key).map(|s| s.fd)
 }
 
+/// #2620 regression-proof: how many real `poll()` syscalls `writer_thread`
+/// has issued for `writer` so far. `None` if unregistered.
+#[cfg(test)]
+fn poll_call_count(writer: &PtyWriter) -> Option<u64> {
+    let key = Arc::as_ptr(writer) as usize;
+    writers()
+        .lock()
+        .get(&key)
+        .map(|s| s.poll_calls.load(Ordering::Relaxed))
+}
+
 /// Enqueue `data` for `writer` and wait up to `timeout` for it to fully
 /// land. `None` if `writer` isn't currently registered (never was, or
 /// already `unregister`ed) — `write_with_timeout` uses this to decide:
@@ -472,6 +510,13 @@ pub(crate) fn write(
             done: tx,
         });
     }
+    // #2620: wake writer_thread if it's parked (queue was empty) so it
+    // proceeds to poll+service this job immediately instead of waiting out
+    // IDLE_POLL_MS. Notifying after the lock is dropped is safe here: the
+    // push above happened under the same `queue` lock `writer_thread`
+    // re-checks before parking, so there's no window where a wakeup could
+    // be missed.
+    state.queue_notify.notify_one();
     Some(match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
@@ -501,21 +546,83 @@ fn retire(key: usize, state: &Arc<WriterState>, reason: &str) {
     }
 }
 
-/// A registered writer's dedicated background thread: poll its own fd,
-/// service at most one bounded write per readiness event, repeat. Runs
-/// until [`unregister`] flips `state.shutdown`, OR (the backstop — see the
-/// module doc's "Correctness fix" section) `state.liveness` fails to
-/// upgrade, meaning the `PtyWriter`'s last strong reference was dropped by
-/// some OTHER teardown path that never called `unregister`.
+/// What a writer's dedicated thread does on its next loop iteration —
+/// extracted as a pure function (no fd/lock access) so the state machine can
+/// be pinned by unit tests directly. `shutdown`/`liveness_dead` take
+/// priority over an empty queue (retiring beats parking indefinitely on a
+/// torn-down writer); otherwise an empty queue means genuinely nothing to
+/// service, so the thread parks instead of polling — see [`writer_thread`]'s
+/// doc for why polling an empty queue was the #2620 busy-loop bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextAction {
+    Retire,
+    Park,
+    Poll,
+}
+
+fn decide_next_action(shutdown: bool, liveness_dead: bool, queue_empty: bool) -> NextAction {
+    if shutdown || liveness_dead {
+        NextAction::Retire
+    } else if queue_empty {
+        NextAction::Park
+    } else {
+        NextAction::Poll
+    }
+}
+
+/// A registered writer's dedicated background thread: service at most one
+/// bounded write per readiness event, repeat. Runs until [`unregister`]
+/// flips `state.shutdown`, OR (the backstop — see the module doc's
+/// "Correctness fix" section) `state.liveness` fails to upgrade, meaning the
+/// `PtyWriter`'s last strong reference was dropped by some OTHER teardown
+/// path that never called `unregister`.
+///
+/// #2620: a healthy PTY fd is essentially ALWAYS `POLLOUT`-ready (kernel
+/// write buffers stay far from full in normal operation), so unconditionally
+/// `poll()`ing even with an empty queue meant: poll returns ready
+/// immediately -> [`service_once`] no-ops on the empty queue -> loop back ->
+/// poll again immediately -> zero-sleep busy loop (confirmed on a live
+/// daemon: two `agend-pty-writer` threads at 99.6% samples inside `poll()`,
+/// `sys` time far exceeding `user`). [`decide_next_action`] now gates
+/// polling behind "queue is non-empty"; while empty, the thread parks on
+/// `state.queue_notify` instead, woken by [`write`]'s enqueue notify (so
+/// write latency doesn't regress — enqueue-to-wake is ~0ms) with a
+/// `wait_timeout(IDLE_POLL_MS)` ceiling that preserves this loop's original
+/// per-`IDLE_POLL_MS` liveness/shutdown-backstop patrol cadence even when
+/// never notified (the module doc's "Correctness fix" section is the reason
+/// that cadence exists — the park must keep re-checking it, not wait
+/// forever).
 fn writer_thread(key: usize, state: Arc<WriterState>) {
     loop {
-        if state.shutdown.load(Ordering::Acquire) || state.liveness.upgrade().is_none() {
-            retire(
-                key,
-                &state,
-                "PTY writer torn down before this write completed",
-            );
-            return;
+        let shutdown = state.shutdown.load(Ordering::Acquire);
+        let liveness_dead = state.liveness.upgrade().is_none();
+        let mut q = state.queue.lock();
+        let queue_empty = q.is_empty();
+
+        match decide_next_action(shutdown, liveness_dead, queue_empty) {
+            NextAction::Retire => {
+                drop(q);
+                retire(
+                    key,
+                    &state,
+                    "PTY writer torn down before this write completed",
+                );
+                return;
+            }
+            NextAction::Park => {
+                // Still holding `q`, acquired above BEFORE the `queue_empty`
+                // check: `wait_timeout` atomically releases it and
+                // reacquires before returning, so a `write()` enqueuing in
+                // between (it needs this same lock to push) can never be
+                // missed — either it landed before we got here (queue_empty
+                // would already be false) or it happens while we're parked
+                // (its notify wakes us).
+                state
+                    .queue_notify
+                    .wait_for(&mut q, Duration::from_millis(IDLE_POLL_MS as u64));
+                continue;
+            }
+            NextAction::Poll => drop(q), // don't hold the queue lock across poll()/write()
         }
 
         let mut pollfd = libc::pollfd {
@@ -523,6 +630,7 @@ fn writer_thread(key: usize, state: Arc<WriterState>) {
             events: libc::POLLOUT,
             revents: 0,
         };
+        state.poll_calls.fetch_add(1, Ordering::Relaxed);
         // Safety: `pollfd` is a valid single-element buffer for the
         // duration of this call.
         let n = unsafe { libc::poll(&mut pollfd, 1, IDLE_POLL_MS) };
@@ -637,6 +745,87 @@ mod tests {
     /// actor-thread bottleneck) -- same rationale `worktree_cleanup.rs::
     /// tests::ENV_LOCK` already applies for shared process-global state.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // ── #2620: decide_next_action pure-decision pins ──────────────────
+
+    #[test]
+    fn decide_next_action_shutdown_wins_over_empty_queue() {
+        assert_eq!(
+            decide_next_action(true, false, true),
+            NextAction::Retire,
+            "shutdown must retire even with an empty queue"
+        );
+    }
+
+    #[test]
+    fn decide_next_action_dead_liveness_wins_over_work_available() {
+        assert_eq!(
+            decide_next_action(false, true, false),
+            NextAction::Retire,
+            "a dropped writer (dead liveness) must retire even with queued work"
+        );
+    }
+
+    #[test]
+    fn decide_next_action_parks_on_empty_queue() {
+        assert_eq!(
+            decide_next_action(false, false, true),
+            NextAction::Park,
+            "nothing to service -> park instead of polling (the #2620 fix)"
+        );
+    }
+
+    #[test]
+    fn decide_next_action_polls_when_work_is_queued() {
+        assert_eq!(
+            decide_next_action(false, false, false),
+            NextAction::Poll,
+            "queued work -> poll+service, unchanged from pre-#2620 behavior"
+        );
+    }
+
+    /// #2620 core regression-proof: an idle writer (queue empty, nothing
+    /// enqueued) must issue ZERO `poll()` syscalls while idle -- not
+    /// "fewer", zero, since the fix's whole point is that an empty queue
+    /// never reaches the poll() call at all (it parks instead). Pre-fix,
+    /// a healthy fd here would have busy-spun through many thousands of
+    /// poll() calls over this same window.
+    #[test]
+    fn idle_writer_never_polls_while_queue_stays_empty() {
+        let _lock = TEST_LOCK.lock();
+        let (writer, mut child, _master) = wedged_pty("idle-no-poll", 5);
+
+        // One real write to spawn the thread (lazy start) and drive the
+        // queue back to empty once it lands.
+        let result = write(&writer, b"hello".to_vec(), Duration::from_secs(2))
+            .expect("registered writer must resolve to Some");
+        assert!(result.is_ok(), "priming write must succeed: {result:?}");
+
+        let baseline = poll_call_count(&writer).expect("writer must still be registered");
+        std::thread::sleep(Duration::from_millis(3 * IDLE_POLL_MS as u64));
+        let after_idle = poll_call_count(&writer).expect("writer must still be registered");
+        assert_eq!(
+            after_idle, baseline,
+            "an idle writer with an empty queue must not call poll() at all \
+             (busy-loop regression, #2620); baseline={baseline} after_idle={after_idle}"
+        );
+
+        // Write latency must not have regressed: a park must wake promptly
+        // on write()'s notify, not wait out IDLE_POLL_MS.
+        let start = std::time::Instant::now();
+        let result = write(&writer, b"world".to_vec(), Duration::from_secs(2))
+            .expect("registered writer must resolve to Some");
+        let elapsed = start.elapsed();
+        assert!(result.is_ok(), "post-idle write must succeed: {result:?}");
+        assert!(
+            elapsed < Duration::from_millis(IDLE_POLL_MS as u64),
+            "a parked writer must wake on write()'s notify near-instantly, not wait out \
+             IDLE_POLL_MS; took {elapsed:?}"
+        );
+
+        let _ = child.kill();
+        unregister(&writer);
+    }
 
     /// A real pty pair whose slave is put into raw mode and never reads
     /// stdin (`stty raw -echo; sleep N`) -- the exact wedge condition
