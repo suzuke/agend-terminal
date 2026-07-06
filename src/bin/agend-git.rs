@@ -30,6 +30,11 @@ mod integrity_core;
 #[path = "../protected_refs.rs"]
 mod protected_refs;
 
+// #2390 ③: default-branch resolution for the push-range guards (denylist +
+// init-pile cleanup), replacing a hardcoded `origin/main` — shim-local.
+#[path = "agend-git/git_refs.rs"]
+mod git_refs;
+
 /// #1504 L3: max times the shim may re-enter before hard-failing. Healthy
 /// operation never exceeds 1 (real git ≠ shim → no re-entry), so a small cap
 /// has zero false-trip risk while containing a self-resolution spawn storm.
@@ -1657,31 +1662,32 @@ fn log_init_heartbeat_forensics(home: &str, agent: &str, args: &[String]) {
 
 // ── #883 pre-push cleanup ───────────────────────────────────────────────
 
-/// #883: drop empty `init` heartbeat commits between `origin/main..HEAD`
-/// before the real `git push` fires. Targets the operator-visible case
-/// (PR #882 saw 16 inits before the real commit on mobile UI). The
-/// cleanup is a local soft-reset to `origin/main` ONLY when EVERY commit
-/// in the range is an empty init heartbeat — that's the common case the
-/// operator hit. The mixed-history case (real commits interleaved with
-/// inits) is left for the existing `repo action=cleanup_init_commits`
-/// MCP tool to handle via interactive rebase; we deliberately do not
-/// replicate that more-complex path in the shim to keep this function
-/// small + self-contained (the shim builds standalone without the
-/// library surface — see comment at line ~188).
+/// #883: drop empty `init` heartbeat commits between `<default-branch>..HEAD`
+/// (base via `git_refs::resolve_default_branch_base`, #2390) before the real
+/// `git push` fires (PR #882 saw 16 inits before the real commit on mobile UI).
+/// Soft-resets to that base ONLY when EVERY commit in the range is an empty init
+/// heartbeat (the common operator case); the mixed-history case is left to the
+/// `repo action=cleanup_init_commits` MCP tool (interactive rebase) — we keep
+/// this shim function small + self-contained (builds standalone, no lib surface).
 ///
-/// **NEVER blocks `git push`.** Any subprocess failure is logged to
-/// stderr and the function returns; `main` then proceeds to
-/// `exec_real_git` as usual. Cleanup is a best-effort hygiene
-/// improvement, not a correctness gate.
-///
-/// (THIS function's never-blocks contract is unchanged. Note the push PATH can
-/// now block: `#2379` `push_trust_root_denylist_violation` runs BEFORE this in
-/// the `CleanupAndChdirPushPass` arm and may `exit(1)` — a separate guardrail,
-/// not part of this hygiene pass.)
+/// **NEVER blocks `git push`.** Any subprocess failure (incl. an undeterminable
+/// base) is logged and the function returns; hygiene, not a correctness gate.
+/// (Unchanged by #2379: `push_trust_root_denylist_violation` runs BEFORE this in
+/// the `CleanupAndChdirPushPass` arm and MAY `exit(1)` — a separate guardrail.)
 fn cleanup_init_pile_pre_push(worktree: &str) {
-    // List commits between origin/main..HEAD with hash + subject.
+    // #2390 ③: resolve the default-branch base (not hardcoded origin/main); soft —
+    // an undeterminable base just no-ops this hygiene pass (never blocks push).
+    let base = match git_refs::resolve_default_branch_base(worktree) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("agend-git: #883 pre-push cleanup skipped (default branch: {e})");
+            return;
+        }
+    };
+    let range = format!("{base}..HEAD");
+    // List commits between <base>..HEAD with hash + subject.
     let log_out = match Command::new("git")
-        .args(["log", "origin/main..HEAD", "--format=%H %s"])
+        .args(["log", &range, "--format=%H %s"])
         .current_dir(worktree)
         .env("AGEND_GIT_BYPASS", "1")
         .output()
@@ -1726,11 +1732,11 @@ fn cleanup_init_pile_pre_push(worktree: &str) {
         return;
     }
     // All-init case: soft-reset is enough — drops every commit on the
-    // branch above origin/main, leaving working tree clean (since the
+    // branch above the base, leaving working tree clean (since the
     // dropped commits had no file changes).
     if empty_init_hashes.len() == total {
         let reset = Command::new("git")
-            .args(["reset", "--soft", "origin/main"])
+            .args(["reset", "--soft", &base])
             .current_dir(worktree)
             .env("AGEND_GIT_BYPASS", "1")
             .status();
@@ -1769,7 +1775,7 @@ fn cleanup_init_pile_pre_push(worktree: &str) {
         .collect();
     let sed_script = sed_parts.join(";");
     let rebase = Command::new("git")
-        .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
+        .args(["-c", "core.abbrev=7", "rebase", "-i", &base])
         .current_dir(worktree)
         .env("AGEND_GIT_BYPASS", "1")
         .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))
@@ -1889,27 +1895,22 @@ fn trust_root_basename_denied(repo_relative_path: &str) -> bool {
 }
 
 /// The repo-relative paths touched by any commit in the push range
-/// (`origin/main..HEAD`) — the union of `--name-only` across the range, so a
+/// (`<default-branch>..HEAD`) — the `--name-only` union across the range, so a
 /// trust-root blob added in an intermediate commit is caught even if a later
-/// commit deletes it (the blob is still in the pushed history). Runs real git in
-/// the worktree with `AGEND_GIT_BYPASS=1` (mirrors `cleanup_init_pile_pre_push`'s
-/// established range base). Returns `Err(msg)` when the range can't be computed
-/// (e.g. `origin/main` not fetched) so the caller can fail CLOSED.
+/// commit deletes it. Base is `git_refs::resolve_default_branch_base` (not a
+/// hardcoded `origin/main`, #2390). Returns `Err(msg)` when the base or range
+/// can't be computed so the caller can fail CLOSED.
 fn push_range_files(worktree: &str) -> Result<Vec<String>, String> {
+    let range = format!("{}..HEAD", git_refs::resolve_default_branch_base(worktree)?);
     let out = Command::new("git")
-        .args([
-            "log",
-            "--name-only",
-            "--pretty=format:",
-            "origin/main..HEAD",
-        ])
+        .args(["log", "--name-only", "--pretty=format:", &range])
         .current_dir(worktree)
         .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map_err(|e| format!("git log spawn failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "git log origin/main..HEAD failed: {}",
+            "git log {range} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -1944,8 +1945,8 @@ fn push_trust_root_denylist_violation(worktree: &str) -> Option<String> {
             }),
         Err(e) => Some(format!(
             "could not verify the push against the trust-root denylist ({e}); refusing to \
-             push (fail-closed). Fetch origin so `origin/main..HEAD` resolves \
-             (`git fetch origin`), then retry."
+             push (fail-closed). Set the remote's default branch so the range resolves — \
+             `git remote set-head origin -a` (works for any default branch name), then retry."
         )),
     }
 }

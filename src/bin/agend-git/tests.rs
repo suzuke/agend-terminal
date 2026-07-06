@@ -3017,3 +3017,167 @@ fn tracked_tree_has_zero_trust_root_hits_persistent_guard_2379() {
              through silently."
     );
 }
+
+// ── #2390 ③: default-branch resolution (push guards no longer hardcode
+// origin/main → a non-main-default repo isn't fail-closed-blocked on every push) ──
+
+/// Build a MASTER-default repo (origin default = master, no `origin/main`) with a
+/// feature branch checked out — the footgun fixture #2390 fixes. Mirrors
+/// `build_repo_with_origin_main_2379` but `-b master`.
+fn build_repo_with_origin_master_2390(tag: &str) -> std::path::PathBuf {
+    let id = format!(
+        "{}-{tag}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let base = std::env::temp_dir().join(format!("agend-2390-{id}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let origin_bare = base.join("origin.git");
+    let worktree = base.join("worktree");
+    assert!(git_run_2379(
+        &[
+            "init",
+            "--bare",
+            "-b",
+            "master",
+            origin_bare.to_str().unwrap()
+        ],
+        &base
+    )
+    .status
+    .success());
+    assert!(git_run_2379(
+        &[
+            "clone",
+            origin_bare.to_str().unwrap(),
+            worktree.to_str().unwrap()
+        ],
+        &base
+    )
+    .status
+    .success());
+    git_run_2379(&["config", "user.name", "test"], &worktree);
+    git_run_2379(&["config", "user.email", "test@test.local"], &worktree);
+    git_run_2379(&["config", "commit.gpgsign", "false"], &worktree);
+    std::fs::write(worktree.join("README.md"), "initial\n").unwrap();
+    assert!(git_run_2379(&["add", "README.md"], &worktree)
+        .status
+        .success());
+    assert!(git_run_2379(&["commit", "-m", "initial"], &worktree)
+        .status
+        .success());
+    assert!(git_run_2379(&["push", "origin", "master"], &worktree)
+        .status
+        .success());
+    assert!(git_run_2379(&["checkout", "-b", "feat/test"], &worktree)
+        .status
+        .success());
+    worktree
+}
+
+/// The resolver returns the real default branch — via origin/HEAD when set, and
+/// via the main→master existence-probe when it is NOT (the managed-worktree case,
+/// where `git remote set-head` never ran). Joins `git-subprocess`.
+#[test]
+fn resolve_default_branch_base_main_and_master_2390() {
+    // main-default (clone sets origin/HEAD → path 1).
+    let main_wt = build_repo_with_origin_main_2379("resolve-main");
+    assert_eq!(
+        git_refs::resolve_default_branch_base(main_wt.to_str().unwrap()).as_deref(),
+        Ok("origin/main")
+    );
+    // Unset origin/HEAD to mimic a managed worktree → path 2 existence-probe.
+    git_run_2379(&["remote", "set-head", "origin", "-d"], &main_wt);
+    assert_eq!(
+        git_refs::resolve_default_branch_base(main_wt.to_str().unwrap()).as_deref(),
+        Ok("origin/main"),
+        "origin/HEAD unset must still resolve via the origin/main probe"
+    );
+    let _ = std::fs::remove_dir_all(main_wt.parent().unwrap());
+
+    // master-default — must resolve to origin/master, NOT error.
+    let master_wt = build_repo_with_origin_master_2390("resolve-master");
+    assert_eq!(
+        git_refs::resolve_default_branch_base(master_wt.to_str().unwrap()).as_deref(),
+        Ok("origin/master")
+    );
+    git_run_2379(&["remote", "set-head", "origin", "-d"], &master_wt);
+    assert_eq!(
+        git_refs::resolve_default_branch_base(master_wt.to_str().unwrap()).as_deref(),
+        Ok("origin/master"),
+        "master default with origin/HEAD unset must probe to origin/master"
+    );
+    let _ = std::fs::remove_dir_all(master_wt.parent().unwrap());
+}
+
+/// Truly undeterminable base (no remote at all: origin/HEAD unset, no origin/main
+/// or origin/master) → `Err`, so the denylist caller stays fail-closed. Joins
+/// `git-subprocess`.
+#[test]
+fn resolve_default_branch_base_errs_when_undeterminable_2390() {
+    let base = std::env::temp_dir().join(format!(
+        "agend-2390-noremote-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    assert!(
+        git_run_2379(&["init", "-b", "trunk", base.to_str().unwrap()], &base)
+            .status
+            .success()
+    );
+    git_run_2379(&["config", "user.name", "test"], &base);
+    git_run_2379(&["config", "user.email", "test@test.local"], &base);
+    git_run_2379(&["config", "commit.gpgsign", "false"], &base);
+    std::fs::write(base.join("a.txt"), "x\n").unwrap();
+    assert!(git_run_2379(&["add", "a.txt"], &base).status.success());
+    assert!(git_run_2379(&["commit", "-m", "c"], &base).status.success());
+    assert!(
+        git_refs::resolve_default_branch_base(base.to_str().unwrap()).is_err(),
+        "no remote default + no origin/main|master must be Err (→ caller fail-closed)"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #2390 footgun fix: on a MASTER-default repo the denylist must NOT falsely block
+/// a clean push (pre-fix `origin/main..HEAD` errored → fail-closed → every push
+/// blocked), yet must still catch a force-added trust-root file. Joins
+/// `git-subprocess`.
+#[test]
+fn denylist_not_falsely_blocked_on_master_default_repo_2390() {
+    let wt = build_repo_with_origin_master_2390("denylist");
+    // Clean commit on the feature branch — must be allowed (was wrongly blocked).
+    std::fs::write(wt.join("feature.txt"), "real work\n").unwrap();
+    assert!(git_run_2379(&["add", "feature.txt"], &wt).status.success());
+    assert!(git_run_2379(&["commit", "-m", "feat: real"], &wt)
+        .status
+        .success());
+    assert_eq!(
+        push_trust_root_denylist_violation(wt.to_str().unwrap()),
+        None,
+        "a clean push on a master-default repo must NOT be fail-closed-blocked"
+    );
+    // And the guardrail still fires for a real trust-root violation.
+    std::fs::write(wt.join("fleet.yaml"), "stolen\n").unwrap();
+    assert!(git_run_2379(&["add", "-f", "fleet.yaml"], &wt)
+        .status
+        .success());
+    assert!(git_run_2379(&["commit", "-m", "sneak"], &wt)
+        .status
+        .success());
+    assert!(
+        push_trust_root_denylist_violation(wt.to_str().unwrap())
+            .as_deref()
+            .is_some_and(|r| r.contains("fleet.yaml")),
+        "trust-root violation must still be denied on a master-default repo"
+    );
+    let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+}
