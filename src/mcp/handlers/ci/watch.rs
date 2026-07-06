@@ -392,10 +392,13 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
     let filter_repo = args["repository"].as_str();
     let filter_branch = args["branch"].as_str();
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    let entries = match std::fs::read_dir(&ci_dir) {
-        Ok(e) => e,
-        Err(_) => return json!({"watches": Vec::<Value>::new()}),
-    };
+    // #35896-11 ③: do NOT early-return on an absent/empty ci-watches dir — a live
+    // ci_handoff_track (a SEPARATE `ci-handoff-tracks` dir) can outlast its watch
+    // (unwatched/expired watch, live renudge), which is EXACTLY lead's 4.5h sample
+    // (empty `watches`, silent renudge). The pending_handoffs surface below must
+    // still render, so fall through with zero watch rows. `into_iter().flatten()`
+    // yields nothing when the dir is missing → `out` stays empty.
+    let entries = std::fs::read_dir(&ci_dir).into_iter().flatten();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let now_secs = chrono::Utc::now().timestamp();
 
@@ -467,7 +470,38 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             "next_after_ci": watch.get("next_after_ci").cloned().unwrap_or(Value::Null),
         }));
     }
-    let mut resp = json!({"watches": out});
+    // #35896-11 ③: surface pending ci_handoff_track sidecars so an agent can SEE
+    // why the ci-ready renudge watchdog keeps nudging them and what to discharge.
+    // Before this the renudge had NO status surface (lead's 4.5h sample: `ci
+    // status` showed empty `watches` the whole time the sidecar-driven renudge
+    // fired every 2min — invisible, no discharge target). Caller-scoped to the
+    // track TARGET (who owes the review = who gets renudged), mirroring the watch
+    // caller-scoping above; the anonymous CLI (empty instance) sees all. The
+    // optional `repository`/`branch` args narrow it the same way they narrow
+    // watches. `renudge_count` is intentionally absent — the throttle counter is
+    // not persisted on the track yet (#35896-11 ⑥, PR-C); `age_secs` is the
+    // renudge driver and IS surfaced so an agent can gauge staleness.
+    let pending_handoffs: Vec<Value> = crate::daemon::ci_handoff_track::list(home)
+        .into_iter()
+        .map(|(_, t)| t)
+        .filter(|t| instance_name.is_empty() || t.target == instance_name)
+        .filter(|t| filter_repo.is_none_or(|r| t.correlation.split('@').next() == Some(r)))
+        .filter(|t| filter_branch.is_none_or(|b| t.correlation.ends_with(&format!("@{b}"))))
+        .map(|t| {
+            let age_secs = chrono::DateTime::parse_from_rfc3339(&t.sent_at)
+                .ok()
+                .map(|s| now_secs - s.timestamp());
+            json!({
+                "target": t.target,
+                "correlation": t.correlation,
+                "task_id": t.task_id,
+                "head_sha": t.head_sha,
+                "sent_at": t.sent_at,
+                "age_secs": age_secs,
+            })
+        })
+        .collect();
+    let mut resp = json!({"watches": out, "pending_handoffs": pending_handoffs});
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
         resp["setup_warning"] = json!(w);
     }
@@ -548,6 +582,75 @@ mod tests {
         assert_eq!(
             left[0].1.target, "reviewer",
             "co-subscriber's track must survive unwatch dismiss"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #35896-11 ③: `ci action=status` must surface pending ci_handoff_track
+    /// sidecars (the renudge watchdog's source) so an agent can SEE why it's
+    /// renudged and what to discharge — pre-③ the sidecar was invisible even
+    /// when it drove a renudge (lead's 4.5h sample: empty `watches`, silent
+    /// renudge). Caller-scoped to the track TARGET: a named caller sees only its
+    /// OWN pending handoff; the anonymous CLI sees all. Crucially this holds with
+    /// NO ci-watches dir at all — the surface must not depend on a live watch.
+    #[test]
+    fn status_ci_surfaces_pending_handoffs_scoped_to_caller_35896_11() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-35896-status-handoffs-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Two tracks on the same branch — the caller's + a co-subscriber's — and
+        // deliberately NO ci-watches dir (the sample scenario: watch gone, track live).
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "lead",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            Some("t-42"),
+        );
+        crate::daemon::ci_handoff_track::record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+
+        // Named caller sees ONLY its own pending handoff.
+        let resp = handle_status_ci(&home, &json!({}), "lead");
+        assert!(resp.get("error").is_none(), "status must not error: {resp}");
+        assert!(
+            resp["watches"].as_array().is_some_and(|w| w.is_empty()),
+            "no ci-watches dir ⟹ empty watches, but the call must still render: {resp}"
+        );
+        let pending = resp["pending_handoffs"]
+            .as_array()
+            .expect("pending_handoffs must be present even with zero watches");
+        assert_eq!(
+            pending.len(),
+            1,
+            "caller sees only its OWN pending handoff, not the co-subscriber's: {resp}"
+        );
+        assert_eq!(pending[0]["target"], "lead");
+        assert_eq!(pending[0]["correlation"], "o/r@b");
+        assert_eq!(pending[0]["task_id"], "t-42");
+        assert!(
+            pending[0]["age_secs"].as_i64().is_some(),
+            "age_secs must be derived from sent_at: {resp}"
+        );
+
+        // Anonymous CLI (empty instance) sees EVERY pending handoff.
+        let resp_all = handle_status_ci(&home, &json!({}), "");
+        assert_eq!(
+            resp_all["pending_handoffs"].as_array().unwrap().len(),
+            2,
+            "anonymous CLI sees every pending handoff: {resp_all}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

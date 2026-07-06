@@ -305,6 +305,35 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
     // typical `unread` state, unlike `ack` which is `delivering`-only).
     let settled_row = crate::inbox::storage::settle_read_by_id(home, instance_name, msg_id);
 
+    // (3b) #35896-11 ②: if the discharged message is a `ci-ready-for-action`
+    // handoff, this explicit discharge ALSO resolves the caller's
+    // ci_handoff_track — so the ONE agent-facing verb silences BOTH the
+    // poll_reminder (row settled above) AND the renudge/escalation watchdog.
+    // Before this wire the only ways to stop a ci-ready renudge were `ci
+    // unwatch` (blunt — tombstones the whole watch) or waiting out the 24h
+    // backstop; a `send triaged=` was a silent dead-write (#2537 ledger is
+    // ci-fail-only). Keyed on the message's own `correlation_id` (a ci-ready
+    // message always carries `repo@branch`, the track's key — poller.rs) and
+    // TARGET-scoped to the caller via `resolve_for_target_correlation` (the same
+    // precise dismiss `ci unwatch` uses), so a co-subscriber's handoff for the
+    // same branch is left intact and a discharge clears only the obligation the
+    // discharged message names. An explicit gesture (not an inbox read) →
+    // #1888's stuck-reviewer escalation is preserved for handoffs never acted on.
+    let handoff_resolved = if row.kind.as_deref() == Some("ci-ready-for-action") {
+        row.correlation_id
+            .as_deref()
+            .map(|corr| {
+                crate::daemon::ci_handoff_track::resolve_for_target_correlation(
+                    home,
+                    instance_name,
+                    corr,
+                )
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
     // (4) LOUD notice — the operator owns the right-to-know. Primary: fan out to
     // every operator channel (channel send → no inbox row → structurally zero
     // obligation loop). Fallback (no channel registered → returns 0): an inbox
@@ -345,7 +374,7 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
         instance_name,
         &format!(
             "msg_id={msg_id} cleared_turn={cleared_turn} settled_row={settled_row} \
-             notified_via={notified_via} reason={reason}"
+             handoff_resolved={handoff_resolved} notified_via={notified_via} reason={reason}"
         ),
     );
 
@@ -354,6 +383,7 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
         "message_id": msg_id,
         "cleared_turn": cleared_turn,
         "settled_row": settled_row,
+        "handoff_resolved": handoff_resolved,
         "notified_via": notified_via
     })
 }
