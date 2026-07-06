@@ -42,6 +42,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) mod backend_exit_detection;
+pub(crate) mod canonical_heartbeat;
 pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
@@ -346,6 +347,12 @@ pub(crate) fn build_default_handlers(
         Box::new(RespawnWatchdogHandler::new()),
         Box::new(WatchdogHandler::new(watchdog_dry_run)),
         Box::new(ExternalLivenessHandler::new()),
+        // #t-…83936-4: canonical source_repo existence heartbeat — pages the
+        // operator if a registered canonical repo vanishes (the 40-min-silent
+        // deletion incident). 60-tick backstop; the real-time path is
+        // binding_state's `worktree_resolves` (protection ①). Order-independent:
+        // reads bound_source_repos + emits alerts, shares no state with others.
+        Box::new(canonical_heartbeat::CanonicalHeartbeatHandler::new(60)),
         // #2413 (B): ShadowObserve MUST run immediately BEFORE SnapshotRotation so the
         // snapshot's operated `agent_state` promotion reads THIS tick's `observed_status`
         // (it was previously LAST in the list → the snapshot would read last tick's). The
