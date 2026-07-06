@@ -274,11 +274,22 @@ fn canonicalize_lenient(p: &Path) -> Option<PathBuf> {
 /// latter; the caller fails the whole sweep round closed rather than treat
 /// an ambiguous row as absent.
 fn bound_worktree_paths_or_ambiguous(home: &Path) -> Result<Vec<PathBuf>, ()> {
-    let Ok(entries) = std::fs::read_dir(crate::paths::runtime_dir(home)) else {
-        return Ok(Vec::new());
+    let entries = match std::fs::read_dir(crate::paths::runtime_dir(home)) {
+        Ok(entries) => entries,
+        // A missing runtime_dir is the normal "no agent has ever bound" state
+        // (mirrors the per-file NotFound branch below) — a genuine absence.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // Any OTHER error (dir exists but unreadable: permissions, fd
+        // exhaustion) COULD be hiding a live binding.json — treat as ambiguity
+        // and fail the sweep round closed rather than report a false absence.
+        Err(_) => return Err(()),
     };
     let mut paths = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        // A per-entry iteration error (the dir became unreadable mid-scan) is
+        // the same ambiguity as an unreadable binding.json below — fail closed
+        // instead of silently dropping the entry (was `entries.flatten()`).
+        let entry = entry.map_err(|_| ())?;
         let agent = entry.file_name().to_string_lossy().into_owned();
         let content = match std::fs::read_to_string(crate::paths::binding_path(home, &agent)) {
             Ok(c) => c,
@@ -1125,6 +1136,69 @@ mod tests {
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…96214-1 (#2657 lead 二席 r1 nit): an UNREADABLE `runtime_dir` (the
+    /// directory exists but a permission / fd-exhaustion error blocks the scan)
+    /// is an AMBIGUITY, not an absence — a live `binding.json` may be hiding
+    /// behind it. Pre-fix, `read_dir` failure fell through `let Ok(..) else
+    /// return Ok(Vec::new())`, silently reporting "no bindings" and letting the
+    /// sweep proceed to removals. It must now fail the round closed (`Err`),
+    /// mirroring the per-file unreadable branch already below it. Unix-only:
+    /// relies on `chmod 000` being enforced (self-skips where it is not, e.g.
+    /// the process runs as root).
+    #[cfg(unix)]
+    #[test]
+    fn bound_worktree_paths_unreadable_runtime_dir_is_ambiguous() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("unreadable-runtime-dir");
+        // Give runtime_dir real content so the ONLY variable under test is its
+        // readability, not its existence.
+        write_source_repo_binding(&home, "some-agent", &home);
+        let rt = crate::paths::runtime_dir(&home);
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // If the mode isn't enforced for this process (root, or a permissive
+        // filesystem), the read still succeeds and the ambiguity cannot be
+        // reproduced — restore + skip rather than assert a false failure.
+        if std::fs::read_dir(&rt).is_ok() {
+            std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).ok();
+            std::fs::remove_dir_all(&home).ok();
+            return;
+        }
+
+        let result = bound_worktree_paths_or_ambiguous(&home);
+        // Restore perms BEFORE asserting so cleanup runs even if the assert panics.
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).ok();
+        assert!(
+            result.is_err(),
+            "an unreadable runtime_dir must be reported as ambiguity (Err), not \
+             an empty binding set — else the sweep proceeds to removals blind to \
+             a possibly-live binding: {result:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…96214-1 negative control: a MISSING `runtime_dir` (no agent has ever
+    /// bound — nothing created `home/runtime` yet) is the normal absence state,
+    /// exactly like a missing per-agent `binding.json`. It must return
+    /// `Ok(empty)`, NOT `Err`, or every steady-state sweep on a fresh home would
+    /// fail closed and stop reaping legitimately-orphaned worktrees. Pins the
+    /// NotFound-is-absence half of the fix against a future blanket-`Err`
+    /// refactor.
+    #[test]
+    fn bound_worktree_paths_missing_runtime_dir_is_absence_not_ambiguity() {
+        let home = tmp_home("missing-runtime-dir");
+        // tmp_home creates `home` but NOT `home/runtime`.
+        assert!(!crate::paths::runtime_dir(&home).exists());
+        assert_eq!(
+            bound_worktree_paths_or_ambiguous(&home),
+            Ok(Vec::new()),
+            "a missing runtime_dir is a genuine absence (no agent ever bound), \
+             not an ambiguity"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
