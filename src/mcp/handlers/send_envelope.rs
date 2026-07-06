@@ -24,7 +24,6 @@ pub(super) struct SendEnvelope {
     // a null directive reads as absent — daemon reads them by value, not presence)
     pub(super) correlation_id: Option<String>,
     pub(super) reviewed_head: Option<String>,
-    pub(super) sequencing: Option<String>,
     pub(super) eta_minutes: Option<u64>,
     pub(super) reporting_cadence: Option<String>,
     pub(super) worktree_binding_required: Option<bool>,
@@ -47,7 +46,6 @@ impl SendEnvelope {
         SendEnvelope {
             correlation_id: args["correlation_id"].as_str().map(String::from),
             reviewed_head: args["reviewed_head"].as_str().map(String::from),
-            sequencing: args["sequencing"].as_str().map(String::from),
             eta_minutes: args["eta_minutes"].as_u64(),
             reporting_cadence: args["reporting_cadence"].as_str().map(String::from),
             worktree_binding_required: args["worktree_binding_required"].as_bool(),
@@ -70,7 +68,6 @@ impl SendEnvelope {
             parent_id,
             correlation_id,
             reviewed_head,
-            sequencing,
             eta_minutes,
             reporting_cadence,
             worktree_binding_required,
@@ -91,7 +88,6 @@ impl SendEnvelope {
             "parent_id": parent_id,
             "correlation_id": correlation_id,
             "reviewed_head": reviewed_head,
-            "sequencing": sequencing,
             "eta_minutes": eta_minutes,
             "reporting_cadence": reporting_cadence,
             "worktree_binding_required": worktree_binding_required,
@@ -132,7 +128,6 @@ impl SendEnvelope {
             parent_id,
             correlation_id,
             reviewed_head,
-            sequencing,
             eta_minutes,
             reporting_cadence,
             worktree_binding_required,
@@ -152,7 +147,6 @@ impl SendEnvelope {
             parent_id: parent_id.clone(),
             correlation_id: correlation_id.clone(),
             reviewed_head: reviewed_head.clone(),
-            sequencing: sequencing.clone(),
             eta_minutes: eta_minutes.map(|v| v as u32),
             reporting_cadence: reporting_cadence.clone(),
             worktree_binding_required: *worktree_binding_required,
@@ -184,7 +178,6 @@ mod tests {
             parent_id: Some("m-parent".to_string()),
             correlation_id: Some("t-corr".to_string()),
             reviewed_head: Some("deadbeef".to_string()),
-            sequencing: Some("sequential".to_string()),
             eta_minutes: Some(42),
             reporting_cadence: Some("per-pr".to_string()),
             worktree_binding_required: Some(true),
@@ -212,7 +205,6 @@ mod tests {
         assert_eq!(p["parent_id"], "m-parent");
         assert_eq!(p["correlation_id"], "t-corr");
         assert_eq!(p["reviewed_head"], "deadbeef");
-        assert_eq!(p["sequencing"], "sequential");
         assert_eq!(p["eta_minutes"], 42);
         assert_eq!(p["reporting_cadence"], "per-pr");
         assert_eq!(p["worktree_binding_required"], true);
@@ -240,7 +232,6 @@ mod tests {
         assert_eq!(m.correlation_id.as_deref(), Some("t-corr"));
         // THE fixed gap: reviewed_head must survive into the fallback.
         assert_eq!(m.reviewed_head.as_deref(), Some("deadbeef"));
-        assert_eq!(m.sequencing.as_deref(), Some("sequential"));
         assert_eq!(m.eta_minutes, Some(42u32));
         assert_eq!(m.reporting_cadence.as_deref(), Some("per-pr"));
         assert_eq!(m.worktree_binding_required, Some(true));
@@ -287,11 +278,9 @@ mod tests {
         };
         let p = env.to_send_params();
         // present-but-null
-        assert!(p["sequencing"].is_null());
         assert!(p["worktree_binding_required"].is_null());
         assert!(p["eta_minutes"].is_null());
         // …and the daemon's value-read yields None (== absent): inert.
-        assert_eq!(p["sequencing"].as_str(), None);
         assert_eq!(p["worktree_binding_required"].as_bool(), None);
         assert_eq!(p["eta_minutes"].as_u64(), None);
     }
@@ -324,14 +313,13 @@ mod tests {
     #[test]
     fn directives_from_args_reads_all() {
         let args = json!({
-            "correlation_id": "t-c", "reviewed_head": "sha", "sequencing": "parallel",
+            "correlation_id": "t-c", "reviewed_head": "sha",
             "eta_minutes": 7, "reporting_cadence": "wave-end", "worktree_binding_required": true,
             "expect_reply_within_secs": 120, "terminal": true, "no_report_expected": true,
         });
         let e = SendEnvelope::directives_from_args(&args);
         assert_eq!(e.correlation_id.as_deref(), Some("t-c"));
         assert_eq!(e.reviewed_head.as_deref(), Some("sha"));
-        assert_eq!(e.sequencing.as_deref(), Some("parallel"));
         assert_eq!(e.eta_minutes, Some(7));
         assert_eq!(e.reporting_cadence.as_deref(), Some("wave-end"));
         assert_eq!(e.worktree_binding_required, Some(true));

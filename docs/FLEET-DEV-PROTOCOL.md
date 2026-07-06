@@ -786,7 +786,7 @@ When multiple PRs ship in the same wave (same dispatch/task_id):
 2. Never parallel merge — later PRs have stale base
 3. After each merge, remaining PRs must rebase and re-run CI before merge
 
-Daemon enforcement: `send(sequencing: "sequential-merge-only")` signals this constraint to downstream agents. Recipients MUST merge one at a time and verify CI between each merge.
+This constraint is communicated in the dispatch message text (there is no daemon-enforced param — the removed `send.sequencing` passthrough had no consumer). Recipients MUST merge one at a time and verify CI between each merge.
 
 ### 12.7 Linked-Issue Close Convention
 

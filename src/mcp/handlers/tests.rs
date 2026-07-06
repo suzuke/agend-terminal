@@ -1062,7 +1062,6 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
-            sequencing: None,
             eta_minutes: None,
             reporting_cadence: None,
             worktree_binding_required: None,
@@ -1135,7 +1134,6 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
-            sequencing: None,
             eta_minutes: None,
             reporting_cadence: None,
             worktree_binding_required: None,
@@ -1318,7 +1316,6 @@ fn test_describe_message_shows_delivery_mode() {
         superseded_by: None,
         from_id: None,
         broadcast_context: None,
-        sequencing: None,
         eta_minutes: None,
         reporting_cadence: None,
         worktree_binding_required: None,
@@ -1563,7 +1560,6 @@ fn delegate_task_forwards_dispatch_directives_high1() {
             "request_kind": "task",
             "task_id": "t-high1-1",
             "worktree_binding_required": true,
-            "sequencing": "sequential-merge-only",
             "correlation_id": "c-high1",
             "reviewed_head": "abc1234",
             "eta_minutes": 30,
@@ -1583,7 +1579,6 @@ fn delegate_task_forwards_dispatch_directives_high1() {
         Some(true),
         "worktree_binding_required must reach the InboxMessage (delivery gate)"
     );
-    assert_eq!(m.sequencing.as_deref(), Some("sequential-merge-only"));
     assert_eq!(m.correlation_id.as_deref(), Some("c-high1"));
     assert_eq!(m.reviewed_head.as_deref(), Some("abc1234"));
     assert_eq!(m.eta_minutes, Some(30));
