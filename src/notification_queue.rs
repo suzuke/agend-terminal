@@ -482,11 +482,12 @@ fn drain_lock_path(home: &Path, agent_name: &str) -> PathBuf {
 /// failed) so an UNCONTENDED acquire is deterministic. `Ok(None)` (a real peer
 /// holds the OS lock) is returned immediately, never retried, so contention
 /// semantics are unchanged. The retry is BOUNDED: after `ACQUIRE_RETRIES` the
-/// original `Err` is PROPAGATED (a genuine, non-transient open failure surfaces
-/// loudly as the caller's contended/`Unavailable` path — never an infinite
-/// hang). This is the root fix for the #2028/#2072/#2074/#2333/#2383 flake
-/// family, where `Err`-under-fd-pressure was misread as contention and broke
-/// strict-outcome assertions.
+/// ORIGINAL (first) `Err` is PROPAGATED — not the last retry's — so a genuine,
+/// non-transient open failure surfaces loudly and identically as the caller's
+/// contended/`Unavailable` path (never an infinite hang). This is the root fix
+/// for the #2028/#2072/#2074/#2333/#2383 flake family, where
+/// `Err`-under-fd-pressure was misread as contention and broke strict-outcome
+/// assertions.
 fn acquire_drain_lock(lock_path: &Path) -> anyhow::Result<Option<crate::store::FileFlockGuard>> {
     #[cfg(not(test))]
     {
@@ -498,14 +499,23 @@ fn acquire_drain_lock(lock_path: &Path) -> anyhow::Result<Option<crate::store::F
         if test_hooks::force_contention(lock_path) {
             return Ok(None);
         }
-        let mut result = crate::store::try_acquire_file_lock(lock_path);
-        let mut retries = 0;
-        while result.is_err() && retries < test_hooks::ACQUIRE_RETRIES {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            result = crate::store::try_acquire_file_lock(lock_path);
-            retries += 1;
+        // Preserve the FIRST error: an `Ok(..)` (acquired or real contention)
+        // returns immediately; otherwise retry transient `Err`s but keep the
+        // original so IT is what propagates once the bound is exhausted — not
+        // the last retry's error. `raw_acquire` also honors a forced-error seam
+        // so a test can prove that identity across exhaustion.
+        let first = test_hooks::raw_acquire(lock_path);
+        if first.is_ok() {
+            return first;
         }
-        result
+        for _ in 0..test_hooks::ACQUIRE_RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let retry = test_hooks::raw_acquire(lock_path);
+            if retry.is_ok() {
+                return retry;
+            }
+        }
+        first
     }
 }
 
@@ -561,6 +571,40 @@ mod test_hooks {
         if let Some(s) = FORCED.lock().as_mut() {
             s.remove(p);
         }
+    }
+
+    /// Per-path forced-error mode. While armed, `raw_acquire` returns a DISTINCT
+    /// `Err` on every call (message carries an incrementing ordinal) instead of
+    /// touching the real lock, so a test can exhaust the retry bound and assert
+    /// that the FIRST/original `Err` is the one propagated. Value = count so far.
+    static FORCED_ERRORS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+    pub(super) fn arm_forced_errors(p: &Path) {
+        FORCED_ERRORS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(p.to_path_buf(), 0);
+    }
+    pub(super) fn clear_forced_errors(p: &Path) {
+        if let Some(m) = FORCED_ERRORS.lock().as_mut() {
+            m.remove(p);
+        }
+    }
+
+    /// The single lock-acquire step used by `acquire_drain_lock`: the real OS
+    /// lock, UNLESS forced-error mode is armed for `p` — then a distinct
+    /// `Err("forced-acquire-err-{n}")` (n = 1, 2, 3…) so the retry-exhaustion
+    /// path is exercised with identifiable errors. The `FORCED_ERRORS` guard is
+    /// dropped before the real lock op.
+    pub(super) fn raw_acquire(p: &Path) -> anyhow::Result<Option<crate::store::FileFlockGuard>> {
+        {
+            let mut g = FORCED_ERRORS.lock();
+            if let Some(n) = g.as_mut().and_then(|m| m.get_mut(p)) {
+                *n += 1;
+                return Err(anyhow::anyhow!("forced-acquire-err-{n}"));
+            }
+        }
+        crate::store::try_acquire_file_lock(p)
     }
 }
 
@@ -1500,6 +1544,31 @@ mod tests {
             test_hooks::acquire_attempts(&lp),
             1,
             "true-empty must drain in exactly one attempt, not burn the retry budget"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// reviewer5 (PR #2666): past the retry bound, `acquire_drain_lock` must
+    /// propagate the ORIGINAL (first) `Err`, not the last retry's — the contract
+    /// the doc + dispatch spec require. Forced-error mode makes every acquire
+    /// return a DISTINCT `Err`, so exhausting the bound proves the first one
+    /// survives.
+    #[test]
+    fn acquire_drain_lock_propagates_original_err_after_retry_exhaustion() {
+        let home = tmp_home("acquire-err-identity");
+        let lp = drain_lock_path(&home, "a");
+        test_hooks::arm_forced_errors(&lp);
+        let result = acquire_drain_lock(&lp);
+        test_hooks::clear_forced_errors(&lp);
+        // (`FileFlockGuard` isn't `Debug`, so match rather than `expect_err`.)
+        let err = match result {
+            Ok(_) => panic!("all acquires forced to Err → the wrapper must return an Err"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            "forced-acquire-err-1",
+            "the ORIGINAL (first) error must survive retry exhaustion, not the last retry's"
         );
         std::fs::remove_dir_all(home).ok();
     }
