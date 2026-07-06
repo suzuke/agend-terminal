@@ -133,8 +133,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         let canonical_present = !source_repo.is_empty()
             && std::fs::metadata(source_repo).is_ok()
             && crate::git_helpers::git_ok(Path::new(source_repo), &["rev-parse", "--git-dir"]);
-        let gitdir_resolves =
-            worktree_exists_on_disk && crate::git_helpers::git_ok(wt_path, &["rev-parse", "--git-dir"]);
+        let gitdir_resolves = worktree_exists_on_disk
+            && crate::git_helpers::git_ok(wt_path, &["rev-parse", "--git-dir"]);
         let worktree_resolves = canonical_present && gitdir_resolves;
         let invalid_reason: Option<&str> = if !worktree_exists_on_disk {
             Some("worktree_missing")
@@ -236,6 +236,14 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
     out.sort();
     out
 }
+
+// #t-…83936-4 protection ① liveness tests (worktree_resolves / invalid_reason)
+// live in a sibling file loaded via `#[path]` so binding_state.rs stays under
+// the MCP-handler LOC ceiling (file_size_invariant skips "*test*"-named files) —
+// the Sprint 54/55 file_size_invariant pattern also used by channel.rs.
+#[cfg(test)]
+#[path = "binding_state_liveness_tests.rs"]
+mod liveness_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

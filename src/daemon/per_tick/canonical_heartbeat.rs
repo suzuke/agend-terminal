@@ -62,8 +62,10 @@ impl PerTickHandler for CanonicalHeartbeatHandler {
             return;
         }
         let repos = crate::binding::bound_source_repos(ctx.home);
-        let registered: HashSet<String> =
-            repos.iter().map(|r| r.to_string_lossy().into_owned()).collect();
+        let registered: HashSet<String> = repos
+            .iter()
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect();
         let mut alerted = self.alerted.lock();
         for repo in &repos {
             let key = repo.to_string_lossy().into_owned();
