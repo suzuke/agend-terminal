@@ -42,19 +42,22 @@ fn validate_release_path_rejects_shallow() {
 
 #[test]
 #[cfg(unix)]
-fn validate_release_path_accepts_deep_existing() {
-    // Create a temp dir deep enough to pass.
+fn validate_release_path_refuses_non_worktree_deep_dir_83936() {
+    // #t-…83936-6: SEMANTIC TIGHTENING (was `..._accepts_deep_existing`, which
+    // asserted a plain deep dir is ACCEPTED — that permissive accept is exactly
+    // what let a canonical repo through to the `remove_dir_all` fallback). Under
+    // the whitelist, validate now accepts ONLY a real linked worktree; a deep
+    // non-worktree dir is refused. The positive control (a legit linked worktree
+    // IS accepted) is `handle_release_repo_still_removes_linked_worktree_83936`.
     let home = std::env::var("HOME").expect("HOME must be set");
     let dir =
         std::path::PathBuf::from(home).join(format!(".agend-release-test-{}", std::process::id()));
     let deep = dir.join("sub");
     std::fs::create_dir_all(&deep).ok();
     let result = super::validate_release_path(deep.to_str().expect("valid UTF-8"));
-    // Should pass (deep enough, not system dir).
     assert!(
-        result.is_ok(),
-        "deep existing path should pass: {:?}",
-        result.err()
+        result.is_err(),
+        "a non-worktree deep dir must now be REFUSED (whitelist), got {result:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -119,8 +122,89 @@ fn validate_release_path_refuses_primary_working_tree_83936() {
     assert!(
         result
             .as_ref()
-            .is_err_and(|e| e.contains("primary working tree")),
+            .is_err_and(|e| e.contains("linked worktree")),
         "a primary/main working tree must be refused, got {result:?}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// reviewer5's bypass (#2668 r0): a BARE repo has NO `.git` child (it IS a git
+/// dir), so the earlier `.git.is_dir()` blacklist let it through and the fallback
+/// `remove_dir_all`'d it. The whitelist (`.git` must be a gitlink FILE) refuses
+/// it. RED against the blacklist code, GREEN after.
+#[test]
+#[cfg(unix)]
+fn handle_release_repo_never_deletes_bare_repo_83936() {
+    let base = release_guard_tmp("no-delete-bare");
+    let bare = base.join("bare-repo.git");
+    std::fs::create_dir_all(&bare).ok();
+    let _ = std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(&bare)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    assert!(bare.join("HEAD").exists(), "a bare repo must have HEAD");
+    assert!(!bare.join(".git").exists(), "a bare repo has NO .git child");
+
+    let _ = handle_release_repo(&serde_json::json!({"path": bare.to_str().unwrap()}));
+
+    assert!(
+        bare.exists() && bare.join("HEAD").exists(),
+        "a bare source repo MUST survive a release call (reviewer5 bare-repo bypass)"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// reviewer4's bypass (#2668 r0'): a `git init --separate-git-dir` MAIN tree has
+/// a gitlink `.git` FILE, so a filesystem `.git`-is-file whitelist would wrongly
+/// DELETE it. The git-based check (a main tree's git-dir == common-dir) refuses
+/// it. RED against the filesystem whitelist, GREEN with the git check.
+#[test]
+#[cfg(unix)]
+fn handle_release_repo_never_deletes_separate_git_dir_main_83936() {
+    let base = release_guard_tmp("no-delete-sepgit");
+    let worktree = base.join("main-worktree");
+    let gitdir = base.join("main-gitdir");
+    let _ = std::process::Command::new("git")
+        .args([
+            "init",
+            "--separate-git-dir",
+            gitdir.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+        ])
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    assert!(
+        worktree.join(".git").is_file(),
+        "a --separate-git-dir main's .git must be a gitlink FILE"
+    );
+    let keep = worktree.join("KEEP.txt");
+    std::fs::write(&keep, "main content").unwrap();
+
+    let _ = handle_release_repo(&serde_json::json!({"path": worktree.to_str().unwrap()}));
+
+    assert!(
+        worktree.exists() && keep.exists(),
+        "a --separate-git-dir MAIN tree MUST survive (reviewer4 gitlink-file bypass)"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Fail-safe (⑤): a non-repo dir git cannot classify must be REFUSED, not
+/// deleted (prefer a false reject over data loss).
+#[test]
+#[cfg(unix)]
+fn handle_release_repo_refuses_non_repo_dir_83936() {
+    let base = release_guard_tmp("non-repo");
+    let dir = base.join("just-a-dir");
+    std::fs::create_dir_all(&dir).ok();
+    std::fs::write(dir.join("file.txt"), "data").unwrap();
+
+    let _ = handle_release_repo(&serde_json::json!({"path": dir.to_str().unwrap()}));
+
+    assert!(
+        dir.exists(),
+        "a non-repo dir must be refused (git can't classify → fail-safe)"
     );
     std::fs::remove_dir_all(&base).ok();
 }
