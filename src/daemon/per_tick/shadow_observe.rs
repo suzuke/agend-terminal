@@ -52,12 +52,17 @@ impl PerTickHandler for ShadowObserveHandler {
         // it before touching any per-agent core lock (never hold the registry lock
         // across another lock — mirrors `api_activity_probe::probe_once`). child_alive
         // is read here (its own `child.lock()`) so the reduce loop needs only core.lock.
-        let mut agents: Vec<(String, Arc<CoreMutex<AgentCore>>, bool)> = {
+        let mut agents: Vec<(String, Arc<CoreMutex<AgentCore>>, bool, String)> = {
             let reg = crate::agent::lock_registry(ctx.registry);
             reg.values()
                 .map(|h| {
                     let child_alive = h.child.lock().process_id().is_some();
-                    (h.name.to_string(), Arc::clone(&h.core), child_alive)
+                    (
+                        h.name.to_string(),
+                        Arc::clone(&h.core),
+                        child_alive,
+                        h.backend_command.clone(),
+                    )
                 })
                 .collect()
         };
@@ -72,13 +77,16 @@ impl PerTickHandler for ShadowObserveHandler {
         agents.extend(
             crate::ephemeral_tracking::live_children_snapshot()
                 .into_iter()
-                .map(|w| (w.worker_id, w.core, w.child_alive)),
+                .map(|w| (w.worker_id, w.core, w.child_alive, String::new())),
         );
         if agents.is_empty() {
             return;
         }
+        // #2413 (a): campaign-gated (default-off) reconcile telemetry. Checked once
+        // per tick so a disabled campaign costs one env read, not one per agent.
+        let reconcile = crate::daemon::shadow::reconcile_log::enabled();
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        for (name, core, child_alive) in &agents {
+        for (name, core, child_alive, backend_command) in &agents {
             // Read the screen + liveness inputs under one core.lock(), drop it, run the
             // reduce (which takes the shadow buffer/runtime locks — DISJOINT from
             // core.lock, and no thread ever acquires core.lock while holding those, so
@@ -95,6 +103,17 @@ impl PerTickHandler for ShadowObserveHandler {
             };
             let status = shadow::observe(name, screen, &live, now_ms);
             log_correction(name, raw_state, screen, &status, &live);
+            if reconcile {
+                crate::daemon::shadow::reconcile_log::record(
+                    ctx.home,
+                    name,
+                    backend_command,
+                    raw_state,
+                    screen,
+                    &status,
+                    &live,
+                );
+            }
             // #2413 (A): publish the GATED badge override into the lock-free mirror the
             // render snapshot reads (Some ⇒ a high-confidence correction the badge shows;
             // None ⇒ render keeps the raw state). Computed BEFORE `status` moves into

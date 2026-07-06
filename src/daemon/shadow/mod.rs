@@ -21,6 +21,7 @@ pub mod evidence;
 pub(crate) mod gate;
 pub mod kiro;
 pub mod opencode;
+pub(crate) mod reconcile_log;
 pub mod reducer;
 pub mod rollout;
 
