@@ -59,6 +59,131 @@ fn validate_release_path_accepts_deep_existing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ── #t-…83936-6 P0: NEVER release a primary/main working tree ───────────────
+// The 2026-07-06 canonical-deletion incident: `repo release path=<canonical>`
+// → validate passed → `git worktree remove` refused the main tree → the
+// `remove_dir_all` fallback deleted the ENTIRE repo. Fixtures live under $HOME
+// (a plain path like the real incident) NOT temp_dir — `/var`→`/private` is
+// already system-prefix-rejected and would MASK the guard under test.
+
+#[cfg(unix)]
+fn release_guard_tmp(tag: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").expect("HOME must be set");
+    let d = std::path::PathBuf::from(home).join(format!(
+        ".agend-release-guard-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&d).ok();
+    d
+}
+
+#[cfg(unix)]
+fn release_guard_git_init(dir: &Path) {
+    std::fs::create_dir_all(dir).ok();
+    for args in [
+        &["init", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let _ = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn validate_release_path_refuses_primary_working_tree_83936() {
+    let base = release_guard_tmp("validate-main");
+    let repo = base.join("source-repo");
+    release_guard_git_init(&repo);
+    assert!(
+        repo.join(".git").is_dir(),
+        "a main repo's .git must be a dir"
+    );
+    let result = super::validate_release_path(repo.to_str().unwrap());
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.contains("primary working tree")),
+        "a primary/main working tree must be refused, got {result:?}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Incident repro (RED against pre-fix code, which `remove_dir_all`s the repo):
+/// a `repo release` pointed at a main repo must leave the repo fully intact.
+#[test]
+#[cfg(unix)]
+fn handle_release_repo_never_deletes_main_repo_83936() {
+    let base = release_guard_tmp("no-delete-main");
+    let repo = base.join("source-repo");
+    release_guard_git_init(&repo);
+    let keep = repo.join("KEEP.txt");
+    std::fs::write(&keep, "canonical content").unwrap();
+
+    let _ = handle_release_repo(&serde_json::json!({"path": repo.to_str().unwrap()}));
+
+    assert!(
+        repo.exists(),
+        "the main repo dir MUST survive a release call (canonical incident)"
+    );
+    assert!(repo.join(".git").is_dir(), ".git MUST survive");
+    assert!(keep.exists(), "repo contents MUST survive");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Counter-example: a genuine LINKED worktree (`.git` is a gitlink file) is
+/// still releasable — the guard must not over-block legitimate releases.
+#[test]
+#[cfg(unix)]
+fn handle_release_repo_still_removes_linked_worktree_83936() {
+    let base = release_guard_tmp("linked-ok");
+    let repo = base.join("source-repo");
+    release_guard_git_init(&repo);
+    let _ = std::process::Command::new("git")
+        .args(["branch", "feat", "main"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let wt = base.join("linked-wt");
+    let add = std::process::Command::new("git")
+        .args(["worktree", "add", wt.to_str().unwrap(), "feat"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree's .git must be a gitlink FILE; add stderr: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    assert!(
+        super::validate_release_path(wt.to_str().unwrap()).is_ok(),
+        "a linked worktree must validate OK"
+    );
+    let _ = handle_release_repo(&serde_json::json!({"path": wt.to_str().unwrap()}));
+    assert!(
+        !wt.exists(),
+        "a linked worktree must still be releasable/removed"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 #[test]
 fn dispatch_with_branch_and_repo_auto_invokes_watch_ci() {
     let home = std::env::temp_dir().join(format!("agend-auto-watch-{}", std::process::id()));

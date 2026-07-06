@@ -1,5 +1,18 @@
 use serde_json::{json, Value};
 
+/// #t-…83936-6 P0 (data-loss incident): is `p` a git PRIMARY/main working tree
+/// (i.e. a real source repo), as opposed to a linked worktree?
+///
+/// A main working tree's `.git` is a DIRECTORY (the actual object store); a
+/// linked worktree's `.git` is a gitlink FILE (`gitdir: <repo>/.git/worktrees/…`).
+/// `handle_release_repo`'s `remove_dir_all` fallback runs whenever
+/// `git worktree remove` fails — and git ALWAYS refuses to remove a main working
+/// tree — so without this guard a `repo release` pointed at a canonical repo
+/// deletes the ENTIRE repo (the 2026-07-06 canonical-deletion incident).
+pub(crate) fn is_primary_working_tree(p: &std::path::Path) -> bool {
+    p.join(".git").is_dir()
+}
+
 /// Reject paths that would be dangerous to `remove_dir_all`.
 /// Validate and canonicalize a release path. Returns canonical absolute
 /// path on success, or error message on rejection.
@@ -52,6 +65,15 @@ pub(crate) fn validate_release_path(path_str: &str) -> Result<std::path::PathBuf
     }
     if canonical.components().count() < 3 {
         return Err(format!("rejected: too shallow: {}", canonical.display()));
+    }
+    // #t-…83936-6 P0: NEVER release a primary/main working tree — the fallback
+    // below would `remove_dir_all` the whole source repo (canonical-deletion
+    // incident). A releasable worktree is a LINKED one (`.git` is a gitlink file).
+    if is_primary_working_tree(&canonical) {
+        return Err(format!(
+            "rejected: primary working tree (source repo), not a releasable worktree: {}",
+            canonical.display()
+        ));
     }
     Ok(canonical)
 }
@@ -110,11 +132,18 @@ pub(crate) fn handle_release_repo(args: &Value) -> Value {
     ) {
         Ok(o) if o.status.success() => return json!({"path": path}),
         Ok(o) => {
-            let _ = std::fs::remove_dir_all(&canonical);
+            // #t-…83936-6 depth guard: NEVER `remove_dir_all` a primary working
+            // tree even if `git worktree remove` failed and validate was somehow
+            // bypassed — this fallback is what deleted the canonical.
+            if !is_primary_working_tree(&canonical) {
+                let _ = std::fs::remove_dir_all(&canonical);
+            }
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
         Err(_) => {
-            let _ = std::fs::remove_dir_all(&canonical);
+            if !is_primary_working_tree(&canonical) {
+                let _ = std::fs::remove_dir_all(&canonical);
+            }
             json!({"path": path})
         }
     };
