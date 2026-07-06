@@ -103,16 +103,26 @@ impl PerTickHandler for HourlyGcHandler {
         // past its per-sweep isolation. Per-sweep results stay observable via
         // tracing/event_log, exactly as before this offload.
         std::thread::spawn(move || {
-            let _guard = super::ClearOnDrop::new(in_flight);
+            // The guard is SCOPED so `in_flight` is cleared (its `Drop`) BEFORE
+            // the test-only completion signal below — a test waking on that
+            // signal then observes `!is_in_flight()` deterministically, with no
+            // wall-clock poll. In non-test builds both `#[cfg(test)]` lines
+            // vanish and the extra scope is a no-op (the guard still drops at
+            // closure end), so production behaviour is byte-identical.
+            {
+                let _guard = super::ClearOnDrop::new(in_flight);
+                #[cfg(test)]
+                test_hooks::round_gate();
+                run_due_sweeps_isolated(
+                    &home,
+                    (due_gc, &gc_tick),
+                    (due_wb, &workspace_boundary),
+                    (due_tmp, &tmp_review),
+                    (due_rec, &reconcile_backups),
+                );
+            }
             #[cfg(test)]
-            test_hooks::maybe_delay();
-            run_due_sweeps_isolated(
-                &home,
-                (due_gc, &gc_tick),
-                (due_wb, &workspace_boundary),
-                (due_tmp, &tmp_review),
-                (due_rec, &reconcile_backups),
-            );
+            test_hooks::signal_round_complete();
         });
     }
 }
@@ -164,22 +174,35 @@ fn run_sweep_isolated(name: &'static str, f: impl FnOnce()) {
     }
 }
 
-/// Test-only seams: fault injection for the per-sweep isolation property, and a
-/// delay seam for the #P1-2607 freeze regression. `FORCE_PANIC`/`INVOKED` are
-/// thread-local because the isolation tests drive `run_due_sweeps_isolated`
-/// SYNCHRONOUSLY on the test thread; `DELAY_MS` is a global because the freeze
-/// test observes it from the spawned background thread (mirrors #2614's seam).
+/// Test-only seams. Two independent groups:
+///
+/// * Per-sweep panic isolation: `FORCE_PANIC`/`INVOKED` are thread-local
+///   because the isolation tests drive `run_due_sweeps_isolated` SYNCHRONOUSLY
+///   on the test thread.
+/// * #P1-2607 offload determinism (t-20260706034654060827-81457-3): a `GATE`
+///   the spawned round blocks on (so a test can hold a round provably
+///   in-flight) and a monotone `COMPLETIONS` counter bumped AFTER the round's
+///   `ClearOnDrop` clears `in_flight`. These replace the old wall-clock
+///   `DELAY_MS` sleep, whose `elapsed() < 100ms` / 2s-poll assertions flaked
+///   under full-parallel-nextest CPU contention. They are process-global
+///   because the round observes them from its background thread; the two tests
+///   that use them are `serial(hourly_gc_delay)`, so they never race each other.
 #[cfg(test)]
 mod test_hooks {
+    use parking_lot::{Condvar, Mutex};
     use std::cell::{Cell, RefCell};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     thread_local! {
         static FORCE_PANIC: Cell<Option<&'static str>> = const { Cell::new(None) };
         static INVOKED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
 
-    static DELAY_MS: AtomicU64 = AtomicU64::new(0);
+    /// `true` while the gate is armed — a spawned round blocks in `round_gate`.
+    static GATE_ARMED: Mutex<bool> = Mutex::new(false);
+    static GATE_CV: Condvar = Condvar::new();
+    /// Monotone count of rounds that have finished (and cleared `in_flight`).
+    static COMPLETIONS: Mutex<u64> = Mutex::new(0);
+    static COMPLETIONS_CV: Condvar = Condvar::new();
 
     /// Records that `name`'s sweep was reached (so a test can assert every DUE
     /// sweep was attempted, in order, even when one panics), then panics if
@@ -203,18 +226,53 @@ mod test_hooks {
         INVOKED.with(|v| std::mem::take(&mut *v.borrow_mut()))
     }
 
-    pub(super) fn set_delay_ms(ms: u64) {
-        DELAY_MS.store(ms, Ordering::Release);
+    /// Reset both offload seams to idle. Called at the start of each test that
+    /// uses them so a prior test — or an early return/panic before
+    /// `release_gate` — can't leave the gate armed or the counter dirty.
+    pub(super) fn reset() {
+        *GATE_ARMED.lock() = false;
+        GATE_CV.notify_all();
+        *COMPLETIONS.lock() = 0;
     }
 
-    pub(super) fn clear_delay() {
-        DELAY_MS.store(0, Ordering::Release);
+    /// Arm the gate so the NEXT spawned round blocks in `round_gate` until
+    /// `release_gate`, letting a test hold a round provably in-flight.
+    pub(super) fn arm_gate() {
+        *GATE_ARMED.lock() = true;
     }
 
-    pub(super) fn maybe_delay() {
-        let ms = DELAY_MS.load(Ordering::Acquire);
-        if ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
+    /// Release a gated round (and any future ones) so it runs to completion.
+    pub(super) fn release_gate() {
+        *GATE_ARMED.lock() = false;
+        GATE_CV.notify_all();
+    }
+
+    /// Called by a spawned round (replaces the old `maybe_delay`): blocks while
+    /// the gate is armed, else falls straight through.
+    pub(super) fn round_gate() {
+        let mut armed = GATE_ARMED.lock();
+        while *armed {
+            GATE_CV.wait(&mut armed);
+        }
+    }
+
+    /// Bumped by a spawned round AFTER its `ClearOnDrop` cleared `in_flight`.
+    pub(super) fn signal_round_complete() {
+        *COMPLETIONS.lock() += 1;
+        COMPLETIONS_CV.notify_all();
+    }
+
+    /// Snapshot of the completed-round count (baseline before an action).
+    pub(super) fn completions() -> u64 {
+        *COMPLETIONS.lock()
+    }
+
+    /// Block until the completed-round count exceeds `prev`. Deterministic — no
+    /// wall-clock ceiling; a genuine hang is caught by nextest's slow-timeout.
+    pub(super) fn wait_for_completion(prev: u64) {
+        let mut n = COMPLETIONS.lock();
+        while *n <= prev {
+            COMPLETIONS_CV.wait(&mut n);
         }
     }
 }
@@ -227,7 +285,6 @@ mod tests {
     use parking_lot::Mutex as PLMutex;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -313,15 +370,23 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// #P1-2607 freeze-regression pin: `run()` must return near-instantly even
-    /// while the round's work is slow (the pathological case that froze the
-    /// daemon — heavy git subprocess work on the main tick loop, simulated via
-    /// the `test_hooks` delay seam). Also pins the re-entrancy guard: a second
-    /// fire while the first round is still running must skip, not spawn an
-    /// overlapping round. Serial: the delay seam is a process-global.
+    /// #P1-2607 freeze-regression pin, made DETERMINISTIC
+    /// (t-20260706034654060827-81457-3): `run()` must offload the round's work
+    /// to a background thread and return without waiting for it. The old version
+    /// proved this with wall-clock `elapsed() < 100ms` assertions, which flaked
+    /// under full-parallel-nextest CPU contention (3 samples). Here a test GATE
+    /// holds the spawned round provably in-flight, so the property is proven
+    /// STRUCTURALLY at any machine speed: had `run()` done the work inline it
+    /// would block on the armed gate and never return (a hang nextest's
+    /// slow-timeout attributes), so reaching the post-`run()` assertions — with
+    /// the round still `in_flight` — is itself the proof of offload. Also pins
+    /// the re-entrancy guard deterministically: exactly ONE round completes even
+    /// though `run()` fired twice while the first was in flight. Serial: the
+    /// gate/counter seams are process-global.
     #[test]
     #[serial_test::serial(hourly_gc_delay)]
     fn run_does_not_block_tick_loop_during_slow_round_p1_2607() {
+        test_hooks::reset();
         let home = tmp_home("slow-round");
         let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
         let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
@@ -334,51 +399,53 @@ mod tests {
             configs: &configs,
         };
 
-        test_hooks::set_delay_ms(300);
+        // Arm the gate so the spawned round blocks mid-flight until we release.
+        test_hooks::arm_gate();
         let h = HourlyGcHandler::new(1); // fires every call
 
-        let start = Instant::now();
+        // If `run()` ran the round inline it would block on the armed gate and
+        // never return — reaching the next line proves it offloaded.
         h.run(&ctx);
-        assert!(
-            start.elapsed() < Duration::from_millis(100),
-            "run() must not block the tick loop on the (delayed) round, took {:?}",
-            start.elapsed()
-        );
         assert!(
             h.is_in_flight(),
-            "the background round should still be running (300ms delay, checked immediately)"
+            "the offloaded round must still be in flight (blocked on the gate)"
         );
 
-        // The very next tick arriving while the previous round is still in
-        // flight: gates fire again, but the re-entrancy guard must skip spawning
-        // a second overlapping round — and still return near-instantly.
-        let start2 = Instant::now();
+        // A second tick while the first round is still in flight: the
+        // re-entrancy guard must skip spawning a second overlapping round — and
+        // this call must also return (not block on the gate).
         h.run(&ctx);
         assert!(
-            start2.elapsed() < Duration::from_millis(100),
-            "the re-entrant skip path must also return near-instantly"
+            h.is_in_flight(),
+            "re-entrant tick must neither block nor clear the in-flight round"
         );
 
-        // Poll for the background round to finish (300ms delay; 2s is a generous
-        // CI-jitter ceiling) and confirm the guard clears.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while h.is_in_flight() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Release the round and wait — deterministically — for it to finish.
+        let before = test_hooks::completions();
+        test_hooks::release_gate();
+        test_hooks::wait_for_completion(before);
+
+        assert_eq!(
+            test_hooks::completions(),
+            before + 1,
+            "exactly ONE round may complete — the re-entrant second run() must \
+             have skipped, not spawned an overlapping round"
+        );
         assert!(
             !h.is_in_flight(),
             "in_flight must clear once the background round completes"
         );
 
-        test_hooks::clear_delay();
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Smoke: `run()` against empty fixtures completes (the background round
-    /// finishes and clears `in_flight`) without panic.
+    /// Smoke, made deterministic: `run()` against empty fixtures spawns a round
+    /// that finishes and clears `in_flight`. No wall-clock poll — the test
+    /// blocks on the completion signal (bumped after the guard clears the flag).
     #[test]
     #[serial_test::serial(hourly_gc_delay)]
     fn run_is_no_op_on_empty_fixtures() {
+        test_hooks::reset();
         let home = tmp_home("empty");
         let registry: AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
         let externals: ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
@@ -392,12 +459,9 @@ mod tests {
         };
 
         let h = HourlyGcHandler::new(1);
+        let before = test_hooks::completions();
         h.run(&ctx);
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while h.is_in_flight() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        test_hooks::wait_for_completion(before);
         assert!(
             !h.is_in_flight(),
             "background round should finish on empty fixtures"
