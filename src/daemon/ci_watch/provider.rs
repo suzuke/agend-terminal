@@ -781,7 +781,11 @@ impl CiProvider for GitHubCiProvider {
                 jobs.iter().find_map(|job| {
                     job["steps"].as_array().and_then(|steps| {
                         steps.iter().find_map(|step| {
-                            (step["conclusion"].as_str() == Some("failure")).then(|| {
+                            matches!(
+                                super::poller::CiOutcome::from(step["conclusion"].as_str()),
+                                super::poller::CiOutcome::Failure
+                            )
+                            .then(|| {
                                 format!(
                                     "{} / {}",
                                     job["name"].as_str().unwrap_or("?"),

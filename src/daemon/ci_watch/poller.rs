@@ -868,6 +868,41 @@ pub(crate) fn parse_review_class(
     }
 }
 
+/// The poller's display-layer distinction over a raw CI `conclusion`
+/// string — exactly the 3-way split the notification/aggregation logic
+/// below makes: `Pending` (no conclusion yet / still running), `Success` /
+/// `Failure` get their own `[ci-pass]` / `[ci-fail]` headline, and
+/// everything else (`cancelled`, `timed_out`, `skipped`, `neutral`,
+/// `action_required`, `stale`, …) falls into `Other` and is displayed
+/// VERBATIM via `[ci-ended] …: {other}` (see `ci_notification_message`).
+///
+/// Distinct from [`crate::daemon::pr_state::CiConclusion`], which is the
+/// REDUCER's 2-state view (`Green` vs `Failed`) — correct at that layer
+/// because `CiState` doesn't distinguish a cancelled run from a failed one.
+/// Merging the two would collapse `Other`'s display semantics here: a
+/// cancelled run would render as `[ci-fail]` instead of `[ci-ended] …:
+/// cancelled`, silently changing user-facing notification text. Do not
+/// merge them. Derived from the Pattern-A follow-up spike, gapfix task
+/// t-20260621072505708315-50793-7 (full ~15-site inventory + rationale).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CiOutcome {
+    Pending,
+    Success,
+    Failure,
+    Other(String),
+}
+
+impl From<Option<&str>> for CiOutcome {
+    fn from(conclusion: Option<&str>) -> Self {
+        match conclusion {
+            None => Self::Pending,
+            Some("success") => Self::Success,
+            Some("failure") => Self::Failure,
+            Some(other) => Self::Other(other.to_string()),
+        }
+    }
+}
+
 pub(crate) fn aggregate_conclusion_for_sha<'a>(runs: &'a [CiRun], sha: &str) -> Option<&'a str> {
     aggregate_conclusion_for_sha_filtered(runs, sha, None)
 }
@@ -939,7 +974,7 @@ pub(crate) fn aggregate_conclusion_for_sha_filtered<'a>(
     // Fail-fast: any failure → immediately report (don't wait for in-progress)
     if matching
         .iter()
-        .any(|r| r.conclusion.as_deref() == Some("failure"))
+        .any(|r| matches!(CiOutcome::from(r.conclusion.as_deref()), CiOutcome::Failure))
     {
         return Some("failure");
     }
@@ -949,7 +984,7 @@ pub(crate) fn aggregate_conclusion_for_sha_filtered<'a>(
     }
     if let Some(r) = matching
         .iter()
-        .find(|r| r.conclusion.as_deref() != Some("success"))
+        .find(|r| !matches!(CiOutcome::from(r.conclusion.as_deref()), CiOutcome::Success))
     {
         return r.conclusion.as_deref();
     }
@@ -976,7 +1011,7 @@ fn aggregate_conclusion_for_indices<'a>(
     }
     if matching
         .iter()
-        .any(|r| r.conclusion.as_deref() == Some("failure"))
+        .any(|r| matches!(CiOutcome::from(r.conclusion.as_deref()), CiOutcome::Failure))
     {
         return Some("failure");
     }
@@ -985,7 +1020,7 @@ fn aggregate_conclusion_for_indices<'a>(
     }
     if let Some(r) = matching
         .iter()
-        .find(|r| r.conclusion.as_deref() != Some("success"))
+        .find(|r| !matches!(CiOutcome::from(r.conclusion.as_deref()), CiOutcome::Success))
     {
         return r.conclusion.as_deref();
     }
@@ -1098,7 +1133,7 @@ pub(crate) fn build_inbox_body(
     run_id: Option<u64>,
     log_tail: Option<&str>,
 ) -> String {
-    if conclusion == "failure" {
+    if matches!(CiOutcome::from(Some(conclusion)), CiOutcome::Failure) {
         let detail = failure_detail.unwrap_or("unknown step");
         let run_id_str = run_id
             .map(|id| id.to_string())
@@ -1139,14 +1174,14 @@ fn ci_notification_message(
     _failure_detail: Option<&str>,
     head_sha: Option<&str>,
 ) -> Option<String> {
-    let conclusion = conclusion?;
     let sha_short = head_sha
         .map(|s| format!(" ({})", &s[..s.len().min(7)]))
         .unwrap_or_default();
-    let msg = match conclusion {
-        "failure" => format!("[ci-fail] {repo}@{branch}{sha_short}: failure"),
-        "success" => format!("[ci-pass] {repo}@{branch}{sha_short}: passed ✓"),
-        other => format!("[ci-ended] {repo}@{branch}{sha_short}: {other}"),
+    let msg = match CiOutcome::from(conclusion) {
+        CiOutcome::Pending => return None,
+        CiOutcome::Failure => format!("[ci-fail] {repo}@{branch}{sha_short}: failure"),
+        CiOutcome::Success => format!("[ci-pass] {repo}@{branch}{sha_short}: passed ✓"),
+        CiOutcome::Other(other) => format!("[ci-ended] {repo}@{branch}{sha_short}: {other}"),
     };
     Some(msg)
 }
@@ -1237,7 +1272,7 @@ async fn check_early_job_failures(
         let jobs = provider.fetch_run_jobs(ctx.repo, run.id).await;
         let failed: Vec<&CiJob> = jobs
             .iter()
-            .filter(|j| j.conclusion.as_deref() == Some("failure"))
+            .filter(|j| matches!(CiOutcome::from(j.conclusion.as_deref()), CiOutcome::Failure))
             .collect();
         if failed.is_empty() {
             continue;
@@ -1802,6 +1837,11 @@ async fn fan_out_notifications(
         if conclusion.is_none() {
             continue;
         }
+        // CiOutcome (Pattern-A follow-up, t-20260621072505708315-50793-7):
+        // `conclusion` is guaranteed `Some` past the check above, so `outcome`
+        // never observes `Pending` here — see `ci_notification_message` for
+        // the site that legitimately maps `None` to `Pending`.
+        let outcome = CiOutcome::from(conclusion);
         if *run_id > max_notified_id {
             max_notified_id = *run_id;
         }
@@ -1838,7 +1878,7 @@ async fn fan_out_notifications(
         // re-evaluates — a LATER required failure on this same sha is never hidden
         // (the lead's hard rule). fail-OPEN: only a definitive Some(false) suppresses;
         // None (no open PR / API error / no rollup) falls through to the normal emit.
-        if conclusion == Some("failure")
+        if matches!(outcome, CiOutcome::Failure)
             && provider.required_check_failed(ctx.repo, ctx.branch).await == Some(false)
         {
             tracing::debug!(
@@ -1861,7 +1901,7 @@ async fn fan_out_notifications(
             let rep = conclusion
                 .and_then(|c| representative_run(&pr.runs, sha, c))
                 .unwrap_or(run);
-            let failure_detail = if conclusion == Some("failure") {
+            let failure_detail = if matches!(outcome, CiOutcome::Failure) {
                 Some(provider.fetch_failure_summary(ctx.repo, rep.id).await)
             } else {
                 None
@@ -1870,7 +1910,7 @@ async fn fan_out_notifications(
             // agent doesn't need an extra `gh run view` round-trip. Async on the
             // ci runtime (the provider impl uses `gh … --log-failed` via
             // tokio::process — never block_on the shared runtime, #1476).
-            let log_tail = if conclusion == Some("failure") {
+            let log_tail = if matches!(outcome, CiOutcome::Failure) {
                 provider.fetch_failure_log_tail(ctx.repo, rep.id, 120).await
             } else {
                 None
@@ -1886,7 +1926,7 @@ async fn fan_out_notifications(
 
             let repo_branch_key = format!("{}@{}", ctx.repo, ctx.branch);
             let supersede_token = format!("ci-{}-{}", run_id, sha);
-            let action_targets_on_success = if conclusion == Some("success") {
+            let action_targets_on_success = if matches!(outcome, CiOutcome::Success) {
                 state.next_after_ci_targets()
             } else {
                 Vec::new()
@@ -1921,8 +1961,8 @@ async fn fan_out_notifications(
                 // #event-bus Step 2 (legacy-zero): the success/failure pair emits
                 // (the subscriber delivers via deliver_ci_watch). A non-pair
                 // "[ci-ended]" conclusion has no event kind → direct deliver.
-                let emitted = match conclusion {
-                    Some("failure") => {
+                let emitted = match outcome {
+                    CiOutcome::Failure => {
                         crate::daemon::event_bus::global().emit(
                             ctx.home,
                             crate::daemon::event_bus::EventKind::CiFail {
@@ -1934,7 +1974,7 @@ async fn fan_out_notifications(
                         );
                         true
                     }
-                    Some("success") => {
+                    CiOutcome::Success => {
                         crate::daemon::event_bus::global().emit(
                             ctx.home,
                             crate::daemon::event_bus::EventKind::CiReady {
@@ -2050,12 +2090,14 @@ fn persist_watch_state(
         // `record_ci_result` below is keyed on repo/branch independent of routing.)
         // The ONE genuinely-silent case — no `next_after_ci` AND no subscribers
         // (a malformed watch) — is loud-logged rather than dropped silently.
-        if aggregate_conclusion_for_sha_filtered(
-            &pr.runs,
-            &pr.current_sha,
-            state.required_checks.as_deref(),
-        ) == Some("success")
-        {
+        if matches!(
+            CiOutcome::from(aggregate_conclusion_for_sha_filtered(
+                &pr.runs,
+                &pr.current_sha,
+                state.required_checks.as_deref(),
+            )),
+            CiOutcome::Success
+        ) {
             let targets = state.next_after_ci_targets();
             if !targets.is_empty() {
                 // The suppression decision is loop-INVARIANT (keyed on repo/branch/

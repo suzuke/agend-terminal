@@ -238,6 +238,18 @@ pub enum Event<'a> {
     ClosedUnmergedObserved { closed_at: String },
 }
 
+/// The reducer's 2-state view of a CI outcome — `Green` vs `Failed` — used
+/// to drive `CiState` transitions, where a cancelled run and a failed run
+/// are not actionably different (neither is "your turn").
+///
+/// Distinct from [`crate::daemon::ci_watch::poller::CiOutcome`], the
+/// poller's 3-state view — it keeps a separate `Other` case because the
+/// poller's notification/aggregation layer displays cancelled/timed_out/etc.
+/// VERBATIM (`[ci-ended] …: {other}`) rather than reporting them as a
+/// failure. Do NOT merge `CiOutcome` into this enum: collapsing `Other`
+/// into `Failed` is correct for the reducer but would change the poller's
+/// notification text. Derived from the Pattern-A follow-up spike, gapfix
+/// task t-20260621072505708315-50793-7.
 #[derive(Debug, Clone, Copy)]
 pub enum CiConclusion<'a> {
     Pending,
