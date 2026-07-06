@@ -266,6 +266,36 @@ fn canonicalize_lenient(p: &Path) -> Option<PathBuf> {
     None
 }
 
+/// #t-…81457-1: distinct `worktree` paths of every LIVE `binding.json`, for
+/// the delete-path occupancy check (mirrors `binding::bound_source_repos`'s
+/// self-healing shape, but this one MUST distinguish "no binding.json"
+/// (normal — agent never bound) from "binding.json exists but failed to
+/// read/parse" (ambiguous — may be hiding a live binding). `Err` signals the
+/// latter; the caller fails the whole sweep round closed rather than treat
+/// an ambiguous row as absent.
+fn bound_worktree_paths_or_ambiguous(home: &Path) -> Result<Vec<PathBuf>, ()> {
+    let Ok(entries) = std::fs::read_dir(crate::paths::runtime_dir(home)) else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        let agent = entry.file_name().to_string_lossy().into_owned();
+        let content = match std::fs::read_to_string(crate::paths::binding_path(home, &agent)) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(()),
+        };
+        let v: serde_json::Value = serde_json::from_str(&content).map_err(|_| ())?;
+        if let Some(wt) = v["worktree"].as_str() {
+            let path = PathBuf::from(wt);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
 /// Check if a worktree path is in use by any active agent.
 fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
     let wt_norm = normalize_path(
@@ -325,7 +355,23 @@ pub fn sweep_from_registry(
     // `configs` until it catches up. binding.json is read fresh every call and
     // is authoritative for "is anyone bound here right now", so feed it into
     // the same occupancy check directly instead of relying solely on `configs`.
-    active_dirs.extend(crate::binding::bound_worktree_paths(home));
+    //
+    // reviewer4 REJECTED r0 of this fix: an unreadable/corrupt binding.json is
+    // an AMBIGUITY, not an absence — it could be hiding a live worktree. Fail
+    // the whole round closed (no removals) rather than treat it as "not
+    // bound"; deletion is auto-run, "寧可漏收不可誤收". A merely-missing file
+    // (agent never bound) is the normal steady state and does not trigger this.
+    match bound_worktree_paths_or_ambiguous(home) {
+        Ok(paths) => active_dirs.extend(paths),
+        Err(()) => {
+            tracing::warn!(
+                "worktree-reclaim: an unreadable/corrupt binding.json was found — \
+                 skipping ALL removals this sweep tick (fail-closed); will retry \
+                 next tick"
+            );
+            return Vec::new();
+        }
+    }
 
     let mut removed = Vec::new();
 
@@ -958,7 +1004,10 @@ mod tests {
     fn sweep_skips_worktree_known_only_via_binding_json_not_yet_in_configs_registry() {
         let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("binding-only-occupancy");
-        git_in(&repo, &["branch", "feat/fresh-bind"]);
+        // Old dated commit so `is_branch_merged`'s age gate (fix #2) does NOT
+        // protect this worktree — isolates fix #1 (binding-registry occupancy)
+        // as the ONLY thing standing between this live-bound worktree and removal.
+        make_old_dated_branch(&repo, "feat/fresh-bind", "2024-01-01T00:00:00 +0000");
         let wt = repo.join("wt-fresh-bind");
         git_in(
             &repo,
@@ -984,6 +1033,93 @@ mod tests {
         assert!(
             wt.exists(),
             "the live-bound worktree directory must survive"
+        );
+
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…81457-1 REJECTED rework (reviewer4 r0): an unreadable/corrupt
+    /// `binding.json` for ANY agent is an AMBIGUITY, not an absence — it could
+    /// be hiding the very live binding that would have protected the worktree
+    /// under test. Pre-rework, `bound_worktree_paths` silently skipped it
+    /// (same as a missing file), so an old (age-gate-cleared), clean, merged
+    /// worktree with no binding of its OWN was still removed even though a
+    /// SIBLING agent's binding.json existed but failed to parse. Reproduces
+    /// reviewer4's exact repro shape: this must now skip the ENTIRE sweep
+    /// round (fail closed), not just the ambiguous row.
+    #[test]
+    fn sweep_fails_closed_when_any_binding_json_is_corrupt() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("corrupt-binding-ambiguity");
+        make_old_dated_branch(&repo, "feat/live-bound", "2024-01-01T00:00:00 +0000");
+        let wt = repo.join("wt-live-bound");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/live-bound"],
+        );
+        git_in(&repo, &["merge", "feat/live-bound"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("corrupt-binding-ambiguity");
+        let configs: HashMap<String, Option<PathBuf>> = HashMap::new();
+        // One valid binding for repo discovery ...
+        write_source_repo_binding(&home, "other-agent", &repo);
+        // ... and one CORRUPT binding.json for a DIFFERENT agent — unrelated to
+        // `feat/live-bound` on its face, but the daemon cannot know that from a
+        // file it failed to parse.
+        let corrupt_dir = crate::paths::runtime_dir(&home).join("dev3");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("binding.json"), b"not valid json").unwrap();
+
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        assert!(
+            removed.is_empty(),
+            "an unreadable/corrupt binding.json anywhere must fail the WHOLE \
+             sweep round closed, even for an unrelated, otherwise-eligible \
+             worktree: {removed:?}"
+        );
+        assert!(wt.exists(), "the worktree must survive the ambiguous round");
+
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #t-…81457-1 REJECTED rework, negative control: a MISSING binding.json
+    /// (the normal steady state — most agents are never bound) must NOT
+    /// trigger the fail-closed ambiguity path, or every legitimate cleanup
+    /// case regresses (the 26 real candidates PRUNE_LIVE's first tick
+    /// correctly reaped would silently stop being collected).
+    #[test]
+    fn sweep_still_removes_when_no_binding_json_exists_at_all() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("no-binding-normal");
+        make_old_dated_branch(&repo, "feat/done", "2024-01-01T00:00:00 +0000");
+        let wt = repo.join("wt-done");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
+        );
+        git_in(&repo, &["merge", "feat/done"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+        let home = tmp_home("no-binding-normal");
+        let configs: HashMap<String, Option<PathBuf>> = HashMap::new();
+        // Repo discovery needs ONE valid binding; no agent has a binding
+        // pointing at `wt` itself, and no binding.json anywhere is corrupt.
+        write_source_repo_binding(&home, "other-agent", &repo);
+
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        assert!(
+            removed.iter().any(|(b, _, _)| b == "feat/done"),
+            "a genuinely unbound, old, clean, merged worktree must still be \
+             removed — a merely-absent binding.json is not an ambiguity: {removed:?}"
         );
 
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
