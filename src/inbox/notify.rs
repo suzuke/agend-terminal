@@ -388,14 +388,25 @@ pub(crate) fn should_defer_inject(
         // (draft_state → `None`). `Drafting` is set ONLY by human TUI keystrokes
         // (record_input_activity), so this fires exactly when a person is
         // composing in this pane — agent PTY output never sets it.
-        operator_typing_recent(home, agent_name)
-            || crate::notification_queue::draft_state(home, agent_name)
-                == crate::notification_queue::DraftState::Drafting
+        operator_has_live_draft(home, agent_name)
     } else {
         // Ambient: the #1457 full draft gate is applied downstream by
         // route_notification — don't double-gate here.
         false
     }
+}
+
+/// Does the operator have a LIVE unsent draft in this pane's input line right
+/// now? Union of the brief post-keystroke settle window (`operator_typing_recent`,
+/// 1.5s) and the pause-immune order signal (`draft_state == Drafting`, holds up to
+/// the 5-min escape window). Single "live draft present" source of truth shared by
+/// the notification defer gate (`should_defer_inject`) and the restart defer gate
+/// (`handle_restart_instance`). Set ONLY by human TUI keystrokes — agent PTY output
+/// never sets it, so it fires exactly when a person is composing in this pane.
+pub(crate) fn operator_has_live_draft(home: &Path, agent_name: &str) -> bool {
+    operator_typing_recent(home, agent_name)
+        || crate::notification_queue::draft_state(home, agent_name)
+            == crate::notification_queue::DraftState::Drafting
 }
 
 /// #1513: did the operator type into this pane within the quiet window? Uses the

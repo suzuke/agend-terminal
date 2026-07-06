@@ -419,6 +419,70 @@ fn restart_spawn_params(
     spawn_params
 }
 
+/// Grace ceiling for [`await_unsent_draft_or_grace`]: even while the operator
+/// keeps typing, force the restart after this long so a context-full / stuck
+/// agent can't be deferred indefinitely. The primary release is the operator
+/// submitting (draft clears well before this); the ceiling only bounds the
+/// pathological continuous-typing case. Tunable.
+const RESTART_DRAFT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Re-check cadence while deferring — silent (no per-poll event / nudge).
+const RESTART_DRAFT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq)]
+enum DraftGate {
+    Proceed,
+    Defer,
+}
+
+/// Pure restart-gate decision (unit-tested exhaustively): proceed with the kill
+/// iff `force`, there is no live operator draft, or the grace ceiling has
+/// elapsed; otherwise keep deferring. Kept pure (no clock / no IO) so the whole
+/// decision matrix is deterministic without real sleeps.
+fn restart_draft_gate(
+    force: bool,
+    has_live_draft: bool,
+    elapsed: std::time::Duration,
+    grace: std::time::Duration,
+) -> DraftGate {
+    if force || !has_live_draft || elapsed >= grace {
+        DraftGate::Proceed
+    } else {
+        DraftGate::Defer
+    }
+}
+
+/// Block the restart while the operator has unsent keystrokes in `name`'s input
+/// line, releasing the instant the draft is submitted/cleared or after
+/// [`RESTART_DRAFT_GRACE`]. Emits exactly two log lines (defer-start, proceed) —
+/// no per-poll noise. Thread-safety rationale is at the call site.
+fn await_unsent_draft_or_grace(home: &Path, name: &str, force: bool) {
+    if restart_draft_gate(
+        force,
+        crate::inbox::notify::operator_has_live_draft(home, name),
+        std::time::Duration::ZERO,
+        RESTART_DRAFT_GRACE,
+    ) == DraftGate::Proceed
+    {
+        return; // fast path: force, or no live draft — no wait, no log.
+    }
+    tracing::info!(%name, "restart deferred: operator has an unsent draft in the input line");
+    let start = std::time::Instant::now();
+    while restart_draft_gate(
+        force,
+        crate::inbox::notify::operator_has_live_draft(home, name),
+        start.elapsed(),
+        RESTART_DRAFT_GRACE,
+    ) == DraftGate::Defer
+    {
+        std::thread::sleep(RESTART_DRAFT_POLL);
+    }
+    tracing::info!(
+        %name,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "restart proceeding: draft submitted/cleared or grace ceiling reached"
+    );
+}
+
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
@@ -464,6 +528,16 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         Some(r) => r,
         None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
     };
+
+    // t-95913-5: the operator's unsent keystrokes live ONLY in the input line of
+    // the process we're about to kill — a fresh OR resume restart destroys them
+    // (`--continue` restores the conversation, not the input line). If the pane
+    // has a live draft, defer the kill until the operator submits (draft clears)
+    // or a grace ceiling elapses (so continuous typing can't defer forever).
+    // Mode-agnostic; `force:true` bypasses. Safe to block here: each api tool call
+    // runs on its own `api_handler` thread (`api::serve` per-session spawn), and
+    // the operator's submit arrives via the TUI write path, not this thread.
+    await_unsent_draft_or_grace(home, name, args["force"].as_bool().unwrap_or(false));
 
     // Session-reset inbox settle: for a FRESH restart (context-lost), settle
     // all DELIVERING rows to PROCESSED before killing the old instance.

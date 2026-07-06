@@ -614,3 +614,96 @@ fn bind_topic_channel_unavailable_via_handler_991() {
     assert_eq!(resp["code"], "channel_unavailable");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── t-95913-5: defer fresh/resume restart while the operator has an unsent
+// draft in the target pane's input line. The pure `restart_draft_gate` covers
+// the whole decision matrix deterministically (no clock, no sleep). ──
+
+#[test]
+fn restart_draft_gate_proceeds_when_no_live_draft() {
+    // No unsent draft → kill immediately (gate is a no-op), any elapsed.
+    assert_eq!(
+        restart_draft_gate(false, false, std::time::Duration::ZERO, RESTART_DRAFT_GRACE),
+        DraftGate::Proceed
+    );
+}
+
+#[test]
+fn restart_draft_gate_defers_live_draft_within_grace() {
+    // Live draft, still inside the grace window → defer the kill.
+    assert_eq!(
+        restart_draft_gate(
+            false,
+            true,
+            std::time::Duration::from_secs(10),
+            RESTART_DRAFT_GRACE
+        ),
+        DraftGate::Defer
+    );
+}
+
+#[test]
+fn restart_draft_gate_proceeds_when_grace_ceiling_reached() {
+    // Live draft but grace elapsed → force the kill so continuous typing can't
+    // defer forever. Boundary: elapsed == grace proceeds.
+    assert_eq!(
+        restart_draft_gate(false, true, RESTART_DRAFT_GRACE, RESTART_DRAFT_GRACE),
+        DraftGate::Proceed
+    );
+    assert_eq!(
+        restart_draft_gate(
+            false,
+            true,
+            std::time::Duration::from_secs(61),
+            RESTART_DRAFT_GRACE
+        ),
+        DraftGate::Proceed
+    );
+}
+
+#[test]
+fn restart_draft_gate_force_bypasses_live_draft() {
+    // force:true → kill immediately even with a live draft inside the window.
+    assert_eq!(
+        restart_draft_gate(true, true, std::time::Duration::ZERO, RESTART_DRAFT_GRACE),
+        DraftGate::Proceed
+    );
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn operator_has_live_draft_reflects_unsent_keystrokes() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-live-draft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    // No metadata → no draft.
+    assert!(!crate::inbox::notify::operator_has_live_draft(&home, "a"));
+    // A keystroke with no following submit → a live unsent draft.
+    crate::notification_queue::record_input_activity(&home, "a");
+    assert!(crate::inbox::notify::operator_has_live_draft(&home, "a"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
+    // No draft → the fast path returns immediately (no block). A regression that
+    // dropped the no-draft check would hang this test to the nextest timeout.
+    let home = std::env::temp_dir().join(format!(
+        "agend-await-nodraft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    await_unsent_draft_or_grace(&home, "a", false);
+    std::fs::remove_dir_all(&home).ok();
+}
