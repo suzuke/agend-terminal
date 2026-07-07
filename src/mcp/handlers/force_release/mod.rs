@@ -75,6 +75,10 @@ pub(super) fn rebase_clean_self(
     let dir_existed = target.exists();
     let mut dir_removed = false;
     if dir_existed {
+        // #2158-adjacent: force_release is destructive-by-design, but a dirty
+        // worktree's uncommitted WIP should still be recoverable. Snapshot it to
+        // a durable recovery ref before the removal (a clean worktree is a no-op).
+        crate::worktree::preserve_dirty_worktree(home, agent, &target, branch);
         match std::fs::remove_dir_all(&target) {
             Ok(()) => {
                 dir_removed = true;
@@ -267,6 +271,88 @@ mod tests {
         assert!(
             dir.exists(),
             "without rebase_mode, stale dir must be preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2158-adjacent: force_release (force:true) dirty-WIP preservation ──
+
+    fn git_bypassed(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    }
+
+    #[test]
+    fn rebase_clean_self_preserves_dirty_wip_before_removal() {
+        // A REAL linked worktree at the daemon pool path, dirtied with untracked
+        // WIP, then force_release'd. force_release is destructive-by-design, but
+        // the WIP must still be recoverable via refs/agend/recovery/<branch>/<ts>.
+        let home = tmp_home("force-release-dirty");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git_bypassed(&repo, &["init", "-b", "main"])
+            .status
+            .success());
+        assert!(git_bypassed(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .status
+        .success());
+
+        let agent = "dev-fr-dirty";
+        let branch = "feat/fr-dirty";
+        let target = home.join("worktrees").join(agent).join(branch);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let add = git_bypassed(
+            &repo,
+            &["worktree", "add", "-b", branch, target.to_str().unwrap()],
+        );
+        assert!(
+            add.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        std::fs::write(target.join("fr-wip.txt"), b"force-release WIP").unwrap();
+
+        let outcome = rebase_clean_self(&home, agent, branch).expect("rebase_clean_self ok");
+        assert!(
+            outcome.dir_existed && outcome.dir_removed,
+            "dirty worktree removed by force_release: {outcome:?}"
+        );
+        assert!(!target.exists(), "worktree dir gone");
+
+        // The WIP survives in a recovery ref.
+        let refs = git_bypassed(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("refs/agend/recovery/{branch}/"),
+            ],
+        );
+        let ref_list = String::from_utf8_lossy(&refs.stdout);
+        let ref_name = ref_list
+            .lines()
+            .find(|l| !l.is_empty())
+            .expect("a recovery ref exists after dirty force_release");
+        let tree = git_bypassed(&repo, &["ls-tree", "-r", "--name-only", ref_name]);
+        assert!(
+            String::from_utf8_lossy(&tree.stdout).contains("fr-wip.txt"),
+            "untracked WIP captured on the force_release path"
         );
         std::fs::remove_dir_all(&home).ok();
     }

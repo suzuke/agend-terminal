@@ -471,6 +471,17 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                 managed_verified = true;
             }
         } else {
+            // #2158-adjacent: a MANUAL release must not silently drop
+            // uncommitted WIP. Snapshot it to a durable recovery ref BEFORE the
+            // destructive remove (a clean worktree is a no-op → zero behaviour
+            // change). `is_daemon_managed` is false for an absent OR unmanaged
+            // path, so this fires only for the managed-worktree case
+            // `remove_worktree` would actually delete — the workspace-teardown
+            // callers of `remove_worktree` are intentionally left untouched.
+            if is_daemon_managed(wt_path) {
+                let branch = binding["branch"].as_str().unwrap_or("");
+                crate::worktree::preserve_dirty_worktree(home, agent, wt_path, branch);
+            }
             match remove_worktree(agent, wt_path, &source_repo) {
                 WorktreeRemoval::Removed => {
                     managed_verified = true;
