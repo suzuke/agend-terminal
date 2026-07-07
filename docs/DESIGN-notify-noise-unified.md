@@ -39,6 +39,10 @@ ci_handoff_track**. #2622 is the best-shaped unifying primitive; the missing wir
    instead of reverting to unread → kills the 2nd poll-reminder stream (watchdog stays the single ci-ready renudge).
 5. **`kind=report` w/ correlation auto-discharges the reporter's dispatch obligation** (default the ack_inbox
    behavior for report-with-correlation) → poll_reminder stops nudging an already-reported dispatch (35896-11 m-208).
+   *Dependency (reviewer5, #2670):* `ack_by_correlation` keys the settle by `(sender, task_id==correlation_id)`
+   only — it does NOT key on the report's target/original dispatcher. Correctness therefore relies on task /
+   correlation ids being **globally unique** (the fleet's task-id design guarantee); a reused id across unrelated
+   dispatches would let one report settle another's row. Sender-scoping already prevents cross-agent bleed (#2647).
 6. **Persist the renudge/escalation throttle** (anchor `last_renudged`/`last_escalated`/`LAST_NOTIFIED` to a
    disk `last_renudged_at`/count on the track, not an in-mem map reset at boot) → no restart burst. **This is
    24134-4's cross-restart concern, solved minimally via the already-durable track + throttle — NOT a new

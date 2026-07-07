@@ -1673,6 +1673,18 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
                 // itself become a nagging un-dischargeable obligation and
                 // regenerate the loop it reports on (the fb2461 lesson).
                 | "channel-reply-discharged"
+                // #35896-11 ④: a `ci-ready-for-action` handoff left in `delivering`
+                // (the reviewer drained but hasn't acted) must NOT be reverted to
+                // unread by reclaim — that reopens a SECOND, uncoordinated poll-
+                // reminder stream for the same event on top of the ci_handoff_track
+                // renudge watchdog (the single intended ci-ready renudge, which is
+                // decoupled from inbox read-state per #1888 and NOT affected by this
+                // settle). Terminally settling the reclaimed row leaves the watchdog
+                // as the one renudge source. NOTE: ci-ready is deliberately kept OUT
+                // of `auto_ack_on_drain_kind` — it must survive the FIRST drain as
+                // `delivering` so the reviewer sees it; only a STALE past-cap
+                // delivering row is settled here.
+                | "ci-ready-for-action"
         )
     )
 }

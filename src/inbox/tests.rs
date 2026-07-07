@@ -1098,6 +1098,46 @@ fn reclaim_still_redelivers_context_alert_conservatively() {
     fs::remove_dir_all(&home).ok();
 }
 
+/// #35896-11 ④: a `ci-ready-for-action` handoff left STALE in `delivering` (the
+/// reviewer drained it but hasn't acted) must be SETTLED by reclaim, not reverted
+/// to unread. Reverting reopens a SECOND, uncoordinated poll-reminder stream for
+/// the same event on top of the ci_handoff_track renudge watchdog (the single
+/// intended ci-ready renudge, decoupled from inbox read-state and unaffected by
+/// this settle). Pre-④ ci-ready was outside `known_fire_and_forget_kind`, so
+/// `kind_is_unknown` → reclaim reverted it to unread (this test would drain it
+/// back). ci-ready is deliberately kept OUT of `auto_ack_on_drain_kind`, so it
+/// still survives the FIRST drain as `delivering` for the reviewer to see.
+#[test]
+fn reclaim_settles_stale_delivering_ci_ready_for_action_35896_11() {
+    let home = tmp_home("reclaim-ci-ready-35896");
+    enqueue(
+        &home,
+        "reviewer",
+        msg()
+            .sender("system:ci")
+            .text("[ci-ready-for-action] o/r@feat: CI passed, your turn.")
+            .kind("ci-ready-for-action")
+            .id("m-ciready-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    assert!(
+        drain(&home, "reviewer").is_empty(),
+        "a stale delivering ci-ready row must be settled by reclaim, not re-delivered (kills the 2nd poll stream)"
+    );
+    let content = fs::read_to_string(inbox_path(&home, "reviewer")).unwrap();
+    let persisted: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        persisted.read_at.is_some(),
+        "reclaim must stamp read_at on the stale ci-ready row (settle), not revert to unread"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 /// healthy 不重投 / 在途不雙投: a FRESH in-flight (delivering) row is left
 /// untouched by reclaim and is never returned a second time — no double-deliver
 /// while the agent is mid-turn.
@@ -4645,6 +4685,50 @@ fn ack_by_correlation_preserves_non_matching() {
     let remaining = ack(&home, agent, None);
     assert_eq!(remaining, 1, "t-other should still be delivering");
 
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #35896-11 ⑤ isolation (#2647): the report auto-discharge settles ONLY the
+/// reporting agent's OWN dispatch row. `ack_by_correlation` reads only the named
+/// agent's inbox, so agent A reporting a shared correlation must never settle
+/// agent B's same-task-id obligation — a shared task id must not cross agent
+/// inboxes (the #2647 discharge-key isolation lesson, at the report seam).
+#[test]
+fn ack_by_correlation_isolates_across_agents_35896_11() {
+    let home = tmp_home("ack-corr-cross-agent-35896");
+    // Both agents received a dispatch carrying the SAME task id.
+    for agent in ["agent-a", "agent-b"] {
+        enqueue(
+            &home,
+            agent,
+            msg()
+                .sender("lead")
+                .text("shared-id dispatch")
+                .kind("task")
+                .task_id("t-shared")
+                .id(&format!("m-{agent}-shared"))
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(
+            drain(&home, agent).len(),
+            1,
+            "{agent}: dispatch drained → delivering"
+        );
+    }
+
+    // Agent A reports the shared correlation → only A's row settles.
+    let settled_a = ack_by_correlation(&home, "agent-a", "t-shared");
+    assert_eq!(settled_a, 1, "agent-a's own dispatch row settles");
+
+    // Agent B's SAME-correlation obligation must survive untouched — proven by it
+    // still being settle-able (a second ack finds it still delivering). If A's ack
+    // had leaked across inboxes, this would return 0.
+    let settled_b = ack_by_correlation(&home, "agent-b", "t-shared");
+    assert_eq!(
+        settled_b, 1,
+        "agent-b's same-task-id obligation must NOT be suppressed by agent-a's report (#2647 isolation)"
+    );
     fs::remove_dir_all(&home).ok();
 }
 

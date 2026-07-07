@@ -539,15 +539,14 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         // Mark dispatch as completed so timeout sweep doesn't false-warn.
         let cid = args["correlation_id"].as_str();
         crate::dispatch_tracking::mark_completed(home, cid, sender.as_str());
-        // ack_inbox: auto-settle the sender's DELIVERING inbox messages whose
-        // task_id matches correlation_id. Eliminates the "remember to ack"
-        // gap — the daemon settles atomically with the report send.
-        if args["ack_inbox"].as_bool() == Some(true) {
-            if let Some(cid) = cid.filter(|s| !s.is_empty()) {
-                let settled = crate::inbox::ack_by_correlation(home, sender.as_str(), cid);
-                if let Some(obj) = result.as_object_mut() {
-                    obj.insert("inbox_settled".to_string(), json!(settled));
-                }
+        // #35896-11 ⑤ (Q2 vet): any kind=report+correlation auto-settles the
+        // SENDER's own delivering dispatch row (was gated on ack_inbox=true);
+        // sender-scoped via ack_by_correlation (#2647 isolation), ack_inbox now a
+        // no-op. Q2 over-settle tradeoff: docs/DESIGN-notify-noise-unified.md.
+        if let Some(cid) = cid.filter(|s| !s.is_empty()) {
+            let settled = crate::inbox::ack_by_correlation(home, sender.as_str(), cid);
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("inbox_settled".to_string(), json!(settled));
             }
         }
         // #2537/#2524 P6 PR-1: best-effort — a ledger write failure doesn't
