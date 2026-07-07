@@ -88,6 +88,20 @@ pub(crate) struct CiHandoffTrack {
     /// nothing extra, unchanged behavior).
     #[serde(default)]
     pub task_id: Option<String>,
+    /// #35896-11 ⑥: the last time the `handoff_timeout_watchdog` re-nudged /
+    /// escalated this `(target, correlation)`, persisted DURABLY on the track so a
+    /// daemon RESTART doesn't reset the in-mem throttle map and re-fire a burst for
+    /// every live handoff on boot. RFC3339. The watchdog's in-mem map stays the
+    /// primary (fast) throttle; these are consulted ONLY as the fallback when the
+    /// map lacks the key (post-restart). A fresh [`record`] (new CI pass) leaves
+    /// them `None` → the new episode is un-throttled (correct: a genuinely new
+    /// handoff should renudge on its own schedule). `#[serde(default)]` → a pre-⑥
+    /// track reads back `None` = never-nudged/never-escalated = the pre-⑥ behavior
+    /// (the first post-restart tick nudges once, then persists the throttle).
+    #[serde(default)]
+    pub last_renudged_at: Option<String>,
+    #[serde(default)]
+    pub last_escalated_at: Option<String>,
 }
 
 fn dir(home: &Path) -> PathBuf {
@@ -221,6 +235,10 @@ pub(crate) fn record(
         sent_at: sent_at.to_string(),
         head_sha: head_sha.map(String::from),
         task_id: task_id.map(String::from),
+        // #35896-11 ⑥: a fresh record (new CI pass) starts un-throttled — the new
+        // handoff episode renudges/escalates on its own schedule.
+        last_renudged_at: None,
+        last_escalated_at: None,
     };
     let path = file_for(home, target, correlation);
     if let Err(e) = std::fs::create_dir_all(dir(home)) {
@@ -242,6 +260,48 @@ pub(crate) fn record(
         %correlation,
         "ci-handoff track recorded (re-nudge until resolution, not until read)"
     );
+}
+
+/// #35896-11 ⑥: persist the watchdog throttle timestamp(s) on an EXISTING track so
+/// a daemon restart doesn't reset the in-mem throttle map and re-fire a burst.
+/// Called from the watchdog with the ACTUAL `list()`-supplied `path`
+/// (encoding-independent, like the resolve/sweep deleters). Read-modify-write UNDER
+/// the per-key lock (the same lock `record`/`remove_if_unchanged` take, so it can't
+/// interleave with a concurrent record's write or a resolve's delete), preserving
+/// every other field incl. `sent_at` — so a concurrent resolve's delete-if-unchanged
+/// still matches its episode. No-op if the track was resolved (deleted) concurrently
+/// or on any lock/read/write failure: a lost stamp just means one extra renudge
+/// after a restart — the failure mode is "slightly noisier", never "obligation lost".
+pub(crate) fn stamp_throttle(
+    home: &Path,
+    path: &Path,
+    target: &str,
+    correlation: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    renudged: bool,
+    escalated: bool,
+) {
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_for(home, target, correlation)) else {
+        return;
+    };
+    // Re-read the ACTUAL path under the lock (not a `file_for` reconstruction — an
+    // older-encoding track stays stampable, mirroring `remove_if_unchanged`).
+    let Some(mut track) = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok())
+    else {
+        return; // resolved/absent/torn — nothing to throttle (self-heals next tick)
+    };
+    let stamp = now.to_rfc3339();
+    if renudged {
+        track.last_renudged_at = Some(stamp.clone());
+    }
+    if escalated {
+        track.last_escalated_at = Some(stamp);
+    }
+    if let Err(e) = atomic_write_track(path, &track) {
+        tracing::warn!(%target, %correlation, error = %e, "#35896-11 ⑥: throttle stamp write failed");
+    }
 }
 
 /// All currently-pending tracks, each paired with its ACTUAL on-disk path.
@@ -1267,6 +1327,8 @@ mod tests {
             sent_at: "2026-06-10T00:00:00Z".into(),
             head_sha: None,
             task_id: None,
+            last_renudged_at: None,
+            last_escalated_at: None,
         };
         std::fs::write(&old_path, serde_json::to_vec(&track).unwrap()).unwrap();
         assert_eq!(
