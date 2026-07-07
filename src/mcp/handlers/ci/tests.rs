@@ -1728,6 +1728,26 @@ fn p780_setup_source_broken_origin(parent: &Path) -> std::path::PathBuf {
         .current_dir(&repo)
         .env(bypass.0, bypass.1)
         .output();
+    // #t-83936-5: a real checkout source is a clone, so it always has a
+    // refs/remotes/origin/* view. Stage one so the create-path data-loss guard —
+    // which fail-closes ONLY when there is no origin view at all — proceeds to the
+    // from_ref resolution this test pins, instead of refusing up front.
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !head.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &head])
+            .current_dir(&repo)
+            .env(bypass.0, bypass.1)
+            .output();
+    }
     repo
 }
 

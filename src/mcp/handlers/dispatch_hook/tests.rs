@@ -3249,6 +3249,15 @@ fn ensure_branch_exists_creates_from_non_origin_remote_2010() {
     }
     let upstream_head = git(&["rev-parse", "HEAD"], &repo);
     git(&["push", "-q", "upstream", "main"], &repo);
+    // #t-83936-5: a real fork clone always has refs/remotes/origin/* — give the
+    // (dummy, unreachable) origin a remote-tracking view so the new data-loss guard
+    // sees origin HAS been synced and, finding it lacks the work branch, proceeds to
+    // the upstream from_ref create (state 3 fail-open) instead of fail-closing on a
+    // viewless origin (state 4).
+    git(
+        &["update-ref", "refs/remotes/origin/main", &upstream_head],
+        &repo,
+    );
     // Drop the local main + any tracking refs so the create MUST fetch upstream.
     git(&["update-ref", "-d", "refs/remotes/upstream/main"], &repo);
 
@@ -3266,6 +3275,246 @@ fn ensure_branch_exists_creates_from_non_origin_remote_2010() {
     assert_eq!(
         new_sha, upstream_head,
         "branch must land on upstream/main HEAD"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #t-83936-5: bind_self re-provision start-point data-loss — 4-state pins ──
+// The create path (local refs/heads/<branch> ABSENT) must base a new local branch
+// on origin/<branch> when it exists, and fail-CLOSED only when totally blind. The
+// 4 states are the lead-confirmed table; each is pinned below.
+
+fn s5_git(args: &[&str], dir: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git spawn");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn s5_commit(dir: &std::path::Path, msg: &str) -> String {
+    s5_git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            msg,
+        ],
+        dir,
+    );
+    s5_git(&["rev-parse", "HEAD"], dir)
+}
+
+fn s5_local_branch_absent(repo: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+}
+
+/// STATE 1 (RED — the incident): local `refs/heads/<branch>` ABSENT but the
+/// remote-tracking view HAS `origin/<branch>` (a fresh clone / prune-after-release
+/// re-bind: `git clone` populates refs/remotes/origin/* and pruning refs/heads
+/// never touches them). `ensure_branch_exists(<branch>, "origin/main")` must base
+/// the new local branch on `origin/<branch>`'s tip, NOT origin/main. Pre-fix the
+/// create arm bases on origin/main and the branch's divergent commits are silently
+/// orphaned — this assertion fails RED against that old behaviour.
+#[test]
+fn ensure_branch_from_origin_when_view_has_branch_state1_83936_5() {
+    let home = std::env::temp_dir().join(format!("agend-83936-5-s1-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let origin = workspace.join("o.git");
+    let seed = workspace.join("seed");
+    let repo = workspace.join("agent");
+
+    // Real bare origin: main@A, feat/x@B where B is NOT an ancestor of A (divergent,
+    // so create-from-origin/main would truly orphan B). No checkout needed — push
+    // the divergent commit straight to a new remote ref.
+    std::fs::create_dir_all(&origin).ok();
+    s5_git(&["init", "--bare", "-b", "main"], &origin);
+    std::fs::create_dir_all(&seed).ok();
+    s5_git(&["init", "-b", "main"], &seed);
+    s5_git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &seed,
+    );
+    let sha_a = s5_commit(&seed, "A");
+    s5_git(&["push", "-q", "origin", "main"], &seed);
+    let sha_b = s5_commit(&seed, "B");
+    s5_git(&["push", "-q", "origin", "HEAD:refs/heads/feat/x"], &seed);
+    assert_ne!(sha_a, sha_b);
+
+    // Agent source repo = a fresh CLONE of origin → refs/remotes/origin/feat/x is
+    // present, only main is checked out (no local refs/heads/feat/x).
+    s5_git(
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+        &workspace,
+    );
+    assert!(
+        s5_local_branch_absent(&repo, "feat/x"),
+        "precondition: local refs/heads/feat/x must be ABSENT after clone"
+    );
+
+    let (created, _) = super::ensure_branch_exists(&home, &repo, "feat/x", "origin/main", "agent")
+        .expect("must provision");
+    let head = s5_git(&["rev-parse", "refs/heads/feat/x"], &repo);
+    assert_eq!(
+        head, sha_b,
+        "must base new local branch on origin/feat/x tip (B), NOT origin/main (A={sha_a})"
+    );
+    assert!(
+        !created,
+        "n_branch=false: branch pre-existed on origin, only materialized locally"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// STATE 2: local ref absent AND the remote-tracking view does NOT yet know the
+/// branch, but it exists on a REACHABLE origin (pushed since our last fetch). The
+/// best-effort `git fetch origin` must discover it and create from its tip.
+#[test]
+fn ensure_branch_from_origin_after_fetch_discovers_branch_state2_83936_5() {
+    let home = std::env::temp_dir().join(format!("agend-83936-5-s2-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let origin = workspace.join("o.git");
+    let seed = workspace.join("seed");
+    let repo = workspace.join("agent");
+
+    std::fs::create_dir_all(&origin).ok();
+    s5_git(&["init", "--bare", "-b", "main"], &origin);
+    std::fs::create_dir_all(&seed).ok();
+    s5_git(&["init", "-b", "main"], &seed);
+    s5_git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &seed,
+    );
+    s5_commit(&seed, "A");
+    s5_git(&["push", "-q", "origin", "main"], &seed);
+
+    // Clone the repo while origin has ONLY main (view lacks feat/y).
+    s5_git(
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+        &workspace,
+    );
+    // Now push feat/y@B to origin from the seed (repo's view is stale — it has no
+    // refs/remotes/origin/feat/y yet).
+    let sha_b = s5_commit(&seed, "B");
+    s5_git(&["push", "-q", "origin", "HEAD:refs/heads/feat/y"], &seed);
+    assert!(
+        s5_local_branch_absent(&repo, "feat/y"),
+        "precondition: local refs/heads/feat/y absent"
+    );
+
+    let (created, fetched) =
+        super::ensure_branch_exists(&home, &repo, "feat/y", "origin/main", "agent")
+            .expect("must provision");
+    let head = s5_git(&["rev-parse", "refs/heads/feat/y"], &repo);
+    assert_eq!(head, sha_b, "must fetch + base on origin/feat/y tip (B)");
+    assert!(!created, "pre-existing on remote → n_branch=false");
+    assert!(fetched, "the discovering fetch must have succeeded");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// STATE 3 (fail-OPEN, the one accepted gap): origin is UNREACHABLE now but we DO
+/// have a remote-tracking view (refs/remotes/origin/main staged) that lacks the
+/// work branch → create from `from_ref`. Pins the fail-open semantic so a future
+/// change can't silently turn this into a refusal (which would block all provision
+/// on any origin blip).
+#[test]
+fn ensure_branch_fail_open_when_unreachable_but_has_view_state3_83936_5() {
+    let home = std::env::temp_dir().join(format!("agend-83936-5-s3-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let repo = workspace.join("agent");
+
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &["remote", "add", "origin", "file:///dev/null/unreachable-s3"],
+        &repo,
+    );
+    let sha_a = s5_commit(&repo, "A");
+    // A remote-tracking VIEW exists (we've synced with origin before) though origin
+    // is unreachable now.
+    s5_git(&["update-ref", "refs/remotes/origin/main", &sha_a], &repo);
+
+    let (created, _) = super::ensure_branch_exists(&home, &repo, "feat/z", "origin/main", "agent")
+        .expect("fail-OPEN: must create from from_ref, not refuse");
+    let head = s5_git(&["rev-parse", "refs/heads/feat/z"], &repo);
+    assert_eq!(head, sha_a, "must base on origin/main view (A)");
+    assert!(created, "genuinely new branch → n_branch=true");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// STATE 4 (fail-CLOSED): origin is UNREACHABLE and there is NO remote-tracking
+/// view at all (never synced) → cannot rule out an existing origin/<branch> →
+/// REFUSE (Err) rather than silently orphan it. This is the guard the lead
+/// explicitly required (#2662 fail-closed on the truly-blind state).
+#[test]
+fn ensure_branch_fail_closed_when_unreachable_and_no_view_state4_83936_5() {
+    let home = std::env::temp_dir().join(format!("agend-83936-5-s4-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let repo = workspace.join("agent");
+
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &["remote", "add", "origin", "file:///dev/null/unreachable-s4"],
+        &repo,
+    );
+    s5_commit(&repo, "A");
+    // NO refs/remotes/origin/* staged — the view is completely empty.
+
+    let err = super::ensure_branch_exists(&home, &repo, "feat/w", "origin/main", "agent")
+        .expect_err("fail-CLOSED: must refuse when blind");
+    assert_eq!(
+        err.code,
+        super::ErrorCode::FetchFailed,
+        "must be the fail-closed FetchFailed code: {err:?}"
+    );
+    assert!(
+        err.message.contains("refusing to provision"),
+        "message must name the refusal: {}",
+        err.message
+    );
+    assert!(
+        s5_local_branch_absent(&repo, "feat/w"),
+        "must NOT have created the branch on refusal"
     );
     std::fs::remove_dir_all(&home).ok();
 }
