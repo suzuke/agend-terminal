@@ -3854,8 +3854,9 @@ fn continue_inject_is_draft_gated_force_false_1680() {
         !norm.contains(&force_true),
         "#1680: no force=true continue-inject may remain"
     );
-    // #2232: the ratelimit-retry self-clear-guidance inject (sibling payload)
-    // must ALSO be draft-gated (force=false) — same #1680 safety on the new path.
+    // #2232: the ratelimit-retry inject (sibling payload; #26795-3 dropped its
+    // self-clear guidance) must ALSO be draft-gated (force=false) — same #1680
+    // safety on the new path.
     assert!(
         norm.contains("RATELIMIT_RETRY_PAYLOAD, false, Some(auto_kind),"),
         "#2232: the ratelimit-retry inject must pass force=false (draft-gated)"
@@ -3865,6 +3866,34 @@ fn continue_inject_is_draft_gated_force_false_1680() {
         !norm.contains(&rl_force_true),
         "#2232: no force=true ratelimit-retry inject may remain"
     );
+}
+
+/// #26795-3 ② (payload copy): the ServerRateLimit auto-retry payload is now a
+/// PLAIN `continue` nudge — the ineffective self-clear instruction (agents never
+/// called it: recovery_shadow 2746/2746 `self_cleared=false`; recovery is now
+/// carried by hook_recovered + the recovered_within heuristic) is gone. The
+/// `[AGEND-AUTO kind=ratelimit-retry]` marker is driven by `auto_kind`, NOT this
+/// body, so the marker contract is unchanged.
+#[test]
+fn ratelimit_retry_payload_is_plain_continue_no_self_clear_26795_3() {
+    let payload = std::str::from_utf8(super::RATELIMIT_RETRY_PAYLOAD).expect("ASCII payload");
+    assert!(
+        !payload.contains("clear_blocked_reason"),
+        "the ineffective self-clear instruction must be gone (agents never called it): {payload:?}"
+    );
+    assert_eq!(
+        super::RATELIMIT_RETRY_PAYLOAD,
+        b"continue\n",
+        "ratelimit-retry payload is now the plain continue nudge"
+    );
+    // Single-line submit contract: exactly one trailing newline, no embedded one
+    // that would submit the nudge early.
+    assert_eq!(
+        payload.matches('\n').count(),
+        1,
+        "exactly one trailing newline"
+    );
+    assert!(payload.ends_with('\n'));
 }
 
 /// #1595 Step 1 (source guard): the ServerRateLimit retry-exhausted Telegram

@@ -116,17 +116,21 @@ const RETRY_AFTER_INJECT_FAIL: Duration = Duration::from_secs(5);
 /// #1316: replaces the old `last_input_text` replay that caused
 /// infinite modal-keystroke loops.
 const CONTINUE_RETRY_PAYLOAD: &[u8] = b"continue\n";
-/// #2232: ServerRateLimit retry payload — `continue` plus a one-line instruction
-/// telling a now-awake agent to self-clear its rate-limit block (MCP
-/// `clear_blocked_reason` reason=rate_limit) so the daemon stops auto-retrying.
-/// That agent-initiated clear is the ground-truth recovery signal the supervisor
-/// latches on; LLM compliance isn't guaranteed, so a missed call gracefully
-/// degrades to the `recovered_within` / state-exit / 12-cap heuristics. ASCII,
-/// SINGLE line + one trailing "\n" (no embedded newline that would submit early).
-/// Kept SEPARATE from the shared `CONTINUE_RETRY_PAYLOAD` so the apierror-nudge
-/// wording is unchanged and the #1680 source-guard literal stays intact — same
-/// split rationale as `inject_channel_reply_missing_gated`.
-const RATELIMIT_RETRY_PAYLOAD: &[u8] = b"continue (if you can act on this you have recovered from a rate limit -- call the agend-terminal health MCP action clear_blocked_reason with reason=rate_limit to stop these auto-retries)\n";
+/// #2232 / #26795-3: ServerRateLimit retry payload. It originally carried
+/// `continue` PLUS a one-line instruction telling a now-awake agent to self-clear
+/// its rate-limit block (MCP `clear_blocked_reason` reason=rate_limit). The
+/// #26795-3 SRL spike found that instruction is INEFFECTIVE noise: agents
+/// essentially never call it (recovery_shadow: 2746/2746 `self_cleared=false`),
+/// and the recovery it was meant to signal is now covered by the hook-authoritative
+/// path (#t-26795 `hook_recovered`, claude) + the `recovered_within` heuristic. So
+/// the payload is now a PLAIN `continue` nudge — the `[AGEND-AUTO
+/// kind=ratelimit-retry]` marker (driven by `auto_kind`, NOT this body) still tags
+/// it, matching the protocol doc's `[AGEND-AUTO kind=ratelimit-retry] continue`
+/// example. ASCII, SINGLE line + one trailing "\n". Kept as a SEPARATE const from
+/// the shared `CONTINUE_RETRY_PAYLOAD` so the #1680 source-guard's distinct
+/// `RATELIMIT_RETRY_PAYLOAD, false, Some(auto_kind)` scan stays intact. (Removing
+/// the now-dead `self_cleared` recovery SIGNAL is the separate #26795-3 ① PR.)
+const RATELIMIT_RETRY_PAYLOAD: &[u8] = b"continue\n";
 
 /// Per-agent notify tracking: last notify time + consecutive error count.
 pub(crate) struct NotifyTrack {
@@ -1308,12 +1312,13 @@ fn inject_continue_gated(
 }
 
 /// #2232 sibling of [`inject_continue_gated`] for the ServerRateLimit retry path:
-/// injects [`RATELIMIT_RETRY_PAYLOAD`] (`continue` + a self-clear instruction)
-/// instead of the bare shared `CONTINUE_RETRY_PAYLOAD`. Kept separate so the
-/// apierror-nudge keeps the plain payload and the #1680 source-guard literal on
-/// the shared one stays intact (same split rationale as
-/// [`inject_channel_reply_missing_gated`]). Same draft-gating (`force=false`) +
-/// `[AGEND-AUTO kind=...]` tagging; returns the 3-state [`InjectOutcome`].
+/// injects [`RATELIMIT_RETRY_PAYLOAD`] (a plain `continue` since #26795-3 dropped
+/// the ineffective self-clear instruction) via its own const instead of the shared
+/// `CONTINUE_RETRY_PAYLOAD`, so the #1680 source-guard's distinct
+/// `RATELIMIT_RETRY_PAYLOAD, false, Some(auto_kind)` scan stays intact (same split
+/// rationale as [`inject_channel_reply_missing_gated`]). Same draft-gating
+/// (`force=false`) + `[AGEND-AUTO kind=...]` tagging; returns the 3-state
+/// [`InjectOutcome`].
 fn inject_ratelimit_retry_gated(
     home: &std::path::Path,
     registry: &AgentRegistry,
