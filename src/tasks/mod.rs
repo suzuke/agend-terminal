@@ -16,6 +16,24 @@ mod tests;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// #78445-2 (d): the SINGLE terminal-cleanup seam for a task reaching a terminal
+/// state (done / cancelled) via ANY writer — interactive done/update, auto-close,
+/// the merged-PR sweep, the batch-cancel sweep, and the cascade child-cancel.
+/// Clears BOTH obligation stores so no watchdog nags about closed work:
+/// - the dispatch_idle sidecar (#1018 `cleanup_pending_for_task_id`), and
+/// - the dispatch_tracking rows that drive the stuck-dispatch sweep
+///   (`mark_completed`, matched by task_id → a co-dispatcher's OTHER task rows
+///   survive).
+///
+/// Centralized (reviewer4 #2679): before this, only 3 of the 6 terminal writers
+/// cleared even the sidecar and none cleared dispatch_tracking. Routing every
+/// writer through one call means a new terminal path wires ONE line and cannot
+/// silently leak either store.
+pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
+    let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, task_id);
+    crate::dispatch_tracking::mark_completed(home, Some(task_id), "");
+}
+
 pub use handler::handle;
 pub use handler::register_subscriber as register_cascade_subscriber;
 // #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch

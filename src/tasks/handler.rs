@@ -763,12 +763,10 @@ fn handle_done(
                     );
                 }
             }
-            // #1018 (B): eager cleanup of pending dispatch
-            // sidecars whose correlation_id matches this
-            // closed task. Prevents the watchdog from firing
-            // `dispatch_idle_threshold_exceeded` later for
-            // work the task board already confirmed done.
-            let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
+            // #1018/#78445-2 (d): a task reaching Done is terminal — clear BOTH
+            // obligation stores (dispatch_idle sidecar + dispatch_tracking rows) via
+            // the shared seam so no watchdog nags about the board-confirmed-done work.
+            super::task_terminal_cleanup(home, &id);
             // #807 Item 1: see create arm note.
             let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             serde_json::json!({
@@ -1179,7 +1177,9 @@ fn handle_update(
         // the task and should clear pending sidecars.
         if let Some(ref s) = new_status {
             if matches!(s.as_str(), "done" | "cancelled") {
-                let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
+                // #1018/#78445-2 (d): terminal via update — shared cleanup of both
+                // obligation stores.
+                super::task_terminal_cleanup(home, &id);
             }
             if s == "cancelled" {
                 cascade_cancel_children(home, &board, &id, &emitter);
@@ -1608,6 +1608,7 @@ fn cascade_cancel_children(
     };
     let parent_tid = crate::task_events::TaskId(parent_id.to_string());
     let mut cancel_events = Vec::new();
+    let mut cancelled_ids = Vec::new();
     let mut notify_ids = Vec::new();
     for (child_id, child) in &state.tasks {
         if child.parent_id.as_ref() != Some(&parent_tid) {
@@ -1620,6 +1621,7 @@ fn cascade_cancel_children(
                     by: emitter.clone(),
                     reason: format!("cascade: parent {parent_id} cancelled"),
                 });
+                cancelled_ids.push(child_id.0.clone());
             }
             crate::task_events::TaskStatus::InProgress => {
                 notify_ids.push((child_id.clone(), child.owner.clone()));
@@ -1627,8 +1629,15 @@ fn cascade_cancel_children(
             _ => {}
         }
     }
-    if !cancel_events.is_empty() {
-        let _ = crate::task_events::append_batch_at(board, emitter, cancel_events);
+    if !cancel_events.is_empty()
+        && crate::task_events::append_batch_at(board, emitter, cancel_events).is_ok()
+    {
+        // #78445-2 (d): each cascaded child-cancel is terminal — clear BOTH obligation
+        // stores for EACH child (plural). task_id-scoped, so non-child rows are
+        // untouched. (This path previously cleared NEITHER.)
+        for cid in &cancelled_ids {
+            super::task_terminal_cleanup(home, cid);
+        }
     }
     for (child_id, owner) in notify_ids {
         if let Some(ref owner_name) = owner {

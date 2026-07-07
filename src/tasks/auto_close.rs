@@ -70,7 +70,8 @@ pub fn auto_close_on_report(
     let closed =
         crate::task_events::append_done_if_legal_at(&board, &emitter, correlation_id, vec![event])?;
     if closed {
-        let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
+        // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
+        super::task_terminal_cleanup(home, correlation_id);
     }
     Ok(closed)
 }
@@ -225,6 +226,64 @@ mod tests {
             Some(crate::task_events::TaskStatus::Done),
             "task status should be Done after auto-close"
         );
+    }
+
+    /// #78445-2 PR-C (defect d) RED-first: closing a task must SETTLE its
+    /// `dispatch_tracking` rows (matched by task_id) so the stuck-dispatch sweep
+    /// stops nagging about a dispatch whose task the board already closed (the
+    /// reviewer4 double "dispatch stuck check"). Isolation (lead reminder): a
+    /// DIFFERENT task's row — even from the SAME dispatcher — must SURVIVE.
+    /// Pre-fix: the closed task's row lingered → still active/nagged.
+    #[test]
+    fn task_close_settles_dispatch_tracking_rows_78445_2() {
+        use crate::dispatch_tracking::{active_target_names, track_dispatch, DispatchEntry};
+        let home = tmp_home("pc_settle_dispatch");
+        let now = chrono::Utc::now().to_rfc3339();
+        // A review dispatch (lead → rev-a) for the task we will close …
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-close-me".into()),
+                from: "lead".into(),
+                to: "rev-a".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now.clone(),
+                status: "pending".into(),
+            },
+        );
+        // … and one for a DIFFERENT task from the SAME dispatcher (isolation guard).
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-keep-me".into()),
+                from: "lead".into(),
+                to: "rev-b".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now,
+                status: "pending".into(),
+            },
+        );
+
+        seed_claimed_task(&home, "t-close-me", "dev-agent");
+        let closed =
+            auto_close_on_report(&home, "report", "t-close-me", "dev-agent", "done", true).unwrap();
+        assert!(
+            closed,
+            "precondition: assignee terminal report auto-closes the task"
+        );
+
+        let active = active_target_names(&home);
+        assert!(
+            !active.contains(&"rev-a".to_string()),
+            "#78445-2 (d): closing the task must settle its dispatch_tracking row (rev-a): {active:?}"
+        );
+        assert!(
+            active.contains(&"rev-b".to_string()),
+            "#78445-2 (d) isolation: a DIFFERENT task's row (rev-b, same dispatcher) must SURVIVE: {active:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

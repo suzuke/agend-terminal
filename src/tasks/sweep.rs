@@ -450,6 +450,12 @@ pub(super) fn emit_cancelled_batch(
     });
     match checked {
         Ok(Ok(_)) => {
+            // #78445-2 (d): each batch-cancelled task is terminal — clear BOTH
+            // obligation stores (this path previously cleared NEITHER). task_id-scoped
+            // → a co-dispatcher's other task rows survive.
+            for id in confirm_ids {
+                super::task_terminal_cleanup(home, id);
+            }
             for (id, category) in &audit {
                 crate::event_log::log(
                     home,
