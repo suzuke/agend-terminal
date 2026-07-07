@@ -54,16 +54,18 @@ pub(super) fn create_new_branch(
     //          NOW + a stale (non-fresh) clone + the branch pushed to origin only
     //          AFTER this repo's last fetch. The incident is a FRESH clone (view
     //          complete → caught by state 1), so this edge is NOT the incident.
-    //        · it is NOT silent: a later push of the wrong-based branch to the
-    //          existing origin/<branch> is a non-fast-forward and is REJECTED — a
-    //          natural second line of defense + a loud signal.
+    //        · it is usually not silent: a later NORMAL push of the wrong-based
+    //          branch to the existing origin/<branch> is a non-fast-forward and is
+    //          rejected — a partial backstop + signal. CAVEAT (t-…78445-1): a bare
+    //          `git push --force` bypasses that rejection, and the agend-git shim
+    //          currently permits force-push to a non-protected branch, so the non-ff
+    //          "defense" holds only against a plain push, not a deliberate force.
     //   4. view none, fetch FAILED, view EMPTY (never synced with origin at all)
     //                                            → truly blind ⇒ REFUSE (Err).
     // Asymmetry vs the EXISTS arm (state 1): that arm update-refs the local ref to the
     // tip; here we base on the view SHA, which when OFFLINE may LAG origin's tip. Lag
-    // ≠ loss — the base is a real ancestor on the correct branch and the non-ff
-    // backstop covers the rest; when online the pre-fetch above advances the view to
-    // the tip anyway.
+    // ≠ loss — the base is a real ancestor on the correct branch; when online the
+    // pre-fetch above advances the view to the tip anyway.
     let work_tracking_ref = format!("refs/remotes/origin/{branch}");
     let work_fetch_ok = crate::git_helpers::git_bypass_timeout(
         source,
@@ -159,8 +161,9 @@ pub(super) fn create_new_branch(
         // origin is unreachable NOW but we DO have a remote-tracking view in which
         // origin/<branch> is absent. Create from `from_ref`. The residual data-loss
         // needs offline + stale-clone + a branch pushed since our last fetch to stack
-        // (non-incident — the incident is a fresh, complete clone), and a wrong-based
-        // push to an existing origin/<branch> is a rejected non-ff (loud 2nd defense).
+        // (non-incident — the incident is a fresh, complete clone); a wrong-based
+        // NORMAL push to the existing origin/<branch> is a rejected non-ff (partial
+        // backstop), but a bare `git push --force` bypasses it (see t-…78445-1).
         crate::event_log::log(
             home,
             "ensure_branch_fail_open",

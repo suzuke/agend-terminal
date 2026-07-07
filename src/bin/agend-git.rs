@@ -35,6 +35,11 @@ mod protected_refs;
 #[path = "agend-git/git_refs.rs"]
 mod git_refs;
 
+// #t-…78445-1: push-authority decisions (protected-ref guard + bare-force gate) live in this
+// submodule to keep agend-git.rs under the 2500-LOC anti-monolith ceiling.
+#[path = "agend-git/force_push.rs"]
+mod force_push;
+
 /// #1504 L3: max times the shim may re-enter before hard-failing. Healthy
 /// operation never exceeds 1 (real git ≠ shim → no re-entry), so a small cap
 /// has zero false-trip risk while containing a self-resolution spawn storm.
@@ -238,7 +243,7 @@ fn main() {
             // Shim-layer defense-in-depth (the remote's branch protection is the primary
             // gate); fail-closed (`load_protected_refs`). A normal push of the agent's own
             // branch is untouched.
-            if let Some(reason) = push_protected_violation(
+            if let Some(reason) = force_push::push_protected_violation(
                 &args,
                 &load_protected_refs(&home),
                 push_default_is_matching(&worktree),
@@ -249,6 +254,22 @@ fn main() {
                     &agent,
                     subcommand,
                     "deny_protected_ref",
+                    None,
+                    Some(&reason),
+                );
+                std::process::exit(1);
+            }
+            // #t-…78445-1: a bare force-push (`--force`/`-f`/`+refspec`) to a NON-protected
+            // feature branch can silently overwrite existing remote commits — require
+            // `--force-with-lease` (footgun removed, rebase-then-force workflow kept).
+            // Runs after the protected check so protected-ref force keeps `deny_protected_ref`.
+            if let Some(reason) = force_push::push_force_without_lease_violation(&args) {
+                emit_deny_error(subcommand, &reason, &agent, Some(&binding));
+                write_git_event_typed(
+                    &home,
+                    &agent,
+                    subcommand,
+                    "deny_force_no_lease",
                     None,
                     Some(&reason),
                 );
@@ -2042,64 +2063,6 @@ fn push_dest_refs(args: &[String]) -> Vec<String> {
             dest.strip_prefix("refs/heads/").unwrap_or(dest).to_string()
         })
         .collect()
-}
-
-/// #2379 S3: a `git push` is DENIED iff it could write a protected ref. COMPREHENSIVE over
-/// the push surface (r6: a positional-only parse let `--all`/`--mirror` slip through).
-/// Returns an actionable deny reason, or `None` to allow:
-/// - **`--all` / `--mirror`** (+ unambiguous abbreviations) push EVERY local head incl.
-///   protected ones → deny (a bound agent must push an explicit refspec of its OWN branch);
-/// - an **explicit refspec** whose DEST is a protected ref (exact, case-insensitive) → deny;
-/// - a **wildcard** refspec dest (`refs/heads/*`) could write a protected ref → deny
-///   (conservative — a bound agent pushes its explicit branch; glob-vs-protected refinement
-///   is a follow-up);
-/// - a **no-refspec** push (`git push` / `git push <remote>`) targets the CURRENT branch
-///   under the modern `push.default` (simple/current/upstream) = a bound agent's
-///   non-protected assigned branch (cross-branch deny) → allow; EXCEPT the deprecated
-///   `push.default=matching`, which would ALSO push a local `main`/`master` → deny.
-///
-/// `--tags` is TAGS-ONLY (`refs/tags/*`, never a branch) regardless of push.default, so it
-/// is exempt even from the matching deny (r6 dry-run: `git push --tags` under matching pushes
-/// only tags). `--follow-tags` is NOT exempt: it pushes the would-be-pushed BRANCHES *plus*
-/// tags, so under `push.default=matching` it pushes the matching heads incl. `main`
-/// (empirically confirmed via dry-run) → it correctly hits the matching deny. Force flags
-/// (`-f`/`--force-with-lease`/`+`) change HOW not WHAT — the refspec is still parsed above.
-/// Shim-layer defense-in-depth — the remote's branch protection is the primary gate.
-fn push_protected_violation(
-    args: &[String],
-    protected: &[String],
-    push_default_matching: bool,
-) -> Option<String> {
-    if let Some(flag) = args.iter().skip(1).find(|a| is_bulk_push_flag(a)) {
-        return Some(format!(
-            "`{flag}` pushes ALL local refs (including protected ones) — push an explicit \
-             refspec of your own task branch instead, not all refs at once"
-        ));
-    }
-    for dest in push_dest_refs(args) {
-        if dest.contains('*') {
-            return Some(format!(
-                "wildcard refspec dest `{dest}` could write a protected ref — push an \
-                 explicit, single-ref refspec instead"
-            ));
-        }
-        if protected.iter().any(|p| p.eq_ignore_ascii_case(&dest)) {
-            return Some(format!(
-                "protected ref — pushing to '{dest}' is denied (shim-layer guard; the \
-                 remote's branch protection is the primary gate). Push your own task branch \
-                 and open a PR; do NOT push directly to a protected ref."
-            ));
-        }
-    }
-    if push_default_matching && !has_explicit_refspec(args) && !is_tags_only_push(args) {
-        return Some(
-            "push.default=matching with no explicit refspec would push every same-named \
-             branch (including a local protected ref) — set push.default=current/simple, or \
-             push an explicit refspec of your own task branch"
-                .to_string(),
-        );
-    }
-    None
 }
 
 /// `--tags` makes the push TAGS-ONLY (`refs/tags/*`), regardless of `push.default` — so it is

@@ -926,7 +926,7 @@ fn push_dest_refs_normalizes_refspec_targets_s3() {
 #[test]
 fn push_protected_violation_explicit_refspec_s3() {
     let p = vargs(&["main", "master", "release-1.0"]);
-    let denied = |a: &[&str]| push_protected_violation(&vargs(a), &p, false);
+    let denied = |a: &[&str]| force_push::push_protected_violation(&vargs(a), &p, false);
     // explicit protected dest → deny (message names the ref).
     assert!(denied(&["push", "origin", "HEAD:main"])
         .unwrap()
@@ -950,7 +950,7 @@ fn push_protected_violation_bulk_and_wildcard_forms_s3() {
     // r6's bypass: `--all`/`--mirror` (and abbreviations) push EVERY local head — must
     // deny regardless of positionals. RM: drop the is_bulk_push_flag branch → RED.
     let p = vargs(&["main", "master"]);
-    let denied = |a: &[&str]| push_protected_violation(&vargs(a), &p, false);
+    let denied = |a: &[&str]| force_push::push_protected_violation(&vargs(a), &p, false);
     assert!(denied(&["push", "origin", "--all"]).is_some());
     assert!(denied(&["push", "--mirror", "origin"]).is_some());
     assert!(denied(&["push", "--all"]).is_some());
@@ -967,26 +967,108 @@ fn push_protected_violation_bulk_and_wildcard_forms_s3() {
 }
 
 #[test]
+fn push_force_without_lease_gate_t78445() {
+    // #t-…78445-1 (dev3 #2673 review): a BARE force-push to a non-protected feature branch
+    // is DENIED; `--force-with-lease` is the escape. RED on pre-gate code — before this the
+    // push arm allowed `push --force origin feat/x` (push_protected_violation ignores force).
+    let v = |a: &[&str]| force_push::push_force_without_lease_violation(&vargs(a));
+    // bare --force / -f / bundled -fu / +refspec (explicit or long) → DENY.
+    assert!(v(&["push", "--force", "origin", "feat/x"]).is_some());
+    assert!(v(&["push", "-f", "origin", "feat/x"]).is_some());
+    assert!(v(&["push", "-fu", "origin", "feat/x"]).is_some());
+    assert!(v(&["push", "origin", "+feat/x"]).is_some());
+    assert!(v(&["push", "origin", "+HEAD:refs/heads/feat/x"]).is_some());
+    // current-branch bare force (no explicit refspec) also overwrites → DENY.
+    assert!(v(&["push", "--force"]).is_some());
+    assert!(v(&["push", "--force", "origin"]).is_some());
+    // the SAFE forms → ALLOW (footgun removed, capability kept).
+    assert!(v(&["push", "--force-with-lease", "origin", "feat/x"]).is_none());
+    assert!(v(&[
+        "push",
+        "--force-with-lease=feat/x:abc123",
+        "origin",
+        "feat/x"
+    ])
+    .is_none());
+    assert!(v(&[
+        "push",
+        "--force-if-includes",
+        "--force-with-lease",
+        "origin",
+        "feat/x"
+    ])
+    .is_none());
+    // git makes a trailing bare --force OVERRIDE a lease → treat as unconditional → DENY.
+    assert!(v(&["push", "--force-with-lease", "--force", "origin", "feat/x"]).is_some());
+    // normal (non-force) pushes → ALLOW (zero regression).
+    assert!(v(&["push", "-u", "origin", "feat/x"]).is_none());
+    assert!(v(&["push", "origin", "feat/x"]).is_none());
+    assert!(v(&["push"]).is_none());
+    // PURE deletions remove a ref, they don't overwrite history → EXEMPT even with force.
+    assert!(v(&["push", "--force", "--delete", "origin", "feat/x"]).is_none());
+    assert!(v(&["push", "--force", "origin", ":feat/x"]).is_none());
+    assert!(v(&["push", "-df", "origin", "feat/x"]).is_none());
+    // F1 (dev2, CONFIRMED bypass) — a MIXED delete+overwrite push must NOT be exempted: the
+    // delete refspec used to trigger an any-arg exemption that let the overwrite's force
+    // through. All three of dev2's forms must DENY (RED against the pre-fix any-arg logic).
+    assert!(v(&["push", "--force", "origin", ":del", "real"]).is_some());
+    assert!(v(&["push", "--force", "origin", "+:del", "real"]).is_some());
+    assert!(v(&["push", "--force", "origin", "real", ":del"]).is_some());
+    // multi-delete (every refspec a deletion) stays EXEMPT.
+    assert!(v(&["push", "--force", "origin", ":del1", ":del2"]).is_none());
+}
+
+#[test]
+fn push_force_deny_message_carries_executable_retry_sequence_t78445() {
+    // Lead req (#t-…78445-1): the deny must be ONE-SHOT fixable — a copy-pasteable retry
+    // sequence with the concrete remote+branch, for models weak at constructing retries.
+    let msg = force_push::push_force_without_lease_violation(&vargs(&[
+        "push", "--force", "origin", "feat/x",
+    ]))
+    .expect("bare force must deny");
+    assert!(
+        msg.contains("git fetch origin feat/x && git push --force-with-lease origin feat/x"),
+        "must carry the exact executable retry sequence: {msg}"
+    );
+    // no explicit remote/branch → the message still names the lease form via a template.
+    let generic = force_push::push_force_without_lease_violation(&vargs(&["push", "--force"]))
+        .expect("current-branch bare force must deny");
+    assert!(
+        generic.contains("--force-with-lease"),
+        "template must still name the safe form: {generic}"
+    );
+}
+
+#[test]
 fn push_protected_violation_push_default_matching_s3() {
     // no-refspec push under the DEPRECATED push.default=matching pushes every same-named
     // branch (incl. a local protected ref) → deny. simple/current (matching=false) →
     // allow (only the current/assigned branch). RM: drop the matching branch → first RED.
     let p = vargs(&["main", "master"]);
-    assert!(push_protected_violation(&vargs(&["push"]), &p, true).is_some());
-    assert!(push_protected_violation(&vargs(&["push", "origin"]), &p, true).is_some());
+    assert!(force_push::push_protected_violation(&vargs(&["push"]), &p, true).is_some());
+    assert!(force_push::push_protected_violation(&vargs(&["push", "origin"]), &p, true).is_some());
     // an EXPLICIT refspec governs even under matching → only that dest matters.
-    assert!(push_protected_violation(&vargs(&["push", "origin", "feat/x"]), &p, true).is_none());
+    assert!(
+        force_push::push_protected_violation(&vargs(&["push", "origin", "feat/x"]), &p, true)
+            .is_none()
+    );
     // not matching → no-refspec push is safe (current branch only).
-    assert!(push_protected_violation(&vargs(&["push"]), &p, false).is_none());
+    assert!(force_push::push_protected_violation(&vargs(&["push"]), &p, false).is_none());
     // r6: `--tags` is TAGS-ONLY (refs/tags/*) even under matching → MUST be allowed
     // (the previous cut wrongly denied it). RM: drop the is_tags_only_push exemption → RED.
-    assert!(push_protected_violation(&vargs(&["push", "--tags", "origin"]), &p, true).is_none());
-    assert!(push_protected_violation(&vargs(&["push", "--tags"]), &p, true).is_none());
+    assert!(
+        force_push::push_protected_violation(&vargs(&["push", "--tags", "origin"]), &p, true)
+            .is_none()
+    );
+    assert!(force_push::push_protected_violation(&vargs(&["push", "--tags"]), &p, true).is_none());
     // `--follow-tags` is NOT tags-only — under matching it pushes the matching branches
     // (incl. main, verified by dry-run) → MUST stay denied (no over-exemption).
-    assert!(
-        push_protected_violation(&vargs(&["push", "--follow-tags", "origin"]), &p, true).is_some()
-    );
+    assert!(force_push::push_protected_violation(
+        &vargs(&["push", "--follow-tags", "origin"]),
+        &p,
+        true
+    )
+    .is_some());
 }
 
 #[test]
@@ -996,11 +1078,13 @@ fn push_head_main_denied_by_hardcode_floor_even_without_policy_s3() {
     // push_protected_violation, OR load_protected_refs drop the floor → RED.
     let h = home_s3("e2e");
     let protected = load_protected_refs(h.to_str().unwrap());
-    assert!(
-        push_protected_violation(&vargs(&["push", "origin", "HEAD:main"]), &protected, false)
-            .is_some()
-    );
-    assert!(push_protected_violation(
+    assert!(force_push::push_protected_violation(
+        &vargs(&["push", "origin", "HEAD:main"]),
+        &protected,
+        false
+    )
+    .is_some());
+    assert!(force_push::push_protected_violation(
         &vargs(&["push", "-u", "origin", "feat/x"]),
         &protected,
         false
