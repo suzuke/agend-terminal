@@ -859,13 +859,12 @@ pub fn reconcile_hooks(home: &Path) {
     }
 }
 
-/// Symlink the agend-git binary into $AGEND_HOME/bin/git.
-/// Called at daemon startup so the shim shadows /usr/bin/git via PATH.
+/// Symlink the agend-git binary into $AGEND_HOME/bin under every name it shadows (so the shims
+/// win over the real tools via PATH). Called at daemon startup. #t-…777-1: the binary is
+/// MULTIPLEXED on argv[0] — `git` = git shim; `pkill`/`killall`/`kill` = kill_guard.rs.
 pub fn symlink_shim(home: &Path) {
     let bin_dir = home.join("bin");
     std::fs::create_dir_all(&bin_dir).ok();
-    let link_name = if cfg!(windows) { "git.exe" } else { "git" };
-    let link_path = bin_dir.join(link_name);
 
     // Find the agend-git binary alongside the main binary.
     let shim_name = if cfg!(windows) {
@@ -878,7 +877,14 @@ pub fn symlink_shim(home: &Path) {
         candidate.exists().then_some(candidate)
     });
 
-    if let Some(src) = shim_src {
+    let Some(src) = shim_src else { return };
+    let shadows: &[&str] = if cfg!(windows) {
+        &["git.exe", "pkill.exe", "killall.exe", "kill.exe"]
+    } else {
+        &["git", "pkill", "killall", "kill"]
+    };
+    for name in shadows {
+        let link_path = bin_dir.join(name);
         // Remove stale symlink/file first.
         let _ = std::fs::remove_file(&link_path);
         #[cfg(unix)]
