@@ -1664,6 +1664,12 @@ fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
                 | "pr-ready-for-merge"
                 | "review-verdict"
                 | "dispatch_idle_long_running"
+                // #78445-2: the quota-wedge escalation subtype — same one-shot daemon
+                // FYI shape as dispatch_idle_long_running (its source-side
+                // `quota_escalated` latch never re-fires the same notice). MUST be
+                // registered or reclaim classifies it unknown → renudge re-delivers it,
+                // defeating the source one-shot (reviewer4 #2678 F1).
+                | "dispatch_idle_quota_wedged"
                 | "dispatch_idle_nudge"
                 // #2622 PR-2: the operator-facing notice emitted when an agent
                 // self-discharges a channel-reply obligation. Pure FYI — no
@@ -1720,6 +1726,9 @@ fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
                 // above, means the row never enters `delivering` limbo
                 // long enough to race the reclaim-TTL in the first place.
                 | "dispatch_idle_long_running"
+                // #78445-2: the quota-wedge subtype — same one-shot daemon FYI; settle
+                // on first drain like its `dispatch_idle_long_running` sibling.
+                | "dispatch_idle_quota_wedged"
                 | "dispatch_idle_nudge"
                 // #2622 PR-2: the self-discharge operator notice — settle on
                 // first drain (same pure-daemon-notification shape). Paired
