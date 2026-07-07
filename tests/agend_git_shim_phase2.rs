@@ -88,6 +88,26 @@ fn shim_deny_unbound_mutate_in_source() {
 }
 
 #[test]
+fn shim_force_push_requires_lease_wired_in_source() {
+    // #t-…78445-1: the push arm must gate bare force-push (require --force-with-lease) and
+    // emit its own audit event, distinct from deny_protected_ref. Guards against accidental
+    // removal of the wiring; the decision logic itself is unit-tested in agend-git/tests.rs.
+    let src = include_str!("../src/bin/agend-git.rs");
+    assert!(
+        src.contains("push_force_without_lease_violation"),
+        "force-push gate must be wired into the push arm"
+    );
+    assert!(
+        src.contains("deny_force_no_lease"),
+        "force-push deny must emit its own audit event type"
+    );
+    assert!(
+        src.contains("--force-with-lease"),
+        "deny message must steer to the safe --force-with-lease form"
+    );
+}
+
+#[test]
 fn shim_deny_worktree_management() {
     let src = include_str!("../src/bin/agend-git.rs");
     assert!(
