@@ -51,16 +51,18 @@ pub fn shim_tool(argv0: &str) -> Option<&'static str> {
 pub fn classify(tool: &str, args: &[String], daemon_pid: Option<i32>) -> Decision {
     match tool {
         "pkill" | "killall" => {
-            // pkill/killall are pattern-scan by design; only informational invocations
-            // (--help/--version/-l …) carry no operand target. `has_kill_target` = any
-            // non-flag operand ⇒ a real pattern-kill ⇒ DENY.
-            if has_kill_target(args) {
+            // #2683 B1: FAIL-CLOSED. pkill/killall are pattern-scan by design; exempt ONLY a
+            // pure informational invocation (all args are no-kill flags), DENY everything else.
+            // Detecting a target by its FORM is a losing enumeration (`--` operands, `--uid=`/
+            // `--newest` selectors, future procps flags all specify targets while every arg
+            // starts with `-`), so we invert to an allowlist — a new selector fails to DENY.
+            if is_informational_only(args) {
+                Decision::Allow
+            } else {
                 Decision::Deny {
                     event: "deny_unscoped_pattern_kill",
                     msg: deny_pattern_kill(tool, args),
                 }
-            } else {
-                Decision::Allow
             }
         }
         "kill" => {
@@ -105,10 +107,14 @@ pub fn run(tool: &'static str, args: &[String]) -> ! {
 
 // ── policy helpers (pure) ────────────────────────────────────────────────────
 
-/// A `pkill`/`killall` invocation targets processes iff it carries ≥1 non-flag operand
-/// (the pattern/name). Only-flags (`--help`, `-l`, or an incomplete `pkill -f`) → no target.
-fn has_kill_target(args: &[String]) -> bool {
-    args.iter().any(|a| !a.starts_with('-'))
+/// The ONLY pkill/killall invocations exempt from the guard: pure informational flags that
+/// perform no kill. Deliberately a small allowlist (#2683 B1 fail-closed) — anything not here
+/// (a pattern, a `--uid=`/`-u`/`--newest` selector, `--` + operand) DENIES. Empty args are
+/// vacuously informational (`pkill` alone errors with no criteria — no kill).
+const KILL_INFO_FLAGS: &[&str] = &["--help", "-h", "--version", "-V", "-l", "--list", "-L"];
+
+fn is_informational_only(args: &[String]) -> bool {
+    args.iter().all(|a| KILL_INFO_FLAGS.contains(&a.as_str()))
 }
 
 /// The target operands of a `kill` invocation, after stripping an optional leading signal
@@ -148,25 +154,31 @@ fn argv_display(args: &[String]) -> String {
         .join(" ")
 }
 
-/// The non-flag operands only (the pattern/name), for a CLEAN `pgrep` hint — echoing the
-/// raw argv would duplicate flags (`pgrep -fl -f …`) or leak signal flags (`-9`) that pgrep
-/// rejects. `pgrep -fl <operands>` is always valid and lists a superset of the matches.
-fn operands_display(args: &[String]) -> String {
-    args.iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The pattern tokens for a copy-pasteable `pgrep` hint. Respects `--` (everything after it is
+/// the pattern, so a `-`-leading pattern like `--dangerously-bypass` is NOT dropped — #2683 B1);
+/// otherwise the non-flag operands. Rendered inside `-- '<pat>'` so pgrep can't parse it as flags.
+fn pattern_for_hint(args: &[String]) -> String {
+    let toks: Vec<&str> = match args.iter().position(|a| a == "--") {
+        Some(pos) => args[pos + 1..].iter().map(String::as_str).collect(),
+        None => args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(String::as_str)
+            .collect(),
+    };
+    toks.join(" ")
 }
 
 fn deny_pattern_kill(tool: &str, args: &[String]) -> String {
     let argv = argv_display(args);
-    let pat = operands_display(args);
+    let pat = pattern_for_hint(args);
+    // M1 (#2683): the hint is `pgrep -f -- '<pat>'` — `--` stops pgrep parsing the pattern as
+    // flags (`--last` etc.) and the single-quotes survive copy-paste with spaces.
     format!(
         "agend-safety: `{tool} {argv}` denied — a pattern-kill scans EVERY process on the host \
 by command line and can match sibling agents or the daemon, not just your own processes \
 (2026-06-24: a `pkill -f` over-matched and killed 3 live agents this way). To do what you \
-intended safely:\n  1) pgrep -fl {pat}          # list what matches — confirm they are all yours\n  \
+intended safely:\n  1) pgrep -fl -- '{pat}'      # list what matches — confirm they are all yours\n  \
 2) kill <pid> [<pid> …]     # kill only the pids you confirmed (explicit pids are allowed)\n\
 Deliberate teardown? Re-run with AGEND_SAFETY_BYPASS=1."
     )
@@ -344,11 +356,29 @@ mod tests {
 
     #[test]
     fn pkill_killall_informational_only_is_allowed() {
-        // No operand target → not a kill (usage/help/incomplete) → allow (no false-block).
+        // The fail-closed allowlist: pure informational flags perform no kill → allow.
         assert!(!denied("pkill", &["--help"], None));
-        assert!(!denied("pkill", &["-f"], None)); // incomplete → real pkill errors harmlessly
+        assert!(!denied("pkill", &["-h"], None));
         assert!(!denied("killall", &["--version"], None));
-        assert!(!denied("killall", &[], None));
+        assert!(!denied("killall", &["-V"], None));
+        assert!(!denied("killall", &["-l"], None)); // list signal names, no kill
+        assert!(!denied("pkill", &[], None)); // bare pkill: no criteria → errors, no kill
+    }
+
+    #[test]
+    fn b1_flag_form_and_end_of_options_targets_are_denied() {
+        // #2683 review B1 (dev3 CONFIRMED bypass): a `!starts_with('-')` target test is fail-OPEN.
+        // A pattern after `--`, or a flag-form selector, has EVERY arg starting with `-` yet still
+        // makes procps kill host-wide. All must DENY (RED against the pre-fix has_kill_target).
+        assert!(denied("pkill", &["-f", "--", "--dangerously-bypass"], None)); // the live incident substring
+        assert!(denied("pkill", &["-f", "--", "-claude"], None));
+        assert!(denied("killall", &["--", "-codex"], None));
+        assert!(denied("pkill", &["--uid=501"], None)); // selector, no positional
+        assert!(denied("pkill", &["--euid=0"], None));
+        assert!(denied("pkill", &["--newest", "--uid=501"], None));
+        assert!(denied("pkill", &["-u", "root"], None)); // -u <user> selector
+                                                         // Incomplete/selector-only pkill is still a kill attempt in spirit → fail-closed DENY.
+        assert!(denied("pkill", &["-f"], None));
     }
 
     #[test]
@@ -385,9 +415,8 @@ mod tests {
     fn deny_messages_are_one_shot_fixable() {
         let m = deny_pattern_kill("pkill", &v(&["-f", "codex"]));
         assert!(m.contains("`pkill -f codex` denied"), "echoes argv: {m}");
-        // Clean pgrep hint: operands only, no duplicated `-f`/leaked signal flags.
-        assert!(m.contains("pgrep -fl codex"), "clean pgrep hint: {m}");
-        assert!(!m.contains("pgrep -fl -f"), "no duplicated -f: {m}");
+        // M1: quoted, `--`-guarded pgrep hint (copy-paste-safe; pattern not parsed as flags).
+        assert!(m.contains("pgrep -fl -- 'codex'"), "quoted pgrep hint: {m}");
         assert!(m.contains("kill <pid>"), "must teach explicit kill: {m}");
         assert!(
             m.contains("AGEND_SAFETY_BYPASS=1"),
@@ -396,10 +425,15 @@ mod tests {
         // killall by name → the pgrep hint carries only the operand (no leaked `-9`),
         // even though the echoed argv line legitimately shows `killall -9 codex`.
         let k = deny_pattern_kill("killall", &v(&["-9", "codex"]));
-        assert!(k.contains("pgrep -fl codex"), "clean killall hint: {k}");
         assert!(
-            !k.contains("pgrep -fl -9"),
-            "no leaked signal flag in hint: {k}"
+            k.contains("pgrep -fl -- 'codex'"),
+            "quoted killall hint: {k}"
+        );
+        // B1 + M1: a `--`-guarded `-`-leading pattern must survive into the hint, quoted.
+        let b = deny_pattern_kill("pkill", &v(&["-f", "--", "--dangerously-bypass"]));
+        assert!(
+            b.contains("pgrep -fl -- '--dangerously-bypass'"),
+            "post-`--` pattern preserved + quoted: {b}"
         );
         let g = deny_group_kill(&v(&["--", "-1"]), "-1");
         assert!(g.contains("AGEND_SAFETY_BYPASS=1") && g.contains("kill <pid>"));
