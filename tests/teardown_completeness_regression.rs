@@ -257,19 +257,26 @@ fn run_scenario(home: &Path) {
     )
     .expect("seed write");
 
-    // t-…78445-0: SKIP-not-FAIL when the real-daemon auto-bind did not produce the
-    // victim's binding.json in THIS environment. On CI's daemon setup the dispatch
-    // above reliably creates it (the sanity asserts + teardown scan below then run
-    // UNCHANGED). A bare local `nextest` run cannot complete the bind (the operator's
-    // agend-git shim on PATH blocks `git worktree add`; CI's real git does not),
-    // leaving it absent — which turned the sanity assert RED for two devs. Gate on the
-    // ABSENCE of the produced artifact (never on an env var) so CI's run is byte-
-    // identical: the early-return only fires when the artifact genuinely wasn't made.
+    // t-…78445-0: SKIP-not-FAIL *only locally* when the real-daemon auto-bind did not
+    // produce the victim's binding.json. A bare local `nextest` run cannot complete the bind
+    // (the operator's agend-git shim on PATH blocks `git worktree add`; CI's real git does
+    // not), which used to turn the sanity assert RED for two devs.
+    //
+    // F1 (reviewer4): the skip is gated on NOT-CI. On CI the daemon's real `git worktree add`
+    // reliably creates the binding, so its absence there is a GENUINE dispatch/auto-bind
+    // regression — NOT the local-shim case — and MUST still hard-fail; a silent skip would
+    // evaporate this teardown seam's CI coverage unseen. So: on CI (GITHUB_ACTIONS / CI set)
+    // keep the hard fail; only a local run is allowed to early-return.
     let victim_binding = home.join("runtime").join(VICTIM).join("binding.json");
     if !victim_binding.exists() {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err() && std::env::var("CI").is_err(),
+            "t-…78445-0: real-daemon auto-bind did not produce {VICTIM}/binding.json IN CI — a \
+             genuine dispatch/auto-bind regression (the local-shim SKIP does not apply on CI)."
+        );
         eprintln!(
             "SKIP (t-…78445-0): real-daemon auto-bind did not produce {VICTIM}/binding.json \
-             in this environment (expected in CI's daemon setup); skipping the residual/teardown \
+             locally (agend-git shim blocks `git worktree add`); skipping the residual/teardown \
              assertions."
         );
         return;

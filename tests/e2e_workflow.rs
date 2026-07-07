@@ -234,20 +234,26 @@ fn run_scenario(home: &Path) {
         "dispatch failed: {dispatch}"
     );
 
-    // t-…78445-0: SKIP-not-FAIL when the real-daemon auto-bind did not produce
-    // mock-dev/binding.json in THIS environment. On CI's daemon setup the dispatch
-    // above reliably creates it (the read below is synchronous, no retry — so on CI
-    // the file is always present here and every seam assertion runs UNCHANGED). A bare
-    // local `nextest` run cannot complete the bind (the operator's agend-git shim on
-    // PATH blocks `git worktree add`; CI's real git does not), leaving it absent —
-    // which turned this test RED for devs touching neighboring modules. Gate on the
-    // ABSENCE of the produced artifact (never on an env var) so CI's run is byte-
-    // identical: the early-return only fires when the artifact genuinely wasn't made.
+    // t-…78445-0: SKIP-not-FAIL *only locally* when the real-daemon auto-bind did not
+    // produce mock-dev/binding.json. A bare local `nextest` run cannot complete the bind
+    // (the operator's agend-git shim on PATH blocks `git worktree add`; CI's real git does
+    // not), which used to turn this test RED for devs touching neighboring modules.
+    //
+    // F1 (reviewer4): the skip is gated on NOT-CI. On CI the daemon's real `git worktree
+    // add` reliably creates the binding, so its absence there is a GENUINE dispatch/auto-bind
+    // regression — NOT the local-shim case — and MUST still hard-fail; a silent skip would
+    // evaporate this seam's CI coverage unseen. So: on CI (GITHUB_ACTIONS / CI set) keep the
+    // hard fail; only a local run is allowed to early-return.
     let binding_path = home.join("runtime").join("mock-dev").join("binding.json");
     if !binding_path.exists() {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err() && std::env::var("CI").is_err(),
+            "t-…78445-0: real-daemon auto-bind did not produce mock-dev/binding.json IN CI — a \
+             genuine dispatch/auto-bind regression (the local-shim SKIP does not apply on CI)."
+        );
         eprintln!(
             "SKIP (t-…78445-0): real-daemon auto-bind did not produce mock-dev/binding.json \
-             in this environment (expected in CI's daemon setup); skipping the residual/seam \
+             locally (agend-git shim blocks `git worktree add`); skipping the residual/seam \
              assertions."
         );
         return;
