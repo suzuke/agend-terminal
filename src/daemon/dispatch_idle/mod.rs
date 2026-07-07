@@ -118,14 +118,16 @@ pub(crate) struct PendingDispatch {
     /// Reset to `None` on re-dispatch (a fresh episode).
     #[serde(default)]
     pub(crate) reported_at: Option<String>,
-    /// #t-116: fire-once latch — the one-time escalation fired while the target is
-    /// QUOTA-WEDGED (backend usage-limit / quota-reached hard-block, snapshot
-    /// `agent_state == "usage_limit"`). Such an agent is EXPECTED to stay silent
-    /// until the quota resets (often hours/days), so re-nudging it every threshold
-    /// is pure noise (r5: agy quota wedged 6 days, pinged every 30 min). Escalate
-    /// ONCE, then suppress until recovery. Reset to `false` the moment the agent is
-    /// no longer quota-wedged (so a genuine later re-wedge re-escalates once) and on
-    /// re-dispatch. Mirrors the `long_running_escalated` fire-once latch.
+    /// #t-116/#78445-2: durable fire-once latch — the one-time escalation fired
+    /// while the target is QUOTA-WEDGED (backend usage-limit / quota-reached
+    /// hard-block, snapshot `agent_state == "usage_limit"`). Such an agent is
+    /// EXPECTED to stay silent until the quota resets (often hours/days), so
+    /// re-nudging it every threshold is pure noise (r5: agy quota wedged 6 days,
+    /// pinged every 30 min). Escalate ONCE, then suppress. #78445-2: this is a
+    /// ONE-SHOT per dispatch — it is NOT cleared on a non-wedged tick, so a
+    /// snapshot flicker can't re-fire it (the observed same-heads-up-twice noise);
+    /// only a re-dispatch (a genuinely new episode) resets it. Mirrors the
+    /// `long_running_escalated` fire-once latch.
     #[serde(default)]
     pub(crate) quota_escalated: bool,
 }
@@ -814,18 +816,6 @@ fn set_quota_escalated(home: &Path, dispatch_id: &str) {
     });
 }
 
-/// #t-116: clear the quota-wedge latch when the target RECOVERS (no longer
-/// quota-wedged), so a genuine later re-wedge re-escalates once.
-fn clear_quota_escalated(home: &Path, dispatch_id: &str) {
-    let path = pending_path(home, dispatch_id);
-    let _ = crate::store::with_json_state::<PendingDispatch, _, _>(&path, |cur| {
-        if cur.quota_escalated {
-            cur.quota_escalated = false;
-        }
-        Some(())
-    });
-}
-
 /// #t-116: is `target` QUOTA-WEDGED — i.e. its snapshot `agent_state` is
 /// `"usage_limit"` (the classifier's `AgentState::UsageLimit`, which maps to
 /// `BlockedReason::QuotaExceeded`)? Such an agent is hard-blocked on a backend
@@ -1059,15 +1049,18 @@ pub(crate) fn scan_and_emit(home: &Path) {
             continue;
         }
 
-        // #t-116: a backend quota / usage-limit hard-block (snapshot
+        // #t-116/#78445-2: a backend quota / usage-limit hard-block (snapshot
         // `agent_state == "usage_limit"`) is EXPECTED to stay silent until the
         // quota resets (often hours/days) — re-nudging every threshold is pure
         // noise (r5: agy quota wedged 6 days, pinged every 30 min). Escalate ONCE
-        // so the dispatcher knows, then LATCH-suppress until recovery. Mirrors the
-        // `long_running_escalated` fire-once idiom (emit the same long-running
-        // "expected delay, confirm" signal; do NOT flip to Exceeded — the agent is
-        // blocked, not stuck). The latch resets the moment the agent is no longer
-        // quota-wedged, so a genuine later re-wedge re-escalates once.
+        // with a quota-specific "blocked on usage_limit, expected silent" event
+        // (NOT the long-running "still showing activity" text — the target is NOT
+        // active), then LATCH-suppress. Do NOT flip to Exceeded — the agent is
+        // blocked, not stuck. #78445-2: `quota_escalated` is a DURABLE one-shot —
+        // it is NOT cleared on a non-wedged tick, so a snapshot flicker can't
+        // re-fire it (the observed same-heads-up-twice noise); a genuinely
+        // recovered-but-idle dispatch instead falls through to the stuck path
+        // below, and only a re-dispatch (new episode) resets the latch.
         if target_is_quota_wedged(snapshot.as_ref(), &d.target) {
             if !d.quota_escalated {
                 tracing::info!(
@@ -1076,15 +1069,10 @@ pub(crate) fn scan_and_emit(home: &Path) {
                     target = %d.target,
                     "#t-116 target quota-wedged (usage_limit) — escalating once then suppressing"
                 );
-                emit_long_running_event(home, &d, elapsed_secs);
+                emit_quota_wedged_event(home, &d, elapsed_secs);
                 set_quota_escalated(home, &d.dispatch_id);
             }
             continue;
-        }
-        // Recovered from a prior quota-wedge → clear the latch so a future re-wedge
-        // re-escalates once (genuine-recurrence-re-logs-once).
-        if d.quota_escalated {
-            clear_quota_escalated(home, &d.dispatch_id);
         }
 
         // #1516/#1694②: the dispatch-idle threshold is for "agent went silent
@@ -1306,8 +1294,24 @@ fn dispatch_idle_text(
     elapsed_secs: i64,
     threshold_secs: i64,
     long_running: bool,
+    quota_wedged: bool,
 ) -> String {
     let corr = correlation_id.unwrap_or("");
+    // #78445-2: the quota-wedge escalation — HONEST about the target being blocked
+    // on its provider quota (usage_limit), NOT "still showing activity" (which the
+    // long-running text below wrongly claimed for a usage_limit target).
+    if quota_wedged {
+        return format!(
+            "[dispatch_idle_quota_wedged] dispatch {dispatch_id} from '{dispatcher}' → '{target}' \
+             (kind={expected_kind}, correlation_id={corr}) has been unreplied for {elapsed_secs}s, and \
+             '{target}' is currently QUOTA-WEDGED (backend usage_limit / provider quota hard-block).\n\n\
+             This is NOT a stuck/silent alarm and NOT active work — '{target}' is blocked on its \
+             provider quota and is EXPECTED to stay silent until the quota resets (often hours/days). \
+             ONE heads-up (no repeats):\n\
+             - Expected → no action; it resolves when the quota lifts and the report arrives.\n\
+             - Can't wait → re-dispatch to a healthy same-role peer ('{target}' won't reply meanwhile).",
+        );
+    }
     // #2008-p2: the long-running escalation is DELIBERATELY worded to read nothing
     // like the stuck alarm — "active, just long, confirm" vs "went silent, may be
     // stuck/crashed" — so the dispatcher tells them apart at a glance.
@@ -1362,6 +1366,7 @@ fn deliver_dispatch_idle(
     elapsed_secs: i64,
     threshold_secs: i64,
     long_running: bool,
+    quota_wedged: bool,
 ) {
     let text = dispatch_idle_text(
         dispatch_id,
@@ -1372,6 +1377,7 @@ fn deliver_dispatch_idle(
         elapsed_secs,
         threshold_secs,
         long_running,
+        quota_wedged,
     );
     // #947: fall back to dispatch_id when upstream correlation_id is None so the
     // nudge is always traceable to its source sidecar.
@@ -1384,7 +1390,9 @@ fn deliver_dispatch_idle(
         "system:dispatch_idle",
         // #2008-p2: a distinct subtype so the dispatcher's inbox tooling can tell a
         // "still active, just long" confirm from a "went silent" stuck alarm.
-        if long_running {
+        if quota_wedged {
+            "dispatch_idle_quota_wedged"
+        } else if long_running {
             "dispatch_idle_long_running"
         } else {
             "dispatch_idle_threshold_exceeded"
@@ -1409,6 +1417,7 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
         threshold_secs,
         correlation_id,
         long_running,
+        quota_wedged,
     } = &event.kind
     {
         deliver_dispatch_idle(
@@ -1421,6 +1430,7 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
             *elapsed_secs,
             *threshold_secs,
             *long_running,
+            *quota_wedged,
         );
         true
     } else {
@@ -1435,7 +1445,7 @@ pub fn register_subscriber() {
 }
 
 fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
-    emit_dispatch_idle_event(home, d, elapsed_secs, false);
+    emit_dispatch_idle_event(home, d, elapsed_secs, false, false);
 }
 
 /// #2008-p2: the "long-running WITH ACTIVITY — confirm expected" escalation fired
@@ -1444,7 +1454,14 @@ fn emit_exceeded_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
 /// wording. Does NOT flip the sidecar to Exceeded — the target is working, not
 /// stuck, so the stuck-alarm path still owns a later genuine idle.
 fn emit_long_running_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
-    emit_dispatch_idle_event(home, d, elapsed_secs, true);
+    emit_dispatch_idle_event(home, d, elapsed_secs, true, false);
+}
+
+/// #78445-2: the quota-wedge escalation — the target is blocked on its provider
+/// quota (usage_limit), NOT active. A distinct honest message + the
+/// `dispatch_idle_quota_wedged` tag, fired once per dispatch (durable one-shot).
+fn emit_quota_wedged_event(home: &Path, d: &PendingDispatch, elapsed_secs: i64) {
+    emit_dispatch_idle_event(home, d, elapsed_secs, false, true);
 }
 
 fn emit_dispatch_idle_event(
@@ -1452,11 +1469,14 @@ fn emit_dispatch_idle_event(
     d: &PendingDispatch,
     elapsed_secs: i64,
     long_running: bool,
+    quota_wedged: bool,
 ) {
     // Observability log runs regardless of the gate (it is not the notification).
     crate::event_log::log(
         home,
-        if long_running {
+        if quota_wedged {
+            "dispatch_idle_quota_wedged"
+        } else if long_running {
             "dispatch_idle_long_running"
         } else {
             "dispatch_idle_threshold_exceeded"
@@ -1485,6 +1505,7 @@ fn emit_dispatch_idle_event(
             threshold_secs: d.threshold_secs,
             correlation_id: d.correlation_id.clone(),
             long_running,
+            quota_wedged,
         },
     );
 }
@@ -1526,6 +1547,13 @@ impl DispatchIdleTracker {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // #78445-2: quota-wedge tests homed in a sibling `*_tests.rs` (LOC-exempt) so
+    // `mod.rs` stays under the anti-monolith ceiling. Submodule of `tests`, so its
+    // `use super::*` inherits both these helpers and the production items. Lives in
+    // the `tests/` subdir a mod-in-inline-module `#[path]` resolves against.
+    #[path = "dispatch_idle_quota_78445_tests.rs"]
+    mod quota_78445_tests;
 
     /// #1636: the `DispatchStatus` enum MUST serialize to / deserialize from the
     /// exact lowercase wire strings the prior stringly-typed field used, so
@@ -2027,7 +2055,7 @@ mod tests {
         );
         let elog = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
         assert_eq!(
-            elog.matches("dispatch_idle_long_running").count(),
+            elog.matches("dispatch_idle_quota_wedged").count(),
             1,
             "exactly one quota escalation: {elog}"
         );
@@ -2041,7 +2069,7 @@ mod tests {
         scan_and_emit(&home);
         let elog2 = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
         assert_eq!(
-            elog2.matches("dispatch_idle_long_running").count(),
+            elog2.matches("dispatch_idle_quota_wedged").count(),
             1,
             "fire-once: still exactly one after repeat scans: {elog2}"
         );
@@ -2053,65 +2081,6 @@ mod tests {
             d.status,
             DispatchStatus::Pending,
             "still suppressed (Pending) across repeats, never Exceeded"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #t-116: when the target RECOVERS from a quota-wedge, the latch resets, so a
-    /// GENUINE later re-wedge re-escalates once (genuine-recurrence-re-logs-once),
-    /// rather than staying permanently silent.
-    #[test]
-    fn quota_recovery_resets_latch_then_rewedge_reescalates_t116() {
-        let home = tmp_home("t116-quota-recover");
-        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        let id = write_pending_at(&home, "lead", "dev", Some("t-qr"), "task", 600, issued);
-
-        // Episode 1 — wedged → escalate once + latch.
-        write_target_snapshot(&home, "dev", "usage_limit");
-        scan_and_emit(&home);
-        assert!(
-            list_pending(&home)
-                .into_iter()
-                .find(|d| d.dispatch_id == id)
-                .unwrap()
-                .quota_escalated,
-            "episode 1: latch set"
-        );
-
-        // Recover from the quota state (agent_state no longer "usage_limit") → the
-        // latch clears. Use "idle" (not a working state): a working state's
-        // suppress-gate refreshes `issued_at`, which would drop episode 2 below
-        // threshold; "idle" leaves the clock untouched and a single scan only bumps
-        // the debounce streak (no fire), isolating the latch-reset behaviour.
-        write_target_snapshot(&home, "dev", "idle");
-        scan_and_emit(&home);
-        let d = list_pending(&home)
-            .into_iter()
-            .find(|d| d.dispatch_id == id)
-            .unwrap();
-        assert!(!d.quota_escalated, "recovery must clear the quota latch");
-        assert_eq!(
-            d.status,
-            DispatchStatus::Pending,
-            "single idle scan defers (debounce), not Exceeded"
-        );
-
-        // Episode 2 — re-wedge → re-escalates once.
-        write_target_snapshot(&home, "dev", "usage_limit");
-        scan_and_emit(&home);
-        let d = list_pending(&home)
-            .into_iter()
-            .find(|d| d.dispatch_id == id)
-            .unwrap();
-        assert!(
-            d.quota_escalated,
-            "re-wedge after recovery re-sets the latch"
-        );
-        let elog = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-        assert_eq!(
-            elog.matches("dispatch_idle_long_running").count(),
-            2,
-            "two escalations across two distinct wedge episodes: {elog}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -3903,6 +3872,7 @@ mod tests {
             elapsed,
             threshold,
             false,
+            false,
         );
 
         // Bus emit→subscriber delivery (the gate-ON path) — real fan-out.
@@ -3920,6 +3890,7 @@ mod tests {
                 threshold_secs: threshold,
                 correlation_id: corr.map(String::from),
                 long_running: false,
+                quota_wedged: false,
             },
         );
 
