@@ -57,6 +57,11 @@ pub enum EventKind {
         /// activity), NOT the "went silent / stuck" alarm. Same delivery shape; the
         /// subscriber branches the message text so the dispatcher tells them apart.
         long_running: bool,
+        /// #78445-2: this escalation is because the TARGET is quota-wedged
+        /// (usage_limit / provider quota hard-block), NOT active work — a distinct
+        /// honest message from `long_running` (which claims activity). At most one
+        /// of `long_running` / `quota_wedged` is true.
+        quota_wedged: bool,
     },
     // #event-bus pattern #9 (supervisor member-state-change): the structured
     // {agent, team, from/to display} PLUS the fields the shared deliver needs to
@@ -525,6 +530,7 @@ mod tests {
                 threshold_secs: 300,
                 correlation_id: Some("t-1".into()),
                 long_running: false,
+                quota_wedged: false,
             },
             EventKind::MemberStateChanged {
                 agent: "dev".into(),

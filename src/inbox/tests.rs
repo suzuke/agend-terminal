@@ -876,6 +876,14 @@ fn drain_auto_acks_daemon_notifications() {
             "[dispatch_idle_long_running] dispatch d-1 from 'lead' -> 'dev' - \
              Long run EXPECTED -> no action; it resolves when the report arrives.",
         ),
+        // #78445-2: the quota-wedge subtype — same one-shot daemon FYI shape as
+        // dispatch_idle_long_running; must auto-ack on drain like its sibling.
+        (
+            "dispatch_idle_quota_wedged",
+            "system:dispatch_idle",
+            "[dispatch_idle_quota_wedged] dispatch d-1 from 'lead' -> 'dev' is \
+             QUOTA-WEDGED (usage_limit) - expected silent until the quota resets.",
+        ),
         (
             "dispatch_idle_nudge",
             "system:dispatch-watchdog",
@@ -1024,6 +1032,8 @@ fn reclaim_settles_legacy_stale_pr_merged_delivering_row() {
 fn reclaim_settles_stale_delivering_for_newly_audited_fire_and_forget_kinds() {
     for kind in [
         "dispatch_idle_long_running",
+        // #78445-2: the quota-wedge subtype — same one-shot daemon FYI class.
+        "dispatch_idle_quota_wedged",
         "dispatch_idle_nudge",
         "pr-ready-for-merge",
         "pr-closed-unmerged",
