@@ -110,28 +110,55 @@ fn push_has_bare_force(args: &[String]) -> bool {
     })
 }
 
-/// A deletion push (`--delete`, a short cluster containing `d`, or a `:<dest>` refspec with an
-/// empty source) removes a ref rather than overwriting history → exempt from the force gate.
+/// A PURE deletion push removes refs rather than overwriting history → exempt from the force
+/// gate. The `--delete` flag (or its short `-d` cluster) makes EVERY named ref a deletion, so
+/// it is unconditionally exempt. Otherwise a push is a pure deletion only when it names at
+/// least one refspec and EVERY refspec is a `:<dest>` deletion.
+///
+/// #t-…78445-1 F1 (dev2 review, CONFIRMED bypass): this MUST NOT use any-arg detection. A
+/// mixed `git push --force origin :del real` deletes `:del` AND force-overwrites `real`; an
+/// any-arg exemption would let `real`'s force through. Exempting only when ALL refspecs are
+/// deletions keeps a lone `:del` (or `--delete`) exempt while a mixed push stays gated.
 fn is_delete_push(args: &[String]) -> bool {
-    args.iter().skip(1).any(|a| {
-        a == "--delete"
-            || (a.starts_with('-') && !a.starts_with("--") && a.contains('d'))
-            || (!a.starts_with('-') && a.strip_prefix('+').unwrap_or(a).starts_with(':'))
-    })
+    // `--delete` / `-d` → all named refs are deletions.
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| a == "--delete" || (a.starts_with('-') && !a.starts_with("--") && a.contains('d')))
+    {
+        return true;
+    }
+    // Otherwise inspect the refspec positionals. The first positional is the remote; a push
+    // is a pure deletion only when it names >=1 refspec and EVERY refspec is a `:<dest>`
+    // deletion (after an optional `+`). A single non-delete refspec means the force applies to
+    // a real overwrite and must stay gated.
+    let non_flag: Vec<&str> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .collect();
+    non_flag.len() > 1
+        && non_flag[1..]
+            .iter()
+            .all(|&a| a.strip_prefix('+').unwrap_or(a).starts_with(':'))
 }
 
-/// Best-effort `(remote, branch)` for the deny message's retry sequence: the first positional
-/// after `push` is the remote, the second (if any) is the refspec whose dest is the branch.
-/// Absent → the message falls back to a `<remote> <branch>` template.
+/// Best-effort `(remote, branch)` for the deny message's retry sequence. Only reported when
+/// BOTH are explicitly on the command line — i.e. >=2 positionals (a remote followed by a
+/// refspec). With fewer we cannot tell a remote from a refspec (dev2 NIT: a lone `+branch`
+/// was mistaken for the remote, yielding `git fetch mybranch mybranch`), so we return
+/// `(None, None)` and the caller falls back to the generic `<remote> <branch>` template.
 fn force_push_target(args: &[String]) -> (Option<String>, Option<String>) {
     let positionals: Vec<&String> = args
         .iter()
         .skip(1)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let remote = positionals
-        .first()
-        .map(|s| s.trim_start_matches('+').to_string());
+    if positionals.len() < 2 {
+        return (None, None);
+    }
+    let remote = Some(positionals[0].trim_start_matches('+').to_string());
     let branch = positionals.get(1).map(|a| {
         let a = a.strip_prefix('+').unwrap_or(a);
         let dest = a.rsplit(':').next().unwrap_or(a);

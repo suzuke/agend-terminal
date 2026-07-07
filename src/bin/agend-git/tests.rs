@@ -1004,10 +1004,18 @@ fn push_force_without_lease_gate_t78445() {
     assert!(v(&["push", "-u", "origin", "feat/x"]).is_none());
     assert!(v(&["push", "origin", "feat/x"]).is_none());
     assert!(v(&["push"]).is_none());
-    // deletions remove a ref, they don't overwrite history → EXEMPT even with force.
+    // PURE deletions remove a ref, they don't overwrite history → EXEMPT even with force.
     assert!(v(&["push", "--force", "--delete", "origin", "feat/x"]).is_none());
     assert!(v(&["push", "--force", "origin", ":feat/x"]).is_none());
     assert!(v(&["push", "-df", "origin", "feat/x"]).is_none());
+    // F1 (dev2, CONFIRMED bypass) — a MIXED delete+overwrite push must NOT be exempted: the
+    // delete refspec used to trigger an any-arg exemption that let the overwrite's force
+    // through. All three of dev2's forms must DENY (RED against the pre-fix any-arg logic).
+    assert!(v(&["push", "--force", "origin", ":del", "real"]).is_some());
+    assert!(v(&["push", "--force", "origin", "+:del", "real"]).is_some());
+    assert!(v(&["push", "--force", "origin", "real", ":del"]).is_some());
+    // multi-delete (every refspec a deletion) stays EXEMPT.
+    assert!(v(&["push", "--force", "origin", ":del1", ":del2"]).is_none());
 }
 
 #[test]
