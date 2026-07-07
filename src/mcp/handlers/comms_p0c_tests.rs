@@ -109,3 +109,91 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #t-78445-3: the SHA-staleness gate must scan `summary + artifacts` for the PR
+/// URL (not `summary` alone). A reviewer whose verdict carries the URL in the
+/// `artifacts` field was FALSE-REJECTED with "no GitHub PR URL" → verdict lost to
+/// fallback (root cause of reviewer4's #2674/#2611 fallbacks). RED on pre-fix code
+/// (gate scanned summary only), GREEN after the shared summary+artifacts scan.
+#[test]
+fn sha_gate_scans_artifacts_for_pr_url_78445_3() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-78445-3-artifacts-url-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reporter = "reviewer-78445";
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!("instances:\n  lead:\n    backend: claude\n  {reporter}:\n    backend: claude\n"),
+    )
+    .unwrap();
+
+    let sender = crate::identity::Sender::new(reporter);
+    // Verdict prefix in `summary` (no URL); the PR URL lives ONLY in `artifacts`.
+    let result = super::handle_report_result(
+        &home,
+        &json!({
+            "instance": "lead",
+            "summary": "VERIFIED — looks correct",
+            "artifacts": "PR: https://github.com/nonexistent-org-xyz/nonexistent-repo/pull/1",
+            "reviewed_head": "abc1234def5678",
+        }),
+        &sender,
+    );
+    // The URL IS present in the envelope (artifacts) → it must NOT be rejected as
+    // missing. (Post-fix the gate then attempts a real fetch which fails for the
+    // fake repo — a DIFFERENT error; the point is the "no URL" false-reject is gone.)
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("no GitHub PR URL"),
+        "PR URL in artifacts must NOT be false-rejected as missing: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #t-78445-3 companion: a bare `#N` reference with NO full URL in EITHER field is
+/// still rejected (the daemon must not guess the repo — anti-forgery), but the
+/// reject message must be one-shot actionable so a degraded model can fix + resend
+/// instead of looping (the fugu re-enter degradation this bug triggered). No fetch
+/// runs (deterministic).
+#[test]
+fn sha_gate_bare_pr_number_still_rejected_actionable_78445_3() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-78445-3-bare-num-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reporter = "reviewer-78445b";
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!("instances:\n  lead:\n    backend: claude\n  {reporter}:\n    backend: claude\n"),
+    )
+    .unwrap();
+
+    let sender = crate::identity::Sender::new(reporter);
+    let result = super::handle_report_result(
+        &home,
+        &json!({
+            "instance": "lead",
+            "summary": "VERIFIED — PR #2674 looks good",
+            "artifacts": "ran: cargo test -> ok",
+            "reviewed_head": "abc1234def5678",
+        }),
+        &sender,
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("no GitHub PR URL"),
+        "a bare #N with no full URL must still reject: {result}"
+    );
+    assert!(
+        err.contains("PR: https://github.com/<owner>/<repo>/pull/<N>"),
+        "reject must name the exact FULL-URL line to add: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

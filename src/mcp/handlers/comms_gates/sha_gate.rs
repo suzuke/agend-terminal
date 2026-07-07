@@ -2,9 +2,14 @@
 
 /// Check that a reviewer's claimed SHA matches the current PR HEAD.
 /// Returns Ok(()) to proceed, Err(message) to reject the verdict.
+///
+/// `scan_text` is the reviewer's report body scanned for the PR URL — the caller
+/// MUST pass `summary + artifacts` (the PR URL may live in either), the SAME scan
+/// surface as the sibling evidence gate. Passing `summary` alone false-rejects a
+/// verdict whose URL is in `artifacts` (#t-78445-3).
 pub(crate) fn check_sha_gate(
     reviewed_head: &str,
-    summary: &str,
+    scan_text: &str,
     fetch: impl Fn(&str) -> Result<String, String>,
 ) -> Result<(), String> {
     if reviewed_head.len() < 7 {
@@ -14,14 +19,23 @@ pub(crate) fn check_sha_gate(
             reviewed_head.len()
         ));
     }
-    let pr_ref = match extract_pr_number(summary) {
+    let pr_ref = match extract_pr_number(scan_text) {
         Some(pr) => pr,
         None => {
-            // B2: reviewed_head provided but no PR URL → incomplete attestation
-            return Err("reviewed_head provided but no GitHub PR URL in summary; \
-                 include PR URL (https://github.com/owner/repo/pull/N) \
-                 so daemon can verify SHA against current PR head"
-                .to_string());
+            // B2: reviewed_head provided but no PR URL anywhere in the report body →
+            // incomplete attestation. One-shot-actionable message (a degraded model
+            // must be able to fix + resend from the text alone). We do NOT guess the
+            // repo from a bare `#N`: guessing could verify against the WRONG PR and
+            // silently pass a stale head — the anti-forgery this gate exists for.
+            return Err(
+                "reviewed_head was provided but no GitHub PR URL was found in the \
+                 report body (summary + artifacts). The daemon verifies reviewed_head against \
+                 the PR's current head, which needs the PR URL. FIX: add a line with the FULL \
+                 URL — `PR: https://github.com/<owner>/<repo>/pull/<N>` — to your message or \
+                 artifacts, then resend. A bare `#<N>` is not enough (the daemon will not guess \
+                 the repo)."
+                    .to_string(),
+            );
         }
     };
     let current_sha = fetch(&pr_ref)?;
@@ -38,6 +52,18 @@ pub(crate) fn check_sha_gate(
         ));
     }
     Ok(())
+}
+
+/// The report body scanned by BOTH the SHA gate (for the PR URL) and the sibling
+/// reviewer-evidence gate (for the evidence token): `summary + artifacts` — either
+/// field may carry it. Shared through this one helper so the two gates' scan
+/// surfaces can never drift apart (the drift that false-rejected reviewer verdicts
+/// whose URL was in `artifacts`, #t-78445-3).
+pub(crate) fn report_scan_body(summary: &str, artifacts: Option<&str>) -> String {
+    match artifacts {
+        Some(a) => format!("{summary}\n{a}"),
+        None => summary.to_string(),
+    }
 }
 
 /// Extract PR number from text containing a GitHub PR URL.
@@ -171,6 +197,41 @@ mod tests {
         assert!(
             result.is_ok(),
             "7-char reviewed_head should pass: {result:?}"
+        );
+    }
+
+    /// #t-78445-3: the caller passes `summary + "\n" + artifacts`; the PR URL may
+    /// live in the artifacts portion. The gate must find it there (not just in the
+    /// summary prefix) — the false-reject root cause.
+    #[test]
+    fn sha_gate_finds_url_in_appended_artifacts_78445_3() {
+        let sha = "abc123def456789012345678901234567890abcd";
+        let scan_text = "VERIFIED — looks correct\nPR: https://github.com/owner/repo/pull/42";
+        let result = check_sha_gate(sha, scan_text, |_| Ok(sha.to_string()));
+        assert!(
+            result.is_ok(),
+            "URL in the appended artifacts portion must be found: {result:?}"
+        );
+    }
+
+    /// #t-78445-3: a bare `#N` (no full URL) is STILL rejected — the daemon must not
+    /// guess the repo (anti-forgery) — but the message must be one-shot actionable.
+    #[test]
+    fn sha_gate_bare_pr_number_rejected_with_actionable_message_78445_3() {
+        let result = check_sha_gate("abc1234def", "VERIFIED — PR #42 only", |_| unreachable!());
+        let err = result.unwrap_err();
+        assert!(err.contains("no GitHub PR URL"), "still rejected: {err}");
+        assert!(
+            err.contains("PR: https://github.com/<owner>/<repo>/pull/<N>"),
+            "message must name the exact FULL-URL line to add: {err}"
+        );
+        assert!(
+            err.contains("summary + artifacts"),
+            "message must say both fields are scanned: {err}"
+        );
+        assert!(
+            err.contains("not guess the repo"),
+            "message must explain why a bare #N is insufficient: {err}"
         );
     }
 }

@@ -19,7 +19,7 @@ pub(super) use evidence_gate::{check_evidence_gate, cross_check_and_log};
 // dispatch tracker (the verdict→review-task bridge in `track_dispatch`), so they
 // are crate-visible, not just `pub(super)`.
 pub(crate) use evidence_gate::{detect_verdict, Verdict};
-pub(super) use sha_gate::{check_sha_gate, fetch_pr_head_sha};
+pub(super) use sha_gate::{check_sha_gate, fetch_pr_head_sha, report_scan_body};
 
 // Send-invariant gate (handle_unified_send).
 pub(super) use anti_stall::enforce_send_invariants;
