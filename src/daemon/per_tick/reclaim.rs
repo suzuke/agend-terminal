@@ -424,6 +424,15 @@ impl PerTickHandler for ReclaimHandler {
             // this needs to snapshot). Covers dispatches the agent already claimed
             // AND ones still unclaimed in its inbox.
             reroute_dispatches(ctx.home, &name, &blocked);
+            // #78445-2: reroute_dispatches clears the `dispatch_tracking` store, but
+            // the `dispatch_idle` sidecar (a SEPARATE store) tracks the same
+            // dispatch and keeps firing `dispatch_idle_long_running` after the
+            // obligation is already released — reclaim was blind to it (only the
+            // board-task cascade below clears dispatch_idle, and only for owned
+            // tasks). A reclaimed agent can no longer respond to ANY dispatch, so
+            // clear every sidecar targeting it here (same target-keyed cleanup the
+            // instance-delete path uses).
+            crate::daemon::dispatch_idle::cleanup_pending_for_instance(ctx.home, &name);
             // Phase 1 board-task reclaim. recovered=false: an eligible agent is
             // blocked (usage_limit), not mid-recovery.
             reclaim_if_eligible(
@@ -958,6 +967,80 @@ mod tests {
             task_status(&home, "t-r"),
             crate::task_events::TaskStatus::Open,
             "Phase 1 must still release the board task to Open"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #78445-2 RED-first (defect a): a reclaimed (usage_limit) agent's
+    /// `dispatch_idle` sidecar must be cleared by reclaim. `reroute_dispatches`
+    /// releases/notifies the dispatch (clearing the SEPARATE `dispatch_tracking`
+    /// store) but pre-fix left the `dispatch_idle` sidecar live, so its watchdog
+    /// kept firing `dispatch_idle_long_running` on an already-released dispatch
+    /// (the observed 4-min repeat noise). NO board task is seeded, so the board-task
+    /// cascade (which retargets sidecars by correlation) cannot clear it — only the
+    /// new reclaim-time `cleanup_pending_for_instance` can, making this RED pre-fix.
+    #[test]
+    fn reclaim_clears_dispatch_idle_sidecar_78445_2() {
+        use parking_lot::Mutex as PLMutex;
+        use std::sync::Arc;
+        let home = tmp_home("reclaim-dispatch-idle");
+        // A kind=task dispatch lead → dev-r populates BOTH stores:
+        //   dispatch_tracking (reroute_dispatches clears this today) …
+        seed_dispatch(&home, "lead", "dev-r", Some("t-r"), "pending");
+        //   … and the dispatch_idle sidecar (the store reclaim forgot to clear).
+        let sidecar = crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "lead",
+            "dev-r",
+            Some("t-r"),
+            "task",
+            900,
+        );
+        assert!(
+            sidecar.is_some(),
+            "precondition: dispatch_idle sidecar seeded"
+        );
+        assert_eq!(
+            crate::daemon::dispatch_idle::list_pending(&home)
+                .iter()
+                .filter(|d| d.target == "dev-r")
+                .count(),
+            1,
+            "precondition: exactly one dispatch_idle sidecar targets dev-r"
+        );
+
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("dev-r");
+        handle.core.lock().state.current = AgentState::UsageLimit;
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+        let past = std::time::Instant::now()
+            - super::super::NOTIFICATION_BOOT_GRACE
+            - std::time::Duration::from_secs(1);
+        let h = ReclaimHandler::new_at(1, fresh_latch(), past);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+
+        // (a) THE FIX: the reclaimed agent's dispatch_idle sidecar is cleared.
+        assert!(
+            crate::daemon::dispatch_idle::list_pending(&home)
+                .iter()
+                .all(|d| d.target != "dev-r"),
+            "#78445-2: reclaim must clear the reclaimed agent's dispatch_idle sidecar \
+             (else the watchdog keeps firing dispatch_idle_long_running on a released dispatch)"
+        );
+        // Regression guard: the existing dispatch_tracking cleanup still happens —
+        // both obligation stores are cleared, not just one.
+        assert!(
+            crate::dispatch_tracking::take_pending_dispatchers_to(&home, "dev-r").is_empty(),
+            "#78445-2: reclaim must still clear the dispatch_tracking store (no regression)"
         );
         std::fs::remove_dir_all(&home).ok();
     }
