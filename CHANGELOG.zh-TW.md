@@ -5,30 +5,56 @@
 本文件記錄本專案所有重要變更。
 格式基於 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)；專案遵循 [SemVer](https://semver.org/spec/v2.0.0.html)。
 
-## [Unreleased]
+## [0.10.0] — 2026-07-07
+
+自 0.9.0 起 311 個 commit。以下依主題整理重點(非完整 commit 清單)。
 
 ### Added
 
-- **per-role MCP 工具子集(#2344、#2367)** — 新增 per-role MCP capability registry(#2344),加上 `fleet.yaml` 中型別化、由 operator 宣告的 `role_kind`(七種變體)驅動它(#2367),裁切 agent 對外公告的工具面。先前用自由文字 `role:` 比對,永遠對不上真實的散文角色名,所以每個 agent 都看到全部工具;唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集,且 exhaustive match 強制每個新角色都要明確決定。opt-in、預設全工具(#2300)。
-- **turn-completion sentinel shadow 擴及 Claude(#2366 —— measure-only、預設 OFF)** — 在 `AGEND_TURN_SENTINEL_SHADOW=1` 下,Claude 現在也會被注入 turn-completion sentinel 並做 shadow 量測,取得跨 backend 的 emission 基線。Claude 的權威狀態仍走其 lifecycle hooks;shadow 永不驅動 state(#1523 Phase 0)。
-- **三態 inbox 投遞(#2345)** — 訊息投遞改為 `unread → delivering → processed`,搭配顯式 `inbox ack` 與 reclaim-TTL:收件者 turn 在 drain 之後死掉的訊息會被重新投遞(at-least-once),不再靜默遺失(#2299)。
+- **Discord 成為一等公民 operator 頻道(#2562、#2586–#2592)** — Discord 加入 Telegram,成為即時的 operator 頻道。先前的工作已交付 REST / gateway 解析 / binding 骨架,但沒有任何連線真正打開;現在 gateway WebSocket + `gateway_event_to_channel_event` 轉譯(#2564)已接上真實的 daemon/app 啟動流程,使 `fleet.yaml` 裡的 `ChannelConfig::Discord` 建構出即時頻道而非 no-op(#2567),搭配把 `poll_event()` 導入 agent inbox 的 inbound dispatcher(#2587)、write-side per-instance binding(#2588),以及一個由 gateway death-status flag 把關的有界重啟 supervisor(#2590、#2592)。背後由完整的 inbound/outbound REST + reconnect-backoff 測試矩陣支撐,現已納入主 CI(#2625、#2628、#2629、#2649)。
+- **Shadow Observer — 不依賴 hook 的活動推斷(#2413、#1523)** — 全新的 out-of-band pipeline 在不依賴 tool-call hook 下推斷 agent 活動:以 lsof 為基礎的 API-activity probe(#2426)、帶 Evidence + quantification 的本地 hook-plane reducer(#2433),以及泛化的 `{Hook|Stream}` reducer 來源,涵蓋 codex rollout-tail(#2437)、opencode SSE(#2440)、kiro session-tail(#2447)與 agy lifecycle-hooks plane(#2448)。已畢業為 kill-switch 背後的預設 ON(#2449)、併入 confidence gate 把關的 pane badge(#2456),並延伸以驅動 operated-state(#2457)。`#1523` turn-completion sentinel 的 shadow 量測現在也涵蓋 `claude` backend(#2366,僅量測、預設 OFF)。
+- **多頻道 binding + topic 補強(#991、#2642)** — `bind_topic` MCP action 把 topic 追加到先前被延後(deferred)的 instance 上(#2598);deployment / team-mode 樣板端到端傳遞 `topic_binding`(#2600);`list_instances` 公開 `topic_binding_mode`(#2606);`FleetConfig::configured_channels()` 提供 canonical 的多頻道視圖(#2643),Telegram 與 Discord 都透過它一起註冊(#2646)。
+- **臨時 one-shot worker(#1967 Phase 1)** — headless、不進 roster 的 PTY worker,生成、跑完一個 turn 就 reap:帶 day-1 cost guards 的 tracking-store 骨架(#2401)、搭配 admission-before-spawn 的真實 headless spawn(#2402)、group-kill reap(#2405),以及一個 one-shot driver(inject → idle-debounce turn-end → capture → oracle),先在 opencode 上線(#2407)再延伸到 claude(#2408)。
+- **per-role MCP capability registry(#2300、#2344、#2367)** — 新增 per-role MCP capability registry(#2344),加上 `fleet.yaml` 中型別化、由 operator 宣告的 `role_kind`(七種變體)驅動它(#2367),裁切 agent 對外公告的工具面。唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集;exhaustive match 強制每個新角色都要做出明確決定。opt-in、預設全工具。
+- **三態 inbox 投遞(#2345、#2299)** — 訊息投遞改為 `unread → delivering → processed`,搭配顯式 `inbox ack` 與 reclaim-TTL:收件者 turn 在 drain 之後死掉的訊息會被重新投遞(at-least-once),不再靜默遺失。
+- **Fugu / Codex model-provider 支援(#2484–#2492、#2505)** — 一鍵 Fugu quick-spawn(#2487),搭配 model-provider descriptor(#2488)與自動偵測(#2486);Fugu 以 Codex「Sakana」backend 呈現(#2490);fleet model-tier policy(#2484);以及 provision 真正的 Codex profile 而非隔離的 `CODEX_HOME`(#2505)。
+- **Fleet 決策與觀察 plane(#2524)** — 進入 `in_progress` 前要求 pre-work alignment 的 plan-ack gate(#2529)、status line 上的被動 decision badge + per-pane marker(#2530)、decision-board timeout + 預設處理(#2531),以及涵蓋臨時 worker 的 observation-plane 覆蓋(#2532、#2535)。
+- **Ralph-loop self-continuation + discharge ledger(#2524、#2622)** — 帶硬性 `max_iterations` 上限的 self-continuation loop(#2543);以及接上 inbox-reclaim 與 `poll_reminder` 兩個 chokepoint 的 channel-reply / notification discharge ledger(#2541、#2644),讓真正被吸收(absorb)的訊息能抑制 re-nudge(#2545),前端為 `inbox action=discharge` 與可指定對象的 `reply message_id`(#2647、#2648)。
+- **Off-thread 渲染 pipeline(Option X — `AGEND_OFFTHREAD_PARSE`,預設 OFF)** — per-pane 解析現在可以跑在主執行緒之外(#2404),並補上正確性後續:pane 捲動(#2411)、基於 snapshot 的複製選取(#2414)、滑鼠轉發(#2417),以及 zoom/resize 路由(#2419、#2420)。
+- **TUI:command palette、圖片貼上、pane 淡化** — `Ctrl+B :` command-palette 自動完成,涵蓋指令探索(#2381)與參數值(#2387);`Ctrl+B i` 把剪貼簿圖片——包含透過真實檔案內容讀取而來的 Finder 檔案複製——貼入 agent 輸入(#2435、#2443、#2446);非聚焦的 pane 預設以 RGB 混色朝背景淡化,方便追蹤焦點(#2444)。
+- **Creator-scoped `delete_instance` ACL(#2552)** — instance 的建立者現在可以刪除自己 spawn 的實例(先前僅限 orchestrator),當目標有 in-flight 工作時,由 `force` + `force_reason` valve 把關。
 
 ### Changed
 
-- **per-tick / render 熱路徑效能稽核(#2348–#2356)** — 一批零行為改變的熱路徑加速:render redraw-scan 節流與 per-pane snapshot-scratch 重用(#2348、#2351、#2354)、PTY reader pre-hash gate 在未變更的 frame 跳過 colour-mask 建構(#2349)、inbox unread-count 改用 cheap probe(#2350)、`FleetConfig` mtime-cache Arc 共享(#2356)、monitor proc-table 重用(#2355)、dismiss scan 在啟動後才開(#2352)、以及 MCP usage-stats 輪替(#2353)。
+- **MCP tool-surface 整併(#2548)** — 多波縮減 MCP surface:移除死工具(#2554);`replace_instance` 退役,併入 `restart_instance mode=fresh`(#2556);`set_display_name` / `set_description` 併入 `set_metadata`(#2557);五個工具移到 CLI 並收窄設定(#2560);`mode` 折入 `list_instances`,`force_release_worktree` 併入 `release_worktree(force:true)`(#2561)——公告的 surface 收斂到 37 個工具。
+- **Notification-watchdog handler 整併(#2549)** — poll-reminder + inbox-stuck + handoff-timeout 併成一個 handler(#2572);context-alert + context-handoff 併入 `ContextThresholdsHandler`(#2577);四個 GC tick handler 折成一個 `HourlyGcHandler`,改成 per-sweep(而非 per-handler)的 panic isolation(#2568);`ProgressBackstop` / `Mirror` 退役,handler 數量從 40 降到 37(#2571)。
+- **Binding / GC / agend-git 收斂(#2550)** — 一輪廣泛整併,把 `binding.json` 路徑建構、scan-all 讀取與 `bind_self` read-back 統一到共用 helper(#2583–#2585);把 GC 折成單一 fire-on-first driver(#2599、#2605);把 `cleanup_merged_branch` 的刪除 gate 收斂到 `is_squash_gc_eligible`(#2597);並抽出帶 protected-refs 收斂的 `agend-git` classify predicate(#2580)。
+- **agend-git policy engine(#2379)** — git 操作被分類為 deny / warn / info,衝突會路由到 `fleet_events`(#2462);fail-closed 的 protected-ref push deny,可用 `policy.toml` override(#2468);以及對 `$AGEND_HOME` config/audit blob 寫入的 push-shim deny(#2390)。
+- **per-tick / render 熱路徑效能稽核(#2348–#2356、#2388–#2400)** — 一批零行為改變的加速:render redraw-scan 節流與 per-pane snapshot-scratch 重用(#2348、#2351、#2354)、PTY-reader pre-hash gate 在未變更的 frame 跳過 colour-mask 建構(#2349)、inbox unread-count 改用 cheap probe(#2350)、`FleetConfig` mtime-cache Arc 共享(#2356)、monitor proc-table 重用(#2355)、唯讀 MCP 工具跳過 usage-append / heartbeat RMW(#2388),以及 task-events compaction hysteresis(#2389、#2400)。
+- **CI handoff 與 inbox 通知可靠性** — 降低 CI source-resolution 的 API loopback(#2495);report auto-close 改走 task project board(#2501);同一 head 上 terminal PR 的重複 ci-ready handoff 被抑制(#2504);修掉會靜默丟棄低 id rerun-to-green 轉換的 per-workflow notify cursor(#2520);以及 pr-state FYI 通知在 drain 時自動 ack(#2508、#2493)。
+- **Team / project metadata 正確性** — 對已存在的 branch 也轉發 `repository_path` 而非丟棄(#2525、#2551);顯式的 `project_id` override,讓脆弱的 `source_repo` slug 推導不會誤導 team 路由(#2509、#2522);`update-add-member` / `project_id` 被釘住以撐過 daemon 重啟(#2565)。
+- **內部簡化與衛生** — `#2050` byte-identical 簡化系列(dispatch / mcp / overlay / inbox helper + 死碼移除,#2357–#2365);`AgentState::Thinking` / `ToolUse` 併成單一 `Active`(#2461);`quickstart.rs` 從 2040 縮到 1100 LOC(#2611);`discord.rs` 拆成 per-concern 子模組(#2619);anti-monolith 檔案大小 ratchet + MCP-docs-vs-registry drift guard(#2483);外加例行依賴升級,包含 `quinn-proto` 的 RUSTSEC-2026-0185 安全修補(#2416)與 `quick-xml` 0.39 → 0.41(移除兩條 RUSTSEC ignore)(#2651)。
 
 ### Fixed
 
-- **redraw 風暴與重啟時的 UI 凍結(#2343、#2346)** — render loop 現在把 redraw 速率上限訂在 30fps 並合併 wakeup,wakeup 風暴不再凍結 UI(#2346);重啟時把 OWNED pane 的還原 spawn 延後到 render-first 背景池,讓畫面先繪出再做重活(#2343)。
-- **本地 / scratch shell 可再次啟動(#2359)** — #1441 的 unmanaged-spawn gate 連 operator 開的本地/scratch shell(`Ctrl+B c`)也擋住了;這些現在豁免。
-- **還原的分割 pane PTY 尺寸(#2360)** — 重啟時還原的分割 pane 會在 deferred attach 之後重新調整到其 content rect,不再卡在錯誤尺寸(#2343)。
-- **GR1 綁定劫持可觀測性(#2158 —— #2341、#2361、#2373)** — self-claim 綁定(無 task dispatch)現在會向 operator 顯示,且不再靜默 auto-arm ci-watch(#2341);該通知改寄到被綁 agent 的 team orchestrator 而非全域 operator inbox,top-level lead 的 self-notify 則跳過(#2361、#2347);per-branch fire-once latch 在 release 時清除,之後同分支的真正 re-claim 會重新顯示(#2373)。僅偵測 —— push 權限仍由 HMAC + guard-b 把關。
-- **API 連線計數器 panic-safe(#2368)** — per-connection slot 與 in-flight session 計數器在 `handle_session` *之後* 才遞減,panic unwind 會跳過;洩漏的 slot 累積到上限(32)後拒絕所有新連線,鎖死控制面。RAII guard 現在在所有路徑(含 panic unwind)都釋放(bug-audit Rank1)。
-- **Telegram 授權在 side-effect 之前執行(#2369)** — allowlist 檢查跑在 fleet-status 注入與 `加 task:` 板寫入 *之後*,非 allowlist 的傳送者可讀取 fleet 狀態或建立板任務。授權區塊已提前到所有內容 side-effect 之前(bug-audit Rank2)。
-- **ci-watch supersede 不再誤殺前綴碰撞的 branch(#2370)** — `mark_ci_watch_superseded` 以子字串比對 `repo@branch` 鍵,使得 `repo@feat/x` 事件誤把未讀的 `repo@feat/x-2` CI-ready 通知標為 superseded。現改以 `correlation_id` 相等比對(bug-audit Rank3)。
-- **被回收的 inbox 訊息會重新 page(#2362)** — 把過期的 `delivering` 列還原回 `unread` 時,現在會重新武裝 poll-reminder,被回收的訊息會再次浮現而非靜默躺著(#2299)。
-- **null 的必填 MCP 參數被乾淨拒絕(#2372)** — `validate_args` 把「存在但為 JSON null」的必填欄位當成存在,例如 `reply {"message": null}` 會轉發空字串、在下游不透明地失敗;現在對每個 handler 都把 null 視為缺漏拒絕,而合法的空字串仍通過(bug-audit Rank8)。
-- **restart/replace 雙重 spawn 防護加上回歸鎖(#2371 —— 僅測試)** — `handle_pty_close` 裡 source 端的 `deleted` guard 是 restart/replace 路徑上防止同名 re-spawn 雙重 spawn 的唯一保護;兩個回歸測試現在把它釘住(deleted → 抑制 exit;not-deleted → crash 仍發出),無 production 變更(bug-audit Rank4)。
+- **Canonical worktree 刪除事故——根因 + 偵測(#2668、#2669)** — 2026-07-06 的 canonical repo 刪除事故追蹤到 `repo release` 執行了 `git worktree remove --force`(git 對 main tree 會拒絕),接著 fall through 到無條件的 `remove_dir_all`。`validate_release_path` 現在以 git 本身(而非檔案系統啟發式)作為 source of truth,拒絕任何 primary / main working tree,使 bare repo 與 `--separate-git-dir` 的 main 都無法漏網(#2668);canonical heartbeat + `binding_state` liveness check 讓未來任何 canonical 遺失都會立刻示警,而不是靜默 40 分鐘(#2669)。
+- **四道資料遺失防線(#2672、#2673、#2677、#2679)** — `bind_self` 重新 provisioning 不再讓既有的 `origin/<branch>` 變成孤兒(#2673);兩條手動 worktree-release 路徑都會把 dirty WIP 存成 recovery ref 的 snapshot,而非無條件丟棄(#2672);`agend-git` shim 對 feature-branch 的 force-push 要求 `--force-with-lease`,堵上任何 agent 都能靜默覆蓋別的 agent origin branch 的 footgun(#2677);以及收尾中的 task 會結清自己的 `dispatch_tracking` 列(不只是 `dispatch_idle` sidecar),讓 `sweep_stuck` 不再對已關閉的工作發牢騷(#2679)。
+- **安全與可靠性稽核清掃——17 個根因修復(#2510)** — 把 `ci-watch` forge token 限制在可信主機的 SSRF / token-exfiltration gate(AUDIT2-001)、對破壞性工具的 per-caller ACL(AUDIT2-002/003)、擋下 cron DST fall-back 的 re-fire 風暴(AUDIT2-010)、atomic + locked 的 runtime-config 寫入(AUDIT2-012),以及 panic-isolated 的 crash-event dispatch(AUDIT2-007),外加零星的 TUI / tasks / skills / durability 修復。
+- **Render-loop 凍結系列** — 重啟時把 OWNED 還原 spawn 延後到 render-first 背景池(#2343);redraw 上限訂在 30fps 並合併 wakeup(#2346);lock-free 發布的 `AgentState` mirror,終結 `core.lock` 爭用造成的凍結(#2380);`drain_output` 改成每 frame 有上限,阻止 PTY-backlog 畫面凍結(#2385);以及把重啟風暴吸收進有界的 boot / loading 階段(#2396)。
+- **Rate-limit / server-overload 恢復,續集** — self-clear latch 在全新的 `ApiError` hook 上重置(#2415,接續 #2318 / #2319);過期的 `ServerRateLimit` badge 會讓位給 SRL 之後的新 hook 活動(#2470、#2471);以及一次 spike 量化出 agent 幾乎從不會自清 rate-limit block(2746 / 2746 筆 shadow 紀錄顯示 `self_cleared=false`),因此移除了死掉的 `rate_limit_self_cleared` 訊號與無效的 self-clear 指示——真正的恢復現在改走 hook-authoritative 路徑(#2674、#2675)。
+- **Worktree / binding / dispatch race 完整性** — 型別化的 `LeaseError` 取代原本可能靜默回傳 `Ok` 但缺 binding 的 lease(#2464);安全的 same-agent rebind 修復取代了破壞性的 fallback(#2496、#2523);過期的 dispatch-checkout binding 現在 fail closed(#2500);push guard 改解析真正的 default branch,而非寫死 `origin/main`(#2662);`HourlyGc` 與 worktree-registry sweep 移出 daemon 的 main tick loop(#2614、#2616);以及堵上三類 worktree-reclaim 的偽陽性(#2657)。
+- **Dirty canonical main working-tree guardrail(#2512)** — 一個未追蹤的散落檔案可以繞過所有既有的防護落進 canonical main working tree(agend-git shim 只看得到 git 指令;drift check 只看 HEAD 狀態;`.gitignore` 只比對完全相同的檔名);新的 L1 + L2 偵測器(`apply_to_canonical` → `Option<CanonicalDirtyReport>`)補上這個確切的缺口。
+- **Health / respawn 硬化(#2480、#2538)** — decay transition 與 `respawn_ok` 現在都強制 process-liveness gate;crash-respawn 失敗會 escalate 而非靜默卡死;backend-exit 的 foreground-identity 偵測會發出 `backend_exited` 通知 + Unhealthy transition(#2546)。
+- **PTY write-actor race 與 leak 硬化** — 用 per-writer thread isolation 修掉 fd-reuse race(#2620、#2630);把 idle busy-poll 換成 park-on-empty-queue(#2656);新增 fd-leak 回歸測試 + ConPTY sideload 稽核(#2613)。
+- **Inbox 投遞可靠性(#2299)** — 還原過期的 `delivering` 列時 poll-reminder 會重新武裝(#2362);`mark_ci_watch_superseded` 改以 `correlation_id` 相等比對,而非文字子字串(#2370);poll-reminder 只計算真正的義務,不算已 drain 的 report(#2412);`DELIVERING` 在 session-reset 時透過 `ack_inbox` 送出並結清(#2425)。
+- **dispatch_idle 殭屍 / quota-wedge 訊息(#2676、#2678)** — 回收 rate-limited agent 時現在也會清掉其 `dispatch_idle` sidecar,讓已釋放的 reviewer / query dispatch 不再發出過期的 watchdog 警報(#2676);quota-wedge escalation 現在持久地 one-shot,不再因 snapshot flicker 而自清——先前這曾導致相隔幾分鐘的重複觸發(#2678)。
+- **Bug-audit 硬化(#2368、#2372)** — RAII connection-slot guard,讓 panic 的 `handle_session` 不會把計數器洩漏到 32-slot 上限而鎖死控制面(#2368);`validate_args` 把「存在但為 JSON null」的必填欄位視為缺漏並拒絕,而非靜默轉發空字串(#2372)。
+- **Auth 與授權(#2369、#2378)** — Telegram 的 allowlist 檢查現在跑在 fleet-status 注入與 `加 task:` 板寫入之前(#2369);已審核的 authz 內容不再被誤標為 `AuthError`(#2378)。
+- **Telegram 健壯性** — quote-reply 對應現在透過持久的 sent-message ledger 精確比對,而非 best-effort matching(#2570);TUI pane create / kill hook 在一次 post-#945 的 channel-ref 回歸後重新觸發(#2591);topic-reuse 的身分混淆漏洞已補上(#2593)。
+- **send 驗證誤拒(#2681)** — reviewer 的 SHA-staleness gate 只在 `summary` 裡掃 PR URL,而對應的 evidence gate 卻掃 `summary + artifacts`,導致 URL 放在 `artifacts` 裡的 verdict 被誤拒進 fallback-inject 路徑;兩個 gate 現在共用同一個掃描面,無 URL 的拒絕訊息也改為一次到位可行動。
+- **e2e local-precondition 摩擦(#2680)** — 兩個 real-daemon e2e 測試在本地 auto-bind 不可用時改為 skip 而非 fail,讓缺少的本地前置條件不再誤讀為假的 CI 失敗。
+- **GR1 綁定劫持可觀測性(#2158、#2341、#2361、#2373)** — self-claim 綁定(無 task dispatch)現在會向 operator 顯示,且不再靜默 auto-arm ci-watch(#2341);該通知改寄到被綁 agent 的 team orchestrator,而非全域 operator inbox(#2361);per-branch fire-once latch 在 release 時清除,之後同分支的真正 re-claim 會重新顯示(#2373)。僅偵測——push 權限仍由 HMAC + guard 把關。
+- **Split-pane 與 local-shell 還原(#2359、#2360)** — operator 開的本地 / scratch shell(`Ctrl+B c`)豁免於 #1441 的 unmanaged-spawn gate(#2359);還原的 split pane 會在 deferred attach 之後重新調整到其 content rect,不再卡在錯誤尺寸(#2360)。
 
 ## [0.9.0] — 2026-06-19
 
