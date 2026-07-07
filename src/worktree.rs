@@ -464,6 +464,257 @@ pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
         .unwrap_or(true)
 }
 
+// ── #2158-adjacent: dirty-WIP preservation on MANUAL worktree release ──────
+//
+// The daemon's AUTO-release already refuses to remove a dirty worktree
+// (auto_release.rs SkipDirtyWorktree). The two MANUAL release paths —
+// `worktree_pool::release_full` (release_worktree force:false) and
+// `mcp::handlers::force_release::rebase_clean_self` (force:true) — removed a
+// dirty worktree UNCONDITIONALLY, silently losing uncommitted WIP. Before that
+// destructive removal we snapshot the WIP into a durable git ref that outlives
+// the worktree dir, and notify the operator with a one-line recovery command.
+// A clean worktree is a no-op → zero behaviour change.
+
+/// Namespace for WIP-recovery refs. Each ref is
+/// `refs/agend/recovery/<branch>/<UTC YYYYMMDDTHHMMSSZ>` and points at a commit
+/// whose tree is the full dirty-worktree snapshot (tracked + untracked).
+pub(crate) const RECOVERY_REF_PREFIX: &str = "refs/agend/recovery";
+
+/// Recovery-ref retention (lead-vetted 2026-07-07: 14-day TTL + at most 3 per
+/// branch). Enforced at creation time against the branch's own refs — see
+/// [`prune_recovery_refs`].
+const RECOVERY_TTL_DAYS: i64 = 14;
+const RECOVERY_MAX_PER_BRANCH: usize = 3;
+
+/// Is there WIP in this worktree worth preserving? Any `git status --porcelain`
+/// entry that is NOT the daemon's own `.agend-managed` marker counts (porcelain
+/// without `--ignored` already excludes gitignored build artifacts). This
+/// deliberately differs from [`has_uncommitted_changes`]: a freshly-leased
+/// worktree ALWAYS carries the untracked marker, which must NOT trigger a
+/// recovery snapshot on an otherwise-clean release (mirrors the marker-exempt
+/// rule in `retention::worktrees::maybe_remove_candidate`). Fail-closed
+/// (`Err => true`): a status failure attempts preservation rather than risk
+/// dropping WIP — a broken git then fails the snapshot gracefully (`None`).
+fn worktree_has_preservable_wip(wt_path: &Path) -> bool {
+    match crate::git_helpers::git_cmd(wt_path, &["status", "--porcelain"]) {
+        Ok(s) => s.lines().any(|line| {
+            let path = line.get(3..).map(str::trim).unwrap_or("");
+            !path.is_empty() && path != crate::worktree_pool::MANAGED_MARKER
+        }),
+        Err(_) => true,
+    }
+}
+
+/// Outcome of a pre-removal WIP-preservation attempt. `#[must_use]` so a release
+/// path cannot silently drop it and destroy the worktree regardless — the
+/// fail-OPEN bug reviewer4 caught in the first cut: a contended `index.lock`
+/// made `git add -A` fail, the ignored `None` let `release_full` proceed, and the
+/// dirty untracked WIP evaporated with zero recovery ref. A caller MUST refuse to
+/// remove the worktree on [`WipPreservation::Blocked`].
+#[must_use]
+pub(crate) enum WipPreservation {
+    /// No preservable WIP (clean, or only the daemon `.agend-managed` marker) —
+    /// safe to remove; zero behaviour change vs a pre-guard release.
+    Clean,
+    /// WIP was snapshotted to a recovery ref (name logged + surfaced to the
+    /// operator inside `preserve_dirty_worktree`) — safe to remove.
+    Preserved,
+    /// Preservable WIP EXISTS but could NOT be snapshotted (git failure or a
+    /// contended index) — the caller MUST NOT remove the worktree, so the operator
+    /// can recover the WIP in place. Carries a human-readable reason.
+    Blocked(String),
+}
+
+impl WipPreservation {
+    /// The block reason when preservation was needed but FAILED — `Some` iff the
+    /// caller must refuse to remove the worktree (fail-closed).
+    pub(crate) fn blocked_reason(&self) -> Option<&str> {
+        match self {
+            WipPreservation::Blocked(reason) => Some(reason),
+            WipPreservation::Clean | WipPreservation::Preserved => None,
+        }
+    }
+}
+
+/// Snapshot a dirty worktree's uncommitted WIP into a durable recovery ref BEFORE
+/// a manual release removes the worktree dir. Returns [`WipPreservation`]:
+/// `Clean` (nothing to preserve → safe to remove), `Preserved(ref)` (WIP captured
+/// → safe to remove), or `Blocked(reason)` (WIP present but the snapshot FAILED →
+/// the caller MUST NOT remove; fail-closed so the operator recovers in place).
+///
+/// Mechanism (race-free, untracked-complete, bypass-only — no raw subprocess):
+/// stage everything incl. untracked into the worktree's OWN (per-worktree,
+/// isolated) index, snapshot a tree, and anchor a commit to a ref in the SHARED
+/// object/ref store — which survives the worktree-dir removal. Unlike
+/// `git stash create` this captures untracked files; unlike `git stash push` it
+/// never touches the shared `refs/stash` stack, so two concurrent dirty releases
+/// can't cross-contaminate. Dirtying the doomed worktree's private index is
+/// harmless — it is removed next.
+pub(crate) fn preserve_dirty_worktree(
+    home: &Path,
+    agent: &str,
+    wt_path: &Path,
+    branch: &str,
+) -> WipPreservation {
+    use crate::git_helpers::git_cmd;
+    if branch.is_empty() {
+        return WipPreservation::Clean; // unknown branch → nothing to key a recovery ref on
+    }
+    // Not a LIVE git worktree (a pruned/dangling stale dir — its `.git` gitlink
+    // points at a removed gitdir, or there is none) → there is no git WIP to
+    // snapshot, so removal is safe. Gate here so the fail-closed WIP path below
+    // fires ONLY for a real worktree whose preservation genuinely failed (e.g. a
+    // contended `index.lock`), NOT for a stale dir git can't read at all — which
+    // would wrongly block the force_release stale-dir cleanup this backs. Our
+    // call sites pass `home/worktrees/...` (outside any repo), so rev-parse can't
+    // resolve a spurious ancestor `.git`.
+    if git_cmd(wt_path, &["rev-parse", "--git-dir"]).is_err() {
+        return WipPreservation::Clean;
+    }
+    if !worktree_has_preservable_wip(wt_path) {
+        return WipPreservation::Clean; // clean / marker-only → zero behaviour change
+    }
+    // Stage tracked modifications + deletions + untracked (respects .gitignore,
+    // matching has_uncommitted_changes) into the worktree's private index. On
+    // failure we KNOW there is WIP (checked above) but cannot snapshot it → Blocked
+    // (fail-closed) rather than the old silent `None`.
+    if let Err(e) = git_cmd(wt_path, &["add", "-A"]) {
+        tracing::warn!(agent, branch, error = %e,
+            "preserve dirty WIP: `add -A` failed — refusing to remove (fail-closed)");
+        return WipPreservation::Blocked(format!("`git add -A` failed: {e}"));
+    }
+    let tree = match git_cmd(wt_path, &["write-tree"]) {
+        Ok(t) if !t.is_empty() => t,
+        other => {
+            tracing::warn!(
+                agent,
+                branch,
+                ?other,
+                "preserve dirty WIP: `write-tree` failed — refusing to remove (fail-closed)"
+            );
+            return WipPreservation::Blocked(format!("`git write-tree` failed: {other:?}"));
+        }
+    };
+    // commit-tree needs a committer identity; supply one via `-c` so the daemon
+    // never depends on ambient user.name/email. Parent = HEAD (the branch tip).
+    let msg = format!("agend recovery: dirty WIP for {branch} preserved on release");
+    let commit = match git_cmd(
+        wt_path,
+        &[
+            "-c",
+            "user.name=agend-recovery",
+            "-c",
+            "user.email=recovery@agend.local",
+            "commit-tree",
+            &tree,
+            "-p",
+            "HEAD",
+            "-m",
+            &msg,
+        ],
+    ) {
+        Ok(c) if !c.is_empty() => c,
+        other => {
+            tracing::warn!(
+                agent,
+                branch,
+                ?other,
+                "preserve dirty WIP: `commit-tree` failed — refusing to remove (fail-closed)"
+            );
+            return WipPreservation::Blocked(format!("`git commit-tree` failed: {other:?}"));
+        }
+    };
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let ref_name = format!("{RECOVERY_REF_PREFIX}/{branch}/{ts}");
+    if let Err(e) = git_cmd(wt_path, &["update-ref", &ref_name, &commit]) {
+        tracing::warn!(agent, branch, error = %e,
+            "preserve dirty WIP: `update-ref` failed — refusing to remove (fail-closed)");
+        return WipPreservation::Blocked(format!("`git update-ref {ref_name}` failed: {e}"));
+    }
+    tracing::info!(agent, branch, %ref_name,
+        "preserve dirty WIP: uncommitted worktree changes snapshotted before manual release");
+    prune_recovery_refs(wt_path, branch);
+    notify_wip_preserved(home, agent, branch, &ref_name);
+    WipPreservation::Preserved
+}
+
+/// Bound the recovery-ref set for `branch`: keep at most
+/// [`RECOVERY_MAX_PER_BRANCH`] newest and drop any older than
+/// [`RECOVERY_TTL_DAYS`]. Enforced at CREATION time against THIS branch's own
+/// refs, in the repo the worktree shares — deliberately NOT a periodic
+/// retention-tick sweep: recovery refs live in the canonical repo's ref store,
+/// which `retention::worktrees` (a `.trash`-directory mtime GC) does not
+/// enumerate, and per-branch growth is already bounded to the cap.
+///
+/// Known gap (accepted, lead-vetted 2026-07-07): a branch dirty-released exactly
+/// once keeps its single ref indefinitely — the 14d TTL only re-fires on that
+/// branch's NEXT dirty release. The footprint is ≤ cap tiny refs per such branch
+/// (each a single small commit object), so this is negligible. If orphan
+/// recovery refs ever accumulate in practice, escalate to a periodic
+/// repo-registry sweep (enumerate managed repos → prune `refs/agend/recovery/*`
+/// by TTL) rather than widening this per-branch creation-time prune.
+///
+/// Best-effort: a prune failure is logged, never fatal.
+pub(crate) fn prune_recovery_refs(git_dir: &Path, branch: &str) {
+    let pattern = format!("{RECOVERY_REF_PREFIX}/{branch}/");
+    // Timestamp names sort lexically == chronologically → `-refname` == newest-first.
+    let listing = match crate::git_helpers::git_cmd(
+        git_dir,
+        &[
+            "for-each-ref",
+            "--sort=-refname",
+            "--format=%(refname)",
+            &pattern,
+        ],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(branch, error = %e, "prune recovery refs: for-each-ref failed");
+            return;
+        }
+    };
+    let refs: Vec<&str> = listing.lines().filter(|l| !l.is_empty()).collect();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(RECOVERY_TTL_DAYS);
+    for (idx, ref_name) in refs.iter().enumerate() {
+        let over_cap = idx >= RECOVERY_MAX_PER_BRANCH;
+        if over_cap || recovery_ref_expired(ref_name, cutoff) {
+            if let Err(e) = crate::git_helpers::git_cmd(git_dir, &["update-ref", "-d", ref_name]) {
+                tracing::warn!(%ref_name, error = %e, "prune recovery refs: delete failed");
+            }
+        }
+    }
+}
+
+/// Parse the trailing `YYYYMMDDTHHMMSSZ` segment of a recovery ref and report
+/// whether it predates `cutoff`. An unparseable name is treated as NOT expired
+/// (fail-safe — never delete WIP we can't date; the per-branch cap still bounds
+/// growth).
+fn recovery_ref_expired(ref_name: &str, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(ts) = ref_name.rsplit('/').next() else {
+        return false;
+    };
+    match chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%SZ") {
+        Ok(naive) => naive.and_utc() < cutoff,
+        Err(_) => false,
+    }
+}
+
+/// Notify the operator-mapped agent (`general`, per convention — mirrors
+/// canonical_hygiene's auto-stash notify) that a dirty worktree's WIP was
+/// preserved, with a one-line recovery command. Best-effort.
+fn notify_wip_preserved(home: &Path, agent: &str, branch: &str, ref_name: &str) {
+    let text = format!(
+        "[system:release_dirty_wip_preserved] Agent `{agent}` released a DIRTY worktree \
+         for branch `{branch}`; its uncommitted WIP (tracked + untracked) was snapshotted \
+         to recovery ref:\n  {ref_name}\nRecover it from the canonical repo with:\n  \
+         git worktree add ../wip-recover {ref_name}\n(or inspect: git log -p {ref_name}). \
+         Auto-pruned after {RECOVERY_TTL_DAYS}d / max {RECOVERY_MAX_PER_BRANCH} per branch. \
+         #2158-adjacent."
+    );
+    let source = crate::inbox::NotifySource::System("release_dirty_wip_preserved");
+    crate::inbox::notify_agent(home, "general", &source, &text);
+}
+
 /// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,
 /// binding-driven so cure-(B) `workspace/<agent>` worktrees are removable.
 ///
@@ -747,6 +998,194 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #2158-adjacent: dirty-WIP preservation helpers ──────────────────
+    // (reuses the module's existing `git_out`/`git_run` bypass helpers below)
+
+    fn recovery_ref_names(repo: &Path, branch: &str) -> Vec<String> {
+        git_out(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("refs/agend/recovery/{branch}/"),
+            ],
+        )
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn pres_kind(p: &WipPreservation) -> &'static str {
+        match p {
+            WipPreservation::Clean => "Clean",
+            WipPreservation::Preserved => "Preserved",
+            WipPreservation::Blocked(_) => "Blocked",
+        }
+    }
+
+    #[test]
+    fn preserve_dirty_worktree_captures_untracked_wip() {
+        let home = tmp_home("preserve-untracked");
+        let repo = tmp_repo("preserve-untracked");
+        let info = create(&home, &repo, "agent1", None).expect("worktree created");
+        // Untracked WIP — the loss-prone case (`clean -fd` would delete it).
+        std::fs::write(info.path.join("scratch-wip.txt"), b"unsaved work").unwrap();
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch);
+        assert!(
+            matches!(outcome, WipPreservation::Preserved),
+            "dirty worktree must be Preserved, got {}",
+            pres_kind(&outcome)
+        );
+        // Verify the ref via git (authoritative — the ref name is not returned).
+        let refs = recovery_ref_names(&repo, &info.branch);
+        assert_eq!(refs.len(), 1, "exactly one recovery ref: {refs:?}");
+        let tree = git_out(&repo, &["ls-tree", "-r", "--name-only", &refs[0]]);
+        assert!(
+            tree.contains("scratch-wip.txt"),
+            "untracked WIP captured in recovery ref tree: {tree}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn preserve_dirty_worktree_clean_is_noop() {
+        let home = tmp_home("preserve-clean");
+        let repo = tmp_repo("preserve-clean");
+        let info = create(&home, &repo, "agent1", None).expect("worktree created");
+        // No real WIP (a freshly-created worktree carries at most the daemon
+        // marker, which is not preservable) → helper must report Clean.
+        assert!(
+            matches!(
+                preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch),
+                WipPreservation::Clean
+            ),
+            "clean worktree must be Clean (no recovery ref)"
+        );
+        assert!(
+            recovery_ref_names(&repo, &info.branch).is_empty(),
+            "no recovery ref for a clean release"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The linked worktree's private index lives at `<gitdir>/index` (gitdir read
+    /// from the `.git` gitlink file). Planting `<gitdir>/index.lock` makes any
+    /// index write (`git add -A`) fail — reviewer4's #2672 counterexample for a
+    /// contended index.
+    fn plant_index_lock(wt_path: &Path) -> PathBuf {
+        let gitlink = std::fs::read_to_string(wt_path.join(".git")).expect("read .git gitlink");
+        let gitdir = gitlink
+            .strip_prefix("gitdir:")
+            .expect("gitlink form")
+            .trim();
+        let lock = Path::new(gitdir).join("index.lock");
+        std::fs::write(&lock, b"").expect("plant index.lock");
+        lock
+    }
+
+    #[test]
+    fn preserve_dirty_worktree_blocks_when_index_locked() {
+        // reviewer4 #2672 fail-OPEN counterexample: dirty untracked WIP + a
+        // contended index (index.lock) → `git add -A` fails. The old code returned
+        // a silently-ignored `None` and the caller removed the worktree, evaporating
+        // the WIP. It must now be Blocked (fail-closed) with NO recovery ref.
+        let home = tmp_home("preserve-blocked");
+        let repo = tmp_repo("preserve-blocked");
+        let info = create(&home, &repo, "agent1", None).expect("worktree created");
+        std::fs::write(info.path.join("precious-wip.txt"), b"must not vanish").unwrap();
+        let lock = plant_index_lock(&info.path);
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch);
+        assert!(
+            outcome.blocked_reason().is_some(),
+            "unpreservable WIP must be Blocked (fail-closed), got {}",
+            pres_kind(&outcome)
+        );
+        assert!(
+            recovery_ref_names(&repo, &info.branch).is_empty(),
+            "Blocked must not leave a (partial) recovery ref"
+        );
+        std::fs::remove_file(&lock).ok();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Seed a recovery ref dated `days_ago` (distinct days → distinct names).
+    fn seed_recovery_ref(repo: &Path, branch: &str, days_ago: i64) -> String {
+        let ts = (chrono::Utc::now() - chrono::Duration::days(days_ago))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let name = format!("refs/agend/recovery/{branch}/{ts}");
+        git_run(repo, &["update-ref", &name, "HEAD"]);
+        name
+    }
+
+    #[test]
+    fn prune_recovery_refs_enforces_per_branch_cap() {
+        let repo = tmp_repo("prune-cap");
+        let branch = "feat/prune-cap";
+        // 5 recent refs (all within TTL); each day is a distinct date so no ts
+        // collision. names[0] = day-1 (newest) … names[4] = day-5 (oldest). Capture
+        // the returned names and assert on THEM (never recompute ts from `now()` —
+        // seed vs assert straddling a second boundary would spuriously mismatch).
+        let names: Vec<String> = [1, 2, 3, 4, 5]
+            .iter()
+            .map(|&d| seed_recovery_ref(&repo, branch, d))
+            .collect();
+        assert_eq!(recovery_ref_names(&repo, branch).len(), 5, "seeded 5");
+        prune_recovery_refs(&repo, branch);
+        let survivors = recovery_ref_names(&repo, branch);
+        assert_eq!(survivors.len(), 3, "cap=3 enforced: {survivors:?}");
+        for keep in &names[0..3] {
+            assert!(survivors.contains(keep), "newest ref must survive: {keep}");
+        }
+        for gone in &names[3..5] {
+            assert!(
+                !survivors.contains(gone),
+                "over-cap ref must be pruned: {gone}"
+            );
+        }
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn prune_recovery_refs_ttl_deletes_expired_within_cap() {
+        let repo = tmp_repo("prune-ttl");
+        let branch = "feat/prune-ttl";
+        let recent = seed_recovery_ref(&repo, branch, 1);
+        let _expired = seed_recovery_ref(&repo, branch, 15); // > 14d TTL
+        prune_recovery_refs(&repo, branch);
+        let survivors = recovery_ref_names(&repo, branch);
+        assert_eq!(
+            survivors,
+            vec![recent],
+            "expired (>14d) ref pruned even under the per-branch cap: {survivors:?}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn recovery_ref_expired_parses_timestamp() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(RECOVERY_TTL_DAYS);
+        assert!(
+            recovery_ref_expired("refs/agend/recovery/b/20200101T000000Z", cutoff),
+            "a year-2020 ref is well past the 14d cutoff"
+        );
+        let now_ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        assert!(
+            !recovery_ref_expired(&format!("refs/agend/recovery/b/{now_ts}"), cutoff),
+            "a just-created ref is not expired"
+        );
+        assert!(
+            !recovery_ref_expired("refs/agend/recovery/b/not-a-timestamp", cutoff),
+            "unparseable name is fail-safe (NOT expired)"
+        );
     }
 
     #[test]

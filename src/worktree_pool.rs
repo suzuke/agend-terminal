@@ -471,6 +471,32 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                 managed_verified = true;
             }
         } else {
+            // #2158-adjacent: a MANUAL release must not silently drop
+            // uncommitted WIP. Snapshot it to a durable recovery ref BEFORE the
+            // destructive remove (a clean worktree is a no-op → zero behaviour
+            // change). `is_daemon_managed` is false for an absent OR unmanaged
+            // path, so this fires only for the managed-worktree case
+            // `remove_worktree` would actually delete — the workspace-teardown
+            // callers of `remove_worktree` are intentionally left untouched.
+            if is_daemon_managed(wt_path) {
+                let branch = binding["branch"].as_str().unwrap_or("");
+                let preservation =
+                    crate::worktree::preserve_dirty_worktree(home, agent, wt_path, branch);
+                if let Some(reason) = preservation.blocked_reason() {
+                    // reviewer4 #2672 fix — FAIL-CLOSED: there IS uncommitted WIP
+                    // but it could not be snapshotted (e.g. a contended
+                    // `index.lock`). Refuse to remove the worktree AND keep the
+                    // binding so the operator can recover the WIP in place. Report
+                    // `released:false` + the reason; the branch cleanup + binding
+                    // clear below are intentionally skipped.
+                    out.error = Some(format!(
+                        "release refused: worktree has uncommitted WIP that could not be \
+                         preserved ({reason}); not removing it so the WIP can be recovered. \
+                         Commit or stash the changes, then release again."
+                    ));
+                    return out;
+                }
+            }
             match remove_worktree(agent, wt_path, &source_repo) {
                 WorktreeRemoval::Removed => {
                     managed_verified = true;

@@ -3492,3 +3492,202 @@ fn reconcile_orphan_leases_tolerates_missing_worktree_field_2550_w3() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2158-adjacent: dirty-release WIP preservation ──────────────────────
+//
+// The daemon's AUTO-release already refuses to remove a dirty worktree
+// (auto_release.rs SkipDirtyWorktree). But MANUAL release (`release_full`,
+// backing `release_worktree`) removed a dirty worktree unconditionally,
+// silently losing uncommitted WIP. RED-first: on pre-guard code
+// `release_full_preserves_dirty_wip_to_recovery_ref` FAILS (no recovery ref).
+// With the guard the WIP is snapshotted to `refs/agend/recovery/<branch>/<ts>`.
+
+/// Recovery refs for `branch` (raw git — cfg(test) fixture; exempt from the
+/// git-subprocess invariants which scan production `src/` portions only).
+fn recovery_refs(repo: &Path, branch: &str) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/agend/recovery/{branch}/"),
+        ])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git for-each-ref");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn ls_tree_names(repo: &Path, git_ref: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", git_ref])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git ls-tree");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn git_in(wt: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn release_full_preserves_dirty_wip_to_recovery_ref() {
+    let home = tmp_home("release-dirty-preserve");
+    let repo = tmp_repo("release-dirty-preserve-repo");
+    let l = lease_bound(&home, &repo, "agent-dirty", "feat/dirty-wip");
+
+    // Seed a tracked file on the branch so we can dirty it with a modification.
+    std::fs::write(l.path.join("tracked.txt"), b"v1\n").unwrap();
+    git_in(&l.path, &["add", "tracked.txt"]);
+    git_in(
+        &l.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed tracked",
+        ],
+    );
+    // Dirty: a tracked MODIFICATION + an UNTRACKED file (the loss-prone case).
+    std::fs::write(l.path.join("tracked.txt"), b"v1\nMODIFIED-wip\n").unwrap();
+    std::fs::write(l.path.join("untracked-wip.txt"), b"precious untracked").unwrap();
+    assert!(
+        crate::worktree::has_uncommitted_changes(&l.path),
+        "precondition: worktree dirty"
+    );
+
+    let outcome = release_full(&home, "agent-dirty", false);
+    assert!(outcome.released, "release must succeed: {outcome:?}");
+    assert!(!l.path.exists(), "dirty worktree removed on release");
+
+    // WIP must survive in exactly one recovery ref (RED on pre-guard code).
+    let refs = recovery_refs(&repo, "feat/dirty-wip");
+    assert_eq!(
+        refs.len(),
+        1,
+        "exactly one recovery ref after dirty release: {refs:?}"
+    );
+    let files = ls_tree_names(&repo, &refs[0]);
+    assert!(
+        files.contains("untracked-wip.txt"),
+        "untracked WIP captured in recovery ref tree: {files}"
+    );
+    assert!(
+        files.contains("tracked.txt"),
+        "tracked file captured in recovery ref tree: {files}"
+    );
+    let show = std::process::Command::new("git")
+        .args(["show", &format!("{}:tracked.txt", refs[0])])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git show");
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("MODIFIED-wip"),
+        "tracked modification content is recoverable from the ref"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_full_clean_worktree_creates_no_recovery_ref() {
+    let home = tmp_home("release-clean-noref");
+    let repo = tmp_repo("release-clean-noref-repo");
+    let l = lease_bound(&home, &repo, "agent-clean", "feat/clean-rel");
+    // A freshly-leased worktree carries only the untracked `.agend-managed`
+    // marker (which `has_uncommitted_changes` reports as dirty but is NOT
+    // preservable WIP) — releasing it must still create no recovery ref.
+    let outcome = release_full(&home, "agent-clean", false);
+    assert!(
+        outcome.released && !l.path.exists(),
+        "clean release succeeds"
+    );
+    assert!(
+        recovery_refs(&repo, "feat/clean-rel").is_empty(),
+        "clean release must create NO recovery ref (zero behaviour change)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Plant `<gitdir>/index.lock` (gitdir read from the worktree's `.git` gitlink)
+/// so any index write (`git add -A`) fails — reviewer4's #2672 contended-index
+/// counterexample.
+fn plant_index_lock(wt_path: &Path) -> PathBuf {
+    let gitlink = std::fs::read_to_string(wt_path.join(".git")).expect("read .git gitlink");
+    let gitdir = gitlink
+        .strip_prefix("gitdir:")
+        .expect("gitlink form")
+        .trim();
+    let lock = Path::new(gitdir).join("index.lock");
+    std::fs::write(&lock, b"").expect("plant index.lock");
+    lock
+}
+
+/// reviewer4 #2672 (fail-OPEN regression): a dirty worktree whose WIP cannot be
+/// snapshotted (contended `index.lock` → `git add -A` fails) must be FAIL-CLOSED —
+/// `release_full` refuses to remove it (WIP recoverable in place), NOT a silent
+/// `released:true` + evaporated WIP.
+#[test]
+fn release_full_refuses_when_dirty_wip_unpreservable() {
+    let home = tmp_home("release-blocked");
+    let repo = tmp_repo("release-blocked-repo");
+    let l = lease_bound(&home, &repo, "agent-blk", "feat/blk");
+    // Real preservable WIP (untracked), then jam the index so preservation fails.
+    std::fs::write(l.path.join("precious-wip.txt"), b"must not vanish").unwrap();
+    let _lock = plant_index_lock(&l.path);
+
+    let outcome = release_full(&home, "agent-blk", false);
+    assert!(
+        !outcome.released,
+        "must NOT report released on unpreservable WIP"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("could not be preserved"),
+        "error must name the refusal: {:?}",
+        outcome.error
+    );
+    assert!(
+        l.path.exists(),
+        "worktree must NOT be removed (fail-closed)"
+    );
+    assert!(
+        l.path.join("precious-wip.txt").exists(),
+        "untracked WIP must survive in place"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-blk").is_some(),
+        "binding must be kept so the operator can recover in place"
+    );
+    assert!(
+        recovery_refs(&repo, "feat/blk").is_empty(),
+        "no (partial) recovery ref on a Blocked release"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
