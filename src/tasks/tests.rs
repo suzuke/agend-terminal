@@ -20,6 +20,60 @@ fn tmp_home(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// #78445-2 (d): the central `task_terminal_cleanup` seam clears BOTH obligation
+/// stores for the closed task — the dispatch_idle sidecar AND the dispatch_tracking
+/// rows — and is task_id-scoped so a co-dispatcher's OTHER task rows survive. All
+/// six terminal writers route through this one call.
+#[test]
+fn task_terminal_cleanup_clears_both_stores_isolated_78445_2() {
+    let home = tmp_home("terminal-cleanup-both");
+    // A dispatch_idle sidecar for the task to close (record_dispatch is kind=task).
+    crate::daemon::dispatch_idle::record_dispatch(
+        &home,
+        "lead",
+        "rev-a",
+        Some("t-close"),
+        "task",
+        900,
+    );
+    // dispatch_tracking rows: one for the task to close (→rev-a), one for a DIFFERENT
+    // task from the SAME dispatcher (→rev-b, isolation guard).
+    let now = chrono::Utc::now().to_rfc3339();
+    for (tid, to) in [("t-close", "rev-a"), ("t-keep", "rev-b")] {
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(tid.into()),
+                from: "lead".into(),
+                to: to.into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now.clone(),
+                status: "pending".into(),
+            },
+        );
+    }
+
+    task_terminal_cleanup(&home, "t-close");
+
+    assert!(
+        crate::daemon::dispatch_idle::list_pending(&home)
+            .iter()
+            .all(|d| d.correlation_id.as_deref() != Some("t-close")),
+        "the closed task's dispatch_idle sidecar must be cleared"
+    );
+    let active = crate::dispatch_tracking::active_target_names(&home);
+    assert!(
+        !active.contains(&"rev-a".to_string()),
+        "the closed task's dispatch_tracking row must settle: {active:?}"
+    );
+    assert!(
+        active.contains(&"rev-b".to_string()),
+        "a DIFFERENT task's row (same dispatcher) must survive: {active:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Sprint 23 P0 r2 F2 helper — minimal Task with assignee for
 /// `can_mutate_task` predicate tests. Mirrors decisions.rs
 /// `make_test_decision` fixture pattern.
@@ -4124,6 +4178,50 @@ fn test_sweep_stale_open_apply_labels_category() {
     assert!(
         log.contains("category=stale_open"),
         "audit line must label the category stale_open (not the fallback), got: {log}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #78445-2 (d): the batch-cancel sweep is terminal for EACH cancelled task — it
+/// must settle each cancelled task's dispatch_tracking rows, while a NON-cancelled
+/// task's row (same dispatcher) survives. This path previously cleared NEITHER
+/// obligation store (reviewer4 #2679).
+#[test]
+fn sweep_cancel_settles_dispatch_tracking_78445_2() {
+    let home = tmp_home("sweep_cancel_settle");
+    write_fleet_yaml(&home, &["alive"]);
+    let id = create_open_task(&home, "ref-less stale task to cancel");
+    // dispatch_tracking rows: one for the task to cancel (→rev-a), one for an
+    // unrelated task from the SAME dispatcher (→rev-b, isolation guard).
+    let now_ts = chrono::Utc::now().to_rfc3339();
+    for (tid, to) in [(id.as_str(), "rev-a"), ("t-unrelated", "rev-b")] {
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(tid.into()),
+                from: "lead".into(),
+                to: to.into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now_ts.clone(),
+                status: "pending".into(),
+            },
+        );
+    }
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(20);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let confirm: std::collections::HashSet<String> = [id.clone()].into_iter().collect();
+    sweep::emit_cancelled_batch(&home, &cats, &confirm, "sweep settle test").expect("emit");
+
+    let active = crate::dispatch_tracking::active_target_names(&home);
+    assert!(
+        !active.contains(&"rev-a".to_string()),
+        "the batch-cancelled task's dispatch_tracking row must settle: {active:?}"
+    );
+    assert!(
+        active.contains(&"rev-b".to_string()),
+        "an unrelated task's row (same dispatcher) must survive: {active:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

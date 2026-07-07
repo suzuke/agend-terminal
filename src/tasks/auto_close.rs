@@ -70,10 +70,8 @@ pub fn auto_close_on_report(
     let closed =
         crate::task_events::append_done_if_legal_at(&board, &emitter, correlation_id, vec![event])?;
     if closed {
-        let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
-        // #78445-2 (d): also settle this task's dispatch_tracking rows (by task_id)
-        // so the stuck-dispatch sweep stops nagging about the now-closed task.
-        crate::dispatch_tracking::mark_completed(home, Some(correlation_id), "");
+        // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
+        super::task_terminal_cleanup(home, correlation_id);
     }
     Ok(closed)
 }

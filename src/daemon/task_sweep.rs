@@ -495,6 +495,10 @@ fn sweep_board_with_prs(
             // out of `open_ids` next cycle, so no re-attempt).
             let closed = task_events::append_done_if_legal_at(&board, &emitter, &marker, events)?;
             if closed {
+                // #78445-2 (d): merged-PR auto-close is a terminal transition — clear
+                // BOTH obligation stores (this path previously cleared NEITHER, so a
+                // sweep-closed task's stuck-dispatch rows nagged the reviewer).
+                crate::tasks::task_terminal_cleanup(home, &marker);
                 tracing::info!(
                     pr = pr.number,
                     marker = %marker,
@@ -1165,6 +1169,59 @@ mod tests {
             "board B's task must NOT be closed by repo A's PR (#2105 isolation)"
         );
 
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// #78445-2 (d): a merged-PR sweep auto-close is a terminal transition — it must
+    /// settle the closed task's obligation stores (dispatch_idle sidecar AND
+    /// dispatch_tracking rows) via `task_terminal_cleanup`. This path previously
+    /// cleared NEITHER (reviewer4 #2679).
+    #[test]
+    fn sweep_close_settles_obligation_stores_78445_2() {
+        let home = tmp_home("sweep-close-settle");
+        let ta = crate::tasks::handle(
+            &home,
+            "test-user",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "test-user", "project": "orgA/projA"}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Obligation rows for the task the merged PR will close.
+        crate::daemon::dispatch_idle::record_dispatch(
+            &home,
+            "lead",
+            "rev-a",
+            Some(&ta),
+            "task",
+            900,
+        );
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(ta.clone()),
+                from: "lead".into(),
+                to: "rev-a".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: "pending".into(),
+            },
+        );
+
+        let pr = make_pr_meta(1, "fix", &format!("Closes {ta}"));
+        sweep_board_with_prs(&home, "orgA/projA", std::slice::from_ref(&pr), None, false).unwrap();
+
+        assert!(
+            crate::daemon::dispatch_idle::list_pending(&home)
+                .iter()
+                .all(|d| d.correlation_id.as_deref() != Some(ta.as_str())),
+            "merged-PR close must clear the dispatch_idle sidecar"
+        );
+        assert!(
+            !crate::dispatch_tracking::active_target_names(&home).contains(&"rev-a".to_string()),
+            "merged-PR close must settle the dispatch_tracking row"
+        );
         fs::remove_dir_all(&home).ok();
     }
 

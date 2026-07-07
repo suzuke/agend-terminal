@@ -46,6 +46,76 @@ fn create_task(home: &std::path::Path, task_id: &str) {
     let _ = args;
 }
 
+/// #78445-2 (d): a cascade parent-cancel is terminal for EACH child — every
+/// cancelled child's dispatch_tracking rows must settle (plural), while a NON-child
+/// task's rows (even the same dispatcher) survive. This path previously cleared
+/// NEITHER store (reviewer4 #2679).
+#[test]
+fn cascade_cancel_settles_each_child_dispatch_tracking_78445_2() {
+    let home = tmp_home("cascade-settle");
+    let seed = |tid: &str, parent: Option<&str>| {
+        crate::task_events::append(
+            &home,
+            &crate::task_events::InstanceName::from("test:seed"),
+            crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId(tid.into()),
+                title: "task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: parent.map(|p| crate::task_events::TaskId(p.into())),
+            },
+        )
+        .expect("seed");
+    };
+    seed("t-parent", None);
+    seed("t-c1", Some("t-parent"));
+    seed("t-c2", Some("t-parent"));
+    seed("t-x", None); // unrelated — NOT a child of t-parent
+
+    // dispatch_tracking rows for both children + the unrelated task (same dispatcher).
+    let now = chrono::Utc::now().to_rfc3339();
+    for (tid, to) in [("t-c1", "rev-c1"), ("t-c2", "rev-c2"), ("t-x", "rev-x")] {
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(tid.into()),
+                from: "lead".into(),
+                to: to.into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now.clone(),
+                status: "pending".into(),
+            },
+        );
+    }
+
+    cascade_cancel_children(
+        &home,
+        &home,
+        "t-parent",
+        &crate::task_events::InstanceName::from("test:cancel"),
+    );
+
+    let active = crate::dispatch_tracking::active_target_names(&home);
+    assert!(
+        !active.contains(&"rev-c1".to_string()) && !active.contains(&"rev-c2".to_string()),
+        "#78445-2 (d): EACH cascaded child's dispatch_tracking row must settle: {active:?}"
+    );
+    assert!(
+        active.contains(&"rev-x".to_string()),
+        "#78445-2 (d) isolation: a NON-child task's row must survive: {active:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Simulate a concurrent reassignment landing between handle_update's
 /// out-of-lock read and its in-lock append.
 fn reassign(home: &std::path::Path, task_id: &str, new_owner: &str) {
