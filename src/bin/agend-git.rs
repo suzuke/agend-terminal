@@ -40,6 +40,12 @@ mod git_refs;
 #[path = "agend-git/force_push.rs"]
 mod force_push;
 
+// #t-…777-1: kill-family footgun-guard (pkill/killall/kill) — a SECOND shim multiplexed onto
+// this binary via the pkill/killall/kill PATH-shadow (binding.rs::symlink_shim). Kept in its
+// own submodule so agend-git.rs stays under the 2500-LOC anti-monolith ceiling.
+#[path = "agend-git/kill_guard.rs"]
+mod kill_guard;
+
 /// #1504 L3: max times the shim may re-enter before hard-failing. Healthy
 /// operation never exceeds 1 (real git ≠ shim → no re-entry), so a small cap
 /// has zero false-trip risk while containing a self-resolution spawn storm.
@@ -54,6 +60,14 @@ fn shim_depth() -> u32 {
 }
 
 fn main() {
+    // #t-…777-1: kill-family shim dispatch. When invoked via the pkill/killall/kill
+    // PATH-shadow symlink (binding.rs::symlink_shim), argv[0]'s basename routes here and
+    // NEVER touches the git logic below (or its recursion guard, which is git-specific).
+    if let Some(tool) = kill_guard::shim_tool(&env::args().next().unwrap_or_default()) {
+        let kargs: Vec<String> = env::args().skip(1).collect();
+        kill_guard::run(tool, &kargs); // -> ! : deny+exit(1) or exec the real binary
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
 
     // #1504 L3: recursion guard. If git ever resolves back to THIS shim (e.g.

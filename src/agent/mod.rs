@@ -810,6 +810,10 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     cmd.env("COLORTERM", "truecolor");
     cmd.env("FORCE_COLOR", "1");
     cmd.env("AGEND_INSTANCE_NAME", name);
+    // #t-…777-1: hand the spawned agent the daemon's own pid so the kill-family shim
+    // (kill_guard.rs) can DENY `kill <daemon-pid>` (a host-tier blast an agent has no legit
+    // reason to issue). This spawn runs in the daemon process, so process::id() IS the daemon.
+    cmd.env("AGEND_DAEMON_PID", std::process::id().to_string());
     // MED-5: AGEND_HOME is on the env-isolation SENSITIVE deny-list (so
     // `env_clear` drops it and the fleet passthrough loop never re-adds it), but
     // the spawned agent's in-pane `agend-terminal` subcommands need it to resolve
