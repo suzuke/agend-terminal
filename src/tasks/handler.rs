@@ -769,6 +769,12 @@ fn handle_done(
             // `dispatch_idle_threshold_exceeded` later for
             // work the task board already confirmed done.
             let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
+            // #78445-2 (d): mirror the sidecar clear for the OTHER obligation store —
+            // settle this task's dispatch_tracking rows (matched by task_id) so the
+            // stuck-dispatch sweep stops nagging about a dispatch whose task the board
+            // already closed (a fallback-inject verdict never fires the kind=report
+            // auto-settle). task_id-scoped → a co-dispatcher's other task rows survive.
+            crate::dispatch_tracking::mark_completed(home, Some(id.as_str()), "");
             // #807 Item 1: see create arm note.
             let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             serde_json::json!({
@@ -1180,6 +1186,9 @@ fn handle_update(
         if let Some(ref s) = new_status {
             if matches!(s.as_str(), "done" | "cancelled") {
                 let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
+                // #78445-2 (d): also settle this task's dispatch_tracking rows (by
+                // task_id) so the stuck-dispatch sweep stops nagging a closed task.
+                crate::dispatch_tracking::mark_completed(home, Some(id.as_str()), "");
             }
             if s == "cancelled" {
                 cascade_cancel_children(home, &board, &id, &emitter);
