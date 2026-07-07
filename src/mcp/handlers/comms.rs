@@ -455,29 +455,29 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     let result = {
         let reviewed_head = args["reviewed_head"].as_str();
 
-        // M3: SHA-staleness gate — if reviewed_head is provided, verify against PR HEAD.
+        // #t-78445-3: shared scan surface for BOTH gates below — `summary +
+        // artifacts` (a PR URL / evidence token may live in either) — built once via
+        // one helper so the two can't drift (the drift that false-rejected verdicts).
+        let scan_body = super::comms_gates::report_scan_body(summary, args["artifacts"].as_str());
+
+        // M3: SHA-staleness gate — verify reviewed_head against PR HEAD; scans
+        // scan_body (keep the surface in sync with the evidence gate below).
         if let Some(rh) = reviewed_head {
             if let Err(e) = super::comms_gates::check_sha_gate(
                 rh,
-                summary,
+                &scan_body,
                 super::comms_gates::fetch_pr_head_sha,
             ) {
                 return json!({"error": e});
             }
         }
 
-        // #1666 Phase A: reviewer-evidence gate. Only fires on actual verdict
-        // reports (summary STARTS WITH VERIFIED/REJECTED/UNVERIFIED — §3.12
-        // convention, so non-verdict reports are never touched). VERIFIED/
-        // REJECTED must carry an evidence token; UNVERIFIED is exempt. Scans
-        // summary + artifacts (evidence may live in either) and reuses the
-        // sha_gate reject path (`json!({"error"})` → back to the reviewer).
+        // #1666 Phase A: reviewer-evidence gate. Only fires on actual verdict reports
+        // (summary STARTS WITH VERIFIED/REJECTED/UNVERIFIED — §3.12). VERIFIED/
+        // REJECTED must carry an evidence token; UNVERIFIED is exempt. Scans scan_body
+        // (in sync with the SHA gate above). Reuses the reject path back to the sender.
         if let Some(verdict) = super::comms_gates::detect_verdict(summary) {
-            let evidence_body = match args["artifacts"].as_str() {
-                Some(a) => format!("{summary}\n{a}"),
-                None => summary.to_string(),
-            };
-            if let Err(e) = super::comms_gates::check_evidence_gate(&evidence_body, verdict) {
+            if let Err(e) = super::comms_gates::check_evidence_gate(&scan_body, verdict) {
                 return json!({"error": e});
             }
 
@@ -487,7 +487,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 home,
                 sender.as_str(),
                 summary,
-                &evidence_body,
+                &scan_body,
                 verdict,
             );
         }
