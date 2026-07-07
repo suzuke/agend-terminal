@@ -78,7 +78,19 @@ pub(super) fn rebase_clean_self(
         // #2158-adjacent: force_release is destructive-by-design, but a dirty
         // worktree's uncommitted WIP should still be recoverable. Snapshot it to
         // a durable recovery ref before the removal (a clean worktree is a no-op).
-        crate::worktree::preserve_dirty_worktree(home, agent, &target, branch);
+        // reviewer4 #2672 fix — FAIL-CLOSED: if there IS WIP but it could not be
+        // snapshotted (e.g. a contended `index.lock`), refuse to nuke the worktree
+        // so the operator can recover it in place — even force_release must not
+        // silently lose it.
+        if let Some(reason) =
+            crate::worktree::preserve_dirty_worktree(home, agent, &target, branch).blocked_reason()
+        {
+            return Err(format!(
+                "force_release refused: worktree at {} has uncommitted WIP that could not be \
+                 preserved ({reason}); not removing it so the WIP can be recovered in place",
+                target.display()
+            ));
+        }
         match std::fs::remove_dir_all(&target) {
             Ok(()) => {
                 dir_removed = true;
@@ -353,6 +365,69 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&tree.stdout).contains("fr-wip.txt"),
             "untracked WIP captured on the force_release path"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// reviewer4 #2672 (fail-OPEN regression) for the force:true path: a dirty
+    /// worktree whose WIP cannot be snapshotted (contended `index.lock`) must be
+    /// FAIL-CLOSED — `rebase_clean_self` returns Err and leaves the worktree in
+    /// place, NOT a silent destructive `remove_dir_all` that evaporates the WIP.
+    #[test]
+    fn rebase_clean_self_refuses_when_dirty_wip_unpreservable() {
+        let home = tmp_home("force-release-blocked");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git_bypassed(&repo, &["init", "-b", "main"])
+            .status
+            .success());
+        assert!(git_bypassed(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .status
+        .success());
+        let agent = "dev-fr-blk";
+        let branch = "feat/fr-blk";
+        let target = home.join("worktrees").join(agent).join(branch);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        assert!(git_bypassed(
+            &repo,
+            &["worktree", "add", "-b", branch, target.to_str().unwrap()],
+        )
+        .status
+        .success());
+        std::fs::write(target.join("fr-wip.txt"), b"must not vanish").unwrap();
+        // Jam the worktree's index so `git add -A` fails during preservation.
+        let gitlink = std::fs::read_to_string(target.join(".git")).unwrap();
+        let gitdir = gitlink.strip_prefix("gitdir:").unwrap().trim();
+        std::fs::write(Path::new(gitdir).join("index.lock"), b"").unwrap();
+
+        let result = rebase_clean_self(&home, agent, branch);
+        assert!(
+            result.is_err(),
+            "force_release must FAIL-CLOSED (Err) when dirty WIP can't be preserved: {result:?}"
+        );
+        assert!(
+            result.unwrap_err().contains("could not be preserved"),
+            "error must name the refusal"
+        );
+        assert!(
+            target.exists(),
+            "worktree must NOT be removed (fail-closed)"
+        );
+        assert!(
+            target.join("fr-wip.txt").exists(),
+            "untracked WIP must survive in place"
         );
         std::fs::remove_dir_all(&home).ok();
     }

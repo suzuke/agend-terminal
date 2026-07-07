@@ -3630,3 +3630,64 @@ fn release_full_clean_worktree_creates_no_recovery_ref() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// Plant `<gitdir>/index.lock` (gitdir read from the worktree's `.git` gitlink)
+/// so any index write (`git add -A`) fails — reviewer4's #2672 contended-index
+/// counterexample.
+fn plant_index_lock(wt_path: &Path) -> PathBuf {
+    let gitlink = std::fs::read_to_string(wt_path.join(".git")).expect("read .git gitlink");
+    let gitdir = gitlink
+        .strip_prefix("gitdir:")
+        .expect("gitlink form")
+        .trim();
+    let lock = Path::new(gitdir).join("index.lock");
+    std::fs::write(&lock, b"").expect("plant index.lock");
+    lock
+}
+
+/// reviewer4 #2672 (fail-OPEN regression): a dirty worktree whose WIP cannot be
+/// snapshotted (contended `index.lock` → `git add -A` fails) must be FAIL-CLOSED —
+/// `release_full` refuses to remove it (WIP recoverable in place), NOT a silent
+/// `released:true` + evaporated WIP.
+#[test]
+fn release_full_refuses_when_dirty_wip_unpreservable() {
+    let home = tmp_home("release-blocked");
+    let repo = tmp_repo("release-blocked-repo");
+    let l = lease_bound(&home, &repo, "agent-blk", "feat/blk");
+    // Real preservable WIP (untracked), then jam the index so preservation fails.
+    std::fs::write(l.path.join("precious-wip.txt"), b"must not vanish").unwrap();
+    let _lock = plant_index_lock(&l.path);
+
+    let outcome = release_full(&home, "agent-blk", false);
+    assert!(
+        !outcome.released,
+        "must NOT report released on unpreservable WIP"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("could not be preserved"),
+        "error must name the refusal: {:?}",
+        outcome.error
+    );
+    assert!(
+        l.path.exists(),
+        "worktree must NOT be removed (fail-closed)"
+    );
+    assert!(
+        l.path.join("precious-wip.txt").exists(),
+        "untracked WIP must survive in place"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-blk").is_some(),
+        "binding must be kept so the operator can recover in place"
+    );
+    assert!(
+        recovery_refs(&repo, "feat/blk").is_empty(),
+        "no (partial) recovery ref on a Blocked release"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
