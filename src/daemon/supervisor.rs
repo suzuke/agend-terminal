@@ -1180,7 +1180,7 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
 /// - `blocked_rl` (primary, lead-vetted) — classify matched a real RATE-LIMIT error pattern,
 ///   not a generic ApiError; `QuotaExceeded` is a distinct variant, so user quota is excluded.
 /// - `has_throttle_hint` — corroborating throttle token still on screen.
-/// - `!recovered && !self_cleared` — the agent is not awake/progressing. `recovered` =
+/// - `!recovered` — the agent is not awake/progressing. `recovered` =
 ///   `recovered_within(RECOVERY_SILENCE)`, so `!recovered` already encodes the productive-silence
 ///   requirement AND preserves the never-produced fresh-agent edge (a just-spawned agent that
 ///   immediately 529s still arms — an explicit silence threshold would wrongly block it).
@@ -1193,13 +1193,8 @@ fn clears_server_rate_limit_retry(state: crate::state::AgentState) -> bool {
 ///
 /// StopFailure-hook corroboration is deliberately NOT required (hooks are best-effort/droppable,
 /// and would re-introduce a false-negative); it only adds confidence when present (claude).
-fn work_turn_throttle_arm(
-    blocked_rl: bool,
-    has_throttle_hint: bool,
-    recovered: bool,
-    self_cleared: bool,
-) -> bool {
-    blocked_rl && has_throttle_hint && !recovered && !self_cleared
+fn work_turn_throttle_arm(blocked_rl: bool, has_throttle_hint: bool, recovered: bool) -> bool {
+    blocked_rl && has_throttle_hint && !recovered
 }
 
 /// #1470 (re-scoped slice, credit @cheerc): notify an agent's team
@@ -1522,7 +1517,7 @@ pub(crate) fn process_error_recovery(
             // produced (`last_productive_output == None`) is NOT recovery, so it
             // latches + injects normally (the fresh-agent edge the creation stamp
             // used to mis-suppress). `productive_silence` is for the log only.
-            let (state, recovered, self_cleared, has_throttle_hint, blocked_rl, productive_silence) = {
+            let (state, recovered, has_throttle_hint, blocked_rl, productive_silence) = {
                 let mut core = handle.core.lock();
                 // KEEP-RAW (#2465): the SRL retry arm reads raw core.state.current. claude hooks
                 // never emit RateLimited (a StopFailure → ApiError, the API plane owns rate-limit),
@@ -1542,24 +1537,16 @@ pub(crate) fn process_error_recovery(
                     Some(crate::health::BlockedReason::RateLimit { .. })
                 );
                 let recovered = core.state.recovered_within(RECOVERY_SILENCE);
-                // #2232: ground-truth recovery latch the agent set by self-clearing
-                // its rate-limit block via the MCP `clear_blocked_reason` action.
-                let self_cleared = core.health.rate_limit_self_cleared;
                 let has_hint =
                     crate::state::screen_has_throttle_hint(&core.vterm.tail_lines(TAIL_LINES));
                 let productive_silence = core.state.productive_silence();
                 if state == AgentState::ServerRateLimit {
-                    // #2232 D1(b): we are about to track/inject a rate-limit retry,
-                    // so we ALREADY KNOW the agent is rate-limited — mark it blocked
-                    // (only when not already RateLimit-latched, to avoid clobbering a
-                    // watchdog-set `retry_after_secs`). This guarantees the agent's
-                    // later self-clear (`clear_blocked_reason reason=rate_limit`)
-                    // reliably matches and latches, making it a dependable
-                    // ground-truth recovery signal rather than a tick-window
-                    // best-effort. Skip once self-cleared so we never re-block an
-                    // agent that already proved it recovered.
+                    // We are about to track/inject a rate-limit retry, so we ALREADY
+                    // KNOW the agent is rate-limited — mark it blocked (only when not
+                    // already RateLimit-latched, to avoid clobbering a watchdog-set
+                    // `retry_after_secs`). Feeds the loose-arm `blocked_rl` read on
+                    // the next tick and the operator-visible health status.
                     if !recovered
-                        && !self_cleared
                         && !matches!(
                             core.health.current_reason,
                             Some(crate::health::BlockedReason::RateLimit { .. })
@@ -1570,20 +1557,8 @@ pub(crate) fn process_error_recovery(
                                 retry_after_secs: None,
                             });
                     }
-                } else {
-                    // #2232: a genuine ServerRateLimit EXIT resets the latch so a
-                    // FUTURE rate-limit episode re-arms the retry path
-                    // (cross-episode), mirroring `clears_server_rate_limit_retry`.
-                    core.health.rate_limit_self_cleared = false;
                 }
-                (
-                    state,
-                    recovered,
-                    self_cleared,
-                    has_hint,
-                    blocked_rl,
-                    productive_silence,
-                )
+                (state, recovered, has_hint, blocked_rl, productive_silence)
             };
 
             // ── #t-26795 SRL hook-override (operator-reported sticky-screen flap) ──
@@ -1593,7 +1568,7 @@ pub(crate) fn process_error_recovery(
             // overwrites → survives the detect→clear→re-detect flap; removed only on a
             // genuine screen exit); a fresh ACTIVE hook whose seq is STRICTLY newer
             // than the floor is a third recovery signal. ADD-ONLY — composes with
-            // recovered/self_cleared; claude-only; a non-claude / missing / stale /
+            // recovered; claude-only; a non-claude / missing / stale /
             // pre-onset hook falls through to the unchanged screen-driven path.
             // r6 finding-2: key the floor by the STABLE InstanceId, not name, so a
             // same-name replacement gets a fresh floor (the hook STORE is still
@@ -1638,8 +1613,7 @@ pub(crate) fn process_error_recovery(
             // fight). Single-ownership vs the future 529-recovery is left to a PRODUCTION signal
             // (the #2547-removed measure-only recovery_shadow shadow never counted); see
             // `work_turn_throttle_arm`.
-            let loose_arm =
-                work_turn_throttle_arm(blocked_rl, has_throttle_hint, recovered, self_cleared);
+            let loose_arm = work_turn_throttle_arm(blocked_rl, has_throttle_hint, recovered);
 
             // ── #1713 root-fix: ServerRateLimit retry — DECIDE with fresh state ──
             // The "should we inject this tick" decision lives HERE, under the lock,
@@ -1649,8 +1623,7 @@ pub(crate) fn process_error_recovery(
             // only EXECUTES the lock-free PTY inject for the names decided here. So a
             // track can never blind-fire `continue` into a non-error state (e.g. a
             // PermissionPrompt the agent reached after the throttle cleared).
-            if state == AgentState::ServerRateLimit && (recovered || self_cleared || hook_recovered)
-            {
+            if state == AgentState::ServerRateLimit && (recovered || hook_recovered) {
                 // #ratelimit-recovery: still latched ServerRateLimit (the stale
                 // "Server is temporarily limiting" line re-matches in the tail and
                 // working_state_below can't see a marker BELOW the most-recent error
@@ -1659,22 +1632,21 @@ pub(crate) fn process_error_recovery(
                 //   • `recovered` — productive output within RECOVERY_SILENCE
                 //     (heuristic; `last_productive_output` is position-independent,
                 //     breaking the Thinking↔ServerRateLimit flicker). MISSES a pure
-                //     fast TEXT reply that never stamped a behaviour marker (#2232).
-                //   • `self_cleared` (#2232) — the agent itself called
-                //     `clear_blocked_reason` on its rate-limit block: ground-truth
-                //     proof it is awake and read the inject, backend-agnostic, zero
-                //     false-positive for liveness. Closes the over-inject gap the
-                //     heuristic alone left. The latch stays set (so no re-arm) until
-                //     a genuine ServerRateLimit exit resets it (capture block above).
+                //     fast TEXT reply that never stamped a behaviour marker — that
+                //     gap is now covered by `hook_recovered` below (#26795-3
+                //     removed the earlier `self_cleared` agent-driven signal, which
+                //     2746/2746 telemetry proved agents never set).
+                //   • `hook_recovered` (#t-26795) — a fresh post-onset claude hook
+                //     proves the agent is mid-tool-call (see the SRL hook-override
+                //     block above): ground-truth liveness that closes the pure-text
+                //     gap the heuristic alone left. claude-only, ADD-ONLY.
                 // Either way: clear the track and do NOT inject. A genuinely-stuck
-                // agent produces nothing AND can't call clear → the inject fires.
+                // agent produces nothing AND fires no fresh hook → the inject fires.
                 if retry_tracks.remove(name).is_some() {
                     tracing::info!(
                         agent = %name,
                         productive_silent_secs = productive_silence.as_secs(),
-                        recovered_via = if self_cleared {
-                            "agent_self_clear"
-                        } else if recovered {
+                        recovered_via = if recovered {
                             "productive_output"
                         } else {
                             "hook_active" // #t-26795: fresh post-onset claude hook
