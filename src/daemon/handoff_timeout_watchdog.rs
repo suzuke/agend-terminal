@@ -41,6 +41,16 @@ const FALLBACK_RECIPIENT: &str = "lead";
 /// Inbox kind of a CI handoff message.
 const HANDOFF_KIND: &str = "ci-ready-for-action";
 
+/// #35896-11 ⑥: parse a track's persisted throttle stamp (RFC3339) into a UTC
+/// instant. `None`/unparseable → `None` = "never" (fires now) — the pre-⑥
+/// behavior, so a corrupt/missing stamp degrades to "slightly noisier", never
+/// "obligation lost".
+fn parse_stamp(s: &Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
+    s.as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
 /// #26795: if `correlation`'s (`owner/repo@branch`) PR is already known to be
 /// merge-blocked (REJECTED verdict or Draft) per the CACHED `pr_state`
 /// snapshot, resolve its `ci_handoff_track` entry and report `true`. Read-only
@@ -134,7 +144,7 @@ pub(crate) fn scan_and_emit_with<F>(
     let mut renudged_this_scan: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     {
-        for (_path, track) in &tracks {
+        for (path, track) in &tracks {
             let target = &track.target;
             // Orphan guard: the target left the fleet — nothing to nudge; the
             // 24h sweep reaps the file.
@@ -187,47 +197,53 @@ pub(crate) fn scan_and_emit_with<F>(
             // that was merely marked read still shows up here — `track_pending`
             // replaces the old `unread_found` (which production proved was
             // always extinguished within seconds).
-            // Read-only: these locals don't feed the gate below.
-            {
-                let busy = crate::snapshot::agent_is_busy(home, target);
-                let renudge_due = last_renudged.get(&key).is_none_or(|prev| {
-                    now.signed_duration_since(*prev).num_minutes() >= RENUDGE_INTERVAL_MINS
-                });
-                // info!-level so it lands in the production daemon.log (default
-                // filter is `agend_terminal=info`); bounded — at most once per
-                // UNREAD ci-handoff per tick, and a handoff stops being scanned the
-                // moment it's read.
-                tracing::info!(
-                    tag = "#1888-renudge-decision",
-                    agent = %target,
-                    correlation = %corr,
-                    track_pending = true,
-                    age_min,
-                    agent_is_busy = busy,
-                    renudge_due,
-                    age_ok = age_min >= RENUDGE_AFTER_MINS,
-                    will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due,
-                    "ci-handoff re-nudge decision"
+            // #35896-11 ⑥: the effective "last re-nudged" is the in-mem throttle map,
+            // OR — when the map lacks the key (a daemon RESTART cleared it) — the
+            // track's PERSISTED `last_renudged_at`, so a boot doesn't reset the
+            // throttle and re-nudge a burst for every live handoff. In-mem stays
+            // primary (fast); the persisted value is the restart-survival fallback
+            // (they're stamped together, so in-mem present ⟹ equals the persisted).
+            let busy = crate::snapshot::agent_is_busy(home, target);
+            let effective_last_renudged = last_renudged
+                .get(&key)
+                .copied()
+                .or_else(|| parse_stamp(&track.last_renudged_at));
+            let renudge_due = effective_last_renudged.is_none_or(|prev| {
+                now.signed_duration_since(prev).num_minutes() >= RENUDGE_INTERVAL_MINS
+            });
+            // info!-level so it lands in the production daemon.log (default filter
+            // is `agend_terminal=info`); bounded — at most once per UNREAD ci-handoff
+            // per tick, and a handoff stops being scanned the moment it's read.
+            tracing::info!(
+                tag = "#1888-renudge-decision",
+                agent = %target,
+                correlation = %corr,
+                track_pending = true,
+                age_min,
+                agent_is_busy = busy,
+                renudge_due,
+                age_ok = age_min >= RENUDGE_AFTER_MINS,
+                will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due,
+                "ci-handoff re-nudge decision"
+            );
+            if age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due {
+                // Stamp EVERY due key (per-key cross-tick interval honesty — so a
+                // collapsed key isn't treated as never-nudged next scan, which would
+                // let the target re-fire inside the interval).
+                last_renudged.insert(key.clone(), *now);
+                // #35896-11 ⑥: persist to the durable track so a restart doesn't reset
+                // this throttle (the burst fix). Per-key, matching the in-mem stamp
+                // above (the actual inject collapses to once-per-target below).
+                crate::daemon::ci_handoff_track::stamp_throttle(
+                    home, path, target, &corr, now, true, false,
                 );
-            }
-            if age_min >= RENUDGE_AFTER_MINS && !crate::snapshot::agent_is_busy(home, target) {
-                let due = last_renudged.get(&key).is_none_or(|prev| {
-                    now.signed_duration_since(*prev).num_minutes() >= RENUDGE_INTERVAL_MINS
-                });
-                if due {
-                    // Stamp EVERY due key (per-key cross-tick interval honesty —
-                    // so a collapsed key isn't treated as never-nudged next scan,
-                    // which would let the target re-fire inside the interval).
-                    last_renudged.insert(key.clone(), *now);
-                    // ...but inject at most ONCE per target per scan.
-                    if renudged_this_scan.insert(target.clone()) {
-                        // #1888 phase-2: the pointer count is the target's PENDING
-                        // TRACKS — the handoff message itself may already be read
-                        // (that no longer stops the re-nudge), so the unread count
-                        // would say 0 and mislead.
-                        let pending = tracks.iter().filter(|(_, t)| &t.target == target).count();
-                        renudge(target, pending);
-                    }
+                // ...but inject at most ONCE per target per scan.
+                if renudged_this_scan.insert(target.clone()) {
+                    // #1888 phase-2: the pointer count is the target's PENDING TRACKS —
+                    // the handoff message itself may already be read (that no longer
+                    // stops the re-nudge), so the unread count would say 0 and mislead.
+                    let pending = tracks.iter().filter(|(_, t)| &t.target == target).count();
+                    renudge(target, pending);
                 }
             }
 
@@ -235,8 +251,16 @@ pub(crate) fn scan_and_emit_with<F>(
             if age_min < HANDOFF_TIMEOUT_MINS {
                 continue;
             }
-            if let Some(prev) = last_escalated.get(&key) {
-                if now.signed_duration_since(*prev).num_minutes() < REALERT_AFTER_MINS {
+            // #35896-11 ⑥: same restart-survival fallback as the re-nudge throttle —
+            // consult the track's PERSISTED `last_escalated_at` when the in-mem map
+            // lacks the key (post-restart), so a boot doesn't re-escalate every
+            // timed-out handoff inside its REALERT window.
+            let effective_last_escalated = last_escalated
+                .get(&key)
+                .copied()
+                .or_else(|| parse_stamp(&track.last_escalated_at));
+            if let Some(prev) = effective_last_escalated {
+                if now.signed_duration_since(prev).num_minutes() < REALERT_AFTER_MINS {
                     continue;
                 }
             }
@@ -288,6 +312,11 @@ pub(crate) fn scan_and_emit_with<F>(
                 "#1491 handoff_timeout_watchdog: escalated an unclaimed CI handoff to the lead"
             );
             last_escalated.insert(key, *now);
+            // #35896-11 ⑥: persist the escalation throttle so a restart doesn't
+            // re-escalate this handoff inside its REALERT window.
+            crate::daemon::ci_handoff_track::stamp_throttle(
+                home, path, target, &corr, now, false, true,
+            );
         }
     }
     // Reap dedup entries for handoffs that are no longer pending (read/resolved
@@ -599,6 +628,110 @@ mod tests {
         assert!(
             crate::daemon::ci_handoff_track::list(&home).is_empty(),
             "#1888: the expired track is swept"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #35896-11 ⑥: the RE-NUDGE throttle is PERSISTED on the track, so a daemon
+    /// RESTART (empty in-mem map) does NOT re-nudge a burst — yet a genuinely-due
+    /// handoff (persisted stamp older than the interval) STILL fires (the
+    /// over-suppression counter-example). Pre-⑥ the empty in-mem map alone drove
+    /// the decision, so Case 1 would burst-fire on restart.
+    #[test]
+    fn persisted_renudge_throttle_survives_restart_without_over_suppression_35896_11() {
+        let home = tmp_home("35896-persist-renudge");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        let now = chrono::Utc::now();
+        // Live handoff old enough to be renudge-eligible (5min >= RENUDGE_AFTER_MINS).
+        seed_handoff(&home, "reviewer", "o/r@b", 5, false);
+        let track_path = crate::daemon::ci_handoff_track::list(&home)[0].0.clone();
+
+        // Case 1 (burst prevention): a RECENT persisted stamp (30s ago, inside the
+        // 2min interval) must suppress the re-nudge on a RESTART (empty in-mem maps).
+        crate::daemon::ci_handoff_track::stamp_throttle(
+            &home,
+            &track_path,
+            "reviewer",
+            "o/r@b",
+            &(now - chrono::Duration::seconds(30)),
+            true,
+            false,
+        );
+        let nudged = run_watchdog(&home, &now, &mut HashMap::new(), &mut HashMap::new());
+        assert!(
+            nudged.is_empty(),
+            "post-restart, a recently-persisted renudge throttle must suppress the boot burst: {nudged:?}"
+        );
+
+        // Case 2 (no over-suppression): an OLD persisted stamp (5min ago, past the
+        // interval) must STILL re-nudge on restart.
+        crate::daemon::ci_handoff_track::stamp_throttle(
+            &home,
+            &track_path,
+            "reviewer",
+            "o/r@b",
+            &(now - chrono::Duration::minutes(5)),
+            true,
+            false,
+        );
+        let nudged2 = run_watchdog(&home, &now, &mut HashMap::new(), &mut HashMap::new());
+        assert_eq!(
+            nudged2,
+            vec!["reviewer".to_string()],
+            "a persisted throttle older than the interval must not over-suppress a due re-nudge"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #35896-11 ⑥ (lead acceptance #2): the ESCALATION throttle is likewise
+    /// persisted — a RESTART must not re-escalate a timed-out handoff inside its
+    /// REALERT window, but MUST still escalate once that window has elapsed (no
+    /// over-suppression of a legitimately-due escalation). Target seeded BUSY so
+    /// the re-nudge path is gated off and only the escalation is exercised.
+    #[test]
+    fn persisted_escalation_throttle_survives_restart_without_over_suppression_35896_11() {
+        let home = tmp_home("35896-persist-escalate");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "thinking"); // busy → no re-nudge noise
+        let now = chrono::Utc::now();
+        // Handoff past the escalation timeout (40min >= HANDOFF_TIMEOUT_MINS=10).
+        seed_handoff(&home, "reviewer", "o/r@b", 40, false);
+        let track_path = crate::daemon::ci_handoff_track::list(&home)[0].0.clone();
+
+        // Case 1 (burst prevention): a RECENT persisted escalation stamp (5min ago,
+        // inside REALERT_AFTER_MINS=30) must suppress re-escalation on a restart.
+        crate::daemon::ci_handoff_track::stamp_throttle(
+            &home,
+            &track_path,
+            "reviewer",
+            "o/r@b",
+            &(now - chrono::Duration::minutes(5)),
+            false,
+            true,
+        );
+        run_watchdog(&home, &now, &mut HashMap::new(), &mut HashMap::new());
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "post-restart, a recently-persisted escalation throttle must suppress the boot re-escalation"
+        );
+
+        // Case 2 (no over-suppression): an OLD persisted stamp (35min ago, past
+        // REALERT) must STILL escalate on restart.
+        crate::daemon::ci_handoff_track::stamp_throttle(
+            &home,
+            &track_path,
+            "reviewer",
+            "o/r@b",
+            &(now - chrono::Duration::minutes(35)),
+            false,
+            true,
+        );
+        run_watchdog(&home, &now, &mut HashMap::new(), &mut HashMap::new());
+        assert_eq!(
+            crate::inbox::drain(&home, "lead").len(),
+            1,
+            "a persisted escalation throttle older than REALERT must not over-suppress a due escalation"
         );
         std::fs::remove_dir_all(home).ok();
     }
