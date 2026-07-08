@@ -72,7 +72,14 @@ jobs:
 
       - name: Format check
         timeout-minutes: 5
-        run: cargo fmt --check
+        shell: bash
+        # #2524 P3: the `agentic-git` [[bin]] (Cargo.toml) compiles vendored
+        # submodule source, which `cargo fmt` walks and would flag against our
+        # rustfmt style — but that is upstream code we don't own (it round-trips to
+        # the agentic-git repo), and rustfmt's `ignore` is NOT reliably honored via
+        # `cargo fmt`'s per-target invocation. Format-check our OWN tracked sources
+        # only (git pathspec excludes vendor/); rustfmt reads no config → defaults.
+        run: git ls-files '*.rs' ':!:vendor/**' | xargs rustfmt --edition 2021 --check
 
       # Single clippy pass with --all-targets --features tray is a superset
       # of the default-feature check — catches both default and tray code
@@ -117,18 +124,19 @@ jobs:
       # the slow-timeout is KILLED and NAMED → a fast, attributed failure instead
       # of a 30-min mystery. The `ci` profile also serializes the heavy real-git
       # test cluster (`git-subprocess` test-group) so it can't race the suite.
-      # #2524 P2 (build-together, design §3.A): the flag-gated git-shim swap
-      # points `git` at a self-built `agentic-git` binary from the vendored
-      # submodule. It is NOT a workspace member (the submodule declares its OWN
-      # [workspace]), so `cargo build --release` above does not produce it — build
-      # it via the submodule manifest and expose its path so the runtime parity
-      # test (tests/agentic_git_shim_swap.rs) exercises the REAL binary instead of
-      # skipping. Unix-only: the shim swap + that test are `#[cfg(unix)]`.
-      - name: Build-together agentic-git shim (#2524 P2)
+      # #2524 P3 (agentic-git migration): the flag-gated git-shim swap points
+      # `git` at a self-built `agentic-git` binary. It is now agend-terminal's OWN
+      # `[[bin]]` target (Cargo.toml `path=` into the vendored submodule source),
+      # so a plain `cargo build` produces it — no build script (P3 retired
+      # scripts/build_agentic_git_shim.sh), and it rides `cargo install`/release
+      # archives automatically. Build it explicitly so the runtime parity test
+      # (tests/agentic_git_shim_swap.rs) exercises the REAL binary at
+      # target/debug/agentic-git instead of skip-loud. Unix-only: `#[cfg(unix)]`.
+      - name: Build agentic-git bin target (#2524 P3)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ./scripts/build_agentic_git_shim.sh debug
+          cargo build --bin agentic-git
           echo "AGENTIC_GIT_SHIM_BIN=$PWD/target/debug/agentic-git" >> "$GITHUB_ENV"
 
       - name: Install nextest (#1784/#1893 — per-test terminate-after, all platforms)

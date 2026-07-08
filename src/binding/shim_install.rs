@@ -54,16 +54,18 @@ fn symlink_shim_at(home: &Path, exe: &Path, use_agentic_git: bool) {
     };
 
     // Flag-gated git target. Fail-SAFE: flag on but the agentic-git sibling
-    // missing (build-together did not ship it) → fall back to agend-git so `git`
-    // is NEVER left unguarded, and WARN loudly so the drift is diagnosable.
+    // missing (cargo build did not produce it — P3: it is agend-terminal's own
+    // `[[bin]]` target, so a stale/partial install can still lack it) → fall back
+    // to agend-git so `git` is NEVER left unguarded, and WARN loudly so the drift
+    // is diagnosable.
     let git_src = if use_agentic_git {
         match sibling("agentic-git") {
             Some(agentic) => agentic,
             None => {
                 tracing::warn!(
                     "use_agentic_git_shim=true but the agentic-git binary is missing next \
-                     to the daemon exe; falling back to agend-git for the git shim (run the \
-                     build-together step). git stays guarded."
+                     to the daemon exe; falling back to agend-git for the git shim (rebuild: \
+                     `cargo build` produces it as a [[bin]] target). git stays guarded."
                 );
                 agend_git.clone()
             }
