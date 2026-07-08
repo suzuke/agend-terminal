@@ -1,7 +1,7 @@
 # Spike #2342 — Hardening decision-manifest (resolving the dialectic's 6 blockers)
 
-**Status:** design only, no impl code. Gated behind reviewer4 + dev2 **re-vet**.
-**Inputs:** reviewer4 §2 verdict `VERDICT-2342-secmodel.md` (F1–F5) + dev2 §5.1 verdict (task `t-…66713-7`, A1–A5). Both REJECTED the as-specified spike; three pillars directionally right, individually necessary-not-sufficient.
+**Status:** design only, no impl code. Gated behind reviewer4 + dev2 **re-vet**. **REV2** — dev2 re-vet CLOSED B5-main/B6a and flagged a load-bearing residual in B4 (only `inject` was gated; `send`/`spawn`/`mcp_tool` equally injection-equivalent) → B4 reworked to per-method default-DENY capability + server-side enqueue target; B5 patched with 2 residuals.
+**Inputs:** reviewer4 §2 verdict `VERDICT-2342-secmodel.md` (F1–F5) + dev2 §5.1 verdict (task `t-…66713-7`, A1–A5) + dev2 re-vet (B4/B5 residuals). Both REJECTED the as-specified spike; three pillars directionally right, individually necessary-not-sufficient.
 **Author:** gapfix-dev (original spike author).
 
 ---
@@ -10,7 +10,7 @@
 
 The structural-unprivilege model **can** hold, but only once the load-bearing hole is closed and each pillar is made an *invariant* rather than a *convention*. Two framing corrections drive the ordering:
 
-1. **dev2 A1 (IPC auth) dominates everything.** An unauthenticated loopback control socket where `inject` is gated by method-shape not caller-identity means a spoofed local process injects any bound instance directly — bypassing the sidecar, HMAC, role, and all three pillars. **No inbound adapter may ship before IPC auth lands.** It is a *pre-existing fleet vulnerability*, fixed first, independently.
+1. **dev2 A1 (IPC auth) dominates everything.** The loopback control socket allows every injection-equivalent method (`inject`/`send`/`spawn`/`mcp_tool`/…) by method-shape, not caller-identity, so a spoofed local process drives any bound instance directly — bypassing the sidecar, HMAC, role, and all three pillars. The fix is a **per-method default-DENY capability** model (not connection-auth + a single-method special-case), with the sidecar holding exactly one `enqueue-only` capability and the daemon resolving the target server-side. **No inbound adapter ships before this lands.** It is a *pre-existing fleet vulnerability*, fixed first, independently.
 2. **Pillars 1+2 carry the load; pillar 3 (backend sandbox) is defense-in-depth only** — and is an empirically-unverified integration claim (reviewer4 F5), so the model must NOT rest on it. It is gated on a real spawn probe, not asserted.
 
 Each blocker below → concrete mechanism + touchpoint + **[PRE-EXISTING]** (independently fixable, fleet-valuable) or **[#2342]** + build phase. Consolidated build order in §7.
@@ -55,29 +55,29 @@ Each blocker below → concrete mechanism + touchpoint + **[PRE-EXISTING]** (ind
 
 ---
 
-## Blocker 4 — IPC authentication + sidecar capability-narrowing  (dev2 A1, LOAD-BEARING, high)
+## Blocker 4 — per-method default-DENY IPC capability + server-side enqueue target  (dev2 A1 + re-vet residual, LOAD-BEARING, high)  ⟵ REV2
 
-**Hole:** the daemon control socket is unauthenticated loopback TCP (`src/ipc.rs:3-10`) and `inject` is a direct method the operator gate *always* allows because it gates by method-shape, not caller identity (`operator_gate.rs:319-326`,`:78`; `api/mod.rs:204-206`). Any local process / spoofed sidecar injects any bound instance = #2158 amplification that bypasses sidecar+HMAC+role. This nullifies the whole "untrusted surface stays outside the daemon" premise.
+**Hole (re-vet-sharpened):** authenticating the connection and special-casing only `inject` (rev1 B4c) is insufficient — the control socket dispatches *many* injection-equivalent direct methods, ALL "operator-transport always allowed", gated by method-shape not caller identity: `INJECT` (`src/api/mod.rs:621`), `SEND` (`:626`), `SPAWN` (`:625`), `MCP_TOOL` (`:645`), plus `KILL`/`DELETE`/`CREATE_TEAM`/… (`api/mod.rs:620-645`; `operator_gate.rs:319-326`; `api/mod.rs:204-206`). A blanket-authenticated sidecar still reaches `send`/`spawn`/`mcp_tool` → A1 stays open. dev2 CLOSED B5-main/B6a; B4 needs this rework.
 
-**Mechanism:**
-- **(a) authenticate the IPC** — per-connection capability token (shared secret / cookie handshake) on the control socket. **[PRE-EXISTING]** load-bearing fleet vulnerability (a compromised local process can already drive the daemon today) → fix FIRST, independently, own review.
-- **(b) capability-scope the sidecar token** to a SINGLE method: `enqueue-to-responder-inbox`. The sidecar cannot call `inject`, any direct-method, or operator ops — its token doesn't grant them. Even a fully-compromised sidecar can only drop a message into a responder's inbox, which then runs the allowlist + Conversational-role + unbindable gates.
-- **(c) identity-gate `inject`** — the direct `inject` method must require an authenticated identity, not just method-shape (`api/mod.rs:204-206`, `operator_gate.rs:319-326`). **[PRE-EXISTING]**.
-**Touchpoints:** `ipc.rs:3-10` (auth handshake), `operator_gate.rs:319-326`/`api/mod.rs:204-206` (identity-gate inject), new capability-token layer.
-**Tag:** **[PRE-EXISTING]** (IPC auth + identity-gated inject — the load-bearing foundation) + **[#2342]** (enqueue-only scoped token).
+**Mechanism (per dev2 re-vet):**
+- **(4a) per-method default-DENY capability authorization.** EVERY control-socket method (`inject`/`send`/`spawn`/`mcp_tool`/`kill`/`delete`/…) requires the caller's token to hold that method's capability; absent capability → DENY. "enqueue-only" is only *provable* against a default-deny base — never a default-allow with one method special-cased. The sidecar token grants exactly ONE capability: `enqueue-to-responder-inbox`; it cannot reach `inject`/`send`/`spawn`/`mcp_tool` at all.
+- **(4b) server-side enqueue-target resolution + role gate.** The DAEMON (not the sidecar) resolves conversation-id → responder instance and enforces `role_kind == Conversational` (else drop+log). The sidecar's enqueue request carries the **conversation-id ONLY** — it must NOT name a target instance, else a compromised sidecar aims its permitted enqueue at a bound instance = equivalent injection. Target choice is the server's, keyed on the allowlisted conversation map.
+- **(4c) token hardening.** Token file mode **0600** + missing/unreadable token → **fail-CLOSED** (refuse connection) + **per-boot rotation** + **publish-before-accept** (token written+fsynced before the socket accepts). ⚠ `store::atomic_write` (used by `ipc.rs:47-49 write_port`) does **not** `set_permissions` → a token written that way is world-readable; the token writer must chmod 0600 (and ideally teach `atomic_write` an optional mode — fleet-valuable).
+**Touchpoints:** `api/mod.rs:620-645` (per-method dispatch — capability check per arm), `operator_gate.rs:319-326`/`api/mod.rs:204-206` (replace method-shape gate with capability gate), `ipc.rs:47-49` (token write + 0600 + fail-closed), new capability-token + capability-set layer.
+**Tag:** **[PRE-EXISTING, LOAD-BEARING]** (per-method capability auth + token 0600 = general fleet hardening) + **[#2342]** (enqueue-only capability + server-side conversation→responder resolution).
 **Build:** **Phase 0a — FIRST. Nothing ships before this.**
 
 ---
 
-## Blocker 5 — anti-replay + global budget + instance cap  (dev2 A2/A3, high/med)
+## Blocker 5 — anti-replay + global budget + instance cap  (dev2 A2/A3 — main CLOSED, 2 residuals patched)  ⟵ REV2
 
-**Hole:** (A2) webhook HMAC signs only the body — no timestamp/nonce → a captured payload **replays** and re-triggers a turn. (A3) rate-limiting sits *after* the IPC boundary, there's no global compute budget, and resident spawn has no instance cap → quota/compute exhaustion.
+**Hole:** (A2) webhook HMAC signs only the body — no timestamp/nonce → a captured payload **replays** and re-triggers a turn. (A3) rate-limiting sits *after* the IPC boundary, no global compute budget, resident spawn has no instance cap → quota/compute exhaustion. *dev2 re-vet CLOSED the main mechanism; two residuals below.*
 
 **Mechanism (all at/ before the untrusted boundary):**
-- **anti-replay in the sidecar:** LINE `eventId` dedup (bounded LRU of seen ids) + timestamp freshness window (reject stale) + **constant-time** HMAC compare (no timing oracle); verify over body+timestamp.
-- **layered budgets:** (i) per-conversation/per-sender **pre-throttle at the sidecar** (before IPC, closing A3's "limit is post-IPC"); (ii) a **global inbound budget** in the daemon (total inbound turns/min across all conversations — no limiter exists today, `RateBudget` `caps.rs:127-141` is an unused struct); (iii) **responder instance cap** — inherently satisfied by pre-provisioned-only responders (Blocker 2a); enforce an explicit ceiling if/when auto-spawn is added; (iv) a per-conversation **compute/turn budget** to bound quota burn.
-**Touchpoints:** sidecar (replay + pre-throttle), new inbound-budget module in daemon, instance-cap at route/spawn, `caps.rs:127-141` (wire the dormant `RateBudget`).
-**Tag:** **[#2342]** (inbound budget + replay are feature-specific); the *absence* of any enforced limiter is a pre-existing gap but the inbound limiter itself is new.
+- **anti-replay in the sidecar:** LINE `eventId` dedup (bounded LRU) + timestamp freshness window + **constant-time** HMAC compare; verify over body+timestamp. **⟵ REV2 residual (a):** the dedup set must **persist** (small on-disk store) OR the ts freshness window must be **aggressively narrowed** — otherwise a sidecar restart clears the in-memory LRU and an in-window replay passes. Prefer persisted dedup keyed on `eventId` (survives restart); a narrow ts window alone still admits fast replays.
+- **layered budgets:** (i) per-conversation/per-sender **pre-throttle at the sidecar** (before IPC); **⟵ REV2 residual (b):** the **global inbound/compute budget must ALSO be enforced at the sidecar (pre-IPC)**, not only in-daemon (post-IPC) — a post-IPC-only ceiling still lets a flood reach and load the daemon. Enforce the global cap at the sidecar first; keep the in-daemon ceiling as defense-in-depth. (ii) **global inbound budget** in the daemon (`RateBudget` `caps.rs:127-141` is an unused struct to wire); (iii) **responder instance cap** — inherently satisfied by pre-provisioned-only responders (Blocker 2a); explicit ceiling if auto-spawn is added; (iv) per-conversation **compute/turn budget**.
+**Touchpoints:** sidecar (persisted dedup + pre-IPC global budget + pre-throttle), in-daemon inbound-budget module, instance-cap at route/spawn, `caps.rs:127-141`.
+**Tag:** **[#2342]** (inbound budget + replay are feature-specific).
 **Build:** Phase 2 (with the sidecar).
 
 ---
@@ -98,7 +98,7 @@ Each blocker below → concrete mechanism + touchpoint + **[PRE-EXISTING]** (ind
 ## 7. Consolidated staging / build order (de-risk: pre-existing hardening lands + is reviewed first)
 
 **Phase 0 — pre-existing fleet vulnerabilities, independent PRs, land + review BEFORE any inbound adapter:**
-- **P0a [LOAD-BEARING]** IPC authentication + identity-gated `inject` + enqueue-only capability token (Blocker 4). *Nothing proceeds until merged.*
+- **P0a [LOAD-BEARING]** per-method default-DENY IPC capability (covers `inject`/`send`/`spawn`/`mcp_tool`/…) + server-side enqueue-target resolution + enqueue-only sidecar capability + token 0600/fail-closed/per-boot-rotation (Blocker 4). *Nothing proceeds until merged.*
 - **P0b** all-resolver fail-closed drop+log, invert general-fallback tests (Blocker 6a).
 - **P0c** per-instance backend-args override (Blocker 3a enabler).
 
