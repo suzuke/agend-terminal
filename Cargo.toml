@@ -67,6 +67,27 @@ strip = true
 lto = "thin"
 codegen-units = 16
 
+# #2524 P3 (agentic-git migration): build the vendored agentic-git shim as
+# agend-terminal's OWN bin target, so `cargo build` produces the sibling binary
+# with ZERO build script + it rides `cargo install`/release archives automatically.
+# `path=` compiles main.rs directly — it does NOT resolve the standalone
+# agentic-git package, so Cargo.lock keeps exactly ONE agentic-git-core (the same
+# path dep the daemon links; single-source invariant, §3.A cond #1). Distinct from
+# a `[workspace]` member (blocked by the submodule's own `[workspace]`) — this is
+# just source compiled under agend-terminal's manifest (edition/MSRV identical).
+#
+# `test = false` is LOAD-BEARING for cross-platform CI: the binary itself builds
+# on all targets (it has cfg(windows) paths; unix code is `#[cfg(unix)]`-gated),
+# but its inline `#[cfg(test)] mod tests` fake argv[0] via unix-only
+# `CommandExt::arg0`/`std::os::unix` and CANNOT COMPILE on Windows (per the
+# vendored crate's own CI, which never test-compiles them off-unix). Those tests
+# are already run in agentic-git's own CI, so agend-terminal must NOT pull them
+# into its test surface — else `cargo nextest` on Windows fails to compile them.
+[[bin]]
+name = "agentic-git"
+path = "vendor/agentic-git/crates/agentic-git/src/main.rs"
+test = false
+
 [dependencies]
 # PTY
 portable-pty = "0.9"

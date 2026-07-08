@@ -72,14 +72,36 @@ jobs:
 
       - name: Format check
         timeout-minutes: 5
-        run: cargo fmt --check
+        shell: bash
+        # #2524 P3: the `agentic-git` [[bin]] (Cargo.toml) compiles vendored
+        # submodule source, which `cargo fmt` walks and would flag against our
+        # rustfmt style — but that is upstream code we don't own (it round-trips to
+        # the agentic-git repo), and rustfmt's `ignore` is NOT reliably honored via
+        # `cargo fmt`'s per-target invocation. Format-check our OWN tracked sources
+        # only (git pathspec excludes vendor/); rustfmt reads no config → defaults.
+        run: git ls-files '*.rs' ':!:vendor/**' | xargs rustfmt --edition 2021 --check
 
-      # Single clippy pass with --all-targets --features tray is a superset
-      # of the default-feature check — catches both default and tray code
-      # paths in one compilation, saving a full rebuild.
-      - name: Clippy (all targets + tray)
+      # #2524 P3: the agentic-git `[[bin]]` compiles vendored submodule source.
+      # `cargo clippy --all-targets` would lint it under agend-terminal's strict
+      # `-D warnings` + `unwrap_used=deny`, but that is UPSTREAM code gated by
+      # agentic-git's OWN CI — and `--all-targets` IGNORES the target's
+      # `test = false`, dragging in its unix-only inline tests (which also fail to
+      # compile on Windows). So run the strict gate on OUR OWN targets only:
+      # `--tests` DOES honor `test=false`, so it excludes the vendored bin's
+      # unittest; enumerate our bins (NOT agentic-git) so `--bins`/`--all-targets`
+      # never pull the vendored binary either. Add a new agend-terminal bin here.
+      # This keeps full default+tray coverage of everything we own.
+      - name: Clippy (our targets, strict)
         timeout-minutes: 15
-        run: cargo clippy --all-targets --features tray -- -D warnings
+        run: cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --tests --examples --features tray -- -D warnings
+      # The vendored agentic-git bin: lint as ADVISORY only (`--cap-lints=warn` →
+      # nothing gates), never imposing agend-terminal's `-D` bar on upstream code.
+      # We do NOT edit the submodule source to add `#[allow]` (that forks the
+      # vendored crate). Real Windows-compile coverage comes from the Build step.
+      - name: Clippy (vendored agentic-git bin, advisory)
+        timeout-minutes: 15
+        continue-on-error: true
+        run: cargo clippy --bin agentic-git --features tray -- --cap-lints=warn
 
       - name: Build
         timeout-minutes: 20
@@ -117,18 +139,19 @@ jobs:
       # the slow-timeout is KILLED and NAMED → a fast, attributed failure instead
       # of a 30-min mystery. The `ci` profile also serializes the heavy real-git
       # test cluster (`git-subprocess` test-group) so it can't race the suite.
-      # #2524 P2 (build-together, design §3.A): the flag-gated git-shim swap
-      # points `git` at a self-built `agentic-git` binary from the vendored
-      # submodule. It is NOT a workspace member (the submodule declares its OWN
-      # [workspace]), so `cargo build --release` above does not produce it — build
-      # it via the submodule manifest and expose its path so the runtime parity
-      # test (tests/agentic_git_shim_swap.rs) exercises the REAL binary instead of
-      # skipping. Unix-only: the shim swap + that test are `#[cfg(unix)]`.
-      - name: Build-together agentic-git shim (#2524 P2)
+      # #2524 P3 (agentic-git migration): the flag-gated git-shim swap points
+      # `git` at a self-built `agentic-git` binary. It is now agend-terminal's OWN
+      # `[[bin]]` target (Cargo.toml `path=` into the vendored submodule source),
+      # so a plain `cargo build` produces it — no build script (P3 retired
+      # scripts/build_agentic_git_shim.sh), and it rides `cargo install`/release
+      # archives automatically. Build it explicitly so the runtime parity test
+      # (tests/agentic_git_shim_swap.rs) exercises the REAL binary at
+      # target/debug/agentic-git instead of skip-loud. Unix-only: `#[cfg(unix)]`.
+      - name: Build agentic-git bin target (#2524 P3)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ./scripts/build_agentic_git_shim.sh debug
+          cargo build --bin agentic-git
           echo "AGENTIC_GIT_SHIM_BIN=$PWD/target/debug/agentic-git" >> "$GITHUB_ENV"
 
       - name: Install nextest (#1784/#1893 — per-test terminate-after, all platforms)

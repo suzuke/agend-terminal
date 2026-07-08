@@ -14,9 +14,11 @@
 //!      SUBMODULE-built binary — the load-bearing safety assumption of the flag
 //!      flip — plus a tamper negative-control so the ALLOW can't be a rubber-stamp.
 //!
-//! The gated tiers prebuild the binary via `scripts/build_agentic_git_shim.sh`
-//! (CI runs it before nextest; locally skip-loud if absent). We deliberately
-//! NEVER nested-`cargo build` inside a test — that reintroduced the windows
+//! The gated tiers use the `agentic-git` binary that a plain `cargo build`
+//! produces as agend-terminal's own `[[bin]]` target (P3 — the vendored
+//! `main.rs` compiled under this manifest; CI builds it before nextest, locally
+//! skip-loud if absent). We deliberately NEVER nested-`cargo build` inside a
+//! test — that reintroduced the windows
 //! target-lock deadlock removed in agend_git_shim_phase2.rs:42-48. The vendored
 //! source is already a hard build prerequisite (the daemon links
 //! `agentic-git-core` from this same submodule, P1b), so `include_str!` on it
