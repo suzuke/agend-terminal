@@ -38,6 +38,14 @@ use crate::integrity_core::{key_path, read_key, KEY_FILE, KEY_LEN};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Load the key, generating it (crypto-random, 0600) on first use.
+///
+/// embedder P1b transitional note (dev3): during P1b the BINDING signer provisions
+/// via `agentic_git_core::integrity_core::ensure_key` (hard_link first-writer-wins)
+/// while operator-mode still provisions via THIS one (rename last-writer-wins) — both
+/// over the SAME `.config-integrity-key`. On a fresh home a concurrent first-provision
+/// could race, but it is fail-CLOSED: the loser's key makes the other's older tag fail
+/// to verify → the shim DENIES (unbound), never authorizes — not a fail-open hole. The
+/// two provisioners collapse to one when P3 retires `config_integrity`.
 fn ensure_key(home: &Path) -> std::io::Result<[u8; KEY_LEN]> {
     if let Some(k) = read_key(home) {
         return Ok(k);
@@ -180,5 +188,84 @@ mod tests {
             br#"{"version":1,"task_id":"T-9","branch":"main"}"#,
             &tag
         ));
+    }
+
+    /// embedder P1b: the daemon's BINDING signer swaps `config_integrity::sign` →
+    /// `agentic_git_core::integrity_core::sign_binding` (binding.rs). That swap is
+    /// only safe because the two emit a BYTE-IDENTICAL bare-hex tag under the SAME
+    /// `.config-integrity-key`: the agend-git verifier-shim (unswapped until P2)
+    /// reads bare hex via its `#[path]` integrity_core, so a divergent tag would
+    /// silently fail EVERY binding verify (fail-closed → fleet-wide push deny).
+    /// Pins the cross-signer equivalence under a deterministic key AND anchors the
+    /// exact HMAC hex (independent python hmac/hashlib oracle) so an algo drift in
+    /// EITHER signer breaks here, at CI, not in production. This is the §3.C
+    /// content-anchored equality gate for the P1 signer swap.
+    #[test]
+    fn daemon_signer_core_swap_is_byte_identical_p1b() {
+        let home = tmp("p1b-byte-identical");
+        // Deterministic key so both signers observe the identical key AND the tag
+        // is reproducible against the golden.
+        std::fs::write(home.join(KEY_FILE), [7u8; KEY_LEN]).unwrap();
+        let body = br#"{"version":1,"branch":"feat/p1b"}"#;
+
+        let old = sign(&home, body).expect("config_integrity::sign");
+        let new = agentic_git_core::integrity_core::sign_binding(&home, body)
+            .expect("core::sign_binding provisions-then-signs on an existing key");
+
+        // (1) cross-signer equivalence — the swap is a same-bytes swap.
+        assert_eq!(
+            old, new,
+            "P1b: core::sign_binding must be byte-identical to config_integrity::sign \
+             under the same key — the unswapped agend-git shim verifies bare hex"
+        );
+        // (2) golden anchor — the exact tag for this fixed key+body, computed by an
+        // independent python hmac/hashlib oracle. A key-derivation / tag-algo drift
+        // in EITHER signer (the 'forgot-to-bump' case) breaks this at CI.
+        assert_eq!(
+            new, "765bc8a235da4ca9e390c3198245e8a173ef75c9dcf3e5afa89bb5a52be21f6c",
+            "P1b: HMAC output changed — every existing binding sidecar would fail closed"
+        );
+        // (3) the shared core verifier accepts the swapped daemon signer's tag (the
+        // signer→verifier contract the binding push-authority rides on).
+        assert!(
+            agentic_git_core::integrity_core::verify(&home, body, &new).is_ok(),
+            "the core verifier must accept the swapped daemon signer's tag"
+        );
+        // (4) THE load-bearing P1b contract: agend-terminal's OWN bare-hex verifier
+        // (`crate::integrity_core::verify`, the exact source the agend-git shim
+        // shares via `#[path]` and still runs unswapped until P2) accepts the
+        // core-signed tag. If sign_binding ever emitted anything but bare hex this
+        // returns false → binding unbound → fleet push deny.
+        assert!(
+            crate::integrity_core::verify(&home, body, &new),
+            "the unswapped agend-git bare-hex verifier must accept the core tag"
+        );
+    }
+
+    /// embedder P1b RED-proof (same code path, no mock branch): demonstrates WHY
+    /// `sign_binding` MUST stay bare hex here. The agend-git shim verifies bare hex
+    /// via its `#[path]` `integrity_core` (unswapped until P2). The daemon emits
+    /// the BARE tag → the shim's bare-hex verify ACCEPTS it; had it emitted the
+    /// P1a ENVELOPE form, that SAME verifier would REJECT it (hex::decode fails on
+    /// the `ag-hmac-sha256:v1:raw:` prefix) → every binding unbound → fleet-wide
+    /// push deny. This is the divergence the byte-identical guard forbids.
+    #[test]
+    fn shim_bare_hex_verify_rejects_envelope_would_break_p1b() {
+        let home = tmp("p1b-envelope-rejected");
+        std::fs::write(home.join(KEY_FILE), [7u8; KEY_LEN]).unwrap();
+        let body = br#"{"version":1,"branch":"feat/p1b"}"#;
+        let bare = agentic_git_core::integrity_core::sign_binding(&home, body).unwrap();
+        let enveloped = agentic_git_core::integrity_core::envelope_tag(&bare);
+        // What the daemon actually emits (bare) → shim bare-hex verify ACCEPTS.
+        assert!(
+            crate::integrity_core::verify(&home, body, &bare),
+            "the shim must accept the bare-hex tag the daemon actually emits"
+        );
+        // The forbidden drift (envelope) → the SAME bare-hex verifier REJECTS.
+        assert!(
+            !crate::integrity_core::verify(&home, body, &enveloped),
+            "the unswapped bare-hex shim would reject an enveloped tag — proves the \
+             byte-identical requirement is load-bearing, not decorative"
+        );
     }
 }

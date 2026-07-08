@@ -25,6 +25,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
+        with:
+          # embedder P1b: agentic-git-core is a path dep vendored as the
+          # `vendor/agentic-git` submodule — without this the path is absent and
+          # every cargo build/check/test/clippy fails to resolve the dependency.
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -251,6 +256,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true # embedder P1b: vendor/agentic-git core path dep
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
@@ -301,6 +308,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true # embedder P1b: vendor/agentic-git core path dep
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

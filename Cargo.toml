@@ -124,6 +124,17 @@ hmac = "0.13"
 # against is visible (and bumps with them, not via transitive drift).
 digest = "0.11"
 hex = "0.4"
+# embedder P1b (§3.A): link agentic-git-core from the pinned submodule
+# (vendor/agentic-git @ 5306c85 = the P1a merge). The daemon signs bindings via
+# `agentic_git_core::integrity_core::sign_binding` (provision+sign, BARE hex —
+# byte-identical to the pre-swap `config_integrity::sign`), so one HMAC source
+# feeds signer(daemon) + verifier(shim) with zero drift. The submodule PATH is
+# agend-terminal's link source (crates.io stays the STANDALONE agentic-git's
+# release channel, not ours); `version` only pins the resolved crate for
+# `cargo publish` metadata — a normal build/check ignores it and uses the path.
+# LOAD-BEARING (reviewer4 cond #1): exactly ONE agentic-git-core in Cargo.lock —
+# enforced by tests/agentic_core_single_source.rs (RED-first).
+agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core", version = "0.2.0" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"

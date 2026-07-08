@@ -381,7 +381,8 @@ pub fn bind_full(
     // (a same-uid agent could read the key + re-sign; true sealing needs
     // OS-isolation, parked #1653). Best-effort: a missing/failed sidecar leaves
     // the binding unsigned → the shim fails CLOSED (denies), never open.
-    match crate::config_integrity::sign(home, body.as_bytes()) {
+    // embedder P1b: BINDING signer → core `sign_binding` (SAME bare-hex bytes; rollback = revert to `config_integrity::sign`; rationale in Cargo.toml + golden `daemon_signer_core_swap_is_byte_identical_p1b`).
+    match agentic_git_core::integrity_core::sign_binding(home, body.as_bytes()) {
         Ok(tag) => {
             if let Err(e) = crate::store::atomic_write(&binding_sig_path(&dir), tag.as_bytes()) {
                 tracing::warn!(%agent, error = %e,
