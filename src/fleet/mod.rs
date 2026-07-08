@@ -193,6 +193,19 @@ pub struct FleetConfig {
     /// [`watchdog::WatchdogConfig`].
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+    /// #2524 P2 (agentic-git migration, design §5-Phase-2): flag-gated git-shim
+    /// backend. `false` (DEFAULT — byte-identical to today) → `$AGEND_HOME/bin/git`
+    /// symlinks to the in-tree `agend-git` shim. `true` → `git` points at the
+    /// self-built vendored `agentic-git` binary instead; the `{pkill,killall,kill}`
+    /// kill-shim links ALWAYS stay on `agend-git` (D1=A — agentic-git has no kill
+    /// guard). Consumed at daemon startup by [`crate::binding::symlink_shim`].
+    /// Rollback = flip back to `false` + restart: the on-disk binding format is
+    /// unchanged, so a rolled-back agend-git shim still verifies core-signed
+    /// bindings (no rebind storm). Additive optional field → no
+    /// [`FLEET_SCHEMA_VERSION`] bump; `skip_serializing_if` keeps a fleet.yaml
+    /// rewrite from injecting the default-off knob.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_agentic_git_shim: bool,
     #[serde(skip)]
     pub(crate) home: Option<PathBuf>,
 }

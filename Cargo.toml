@@ -223,3 +223,9 @@ glob = "0.3"
 # §7 PR-C names `tracing-test` as the sanctioned approach for asserting
 # `tracing::warn!` records are actually emitted).
 tracing-test = "0.2"
+# #2524 P2 cross-build proof (tests/agentic_git_shim_swap.rs): sign a bound
+# binding with the SAME core the daemon links (agend-terminal's build) so the
+# test can assert the SUBMODULE-built agentic-git binary verifies + allows it.
+# SAME path as the normal dep (line ~137) → cargo unifies to ONE package, so the
+# single-source invariant (tests/agentic_core_single_source.rs) is preserved.
+agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core" }
