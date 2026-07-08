@@ -11,9 +11,15 @@
 //! platform.
 //!
 //! This test parses `.github/workflows/release.yml` and asserts the
-//! 3 packaging steps (Unix tar, Windows zip, AppImage stage) all
-//! reference the bridge. It catches release-workflow edits that
-//! drop the bridge — the regression that originally produced #531.
+//! 3 packaging steps (Unix tar, Windows zip, AppImage stage) ship
+//! EVERY binary the daemon expects as a sibling — the MCP bridge
+//! (#531) plus the #2524 P3 git/kill shims (`agend-git`,
+//! `agentic-git`). `symlink_shim` resolves those shims via
+//! `current_exe().with_file_name()`, so a release-download install
+//! missing one silently degrades the git guard. It catches
+//! release-workflow edits that drop any of them — the regression that
+//! originally produced #531, now generalized to the P3 distribution
+//! gap (the cargo-install path is covered by the `[[bin]]` in #2691).
 //!
 //! ## Why text-parse over shell-out
 //!
@@ -33,6 +39,17 @@
 
 const RELEASE_YML: &str = include_str!("../.github/workflows/release.yml");
 
+/// Every binary the daemon expects as a sibling of `agend-terminal`
+/// (`current_exe().with_file_name()`). Each packaging step must ship all of
+/// them at the same layer: the MCP bridge (#531) plus the #2524 P3 git/kill
+/// shims. A missing shim in a release download silently degrades the git guard.
+const REQUIRED_PACKAGED_BINS: [&str; 4] = [
+    "agend-terminal",
+    "agend-mcp-bridge",
+    "agend-git",
+    "agentic-git",
+];
+
 #[test]
 fn release_workflow_packages_bridge_in_unix_tar_step() {
     // The Unix tar packaging step (line 77+ at the time of writing)
@@ -50,12 +67,14 @@ fn release_workflow_packages_bridge_in_unix_tar_step() {
         .map(|n| tar_idx + n)
         .unwrap_or(RELEASE_YML.len());
     let section = &RELEASE_YML[tar_idx..section_end];
-    assert!(
-        section.contains("agend-mcp-bridge"),
-        "Unix tar packaging step must include `agend-mcp-bridge` so \
-         release tarballs ship both binaries — Phase 2a fix for #531. \
-         Section was:\n{section}"
-    );
+    for bin in REQUIRED_PACKAGED_BINS {
+        assert!(
+            section.contains(bin),
+            "Unix tar packaging step must include `{bin}` so release tarballs \
+             ship every daemon sibling (bridge #531 + P3 git/kill shims). \
+             Section was:\n{section}"
+        );
+    }
 }
 
 #[test]
@@ -70,12 +89,14 @@ fn release_workflow_packages_bridge_in_windows_zip_step() {
         .map(|n| zip_idx + n)
         .unwrap_or(RELEASE_YML.len());
     let section = &RELEASE_YML[zip_idx..section_end];
-    assert!(
-        section.contains("agend-mcp-bridge"),
-        "Windows zip packaging step must include `agend-mcp-bridge.exe` \
-         so the release zip ships both binaries — Phase 2a fix for #531. \
-         Section was:\n{section}"
-    );
+    for bin in REQUIRED_PACKAGED_BINS {
+        assert!(
+            section.contains(bin),
+            "Windows zip packaging step must include `{bin}.exe` so the \
+             release zip ships every daemon sibling (bridge #531 + P3 git/kill \
+             shims). Section was:\n{section}"
+        );
+    }
 }
 
 #[test]
@@ -93,12 +114,14 @@ fn release_workflow_includes_bridge_in_appimage_stage() {
         .map(|n| stage_idx + n)
         .unwrap_or(RELEASE_YML.len());
     let section = &RELEASE_YML[stage_idx..section_end];
-    assert!(
-        section.contains("agend-mcp-bridge"),
-        "AppImage stage must copy `agend-mcp-bridge` into \
-         AppDir/usr/bin/ so AppImage installs ship both binaries — \
-         Phase 2a fix for #531. Section was:\n{section}"
-    );
+    for bin in REQUIRED_PACKAGED_BINS {
+        assert!(
+            section.contains(bin),
+            "AppImage stage must copy `{bin}` into AppDir/usr/bin/ so AppImage \
+             installs ship every daemon sibling (bridge #531 + P3 git/kill \
+             shims). Section was:\n{section}"
+        );
+    }
 }
 
 #[test]

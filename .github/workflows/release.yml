@@ -179,10 +179,13 @@ jobs:
           # current_exe().with_file_name(), so a release-tarball install must
           # place them beside agend-terminal or the git guard silently falls
           # back / breaks (the cargo-install path already gets all 4, #2691).
-          bins="agend-terminal agend-mcp-bridge agend-git agentic-git"
-          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz $bins
+          # All 4 bins listed explicitly on the `tar czf` line + guard loop so
+          # tests/no_local_mcp_mode_invariant.rs (brackets forward from `tar czf`)
+          # asserts each is packaged.
+          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz \
+            agend-terminal agend-mcp-bridge agend-git agentic-git
           # Fail-loud: the archive MUST contain every expected sibling binary.
-          for b in $bins; do
+          for b in agend-terminal agend-mcp-bridge agend-git agentic-git; do
             tar tzf ../../../agend-terminal-${{ matrix.target }}.tar.gz | grep -qx "$b" \
               || { echo "::error::release tarball missing $b"; exit 1; }
           done
@@ -197,12 +200,14 @@ jobs:
           # agentic-git) beside agend-terminal — symlink_shim finds siblings via
           # current_exe().with_file_name() (see the Unix arm for the rationale).
           $rel = "target/${{ matrix.target }}/release"
-          $bins = @("agend-terminal","agend-mcp-bridge","agend-git","agentic-git")
-          $paths = $bins | ForEach-Object { "$rel/$_.exe" }
-          Compress-Archive -Path $paths -DestinationPath agend-terminal-${{ matrix.target }}.zip -Force
+          # All 4 .exe listed explicitly on the Compress-Archive line + guard loop
+          # so tests/no_local_mcp_mode_invariant.rs asserts each is packaged.
+          Compress-Archive `
+            -Path "$rel/agend-terminal.exe","$rel/agend-mcp-bridge.exe","$rel/agend-git.exe","$rel/agentic-git.exe" `
+            -DestinationPath agend-terminal-${{ matrix.target }}.zip -Force
           # Fail-loud: the archive MUST contain every expected sibling binary.
           Expand-Archive -Path agend-terminal-${{ matrix.target }}.zip -DestinationPath _verify -Force
-          foreach ($b in $bins) {
+          foreach ($b in @("agend-terminal","agend-mcp-bridge","agend-git","agentic-git")) {
             if (!(Test-Path "_verify/$b.exe")) { Write-Error "release zip missing $b.exe"; exit 1 }
           }
           Remove-Item -Recurse -Force _verify
