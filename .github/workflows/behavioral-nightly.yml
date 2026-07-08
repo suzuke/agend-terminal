@@ -14,6 +14,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true # embedder P1b: vendor/agentic-git core path dep
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --bin agend-terminal -- e2e_
         env:
