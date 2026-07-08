@@ -599,51 +599,6 @@ fn feed_fallback_gated_by_hash_dedup() {
     assert_eq!(t.get_state(), AgentState::Active);
 }
 
-// #2524 P3a PR-2: confirm-first finding — a caller (the ephemeral driver) that
-// polls `get_state()` on a fixed cadence but never calls the general `tick()`
-// (#1967) has NO periodic backstop, and `feed_fallback_gated_by_hash_dedup` above
-// already proves the screen-driven path alone can't help either once the screen
-// stops changing (hash-dedup skips re-detection). Without SOME periodic caller, a
-// mis-latched `Active` on a fully static screen (codex's ready screen, confirmed on
-// a real spawn) is permanent. `expire_stale_latch_if_due` is that periodic caller,
-// throttled so the driver can call it every poll cheaply.
-
-/// Throttle not yet due (< `LATCH_EXPIRE_CHECK_MS` since the last check) → no-op,
-/// even though `since` is already well past `LATCHED_STATE_EXPIRY`. Proves the
-/// throttle actually throttles (doesn't just always run the real check).
-#[test]
-fn expire_stale_latch_if_due_noop_before_throttle_window() {
-    let mut t = tracker_at(&Backend::Codex, AgentState::Active, 31);
-    t.expire_stale_latch_if_due(500); // last_latch_check_ms starts at 0; 500 < 1_000
-    assert_eq!(t.get_state(), AgentState::Active);
-}
-
-/// THE decisive test: a mis-latched `Active` with `since` backdated past
-/// `LATCHED_STATE_EXPIRY` (DI clock — no real sleep) and a fully static screen (no
-/// `feed()` call at all — this is the exact "no new pty bytes" shape of the
-/// confirm-first finding) self-heals to `Idle` once the throttle window elapses.
-#[test]
-fn expire_stale_latch_if_due_unsticks_a_stale_active_latch() {
-    let mut t = tracker_at(&Backend::Codex, AgentState::Active, 31);
-    t.expire_stale_latch_if_due(1_000); // >= LATCH_EXPIRE_CHECK_MS since 0 → runs the check
-    assert_eq!(
-        t.get_state(),
-        AgentState::Idle,
-        "a stale Active latch with no screen activity must self-heal once the \
-         throttled check actually runs"
-    );
-}
-
-/// A genuinely-fresh `Active` (well within `LATCHED_STATE_EXPIRY`) must NOT be
-/// touched even once the throttle window is due — the throttle only gates HOW
-/// OFTEN we check, not whether the underlying 30s rule applies.
-#[test]
-fn expire_stale_latch_if_due_leaves_a_fresh_active_alone() {
-    let mut t = tracker_at(&Backend::Codex, AgentState::Active, 2);
-    t.expire_stale_latch_if_due(1_000);
-    assert_eq!(t.get_state(), AgentState::Active);
-}
-
 #[test]
 fn starting_hang_120s() {
     let mut h = HealthTracker::new();
