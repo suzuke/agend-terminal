@@ -166,6 +166,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
+          set -euo pipefail
           cd target/${{ matrix.target }}/release
           # Sprint 56 Track I-Phase2a (#531): bundle agend-mcp-bridge
           # alongside agend-terminal so backends spawned by the daemon's
@@ -173,18 +174,38 @@ jobs:
           # this, mcp_config::bridge_binary_path falls back to
           # `agend-terminal mcp` and reply / react / download_attachment
           # land on the daemon-state-unreachable error path on Windows.
-          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz agend-terminal agend-mcp-bridge
+          # #2524 P3: also bundle the git/kill shims (agend-git + agentic-git)
+          # AT THE SAME LAYER — the daemon's symlink_shim resolves siblings via
+          # current_exe().with_file_name(), so a release-tarball install must
+          # place them beside agend-terminal or the git guard silently falls
+          # back / breaks (the cargo-install path already gets all 4, #2691).
+          bins="agend-terminal agend-mcp-bridge agend-git agentic-git"
+          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz $bins
+          # Fail-loud: the archive MUST contain every expected sibling binary.
+          for b in $bins; do
+            tar tzf ../../../agend-terminal-${{ matrix.target }}.tar.gz | grep -qx "$b" \
+              || { echo "::error::release tarball missing $b"; exit 1; }
+          done
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          # Sprint 56 Track I-Phase2a (#531): same dual-binary packaging
-          # as the Unix tar arm. PowerShell's Compress-Archive `-Path`
-          # accepts a comma-separated array of file paths.
-          Compress-Archive `
-            -Path "target/${{ matrix.target }}/release/agend-terminal.exe","target/${{ matrix.target }}/release/agend-mcp-bridge.exe" `
-            -DestinationPath agend-terminal-${{ matrix.target }}.zip
+          $ErrorActionPreference = "Stop"
+          # Sprint 56 Track I-Phase2a (#531): same dual-binary packaging as the
+          # Unix tar arm. #2524 P3: also ship the git/kill shims (agend-git +
+          # agentic-git) beside agend-terminal — symlink_shim finds siblings via
+          # current_exe().with_file_name() (see the Unix arm for the rationale).
+          $rel = "target/${{ matrix.target }}/release"
+          $bins = @("agend-terminal","agend-mcp-bridge","agend-git","agentic-git")
+          $paths = $bins | ForEach-Object { "$rel/$_.exe" }
+          Compress-Archive -Path $paths -DestinationPath agend-terminal-${{ matrix.target }}.zip -Force
+          # Fail-loud: the archive MUST contain every expected sibling binary.
+          Expand-Archive -Path agend-terminal-${{ matrix.target }}.zip -DestinationPath _verify -Force
+          foreach ($b in $bins) {
+            if (!(Test-Path "_verify/$b.exe")) { Write-Error "release zip missing $b.exe"; exit 1 }
+          }
+          Remove-Item -Recurse -Force _verify
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -237,6 +258,13 @@ jobs:
           # operators hit the same #531 fallback-to-`agend-terminal
           # mcp` failure mode for daemon-state-required tools.
           cp target/release/agend-mcp-bridge AppDir/usr/bin/agend-mcp-bridge
+          # #2524 P3: ship the git/kill shims beside agend-terminal in the
+          # AppImage too — symlink_shim resolves siblings via
+          # current_exe().with_file_name(), which inside the AppImage is
+          # AppDir/usr/bin. `set -euo pipefail` (above) makes a missing source
+          # binary fail-loud; without these the git guard silently degrades.
+          cp target/release/agend-git AppDir/usr/bin/agend-git
+          cp target/release/agentic-git AppDir/usr/bin/agentic-git
           cp assets/appimage/agend-terminal.desktop AppDir/usr/share/applications/agend-terminal.desktop
           # Resize 1024x1024 master → 256x256 for hicolor + AppImage root
           convert assets/appimage/agend-terminal.png -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png
