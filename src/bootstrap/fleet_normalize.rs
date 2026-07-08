@@ -141,6 +141,7 @@ mod tests {
             display_timezone: None,
             agy_workspace_link_base: None,
             watchdog: Default::default(),
+            use_agentic_git_shim: false,
             home: None,
         };
         c.instances.insert(

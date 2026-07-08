@@ -860,44 +860,13 @@ pub fn reconcile_hooks(home: &Path) {
     }
 }
 
-/// Symlink the agend-git binary into $AGEND_HOME/bin under every name it shadows (so the shims
-/// win over the real tools via PATH). Called at daemon startup. #t-…777-1: the binary is
-/// MULTIPLEXED on argv[0] — `git` = git shim; `pkill`/`killall`/`kill` = kill_guard.rs.
-pub fn symlink_shim(home: &Path) {
-    let bin_dir = home.join("bin");
-    std::fs::create_dir_all(&bin_dir).ok();
-
-    // Find the agend-git binary alongside the main binary.
-    let shim_name = if cfg!(windows) {
-        "agend-git.exe"
-    } else {
-        "agend-git"
-    };
-    let shim_src = std::env::current_exe().ok().and_then(|exe| {
-        let candidate = exe.with_file_name(shim_name);
-        candidate.exists().then_some(candidate)
-    });
-
-    let Some(src) = shim_src else { return };
-    let shadows: &[&str] = if cfg!(windows) {
-        &["git.exe", "pkill.exe", "killall.exe", "kill.exe"]
-    } else {
-        &["git", "pkill", "killall", "kill"]
-    };
-    for name in shadows {
-        let link_path = bin_dir.join(name);
-        // Remove stale symlink/file first.
-        let _ = std::fs::remove_file(&link_path);
-        #[cfg(unix)]
-        {
-            let _ = std::os::unix::fs::symlink(&src, &link_path);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = std::fs::copy(&src, &link_path);
-        }
-    }
-}
+/// Git/kill shim installation — see [`shim_install::symlink_shim`]. Homed in its
+/// own module so the #2524-P2 flag-gated backend-swap logic AND its unit tests
+/// don't push this core file past the anti-monolith LOC ceiling. Re-exported so
+/// the public path stays `crate::binding::symlink_shim` (call site + wiring
+/// invariant unchanged).
+mod shim_install;
+pub use shim_install::symlink_shim;
 
 /// Clear orphan bindings (agents no longer in registry).
 /// Called at daemon startup.

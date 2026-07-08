@@ -373,7 +373,8 @@ pub(crate) fn resolve_fleet_and_reconcile(
             .spawn(move || crate::binding::reconcile_hooks(&home_owned));
     }
     time_step("binding::symlink_shim", || {
-        crate::binding::symlink_shim(home);
+        // #2524 P2: flag-gated git-shim backend (default off = agend-git).
+        crate::binding::symlink_shim(home, config.use_agentic_git_shim);
     });
     time_step("binding::reconcile_orphans", || {
         crate::binding::reconcile_orphans(home);
