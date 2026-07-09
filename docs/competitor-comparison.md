@@ -50,7 +50,7 @@ The control layer's premise is that a single power-user **commands a fleet in re
 time** — watching live output, interrupting bad work mid-thought, course-correcting
 before a task is burned, and gating results through a structured review chain. This
 requires deep daemon-PTY integration (`vterm.rs`, `render/`, `layout/`,
-`keybinds.rs`) and a coordination spine (~30-36 MCP tools, an event-sourced task
+`keybinds.rs`) and a coordination spine (29 MCP tools, an event-sourced task
 board) that the other layers were not designed to carry. See
 [architecture.md](architecture.md) for the structural map.
 

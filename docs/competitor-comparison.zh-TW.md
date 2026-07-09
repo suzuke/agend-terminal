@@ -38,7 +38,7 @@ Agent 工具堆疊有三個抽象層。AgEnD 佔據第三層：
 
 控制層的前提是：單一 power-user **即時指揮一支艦隊**——看著 live 輸出、在壞工作半途插手、在 task
 被燒掉前修正方向、並讓結果通過結構化 review chain。這需要深度的 daemon-PTY 整合（`vterm.rs`、
-`render/`、`layout/`、`keybinds.rs`）與一條協調脊柱（~30-36 個 MCP 工具、event-sourced
+`render/`、`layout/`、`keybinds.rs`）與一條協調脊柱（29 個 MCP 工具、event-sourced
 task board），而其他層在設計時並未承載這些。結構地圖見 [architecture.md](architecture.md)。
 
 ```mermaid
