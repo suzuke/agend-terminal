@@ -533,12 +533,9 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     f.read_to_end(&mut bytes).ok()?;
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     if start > 0 {
-        match text.find('\n') {
-            Some(i) => {
-                text.drain(..=i);
-            }
-            None => return None,
-        }
+        // Mid-file start: drop the partial first line (no newline ⇒ unusable).
+        let i = text.find('\n')?;
+        text.drain(..=i);
     }
     Some(text)
 }
