@@ -134,9 +134,47 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
     }
 }
 
+/// P0a (#2342 B4) — per-method **capability** gate. Authority is proven by the
+/// AUTHENTICATED [`Principal`] (which per-daemon secret the connection presented
+/// at handshake), NEVER by the request's method-shape — that is the dev2 A1 fix.
+/// This runs at the socket-ingress choke point (`api::serve`) BEFORE the
+/// operator-mode gate ([`check_operation_allowed`]), as a HARD default-DENY:
+/// `false` ⇒ the caller's token has no capability for `method`, refuse outright
+/// (not a mode-deferred queue). The exhaustive `match` forces every principal to
+/// declare its capability, so a future `Principal::Sidecar` cannot be added
+/// without deciding what it may invoke.
+///
+/// [`Principal`]: crate::auth_cookie::Principal
+pub(crate) fn capability_allows(principal: crate::auth_cookie::Principal, method: &str) -> bool {
+    use crate::auth_cookie::Principal;
+    match principal {
+        // The boot-minted operator full-capability token — every control method
+        // (its CLI/TUI drive the direct methods; operator-mode gates AGENTS, not
+        // the operator, so the mode gate downstream is a pass-through for it).
+        Principal::Operator => true,
+        // The shared agent cookie — capability = the MCP tunnel ONLY. Every
+        // direct method (inject/send/spawn/kill/delete/mode/shutdown/…) is
+        // default-DENIED. (Closes dev2 A1: a shared-cookie holder could
+        // previously reach every injection-equivalent method by method-shape.)
+        // `mcp_tool`/`mcp_tools_list` then flow on to the operator-mode gate for
+        // per-tool authority; this gate only decides reachability.
+        Principal::Agent => {
+            method == super::method::MCP_TOOL || method == super::method::MCP_TOOLS_LIST
+        }
+    }
+}
+
 /// Decide whether `method` (+ `params`) is allowed under the current
 /// `state`. `Ok(())` = allowed; `Err(reason)` = denied (caller returns the
 /// reason to the requester). Pure — no I/O, fully unit-testable.
+///
+/// P0a note: this is the operator-**mode** gate. It runs AFTER
+/// [`capability_allows`] at the ingress, so by the time it is reached an Agent
+/// principal can only be on `mcp_tool`/`mcp_tools_list` (every direct method was
+/// already hard-denied by the capability gate) and an Operator principal has
+/// full authority. Its residual `is_agent_transport` method-shape check is thus
+/// only ever exercised by Operator+direct (allow) or Agent+mcp-tunnel (gate) —
+/// both correct — and is no longer an authority-establishing decision.
 pub(crate) fn check_operation_allowed(
     method: &str,
     params: &Value,
@@ -679,6 +717,61 @@ mod tests {
             assert!(
                 src.contains("DAEMON-AUTONOMIC, GATE-EXEMPT BY DESIGN"),
                 "{rel} must carry the #1339 gate-exempt marker"
+            );
+        }
+    }
+
+    // ── P0a (#2342 B4): per-method capability gate ───────────────────────────
+    use crate::api::method;
+    use crate::auth_cookie::Principal as P;
+
+    #[test]
+    fn capability_operator_may_invoke_every_method() {
+        // The operator full-capability token reaches every control method —
+        // direct AND the mcp tunnel (its CLI/TUI drive the direct methods).
+        for m in [
+            method::INJECT,
+            method::SEND,
+            method::SPAWN,
+            method::KILL,
+            method::DELETE,
+            method::CREATE_TEAM,
+            method::MODE,
+            method::SHUTDOWN,
+            method::LIST,
+            method::MCP_TOOL,
+            method::MCP_TOOLS_LIST,
+        ] {
+            assert!(
+                capability_allows(P::Operator, m),
+                "operator must be capable of '{m}'"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_agent_is_mcp_tunnel_only_default_deny() {
+        // The shared agent cookie reaches ONLY the mcp tunnel.
+        assert!(capability_allows(P::Agent, method::MCP_TOOL));
+        assert!(capability_allows(P::Agent, method::MCP_TOOLS_LIST));
+        // Every injection-equivalent direct method is default-DENIED (dev2 A1).
+        for m in [
+            method::INJECT,
+            method::SEND,
+            method::SPAWN,
+            method::KILL,
+            method::DELETE,
+            method::CREATE_TEAM,
+            method::UPDATE_TEAM,
+            method::MODE,
+            method::SHUTDOWN,
+            method::LIST,
+            method::STATUS,
+            "some_unknown_future_method",
+        ] {
+            assert!(
+                !capability_allows(P::Agent, m),
+                "agent cookie must NOT be capable of direct method '{m}'"
             );
         }
     }

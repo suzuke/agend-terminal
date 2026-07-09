@@ -95,8 +95,12 @@ fn socket_call(port: u16, auth_hex: Option<&str>, request: &Value) -> Outcome {
         }
     }
 
-    writeln!(writer, "{}", serde_json::to_string(request).expect("serialize"))
-        .expect("write request");
+    writeln!(
+        writer,
+        "{}",
+        serde_json::to_string(request).expect("serialize")
+    )
+    .expect("write request");
     writer.flush().ok();
     let mut resp = String::new();
     reader.read_line(&mut resp).expect("read response");
@@ -120,8 +124,7 @@ fn socket_call(port: u16, auth_hex: Option<&str>, request: &Value) -> Outcome {
 #[test]
 fn agent_cookie_cannot_reach_direct_methods() {
     let home = hermetic_home("red-direct");
-    let h = AgendHarness::spawn_with(home.clone(), &minimal_fleet(), "start")
-        .expect("daemon boot");
+    let h = AgendHarness::spawn_with(home.clone(), &minimal_fleet(), "start").expect("daemon boot");
     let cookie_hex = hex_of_file(&run_dir_of(&h).join("api.cookie"));
 
     // Every injection-equivalent direct method the manifest names.
@@ -144,6 +147,108 @@ fn agent_cookie_cannot_reach_direct_methods() {
             "dev2 A1: agent-cookie holder reached direct method '{method}' \
              (expected capability-deny). response={resp}"
         );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Compat (the #1 load-bearing risk = operator lockout): the operator
+/// full-capability token MUST reach the direct methods its own CLI/TUI drive.
+/// This is the end-to-end "operator transport is NOT locked" proof.
+#[test]
+fn operator_token_reaches_direct_methods() {
+    let home = hermetic_home("op-allow");
+    let h = AgendHarness::spawn_with(home.clone(), &minimal_fleet(), "start").expect("daemon boot");
+    let op_hex = hex_of_file(&run_dir_of(&h).join("api.operator"));
+
+    // A read (`list`) and a structural op (`spawn`) — both must reach the handler
+    // (never capability-denied) for the operator principal.
+    for (method, params) in [
+        ("list", json!({})),
+        (
+            "spawn",
+            json!({"name": "p0a-op-spawned", "command": "/bin/cat"}),
+        ),
+    ] {
+        let req = json!({"method": method, "params": params});
+        let resp = match socket_call(h.api_port, Some(&op_hex), &req) {
+            Outcome::Response(v) => v,
+            Outcome::AuthRejected(v) => {
+                panic!("operator token handshake unexpectedly rejected for {method}: {v}")
+            }
+        };
+        assert_ne!(
+            resp.get("denied_by").and_then(Value::as_str),
+            Some("capability"),
+            "operator lockout regression: operator token was capability-denied for \
+             '{method}'. response={resp}"
+        );
+    }
+
+    // `list` specifically returns a successful handler result for the operator.
+    let list = match socket_call(
+        h.api_port,
+        Some(&op_hex),
+        &json!({"method": "list", "params": {}}),
+    ) {
+        Outcome::Response(v) => v,
+        Outcome::AuthRejected(v) => panic!("operator list rejected: {v}"),
+    };
+    assert_eq!(
+        list.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "operator `list` should succeed. response={list}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Compat: the shared agent cookie must STILL reach the MCP tunnel — narrowing
+/// the sidecar/agent surface must not break the agent bridge's only real path.
+#[test]
+fn agent_cookie_still_reaches_mcp_tunnel() {
+    let home = hermetic_home("agent-mcp");
+    let h = AgendHarness::spawn_with(home.clone(), &minimal_fleet(), "start").expect("daemon boot");
+    let cookie_hex = hex_of_file(&run_dir_of(&h).join("api.cookie"));
+
+    let req = json!({
+        "method": "mcp_tool",
+        "params": {"tool": "list_instances", "arguments": {}, "instance": "probe"}
+    });
+    let resp = match socket_call(h.api_port, Some(&cookie_hex), &req) {
+        Outcome::Response(v) => v,
+        Outcome::AuthRejected(v) => panic!("agent cookie handshake rejected: {v}"),
+    };
+    assert_ne!(
+        resp.get("denied_by").and_then(Value::as_str),
+        Some("capability"),
+        "compat regression: agent cookie was capability-denied for the mcp tunnel. \
+         response={resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Regression guard: a connection presenting NEITHER secret is refused at the
+/// handshake (fail-closed), before any method is dispatched.
+#[test]
+fn unauthenticated_and_wrong_token_are_rejected() {
+    let home = hermetic_home("no-auth");
+    let h = AgendHarness::spawn_with(home.clone(), &minimal_fleet(), "start").expect("daemon boot");
+
+    let inject = json!({"method": "inject", "params": {"instance": "probe", "text": "x"}});
+
+    // No handshake line at all.
+    match socket_call(h.api_port, None, &inject) {
+        Outcome::AuthRejected(_) => {}
+        Outcome::Response(v) => panic!("no-token connection was NOT rejected: {v}"),
+    }
+
+    // A well-formed hex that matches neither the operator token nor the cookie.
+    let stranger_hex = "aa".repeat(32);
+    match socket_call(h.api_port, Some(&stranger_hex), &inject) {
+        Outcome::AuthRejected(_) => {}
+        Outcome::Response(v) => panic!("wrong-token connection was NOT rejected: {v}"),
     }
 
     std::fs::remove_dir_all(&home).ok();
