@@ -2582,6 +2582,94 @@ fn force_reclaim_dead_agent_past_cap_is_candidate() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// PR-C follow-up ④ (8145a9): a FLAT depth-1 layout worktree
+/// (`worktrees/<agent>-<enc-repo>/`, built by `repo action=checkout`, NOT the
+/// nested `worktrees/<agent>/<branch>/` that `lease()` builds) whose agent is
+/// dead and lease is aged past the force-reclaim cap MUST become a ForceReclaim
+/// candidate — via `evaluate_candidate` directly AND through the full
+/// `gc_candidates` enumeration. RED before the fix (the flat orphan leaked).
+#[test]
+fn force_reclaim_flat_layout_dead_agent_is_candidate() {
+    let home = tmp_home("fr-flat");
+    // Flat depth-1 dir directly under the managed root — no <agent>/<branch> nest.
+    let flat = daemon_managed_worktree_root(&home)
+        .join("claude-8145a9-_Users_suzuke_Documents_Hack_agend-terminal");
+    std::fs::create_dir_all(&flat).unwrap();
+    let old =
+        (chrono::Utc::now() - chrono::Duration::days(force_reclaim_age_days() + 20)).to_rfc3339();
+    // Marker mirrors the live specimen: authoritative agent=, aged leased_at,
+    // NO released_at (never-released → force-reclaim arm).
+    std::fs::write(
+        flat.join(MANAGED_MARKER),
+        format!("agent=claude-8145a9\nbranch=fix/medium-test-findings\nleased_at={old}\n"),
+    )
+    .unwrap();
+    let live: std::collections::HashSet<String> = std::collections::HashSet::new(); // agent dead
+
+    let direct = evaluate_candidate(&home, &flat, &live);
+    assert!(
+        direct.as_ref().map(|c| c.kind) == Some(GcKind::ForceReclaim),
+        "flat-layout dead-agent aged orphan must be a ForceReclaim candidate (evaluate_candidate); got {direct:?}"
+    );
+    let cands = gc_candidates(&home);
+    assert!(
+        cands
+            .iter()
+            .any(|c| c.path == flat && c.kind == GcKind::ForceReclaim),
+        "gc_candidates must enumerate + force-reclaim the flat orphan; got {cands:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// PR-C follow-up ④ (8145a9) RED: the ACTUAL leak — a HALF-ORPHANED flat
+/// worktree whose `.git` gitlink points at a canonical `.git/worktrees/<name>`
+/// entry that was already pruned, so `git status` in it FAILS. It IS a valid
+/// ForceReclaim candidate, but `maybe_remove_candidate`'s pre-archive git-status
+/// check errored → `Skipped{status_check_failed}` → it leaked forever. The fix
+/// makes a status-check FAILURE never block a force-reclaim archive (fs-level +
+/// recoverable). RED before the fix (Skipped); GREEN after (Removed + archived).
+#[test]
+fn force_reclaim_archives_half_orphaned_flat_worktree() {
+    use crate::daemon::retention::worktrees::{maybe_remove_candidate, RemovalOutcome};
+    let home = tmp_home("fr-orphan");
+    let flat = daemon_managed_worktree_root(&home).join("claude-8145a9-enc");
+    std::fs::create_dir_all(&flat).unwrap();
+    // Binding-lock dir maybe_remove_candidate acquires (runtime_dir/<agent>/).
+    std::fs::create_dir_all(crate::paths::runtime_dir(&home).join("claude-8145a9")).unwrap();
+    let old =
+        (chrono::Utc::now() - chrono::Duration::days(force_reclaim_age_days() + 20)).to_rfc3339();
+    std::fs::write(
+        flat.join(MANAGED_MARKER),
+        format!("agent=claude-8145a9\nbranch=fix/x\nleased_at={old}\n"),
+    )
+    .unwrap();
+    // Half-orphaned: gitlink → a canonical worktrees entry that does NOT exist →
+    // `git status` errors (the 8145a9 leak's distinguishing trait).
+    std::fs::write(
+        flat.join(".git"),
+        format!(
+            "gitdir: {}/gone-repo/.git/worktrees/claude-8145a9-enc\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let cand = evaluate_candidate(&home, &flat, &live).expect("force-reclaim candidate");
+    assert_eq!(cand.kind, GcKind::ForceReclaim);
+
+    let outcome = maybe_remove_candidate(&home, &cand);
+    assert!(
+        matches!(outcome, RemovalOutcome::Removed),
+        "half-orphaned flat force-reclaim must archive-to-trash (git-status failure \
+         must not block force-reclaim), not Skip; got {outcome:?}"
+    );
+    assert!(
+        !flat.exists(),
+        "worktree dir must be moved out (archived to .trash) after reclaim"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Append a malformed `released_at=` to a lease's marker and drop its binding
 /// (a released worktree is unbound) — the #1882 WT-LEAK-1 corrupt-marker shape.
 fn corrupt_released_at(home: &Path, agent: &str, wt_path: &Path) {

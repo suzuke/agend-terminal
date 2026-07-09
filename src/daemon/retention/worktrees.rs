@@ -198,21 +198,45 @@ pub(crate) fn maybe_remove_candidate(
                 };
             }
         }
+        // PR-C follow-up ④ (8145a9): the git status pre-check FAILING (not just
+        // "dirty") — e.g. a half-orphaned worktree whose `.git` gitlink points at
+        // a canonical `.git/worktrees/<name>` entry that was already pruned, so
+        // `git status` errors — must NOT block a FORCE-RECLAIM archive. That
+        // archive is fs-level (rename to `.trash`) and recoverable, and such an
+        // orphan is exactly what force-reclaim exists to collect (its git state is
+        // unrecoverable anyway). CLEAN-RELEASE (can hard-delete, irrecoverable)
+        // stays conservative: an unverifiable status still Skips — never
+        // hard-delete unseen WIP.
         Ok(o) => {
+            if !force_reclaim {
+                tracing::warn!(
+                    path = %path.display(),
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "git status check failed, skipping GC"
+                );
+                return RemovalOutcome::Skipped {
+                    reason: "status_check_failed".to_string(),
+                };
+            }
             tracing::warn!(
                 path = %path.display(),
                 stderr = %String::from_utf8_lossy(&o.stderr),
-                "git status check failed, skipping GC"
+                "git status check failed for force-reclaim (half-orphaned worktree?) — \
+                 archiving to .trash anyway (recoverable)"
             );
-            return RemovalOutcome::Skipped {
-                reason: "status_check_failed".to_string(),
-            };
         }
         Err(e) => {
-            tracing::error!(error = %e, "git status invocation failed");
-            return RemovalOutcome::Skipped {
-                reason: format!("invoke error: {e}"),
-            };
+            if !force_reclaim {
+                tracing::error!(error = %e, "git status invocation failed");
+                return RemovalOutcome::Skipped {
+                    reason: format!("invoke error: {e}"),
+                };
+            }
+            tracing::warn!(
+                error = %e,
+                "git status invocation failed for force-reclaim (half-orphaned \
+                 worktree?) — archiving to .trash anyway (recoverable)"
+            );
         }
     }
 
