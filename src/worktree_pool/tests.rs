@@ -2024,9 +2024,16 @@ fn release_full_preserves_unmerged_branch() {
         !outcome.branch_deleted,
         "unmerged branch must NOT be deleted"
     );
+    // #P3: the fixture repo has NO github remote, so PR-merge detection is
+    // Unknown → the split fail-closed keep reason (the pre-#P3 blanket "not
+    // merged into main…" text was misleading — it implied a definitive verdict
+    // when the check could not actually run). Either way the branch is KEPT.
     assert_eq!(
         outcome.branch_cleanup_skipped_reason.as_deref(),
-        Some("branch not merged into main and not a squash-merge orphan")
+        Some(
+            "branch 'feat/unmerged': PR-merge detection unavailable (no github \
+             remote, or gh/scm error) — kept, fail-closed; retried next sweep"
+        )
     );
     // Verify branch still exists.
     let branch_exists = std::process::Command::new("git")
@@ -2143,9 +2150,18 @@ fn release_full_absent_worktree_unmerged_branch_preserved() {
         !outcome.branch_deleted,
         "unmerged branch must NOT be deleted"
     );
+    // #P3: the fixture repo has NO github remote, so PR-merge detection is
+    // Unknown → the split fail-closed keep reason (the pre-#P3 blanket "not
+    // merged into main…" text was misleading — it implied a definitive
+    // not-merged verdict when the check couldn't actually run). In production a
+    // bound repo has a github remote, so a genuinely-unmerged branch there gets
+    // the "is not merged into 'main'…" reason instead; either way it is KEPT.
     assert_eq!(
         outcome.branch_cleanup_skipped_reason.as_deref(),
-        Some("branch not merged into main and not a squash-merge orphan")
+        Some(
+            "branch 'feat/absent-unmerged': PR-merge detection unavailable \
+             (no github remote, or gh/scm error) — kept, fail-closed; retried next sweep"
+        )
     );
     let branch_exists = std::process::Command::new("git")
         .args(["rev-parse", "--verify", "feat/absent-unmerged"])
@@ -3689,5 +3705,102 @@ fn release_full_refuses_when_dirty_wip_unpreservable() {
         "no (partial) recovery ref on a Blocked release"
     );
     std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #P3 (branch-residue) RED6 — pure KEEP/DELETE decision, testable without a
+/// live gh/scm. An authoritative merged PR (`pr_merged=true`) makes the branch
+/// delete-eligible IMMEDIATELY (`Ok`), even though it is NOT age-gated
+/// (`squash_aged=false`) — the monotonic-PR fast path. Pre-#P3
+/// `cleanup_merged_branch` had NO PR path at all, so a PR-merged branch under
+/// the 24h floor was kept; this pins the new fast path plus the three SPLIT
+/// keep reasons (the old blanket "not merged" text was misleading).
+#[test]
+fn merged_branch_disposition_split_reasons_and_pr_fast_path_red6() {
+    // Authoritative merged PR → delete NOW, no age gate.
+    assert!(
+        merged_branch_disposition("feat/x", "main", false, true, false, false, false).is_ok(),
+        "an authoritative merged PR must be delete-eligible now, no age gate"
+    );
+    // A plain merged ancestor is likewise eligible.
+    assert!(
+        merged_branch_disposition("feat/x", "main", true, false, false, false, false).is_ok(),
+        "a merged ancestor stays delete-eligible"
+    );
+    // Nothing merged, no PR, not structural, detection ran → precise "not
+    // merged" keep reason (NOT a gh-outage or age-floor reason).
+    let err =
+        merged_branch_disposition("feat/x", "main", false, false, false, false, false).unwrap_err();
+    assert!(
+        err.contains("not merged into 'main'"),
+        "plain unmerged branch keeps with the 'not merged' reason: {err}"
+    );
+    // gh/detection unavailable (and not structurally squash) → fail-closed reason.
+    let err =
+        merged_branch_disposition("feat/x", "main", false, false, false, false, true).unwrap_err();
+    assert!(
+        err.contains("detection unavailable"),
+        "a gh/remote outage keeps with the fail-closed detection reason: {err}"
+    );
+    // Structurally squash-merged but under the age floor → age-floor reason.
+    let err =
+        merged_branch_disposition("feat/x", "main", false, false, false, true, false).unwrap_err();
+    assert!(
+        err.contains("younger than"),
+        "a young squash-merge keeps with the age-floor reason: {err}"
+    );
+}
+
+/// #P3 (branch-residue) RED7 — hermetic fail-closed: a fixture repo with NO
+/// github remote makes `pr_merge_status` return `Unknown` (extract_github_repo
+/// None), and `cleanup_merged_branch` on such a repo for a young, non-merged
+/// branch KEEPS it (falls back to the age-gated heuristic, which also declines)
+/// with the fail-closed detection reason. Proves gh-unavailable → fail-closed
+/// keep, never a delete. No real gh runs (no github remote to resolve).
+#[test]
+fn pr_merge_status_unknown_without_github_remote_keeps_branch_red7() {
+    fn git(dir: &Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+    }
+    let repo = tmp_repo("red7-no-remote");
+    // A young, non-merged branch with its OWN commit (diverges from main, so it
+    // is NOT an ancestor → is_merged=false; committed now → under the age floor).
+    git(&repo, &["checkout", "-b", "feat/red7"]);
+    std::fs::write(repo.join("red7.txt"), "young unmerged work").ok();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "young unmerged work"]);
+    git(&repo, &["checkout", "main"]);
+
+    // No github remote configured → detection is Unknown (fail-closed), NOT a
+    // NotMerged/Merged verdict.
+    assert_eq!(
+        crate::branch_sweep::pr_merge_status(&repo, "main", "feat/red7"),
+        crate::branch_sweep::PrMergeStatus::Unknown,
+        "no github remote → detection Unknown (fail-closed), not a merge verdict"
+    );
+
+    // And the release-path cleanup KEEPS the branch (never deletes on a
+    // gh-unavailable young unmerged branch), surfacing the fail-closed reason.
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/red7", false);
+    assert!(
+        !deleted,
+        "a gh-unavailable young unmerged branch must be KEPT, never deleted"
+    );
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("detection unavailable")),
+        "keep must carry the fail-closed detection reason: {reason:?}"
+    );
+
     std::fs::remove_dir_all(&repo).ok();
 }
