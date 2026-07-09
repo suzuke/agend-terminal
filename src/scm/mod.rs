@@ -562,6 +562,14 @@ not_supported_provider!(BitbucketScmProvider, "bitbucket");
 // ---------------------------------------------------------------------------
 
 pub(crate) fn make_scm_provider(repo: &str, scm_override: Option<&str>) -> Box<dyn ScmProvider> {
+    // #t-…24962-7 test seam: a thread-local mock (installed via
+    // `set_test_scm_provider`) short-circuits `gh` for unit/integration tests.
+    // No effect in production (`#[cfg(test)]`); the single source of truth for
+    // gh mocking across the crate.
+    #[cfg(test)]
+    if let Some(p) = TEST_SCM_PROVIDER.with(|c| c.borrow().clone()) {
+        return Box::new(TestScmHandle(p));
+    }
     let kind = match scm_override {
         Some(k) => k,
         None => crate::daemon::ci_watch::detect_provider_from_remote(repo).0,
@@ -572,6 +580,133 @@ pub(crate) fn make_scm_provider(repo: &str, scm_override: Option<&str>) -> Box<d
         // `detect_provider_from_remote` already defaults unknown/short-form
         // remotes to "github", so this arm is GitHub + any explicit "github".
         _ => Box::new(GitHubScmProvider),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #t-…24962-7 test seam: mock `gh` at the `make_scm_provider` boundary so any
+// call site can be driven without a live `gh` in unit/integration tests. Single
+// source of truth for gh mocking across the crate (lead seam-ownership ruling).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SCM_PROVIDER: std::cell::RefCell<Option<std::sync::Arc<dyn ScmProvider>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: install `provider` as the ScmProvider for the current thread until
+/// the returned guard drops; `make_scm_provider` then returns it verbatim
+/// (ignoring repo/override). Nextest runs each test on its own thread, so the
+/// override is isolated per test.
+#[cfg(test)]
+pub(crate) fn set_test_scm_provider(provider: std::sync::Arc<dyn ScmProvider>) -> TestScmGuard {
+    TEST_SCM_PROVIDER.with(|c| *c.borrow_mut() = Some(provider));
+    TestScmGuard
+}
+
+#[cfg(test)]
+#[must_use = "the mock provider is uninstalled when this guard is dropped"]
+pub(crate) struct TestScmGuard;
+
+#[cfg(test)]
+impl Drop for TestScmGuard {
+    fn drop(&mut self) {
+        TEST_SCM_PROVIDER.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Adapts the thread-local `Arc<dyn ScmProvider>` back into the `Box<dyn
+/// ScmProvider>` that `make_scm_provider` returns (a `dyn` value can't be moved
+/// out of the `Arc`). Delegates every method.
+#[cfg(test)]
+struct TestScmHandle(std::sync::Arc<dyn ScmProvider>);
+
+#[cfg(test)]
+impl ScmProvider for TestScmHandle {
+    fn pr_view(&self, r: &str, p: u64, f: &[&str]) -> anyhow::Result<PrSummary> {
+        self.0.pr_view(r, p, f)
+    }
+    fn pr_checks(&self, r: &str, p: u64) -> anyhow::Result<Vec<CheckState>> {
+        self.0.pr_checks(r, p)
+    }
+    fn pr_list(
+        &self,
+        r: &str,
+        f: &ListFilter,
+        fl: &[&str],
+        c: Option<&Path>,
+    ) -> anyhow::Result<Vec<PrSummary>> {
+        self.0.pr_list(r, f, fl, c)
+    }
+    fn pr_merge(&self, r: &str, p: u64, o: &MergeOpts) -> anyhow::Result<MergeOutcome> {
+        self.0.pr_merge(r, p, o)
+    }
+    fn issue_view(&self, r: &str, n: u64, f: &[&str]) -> anyhow::Result<IssueSummary> {
+        self.0.issue_view(r, n, f)
+    }
+    fn compare(&self, r: &str, b: &str, h: &str) -> anyhow::Result<CompareResult> {
+        self.0.compare(r, b, h)
+    }
+}
+
+/// Reusable [`ScmProvider`] test double. Only the methods a test configures are
+/// implemented; the rest panic to surface an unexpected call. Extend as new call
+/// sites need mocking (this is the single shared mock).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MockScmProvider {
+    pr_list: Option<MockPrList>,
+}
+
+/// Configured `pr_list` behavior for [`MockScmProvider`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum MockPrList {
+    /// Return this many default PRs — non-empty ⇒ "the branch has/had a PR".
+    Prs(usize),
+    /// Return an `Err` ⇒ a transient gh failure (a no-PR confirm must NOT release).
+    Fail(String),
+}
+
+#[cfg(test)]
+impl MockScmProvider {
+    pub(crate) fn with_pr_list(behavior: MockPrList) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pr_list: Some(behavior),
+        })
+    }
+}
+
+#[cfg(test)]
+impl ScmProvider for MockScmProvider {
+    fn pr_list(
+        &self,
+        _repo: &str,
+        _filter: &ListFilter,
+        _fields: &[&str],
+        _cwd: Option<&Path>,
+    ) -> anyhow::Result<Vec<PrSummary>> {
+        match &self.pr_list {
+            Some(MockPrList::Prs(n)) => Ok(vec![PrSummary::default(); *n]),
+            Some(MockPrList::Fail(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            None => Ok(vec![]),
+        }
+    }
+    fn pr_view(&self, _r: &str, _p: u64, _f: &[&str]) -> anyhow::Result<PrSummary> {
+        unimplemented!("MockScmProvider::pr_view not configured")
+    }
+    fn pr_checks(&self, _r: &str, _p: u64) -> anyhow::Result<Vec<CheckState>> {
+        unimplemented!("MockScmProvider::pr_checks not configured")
+    }
+    fn pr_merge(&self, _r: &str, _p: u64, _o: &MergeOpts) -> anyhow::Result<MergeOutcome> {
+        unimplemented!("MockScmProvider::pr_merge not configured")
+    }
+    fn issue_view(&self, _r: &str, _n: u64, _f: &[&str]) -> anyhow::Result<IssueSummary> {
+        unimplemented!("MockScmProvider::issue_view not configured")
+    }
+    fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<CompareResult> {
+        unimplemented!("MockScmProvider::compare not configured")
     }
 }
 
