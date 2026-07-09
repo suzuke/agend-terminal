@@ -555,6 +555,7 @@ pub(crate) fn preserve_dirty_worktree(
     agent: &str,
     wt_path: &Path,
     branch: &str,
+    sender: Option<&str>,
 ) -> WipPreservation {
     use crate::git_helpers::git_cmd;
     if branch.is_empty() {
@@ -634,7 +635,7 @@ pub(crate) fn preserve_dirty_worktree(
     tracing::info!(agent, branch, %ref_name,
         "preserve dirty WIP: uncommitted worktree changes snapshotted before manual release");
     prune_recovery_refs(wt_path, branch);
-    notify_wip_preserved(home, agent, branch, &ref_name);
+    notify_wip_preserved(home, agent, branch, &ref_name, sender);
     WipPreservation::Preserved
 }
 
@@ -699,20 +700,44 @@ fn recovery_ref_expired(ref_name: &str, cutoff: chrono::DateTime<chrono::Utc>) -
     }
 }
 
-/// Notify the operator-mapped agent (`general`, per convention — mirrors
-/// canonical_hygiene's auto-stash notify) that a dirty worktree's WIP was
-/// preserved, with a one-line recovery command. Best-effort.
-fn notify_wip_preserved(home: &Path, agent: &str, branch: &str, ref_name: &str) {
-    let text = format!(
-        "[system:release_dirty_wip_preserved] Agent `{agent}` released a DIRTY worktree \
+/// Resolve the recipient for a WIP-preserved notice: the release's CALLER when
+/// known (`sender`), else the agent's team orchestrator, else the operator inbox
+/// (`general`) as a last resort — never a hardcoded recipient (#t-…61315-2 Bug1).
+fn wip_notice_recipient(home: &Path, agent: &str, sender: Option<&str>) -> String {
+    sender
+        .map(str::to_string)
+        .or_else(|| crate::teams::find_team_for(home, agent).and_then(|t| t.orchestrator))
+        .unwrap_or_else(|| "general".to_string())
+}
+
+/// The WIP-preserved notice BODY. The `[system:release_dirty_wip_preserved]`
+/// marker is added by the notify layer (`NotifySource::System`); the body must
+/// NOT embed a second (double-prefix bug, #t-…61315-2 Bug2).
+fn wip_preserved_notice(agent: &str, branch: &str, ref_name: &str) -> String {
+    format!(
+        "Agent `{agent}` released a DIRTY worktree \
          for branch `{branch}`; its uncommitted WIP (tracked + untracked) was snapshotted \
          to recovery ref:\n  {ref_name}\nRecover it from the canonical repo with:\n  \
          git worktree add ../wip-recover {ref_name}\n(or inspect: git log -p {ref_name}). \
          Auto-pruned after {RECOVERY_TTL_DAYS}d / max {RECOVERY_MAX_PER_BRANCH} per branch. \
          #2158-adjacent."
-    );
+    )
+}
+
+/// Notify the release's CALLER that a dirty worktree's WIP was preserved, with a
+/// one-line recovery command. Recipient + body per the pure helpers above.
+/// Best-effort.
+fn notify_wip_preserved(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    ref_name: &str,
+    sender: Option<&str>,
+) {
+    let recipient = wip_notice_recipient(home, agent, sender);
+    let text = wip_preserved_notice(agent, branch, ref_name);
     let source = crate::inbox::NotifySource::System("release_dirty_wip_preserved");
-    crate::inbox::notify_agent(home, "general", &source, &text);
+    crate::inbox::notify_agent(home, &recipient, &source, &text);
 }
 
 /// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,
@@ -1034,7 +1059,7 @@ mod tests {
         // Untracked WIP — the loss-prone case (`clean -fd` would delete it).
         std::fs::write(info.path.join("scratch-wip.txt"), b"unsaved work").unwrap();
 
-        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch);
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch, None);
         assert!(
             matches!(outcome, WipPreservation::Preserved),
             "dirty worktree must be Preserved, got {}",
@@ -1061,7 +1086,7 @@ mod tests {
         // marker, which is not preservable) → helper must report Clean.
         assert!(
             matches!(
-                preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch),
+                preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch, None),
                 WipPreservation::Clean
             ),
             "clean worktree must be Clean (no recovery ref)"
@@ -1101,7 +1126,7 @@ mod tests {
         std::fs::write(info.path.join("precious-wip.txt"), b"must not vanish").unwrap();
         let lock = plant_index_lock(&info.path);
 
-        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch);
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, &info.branch, None);
         assert!(
             outcome.blocked_reason().is_some(),
             "unpreservable WIP must be Blocked (fail-closed), got {}",
@@ -1114,6 +1139,62 @@ mod tests {
         std::fs::remove_file(&lock).ok();
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Bug1 (#t-…61315-2): a known caller is the notice recipient — never the
+    /// hardcoded `general` the pre-fix `notify_agent(home, "general", …)` used.
+    #[test]
+    fn wip_notice_recipient_prefers_the_caller() {
+        let home = tmp_home("wip-recipient-caller");
+        assert_eq!(
+            wip_notice_recipient(&home, "agent1", Some("lead-x")),
+            "lead-x",
+            "a known caller must be the recipient, not a hardcoded one"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Bug1 last-resort fallback: no caller AND no team → operator inbox
+    /// (`general`). This is the ONLY path that may legitimately use `general`.
+    #[test]
+    fn wip_notice_recipient_no_team_falls_back_to_general() {
+        let home = tmp_home("wip-recipient-no-team");
+        assert_eq!(
+            wip_notice_recipient(&home, "agent1", None),
+            "general",
+            "no caller and no team → operator inbox as last resort"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Bug1 middle fallback: no caller but the agent belongs to a team → route to
+    /// that team's ORCHESTRATOR, not the hardcoded `general`.
+    #[test]
+    fn wip_notice_recipient_no_caller_uses_team_orchestrator() {
+        let home = tmp_home("wip-recipient-team");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  gapfix:\n    members: [agent1, lead-y]\n    orchestrator: lead-y\n",
+        )
+        .expect("write fleet.yaml");
+        assert_eq!(
+            wip_notice_recipient(&home, "agent1", None),
+            "lead-y",
+            "no caller but a team → the team orchestrator, not hardcoded general"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Bug2 (#t-…61315-2): the `[system:…]` marker is added exactly once by the
+    /// notify layer (`NotifySource::System`); the body builder must NOT embed a
+    /// second copy — else the delivered message double-prefixes.
+    #[test]
+    fn wip_preserved_notice_has_no_embedded_marker() {
+        let notice = wip_preserved_notice("agent1", "feat/x", "refs/agend-wip/agent1/x-1");
+        assert!(
+            !notice.contains("[system:"),
+            "notice body must not embed a [system:…] marker (notify layer adds it): {notice}"
+        );
     }
 
     /// Seed a recovery ref dated `days_ago` (distinct days → distinct names).

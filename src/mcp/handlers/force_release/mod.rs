@@ -59,6 +59,7 @@ pub(super) fn rebase_clean_self(
     home: &Path,
     agent: &str,
     branch: &str,
+    sender: Option<&str>,
 ) -> Result<RebaseCleanOutcome, String> {
     let worktrees_root = home.join("worktrees");
     let target = worktrees_root.join(agent).join(branch);
@@ -83,7 +84,8 @@ pub(super) fn rebase_clean_self(
         // so the operator can recover it in place — even force_release must not
         // silently lose it.
         if let Some(reason) =
-            crate::worktree::preserve_dirty_worktree(home, agent, &target, branch).blocked_reason()
+            crate::worktree::preserve_dirty_worktree(home, agent, &target, branch, sender)
+                .blocked_reason()
         {
             return Err(format!(
                 "force_release refused: worktree at {} has uncommitted WIP that could not be \
@@ -175,7 +177,7 @@ mod tests {
         let home = tmp_home("rebase-clean-existing");
         let dir = seed_daemon_worktree(&home, "dev", "feat/rebase-x");
         assert!(dir.exists());
-        let outcome = rebase_clean_self(&home, "dev", "feat/rebase-x")
+        let outcome = rebase_clean_self(&home, "dev", "feat/rebase-x", None)
             .expect("clean state in pool must succeed");
         assert!(outcome.dir_existed);
         assert!(outcome.dir_removed);
@@ -192,7 +194,7 @@ mod tests {
         // No prior bind, no stale dir → helper still runs release_full
         // (idempotent) and reports dir_existed=false.
         let home = tmp_home("rebase-clean-idempotent");
-        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed")
+        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed", None)
             .expect("helper must not error on clean state");
         assert!(!outcome.dir_existed);
         assert!(!outcome.dir_removed);
@@ -214,7 +216,7 @@ mod tests {
         let home = tmp_home("rebase-outside-pool");
         // An empty branch resolves to <home>/worktrees/dev (the
         // agent-level dir) which the safety check rejects.
-        let r = rebase_clean_self(&home, "dev", "");
+        let r = rebase_clean_self(&home, "dev", "", None);
         assert!(r.is_err(), "empty branch must reject as path-unsafe");
         // A branch with `..` would also escape the pool — but
         // agent_ops::validate_branch already rejects those before this
@@ -340,7 +342,7 @@ mod tests {
         );
         std::fs::write(target.join("fr-wip.txt"), b"force-release WIP").unwrap();
 
-        let outcome = rebase_clean_self(&home, agent, branch).expect("rebase_clean_self ok");
+        let outcome = rebase_clean_self(&home, agent, branch, None).expect("rebase_clean_self ok");
         assert!(
             outcome.dir_existed && outcome.dir_removed,
             "dirty worktree removed by force_release: {outcome:?}"
@@ -412,7 +414,7 @@ mod tests {
         let gitdir = gitlink.strip_prefix("gitdir:").unwrap().trim();
         std::fs::write(Path::new(gitdir).join("index.lock"), b"").unwrap();
 
-        let result = rebase_clean_self(&home, agent, branch);
+        let result = rebase_clean_self(&home, agent, branch, None);
         assert!(
             result.is_err(),
             "force_release must FAIL-CLOSED (Err) when dirty WIP can't be preserved: {result:?}"

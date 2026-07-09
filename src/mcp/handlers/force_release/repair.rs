@@ -153,7 +153,11 @@ pub(crate) fn attempt_safe_rebind_repair(
         {
             return Err(blocked);
         }
-        return match rebase_clean_self(home, agent, branch) {
+        // Stale-state cleanup: the recorded worktree is already GONE (no live WIP
+        // to preserve here), and this repair helper carries no caller identity →
+        // None routes any WIP-preserved notice to the agent's team orchestrator
+        // (fallback: operator inbox), never a hardcoded recipient.
+        return match rebase_clean_self(home, agent, branch, None) {
             Ok(_) => Ok(RepairAction::StaleStateCleared),
             Err(e) => Err(RepairBlocked::PathUnsafe(e)),
         };
