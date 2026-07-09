@@ -258,6 +258,29 @@ pub fn serve(
             return;
         }
     };
+    // P0a (#2342 B4): the operator full-capability token is minted alongside the
+    // cookie by `auth_cookie::issue` (every boot path), so it is on disk before
+    // this accept loop starts (publish-before-accept). Fail CLOSED if it is
+    // missing: serving without the operator secret would either lock the operator
+    // out (no full-cap principal possible) or force a default-allow fallback —
+    // both worse than not serving.
+    let operator_token = match crate::auth_cookie::read_operator_token(&run_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "api.operator token missing; aborting serve");
+            return;
+        }
+    };
+    // P0a security-posture surface (dev2 A1 residual, task
+    // t-20260709010037959088-61315-1): the operator token is 0600 in run_dir,
+    // which isolates cross-USER only — a same-uid agent can read it. Until this
+    // is `Resolved`, a Conversational responder that accepts inbound MUST NOT
+    // ship (enforced by the `responder_inbound_requires_same_uid_isolation`
+    // invariant). Surfaced here so the posture is visible in daemon logs.
+    tracing::debug!(
+        isolation = ?crate::auth_cookie::SAME_UID_OPERATOR_ISOLATION,
+        "operator/agent same-uid secret-isolation status"
+    );
     tracing::info!(port, "API listening");
 
     // #1189: write `.ready` in app (TUI) mode after confirmed bind success.
@@ -353,9 +376,10 @@ pub fn serve(
         let cfgs = Arc::clone(&configs);
         let ext = Arc::clone(&externals);
         let ntf = notifier.clone();
-        // Cookie is `[u8; 32]` (Copy), each session gets its own copy so the
-        // spawned closure satisfies `'static`.
+        // Cookie + operator token are `[u8; 32]` (Copy); each session gets its
+        // own copies so the spawned closure satisfies `'static`.
         let session_cookie = cookie;
+        let session_operator_token = operator_token;
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
@@ -372,6 +396,7 @@ pub fn serve(
                     &cfgs,
                     &ext,
                     ntf.as_deref(),
+                    session_operator_token,
                     session_cookie,
                 );
             })
@@ -506,6 +531,7 @@ fn handle_session(
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
     notifier: Option<&dyn ApiNotifier>,
+    operator_token: crate::auth_cookie::Cookie,
     cookie: crate::auth_cookie::Cookie,
 ) {
     let cloned = match stream.try_clone() {
@@ -531,15 +557,22 @@ fn handle_session(
     let _ = reader
         .get_ref()
         .set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    // Sprint 25 P1 F1: extract optional peer PID for telemetry.
-    let peer_pid =
-        match crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
-            Ok(pid) => pid,
-            Err(e) => {
-                tracing::warn!(error = %e, "API auth rejected");
-                return;
-            }
-        };
+    // P0a (#2342 B4): the handshake now also resolves WHICH principal
+    // authenticated (operator full-cap token vs shared agent cookie) — authority
+    // is proven by this principal, not by method-shape (dev2 A1). Sprint 25 P1 F1:
+    // the optional peer PID (telemetry) is still returned alongside.
+    let (principal, peer_pid) = match crate::auth_cookie::server_handshake_ndjson(
+        &mut reader,
+        &mut writer,
+        &operator_token,
+        &cookie,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, "API auth rejected");
+            return;
+        }
+    };
     // Restore no-timeout for authenticated sessions (on the read fd it was
     // armed on above — CR-2026-06-14).
     let _ = reader.get_ref().set_read_timeout(None);
@@ -604,11 +637,30 @@ fn handle_session(
             home,
         };
 
-        // #1339: single operator-mode authority gate. Covers every direct method
-        // AND the `mcp_tool` tunnel (all 36 tools) at the one ingress choke point.
-        // Operator-surface calls (no `instance`) are never denied; Active is a
-        // passthrough. A deny short-circuits before dispatch.
-        let response = if let Err(denied) =
+        // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
+        // by the authenticated principal (which secret was presented), not by
+        // method-shape. Closes the method-shape / sidecar-agent-cookie subcase of
+        // dev2 A1 (the same-user-agent subcase — a same-uid agent reading
+        // `api.operator` — is a HARD Phase-2 prereq: `auth_cookie::SAME_UID_OPERATOR_ISOLATION`).
+        // HARD default-DENY: an Agent-cookie holder reaching any direct method
+        // (inject/send/spawn/kill/…) is refused here, before the operator-mode gate.
+        // Distinct `denied_by` ("capability", not queued) keeps the denial legible in audit.
+        //
+        // #1339: the operator-mode authority gate then covers the `mcp_tool`
+        // tunnel (per-tool authority) at the one ingress choke point. By here an
+        // Agent principal can only be on `mcp_tool`/`mcp_tools_list`; Operator has
+        // full authority (mode gate is a pass-through for direct methods). A deny
+        // short-circuits before dispatch.
+        let response = if !operator_gate::capability_allows(principal, method) {
+            json!({
+                "ok": false,
+                "error": format!(
+                    "method '{method}' is not permitted for this connection's token \
+                     (capability gate: default-deny)"
+                ),
+                "denied_by": "capability"
+            })
+        } else if let Err(denied) =
             operator_gate::check_operation_allowed(method, params, &crate::operator_mode::get())
         {
             json!({"ok": false, "error": denied, "denied_by": "operator_mode", "queued": true})
@@ -737,10 +789,15 @@ pub fn call_at(run_dir: &Path, request: &Value) -> anyhow::Result<Value> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .context("set call_at read timeout")?;
-    let cookie = crate::auth_cookie::read_cookie(run_dir)?;
+    // P0a (#2342 B4): the operator surface presents the operator full-capability
+    // token, NOT the shared agent cookie — so it authenticates as
+    // `Principal::Operator` (allow-all). Fail CLOSED if the token is missing
+    // (`?`): never silently fall back to the cookie, which would authenticate as
+    // a mere Agent and get every direct method denied (operator lockout).
+    let operator_token = crate::auth_cookie::read_operator_token(run_dir)?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie)?;
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &operator_token)?;
     writeln!(writer, "{request}")?;
     writer.flush()?;
     let mut line = String::new();
@@ -779,12 +836,17 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     stream
         .set_read_timeout(Some(timeout))
         .context("set api::call read timeout")?;
-    // Cookie from the SAME `run` resolution used for the port above (#2 fix).
-    let cookie = crate::auth_cookie::read_cookie(&run)?;
+    // P0a (#2342 B4): present the operator full-capability token (NOT the shared
+    // agent cookie) so this operator-surface call authenticates as
+    // `Principal::Operator` = allow-all. Read from the SAME `run` resolution used
+    // for the port above (#2 fix). Fail CLOSED if missing (`?`) — never fall back
+    // to the cookie (that would authenticate as Agent → direct methods denied →
+    // operator locked out of its own daemon).
+    let operator_token = crate::auth_cookie::read_operator_token(&run)?;
 
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie)?;
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &operator_token)?;
 
     writeln!(writer, "{}", request)?;
     writer.flush()?;
@@ -1222,10 +1284,13 @@ mod tests {
         let mut writer = stream.try_clone().unwrap();
         let mut reader = std::io::BufReader::new(stream);
 
-        // Auth handshake
+        // Auth handshake — this helper drives operator-surface DIRECT methods
+        // (delete/create_team/…), so it presents the operator full-capability
+        // token (P0a), exactly as the real `api::call`/`call_at` now do.
         let run_dir = crate::daemon::run_dir(home);
-        let cookie = crate::auth_cookie::read_cookie(&run_dir).unwrap();
-        crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie).unwrap();
+        let operator_token = crate::auth_cookie::read_operator_token(&run_dir).unwrap();
+        crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &operator_token)
+            .unwrap();
 
         writeln!(writer, "{}", request).unwrap();
         writer.flush().unwrap();

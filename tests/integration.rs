@@ -117,13 +117,17 @@ impl TestDaemon {
         None
     }
 
-    /// Read the 32-byte cookie the daemon published in its run dir. Tests
-    /// speak raw TCP so they must present it manually (unlike production
-    /// clients which go through `ipc::connect_api`/`auth_cookie`).
-    fn find_api_cookie(home: &Path) -> Option<Vec<u8>> {
+    /// Read the 32-byte operator full-capability token the daemon published in
+    /// its run dir. `TestDaemon` emulates the OPERATOR CLI (it drives direct
+    /// methods list/kill/delete/inject/shutdown), so it presents `api.operator`
+    /// (P0a #2342 B4) — the shared `api.cookie` would authenticate as a mere
+    /// Agent and get every direct method capability-denied. Tests speak raw TCP
+    /// so they present it manually (unlike production clients which go through
+    /// `api::call`/`auth_cookie::read_operator_token`).
+    fn find_operator_token(home: &Path) -> Option<Vec<u8>> {
         let run = home.join("run");
         for entry in std::fs::read_dir(&run).ok()?.flatten() {
-            let p = entry.path().join("api.cookie");
+            let p = entry.path().join("api.operator");
             if let Ok(bytes) = std::fs::read(&p) {
                 if bytes.len() == 32 {
                     return Some(bytes);
@@ -138,7 +142,7 @@ impl TestDaemon {
     /// request.
     fn connect_authed(&self) -> (BufReader<TcpStream>, TcpStream) {
         let port = Self::find_api_port(&self.home).expect("api port");
-        let cookie = Self::find_api_cookie(&self.home).expect("api.cookie");
+        let cookie = Self::find_operator_token(&self.home).expect("api.operator");
         let stream =
             TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
         stream.set_nodelay(true).ok();

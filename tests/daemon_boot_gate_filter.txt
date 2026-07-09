@@ -15,6 +15,7 @@ e2e_workflow
 harness_smoke
 migrated_scripts
 vte_gotchas
+p0a_capability_auth
 # Direct daemon-boot (start --foreground, not via AgendHarness) — manually listed;
 # add a new direct-boot daemon test here when you write one.
 restart_smoke

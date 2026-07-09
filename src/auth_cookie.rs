@@ -21,21 +21,105 @@ use std::path::Path;
 
 pub const COOKIE_LEN: usize = 32;
 pub const COOKIE_FILE: &str = "api.cookie";
+/// P0a (#2342 B4): the operator full-capability token — a SECOND per-daemon
+/// secret, distinct from the shared agent `api.cookie`. The operator CLI/TUI
+/// present THIS token (see `api::call`/`call_at`); the agent MCP bridge presents
+/// only `api.cookie`. Holding it authenticates as [`Principal::Operator`] (full
+/// capability); the cookie authenticates as [`Principal::Agent`] (MCP tunnel
+/// only). 0600, per-boot fresh — see [`issue`].
+pub const OPERATOR_TOKEN_FILE: &str = "api.operator";
 
 pub type Cookie = [u8; COOKIE_LEN];
 
-/// Generate a fresh 32-byte cookie and write it atomically to
-/// `{run_dir}/api.cookie` with mode 0600 on Unix. Returns the bytes so the
-/// caller can keep an in-memory copy rather than re-reading on each connect.
+/// The authenticated principal a control-socket connection presented at
+/// handshake — i.e. WHICH per-daemon secret it holds. Authority is proven by
+/// this principal (a capability class), NEVER by the request's method-shape —
+/// this closes the **method-shape / sidecar-agent-cookie subcase** of dev2 A1.
+/// The **same-user-agent subcase** is NOT closed here — see
+/// [`SAME_UID_OPERATOR_ISOLATION`]. Consumed by `api::operator_gate::capability_allows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    /// Holder of the boot-minted operator full-capability token
+    /// (`api.operator`) — the operator CLI/TUI. Full capability: every method.
+    Operator,
+    /// Holder of the shared agent cookie (`api.cookie`) — the MCP bridge.
+    /// Capability = the MCP tunnel ONLY; every direct method is default-DENIED.
+    Agent,
+    // Future (#2342 Phase 2): a `Sidecar` principal whose sole capability is
+    // `enqueue-to-responder-inbox`. Add the variant here — the exhaustive match
+    // in `capability_allows` will then force its capability decision.
+}
+
+/// Status of the same-uid operator/agent SECRET-ISOLATION residual — dev2's P0a
+/// review finding; tracking task `t-20260709010037959088-61315-1`.
+///
+/// P0a closes the **method-shape / sidecar-agent-cookie** subcase of dev2 A1 (an
+/// entity holding only the agent cookie cannot reach the direct methods). It does
+/// NOT close the **same-user-agent** subcase: `api.operator` lives in `run_dir`
+/// mode 0600, and 0600 isolates cross-USER only — a same-uid agent (the future
+/// #2342 Conversational **responder**, if prompt-injected) can
+/// `read(run_dir/api.operator)`, present it, authenticate as [`Principal::Operator`],
+/// and drive every direct method (`inject`/`spawn`/`delete`/…), bypassing the whole
+/// capability model + Conversational ACL. Root cause: the principal is bound to a
+/// *same-uid-readable secret*, not to caller IDENTITY (TCP loopback has no OS
+/// peer-cred; the handshake `pid` is client-supplied and unauthenticated).
+///
+/// Closing it requires binding the principal to caller identity — OS peer-cred
+/// (operator surface over a UDS + `SO_PEERCRED`), an out-of-band operator token
+/// (never written to agent-readable disk), or per-agent private capability cookies.
+/// It MUST NOT be considered satisfied by the no-tools sandbox alone (pillar-3 —
+/// manifest §0.2 explicitly forbids leaning on it).
+///
+/// This is a **HARD prerequisite** for shipping a Conversational responder that
+/// accepts inbound (Phase 2). The invariant test
+/// `responder_inbound_requires_same_uid_isolation` (tests/p0a_capability_auth.rs)
+/// couples the two: wiring a responder-inbound path while this is `Unresolved`
+/// fails loud, so the prerequisite cannot be shipped around silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationStatus {
+    /// Same-uid operator/agent secret isolation is NOT yet enforced. Safe ONLY
+    /// while no same-uid Conversational responder accepts inbound.
+    Unresolved,
+    /// Caller identity is bound (peer-cred / out-of-band token / per-agent
+    /// cookie); a same-uid agent can no longer impersonate the operator. Not yet
+    /// constructed in production — the flip to this state lands with task
+    /// t-20260709010037959088-61315-1 (the Phase-2 hard prerequisite).
+    #[allow(dead_code)] // forward state: constructed when isolation is resolved (Phase 2).
+    Resolved,
+}
+
+/// Current status of the same-uid operator/agent secret isolation. Flip to
+/// [`IsolationStatus::Resolved`] ONLY when task `t-20260709010037959088-61315-1`
+/// actually lands (identity-bound auth). The responder-inbound guard reads this.
+pub const SAME_UID_OPERATOR_ISOLATION: IsolationStatus = IsolationStatus::Unresolved;
+
+/// Issue BOTH per-daemon control-socket secrets, fresh, into `run_dir`:
+///  - `api.cookie`   — the shared agent cookie (RETURNED so the caller can cache
+///    an in-memory copy rather than re-reading on each connect).
+///  - `api.operator` — the operator full-capability token (P0a #2342 B4).
+///
+/// Two INDEPENDENT 32-byte random secrets, each written 0600 (Unix) and fsynced
+/// before rename. Every daemon boot path funnels through `issue` before the API
+/// socket accepts, so both secrets are durably published before accept
+/// (publish-before-accept) and rotate per boot. Callers needing the operator
+/// token read it back via [`read_operator_token`].
 pub fn issue(run_dir: &Path) -> Result<Cookie> {
-    let mut cookie = [0u8; COOKIE_LEN];
-    // `getrandom::Error` implements `std::error::Error` in 0.3+.
-    getrandom::fill(&mut cookie).map_err(|e| anyhow!("getrandom: {e}"))?;
-    let path = run_dir.join(COOKIE_FILE);
-    let tmp = run_dir.join(format!(".{COOKIE_FILE}.tmp"));
-    write_restricted(&tmp, &cookie).context("write api.cookie tmp")?;
-    std::fs::rename(&tmp, &path).context("rename api.cookie")?;
+    let cookie = issue_secret(run_dir, COOKIE_FILE)?;
+    issue_secret(run_dir, OPERATOR_TOKEN_FILE)?;
     Ok(cookie)
+}
+
+/// Generate a fresh 32-byte secret and write it atomically to `{run_dir}/{file}`
+/// with mode 0600 on Unix (fsync-before-rename). Returns the bytes.
+fn issue_secret(run_dir: &Path, file: &str) -> Result<Cookie> {
+    let mut secret = [0u8; COOKIE_LEN];
+    // `getrandom::Error` implements `std::error::Error` in 0.3+.
+    getrandom::fill(&mut secret).map_err(|e| anyhow!("getrandom: {e}"))?;
+    let path = run_dir.join(file);
+    let tmp = run_dir.join(format!(".{file}.tmp"));
+    write_restricted(&tmp, &secret).with_context(|| format!("write {file} tmp"))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename {file}"))?;
+    Ok(secret)
 }
 
 #[cfg(unix)]
@@ -66,15 +150,29 @@ fn write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// Read the cookie from `{run_dir}/api.cookie`. Enforces exact 32-byte size
-/// so a truncated or padded file can't match by coincidence.
+/// Read the shared agent cookie from `{run_dir}/api.cookie`. Enforces exact
+/// 32-byte size so a truncated or padded file can't match by coincidence.
 pub fn read_cookie(run_dir: &Path) -> Result<Cookie> {
-    let mut f = File::open(run_dir.join(COOKIE_FILE)).context("open api.cookie")?;
+    read_secret(run_dir, COOKIE_FILE)
+}
+
+/// Read the operator full-capability token from `{run_dir}/api.operator` (P0a
+/// #2342 B4). Same exact-size enforcement as [`read_cookie`]. Missing/unreadable
+/// → Err: operator clients fail CLOSED — they must refuse rather than silently
+/// fall back to the shared cookie (which would authenticate as a mere Agent and
+/// lock the operator out of its own direct methods).
+pub fn read_operator_token(run_dir: &Path) -> Result<Cookie> {
+    read_secret(run_dir, OPERATOR_TOKEN_FILE)
+}
+
+fn read_secret(run_dir: &Path, file: &str) -> Result<Cookie> {
+    let mut f = File::open(run_dir.join(file)).with_context(|| format!("open {file}"))?;
     let mut bytes = [0u8; COOKIE_LEN];
-    f.read_exact(&mut bytes).context("read api.cookie")?;
+    f.read_exact(&mut bytes)
+        .with_context(|| format!("read {file}"))?;
     let mut extra = [0u8; 1];
     if f.read(&mut extra).unwrap_or(0) != 0 {
-        return Err(anyhow!("api.cookie: unexpected trailing bytes"));
+        return Err(anyhow!("{file}: unexpected trailing bytes"));
     }
     Ok(bytes)
 }
@@ -129,14 +227,20 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Server-side NDJSON handshake: reads the first line, verifies `auth`
-/// matches `expected`, writes `{"ok":true}` on success. Returns Err (and
-/// writes a JSON error reply) on mismatch or malformed input.
+/// Server-side NDJSON handshake: reads the first line and verifies the presented
+/// `auth` hex against the two per-daemon secrets, returning WHICH [`Principal`]
+/// authenticated (P0a #2342 B4). Writes `{"ok":true}` on a match; on mismatch or
+/// malformed input writes `{"ok":false,"error":"auth"}` and returns Err
+/// (fail-closed — a connection presenting NEITHER secret is refused before any
+/// method). Presented secret == `operator_token` → [`Principal::Operator`];
+/// == `agent_cookie` → [`Principal::Agent`]. Also returns the optional peer PID
+/// (telemetry only — the daemon does not poll it for liveness).
 pub fn server_handshake_ndjson<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    expected: &Cookie,
-) -> Result<Option<u32>> {
+    operator_token: &Cookie,
+    agent_cookie: &Cookie,
+) -> Result<(Principal, Option<u32>)> {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Err(anyhow!("auth: connection closed before handshake"));
@@ -150,18 +254,21 @@ pub fn server_handshake_ndjson<R: BufRead, W: Write>(
     };
     let hex = parsed.get("auth").and_then(|x| x.as_str()).unwrap_or("");
     let got = from_hex(hex);
-    let ok = matches!(&got, Some(c) if verify(expected, c));
-    if !ok {
-        let _ = writeln!(writer, r#"{{"ok":false,"error":"auth"}}"#);
-        return Err(anyhow!("auth: bad cookie"));
-    }
+    // Operator token checked first (a full-capability match wins). Both
+    // comparisons are constant-time (`verify`); a rejected attempt runs both.
+    let principal = match &got {
+        Some(c) if verify(operator_token, c) => Principal::Operator,
+        Some(c) if verify(agent_cookie, c) => Principal::Agent,
+        _ => {
+            let _ = writeln!(writer, r#"{{"ok":false,"error":"auth"}}"#);
+            return Err(anyhow!("auth: bad cookie"));
+        }
+    };
     writeln!(writer, r#"{{"ok":true}}"#)?;
     writer.flush().ok();
     // Sprint 25 P1 F1: extract optional peer PID for telemetry.
-    // Telemetry only: daemon does not poll this PID for liveness;
-    // see Sprint 25 P3 follow-up (active peer-process invalidation).
     let peer_pid = parsed.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
-    Ok(peer_pid)
+    Ok((principal, peer_pid))
 }
 
 /// Client-side NDJSON handshake: sends `{"auth":"<hex>"}`, reads one-line
@@ -256,6 +363,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn issued_operator_token_has_mode_0600() {
+        // P0a: the operator full-capability token is a secret — it MUST be 0600,
+        // same as the cookie (it is written via the same `write_restricted`).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("op-mode");
+        issue(&dir).unwrap();
+        let meta = std::fs::metadata(dir.join(OPERATOR_TOKEN_FILE)).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn operator_token_and_cookie_are_independent_secrets() {
+        // If they collided, there would be no operator/agent separation.
+        let dir = tmp_dir("distinct");
+        let cookie = issue(&dir).unwrap();
+        let read_cookie_back = read_cookie(&dir).unwrap();
+        let operator = read_operator_token(&dir).unwrap();
+        assert_eq!(cookie, read_cookie_back, "issue returns the agent cookie");
+        assert_ne!(
+            operator, cookie,
+            "operator token must differ from the agent cookie"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn read_cookie_rejects_short_file() {
         let dir = tmp_dir("short");
@@ -304,44 +439,56 @@ mod tests {
         assert_eq!(from_hex(&"z".repeat(64)), None);
     }
 
-    #[test]
-    fn ndjson_handshake_accepts_correct_cookie() {
-        let cookie: Cookie = [0x42; COOKIE_LEN];
-        let payload = format!("{{\"auth\":\"{}\"}}\n", to_hex(&cookie));
-        let mut reader = std::io::BufReader::new(payload.as_bytes());
+    // P0a: distinct operator token + agent cookie for the two-secret handshake.
+    const OPERATOR: Cookie = [0x42; COOKIE_LEN];
+    const AGENT: Cookie = [0x24; COOKIE_LEN];
+
+    fn run_handshake(auth_hex: &str) -> (Result<(Principal, Option<u32>)>, String) {
+        let payload = format!("{{\"auth\":\"{auth_hex}\"}}\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(payload.into_bytes()));
         let mut writer: Vec<u8> = Vec::new();
-        server_handshake_ndjson(&mut reader, &mut writer, &cookie).unwrap();
-        assert!(String::from_utf8_lossy(&writer).contains("\"ok\":true"));
+        let res = server_handshake_ndjson(&mut reader, &mut writer, &OPERATOR, &AGENT);
+        (res, String::from_utf8_lossy(&writer).into_owned())
     }
 
     #[test]
-    fn ndjson_handshake_rejects_wrong_cookie() {
-        let expected: Cookie = [0x42; COOKIE_LEN];
-        let presented: Cookie = [0x43; COOKIE_LEN];
-        let payload = format!("{{\"auth\":\"{}\"}}\n", to_hex(&presented));
-        let mut reader = std::io::BufReader::new(payload.as_bytes());
-        let mut writer: Vec<u8> = Vec::new();
-        let err = server_handshake_ndjson(&mut reader, &mut writer, &expected).unwrap_err();
-        assert!(format!("{err}").contains("auth"));
-        assert!(String::from_utf8_lossy(&writer).contains("\"ok\":false"));
+    fn ndjson_handshake_maps_operator_token_to_operator_principal() {
+        let (res, reply) = run_handshake(&to_hex(&OPERATOR));
+        let (principal, _pid) = res.unwrap();
+        assert_eq!(principal, Principal::Operator);
+        assert!(reply.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn ndjson_handshake_maps_agent_cookie_to_agent_principal() {
+        let (res, reply) = run_handshake(&to_hex(&AGENT));
+        let (principal, _pid) = res.unwrap();
+        assert_eq!(principal, Principal::Agent);
+        assert!(reply.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn ndjson_handshake_rejects_secret_matching_neither() {
+        let stranger: Cookie = [0x99; COOKIE_LEN];
+        let (res, reply) = run_handshake(&to_hex(&stranger));
+        assert!(format!("{}", res.unwrap_err()).contains("auth"));
+        assert!(reply.contains("\"ok\":false"));
     }
 
     #[test]
     fn ndjson_handshake_rejects_missing_auth_field() {
-        let cookie: Cookie = [0x42; COOKIE_LEN];
         let mut reader = std::io::BufReader::new(&b"{\"method\":\"list\"}\n"[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let err = server_handshake_ndjson(&mut reader, &mut writer, &cookie).unwrap_err();
+        let err = server_handshake_ndjson(&mut reader, &mut writer, &OPERATOR, &AGENT).unwrap_err();
         assert!(format!("{err}").contains("auth"));
         assert!(String::from_utf8_lossy(&writer).contains("\"ok\":false"));
     }
 
     #[test]
     fn ndjson_handshake_rejects_empty_stream() {
-        let cookie: Cookie = [0x42; COOKIE_LEN];
         let mut reader = std::io::BufReader::new(&b""[..]);
         let mut writer: Vec<u8> = Vec::new();
-        assert!(server_handshake_ndjson(&mut reader, &mut writer, &cookie).is_err());
+        assert!(server_handshake_ndjson(&mut reader, &mut writer, &OPERATOR, &AGENT).is_err());
     }
 
     #[test]
@@ -359,7 +506,13 @@ mod tests {
         to_server.extend_from_slice(&client_writer);
         let mut server_reader = std::io::BufReader::new(&to_server[..]);
         let mut server_writer: Vec<u8> = Vec::new();
-        server_handshake_ndjson(&mut server_reader, &mut server_writer, &cookie).unwrap();
+        // The client presents `cookie` as the agent cookie; a different value
+        // stands in for the operator token so the two secrets are distinct.
+        let operator: Cookie = [0x11; COOKIE_LEN];
+        let (principal, _) =
+            server_handshake_ndjson(&mut server_reader, &mut server_writer, &operator, &cookie)
+                .unwrap();
+        assert_eq!(principal, Principal::Agent);
         // Now feed server's reply back into client's reader.
         let mut client_reader = std::io::BufReader::new(&server_writer[..]);
         // Re-run client half against a fresh writer to exercise the success path.
@@ -367,6 +520,61 @@ mod tests {
         client_handshake_ndjson(&mut client_reader, &mut ignored, &cookie).unwrap();
         // `dummy_reader` was unused; pacify the linter.
         let _ = dummy_reader.fill_buf();
+    }
+
+    /// Recursively test whether any `.rs` file under `dir` contains `needle`.
+    fn rs_files_contain(dir: &std::path::Path, needle: &str) -> bool {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    if let Ok(txt) = std::fs::read_to_string(&p) {
+                        if txt.contains(needle) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// HARD-PREREQUISITE fail-loud guard (dev2's P0a review residual, tracking
+    /// task t-20260709010037959088-61315-1).
+    ///
+    /// P0a leaves the **same-user-agent** subcase of dev2 A1 OPEN: a same-uid
+    /// agent can read `api.operator` and impersonate the operator (see
+    /// [`SAME_UID_OPERATOR_ISOLATION`]). That is safe ONLY while no same-uid
+    /// Conversational responder accepts inbound. CONTRACT: any PR that wires such
+    /// a responder MUST (a) place the responder-inbound contract marker (the
+    /// `marker` value assembled below — split so this guard does not self-match)
+    /// at the wiring site, and (b) resolve the isolation, flipping
+    /// `SAME_UID_OPERATOR_ISOLATION` to `Resolved`. If the marker appears while
+    /// isolation is still `Unresolved`, this guard fails loud — so the
+    /// prerequisite cannot be shipped around silently, and in particular NOT by
+    /// leaning on the no-tools sandbox (manifest §0.2).
+    #[test]
+    fn responder_inbound_requires_same_uid_isolation() {
+        let marker = concat!("RESPONDER-", "INBOUND-LIVE");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let responder_inbound_wired = rs_files_contain(&src, marker);
+        if responder_inbound_wired && SAME_UID_OPERATOR_ISOLATION != IsolationStatus::Resolved {
+            panic!(
+                "HARD PREREQ VIOLATED: a Conversational responder inbound path is wired \
+                 (contract marker present) but SAME_UID_OPERATOR_ISOLATION is Unresolved. \
+                 A same-uid prompt-injected responder can read api.operator and impersonate \
+                 the operator, bypassing the whole capability model. Resolve tracking task \
+                 t-20260709010037959088-61315-1 (UDS peer-cred / out-of-band operator token / \
+                 per-agent capability cookie — NOT the no-tools sandbox, manifest §0.2), then \
+                 set SAME_UID_OPERATOR_ISOLATION = IsolationStatus::Resolved."
+            );
+        }
     }
 
     #[test]
