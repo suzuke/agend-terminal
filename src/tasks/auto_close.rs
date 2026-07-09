@@ -72,6 +72,23 @@ pub fn auto_close_on_report(
     if closed {
         // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
         super::task_terminal_cleanup(home, correlation_id);
+        // #t-…24962-7: a verdict-auto-closed task is a terminal task-done event
+        // too — enqueue a release-invariant recompute so the reporter's worktree is
+        // released, mirroring the MCP task-done handler (tasks/handler.rs). Without
+        // this, a review task closed by a terminal verdict (which has no PR of its
+        // own) never enqueues an intent → its binding leaks (immortal review
+        // worktree). `assignee == reporter` was enforced above; repo="" → the
+        // sweeper derives it from the binding's source_repo.
+        if let Some(binding) = crate::binding::read(home, reporter) {
+            if let Some(branch) = binding["branch"].as_str() {
+                crate::daemon::auto_release::enqueue_release_recompute(
+                    home,
+                    "",
+                    branch,
+                    "task_done",
+                );
+            }
+        }
     }
     Ok(closed)
 }

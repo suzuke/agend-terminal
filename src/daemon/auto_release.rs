@@ -242,6 +242,28 @@ fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
         })
 }
 
+/// #t-…24962-7: positively confirm a branch NEVER had any PR — `gh pr list
+/// --state all --head <branch>` returns empty. Branch-delete-immune (queries by
+/// head-branch name, not a live ref). `Some(true)` = confirmed never-PR;
+/// `Some(false)` = a PR exists/existed; `None` = gh failed (cannot confirm — the
+/// caller must NOT release, #986 transient-failure convention). Routed through
+/// `make_scm_provider` so the crate-wide test seam can drive it without gh.
+fn branch_never_had_pr(repo: &str, branch: &str) -> Option<bool> {
+    match crate::scm::make_scm_provider(repo, None).pr_list(
+        repo,
+        &crate::scm::ListFilter {
+            state: Some("all"),
+            head: Some(branch.to_string()),
+            ..Default::default()
+        },
+        &["number"],
+        None,
+    ) {
+        Ok(prs) => Some(prs.is_empty()),
+        Err(_) => None,
+    }
+}
+
 /// t-worktree-leak (PR-1): the unified release invariant (must-fix #2/#3/#4),
 /// repo+branch scoped. `releasable ⟺ PR-terminal ∨ (no-PR ∧ all branch tasks
 /// done)`. Returns (releasable_per_invariant, confidence). The dirty / opt-out /
@@ -645,6 +667,16 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
                 confidence = PrConfidence::ObservedTerminal;
                 tracing::info!(agent = %assignee, repo = %repo, branch = %branch,
                     "auto_release: pr_state absent but branch confirmed merged (post --delete-branch) — treating as terminal");
+            } else if branch_never_had_pr(&repo, &branch) == Some(true) {
+                // #t-…24962-7: no pr_state AND gh positively confirms the branch
+                // never had ANY PR (review/spike/design worktrees that produce no
+                // PR of their own) AND all tasks are done → releasable via the
+                // no-PR invariant. A transient gh failure returns None → NOT
+                // released (retain for a later sweep, #986 convention).
+                releasable = true;
+                confidence = PrConfidence::QueriedNone;
+                tracing::info!(agent = %assignee, repo = %repo, branch = %branch,
+                    "auto_release: pr_state absent, gh confirms branch never had a PR + all tasks done — releasable (no-PR)");
             }
         }
     }
@@ -2024,7 +2056,12 @@ mod tests {
         itest_git(&wt, &["add", "feature.txt"]);
         itest_git(&wt, &["commit", "-m", "unmerged feat"]);
         std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
-        // No pr_state → Unknown; branch NOT squash-merged → fallback must decline.
+        // No pr_state → Unknown; NOT squash-merged; gh reports an existing (open)
+        // PR → branch_never_had_pr = Some(false) → the no-PR path also declines →
+        // RETAIN. Deterministic mock avoids a real gh call in the test.
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Prs(1),
+        ));
         task_done_via_handler(&home, "dev", "t-pg");
         assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
         drain_queue(&home);
@@ -2033,6 +2070,91 @@ mod tests {
             "Unknown + NOT merged + dirty → binding preserved (no false-release)"
         );
         assert_eq!(queue_len(&home), 1, "unmerged intent RETAINED for retry");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #t-…24962-7 (a): a verdict-auto-closed task must ENQUEUE a release-recompute
+    /// (mirroring the MCP task-done handler) so the reporter's review worktree gets
+    /// released. RED against pre-fix `auto_close_on_report`, which appended Done
+    /// WITHOUT enqueueing → the review-worktree binding leaked (intent never
+    /// existed = the specimens' empty queue).
+    #[test]
+    fn auto_close_on_report_enqueues_release_recompute() {
+        let home = tmp_home("itest-autoclose-enq");
+        write_fleet(&home, "reviewer");
+        let repo = itest_source_repo(&home, "owner/repo");
+        itest_lease(&home, &repo, "reviewer", "review/x", "t-rev", false);
+        assert_eq!(queue_len(&home), 0, "no intent before the terminal report");
+        let closed = crate::tasks::auto_close::auto_close_on_report(
+            &home,
+            "report",
+            "t-rev",
+            "reviewer",
+            "VERIFIED — clean",
+            true,
+        )
+        .expect("auto_close ok");
+        assert!(closed, "terminal report auto-closes the review task");
+        assert_eq!(
+            queue_len(&home),
+            1,
+            "verdict auto-close must enqueue a release-recompute intent"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #t-…24962-7 (b): a done task on a branch that NEVER had a PR (review / spike
+    /// / design worktree), no pr_state, dirty → gh positively confirms no PR →
+    /// WIP-preserve + release. RED (pre-fix): Unknown → retain FOREVER (immortal
+    /// review worktree — the specimen class).
+    #[test]
+    fn integration_no_pr_ever_dirty_releases_via_gh_confirm() {
+        let home = tmp_home("itest-nopr-ever");
+        write_fleet(&home, "reviewer");
+        let repo = itest_source_repo(&home, "owner/repo");
+        let wt = itest_lease(&home, &repo, "reviewer", "review/y", "t-revy", false);
+        std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
+        // gh confirms the branch never had ANY PR (empty pr list).
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Prs(0),
+        ));
+        task_done_via_handler(&home, "reviewer", "t-revy");
+        assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
+        drain_queue(&home);
+        assert!(
+            !bound(&home, "reviewer"),
+            "no-PR-ever + dirty → WIP-preserved + released (not immortal)"
+        );
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "released intent is done (queue drained)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #t-…24962-7 guard: a transient gh failure during the no-PR confirmation
+    /// must NOT release (branch_never_had_pr = None) — the worktree is RETAINED for
+    /// a later sweep (#986 convention), never false-released on an unconfirmed query.
+    #[test]
+    fn integration_no_pr_transient_gh_fail_retains() {
+        let home = tmp_home("itest-nopr-ghfail");
+        write_fleet(&home, "reviewer");
+        let repo = itest_source_repo(&home, "owner/repo");
+        let wt = itest_lease(&home, &repo, "reviewer", "review/z", "t-revz", false);
+        std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
+        // gh fails → cannot confirm no-PR.
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
+            crate::scm::MockPrList::Fail("gh: rate limited".into()),
+        ));
+        task_done_via_handler(&home, "reviewer", "t-revz");
+        assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
+        drain_queue(&home);
+        assert!(
+            bound(&home, "reviewer"),
+            "transient gh failure → binding preserved (no false-release)"
+        );
+        assert_eq!(queue_len(&home), 1, "unconfirmed intent RETAINED for retry");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
