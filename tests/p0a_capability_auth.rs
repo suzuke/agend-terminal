@@ -7,12 +7,20 @@
 //! method to full authority). So ANY holder of the shared cookie — the agent
 //! bridge, or any same-user process that can read the cookie file — can drive
 //! every injection-equivalent DIRECT method (`inject`/`send`/`spawn`/`kill`/…)
-//! by simply sending its method string. That is dev2 A1.
+//! by simply sending its method string. That is the method-shape subcase of dev2 A1.
 //!
-//! P0a closes it: authority is proven by the AUTHENTICATED PRINCIPAL (which
-//! secret was presented at handshake), not by method-shape. A boot-minted
-//! operator full-capability token (`api.operator`) → allow-all; the shared agent
-//! cookie → the MCP tunnel ONLY, every direct method default-DENIED.
+//! P0a closes the **method-shape / sidecar-agent-cookie** subcase: authority is
+//! proven by the AUTHENTICATED PRINCIPAL (which secret was presented at
+//! handshake), not by method-shape. A boot-minted operator full-capability token
+//! (`api.operator`) → allow-all; the shared agent cookie → the MCP tunnel ONLY,
+//! every direct method default-DENIED.
+//!
+//! NOT closed here — the **same-user-agent** subcase: `api.operator` is 0600 in
+//! run_dir, which isolates cross-USER only, so a same-uid agent (a future #2342
+//! responder, if prompt-injected) can read it and impersonate the operator. That
+//! is a HARD Phase-2 prerequisite tracked by task t-20260709010037959088-61315-1
+//! and pinned by the `responder_inbound_requires_same_uid_isolation` guard in
+//! `src/auth_cookie.rs` (see `auth_cookie::SAME_UID_OPERATOR_ISOLATION`).
 //!
 //! Unix-only: mirrors the other socket-level harness tests.
 #![cfg(unix)]

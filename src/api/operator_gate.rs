@@ -154,8 +154,11 @@ pub(crate) fn capability_allows(principal: crate::auth_cookie::Principal, method
         Principal::Operator => true,
         // The shared agent cookie — capability = the MCP tunnel ONLY. Every
         // direct method (inject/send/spawn/kill/delete/mode/shutdown/…) is
-        // default-DENIED. (Closes dev2 A1: a shared-cookie holder could
-        // previously reach every injection-equivalent method by method-shape.)
+        // default-DENIED. (Closes the method-shape / sidecar-agent-cookie subcase
+        // of dev2 A1: a shared-cookie holder could previously reach every
+        // injection-equivalent method by method-shape. The same-user-agent subcase
+        // — a same-uid agent reading `api.operator` — is a HARD Phase-2 prereq, see
+        // `auth_cookie::SAME_UID_OPERATOR_ISOLATION`.)
         // `mcp_tool`/`mcp_tools_list` then flow on to the operator-mode gate for
         // per-tool authority; this gate only decides reachability.
         Principal::Agent => {

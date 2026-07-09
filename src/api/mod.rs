@@ -271,6 +271,16 @@ pub fn serve(
             return;
         }
     };
+    // P0a security-posture surface (dev2 A1 residual, task
+    // t-20260709010037959088-61315-1): the operator token is 0600 in run_dir,
+    // which isolates cross-USER only — a same-uid agent can read it. Until this
+    // is `Resolved`, a Conversational responder that accepts inbound MUST NOT
+    // ship (enforced by the `responder_inbound_requires_same_uid_isolation`
+    // invariant). Surfaced here so the posture is visible in daemon logs.
+    tracing::debug!(
+        isolation = ?crate::auth_cookie::SAME_UID_OPERATOR_ISOLATION,
+        "operator/agent same-uid secret-isolation status"
+    );
     tracing::info!(port, "API listening");
 
     // #1189: write `.ready` in app (TUI) mode after confirmed bind success.
@@ -629,10 +639,12 @@ fn handle_session(
 
         // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
         // by the authenticated principal (which secret was presented), not by
-        // method-shape (dev2 A1). This is a HARD default-DENY: an Agent-cookie
-        // holder reaching any direct method (inject/send/spawn/kill/…) is refused
-        // outright here, before the operator-mode gate. Distinct `denied_by`
-        // ("capability", not queued) keeps the security denial legible in audit.
+        // method-shape. Closes the method-shape / sidecar-agent-cookie subcase of
+        // dev2 A1 (the same-user-agent subcase — a same-uid agent reading
+        // `api.operator` — is a HARD Phase-2 prereq: `auth_cookie::SAME_UID_OPERATOR_ISOLATION`).
+        // HARD default-DENY: an Agent-cookie holder reaching any direct method
+        // (inject/send/spawn/kill/…) is refused here, before the operator-mode gate.
+        // Distinct `denied_by` ("capability", not queued) keeps the denial legible in audit.
         //
         // #1339: the operator-mode authority gate then covers the `mcp_tool`
         // tunnel (per-tool authority) at the one ingress choke point. By here an

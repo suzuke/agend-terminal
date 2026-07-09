@@ -33,8 +33,10 @@ pub type Cookie = [u8; COOKIE_LEN];
 
 /// The authenticated principal a control-socket connection presented at
 /// handshake — i.e. WHICH per-daemon secret it holds. Authority is proven by
-/// this principal (a capability class), NEVER by the request's method-shape
-/// (this is the dev2 A1 fix). Consumed by `api::operator_gate::capability_allows`.
+/// this principal (a capability class), NEVER by the request's method-shape —
+/// this closes the **method-shape / sidecar-agent-cookie subcase** of dev2 A1.
+/// The **same-user-agent subcase** is NOT closed here — see
+/// [`SAME_UID_OPERATOR_ISOLATION`]. Consumed by `api::operator_gate::capability_allows`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Principal {
     /// Holder of the boot-minted operator full-capability token
@@ -47,6 +49,49 @@ pub enum Principal {
     // `enqueue-to-responder-inbox`. Add the variant here — the exhaustive match
     // in `capability_allows` will then force its capability decision.
 }
+
+/// Status of the same-uid operator/agent SECRET-ISOLATION residual — dev2's P0a
+/// review finding; tracking task `t-20260709010037959088-61315-1`.
+///
+/// P0a closes the **method-shape / sidecar-agent-cookie** subcase of dev2 A1 (an
+/// entity holding only the agent cookie cannot reach the direct methods). It does
+/// NOT close the **same-user-agent** subcase: `api.operator` lives in `run_dir`
+/// mode 0600, and 0600 isolates cross-USER only — a same-uid agent (the future
+/// #2342 Conversational **responder**, if prompt-injected) can
+/// `read(run_dir/api.operator)`, present it, authenticate as [`Principal::Operator`],
+/// and drive every direct method (`inject`/`spawn`/`delete`/…), bypassing the whole
+/// capability model + Conversational ACL. Root cause: the principal is bound to a
+/// *same-uid-readable secret*, not to caller IDENTITY (TCP loopback has no OS
+/// peer-cred; the handshake `pid` is client-supplied and unauthenticated).
+///
+/// Closing it requires binding the principal to caller identity — OS peer-cred
+/// (operator surface over a UDS + `SO_PEERCRED`), an out-of-band operator token
+/// (never written to agent-readable disk), or per-agent private capability cookies.
+/// It MUST NOT be considered satisfied by the no-tools sandbox alone (pillar-3 —
+/// manifest §0.2 explicitly forbids leaning on it).
+///
+/// This is a **HARD prerequisite** for shipping a Conversational responder that
+/// accepts inbound (Phase 2). The invariant test
+/// `responder_inbound_requires_same_uid_isolation` (tests/p0a_capability_auth.rs)
+/// couples the two: wiring a responder-inbound path while this is `Unresolved`
+/// fails loud, so the prerequisite cannot be shipped around silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationStatus {
+    /// Same-uid operator/agent secret isolation is NOT yet enforced. Safe ONLY
+    /// while no same-uid Conversational responder accepts inbound.
+    Unresolved,
+    /// Caller identity is bound (peer-cred / out-of-band token / per-agent
+    /// cookie); a same-uid agent can no longer impersonate the operator. Not yet
+    /// constructed in production — the flip to this state lands with task
+    /// t-20260709010037959088-61315-1 (the Phase-2 hard prerequisite).
+    #[allow(dead_code)] // forward state: constructed when isolation is resolved (Phase 2).
+    Resolved,
+}
+
+/// Current status of the same-uid operator/agent secret isolation. Flip to
+/// [`IsolationStatus::Resolved`] ONLY when task `t-20260709010037959088-61315-1`
+/// actually lands (identity-bound auth). The responder-inbound guard reads this.
+pub const SAME_UID_OPERATOR_ISOLATION: IsolationStatus = IsolationStatus::Unresolved;
 
 /// Issue BOTH per-daemon control-socket secrets, fresh, into `run_dir`:
 ///  - `api.cookie`   — the shared agent cookie (RETURNED so the caller can cache
@@ -475,6 +520,61 @@ mod tests {
         client_handshake_ndjson(&mut client_reader, &mut ignored, &cookie).unwrap();
         // `dummy_reader` was unused; pacify the linter.
         let _ = dummy_reader.fill_buf();
+    }
+
+    /// Recursively test whether any `.rs` file under `dir` contains `needle`.
+    fn rs_files_contain(dir: &std::path::Path, needle: &str) -> bool {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    if let Ok(txt) = std::fs::read_to_string(&p) {
+                        if txt.contains(needle) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// HARD-PREREQUISITE fail-loud guard (dev2's P0a review residual, tracking
+    /// task t-20260709010037959088-61315-1).
+    ///
+    /// P0a leaves the **same-user-agent** subcase of dev2 A1 OPEN: a same-uid
+    /// agent can read `api.operator` and impersonate the operator (see
+    /// [`SAME_UID_OPERATOR_ISOLATION`]). That is safe ONLY while no same-uid
+    /// Conversational responder accepts inbound. CONTRACT: any PR that wires such
+    /// a responder MUST (a) place the responder-inbound contract marker (the
+    /// `marker` value assembled below — split so this guard does not self-match)
+    /// at the wiring site, and (b) resolve the isolation, flipping
+    /// `SAME_UID_OPERATOR_ISOLATION` to `Resolved`. If the marker appears while
+    /// isolation is still `Unresolved`, this guard fails loud — so the
+    /// prerequisite cannot be shipped around silently, and in particular NOT by
+    /// leaning on the no-tools sandbox (manifest §0.2).
+    #[test]
+    fn responder_inbound_requires_same_uid_isolation() {
+        let marker = concat!("RESPONDER-", "INBOUND-LIVE");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let responder_inbound_wired = rs_files_contain(&src, marker);
+        if responder_inbound_wired && SAME_UID_OPERATOR_ISOLATION != IsolationStatus::Resolved {
+            panic!(
+                "HARD PREREQ VIOLATED: a Conversational responder inbound path is wired \
+                 (contract marker present) but SAME_UID_OPERATOR_ISOLATION is Unresolved. \
+                 A same-uid prompt-injected responder can read api.operator and impersonate \
+                 the operator, bypassing the whole capability model. Resolve tracking task \
+                 t-20260709010037959088-61315-1 (UDS peer-cred / out-of-band operator token / \
+                 per-agent capability cookie — NOT the no-tools sandbox, manifest §0.2), then \
+                 set SAME_UID_OPERATOR_ISOLATION = IsolationStatus::Resolved."
+            );
+        }
     }
 
     #[test]
