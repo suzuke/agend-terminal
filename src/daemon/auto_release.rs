@@ -576,7 +576,7 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
     let tasks = crate::tasks::list_all(home);
     let task = tasks.iter().find(|t| t.id == intent.task_id).cloned();
     let Some(assignee) = task.as_ref().and_then(|t| t.assignee.clone()) else {
-        tracing::debug!(task_id = %intent.task_id, event, "auto_release: task missing / no assignee — dropping intent");
+        tracing::info!(task_id = %intent.task_id, event, "auto_release: task missing / no assignee — dropping intent");
         return IntentOutcome::Done;
     };
     let Some(binding) = crate::binding::read(home, &assignee) else {
@@ -587,7 +587,7 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
 
     // ── must-fix #5: eligibility — only dispatch leases get invariant-release.
     if !is_dispatch_lease(&binding) {
-        tracing::debug!(agent = %assignee, "auto_release: not a dispatch lease (no task_id) — left to force-reclaim backstop (PR-2)");
+        tracing::info!(agent = %assignee, "auto_release: not a dispatch lease (no task_id) — left to force-reclaim backstop (PR-2)");
         return IntentOutcome::Done;
     }
 
@@ -621,10 +621,33 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
     if branch.is_empty() || repo.is_empty() {
         // Cannot scope the invariant → cannot positively confirm. Retry (a later
         // gh-poll / event may resolve repo/branch) rather than release blindly.
-        tracing::debug!(agent = %assignee, task_id = %intent.task_id, event, "auto_release: repo/branch unresolved — retaining for retry");
+        tracing::info!(agent = %assignee, task_id = %intent.task_id, event, "auto_release: repo/branch unresolved — retaining for retry");
         return IntentOutcome::Retry;
     }
-    let (releasable, confidence) = releasable_by_invariant(home, &repo, &branch);
+    let (mut releasable, mut confidence) = releasable_by_invariant(home, &repo, &branch);
+    // #P1b (t-…24962-1): the fleet-standard merge flow is `--delete-branch`, after
+    // which the pr_state scanner deletes the pr_state doc (scanner.rs
+    // `ScanAction::Remove`) → `evaluate_pr_for_release` falls to `Unknown` and the
+    // worktree would retain FOREVER (an immortal worktree, until the 7d
+    // force-reclaim). Positively re-confirm a terminal merge via the
+    // branch-delete-immune squash-merge check (`git cherry`/patch-id locally, gh
+    // headRefOid fallback), gated to COMPLETED work (all branch tasks done) so a
+    // transient pr_state absence on an OPEN PR is never false-released.
+    if !releasable
+        && confidence == PrConfidence::Unknown
+        && all_branch_tasks_done(home, &repo, &branch)
+    {
+        if let Some(src) = binding.get("source_repo").and_then(|v| v.as_str()) {
+            let src = Path::new(src);
+            let default = crate::git_helpers::default_branch(src);
+            if crate::branch_sweep::is_squash_merged(src, &default, &branch) {
+                releasable = true;
+                confidence = PrConfidence::ObservedTerminal;
+                tracing::info!(agent = %assignee, repo = %repo, branch = %branch,
+                    "auto_release: pr_state absent but branch confirmed merged (post --delete-branch) — treating as terminal");
+            }
+        }
+    }
     if !releasable {
         // #2010 2a: the open-PR invariant holds an IMPLEMENTER's worktree until
         // the PR is terminal (correct — it may be needed for rework/merge), but
@@ -650,58 +673,84 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         }
     }
 
-    // ── final gate (dirty / opt-out / bound), must-fix #6 — unchanged decide_release.
+    // ── final gate (dirty / opt-out / bound), must-fix #6.
     let worktree_dirty = binding
         .get("worktree")
         .and_then(|v| v.as_str())
         .map(|w| !is_worktree_clean(Path::new(w)));
-    match decide_release(task.as_ref(), Some(&binding), worktree_dirty) {
-        ReleaseDecision::Release => {
-            // codex gap ②: CAS+release must be ONE atomic critical section under
-            // `.binding.json.lock` — the same lock `bind_full` holds (binding.rs:67)
-            // and the GC path uses (worktree_pool.rs:717). The pre-lock CAS above is
-            // only a cheap early-out; a concurrent bind_full from ANOTHER thread
-            // (MCP handler) could interleave between it and the release. So re-read
-            // + re-validate the FULL lease identity under the lock, then release in
-            // the same section. (`release_full` → `unbind` does NOT take this lock —
-            // binding.rs:119 just removes the file — so no deadlock, mirroring the
-            // pre-PR-1 merge path.)
-            let lock_path = crate::paths::runtime_dir(home)
-                .join(&assignee)
-                .join(".binding.json.lock");
-            let _lock = match crate::store::acquire_file_lock(&lock_path) {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(agent = %assignee, error = %e, "auto_release: binding lock failed — retaining for retry");
-                    return IntentOutcome::Retry;
-                }
-            };
-            let Some(live) = crate::binding::read(home, &assignee) else {
-                // Unbound under the lock → already released. Nothing to do.
-                return IntentOutcome::Done;
-            };
-            if let Some(snap) = intent.lease.as_ref() {
-                if &LeaseIdentity::from_binding(&assignee, &live) != snap {
-                    tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: lease identity changed under lock (re-leased) — skip (TOCTOU CAS)");
-                    return IntentOutcome::Done;
-                }
+    let decision = decide_release(task.as_ref(), Some(&binding), worktree_dirty);
+    // #P1b (t-…24962-1): on a RELEASABLE branch (PR-terminal, or no-PR + all tasks
+    // done), a dirty worktree is stale build/handoff artifacts — a gitignored
+    // SESSION-HANDOFF, a build-dirtied submodule — that never self-clears. The old
+    // dirty→refuse-retry immortalized the worktree (retry every sweep, dirt stays,
+    // never releases). Treat releasable-dirty like Release: `release_full`
+    // WIP-preserves the dirty tree to a durable recovery ref (fail-closed, #2672)
+    // AND notifies (wip_notice_recipient → team orchestrator, #2696) before
+    // removing, so no WIP is lost. A NON-releasable dirty worktree (open PR /
+    // Unknown / reviewer-bypass) still retains — that WIP may be active work.
+    let release_now = matches!(decision, ReleaseDecision::Release)
+        || (matches!(decision, ReleaseDecision::SkipDirtyWorktree) && releasable);
+    if release_now {
+        // codex gap ②: CAS+release must be ONE atomic critical section under
+        // `.binding.json.lock` — the same lock `bind_full` holds (binding.rs:67)
+        // and the GC path uses (worktree_pool.rs:717). The pre-lock CAS above is
+        // only a cheap early-out; a concurrent bind_full from ANOTHER thread
+        // (MCP handler) could interleave between it and the release. So re-read
+        // + re-validate the FULL lease identity under the lock, then release in
+        // the same section. (`release_full` → `unbind` does NOT take this lock —
+        // binding.rs:119 just removes the file — so no deadlock, mirroring the
+        // pre-PR-1 merge path.)
+        let lock_path = crate::paths::runtime_dir(home)
+            .join(&assignee)
+            .join(".binding.json.lock");
+        let _lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(agent = %assignee, error = %e, "auto_release: binding lock failed — retaining for retry");
+                return IntentOutcome::Retry;
             }
-            let outcome = crate::worktree_pool::release_full(home, &assignee, false);
-            tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
-            IntentOutcome::Done
+        };
+        let Some(live) = crate::binding::read(home, &assignee) else {
+            // Unbound under the lock → already released. Nothing to do.
+            return IntentOutcome::Done;
+        };
+        if let Some(snap) = intent.lease.as_ref() {
+            if &LeaseIdentity::from_binding(&assignee, &live) != snap {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: lease identity changed under lock (re-leased) — skip (TOCTOU CAS)");
+                return IntentOutcome::Done;
+            }
         }
-        // Dirty is transient (operator commits / stashes later) → retry.
-        ReleaseDecision::SkipDirtyWorktree => {
-            tracing::warn!(agent = %assignee, repo = %repo, branch = %branch, "auto_release: worktree dirty — retaining for retry (operator WIP protection)");
+        let dirty = worktree_dirty.unwrap_or(false);
+        let outcome = crate::worktree_pool::release_full(home, &assignee, false);
+        if outcome.released {
+            tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, dirty, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
+            IntentOutcome::Done
+        } else {
+            // #P1b: release_full is FAIL-CLOSED — dirty WIP that could not be
+            // snapshotted (e.g. a contended index.lock) leaves the binding intact
+            // (#2672). Retain the intent so a later sweep retries rather than
+            // dropping it and leaking the worktree.
+            tracing::warn!(agent = %assignee, task_id = %intent.task_id, error = ?outcome.error, "auto_release: release_full did not release (fail-closed) — retaining for retry");
             IntentOutcome::Retry
         }
-        ReleaseDecision::SkipOptOut => {
-            tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: opted out (auto_release_on_verdict=false) — dropping intent");
-            IntentOutcome::Done
-        }
-        other => {
-            tracing::debug!(agent = %assignee, task_id = %intent.task_id, decision = ?other, "auto_release: terminal skip — dropping intent");
-            IntentOutcome::Done
+    } else {
+        match decision {
+            // Non-terminal dirty: active-WIP protection. Debug because it repeats
+            // every sweep until the branch terminates (per-cycle info = log spam);
+            // the immortal case is gone — a terminal branch now takes the release
+            // arm above and logs once.
+            ReleaseDecision::SkipDirtyWorktree => {
+                tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, ?confidence, "auto_release: worktree dirty on non-terminal branch — retaining for retry");
+                IntentOutcome::Retry
+            }
+            ReleaseDecision::SkipOptOut => {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: opted out (auto_release_on_verdict=false) — dropping intent");
+                IntentOutcome::Done
+            }
+            other => {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, decision = ?other, "auto_release: terminal skip — dropping intent");
+                IntentOutcome::Done
+            }
         }
     }
 }
@@ -1865,6 +1914,125 @@ mod tests {
             0,
             "expired intent dropped (force-reclaim backstop takes over)"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #P1b test git helper: run git in `dir` with bypass + inline identity.
+    fn itest_git(dir: &Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+    }
+
+    /// #P1b: a MERGED PR (pr_state present = ObservedTerminal) + a DIRTY dispatch
+    /// worktree + done task. Pre-fix this refused forever (dirty→retain), leaving
+    /// an immortal worktree. Post-fix: dirty on a terminal branch is stale
+    /// build/handoff artifacts → WIP-preserve + release (release_full snapshots the
+    /// dirty tree to a recovery ref before removing, #2672).
+    #[test]
+    fn integration_merged_dirty_wip_preserves_and_releases() {
+        let home = tmp_home("itest-merged-dirty");
+        write_fleet(&home, "dev");
+        let repo = itest_source_repo(&home, "owner/repo");
+        let wt = itest_lease(&home, &repo, "dev", "feat/md", "t-md", false);
+        // Untracked, non-ignored file → git status --porcelain non-empty → dirty.
+        std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
+        write_pr_slug(
+            &home,
+            "owner/repo",
+            "feat/md",
+            MergeState::Merged {
+                merge_commit: "c".into(),
+                merged_at: "2026-06-05T00:00:00Z".into(),
+            },
+            5,
+            true,
+        );
+        task_done_via_handler(&home, "dev", "t-md");
+        assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
+        drain_queue(&home);
+        assert!(
+            !bound(&home, "dev"),
+            "MERGED + dirty → WIP-preserved + released (not an immortal worktree)"
+        );
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "released intent is done (queue drained)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #P1b full-chain (lead merge-gate requirement): the fleet-standard
+    /// `--delete-branch` merge leaves NO pr_state (scanner deletes it) → evaluate
+    /// falls to Unknown. Pre-fix the dirty worktree retained FOREVER (immortal).
+    /// Post-fix the terminal-resolution fallback confirms the branch is
+    /// squash-merged (git cherry / patch-id, branch-delete-immune) → releasable →
+    /// WIP-preserve + release.
+    #[test]
+    fn integration_deleted_branch_merged_dirty_releases_via_squash_check() {
+        let home = tmp_home("itest-deleted-merged");
+        write_fleet(&home, "dev");
+        let repo = itest_source_repo(&home, "owner/repo");
+        let branch = "feat/sm";
+        let wt = itest_lease(&home, &repo, "dev", branch, "t-sm", false);
+        // A real branch commit (tracked change).
+        std::fs::write(wt.join("feature.txt"), "feature work").unwrap();
+        itest_git(&wt, &["add", "feature.txt"]);
+        itest_git(&wt, &["commit", "-m", "feat work"]);
+        // Squash-merge the branch into main in the source repo — what a GitHub
+        // squash-merge does — so `git cherry main feat/sm` sees the patch present.
+        itest_git(&repo, &["merge", "--squash", branch]);
+        itest_git(&repo, &["commit", "-m", "squash merge feat/sm"]);
+        // NO write_pr_slug → pr_state absent (== deleted after --delete-branch) →
+        // evaluate = Unknown. Dirty (untracked, non-ignored) = build/handoff artifact.
+        std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
+        task_done_via_handler(&home, "dev", "t-sm");
+        assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
+        drain_queue(&home);
+        assert!(
+            !bound(&home, "dev"),
+            "merged (squash-confirmed) + dirty → WIP-preserved + RELEASED, not immortal"
+        );
+        assert_eq!(
+            queue_len(&home),
+            0,
+            "released intent is done (queue drained)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #P1b guard: NO pr_state + branch NOT merged + done task + dirty → the
+    /// terminal-resolution fallback must find is_squash_merged = false → stay
+    /// Unknown → RETAIN (never false-release a done-but-unmerged worktree).
+    #[test]
+    fn integration_unmerged_unknown_dirty_retains() {
+        let home = tmp_home("itest-unmerged-unknown");
+        write_fleet(&home, "dev");
+        let repo = itest_source_repo(&home, "owner/repo");
+        let branch = "feat/pg";
+        let wt = itest_lease(&home, &repo, "dev", branch, "t-pg", false);
+        // A real UNMERGED branch commit (never applied to main).
+        std::fs::write(wt.join("feature.txt"), "unmerged work").unwrap();
+        itest_git(&wt, &["add", "feature.txt"]);
+        itest_git(&wt, &["commit", "-m", "unmerged feat"]);
+        std::fs::write(wt.join("build-artifact.txt"), "dirty").unwrap();
+        // No pr_state → Unknown; branch NOT squash-merged → fallback must decline.
+        task_done_via_handler(&home, "dev", "t-pg");
+        assert_eq!(queue_len(&home), 1, "task-done enqueued the intent");
+        drain_queue(&home);
+        assert!(
+            bound(&home, "dev"),
+            "Unknown + NOT merged + dirty → binding preserved (no false-release)"
+        );
+        assert_eq!(queue_len(&home), 1, "unmerged intent RETAINED for retry");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
