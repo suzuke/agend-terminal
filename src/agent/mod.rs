@@ -1566,10 +1566,9 @@ fn wait_for_idle_inject_target(
         }
         let core = {
             let reg = lock_registry(registry);
-            match reg.get(&instance_id) {
-                Some(h) => std::sync::Arc::clone(&h.core),
-                None => return None, // agent gone
-            }
+            // agent gone → abort bootstrap wait
+            let h = reg.get(&instance_id)?;
+            std::sync::Arc::clone(&h.core)
         };
         if bootstrap_core_is_idle(&core) {
             break;
