@@ -11,14 +11,13 @@
 //! #2605: repo discovery used to come from `AgentConfig.worktree_source`, a
 //! spawn-time cache keyed on the LEGACY `{repo}/.worktrees/...` layout — under
 //! the current workspace-spawn + post-spawn-bind architecture this was always
-//! empty, so this module's git-mutating paths have never actually run against
+//! empty, so this module's git-mutating paths had never actually run against
 //! the canonical repo in production (see `BRANCH-AUDIT-20260704.md`). Fixing
-//! repo discovery activates a delete path with zero production track record,
-//! so real deletion is additionally gated **opt-in** via
-//! `AGEND_WORKTREE_PRUNE_LIVE=1` (see `prune_live_enabled`) — default is
-//! dry-run: candidates are logged (`tracing` + `event_log`), nothing is
-//! deleted, until an operator diffs the dry-run output against a fresh audit
-//! and flips the gate.
+//! repo discovery activated a delete path that was, for a rollout window,
+//! gated opt-in via `AGEND_WORKTREE_PRUNE_LIVE`. As of PR-A (branch-residue,
+//! #2695) that gate is **default-LIVE, opt-OUT**: real deletion runs unless
+//! `AGEND_WORKTREE_PRUNE_LIVE=0` (see `prune_live_enabled`); when opted out,
+//! candidates are only logged (`tracing` + `event_log`), nothing is deleted.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -72,21 +71,53 @@ pub struct WorktreeEntry {
 /// exposed to that failure mode). Adds the #1897 60s LOCAL_GIT_TIMEOUT
 /// bound `git_bypass` provides — the raw `Command` this replaced had NO
 /// timeout, unlike the other 3 porcelain call sites already converged here.
-fn list_worktrees(repo_root: &Path) -> Vec<WorktreeEntry> {
-    crate::git_worktree::list_porcelain(repo_root)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(path, branch)| {
-            let branch = branch?;
-            if branch == "main" || branch == "master" {
-                return None;
-            }
-            Some(WorktreeEntry {
-                path: path.display().to_string(),
-                branch,
+///
+/// PR-B rider (dev2 #2695 seat2): **fail-CLOSED**. A `git worktree list`
+/// failure is an AMBIGUITY, not "no worktrees" — swallowing it (the former
+/// `unwrap_or_default()`) collapsed the occupancy dimension to empty, so a
+/// caller's "not occupied → eligible to delete" check would fail-OPEN and could
+/// reap a branch whose worktree is merely un-enumerable. The error now
+/// propagates as `Err(())` (logged once here) and every caller skips its
+/// mutating work for this tick (mirrors the `bound_worktree_paths_or_ambiguous`
+/// fail-closed convention below).
+fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, ()> {
+    // Call git directly rather than `git_worktree::list_porcelain`, which
+    // collapses a NON-ZERO exit into `Ok(Vec::new())` (that swallow is exactly
+    // half of the fail-OPEN dev2 flagged). Here BOTH a spawn error AND a
+    // non-zero `git worktree list` exit surface as `Err(())` so the caller skips
+    // its removals this tick instead of proceeding on a collapsed occupancy view.
+    let out = crate::git_helpers::git_bypass(repo_root, &crate::git_worktree::LIST_PORCELAIN_ARGS)
+        .map_err(|e| {
+            tracing::warn!(
+                repo = %repo_root.display(),
+                error = %e,
+                "list_worktrees: git worktree enumeration failed to spawn — caller fails closed"
+            );
+        })?;
+    if !out.status.success() {
+        tracing::warn!(
+            repo = %repo_root.display(),
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "list_worktrees: git worktree list exited non-zero — occupancy dimension \
+             would collapse; caller fails closed (skips its removals this tick)"
+        );
+        return Err(());
+    }
+    Ok(
+        crate::git_worktree::parse_porcelain(&String::from_utf8_lossy(&out.stdout))
+            .into_iter()
+            .filter_map(|(path, branch)| {
+                let branch = branch?;
+                if branch == "main" || branch == "master" {
+                    return None;
+                }
+                Some(WorktreeEntry {
+                    path: path.display().to_string(),
+                    branch,
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// Check if a branch is merged into the default branch (local check, no API needed).
@@ -432,7 +463,12 @@ pub fn sweep_from_registry(
         let default = crate::git_helpers::default_branch(repo);
 
         // Phase 1: clean worktrees (existing logic + remote-gone)
-        let entries = list_worktrees(repo);
+        // PR-B rider: fail-closed — if worktree enumeration errors, skip this
+        // repo's reclaim this tick rather than proceed with a collapsed occupancy view.
+        let entries = match list_worktrees(repo) {
+            Ok(e) => e,
+            Err(()) => continue,
+        };
         for entry in &entries {
             let wt_path = Path::new(&entry.path);
 
@@ -499,7 +535,9 @@ pub fn sweep_from_registry(
 /// human may still follow up on locally) is left for a later tick. A
 /// genuinely-orphaned squash-merged branch's tip predates the merge, so it
 /// clears this floor on the next sweep.
-const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+// #P3 (branch-residue): `pub(crate)` so `worktree_pool::merged_branch_disposition`
+// can phrase its "younger than the {N}h GC floor" keep reason with the SAME N.
+pub(crate) const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// PR-A P1 (branch-residue RCA §3): a reviewer-checkout scaffolding branch
 /// (`review/*` etc. — see [`crate::branch_sweep::is_reviewer_checkout`]) whose
@@ -569,6 +607,20 @@ type SquashCacheKey = (PathBuf, String, String, String);
 static SQUASH_MERGED_CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<SquashCacheKey, bool>>> =
     std::sync::OnceLock::new();
 
+/// #P3 (branch-residue): positive-only cache of a TRUE structural squash-merge,
+/// keyed WITHOUT `default_tip_sha` — `(repo, branch, tip_sha)`. A positive
+/// squash verdict is MONOTONIC (once a branch's patch is in `default`, `default`
+/// only ever advances further; it never "un-absorbs" the patch), so `default`
+/// advancing must NOT bust a cached TRUE and force the expensive cherry/tree-diff
+/// re-run. This set is checked BEFORE `default`'s tip is even resolved. The
+/// `default_tip`-keyed [`SQUASH_MERGED_CACHE`] above still holds FALSE verdicts,
+/// which are NOT monotonic (a false can flip to true once `default` advances to
+/// absorb the branch), so those MUST stay default-tip-keyed to re-evaluate.
+type SquashPositiveKey = (PathBuf, String, String);
+static SQUASH_MERGED_POSITIVE: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashSet<SquashPositiveKey>>,
+> = std::sync::OnceLock::new();
+
 /// #1750-B3: is `branch` a squash-merge orphan eligible for auto-GC? True when
 /// it is squash-merged into the default branch AND its tip is older than
 /// [`SQUASH_GC_MIN_TIP_AGE`]. Reuses `branch_sweep`'s detection (git cherry +
@@ -601,6 +653,17 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
     if Duration::from_secs(now.saturating_sub(tip_ts)) < SQUASH_GC_MIN_TIP_AGE {
         return false;
     }
+
+    // #P3: a positive squash verdict is monotonic — check the default-tip-FREE
+    // positive set FIRST. A hit short-circuits to `true` without even resolving
+    // `default`'s tip (so `default` advancing can't needlessly bust it).
+    let pos_key = (repo_root.to_path_buf(), branch.to_string(), tip_sha.clone());
+    let positive = SQUASH_MERGED_POSITIVE
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    if positive.lock().contains(&pos_key) {
+        return true;
+    }
+
     let Some((default_tip_sha, _)) = branch_tip_info(repo_root, default) else {
         return false;
     };
@@ -616,6 +679,12 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
         return cached;
     }
     let result = crate::branch_sweep::is_squash_merged(repo_root, default, branch);
+    // #P3: only TRUE is monotonic — record it in the positive set so a later
+    // `default` advance is a cheap positive-set hit. FALSE stays in the
+    // default-tip-keyed bool cache (it can flip to true when `default` advances).
+    if result {
+        positive.lock().insert(pos_key);
+    }
     cache.lock().insert(key, result);
     result
 }
@@ -631,10 +700,21 @@ pub(crate) fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &st
 fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'static str)> {
     let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
-    let wt_branches: HashSet<String> = list_worktrees(repo_root)
-        .into_iter()
-        .map(|e| e.branch)
-        .collect();
+    // PR-B rider (dev2 #2695 seat2): fail-CLOSED occupancy. If the worktree list
+    // can't be determined, the occupancy dimension would collapse to "nothing
+    // occupied" and a branch whose worktree is merely un-enumerable could be
+    // reaped — skip ALL branch pruning this tick instead (mirrors :382).
+    let wt_branches: HashSet<String> = match list_worktrees(repo_root) {
+        Ok(entries) => entries.into_iter().map(|e| e.branch).collect(),
+        Err(()) => {
+            tracing::warn!(
+                repo = %repo_root.display(),
+                "prune_orphaned_branches: worktree occupancy could not be determined — \
+                 skipping ALL branch pruning this tick (fail-closed)"
+            );
+            return Vec::new();
+        }
+    };
 
     // W1.2: git_cmd → trimmed stdout on success; spawn-error + non-zero collapse to `Err → []`.
     let branches: Vec<String> =
@@ -861,6 +941,43 @@ mod tests {
         std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
         assert!(prune_live_enabled());
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+    }
+
+    // ── PR-B rider (dev2 #2695 seat2): occupancy fail-CLOSED ──
+
+    /// A `git worktree list` failure must surface as `Err` (fail-closed), NOT
+    /// collapse to an empty Vec — the former `unwrap_or_default()` fail-OPEN let
+    /// a caller treat "occupancy unknown" as "nothing occupied" and reap a branch
+    /// whose worktree is merely un-enumerable. A non-git-repo path makes the
+    /// enumeration fail; this is the fail-open path dev2 flagged as uncovered.
+    #[test]
+    fn list_worktrees_fails_closed_on_git_error() {
+        let non_repo = std::env::temp_dir().join(format!(
+            "agend-not-a-repo-{}-{}",
+            std::process::id(),
+            "riderfailclosed"
+        ));
+        let _ = std::fs::remove_dir_all(&non_repo);
+        std::fs::create_dir_all(&non_repo).unwrap();
+        assert!(
+            list_worktrees(&non_repo).is_err(),
+            "list_worktrees must fail-CLOSED (Err) when git worktree enumeration fails, \
+             not collapse to an empty Vec"
+        );
+        std::fs::remove_dir_all(&non_repo).ok();
+    }
+
+    /// Happy path: a valid repo (no extra worktrees) enumerates to `Ok` (empty
+    /// after excluding the main worktree) — the fail-closed change must not break
+    /// normal enumeration.
+    #[test]
+    fn list_worktrees_ok_on_valid_repo() {
+        let repo = setup_test_repo("rider-lw-ok");
+        assert!(
+            list_worktrees(&repo).is_ok(),
+            "a valid repo must enumerate worktrees as Ok"
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -1864,6 +1981,52 @@ mod tests {
              RECOMPUTED — `default`'s tip is part of the cache key, so a stale \
              entry keyed only on branch tip must not keep returning the old \
              (false) verdict forever"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #P3 (branch-residue): a POSITIVE (true) squash verdict is monotonic —
+    /// once a branch's patch is in `default`, `default` only advances further,
+    /// so `default`'s tip changing must NOT bust the cached TRUE and force the
+    /// expensive cherry/tree-diff re-run. Proven by seeding the positive-only
+    /// set (keyed WITHOUT default_tip) for a branch that is structurally NOT
+    /// squash-merged, then advancing `default`'s tip: a genuine recompute would
+    /// return FALSE, so the call returning TRUE proves the positive set is
+    /// consulted first (before default_tip is even resolved). Pre-#P3 (no
+    /// positive set) this recomputes under the new 4-tuple key → returns FALSE.
+    #[test]
+    fn is_squash_gc_eligible_positive_cache_survives_default_advance_p3() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("p3-positive-cache");
+        // An OLD (age-floor-clearing) branch that is NOT actually squash-merged
+        // — a genuine recompute returns false.
+        make_unmerged_dated_branch(&repo, "feat/positive", "2024-01-01T00:00:00 +0000");
+        assert!(
+            !crate::branch_sweep::is_squash_merged(&repo, "main", "feat/positive"),
+            "precondition: structurally NOT squash-merged (recompute would say false)"
+        );
+        let (tip_sha, _) = branch_tip_info(&repo, "feat/positive").expect("tip info must resolve");
+
+        // Seed the positive-only set for (repo, branch, tip_sha) — simulating a
+        // prior sweep that computed TRUE and recorded the monotonic positive.
+        let positive =
+            SQUASH_MERGED_POSITIVE.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        positive
+            .lock()
+            .insert((repo.clone(), "feat/positive".to_string(), tip_sha.clone()));
+
+        // Advance `default`'s tip (a fresh commit on main) so the 4-tuple bool
+        // cache key would differ — forcing a recompute absent the positive set.
+        std::fs::write(repo.join("advance.txt"), "main advances").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "advance main"]);
+
+        assert!(
+            is_squash_gc_eligible(&repo, "feat/positive", "main"),
+            "#P3: the positive set (keyed without default_tip) must be consulted \
+             FIRST and return true without recompute, even though `default` \
+             advanced and the structural check would now say false"
         );
 
         std::fs::remove_dir_all(&repo).ok();

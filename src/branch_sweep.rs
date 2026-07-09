@@ -210,37 +210,48 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
     had_any
 }
 
-/// GitHub API based detection: query whether a merged PR exists for
-/// this branch with matching HEAD SHA. Most reliable — not affected
-/// by git history topology. SHA check prevents false positives from
-/// branch name reuse.
-fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
+/// Tri-state result of the PR-based (authoritative) merge check. `Unknown`
+/// means the check could NOT run — no github remote, `extract_github_repo`
+/// returned `None`, the tip couldn't be resolved, or the `gh`/scm call errored
+/// — as distinct from `NotMerged` (the check ran and found no matching merged
+/// PR). #P3 (branch-residue): callers that treat a merged PR as monotonic proof
+/// (delete NOW, no age gate) act ONLY on `Merged`; `Unknown` fails CLOSED
+/// (treated as not-merged) everywhere, so a gh outage never reaps a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrMergeStatus {
+    Merged,
+    NotMerged,
+    Unknown,
+}
+
+/// GitHub API based detection: query whether a merged PR exists for this
+/// branch with matching HEAD SHA. Most reliable — not affected by git history
+/// topology. SHA check prevents false positives from branch name reuse.
+///
+/// #P3: returns a TRI-STATE (`PrMergeStatus`) so a caller can tell "detection
+/// couldn't run" (`Unknown`) apart from "ran, no matching merged PR"
+/// (`NotMerged`). The private `is_squash_merged_diff` wrapper below collapses
+/// `Merged → true` / else → false to keep `is_squash_merged`'s Method-2
+/// behavior byte-identical.
+pub(crate) fn pr_merge_status(repo: &Path, base: &str, branch: &str) -> PrMergeStatus {
     // Resolve owner/repo from git remote origin.
-    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (this site previously
-    // ran raw `git` with NO bypass env). Daemon-side git over a fleet repo is the
-    // forgot-bypass latent class (#821/#1463); always-bypass is the intended fix.
-    // git_cmd trims stdout → identical to the prior `.trim().to_string()`.
-    let remote = crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]).ok();
-    let Some(remote_url) = remote else {
-        return false;
+    // W1.2 class-2: git_cmd always adds AGEND_GIT_BYPASS + trims stdout (this
+    // site previously ran raw `git` — the forgot-bypass latent class #821/#1463).
+    let Ok(remote_url) = crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]) else {
+        return PrMergeStatus::Unknown;
     };
-    let gh_repo = extract_github_repo(&remote_url);
-    let Some(gh_repo) = gh_repo else {
-        return false;
+    let Some(gh_repo) = extract_github_repo(&remote_url) else {
+        return PrMergeStatus::Unknown;
     };
     // Get local branch tip SHA.
-    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (was raw, no bypass).
-    // Same forgot-bypass class as the remote read above; git_cmd trims → identical.
-    let local_sha = crate::git_helpers::git_cmd(repo, &["rev-parse", branch]).ok();
-    let Some(local_sha) = local_sha else {
-        return false;
+    let Ok(local_sha) = crate::git_helpers::git_cmd(repo, &["rev-parse", branch]) else {
+        return PrMergeStatus::Unknown;
     };
     // #PR-D: `gh pr list` via ScmProvider. argv is set-equal to the prior
     // inline `pr list --state merged --head B --base BASE --repo R --json
     // headRefOid` — flag ORDER is canonicalized (gh order-insensitive) per
     // decision d-20260601151209762922-0; same flags+values. Uses --repo
-    // (gh_repo derived above), no cwd. Any failure → false (unchanged from
-    // the prior gh-fail / parse-fail → false).
+    // (gh_repo derived above), no cwd. A gh/scm error → `Unknown` (fail-closed).
     let Ok(prs) = crate::scm::make_scm_provider(&gh_repo, None).pr_list(
         &gh_repo,
         &crate::scm::ListFilter {
@@ -252,16 +263,28 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
         &["headRefOid"],
         None,
     ) else {
-        return false;
+        return PrMergeStatus::Unknown;
     };
-    // True iff any merged PR's HEAD SHA matches the local branch tip, or the
+    // Merged iff any merged PR's HEAD SHA matches the local branch tip, or the
     // local tip is a strict ancestor of that HEAD SHA — see
     // `local_sha_matches_merged_head` for why the ancestor case matters.
-    prs.iter().any(|s| {
+    let merged = prs.iter().any(|s| {
         s.head_ref_oid
             .as_deref()
             .is_some_and(|oid| local_sha_matches_merged_head(repo, &local_sha, oid))
-    })
+    });
+    if merged {
+        PrMergeStatus::Merged
+    } else {
+        PrMergeStatus::NotMerged
+    }
+}
+
+/// Method-2 wrapper for [`is_squash_merged`]: `Merged → true`, else false.
+/// `Unknown` maps to NOT squash-merged — byte-identical to the pre-#P3
+/// `is_squash_merged_diff` (every non-`Merged` outcome was already `false`).
+fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
+    matches!(pr_merge_status(repo, base, branch), PrMergeStatus::Merged)
 }
 
 /// True iff `head_ref_oid` (a merged PR's recorded HEAD SHA) equals
