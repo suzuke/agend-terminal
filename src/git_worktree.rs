@@ -117,6 +117,10 @@ pub(crate) fn remove_force(
     wt_path: &str,
 ) -> std::io::Result<std::process::Output> {
     if source_repo.as_os_str().is_empty() {
+        // git-raw-allowed: empty source_repo — MUST NOT set current_dir (git
+        // resolves the repo from the absolute wt_path). `git_bypass`/`git_cmd`
+        // both require a cwd, so this branch stays a raw always-bypass Command
+        // (documented exception; see module doc + #2550 W2).
         std::process::Command::new("git")
             .args(["worktree", "remove", "--force", wt_path])
             .env("AGEND_GIT_BYPASS", "1")

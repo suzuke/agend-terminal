@@ -85,6 +85,15 @@ const MODULE_SCOPE: &[&str] = &[
     // byte-identical (non-wedge); the only behavioural change is the 60s timeout
     // bound replacing an unbounded index.lock hang.
     "worktree.rs",
+    // W1.2 slice: git_worktree (worktree list/remove primitives — production
+    // non-empty-cwd path already via git_bypass; empty-source_repo remove stays
+    // raw with git-raw-allowed). worktree_pool/gc was the last raw
+    // `worktree remove --force` in the pool GC path; now routes through
+    // git_worktree::remove_force (timeout-bounded). worktree_pool/workspace
+    // already used remove_force — seal against regression.
+    "git_worktree.rs",
+    "worktree_pool/gc.rs",
+    "worktree_pool/workspace.rs",
 ];
 
 /// One violation entry — `(file, line_number, snippet)`.
