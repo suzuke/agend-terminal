@@ -269,7 +269,12 @@ fn handle_release_worktree_force(
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
 
-    match crate::mcp::handlers::force_release::rebase_clean_self(home, agent, branch) {
+    match crate::mcp::handlers::force_release::rebase_clean_self(
+        home,
+        agent,
+        branch,
+        sender.as_ref().map(|s| s.as_str()),
+    ) {
         Ok(o) => {
             // #826 L2 GC: when the binding-clear path short-circuited on
             // "no binding" (the post-disband state), the

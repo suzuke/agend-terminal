@@ -314,14 +314,21 @@ fn git_stash_push(canonical: &std::path::Path, message: &str) -> Result<(), Stri
 /// stash with recovery instructions. Delivery failures are silently
 /// dropped — the tracing::info above already records the canonical
 /// hygiene event for log audits.
-fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &str) {
-    let home = crate::home_dir();
-    let text = format!(
-        "[system:canonical_auto_stash] Canonical at `{path}` was detached + dirty; \
+/// The canonical-auto-stash notice BODY. The `[system:canonical_auto_stash]`
+/// marker is added by the notify layer (`NotifySource::System`); the body must
+/// NOT embed a second (double-prefix bug, #t-…61315-2).
+fn canonical_auto_stash_notice(canonical: &std::path::Path, stash_message: &str) -> String {
+    format!(
+        "Canonical at `{path}` was detached + dirty; \
          auto-stashed WIP as `{stash_message}` and switched back to {DEFAULT_BRANCH}. \
          Recover via:\n  git -C {path} stash list\n  git -C {path} stash pop  # or: git stash apply <ref>\n#852.",
         path = canonical.display(),
-    );
+    )
+}
+
+fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &str) {
+    let home = crate::home_dir();
+    let text = canonical_auto_stash_notice(canonical, stash_message);
     let source = crate::inbox::NotifySource::System("canonical_auto_stash");
     crate::inbox::notify_agent(&home, "general", &source, &text);
 }
@@ -332,9 +339,12 @@ fn notify_operator_of_auto_stash(canonical: &std::path::Path, stash_message: &st
 /// move scratch out) WITHOUT attributing it to any agent — we have no provenance.
 /// The notification body is bounded (first `MAX_LINES` porcelain entries + a
 /// count); the full porcelain list goes to the event log for audit.
-pub(crate) fn notify_operator_of_canonical_dirty(report: &CanonicalDirtyReport) {
+/// The canonical-dirty notice BODY. The `[system:canonical_dirty]` marker is added
+/// by the notify layer (`NotifySource::System`); the body must NOT embed a second
+/// (double-prefix bug, #t-…61315-2). Bounded to the first `MAX_LINES` porcelain
+/// entries + a count; the full list goes to the event log.
+fn canonical_dirty_notice(report: &CanonicalDirtyReport) -> String {
     const MAX_LINES: usize = 10;
-    let home = crate::home_dir();
     let total = report.porcelain_lines.len();
     let mut body: String = report
         .porcelain_lines
@@ -348,14 +358,19 @@ pub(crate) fn notify_operator_of_canonical_dirty(report: &CanonicalDirtyReport) 
             total - MAX_LINES
         ));
     }
-    let text = format!(
-        "[system:canonical_dirty] Managed canonical repo `{path}` is DIRTY on \
+    format!(
+        "Managed canonical repo `{path}` is DIRTY on \
          {branch} ({total} non-ignored change(s)). Canonical repos must stay clean \
          under AgEnD — work in a git worktree and move any scratch/handoff files \
          OUT of the canonical tree.{body}\nInspect: git -C {path} status",
         path = report.path.display(),
         branch = DEFAULT_BRANCH,
-    );
+    )
+}
+
+pub(crate) fn notify_operator_of_canonical_dirty(report: &CanonicalDirtyReport) {
+    let home = crate::home_dir();
+    let text = canonical_dirty_notice(report);
     let source = crate::inbox::NotifySource::System("canonical_dirty");
     crate::inbox::notify_agent(&home, "general", &source, &text);
 
@@ -429,6 +444,32 @@ pub fn decide_canonical_action(head_state: &str, working_tree_clean: bool) -> Ca
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// #t-…61315-2 Bug2 (RED-first): the `[system:…]` marker is added exactly
+    /// once by the notify layer (`NotifySource::System`). The text builder must
+    /// NOT embed a second copy — else the delivered message double-prefixes.
+    #[test]
+    fn canonical_dirty_notice_no_embedded_marker() {
+        let report = CanonicalDirtyReport::from_status(
+            std::path::Path::new("/tmp/canon"),
+            " M src/foo.rs\n?? scratch.txt",
+        );
+        let notice = canonical_dirty_notice(&report);
+        assert!(
+            !notice.contains("[system:"),
+            "notice body must not embed a [system:…] marker (notify layer adds it): {notice}"
+        );
+    }
+
+    /// #t-…61315-2 Bug2 (RED-first): auto-stash notice builder — same invariant.
+    #[test]
+    fn canonical_auto_stash_notice_no_embedded_marker() {
+        let notice = canonical_auto_stash_notice(std::path::Path::new("/tmp/canon"), "wip-abc123");
+        assert!(
+            !notice.contains("[system:"),
+            "notice body must not embed a [system:…] marker (notify layer adds it): {notice}"
+        );
+    }
 
     /// Most-common boot path: HEAD is on `main`. No-op regardless of
     /// working-tree state (operator might have WIP that's expected).
