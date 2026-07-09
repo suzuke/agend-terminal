@@ -583,12 +583,16 @@ fn authed_api_call(
     let mut writer = stream.try_clone().map_err(|e| format!("clone: {e}"))?;
     let mut reader = BufReader::new(stream);
 
-    // Auth handshake
+    // Auth handshake — this helper drives OPERATOR-surface methods (list/status/
+    // inject/…), so it presents the operator full-capability token (P0a #2342 B4),
+    // exactly as the real operator CLI (`api::call`) now does. Presenting the
+    // shared agent cookie would authenticate as `Principal::Agent`, whose only
+    // capability is the mcp tunnel → every direct method denied.
     let run_dir = find_run_dir(home).ok_or("no run dir".to_string())?;
-    let cookie_bytes =
-        std::fs::read(run_dir.join("api.cookie")).map_err(|e| format!("read cookie: {e}"))?;
-    let cookie_hex: String = cookie_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    writeln!(writer, r#"{{"auth":"{cookie_hex}"}}"#).map_err(|e| format!("write auth: {e}"))?;
+    let token_bytes = std::fs::read(run_dir.join("api.operator"))
+        .map_err(|e| format!("read operator token: {e}"))?;
+    let token_hex: String = token_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    writeln!(writer, r#"{{"auth":"{token_hex}"}}"#).map_err(|e| format!("write auth: {e}"))?;
     writer.flush().map_err(|e| format!("flush: {e}"))?;
     let mut auth_resp = String::new();
     reader
