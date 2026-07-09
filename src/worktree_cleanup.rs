@@ -34,21 +34,23 @@ pub fn auto_cleanup_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// #2605 first-activation safety gate: returns true only when
-/// `AGEND_WORKTREE_PRUNE_LIVE` is explicitly set to "1". Unlike
-/// `auto_cleanup_enabled` (opt-out, already-trusted feature), this is
-/// deliberately **opt-in** and independent of it — the repo-discovery fix this
-/// gate ships alongside activates a `git branch -D` / `git worktree remove`
-/// path that has never run against the canonical repo before, so it must not
-/// go live merely because the already-on `AGEND_WORKTREE_AUTO_CLEANUP` default
-/// stays on. While this returns false, `sweep_from_registry` computes the
-/// exact same eligibility (squash gate, worktree-occupancy fail-closed check)
-/// but skips every mutating git call, logging would-delete candidates
-/// instead.
+/// Whether the worktree/branch prune runs LIVE (real `git branch -D` /
+/// `git worktree remove`) vs dry-run (compute the same eligibility, log
+/// would-delete candidates, mutate nothing).
+///
+/// PR-A P2 (branch-residue RCA §3): **default LIVE, opt-OUT** — only the exact
+/// value `AGEND_WORKTREE_PRUNE_LIVE=0` returns to dry-run. Originally this was
+/// opt-IN ("1" required) as a first-activation safety gate for a delete path
+/// with no production track record; it has since matured over a 3-day operator
+/// soak (from 2026-07-06) with no mis-deletion, and the eligibility gate
+/// (merged/squash + tip-age floor + worktree-occupancy fail-closed check) is
+/// well-tested. A default dry-run had inverted into the larger risk: any daemon
+/// restart that forgot the flag silently stopped all GC and let residue
+/// re-accumulate with no signal (RCA H2). The independent master off-switch
+/// `AGEND_WORKTREE_AUTO_CLEANUP` is unchanged — it can still disable cleanup
+/// wholesale.
 pub fn prune_live_enabled() -> bool {
-    std::env::var("AGEND_WORKTREE_PRUNE_LIVE")
-        .ok()
-        .is_some_and(|v| v == "1")
+    std::env::var("AGEND_WORKTREE_PRUNE_LIVE").ok().as_deref() != Some("0")
 }
 
 /// Entry for a git worktree.
@@ -499,6 +501,16 @@ pub fn sweep_from_registry(
 /// clears this floor on the next sweep.
 const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// PR-A P1 (branch-residue RCA §3): a reviewer-checkout scaffolding branch
+/// (`review/*` etc. — see [`crate::branch_sweep::is_reviewer_checkout`]) whose
+/// tip has been idle at least this long is GC-eligible. Such branches never
+/// carry a PR and never merge, so neither the merged nor the squash reap path
+/// ever fires — a TTL is their only live terminal path. Longer than
+/// [`SQUASH_GC_MIN_TIP_AGE`] (24h) because a review can legitimately sit idle
+/// across a weekend; a checked-out (in-progress) review is protected by the
+/// worktree-occupancy check regardless of age.
+const REVIEW_SCAFFOLD_TTL: Duration = Duration::from_secs(72 * 60 * 60);
+
 /// #1750-B3/#P1-2607: `branch`'s tip SHA + committer-date unix timestamp, in
 /// ONE `git log` call (`%H%x09%ct`) — was two separate concerns (a `rev-parse`
 /// for the SHA, a `log --format=%ct` for the age) collapsed into one spawn,
@@ -510,6 +522,27 @@ fn branch_tip_info(repo_root: &Path, branch: &str) -> Option<(String, u64)> {
     let (sha, ts_str) = out.split_once('\t')?;
     let ts: u64 = ts_str.parse().ok()?;
     Some((sha.to_string(), ts))
+}
+
+/// PR-A P1 (branch-residue RCA §3): is `branch` a disposable reviewer-checkout
+/// scaffolding branch whose tip has aged past [`REVIEW_SCAFFOLD_TTL`]? Reuses
+/// the single-source [`crate::branch_sweep::is_reviewer_checkout`] regex
+/// (`review/*` / `tmp*` / `pr\d+_head`) — no literal duplication. The caller
+/// enforces occupancy (a checked-out review is skipped before this is reached),
+/// so an in-progress review is never eligible regardless of age. Fail-closed:
+/// missing tip info → not eligible.
+fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
+    if !crate::branch_sweep::is_reviewer_checkout(branch) {
+        return false;
+    }
+    let Some((_, tip_ts)) = branch_tip_info(repo_root, branch) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Duration::from_secs(now.saturating_sub(tip_ts)) >= REVIEW_SCAFFOLD_TTL
 }
 
 /// #P1-2607: process-wide cache of the STRUCTURAL squash-merged check (git
@@ -636,16 +669,36 @@ fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'st
         // (which no longer excludes the gone case) instead of the unguarded
         // remote-gone trigger.
         let squash = !merged && is_squash_gc_eligible(repo_root, branch, &default);
-        if !merged && !squash {
+        // PR-A P1 (branch-residue RCA §3): disposable reviewer-checkout
+        // scaffolding (review/* etc.) that is unoccupied (checked above) and
+        // aged past REVIEW_SCAFFOLD_TTL. These never carry a PR and never merge,
+        // so the merged/squash paths never reap them — a TTL is their only live
+        // terminal path (H1 in the RCA).
+        let scaffold = !merged && !squash && is_stale_review_scaffold(repo_root, branch);
+        if !merged && !squash && !scaffold {
             continue;
         }
+        // The scaffolding path never merged, so its commits survive only in the
+        // object store once the branch ref is gone — capture the tip SHA BEFORE
+        // deletion so the log keeps them recoverable.
+        let scaffold_tip = if scaffold {
+            branch_tip_info(repo_root, branch).map(|(sha, _)| sha)
+        } else {
+            None
+        };
         let ok = dry_run || crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
         if ok {
-            let reason = if merged { "merged" } else { "squash-merged" };
-            if dry_run {
-                tracing::info!(branch, reason, "would prune orphaned branch (dry-run)");
+            let reason = if merged {
+                "merged"
+            } else if squash {
+                "squash-merged"
             } else {
-                tracing::info!(branch, reason, "pruned orphaned branch");
+                "review-scaffold-ttl"
+            };
+            if dry_run {
+                tracing::info!(branch, reason, tip_sha = ?scaffold_tip, "would prune orphaned branch (dry-run)");
+            } else {
+                tracing::info!(branch, reason, tip_sha = ?scaffold_tip, "pruned orphaned branch");
             }
             pruned.push((branch.clone(), reason));
         }
@@ -774,22 +827,30 @@ mod tests {
     // ── #2605: first-activation safety gate ──
 
     #[test]
-    fn prune_live_disabled_by_default() {
+    fn prune_live_enabled_by_default_p2() {
+        // PR-A P2 (RED5): unset ⇒ LIVE (default flipped to opt-out).
         let _lock = ENV_LOCK.lock();
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         assert!(
-            !prune_live_enabled(),
-            "must default to dry-run — this path has zero production track record"
+            prune_live_enabled(),
+            "PR-A P2: prune must default to LIVE when the flag is unset (opt-out design)"
         );
     }
 
     #[test]
-    fn prune_live_disabled_for_non_1_value() {
+    fn prune_live_disabled_only_for_explicit_0_p2() {
+        // PR-A P2 (RED5): only the exact "0" opts back out to dry-run; any other
+        // value (incl. truthy-looking strings) stays LIVE under the new default.
         let _lock = ENV_LOCK.lock();
-        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "true");
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "0");
         assert!(
             !prune_live_enabled(),
-            "opt-in gate must require the exact value \"1\", not any truthy-looking string"
+            "PR-A P2: AGEND_WORKTREE_PRUNE_LIVE=0 must opt out to dry-run"
+        );
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "true");
+        assert!(
+            prune_live_enabled(),
+            "PR-A P2: only the exact \"0\" opts out — other values stay live"
         );
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
     }
@@ -831,7 +892,7 @@ mod tests {
         git_in(&repo, &["merge", "feat/done"]);
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
-        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE"); // explicit: default dry-run
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "0"); // PR-A P2: explicit opt-out to dry-run (default is now live)
         let home = tmp_home("v2-dry-run");
         let mut configs = HashMap::new();
         configs.insert("other-agent".to_string(), Some(repo.join("other")));
@@ -843,8 +904,9 @@ mod tests {
         );
         assert!(
             wt.exists(),
-            "dry-run (AGEND_WORKTREE_PRUNE_LIVE unset) must NOT actually remove the worktree"
+            "dry-run (AGEND_WORKTREE_PRUNE_LIVE=0) must NOT actually remove the worktree"
         );
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&home).ok();
@@ -1567,6 +1629,117 @@ mod tests {
         assert!(
             crate::git_helpers::git_ok(&repo, &["rev-parse", "--verify", "feat/merged"]),
             "#2605: dry-run must NOT actually delete the branch"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── PR-A P1 (branch-residue RCA §3): review/* scaffolding TTL prune ──
+
+    /// Create an UNMERGED branch `name` with a single tip commit dated `date`.
+    /// (Diverges from main; never merged — the reviewer-checkout scaffolding shape.)
+    fn make_unmerged_dated_branch(repo: &Path, name: &str, date: &str) {
+        git_in(repo, &["checkout", "-b", name]);
+        std::fs::write(repo.join("scaffold.txt"), name).ok();
+        git_in(repo, &["add", "."]);
+        git_commit_dated(repo, "scaffolding commit", date);
+        git_in(repo, &["checkout", "main"]);
+    }
+
+    /// RED1 (证洞→修): an aged (>72h), unoccupied `review/*` scaffolding branch —
+    /// never merged, so the merged/squash paths never reap it. On the pre-P1 code
+    /// `prune_orphaned_branches` KEEPS it (the leak); after P1 it is deleted with
+    /// reason `review-scaffold-ttl`.
+    #[test]
+    fn prune_deletes_aged_unoccupied_review_scaffold_p1() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("p1-scaffold-aged");
+        make_unmerged_dated_branch(&repo, "review/2342-r0", "2024-01-01T00:00:00 +0000");
+        // Precondition: neither of the existing reap signals fires.
+        assert!(
+            !is_branch_merged(&repo, "review/2342-r0"),
+            "not a --merged ancestor"
+        );
+        assert!(
+            !crate::branch_sweep::is_squash_merged(&repo, "main", "review/2342-r0"),
+            "not squash-merged"
+        );
+
+        let pruned = prune_orphaned_branches(&repo, false);
+        assert!(
+            pruned
+                .iter()
+                .any(|(b, r)| b == "review/2342-r0" && *r == "review-scaffold-ttl"),
+            "PR-A P1: an aged, unoccupied review/* scaffolding branch must be GC'd with \
+             reason \"review-scaffold-ttl\", got: {pruned:?}"
+        );
+        assert!(
+            !crate::git_helpers::git_ok(&repo, &["rev-parse", "--verify", "review/2342-r0"]),
+            "PR-A P1: the aged review scaffold must actually be deleted"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// RED2 (guard, 永遠保留): the SAME aged `review/*` branch, but checked out in a
+    /// worktree (an in-progress review), must NEVER be pruned regardless of age.
+    #[test]
+    fn prune_keeps_occupied_review_scaffold_p1() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("p1-scaffold-occupied");
+        make_unmerged_dated_branch(&repo, "review/2342-r0", "2024-01-01T00:00:00 +0000");
+        let wt = repo.join("wt-review");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "review/2342-r0"],
+        );
+
+        let pruned = prune_orphaned_branches(&repo, false);
+        assert!(
+            !pruned.iter().any(|(b, _)| b == "review/2342-r0"),
+            "PR-A P1: a review/* branch occupied by a worktree (review in progress) must \
+             NOT be pruned even when aged: {pruned:?}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// RED3 (guard, young→保留): a `review/*` scaffolding branch whose tip is
+    /// recent (under `REVIEW_SCAFFOLD_TTL`) must NOT be pruned yet.
+    #[test]
+    fn prune_keeps_young_review_scaffold_p1() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("p1-scaffold-young");
+        // now-dated tip (git default date) → well under the 72h TTL.
+        git_in(&repo, &["checkout", "-b", "review/fresh"]);
+        std::fs::write(repo.join("scaffold.txt"), "fresh").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "fresh review scaffold"]);
+        git_in(&repo, &["checkout", "main"]);
+
+        let pruned = prune_orphaned_branches(&repo, false);
+        assert!(
+            !pruned.iter().any(|(b, _)| b == "review/fresh"),
+            "PR-A P1: a review/* branch under REVIEW_SCAFFOLD_TTL must NOT be pruned: {pruned:?}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// RED4 (guard, 不動): `spike/*` (intentional design record) and an aged but
+    /// UNMERGED `feat/*` (real WIP) must never be touched by the scaffolding path
+    /// — neither matches the reviewer-checkout regex / is disposable.
+    #[test]
+    fn prune_keeps_spike_and_unmerged_feat_p1() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("p1-spike-feat");
+        make_unmerged_dated_branch(&repo, "spike/2342-inbound", "2024-01-01T00:00:00 +0000");
+        make_unmerged_dated_branch(&repo, "feat/real-wip", "2024-01-01T00:00:00 +0000");
+
+        let pruned = prune_orphaned_branches(&repo, false);
+        assert!(
+            !pruned.iter().any(|(b, _)| b == "spike/2342-inbound"),
+            "PR-A P1: spike/* is a retained design record and must NOT be pruned: {pruned:?}"
+        );
+        assert!(
+            !pruned.iter().any(|(b, _)| b == "feat/real-wip"),
+            "PR-A P1: an unmerged feat/* carrying real work must NOT be pruned: {pruned:?}"
         );
         std::fs::remove_dir_all(&repo).ok();
     }
