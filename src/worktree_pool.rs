@@ -196,6 +196,54 @@ pub struct ReleaseOutcome {
 /// remote-gone yet carries committed-but-unpushed work `git branch -D` would
 /// destroy irrecoverably. Mirrors `worktree_cleanup.rs::prune_orphaned_branches`.
 ///
+/// #P3 (branch-residue): pure KEEP/DELETE decision for a released managed
+/// branch, split out of `cleanup_merged_branch` so the authoritative-PR-merge
+/// fast path and the fail-closed keep reasons are unit-testable without a live
+/// `gh`/scm (the RED6 seam). `Ok(())` = delete-eligible; `Err(reason)` = keep,
+/// with a reason that no longer blanket-blames "not merged" — the pre-#P3 text
+/// was misleading when the real cause was a gh-detection outage or the age floor.
+///
+/// - `is_merged`: `git merge-base --is-ancestor branch default`.
+/// - `pr_merged`: an authoritative merged PR matches the tip → delete NOW,
+///   no age gate (monotonic proof).
+/// - `squash_aged`: structurally squash-merged AND past the 24h tip-age floor.
+/// - `is_squash_structural`: `branch_sweep::is_squash_merged` (offline
+///   cherry+tree-diff) — used ONLY to phrase the "under the age floor" keep
+///   reason; the caller computes it lazily (keep path only) to avoid an extra
+///   git call on the delete path, passing `false` when eligible (never read).
+/// - `pr_detect_unknown`: the PR check could not run (no github remote / gh
+///   error) → fail-closed keep, retried next sweep.
+pub(crate) fn merged_branch_disposition(
+    branch: &str,
+    default: &str,
+    is_merged: bool,
+    pr_merged: bool,
+    squash_aged: bool,
+    is_squash_structural: bool,
+    pr_detect_unknown: bool,
+) -> Result<(), String> {
+    if is_merged || pr_merged || squash_aged {
+        return Ok(());
+    }
+    if pr_detect_unknown && !is_squash_structural {
+        return Err(format!(
+            "branch '{branch}': PR-merge detection unavailable (no github remote, \
+             or gh/scm error) — kept, fail-closed; retried next sweep"
+        ));
+    }
+    if is_squash_structural {
+        let hours = crate::worktree_cleanup::SQUASH_GC_MIN_TIP_AGE.as_secs() / 3600;
+        return Err(format!(
+            "branch '{branch}': squash-merged but tip younger than the {hours}h \
+             GC floor — kept; a later sweep will delete it"
+        ));
+    }
+    Err(format!(
+        "branch '{branch}' is not merged into '{default}' (no merged PR with a \
+         matching head SHA, not a squash-merge orphan) — kept"
+    ))
+}
+
 /// Returns `(deleted, skip_reason)`:
 /// - `(true, None)` — branch was deleted
 /// - `(false, Some(reason))` — branch was NOT deleted, reason explains why
@@ -251,20 +299,49 @@ fn cleanup_merged_branch(
         &["merge-base", "--is-ancestor", branch, &default],
     );
 
+    // #P3 (branch-residue): an authoritative PR-merge (a merged PR whose head
+    // SHA == this branch tip, or the tip is an ancestor of it) is MONOTONIC
+    // proof the work landed — delete NOW, no age margin. The 24h
+    // `SQUASH_GC_MIN_TIP_AGE` floor exists ONLY to stop the cherry/tree-diff
+    // HEURISTIC (`is_squash_gc_eligible`) from false-reaping a just-created
+    // branch that happens to be tree-equal to main; an authoritative PR needs
+    // no such belt. Skip the (network) PR check when already merged.
+    let pr_status = if is_merged {
+        crate::branch_sweep::PrMergeStatus::NotMerged
+    } else {
+        crate::branch_sweep::pr_merge_status(source_repo, &default, branch)
+    };
+    let pr_merged = matches!(pr_status, crate::branch_sweep::PrMergeStatus::Merged);
+
     // t-...50899-10 / CR-2026-06-14 parity: `is_gone` (remote-tracking ref
     // deleted) is no longer an independent delete trigger — a remote-gone
     // branch carrying commits NOT reachable from `default` (unpushed local
     // work) must be KEPT. Delete only when the branch's work is provably in
-    // `default`: merged (ancestor) or squash-merged (age-gated heuristic),
-    // same gate `worktree_cleanup.rs::prune_orphaned_branches` uses.
-    let squash =
-        !is_merged && crate::worktree_cleanup::is_squash_gc_eligible(source_repo, branch, &default);
+    // `default`: merged (ancestor), an authoritative merged PR (above), or
+    // squash-merged past the age floor (heuristic), same gate
+    // `worktree_cleanup.rs::prune_orphaned_branches` uses.
+    let squash_aged = !is_merged
+        && !pr_merged
+        && crate::worktree_cleanup::is_squash_gc_eligible(source_repo, branch, &default);
 
-    if !is_merged && !squash {
-        return (
-            false,
-            Some("branch not merged into main and not a squash-merge orphan".to_string()),
-        );
+    // #P3: split the KEEP/DELETE decision (+ the split skip reason) into a pure,
+    // unit-testable free function. Compute the offline structural-squash signal
+    // ONLY on the keep path (it's needed just to phrase the age-floor reason) —
+    // the delete path passes a dummy `false` the function never reads.
+    let eligible = is_merged || pr_merged || squash_aged;
+    let is_squash_structural =
+        !eligible && crate::branch_sweep::is_squash_merged(source_repo, &default, branch);
+    let pr_detect_unknown = matches!(pr_status, crate::branch_sweep::PrMergeStatus::Unknown);
+    if let Err(reason) = merged_branch_disposition(
+        branch,
+        &default,
+        is_merged,
+        pr_merged,
+        squash_aged,
+        is_squash_structural,
+        pr_detect_unknown,
+    ) {
+        return (false, Some(reason));
     }
 
     if dry_run {
