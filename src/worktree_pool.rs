@@ -480,8 +480,11 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
             // callers of `remove_worktree` are intentionally left untouched.
             if is_daemon_managed(wt_path) {
                 let branch = binding["branch"].as_str().unwrap_or("");
+                // No caller identity on the background pool-sweep path → None
+                // routes the WIP-preserved notice to the agent's team orchestrator
+                // (fallback: operator inbox) rather than a hardcoded recipient.
                 let preservation =
-                    crate::worktree::preserve_dirty_worktree(home, agent, wt_path, branch);
+                    crate::worktree::preserve_dirty_worktree(home, agent, wt_path, branch, None);
                 if let Some(reason) = preservation.blocked_reason() {
                     // reviewer4 #2672 fix — FAIL-CLOSED: there IS uncommitted WIP
                     // but it could not be snapshotted (e.g. a contended
