@@ -1222,8 +1222,13 @@ mod tests {
              exists at {}; worktree add alone leaves submodule dirs empty",
             nested_b.display()
         );
+        // Windows git may rewrite LF→CRLF on checkout (core.autocrlf); pin payload only.
         let body = std::fs::read_to_string(&nested_b).unwrap();
-        assert_eq!(body, "level-b-payload\n");
+        assert_eq!(
+            body.trim_end_matches(['\r', '\n']),
+            "level-b-payload",
+            "payload text must match regardless of CRLF vs LF"
+        );
 
         std::fs::remove_dir_all(&home).ok();
         // super_repo's parent root holds A/B siblings — best-effort clean.
