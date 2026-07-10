@@ -472,8 +472,19 @@ pub fn sweep_from_registry(
         for entry in &entries {
             let wt_path = Path::new(&entry.path);
 
-            if is_in_use(wt_path, &active_dirs) {
-                tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (in use by agent)");
+            // PR-D·D3: occupancy/marker protection (L0) delegated to the shared
+            // `disposition::l0_protected` — the SAME fail-direction the classifier
+            // applies (in-use `Some(true)` / unresolvable `None` → protected). The
+            // sweep never consulted the marker/pin dims, so they are pass-through
+            // (daemon_managed=true, pinned=false) → byte-identical to the prior
+            // `is_in_use`-only skip. (The tick-level `list_worktrees Err → continue`
+            // above is the `None`/unresolvable arm of the same L0 fail-direction.)
+            if crate::worktree::disposition::l0_protected(
+                true,
+                false,
+                Some(is_in_use(wt_path, &active_dirs)),
+            ) {
+                tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (in use by agent — L0 protected)");
                 continue;
             }
 
@@ -495,8 +506,16 @@ pub fn sweep_from_registry(
             // committed-but-unpushed local work; deleting the ref would lose it
             // irrecoverably (phase-1 only skips *dirty* worktrees, not
             // committed-but-unpushed ones). The worktree dir is still reclaimed.
-            let branch_safe_to_delete =
-                merged || is_squash_gc_eligible(repo, &entry.branch, &default);
+            // PR-D·D3: the branch-safe-to-delete (L4) decision delegates to
+            // `branch_disposition` via `branch_reap_delete`. `merged || squash` is
+            // the ProvablyInDefault signal; `gone` alone keeps the branch
+            // (CR-2026-06-14). No scaffold-TTL arm here — that is phase-2's
+            // orphaned-branch concern (this entry still HAS a worktree).
+            let branch_safe_to_delete = branch_reap_delete(
+                merged || is_squash_gc_eligible(repo, &entry.branch, &default),
+                gone,
+                false,
+            );
             let reason = if merged { "merged" } else { "remote-gone" };
 
             tracing::info!(
@@ -581,6 +600,35 @@ fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     Duration::from_secs(now.saturating_sub(tip_ts)) >= REVIEW_SCAFFOLD_TTL
+}
+
+/// PR-D·D3: the branch-reap decision, delegated to the shared
+/// [`crate::worktree::disposition::branch_disposition`] classifier (L4). The
+/// SHARED "provably in default → delete" fail-direction lives in the classifier;
+/// this caller only gathers the signals and adds the one override the classifier
+/// does not encode.
+///
+/// - `provably_in_default` (merged-ancestor OR squash-merged past the age floor)
+///   → `BranchSignal::ProvablyInDefault → DeleteBranch`.
+/// - `remote_gone` alone → `BranchSignal::RemoteGoneOnly → KeepBranch`
+///   (CR-2026-06-14: remote-gone is NEVER an independent delete trigger — the
+///   branch may hold committed-but-unpushed local work).
+/// - `scaffold_ttl` is a review-scaffold branch that is `NotMerged` (the classifier
+///   KEEPS it) but has aged past its TTL — an EXPLICIT external arm reproduces the
+///   reap the classifier can't model. Same shape as D2's #2010 `reviewer_bypass`:
+///   an override the pure classifier deliberately does not encode, kept outside so
+///   the delegation stays honest. Locked byte-for-byte by
+///   [`tests::branch_reap_delete_equals_pre_d3_gate`].
+fn branch_reap_delete(provably_in_default: bool, remote_gone: bool, scaffold_ttl: bool) -> bool {
+    use crate::worktree::disposition::{branch_disposition, BranchDisposition, BranchSignal};
+    let signal = if provably_in_default {
+        BranchSignal::ProvablyInDefault
+    } else if remote_gone {
+        BranchSignal::RemoteGoneOnly
+    } else {
+        BranchSignal::NotMerged
+    };
+    matches!(branch_disposition(signal), BranchDisposition::DeleteBranch) || scaffold_ttl
 }
 
 /// #P1-2607: process-wide cache of the STRUCTURAL squash-merged check (git
@@ -755,7 +803,13 @@ fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'st
         // so the merged/squash paths never reap them — a TTL is their only live
         // terminal path (H1 in the RCA).
         let scaffold = !merged && !squash && is_stale_review_scaffold(repo_root, branch);
-        if !merged && !squash && !scaffold {
+        // PR-D·D3: the reap decision (L4) delegates to `branch_disposition` via
+        // `branch_reap_delete`. `merged || squash` = ProvablyInDefault → delete;
+        // `scaffold` is the explicit external-arm override (a NotMerged branch the
+        // classifier keeps, aged past its TTL). Phase-2 does not compute remote-gone
+        // (CR-2026-06-14 dropped it as a trigger) → remote_gone=false. Byte-identical
+        // to the prior `!merged && !squash && !scaffold` continue-gate.
+        if !branch_reap_delete(merged || squash, false, scaffold) {
             continue;
         }
         // The scaffolding path never merged, so its commits survive only in the
@@ -1626,6 +1680,30 @@ mod tests {
         git_in(repo, &["add", "."]);
         git_in(repo, &["commit", "-m", "main diverge"]);
         git_in(repo, &["cherry-pick", branch]);
+    }
+
+    /// PR-D·D3 equivalence pin: `branch_reap_delete` — the `branch_disposition`
+    /// delegation — must reproduce BOTH pre-D3 branch-reap gates byte-for-byte:
+    ///   phase-2 `prune_orphaned_branches`: delete iff `merged || squash || scaffold`
+    ///   phase-1 `branch_safe_to_delete`:   delete iff `merged || squash` (scaffold=false)
+    /// Both reduce to `provably_in_default || scaffold_ttl`. The CR-2026-06-14
+    /// invariant — remote-gone ALONE is never a delete trigger — is pinned by
+    /// asserting `remote_gone` NEVER changes the result across the full domain.
+    #[test]
+    fn branch_reap_delete_equals_pre_d3_gate() {
+        for provably_in_default in [true, false] {
+            for remote_gone in [true, false] {
+                for scaffold_ttl in [true, false] {
+                    assert_eq!(
+                        branch_reap_delete(provably_in_default, remote_gone, scaffold_ttl),
+                        provably_in_default || scaffold_ttl,
+                        "branch reap DRIFT: provably={provably_in_default} \
+                         remote_gone={remote_gone} scaffold={scaffold_ttl} \
+                         (remote-gone must NEVER flip the result — CR-2026-06-14)"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

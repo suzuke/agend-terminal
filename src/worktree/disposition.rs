@@ -22,13 +22,13 @@
 //! `evaluate_candidate` classification. It re-encodes NONE of that logic; it only
 //! adds the cross-system routing that unifies the three decision systems.
 //!
-//! PR-D · D2 (#2711) narrowed D1's blanket `#![allow(dead_code)]`: the L0–L2
-//! auto-release path now has a real production caller
-//! ([`crate::daemon::auto_release::should_release_now`]), so `terminal_disposition`
-//! + `DispositionInput` are live. Only the still-unwired L3 GC reclaim states
-//! (`ReclaimState`) and the L4 branch-ref decision (`branch_disposition` +
-//! `BranchSignal` / `BranchDisposition`) carry targeted `#[allow(dead_code)]`,
-//! until D3/D4 land their call sites.
+//! PR-D narrows D1's blanket `#![allow(dead_code)]` as each call site lands: D2
+//! (#2713) wired the L0–L2 auto-release path
+//! ([`crate::daemon::auto_release::should_release_now`]); D3 wired the shared L0
+//! gate ([`l0_protected`]) + the L4 branch decision ([`branch_disposition`]) into
+//! the sweep ([`crate::worktree_cleanup`]). Only the still-unwired L3 GC reclaim
+//! states (`ReclaimState`'s non-`NotEligible` variants) carry a targeted
+//! `#[allow(dead_code)]`, until D4 lands the GC `evaluate_candidate` call site.
 
 use crate::daemon::auto_release::ReleaseDecision;
 
@@ -76,8 +76,6 @@ pub(crate) enum ReclaimState {
 /// may be reclaimed while its branch ref is KEPT (CR-2026-06-14 — remote-gone
 /// alone is never a `branch -D` trigger).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// L4 branch-ref axis: D3/D4 wire `branch_disposition` into the sweep/GC paths.
-#[allow(dead_code)]
 pub(crate) enum BranchSignal {
     /// Merged-ancestor, squash-merged past the age floor, or an authoritative
     /// merged PR (#2698) → the work is provably in `default`.
@@ -91,8 +89,6 @@ pub(crate) enum BranchSignal {
 
 /// Branch-ref disposition (spike §1 L4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// L4 branch-ref axis: D3/D4 wire `branch_disposition` into the sweep/GC paths.
-#[allow(dead_code)]
 pub(crate) enum BranchDisposition {
     KeepBranch,
     DeleteBranch,
@@ -132,16 +128,27 @@ pub(crate) struct DispositionInput {
     pub reclaim: ReclaimState,
 }
 
+/// Spike §1 L0 — the SHARED protection gate: a worktree is protected from ALL
+/// reclaim paths when it is operator-created (not `.agend-managed`), pinned,
+/// in-use, or its occupancy is unresolvable. This is the fail-closed prefix every
+/// terminal-detection system shares; extracting it (PR-D·D3) lets a system that
+/// owns its OWN terminal trigger — e.g. the sweep's `merged‖gone` — delegate the
+/// SAME occupancy/marker fail-direction instead of re-deriving it (the RCA
+/// "no-man's-land between policies" fix). `in_use == None` (unresolvable) fails
+/// CLOSED → protected, mirroring the sweep's `list_worktrees Err → skip`.
+pub(crate) fn l0_protected(daemon_managed: bool, pinned: bool, in_use: Option<bool>) -> bool {
+    !daemon_managed || pinned || !matches!(in_use, Some(false))
+}
+
 /// The unified worktree-disposition decision (spike §1, layers L0–L3). Pure:
 /// routes over pre-computed sub-verdicts, duplicating none of their logic.
 pub(crate) fn terminal_disposition(input: &DispositionInput) -> Disposition {
-    // ── L0 — protection. Any ambiguity or protection hit → Keep. ──
-    if !input.daemon_managed || input.pinned {
+    // ── L0 — protection. Any ambiguity or protection hit → Keep. The shared
+    // fail-direction lives in `l0_protected` so a system that owns its own
+    // terminal trigger (the sweep's merged‖gone, PR-D·D3) delegates the SAME
+    // occupancy/marker gate rather than re-deriving it. ──
+    if l0_protected(input.daemon_managed, input.pinned, input.in_use) {
         return Disposition::Keep;
-    }
-    match input.in_use {
-        None | Some(true) => return Disposition::Keep, // unresolvable or in use
-        Some(false) => {}
     }
 
     if input.binding_present {
@@ -173,8 +180,6 @@ pub(crate) fn terminal_disposition(input: &DispositionInput) -> Disposition {
 
 /// The branch-ref decision (spike §1 L4), independent of the worktree dir.
 /// Delete only on provable-in-default; remote-gone alone never deletes.
-// L4 branch-ref axis: no production caller until D3/D4 wire the sweep/GC paths.
-#[allow(dead_code)]
 pub(crate) fn branch_disposition(signal: BranchSignal) -> BranchDisposition {
     match signal {
         BranchSignal::ProvablyInDefault => BranchDisposition::DeleteBranch,
@@ -244,6 +249,42 @@ mod tests {
             ..base()
         };
         assert_eq!(terminal_disposition(&input), Disposition::Keep);
+    }
+
+    // ── PR-D·D3: the shared L0 protection predicate ──
+
+    #[test]
+    fn l0_protected_holds_the_l0_fail_directions() {
+        // `l0_protected` is the extracted L0 gate `terminal_disposition` now calls —
+        // it must hold the SAME fail directions (spike §1 L0).
+        assert!(
+            l0_protected(false, false, Some(false)),
+            "unmanaged → protected"
+        );
+        assert!(l0_protected(true, true, Some(false)), "pinned → protected");
+        assert!(l0_protected(true, false, Some(true)), "in-use → protected");
+        assert!(
+            l0_protected(true, false, None),
+            "occupancy unresolvable → fail-CLOSED protected"
+        );
+        assert!(
+            !l0_protected(true, false, Some(false)),
+            "managed + unpinned + not-in-use → NOT protected (the only reclaimable case)"
+        );
+    }
+
+    #[test]
+    fn l0_protected_is_the_sweep_occupancy_gate() {
+        // PR-D·D3: the sweep passes marker/pin as pass-through (it never consulted
+        // them) + `Some(is_in_use)`, so the delegated gate reduces EXACTLY to the
+        // pre-D3 `is_in_use` skip — byte-identical.
+        for in_use in [true, false] {
+            assert_eq!(
+                l0_protected(true, false, Some(in_use)),
+                in_use,
+                "sweep occupancy delegation must equal is_in_use (in_use={in_use})"
+            );
+        }
     }
 
     // ── L1/L2 binding-present — fail-direction pins ──
