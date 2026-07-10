@@ -20,12 +20,9 @@
 //!   this shared core — the core does NOT bake in any one caller's filter.
 //! - `git worktree remove --force`: [`remove_force`] extracts the
 //!   INTENTIONALLY-duplicated empty-`source_repo` dual-cwd branch shared
-//!   verbatim by `worktree_pool.rs::remove_worktree` and
-//!   `worktree_pool/workspace.rs::teardown_workspace_worktree` (both
-//!   already had matching comments citing the same "lead ruling": git
-//!   needs a resolvable cwd, and an empty `source_repo` means the ONLY
-//!   correct move is a bypass-enabled raw `Command` with NO `current_dir`,
-//!   never `git_bypass`/`git_cmd` — those both require a cwd).
+//!   by `worktree_pool` callers. Empty `source_repo` uses
+//!   [`crate::git_helpers::git_bypass_no_cwd`] (always-bypass + timeout,
+//!   no `current_dir`); non-empty uses [`crate::git_helpers::git_bypass`].
 //! - Wrapper/error-handling-granularity CHOICE (`git_bypass` vs `git_ok` vs
 //!   `git_cmd`) stays with each existing caller — this module does not
 //!   force a uniform return type onto call sites that currently rely on
@@ -106,27 +103,18 @@ pub(crate) fn list_porcelain(repo: &Path) -> std::io::Result<Vec<(PathBuf, Optio
 
 /// `git worktree remove --force <wt_path>`.
 ///
-/// `source_repo` empty → runs with NO `current_dir` (git resolves the repo
-/// from the absolute `wt_path` itself; `AGEND_GIT_BYPASS=1` still set via
-/// `env`) — the documented exception both original call sites shared
-/// verbatim (see module doc: `git_bypass`/`git_cmd` both REQUIRE a cwd, and
-/// the worktrees-pool parent dir is NOT the owning repo).
-/// `source_repo` non-empty → `git_helpers::git_bypass(source_repo, ...)`.
+/// `source_repo` empty → [`git_helpers::git_bypass_no_cwd`] (no `current_dir`;
+/// git resolves the repo from the absolute `wt_path`; still always-bypass +
+/// timeout-bounded). `source_repo` non-empty → [`git_helpers::git_bypass`].
 pub(crate) fn remove_force(
     source_repo: &Path,
     wt_path: &str,
 ) -> std::io::Result<std::process::Output> {
+    let args = ["worktree", "remove", "--force", wt_path];
     if source_repo.as_os_str().is_empty() {
-        // git-raw-allowed: empty source_repo — MUST NOT set current_dir (git
-        // resolves the repo from the absolute wt_path). `git_bypass`/`git_cmd`
-        // both require a cwd, so this branch stays a raw always-bypass Command
-        // (documented exception; see module doc + #2550 W2).
-        std::process::Command::new("git")
-            .args(["worktree", "remove", "--force", wt_path])
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
+        crate::git_helpers::git_bypass_no_cwd(&args)
     } else {
-        crate::git_helpers::git_bypass(source_repo, &["worktree", "remove", "--force", wt_path])
+        crate::git_helpers::git_bypass(source_repo, &args)
     }
 }
 
