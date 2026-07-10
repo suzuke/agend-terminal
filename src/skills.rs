@@ -49,6 +49,7 @@ pub const BACKEND_SKILL_DIRS: &[(&str, &str)] = &[
     ("opencode", ".opencode/skills"),
     ("kiro", ".kiro/skills"),
     ("agy", ".agents/skills"),
+    ("grok", ".grok/skills"),
 ];
 
 /// Unified skill source root: `<home>/skills/`.

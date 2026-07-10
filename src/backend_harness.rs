@@ -52,6 +52,7 @@ impl CapabilityMatrix {
             ("claude", "LLM context not tied to PTY buffer (known gap)"),
             ("opencode", ""),
             ("agy", ""),
+            ("grok", "MVP: typed inject + project-trust dismiss"),
         ] {
             backends.insert(
                 name.into(),
@@ -358,8 +359,8 @@ mod tests {
     #[test]
     fn test_capability_matrix_serializes_with_split_columns() {
         let matrix = CapabilityMatrix::new();
-        // #1580: 6 → 5 (gemini-cli retired).
-        assert_eq!(matrix.backends.len(), 5);
+        // #1580: 6 → 5 (gemini retired); Grok MVP: 6.
+        assert_eq!(matrix.backends.len(), 6);
         // All start unverified
         for b in matrix.backends.values() {
             assert_eq!(b.esc_semantics_verified, CapabilityLevel::Unverified);

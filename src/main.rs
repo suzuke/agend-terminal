@@ -819,16 +819,14 @@ fn main() -> anyhow::Result<()> {
                             .split_once(':')
                             .map(|(n, c)| (n.to_string(), c.to_string()))
                             .unwrap_or_else(|| (a.to_string(), a.to_string()));
-                        let (preset_args, submit_key) = backend::Backend::from_command(&cmd)
-                            .map(|b| {
-                                let p = b.preset();
-                                let mut a: Vec<String> =
-                                    p.args.iter().map(|s| s.to_string()).collect();
-                                a.extend(p.resume_mode.args_for());
-                                (a, p.submit_key.to_string())
-                            })
-                            .unwrap_or_else(|| (Vec::new(), "\r".to_string()));
-                        (name, cmd, preset_args, None, None, submit_key)
+                        // User-only args: empty. `agent::build_command` prepends
+                        // `preset_spawn_args(spawn_mode)` — callers must NOT also
+                        // stuff preset flags here or backends that reject
+                        // duplicate flags (e.g. Grok `--always-approve`) exit 2.
+                        let submit_key = backend::Backend::from_command(&cmd)
+                            .map(|b| b.preset().submit_key.to_string())
+                            .unwrap_or_else(|| "\r".to_string());
+                        (name, cmd, Vec::new(), None, None, submit_key)
                     })
                     .collect();
                 // #1441: managed spawns fail-fast unless the instance is in

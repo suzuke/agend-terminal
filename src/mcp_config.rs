@@ -814,6 +814,72 @@ fn strip_agend_mcp_sections(content: &str) -> String {
     out
 }
 
+/// Grok Build: write project-scoped `<workdir>/.grok/config.toml` with
+/// `[mcp_servers.agend-terminal]`. Grok loads project MCP from that path
+/// (see `grok mcp add --scope project`). Scope rule: never write `~/.grok`.
+fn configure_grok(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
+    configure_grok_with_home(working_dir, &home_path(), instance_name)
+}
+
+fn configure_grok_with_home(
+    working_dir: &Path,
+    home: &str,
+    instance_name: Option<&str>,
+) -> Result<()> {
+    let (bridge_cmd, bridge_args) = bridge_binary_path();
+    let grok_dir = working_dir.join(".grok");
+    std::fs::create_dir_all(&grok_dir)?;
+    let config_path = grok_dir.join("config.toml");
+
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
+
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    // Reuse the same section headers as Codex — Grok's native schema is also
+    // `[mcp_servers.<name>]` (+ optional `.env` subtable).
+    let mut stripped = strip_agend_mcp_sections(&existing);
+    while stripped.ends_with("\n\n") {
+        stripped.pop();
+    }
+    if !stripped.is_empty() && !stripped.ends_with('\n') {
+        stripped.push('\n');
+    }
+    let separator = if stripped.is_empty() { "" } else { "\n" };
+
+    let bin_lit = toml_string_value(&bridge_cmd);
+    let home_lit = toml_string_value(home);
+    let instance_line = instance_name
+        .map(|n| format!("AGEND_INSTANCE_NAME = {}\n", toml_string_value(n)))
+        .unwrap_or_default();
+    let args_toml = if bridge_args.is_empty() {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{}]",
+            bridge_args
+                .iter()
+                .map(|a| format!("\"{a}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let body = format!(
+        r#"{stripped}{separator}{CODEX_MCP_HEADER}
+command = {bin_lit}
+args = {args_toml}
+enabled = true
+
+{CODEX_MCP_ENV_HEADER}
+AGEND_HOME = {home_lit}
+{instance_line}"#
+    );
+
+    if existing != body {
+        crate::store::atomic_write(&config_path, body.as_bytes())?;
+    }
+    tracing::debug!(path = %config_path.display(), "configured Grok MCP");
+    Ok(())
+}
+
 /// Detect backend from command name and configure MCP.
 pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>) {
     let backend = crate::backend::Backend::from_command(command);
@@ -823,6 +889,7 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
         Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
         Some(crate::backend::Backend::OpenCode) => configure_opencode(working_dir, instance_name),
         Some(crate::backend::Backend::Codex) => configure_codex(working_dir, instance_name),
+        Some(crate::backend::Backend::Grok) => configure_grok(working_dir, instance_name),
         // Non-preset backends (Shell, Raw) have no MCP wiring.
         Some(crate::backend::Backend::Shell) | Some(crate::backend::Backend::Raw(_)) | None => {
             return
@@ -1140,6 +1207,50 @@ mod tests {
         configure(&dir, "opencode", None);
         assert!(dir.join("opencode.json").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn configure_dispatches_grok_writes_project_toml() {
+        let dir = tmp_dir("dispatch_grok");
+        let home_scratch = tmp_dir("dispatch_grok_home");
+        configure_grok_with_home(&dir, home_scratch.to_str().unwrap(), Some("grok-1"))
+            .expect("configure_grok");
+
+        let cfg = dir.join(".grok").join("config.toml");
+        assert!(cfg.exists(), "configure_grok must write .grok/config.toml");
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            body.contains("[mcp_servers.agend-terminal]"),
+            "missing mcp server table: {body}"
+        );
+        assert!(
+            body.contains("AGEND_INSTANCE_NAME"),
+            "missing instance env: {body}"
+        );
+        assert!(
+            body.contains("enabled = true"),
+            "server must be enabled: {body}"
+        );
+        // Scope rule: nothing under the home_scratch arg except what we pass as AGEND_HOME value
+        let home_entries: Vec<_> = std::fs::read_dir(&home_scratch)
+            .map(|rd| rd.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            home_entries.is_empty(),
+            "configure_grok must not write under home, found: {home_entries:?}"
+        );
+        // Second call is idempotent (no double-append).
+        configure_grok_with_home(&dir, home_scratch.to_str().unwrap(), Some("grok-1"))
+            .expect("configure_grok 2");
+        let body2 = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(
+            body.matches("[mcp_servers.agend-terminal]").count(),
+            1,
+            "must not duplicate sections"
+        );
+        assert_eq!(body, body2);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home_scratch).ok();
     }
 
     /// #987: configure dispatches Backend::Agy to write the standard
