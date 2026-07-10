@@ -288,6 +288,48 @@ fn parse_inbox_messages(content: &str) -> impl Iterator<Item = InboxMessage> + '
         .filter_map(|line| serde_json::from_str::<InboxMessage>(line).ok())
 }
 
+/// AUDIT3-005: the single parse step for EVERY read-modify-write rewriter
+/// (`drain` / `ack` / `settle_read_by_id` / `ack_by_correlation` / `clear_compact`
+/// / `sweep_expired` / `reclaim_stale_delivering`). Returns `Some(msg)` only for a
+/// row this daemon can process (parseable, schema ≤ current); the caller runs its
+/// own logic on it. A row the caller must NOT process but MUST NOT DELETE — a
+/// FORWARD-SCHEMA row (valid JSON a newer daemon wrote, downgrade-safe) OR an
+/// UNPARSEABLE line (a torn enqueue / external corruption) — is pushed VERBATIM to
+/// `preserved` (the caller re-emits it in its rewrite) and `None` returned.
+/// Centralizing this closes the runtime-rewrite silent-loss window: pre-fix each
+/// site's `Err(_) => continue` DROPPED the corrupt line on rewrite — before the
+/// startup-only `recover_half_writes` could quarantine it — with no log. Routing
+/// all sites through ONE helper (not per-site patches) prevents a missed/ drifted
+/// site (the #27 lesson). Blank-line handling stays the caller's concern. WARNs so
+/// the formerly-silent event is observable.
+fn parse_or_preserve_line(line: &str, preserved: &mut Vec<String>) -> Option<InboxMessage> {
+    match serde_json::from_str::<InboxMessage>(line) {
+        Ok(msg) if msg.schema_version <= InboxMessage::CURRENT_VERSION => Some(msg),
+        Ok(msg) => {
+            // Forward-schema: unknown newer fields — re-emit intact, never downgrade-delete.
+            tracing::warn!(
+                found = msg.schema_version,
+                supported = InboxMessage::CURRENT_VERSION,
+                "inbox rewrite: preserving forward-schema row verbatim"
+            );
+            preserved.push(line.to_string());
+            None
+        }
+        Err(e) => {
+            // AUDIT3-005: a torn enqueue / externally-corrupt line. Preserve verbatim
+            // so a runtime rewrite never destroys it before startup
+            // `recover_half_writes` quarantines it to inbox.recovery/.
+            tracing::warn!(
+                error = %e,
+                line_len = line.len(),
+                "inbox rewrite: preserving unparseable line verbatim (AUDIT3-005; was silently dropped)"
+            );
+            preserved.push(line.to_string());
+            None
+        }
+    }
+}
+
 /// Iterate `home/inbox`'s `*.jsonl` entry paths (the directory-walk +
 /// extension-filter shared by `sweep_expired` / `get_thread` / `find_message`).
 /// A `read_dir` error yields an empty iteration (callers historically
@@ -320,9 +362,12 @@ pub fn inbox_agent_names(home: &Path) -> Vec<String> {
 ///
 /// NOT crash-atomic: enqueue appends in place — no tmp+rename (only the
 /// read-modify-write rewriters drain/sweep/clear/supersede use that). A crash
-/// mid-write can leave a half-written trailing line; every read path skips an
-/// unparseable line and [`recover_half_writes`] quarantines it (to
-/// `inbox.recovery/`) at startup.
+/// mid-write can leave a half-written trailing line. Read-ONLY paths skip an
+/// unparseable line; the read-modify-write rewriters PRESERVE it verbatim
+/// (AUDIT3-005 — all route through [`parse_or_preserve_line`], which re-emits a
+/// forward-schema OR unparseable line instead of dropping it), so a RUNTIME
+/// rewrite can never silently destroy it before [`recover_half_writes`]
+/// quarantines it (to `inbox.recovery/`) at the next startup.
 ///
 /// Returns an error when the inbox is in readonly mode (disk full).
 /// Callers should invoke [`check_disk_space`] periodically (e.g. daemon tick);
@@ -612,24 +657,12 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                // CR-2026-06-14: a newer daemon wrote this row. We can't deliver
-                // it (forward-only fields are unknown to this struct), but we MUST
-                // NOT delete it on the rewrite below — that is downgrade data loss.
-                // Preserve the RAW line verbatim so the rewrite re-emits it intact
-                // (store.rs refuse-and-preserve).
-                tracing::warn!(
-                    found = msg.schema_version,
-                    supported = InboxMessage::CURRENT_VERSION,
-                    "skipping (preserving on disk) inbox message written by newer schema version"
-                );
-                preserved_forward.push(line.to_string());
+            // AUDIT3-005: parse-or-preserve — a forward-schema row (newer daemon) AND
+            // an unparseable line (torn enqueue / corruption) are preserved verbatim
+            // (re-emitted below), never silently dropped on the rewrite.
+            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                 continue;
-            }
+            };
             if msg.read_at.is_none() {
                 if msg.superseded_by.is_some() {
                     // superseded obligations are retired (marked read) but never
@@ -843,16 +876,10 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                // Mirror drain()/clear_compact(): never destroy a forward-schema
-                // row a newer daemon wrote — re-emit it verbatim.
-                preserved_forward.push(line.to_string());
+            // AUDIT3-005: forward-schema + unparseable lines preserved verbatim.
+            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                 continue;
-            }
+            };
             // Only an in-flight `delivering` row is ackable. Match on id when given.
             let is_target = msg_id.is_none_or(|id| msg.id.as_deref() == Some(id));
             if is_target && msg.read_at.is_none() && msg.delivering_at.is_some() {
@@ -919,14 +946,10 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                preserved_forward.push(line.to_string());
+            // AUDIT3-005: forward-schema + unparseable lines preserved verbatim.
+            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                 continue;
-            }
+            };
             if msg.id.as_deref() == Some(msg_id) && msg.read_at.is_none() {
                 msg.read_at = Some(now.clone());
                 settled = true;
@@ -1025,14 +1048,10 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
             if line.trim().is_empty() {
                 continue;
             }
-            let mut msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                preserved_forward.push(line.to_string());
+            // AUDIT3-005: forward-schema + unparseable lines preserved verbatim.
+            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                 continue;
-            }
+            };
             // Only ack delivering rows whose task_id matches the correlation_id.
             let task_matches = msg
                 .task_id
@@ -1215,21 +1234,10 @@ pub fn clear_compact(
             if line.trim().is_empty() {
                 continue;
             }
-            let mut msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                // CR-2026-06-14: preserve forward-schema rows verbatim — never
-                // delete a message a newer daemon wrote (downgrade data loss).
-                tracing::warn!(
-                    found = msg.schema_version,
-                    supported = InboxMessage::CURRENT_VERSION,
-                    "skipping (preserving on disk) inbox message written by newer schema version"
-                );
-                preserved_forward.push(line.to_string());
+            // AUDIT3-005: forward-schema + unparseable lines preserved verbatim.
+            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                 continue;
-            }
+            };
             // Already-read rows are untouched (and not re-summarised).
             if msg.read_at.is_some() {
                 out.push(msg);
@@ -1776,14 +1784,17 @@ pub fn sweep_expired(home: &Path) {
                 read_non_blocker: bool,
             }
             let mut kept: Vec<Kept> = Vec::new();
+            // AUDIT3-005: forward-schema + unparseable lines to re-emit verbatim (never swept).
+            let mut preserved: Vec<String> = Vec::new();
             let mut changed = false;
             for line in content.lines() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let msg: InboxMessage = match serde_json::from_str(line) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                // AUDIT3-005: a corrupt line has no parseable TTL — preserve it
+                // verbatim, never sweep it away.
+                let Some(msg) = parse_or_preserve_line(line, &mut preserved) else {
+                    continue;
                 };
                 let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -1844,7 +1855,9 @@ pub fn sweep_expired(home: &Path) {
             }
 
             if changed {
-                if kept.is_empty() {
+                // AUDIT3-005: only delete the file when NOTHING survives — a preserved
+                // (forward-schema / unparseable) line must keep the file alive.
+                if kept.is_empty() && preserved.is_empty() {
                     let _ = std::fs::remove_file(path);
                 } else {
                     let tmp = path.with_extension("jsonl.tmp");
@@ -1856,6 +1869,10 @@ pub fn sweep_expired(home: &Path) {
                             .open(&tmp)?;
                         for k in &kept {
                             writeln!(f, "{}", k.line)?;
+                        }
+                        // AUDIT3-005: re-emit forward-schema + unparseable lines verbatim.
+                        for raw in &preserved {
+                            writeln!(f, "{raw}")?;
                         }
                         f.sync_all()?;
                         std::fs::rename(&tmp, path)?;
@@ -1926,14 +1943,10 @@ pub fn reclaim_stale_delivering(home: &Path) {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let mut msg: InboxMessage = match serde_json::from_str(line) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if msg.schema_version > InboxMessage::CURRENT_VERSION {
-                    preserved_forward.push(line.to_string());
+                // AUDIT3-005: forward-schema + unparseable lines preserved verbatim.
+                let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
                     continue;
-                }
+                };
                 // A `delivering` row = read_at None AND delivering_at Some.
                 if msg.read_at.is_none() {
                     if let Some(ref since) = msg.delivering_at {

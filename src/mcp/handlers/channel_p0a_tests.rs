@@ -863,3 +863,74 @@ fn reply_with_message_id_missing_channel_on_row_errors_2622() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// reply auto-settle: a PLAIN reply (no explicit `message_id`) must SETTLE the
+/// current user turn's persistent inbox row(s). Pre-fix, only the
+/// `message_id`-carrying branch settled — a plain reply left the row `delivering`,
+/// so `reclaim_stale_delivering` reverted it to unread after the 600s TTL and
+/// RE-DELIVERED it, producing the telegram DOUBLE reply. RED before the
+/// channel.rs `else` branch that settles `pending_user_turn.group_msg_ids`.
+#[test]
+fn plain_reply_settles_turn_group_so_reclaim_cannot_redeliver() {
+    let _g = registry_guard();
+    crate::channel::reset_active_channel_for_test();
+    let home = tmp_home("reply-settle");
+    // A delivered channel message in alpha's inbox, in the reclaim-vulnerable
+    // `delivering` state with a stale `delivering_at` (past RECLAIM_TTL=600s).
+    let stale = (chrono::Utc::now() - chrono::Duration::seconds(1000)).to_rfc3339();
+    let row = crate::inbox::message::InboxMessage {
+        schema_version: 1,
+        id: Some("m-turn-1".into()),
+        from: "user:op".into(),
+        text: "a long question".into(),
+        channel: Some(crate::channel::ChannelKind::Telegram),
+        timestamp: stale.clone(),
+        delivering_at: Some(stale),
+        ..Default::default()
+    };
+    // Arm the turn the way the drain does (reply_to_channel + group_msg_ids); this
+    // also establishes alpha's resolved (UUID-keyed, #2622) inbox path.
+    crate::reply_ledger::arm_channel_turn(
+        &home,
+        "alpha",
+        crate::channel::ChannelKind::Telegram,
+        Some("m-turn-1".into()),
+        None,
+        None,
+        Some("user:op"),
+        Some("a long question"),
+    );
+    // Insert the delivering row via `enqueue` so it lands in the RESOLVED inbox file
+    // (the same one settle_read_by_id / reclaim operate on).
+    crate::inbox::storage::enqueue(&home, "alpha", row).expect("enqueue");
+    crate::channel::register_active_channel(MockChannel::arc("telegram", ReplyOutcome::Ok));
+
+    // Plain reply — NO message_id.
+    let result = super::handle_reply(&home, &serde_json::json!({"message": "answer"}), "alpha");
+    assert_eq!(
+        result["message_id"], "mock-msg-1",
+        "reply must succeed: {result}"
+    );
+
+    let inbox_path = crate::inbox::storage::inbox_path_resolved(&home, "alpha");
+    let read_at_of = |p: &std::path::Path| -> Option<String> {
+        std::fs::read_to_string(p).ok().and_then(|c| {
+            c.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|v| v["id"] == "m-turn-1")
+                .and_then(|v| v["read_at"].as_str().map(String::from))
+        })
+    };
+    assert!(
+        read_at_of(&inbox_path).is_some(),
+        "plain reply must SETTLE the turn's inbox row (read_at set), else reclaim re-delivers"
+    );
+    // A settled (read) row is immune to reclaim_stale_delivering (it only reverts
+    // `delivering` rows with read_at None) → no double-delivery.
+    crate::inbox::storage::reclaim_stale_delivering(&home);
+    assert!(
+        read_at_of(&inbox_path).is_some(),
+        "settled row must survive reclaim (no revert-to-unread / double-delivery)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
