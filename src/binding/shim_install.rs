@@ -18,9 +18,13 @@ use std::path::{Path, PathBuf};
 /// guard matrix is parity-equivalent to agend-git's); otherwise `git` stays on
 /// `agend-git`. The `{pkill,killall,kill}` kill-shim links ALWAYS point at
 /// `agend-git` (D1=A — agentic-git is git-only and has no process-kill guard,
-/// so it must never shadow the kill family). Rollback = flip the flag back to
-/// false + restart; the on-disk binding format is unchanged, so a rolled-back
-/// agend-git shim still verifies core-signed bindings (no rebind storm).
+/// so it must never shadow the kill family). #2524 P3b: agend-git's git logic
+/// was DELETED (kill-only residual), so a flag-OFF or agentic-missing
+/// `git`→agend-git link now FAILS CLOSED (loud, non-zero exit) instead of
+/// serving git. Flag-flip is therefore no longer a live rollback — rollback =
+/// revert the P3b commit + rebuild. The symlink targets below are unchanged;
+/// only their runtime meaning changed. Retiring the flag's git-routing entirely
+/// is a separate follow-up (P3 "legacy window" decision).
 pub fn symlink_shim(home: &Path, use_agentic_git: bool) {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -53,19 +57,23 @@ fn symlink_shim_at(home: &Path, exe: &Path, use_agentic_git: bool) {
         return;
     };
 
-    // Flag-gated git target. Fail-SAFE: flag on but the agentic-git sibling
-    // missing (cargo build did not produce it — P3: it is agend-terminal's own
-    // `[[bin]]` target, so a stale/partial install can still lack it) → fall back
-    // to agend-git so `git` is NEVER left unguarded, and WARN loudly so the drift
-    // is diagnosable.
+    // Flag-gated git target. Flag on but the agentic-git sibling missing (cargo
+    // build did not produce it — it is agend-terminal's own `[[bin]]` target, so
+    // a stale/partial install can lack it) → point `git` back at agend-git and
+    // WARN loudly. #2524 P3b: agend-git's git logic is deleted, so this link now
+    // FAILS CLOSED (loud, non-zero exit) rather than serving git. That is the
+    // correct posture (a broken build must never leave git unguarded), but no
+    // longer a working fallback — the warn is the operator's cue to rebuild.
     let git_src = if use_agentic_git {
         match sibling("agentic-git") {
             Some(agentic) => agentic,
             None => {
                 tracing::warn!(
                     "use_agentic_git_shim=true but the agentic-git binary is missing next \
-                     to the daemon exe; falling back to agend-git for the git shim (rebuild: \
-                     `cargo build` produces it as a [[bin]] target). git stays guarded."
+                     to the daemon exe; `git` is pointed back at agend-git, which post-P3b \
+                     FAILS CLOSED on git (it no longer serves git). Rebuild so `cargo build` \
+                     produces the `agentic-git` [[bin]] target — until then agent git calls \
+                     hard-fail with an actionable message."
                 );
                 agend_git.clone()
             }
@@ -131,6 +139,10 @@ mod tests {
 
     #[test]
     fn flag_off_git_points_agend_git() {
+        // #2524 P3b: flag-OFF still links `git`→agend-git, but agend-git now FAILS
+        // CLOSED on git (flag-flip is no longer a live rollback). This pins the
+        // symlink TARGET only; the fail-closed runtime is covered by
+        // tests/agend_git_kill_only_fail_closed_2524.rs.
         let (home, exe) = fixture("off", &["agend-git", "agentic-git"]);
         symlink_shim_at(&home, &exe, false);
         let agend = exe.with_file_name("agend-git");
@@ -164,8 +176,10 @@ mod tests {
 
     #[test]
     fn flag_on_missing_agentic_falls_back_to_agend_git() {
-        // Fail-safe: flag on but agentic-git not shipped → git must NOT be left
-        // unguarded; it falls back to the agend-git floor.
+        // Flag on but agentic-git not shipped → `git` points back at the agend-git
+        // floor. #2524 P3b: agend-git now FAILS CLOSED on git, so this is a loud
+        // dead-end (never unguarded git), not a working fallback. Target pin only;
+        // fail-closed runtime is covered by the kill-only fail-closed test.
         let (home, exe) = fixture("fallback", &["agend-git"]);
         symlink_shim_at(&home, &exe, true);
         let agend = exe.with_file_name("agend-git");
