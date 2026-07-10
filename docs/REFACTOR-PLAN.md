@@ -55,14 +55,16 @@ wanting raw control. Makes "forgot `AGEND_GIT_BYPASS`" structurally
 impossible daemon-side and kills a flaky-test class.
 **Effort** 0.5–1 day · **Risk** low, mechanical, reviewable per call-site ·
 **Source** survey 05-R1.
-**Status** ✅ First slice done — PR #2068. `git_cmd`/`git_ok` landed; 4 modules
-migrated + sealed (`branch_sweep`, `worktree_cleanup`, `worktree_pool`,
-`binding`) by the `tests/daemon_git_helper_invariant.rs` per-slice
-`MODULE_SCOPE` scanner (FAILs CI on an unmarked raw `Command::new("git")` in a
-sealed module). **Scope correction**: the daemon has **~150** raw git sites
-across **~25** modules (not the ~51 estimate above); `MODULE_SCOPE` grows
-monotonically as each later slice adds its module, so the seal never claims
-unearned coverage. Remaining-module migration is the backlog: task `t-…766-17`.
+**Status** ✅ Production closeout (2026-07). `git_cmd`/`git_ok` landed in
+#2068; subsequent slices sealed worktree lifecycle, claim/deploy, auto_release,
+`git_worktree` + pool GC (#2702), then every remaining daemon/MCP module that
+already used the helpers with **zero production raw** `Command::new("git")`
+(admin, conflict_notify, per-tick GC helpers, binding_state, ci/checkout,
+dispatch_hook, force_release). `MODULE_SCOPE` in
+`tests/daemon_git_helper_invariant.rs` is the authority list — grows
+monotonically. Intentional residual raw: `git_helpers` (implementation) and
+`bin/agend-git` (gated shim). Optional backlog: no-cwd bypass helper for
+`git_worktree::remove_force`'s empty-`source_repo` allow-marked branch.
 
 ### W1.3 Quick wins (one small PR each)
 - Unify the duplicated tool-timeout maps (`request_dedup.rs:465` ↔
