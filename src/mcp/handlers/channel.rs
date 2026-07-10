@@ -174,6 +174,19 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         },
     ) {
         Ok(msg) => {
+            // A plain reply (no explicit `message_id`) answers the CURRENT user turn.
+            // Capture that turn's persistent inbox-row ids NOW — BEFORE
+            // `record_reply_outcome` below, which `take()`s `pending_user_turn` — so we
+            // can settle them. The daemon drain armed the real delivery ids into
+            // `group_msg_ids` (#2042: replying to any id settles the whole logical turn).
+            let plain_reply_group_ids: Vec<String> = if message_id.is_none() {
+                crate::daemon::heartbeat_pair::snapshot_for(instance_name)
+                    .pending_user_turn
+                    .map(|t| t.group_msg_ids)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             // #1665: reply delivered — closes the user-turn (no warn at sweep).
             crate::reply_ledger::record_reply_outcome(instance_name, true);
             // #2622 PR-3 Fork C: a targeted reply also settles the persistent
@@ -182,6 +195,14 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
             // stops redelivering once it's actually been answered.
             if let Some(msg_id) = message_id {
                 crate::inbox::storage::settle_read_by_id(home, instance_name, msg_id);
+            } else {
+                // Plain-reply path: settle the whole turn's group so the row can't stay
+                // `delivering` and get reverted-to-unread + RE-DELIVERED by
+                // `reclaim_stale_delivering` after the 600s TTL — the telegram
+                // double-reply. Same action as the `message_id` path; id source differs.
+                for id in &plain_reply_group_ids {
+                    crate::inbox::storage::settle_read_by_id(home, instance_name, id);
+                }
             }
             // Sprint 59 Wave 1 PR-4: surface the pending-decision /
             // resolved-decision IDs so caller observability is
