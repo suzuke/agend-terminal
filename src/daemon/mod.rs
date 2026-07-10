@@ -758,6 +758,11 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     // inherits this and can restart normally in turn.
     RUN_CORE_ACTIVE.store(true, Ordering::Release);
 
+    // PR-D6: fail LOUD if the retired `AGEND_WORKTREE_PRUNE_LIVE` is still set —
+    // sweep gating is now `AGEND_WORKTREE_AUTO_CLEANUP` only. One warn at boot so
+    // an operator carrying the stale flag learns it is ignored (not silent).
+    crate::worktree_cleanup::warn_if_prune_live_retired();
+
     // For the handoff path, the channel inits post-lock (its registry attaches
     // via the #945 pending-registry bridge that `init_daemon_services` arms),
     // so pass None here; `Resolved` carries the already-inited channel.

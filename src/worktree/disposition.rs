@@ -65,7 +65,7 @@ pub(crate) enum ReclaimState {
     /// `released_at` present + past grace, but the hard delete is unactionable
     /// (lock contention / owning-repo unresolved / remove failed) and the archive
     /// gate is on → archive instead. PR-D·D4: this is a REMOVAL-time archive-belt
-    /// outcome (`gc_remove_one`'s #2550 W5 `AGEND_WORKTREE_GC` fall-through), NOT an
+    /// outcome (`gc_remove_one`'s #2550 W5 `AGEND_WORKTREE_ARCHIVE_FALLBACK` fall-through), NOT an
     /// `evaluate_candidate` verdict — the candidate JUDGMENT D4 delegates only
     /// produces `NotEligible`/`CleanReleaseHardDelete`/`ForceReclaim`. This belt
     /// outcome routes natively still (the disposition LADDER is D5), so it is
