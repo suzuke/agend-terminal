@@ -111,6 +111,7 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
     static OPENCODE: OnceLock<BackendProfile> = OnceLock::new();
     static CODEX: OnceLock<BackendProfile> = OnceLock::new();
     static CLAUDE: OnceLock<BackendProfile> = OnceLock::new();
+    static GROK: OnceLock<BackendProfile> = OnceLock::new();
     // Shell + Raw share one profile — every legacy source treats `Shell | Raw(_)`
     // identically (empty patterns, default behavioral, generic productivity, Idle).
     static EMPTY: OnceLock<BackendProfile> = OnceLock::new();
@@ -120,7 +121,51 @@ pub fn profile(backend: &Backend) -> &'static BackendProfile {
         Backend::OpenCode => OPENCODE.get_or_init(opencode_profile),
         Backend::Codex => CODEX.get_or_init(codex_profile),
         Backend::ClaudeCode => CLAUDE.get_or_init(claudecode_profile),
+        Backend::Grok => GROK.get_or_init(grok_profile),
         Backend::Shell | Backend::Raw(_) => EMPTY.get_or_init(empty_profile),
+    }
+}
+
+/// Grok Build CLI — MVP detection profile (calibrated against Grok 0.2.93 PTY
+/// smoke). Patterns are deliberately thin: enough for dispatch ready/idle/active
+/// and the project-trust modal. Finer states (rate-limit, auth, etc.) land with
+/// real fixtures later.
+fn grok_profile() -> BackendProfile {
+    BackendProfile {
+        patterns: vec![
+            // Trust / permission chrome — before Idle so a stuck trust modal
+            // is not misread as ready-to-dispatch Idle.
+            (
+                AgentState::PermissionPrompt,
+                r"Run Grok Build in a project directory\?|Do you trust",
+            ),
+            // Active turn chrome (smoke: Thinking… / Responding…).
+            (
+                AgentState::Active,
+                r"Thinking…|Thinking\.\.\.|Responding…|Responding\.\.\.|esc to interrupt",
+            ),
+            // Idle / ready chrome.
+            (
+                AgentState::Idle,
+                r"\? for shortcuts|Enter:send|always-approve",
+            ),
+            (AgentState::Idle, r"Grok Build|❯"),
+        ],
+        behavioral: BehavioralConfig {
+            silence_thinking_ms: 3000,
+            silence_idle_ms: 8000,
+        },
+        productivity: ProductivityConfig {
+            // Reuse generic save-banner markers; Grok-specific completion
+            // glyphs can be added once we have state-replay fixtures.
+            markers: crate::behavioral::GENERIC_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Generic),
+        },
+        context_pattern: None,
+        input_line_markers: &["❯"],
+        initial_state: AgentState::Starting,
     }
 }
 
@@ -538,6 +583,7 @@ mod context_pattern_tests {
         assert!(!has(&Backend::Codex));
         assert!(!has(&Backend::OpenCode));
         assert!(!has(&Backend::Agy));
+        assert!(!has(&Backend::Grok));
         assert!(!has(&Backend::Shell));
         assert!(!has(&Backend::Raw("x".into())));
     }

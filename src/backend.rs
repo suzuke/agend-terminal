@@ -20,6 +20,10 @@ pub enum Backend {
     /// project-local config at `<workdir>/.antigravitycli/mcp_config.json`.
     /// Added in #987.
     Agy,
+    /// xAI Grok Build CLI (`grok`). Full-screen TUI coding agent.
+    /// Project-local MCP at `<workdir>/.grok/config.toml` (`[mcp_servers.*]`).
+    /// MVP: typed inject + trust dismiss; no lifecycle hooks yet.
+    Grok,
     /// Generic shell (bash/zsh/sh). No preset wiring — inject/ready/resume are
     /// all no-ops. Command defaults to `$SHELL` or the platform default
     /// (`/bin/bash` on Unix, `cmd.exe` on Windows).
@@ -47,7 +51,8 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
-            | Backend::Agy => true,
+            | Backend::Agy
+            | Backend::Grok => true,
             Backend::Shell | Backend::Raw(_) => false,
         }
     }
@@ -110,6 +115,9 @@ impl Backend {
                 "OPENCODE_CONFIG",
                 "OPENCODE_API_KEY",
             ],
+            // OAuth also lives under ~/.grok/auth.json (file-based); the env
+            // key is the headless/CI path. GROK_HOME may be used for isolation.
+            Backend::Grok => &["XAI_API_KEY"],
             Backend::Shell | Backend::Raw(_) => &[],
         }
     }
@@ -127,6 +135,7 @@ impl Backend {
             "opencode" | "opencode-cli" => Backend::OpenCode,
             // #1580: "gemini"/"gemini-cli" retired → fall through to Raw.
             "agy" | "antigravity" | "antigravity-cli" => Backend::Agy,
+            "grok" | "grok-build" | "grok-cli" | "grok-build-cli" => Backend::Grok,
             "shell" | "bash" | "zsh" | "sh" => Backend::Shell,
             _ => Backend::Raw(trimmed.to_string()),
         }
@@ -145,6 +154,7 @@ impl Backend {
             // parse_str still accepts the "agy" alias for backward-compat with
             // any fleet.yaml entries written before #995.
             Backend::Agy => "antigravity-cli",
+            Backend::Grok => "grok",
             Backend::Shell => "shell",
             Backend::Raw(s) => s.as_str(),
         }
@@ -169,7 +179,7 @@ impl Backend {
     /// test (codex-44cea9, 2026-06-10) surfaced this.
     pub fn input_prompt_marker(&self) -> Option<&'static str> {
         match self {
-            Backend::ClaudeCode => Some("❯"),
+            Backend::ClaudeCode | Backend::Grok => Some("❯"),
             Backend::Agy => Some(">"),
             _ => None,
         }
@@ -224,7 +234,8 @@ impl Backend {
             | Backend::KiroCli
             | Backend::Codex
             | Backend::OpenCode
-            | Backend::Agy => self.preset().command.to_string(),
+            | Backend::Agy
+            | Backend::Grok => self.preset().command.to_string(),
             Backend::Shell => crate::shell_command(),
             Backend::Raw(path) => path.clone(),
         }
@@ -641,6 +652,44 @@ impl Backend {
                 fleet_mcp_supported: true,
                 ..DEFAULTS
             },
+            Backend::Grok => BackendPreset {
+                command: "grok",
+                // Unattended tool execution (fleet dispatch). Matches Claude's
+                // --dangerously-skip-permissions / Agy's same flag.
+                args: &["--always-approve"],
+                // Splash + empty prompt (smoke-verified against Grok 0.2.93).
+                ready_pattern: "Grok Build|❯|always-approve",
+                // Full-screen TUI: bulk write does not land; paced inject required
+                // (inject-focus smoke 2026-07-10).
+                typed_inject: true,
+                // Grok's `--continue` EXIT 2s when no session exists for cwd
+                // ("No session found for current directory"). Unlike Claude, it
+                // does not soft-fallback. Until has_resumable_session is wired
+                // to ~/.grok/sessions/<encoded-cwd>/, keep resume off so Fresh
+                // spawns (and the --agents path, which always appends resume
+                // flags) stay bootable. Operator can still /resume inside the
+                // TUI. Follow-up: encode-cwd session probe + ContinueInCwd.
+                resume_mode: ResumeMode::NotSupported,
+                quit_command: "/exit",
+                // Shared AGENTS.md (also Codex/OpenCode). Grok reads project rules
+                // from AGENTS.md / Claude.md automatically.
+                instructions_path: "AGENTS.md",
+                instructions_shared: true,
+                ready_timeout_secs: 30,
+                // Project trust modal fires on first tool use in a new workdir
+                // ("Run Grok Build in a project directory?"). Default cursor is
+                // the accept option → single Enter. Anchored per #468. The
+                // inject path submits with one CR; this dismiss covers the
+                // follow-up trust modal (empirically needed for a turn to run).
+                dismiss_patterns: &[DismissPattern {
+                    label: r"(?m)^[^A-Za-z\n]*Run Grok Build in a project directory\?",
+                    sequence: b"\r",
+                }],
+                // configure_grok writes <workdir>/.grok/config.toml
+                // [mcp_servers.agend-terminal] (project-scoped; no HOME write).
+                fleet_mcp_supported: true,
+                ..DEFAULTS
+            },
             // Shell and Raw have no preset behavior. `command` is `""` as a
             // sentinel — callers that need the actual spawn path should use
             // [`Backend::command_string`], which resolves Shell to `$SHELL`
@@ -681,6 +730,8 @@ impl Backend {
             // covers the user-facing "antigravity" alias for hand-edited
             // fleet.yaml entries.
             Some(Backend::Agy)
+        } else if basename == "grok" || basename.starts_with("grok-") {
+            Some(Backend::Grok)
         } else {
             None
         }
@@ -695,6 +746,7 @@ impl Backend {
             Backend::OpenCode,
             // #1580: Gemini retired; Agy (its successor) carries the Google engine.
             Backend::Agy,
+            Backend::Grok,
         ]
     }
 
@@ -769,6 +821,7 @@ impl Backend {
             Backend::OpenCode => Some("opencode"),
             Backend::KiroCli => Some("kiro"),
             Backend::Agy => Some("agy"),
+            Backend::Grok => Some("grok"),
             Backend::Shell | Backend::Raw(_) => None,
         }
     }
@@ -870,6 +923,8 @@ impl Backend {
             Backend::Codex => "0.118.0",
             Backend::OpenCode => "1.4.0",
             Backend::Agy => "1.0.0",
+            // Patterns + trust dismiss calibrated against live PTY smoke.
+            Backend::Grok => "0.2.93",
             Backend::Shell | Backend::Raw(_) => "n/a",
         }
     }
@@ -1283,6 +1338,7 @@ mod tests {
             Backend::Codex,
             Backend::OpenCode,
             Backend::KiroCli,
+            Backend::Grok,
             Backend::Shell,
             Backend::Raw("x".into()),
         ] {
@@ -1306,6 +1362,7 @@ mod tests {
             Backend::Codex,
             Backend::OpenCode,
             Backend::Agy,
+            Backend::Grok,
             Backend::Shell,
             Backend::Raw("x".to_string()),
         ] {
@@ -1346,6 +1403,7 @@ mod tests {
             Backend::Codex,
             Backend::OpenCode,
             Backend::Agy,
+            Backend::Grok,
             Backend::Shell,
             Backend::Raw("x".to_string()),
         ] {
@@ -1357,6 +1415,27 @@ mod tests {
     }
 
     #[test]
+    fn grok_preset_mvp_inject_and_trust() {
+        let p = Backend::Grok.preset();
+        assert_eq!(p.command, "grok");
+        assert_eq!(p.args, &["--always-approve"]);
+        assert!(p.typed_inject, "Grok TUI requires paced inject");
+        assert_eq!(p.submit_key, "\r");
+        assert_eq!(p.instructions_path, "AGENTS.md");
+        assert!(p.instructions_shared);
+        assert!(p.fleet_mcp_supported);
+        assert!(matches!(p.resume_mode, ResumeMode::NotSupported));
+        let trust = p
+            .dismiss_patterns
+            .iter()
+            .find(|dp| dp.label.contains("project directory"))
+            .expect("Grok must dismiss project-directory trust modal");
+        assert_eq!(trust.sequence, b"\r");
+        assert_eq!(Backend::Grok.input_prompt_marker(), Some("❯"));
+        assert_eq!(Backend::Grok.credential_env_keys(), &["XAI_API_KEY"]);
+    }
+
+    #[test]
     fn from_command_detection() {
         assert_eq!(Backend::from_command("claude"), Some(Backend::ClaudeCode));
         assert_eq!(Backend::from_command("kiro-cli"), Some(Backend::KiroCli));
@@ -1365,6 +1444,11 @@ mod tests {
         // #1580: gemini retired — `gemini` no longer maps to a managed backend.
         assert_eq!(Backend::from_command("gemini"), None);
         assert_eq!(Backend::from_command("agy"), Some(Backend::Agy));
+        assert_eq!(Backend::from_command("grok"), Some(Backend::Grok));
+        assert_eq!(
+            Backend::from_command("/Users/x/.grok/bin/grok"),
+            Some(Backend::Grok)
+        );
         // Case insensitive
         assert_eq!(Backend::from_command("Claude"), Some(Backend::ClaudeCode));
         assert_eq!(
@@ -1469,19 +1553,22 @@ mod tests {
             Backend::Codex,
             Backend::OpenCode,
             Backend::Agy,
+            Backend::Grok,
             Backend::Shell,
             Backend::Raw("/x".to_string()),
         ];
-        let submit_key = ["\r"; 7];
-        let inject_prefix = ["", "", "", "\r", "\r", "", ""];
-        let typed_inject = [false, false, true, true, true, false, false];
-        let quit_command = ["/exit", "/quit", "exit", "/exit", "/exit", "exit", "exit"];
-        let instructions_shared = [false, false, true, true, true, false, false];
-        let inject_on_ready = [false; 7];
-        let ready_timeout = [30u64, 30, 20, 45, 20, 10, 10];
-        let fresh_some = [false, false, true, false, false, false, false];
-        let fleet_mcp = [true, true, true, true, true, false, false];
-        let redraw = [false, true, false, false, false, false, false];
+        let submit_key = ["\r"; 8];
+        let inject_prefix = ["", "", "", "\r", "\r", "", "", ""];
+        let typed_inject = [false, false, true, true, true, true, false, false];
+        let quit_command = [
+            "/exit", "/quit", "exit", "/exit", "/exit", "/exit", "exit", "exit",
+        ];
+        let instructions_shared = [false, false, true, true, true, true, false, false];
+        let inject_on_ready = [false; 8];
+        let ready_timeout = [30u64, 30, 20, 45, 20, 30, 10, 10];
+        let fresh_some = [false, false, true, false, false, false, false, false];
+        let fleet_mcp = [true, true, true, true, true, true, false, false];
+        let redraw = [false, true, false, false, false, false, false, false];
         for (i, b) in backends.iter().enumerate() {
             let p = b.preset();
             assert_eq!(p.submit_key, submit_key[i], "submit_key {b:?}");
@@ -1625,11 +1712,11 @@ mod tests {
     }
 
     #[test]
-    fn all_backends_returns_five() {
-        // #987 bumped 5 → 6 with Backend::Agy (gemini-cli's successor); #1580
-        // drops back to 5 as gemini-cli is retired:
-        // ClaudeCode, KiroCli, Codex, OpenCode, Agy.
-        assert_eq!(Backend::all().len(), 5);
+    fn all_backends_returns_six() {
+        // #987: 5 → 6 with Agy; #1580: back to 5 (gemini retired); Grok MVP: 6.
+        // ClaudeCode, KiroCli, Codex, OpenCode, Agy, Grok.
+        assert_eq!(Backend::all().len(), 6);
+        assert!(Backend::all().contains(&Backend::Grok));
     }
 
     #[test]
@@ -1650,9 +1737,13 @@ mod tests {
         assert_eq!(Backend::parse_str("agy"), Backend::Agy);
         assert_eq!(Backend::parse_str("antigravity"), Backend::Agy);
         assert_eq!(Backend::parse_str("antigravity-cli"), Backend::Agy);
+        assert_eq!(Backend::parse_str("grok"), Backend::Grok);
+        assert_eq!(Backend::parse_str("grok-build"), Backend::Grok);
+        assert_eq!(Backend::parse_str("grok-cli"), Backend::Grok);
         // Case insensitive
         assert_eq!(Backend::parse_str("Claude"), Backend::ClaudeCode);
         assert_eq!(Backend::parse_str("AGY"), Backend::Agy);
+        assert_eq!(Backend::parse_str("GROK"), Backend::Grok);
         // Whitespace trim
         assert_eq!(Backend::parse_str("  claude  "), Backend::ClaudeCode);
     }
