@@ -12,6 +12,10 @@
 use crate::agent_ops::validate_branch;
 use std::path::{Path, PathBuf};
 
+/// PR-D · D1: the unified `terminal_disposition` classifier seam (spike §1).
+/// Additive — no production caller yet; D2–D4 wire the call sites.
+pub(crate) mod disposition;
+
 /// Sprint 57 Wave 4 (#546 Item 4) canonical worktree path:
 /// `$AGEND_HOME/worktrees/<agent>/<branch>/`. Single source of truth
 /// — every site that needs to know "where does agent X's branch Y
