@@ -403,6 +403,51 @@ pub(crate) fn decide_release(
     }
 }
 
+/// PR-D · D2 (#2711): the bound-path release gate, delegated to the unified
+/// [`crate::worktree::disposition::terminal_disposition`] classifier (D1) instead
+/// of an inline boolean. Pure, so the equivalence pin can lock it exhaustively.
+///
+/// The classifier owns the normal L1/L2 invariant — release only on a POSITIVE
+/// PR-invariant, for both the clean-`Release` and the #2697 dirty-but-releasable
+/// (`SkipDirtyWorktree`) arms. The auto-release path exercises only L0+L1/L2, so
+/// the L0 protection fields are fed pass-through values (the pre-D2 gate never
+/// consulted `.agend-managed` / `.agend-pinned` / occupancy) and the L3 (GC)
+/// fields are inert — with `binding_present=true` the classifier never reaches the
+/// binding-absent branch that reads them.
+///
+/// `reviewer_bypassed` (the #2010 2a reviewer-binding release) is `releasable ==
+/// false` BY CONSTRUCTION (it is only ever set inside the `!releasable` block), so
+/// the classifier keeps it. The bypass therefore releases a CLEAN reviewer
+/// worktree via a SEPARATE explicit arm; a DIRTY one still retains (protecting
+/// review WIP). This reproduces the pre-D2
+/// `matches!(Release) || (matches!(SkipDirtyWorktree) && releasable)` expression
+/// byte-for-byte on every reachable `(decision, releasable, reviewer_bypassed)` —
+/// locked by [`tests::should_release_now_equals_pre_d2_gate`].
+fn should_release_now(
+    decision: &ReleaseDecision,
+    releasable: bool,
+    reviewer_bypassed: bool,
+) -> bool {
+    use crate::worktree::disposition::{
+        terminal_disposition, Disposition, DispositionInput, ReclaimState,
+    };
+    let input = DispositionInput {
+        // L0 pass-through: the pre-D2 auto-release gate never consulted these.
+        daemon_managed: true,
+        pinned: false,
+        in_use: Some(false),
+        // L1/L2: the real sub-verdicts the classifier composes.
+        binding_present: true,
+        release_decision: decision.clone(),
+        releasable_by_invariant: releasable,
+        // L3 (GC) inert on the bound path — never read when binding_present.
+        agent_alive: Some(false),
+        reclaim: ReclaimState::NotEligible,
+    };
+    matches!(terminal_disposition(&input), Disposition::Release)
+        || (reviewer_bypassed && matches!(decision, ReleaseDecision::Release))
+}
+
 /// Return the queue directory path. Caller is responsible for ensuring
 /// it exists before reading; [`enqueue_intent`] handles creation on
 /// the write side.
@@ -680,7 +725,7 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
             }
         }
     }
-    if !releasable {
+    let reviewer_bypassed = if !releasable {
         // #2010 2a: the open-PR invariant holds an IMPLEMENTER's worktree until
         // the PR is terminal (correct — it may be needed for rework/merge), but
         // it must NOT hold a REVIEWER's binding once the reviewer's own review
@@ -699,11 +744,14 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         if reviewer_binding_release_bypass(intent, task.as_ref(), &assignee, sender_role.as_deref())
         {
             tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, role = ?sender_role, "auto_release: reviewer-binding bypass — reviewer verdict + review task terminal, releasing if clean (#2010 2a)");
+            true
         } else {
             tracing::debug!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, "auto_release: invariant not yet satisfied — retaining for retry");
             return IntentOutcome::Retry;
         }
-    }
+    } else {
+        false
+    };
 
     // ── final gate (dirty / opt-out / bound), must-fix #6.
     let worktree_dirty = binding
@@ -720,8 +768,11 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
     // AND notifies (wip_notice_recipient → team orchestrator, #2696) before
     // removing, so no WIP is lost. A NON-releasable dirty worktree (open PR /
     // Unknown / reviewer-bypass) still retains — that WIP may be active work.
-    let release_now = matches!(decision, ReleaseDecision::Release)
-        || (matches!(decision, ReleaseDecision::SkipDirtyWorktree) && releasable);
+    // PR-D · D2 (#2711): delegate this gate to the unified `terminal_disposition`
+    // classifier instead of the inline boolean. `reviewer_bypassed` carries the
+    // #2010 clean-reviewer release the classifier can't encode (releasable=false by
+    // construction). Byte-identical — `should_release_now` + its equivalence pin.
+    let release_now = should_release_now(&decision, releasable, reviewer_bypassed);
     if release_now {
         // codex gap ②: CAS+release must be ONE atomic critical section under
         // `.binding.json.lock` — the same lock `bind_full` holds (binding.rs:67)
@@ -1096,6 +1147,48 @@ mod tests {
             !reviewer_binding_release_bypass(&intent, None, "reviewer-1", rev),
             "missing task must not bypass"
         );
+    }
+
+    /// PR-D · D2 (#2711) equivalence pin: `should_release_now` — the classifier
+    /// delegation — must reproduce the pre-D2 inline gate
+    /// `matches!(Release) || (matches!(SkipDirtyWorktree) && releasable)`
+    /// byte-for-byte on EVERY reachable `(decision, releasable, reviewer_bypassed)`.
+    ///
+    /// Reachability at the gate (`process_intent`): the code returns `Retry` before
+    /// the gate unless `releasable || reviewer_bypassed`, and `reviewer_bypassed` is
+    /// only ever set inside the `!releasable` block — so at the gate EXACTLY ONE of
+    /// the two is true. The reviewer-bypass arm (releasable=false) is where the
+    /// classifier ALONE would drift: it keeps a clean reviewer worktree the pre-D2
+    /// gate released, so the explicit bypass arm restores it — and must NOT release
+    /// a dirty one (review-WIP protection). This pin locks BOTH directions. (The
+    /// two unreachable combos — (false,false) already returned Retry; (true,true)
+    /// can't arise since bypass ⟹ !releasable — are deliberately not asserted.)
+    #[test]
+    fn should_release_now_equals_pre_d2_gate() {
+        // The pre-D2 inline expression, verbatim (main 8ddf26f1) — the baseline.
+        fn pre_d2(decision: &ReleaseDecision, releasable: bool) -> bool {
+            matches!(decision, ReleaseDecision::Release)
+                || (matches!(decision, ReleaseDecision::SkipDirtyWorktree) && releasable)
+        }
+        let decisions = [
+            ReleaseDecision::Release,
+            ReleaseDecision::SkipDirtyWorktree,
+            ReleaseDecision::SkipOptOut,
+            ReleaseDecision::SkipNotBound,
+            ReleaseDecision::SkipNoAssignee,
+            ReleaseDecision::SkipTaskMissing,
+        ];
+        for d in &decisions {
+            // Reachable gate states: exactly one of {releasable, reviewer_bypassed}.
+            for &(releasable, reviewer_bypassed) in &[(true, false), (false, true)] {
+                assert_eq!(
+                    should_release_now(d, releasable, reviewer_bypassed),
+                    pre_d2(d, releasable),
+                    "release_now DRIFT: decision={d:?} releasable={releasable} \
+                     reviewer_bypassed={reviewer_bypassed}",
+                );
+            }
+        }
     }
 
     /// #2010 codex-r1 §3.9 — the implementer self-verdict EXPLOIT must not
