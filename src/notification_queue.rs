@@ -903,7 +903,9 @@ mod tests {
         enqueue_coalesced_auto(&home, a, rl).expect("rl#1");
         {
             // Simulate a drainer mid-claim by holding the per-agent drain lock.
-            let _held = crate::store::try_acquire_file_lock(&drain_lock_path(&home, a))
+            // #2666 uncovered facet: acquire via the retrying `acquire_drain_lock`,
+            // not a raw acquire that flakes on a transient Err under llvm-cov.
+            let _held = acquire_drain_lock(&drain_lock_path(&home, a))
                 .expect("lock op")
                 .expect("lock acquired");
             enqueue_coalesced_auto(&home, a, rl).expect("rl#2 under held lock → fallback append");
@@ -1460,7 +1462,9 @@ mod tests {
     fn try_drain_reports_unavailable_while_lock_held_2028() {
         let home = tmp_home("unavail-lock");
         enqueue(&home, "a", "queued").expect("enqueue");
-        let guard = crate::store::try_acquire_file_lock(&drain_lock_path(&home, "a"))
+        // #2666 uncovered facet: retrying acquire, not a raw one that flakes on a
+        // transient Err under llvm-cov.
+        let guard = acquire_drain_lock(&drain_lock_path(&home, "a"))
             .expect("lock open")
             .expect("lock acquired");
         assert!(
@@ -1486,7 +1490,9 @@ mod tests {
     fn flusher_drain_still_collapses_contention_to_empty_2028() {
         let home = tmp_home("flusher-collapse");
         enqueue(&home, "a", "queued").expect("enqueue");
-        let _guard = crate::store::try_acquire_file_lock(&drain_lock_path(&home, "a"))
+        // #2666 uncovered facet: retrying acquire, not a raw one that flakes on a
+        // transient Err under llvm-cov.
+        let _guard = acquire_drain_lock(&drain_lock_path(&home, "a"))
             .expect("lock open")
             .expect("lock acquired");
         assert!(
@@ -1571,5 +1577,29 @@ mod tests {
             "the ORIGINAL (first) error must survive retry exhaustion, not the last retry's"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2666 uncovered-facet guard (flake recurrence #3, t-…44436-10): every
+    /// drain-lock acquisition in THIS file's test *setups* must route through the
+    /// retrying `acquire_drain_lock` (retries past a transient `Err`), NOT a raw
+    /// `store::try_acquire_file_lock` against a `&drain_lock_path(..)`, whose
+    /// spurious `Err` under the Coverage job's llvm-cov fd pressure panicked and
+    /// reddened CI three times. #2666 hardened the production acquire but not the
+    /// test-setup raw acquires; this pins the fix so a regressed raw acquire fails
+    /// loudly here instead of flaking under Coverage.
+    #[test]
+    fn test_setups_acquire_drain_lock_with_retry_not_raw() {
+        let src = include_str!("notification_queue.rs");
+        // Assemble the forbidden call form at runtime so THIS test's own source
+        // never contains the needle verbatim (no self-match). The production
+        // acquire + `test_hooks::raw_acquire` call `try_acquire_file_lock(lock_path)`
+        // / `(p)`, so this drain-lock-path-specific form matches ONLY test setups.
+        let raw_setup_acquire = format!("{}{}", "try_acquire_file_lock", "(&drain_lock_path");
+        let hits = src.matches(raw_setup_acquire.as_str()).count();
+        assert_eq!(
+            hits, 0,
+            "drain-lock test setups must use `acquire_drain_lock` (retry-past-Err), \
+             not a raw drain-lock `try_acquire_file_lock` — see #2666 / flake recurrence #3"
+        );
     }
 }
