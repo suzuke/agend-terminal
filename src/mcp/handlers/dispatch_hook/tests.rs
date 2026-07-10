@@ -173,6 +173,148 @@ fn ensure_branch_exists_refreshes_stale_origin_before_create_1755() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2703: the dispatch auto-create path must base a NEW branch on the repo's
+/// DEFAULT branch (`origin/HEAD` via `git_helpers::default_branch`), NOT a
+/// hard-coded `origin/main`. External report (cheerc, 2/2 repro): a repo whose
+/// default is `dev` got every dispatched branch based on `origin/main`, forcing
+/// an impl-side `reset --hard origin/dev`. RED before the mod.rs:488
+/// `default_branch()` swap (pre-fix the created branch tips at origin/main).
+#[test]
+fn dispatch_auto_create_bases_on_repo_default_branch_2703() {
+    let home = std::env::temp_dir().join(format!("agend-2703-devdefault-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let origin = workspace.join("o.git");
+    let repo = workspace.join("dev-agent");
+
+    let git = |args: &[&str], dir: &std::path::Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Bare origin whose DEFAULT branch is `dev`, with main != dev tips.
+    std::fs::create_dir_all(&origin).ok();
+    git(&["init", "--bare", "-b", "main"], &origin);
+    std::fs::create_dir_all(&repo).ok();
+    git(&["init", "-b", "main"], &repo);
+    git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &repo,
+    );
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "MAIN",
+        ],
+        &repo,
+    );
+    let main_sha = git(&["rev-parse", "HEAD"], &repo);
+    git(&["push", "-q", "origin", "main"], &repo);
+    git(&["checkout", "-b", "dev"], &repo);
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "DEV",
+        ],
+        &repo,
+    );
+    let dev_sha = git(&["rev-parse", "HEAD"], &repo);
+    git(&["push", "-q", "origin", "dev"], &repo);
+    // origin default → dev (bare HEAD + local remote-tracking `origin/HEAD`).
+    git(&["symbolic-ref", "HEAD", "refs/heads/dev"], &origin);
+    git(&["fetch", "origin", "--quiet"], &repo);
+    git(&["remote", "set-head", "origin", "dev"], &repo);
+    assert_ne!(main_sha, dev_sha);
+    assert_eq!(
+        crate::git_helpers::default_branch(&repo),
+        "dev",
+        "precondition: repo default must resolve to dev"
+    );
+
+    // fleet.yaml so dispatch resolves source_repo = repo.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  dev-agent:\n    backend: claude\n    working_directory: {}\n",
+            repo.display()
+        ),
+    )
+    .ok();
+
+    // Call the PRODUCTION dispatch entry.
+    let r = super::dispatch_auto_bind_lease(&home, "dev-agent", "T-2703", "feat/x-2703", None);
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+
+    // The created branch must base on origin/dev (the default), NOT origin/main.
+    let created_tip = git(&["rev-parse", "refs/heads/feat/x-2703"], &repo);
+    assert_eq!(
+        created_tip, dev_sha,
+        "#2703: dispatched branch must base on repo default (origin/dev), \
+         got {created_tip} (origin/main={main_sha})"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2703 invariance: a repo whose default IS `main` must stay byte-identical to
+/// the pre-fix literal — the dispatched branch still bases on `origin/main`.
+/// Guards the common case against regression when the `origin/main` literal
+/// became `format!("origin/{}", default_branch(src))` (default_branch → "main").
+#[test]
+fn dispatch_auto_create_main_default_invariance_2703() {
+    let home = std::env::temp_dir().join(format!("agend-2703-maininv-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "main-agent");
+    let repo = crate::paths::workspace_dir(&home).join("main-agent");
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let origin_main = git(&["rev-parse", "refs/remotes/origin/main"]);
+    assert_eq!(
+        crate::git_helpers::default_branch(&repo),
+        "main",
+        "precondition: default must resolve to main"
+    );
+
+    let r = super::dispatch_auto_bind_lease(&home, "main-agent", "T-inv", "feat/inv-2703", None);
+    assert!(r.is_ok(), "dispatch must succeed: {:?}", r.err());
+
+    let created = git(&["rev-parse", "refs/heads/feat/inv-2703"]);
+    assert_eq!(
+        created, origin_main,
+        "#2703: main-default repo base must stay origin/main (byte-identical)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn dispatch_with_branch_creates_binding_and_worktree() {
     let home = std::env::temp_dir().join(format!("agend-s53-prod-{}-bind", std::process::id()));

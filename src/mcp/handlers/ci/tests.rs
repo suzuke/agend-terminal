@@ -1105,6 +1105,102 @@ fn checkout_bind_true_writes_binding_marker_and_no_longer_arms_watch_2158_gr1() 
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #2703: `repo action=checkout bind:true` WITHOUT an explicit `from_ref` must
+/// default the new branch's base to the repo's DEFAULT branch (`origin/HEAD`),
+/// not a hard-coded `origin/main` (checkout.rs's `unwrap_or("origin/main")`).
+/// Same root as the dispatch-path fix (dispatch_hook/mod.rs:488). RED before the
+/// `default_branch()` swap (pre-fix the created branch tips at origin/main).
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_defaults_base_to_repo_default_branch_2703() {
+    let home = p778_tmp_home("2703-devdefault");
+    let parent = p778_tmp_home("2703-devdefault-src");
+    let origin = parent.join("o.git");
+    let source = parent.join("source-repo");
+
+    let git = |args: &[&str], dir: &std::path::Path| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Bare origin whose DEFAULT branch is `dev`, with main != dev tips.
+    std::fs::create_dir_all(&origin).ok();
+    git(&["init", "--bare", "-b", "main"], &origin);
+    std::fs::create_dir_all(&source).ok();
+    git(&["init", "-b", "main"], &source);
+    git(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &source,
+    );
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "MAIN",
+        ],
+        &source,
+    );
+    let main_sha = git(&["rev-parse", "HEAD"], &source);
+    git(&["push", "-q", "origin", "main"], &source);
+    git(&["checkout", "-b", "dev"], &source);
+    git(
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "DEV",
+        ],
+        &source,
+    );
+    let dev_sha = git(&["rev-parse", "HEAD"], &source);
+    git(&["push", "-q", "origin", "dev"], &source);
+    git(&["symbolic-ref", "HEAD", "refs/heads/dev"], &origin);
+    git(&["fetch", "origin", "--quiet"], &source);
+    git(&["remote", "set-head", "origin", "dev"], &source);
+    assert_ne!(main_sha, dev_sha);
+
+    // No `from_ref` supplied → must default to the repo default (origin/dev).
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/x-2703",
+            "bind": true,
+        }),
+        "checkout-2703-agent",
+    );
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+
+    let created = git(&["rev-parse", "refs/heads/feat/x-2703"], &source);
+    assert_eq!(
+        created, dev_sha,
+        "#2703: checkout bind:true default base must be repo default (origin/dev), \
+         got {created} (origin/main={main_sha})"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 /// #2533: `repo action=checkout bind:true task_id=...` (the reviewer-workflow
 /// self-claim path, §3.19.1) must thread the caller-supplied `task_id` into
 /// `binding.json` — pre-fix, `handle_checkout_repo_inner` hardcoded `""`

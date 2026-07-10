@@ -98,8 +98,14 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let mut auto_created_branch = false;
     let mut fetch_attempted = false;
     if bind {
-        let from_ref = args["from_ref"].as_str().unwrap_or("origin/main");
         let src = Path::new(&source_path);
+        // #2703: when the caller omits `from_ref`, default to the repo's DEFAULT
+        // branch (origin/HEAD via `default_branch`), not a hard-coded origin/main —
+        // mirrors the dispatch-path fix (dispatch_hook/mod.rs). An explicit
+        // `from_ref` override is unchanged. Main-default repos: default_branch →
+        // "main" → "origin/main", byte-identical to the prior literal.
+        let default_base = format!("origin/{}", crate::git_helpers::default_branch(src));
+        let from_ref = args["from_ref"].as_str().unwrap_or(&default_base);
         match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
             home,
             src,

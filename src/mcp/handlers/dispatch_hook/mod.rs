@@ -469,7 +469,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // auto_created_branch / fetch_attempted) and shares one decision
     // tree with `repo action=checkout bind:true` (the #784 entry).
     //
-    // `from_ref` is hard-coded to `"origin/main"` (mirror #784 default).
+    // #2703: `from_ref` is the repo's DEFAULT branch (`origin/<default_branch>`
+    // via `git_helpers::default_branch`, reading `origin/HEAD`), NOT a hard-coded
+    // `origin/main` (the #784 default, which mis-based every dispatched branch in a
+    // dev-default repo). Invariant for main-default (and origin/HEAD-blind) repos:
+    // `default_branch` returns "main" → `origin/main`, byte-identical to the prior
+    // literal (pinned by `dispatch_auto_create_main_default_invariance_2703`).
     //
     // Strict error contract (#781 Phase 3 r1, Path A — restored after
     // initial fail-soft fix was found to weaken Piece 7's structured-
@@ -485,7 +490,15 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let (auto_created_branch, fetch_attempted) = if reused {
         (false, false)
     } else {
-        ensure_branch_exists(home, &source_repo, branch, "origin/main", target)?
+        // #2703: base on the repo's default branch (origin/HEAD), not a literal
+        // origin/main. `default_branch` returns a bare branch name; qualify it with
+        // the push remote (`origin`, per #2047) so `resolve_from_ref_remote` splits
+        // it correctly for both the create base and the #1755 pre-create fetch.
+        let base = format!(
+            "origin/{}",
+            crate::git_helpers::default_branch(&source_repo)
+        );
+        ensure_branch_exists(home, &source_repo, branch, &base, target)?
     };
 
     // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
