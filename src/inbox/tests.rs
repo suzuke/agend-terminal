@@ -4883,3 +4883,167 @@ fn unread_obligation_summary_empty_inbox_is_default_2604() {
     assert!(s.oldest_obligation.is_none());
     fs::remove_dir_all(&home).ok();
 }
+
+// ── AUDIT3-005: every RUNTIME read-modify-write rewriter must PRESERVE an
+// unparseable line verbatim (re-emit it), NOT silently drop it — else a torn
+// enqueue / corrupt line is lost before startup `recover_half_writes` can
+// quarantine it. RED before the shared `parse_or_preserve_line` fix: each rewriter
+// drops the corrupt line when its rewrite fires (changed=true). One test per site
+// (mark_ci_watch_superseded already preserves via its else-branch, so it is a
+// control, not a fix target).
+const A3005_CORRUPT: &str = "{\"broken\":CORRUPT-005 unparseable torn line";
+
+fn a3005_read(home: &Path, name: &str) -> String {
+    fs::read_to_string(home.join("inbox").join(format!("{name}.jsonl"))).unwrap_or_default()
+}
+fn a3005_write(home: &Path, name: &str, good: &str) {
+    let dir = home.join("inbox");
+    fs::create_dir_all(&dir).ok();
+    fs::write(
+        dir.join(format!("{name}.jsonl")),
+        format!("{good}\n{A3005_CORRUPT}\n"),
+    )
+    .ok();
+}
+
+#[test]
+fn audit3_005_drain_preserves_corrupt_line() {
+    let home = tmp_home("a3005-drain");
+    a3005_write(
+        &home,
+        "ag",
+        &serde_json::to_string(&make_msg("s", "keep")).unwrap(),
+    );
+    let _ = drain(&home, "ag");
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "drain must PRESERVE the unparseable line, not silently drop it"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn audit3_005_ack_preserves_corrupt_line() {
+    let home = tmp_home("a3005-ack");
+    let deliv = msg()
+        .sender("s")
+        .id("m-ack")
+        .delivering_at(&secs_ago(5))
+        .build();
+    a3005_write(&home, "ag", &serde_json::to_string(&deliv).unwrap());
+    ack(&home, "ag", Some("m-ack"));
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "ack must PRESERVE the unparseable line"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn audit3_005_settle_read_by_id_preserves_corrupt_line() {
+    let home = tmp_home("a3005-settle");
+    let deliv = msg()
+        .sender("s")
+        .id("m-set")
+        .delivering_at(&secs_ago(5))
+        .build();
+    a3005_write(&home, "ag", &serde_json::to_string(&deliv).unwrap());
+    super::storage::settle_read_by_id(&home, "ag", "m-set");
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "settle_read_by_id must PRESERVE the unparseable line"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn audit3_005_ack_by_correlation_preserves_corrupt_line() {
+    let home = tmp_home("a3005-ackcorr");
+    // ack_by_correlation matches on `task_id` (despite the name), delivering + unread.
+    let m = msg()
+        .sender("s")
+        .id("m-c")
+        .task_id("corr-1")
+        .delivering_at(&secs_ago(5))
+        .build();
+    a3005_write(&home, "ag", &serde_json::to_string(&m).unwrap());
+    ack_by_correlation(&home, "ag", "corr-1");
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "ack_by_correlation must PRESERVE the unparseable line"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn audit3_005_clear_compact_preserves_corrupt_line() {
+    let home = tmp_home("a3005-clear");
+    a3005_write(
+        &home,
+        "ag",
+        &serde_json::to_string(&make_msg("s", "clear-me")).unwrap(),
+    );
+    let _ = clear_compact(&home, "ag", |_| None); // non-obligation → cleared (changed)
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "clear_compact must PRESERVE the unparseable line"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn audit3_005_sweep_expired_preserves_corrupt_line() {
+    let home = tmp_home("a3005-sweep");
+    // Ancient unread message → expired (UNREAD_TTL) → sweep rewrites (changed=true),
+    // leaving ONLY the corrupt line — also exercises the empty-`kept` remove-file path.
+    let old = msg()
+        .sender("s")
+        .text("old")
+        .timestamp("2020-01-01T00:00:00Z")
+        .build();
+    a3005_write(&home, "ag", &serde_json::to_string(&old).unwrap());
+    sweep_expired(&home);
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "sweep_expired must PRESERVE the unparseable line (it can't judge its TTL)"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn audit3_005_reclaim_stale_delivering_preserves_corrupt_line() {
+    let home = tmp_home("a3005-reclaim");
+    let stale = msg()
+        .sender("s")
+        .delivering_at(&secs_ago(1_000_000))
+        .build();
+    a3005_write(&home, "ag", &serde_json::to_string(&stale).unwrap());
+    reclaim_stale_delivering(&home);
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "reclaim_stale_delivering must PRESERVE the unparseable line"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Control: `mark_ci_watch_superseded` ALREADY preserves (its `else` re-pushes the
+/// raw line). Pins that it stays correct.
+#[test]
+fn audit3_005_mark_ci_watch_superseded_preserves_corrupt_line_control() {
+    let home = tmp_home("a3005-supersede");
+    let ci = msg()
+        .sender("system:ci")
+        .kind("ci-watch")
+        .id("m-ci")
+        .build();
+    let mut ci = ci;
+    ci.correlation_id = Some("repo@feat/x".into());
+    ci.text = "ci-watch system:ci repo@feat/x".into();
+    a3005_write(&home, "ag", &serde_json::to_string(&ci).unwrap());
+    mark_ci_watch_superseded(&home, "ag", "repo@feat/x", "m-new");
+    assert!(
+        a3005_read(&home, "ag").contains("CORRUPT-005"),
+        "mark_ci_watch_superseded must keep preserving the unparseable line"
+    );
+    fs::remove_dir_all(&home).ok();
+}
