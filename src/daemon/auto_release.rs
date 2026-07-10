@@ -804,7 +804,21 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
             }
         }
         let dirty = worktree_dirty.unwrap_or(false);
-        let outcome = crate::worktree_pool::release_full(home, &assignee, false);
+        // PR-D·D5: route through the shared `janitor::dispose` Release arm
+        // (== `release_full(home, agent, false)`). The lock/CAS/re-validation above
+        // and the fail-closed retain-on-failure below stay in THIS caller (D5-Q1);
+        // dispose owns only the Release→release_full mechanism binding.
+        let crate::daemon::janitor::DispositionOutcome::Released(outcome) =
+            crate::daemon::janitor::dispose(
+                home,
+                crate::worktree::disposition::Disposition::Release,
+                &assignee,
+                None,
+                || Ok(()),
+            )
+        else {
+            unreachable!("Release disposition yields Released");
+        };
         if outcome.released {
             tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, dirty, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
             IntentOutcome::Done
