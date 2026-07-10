@@ -92,8 +92,22 @@ cargo yank --version X.Y.Z --undo     # if yanked by mistake
 已修正的版本。然後透過正常流程把修正當成一個新的 patch release 發出去——絕不要
 重用或移動已發布的 tag。
 
+## Toolchain 政策（MSRV 地板 vs CI Check）
+
+兩條 pin，刻意分開（#1994 / #2339 / #2340）：
+
+| 角色 | Toolchain | 位置 | 目的 |
+|------|-----------|------|------|
+| **MSRV 地板** | **1.88**（宣告） | `Cargo.toml` `rust-version`、`ci.yml` 的 `MSRV check (1.88)`、`release.yml` gate | rustc ≥ 1.88 就能 `cargo install`／編譯 locked tree。擋住 Dependabot 靜默抬高地板（sysinfo 0.39 → rustc 1.95 那類）。 |
+| **CI Check** | **當日 stable**（浮動） | `ci.yml` `check` matrix（`dtolnay/rust-toolchain@stable` + fmt/clippy/test） | 抓新 clippy 與編譯器行為。**不**釘在 1.88。 |
+
+不要只因為 stable 前進（例如 1.96／1.97）就 bump `rust-version`。
+新 stable 上的 clippy 拒絕項用一個機械小 PR 修到 `main`，MSRV 維持 1.88。
+只有依賴**必須**升級且沒有 1.88 相容 pin 時才抬 MSRV——見下節。
+
 ## MSRV bumps
 
 `Cargo.toml` 裡的 `rust-version` 是唯一的真實來源；gate 的 `cargo +1.88 check`
-pin 必須在同一個做 bump 的 PR 裡一起更新（在 release.yml 裡 grep `1.88`）。把一次
-MSRV bump 當成一個 minor-version 事件來看待，並在 changelog 中特別點出來。
+pin 必須在同一個做 bump 的 PR 裡一起更新（在 `ci.yml` 與 `release.yml` 裡
+grep `1.88`）。把一次 MSRV bump 當成 minor-version 事件，並在 changelog 點出。
+新地板仍應偏保守，不要對齊「最新 stable」。

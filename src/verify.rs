@@ -196,7 +196,7 @@ pub fn run(
     // Kill test agents
     {
         let reg = registry.lock();
-        for (_, handle) in reg.iter() {
+        for handle in reg.values() {
             let mut child = handle.child.lock();
             let _ = child.kill();
         }

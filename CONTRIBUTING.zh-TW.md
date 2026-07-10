@@ -20,6 +20,16 @@ cargo clippy -- -D warnings          # must be warning-free
 
 CI 會在 Ubuntu + macOS + Windows 上複製這些步驟（`.github/workflows/ci.yml`）。
 
+**Toolchain 分軌（不要混為一談）：**
+
+- **MSRV 1.88**（`Cargo.toml` `rust-version`）— 支援的安裝地板。
+  CI 用獨立 job `MSRV check (1.88)`（`cargo +1.88 check --locked`）強制。
+  不要隨便抬高；細節見 `docs/RELEASING.zh-TW.md`。
+- **CI Check 用當日 stable**（`dtolnay/rust-toolchain@stable`）跑
+  fmt／clippy／test。本機請用較新的 rustup stable，讓 `clippy -D warnings`
+  與 CI 對齊。stable 前進、clippy 新拒絕既有程式碼時，用小 PR 修到 `main`
+  即可——這是預期行為，**不是**該 bump MSRV 的信號。
+
 ### 推送前：`scripts/preflight.sh`
 
 執行這個一次到位、與 CI 對齊的 preflight，把失敗在本地就抓出來，而不是等到推送之後：
