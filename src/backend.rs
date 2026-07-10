@@ -662,14 +662,17 @@ impl Backend {
                 // Full-screen TUI: bulk write does not land; paced inject required
                 // (inject-focus smoke 2026-07-10).
                 typed_inject: true,
-                // Grok's `--continue` EXIT 2s when no session exists for cwd
-                // ("No session found for current directory"). Unlike Claude, it
-                // does not soft-fallback. Until has_resumable_session is wired
-                // to ~/.grok/sessions/<encoded-cwd>/, keep resume off so Fresh
-                // spawns (and the --agents path, which always appends resume
-                // flags) stay bootable. Operator can still /resume inside the
-                // TUI. Follow-up: encode-cwd session probe + ContinueInCwd.
-                resume_mode: ResumeMode::NotSupported,
+                // Grok `-c/--continue` resumes the most recent session for the
+                // cwd (grok 0.2.93 `--help`: "Continue the most recent session
+                // for the current working directory"). It EXITs 2s ("No session
+                // found for current directory") when the cwd has no session and,
+                // unlike Claude, does NOT soft-fallback — so resume is GATED on
+                // `has_resumable_session` (wired to `grok_session`, which probes
+                // ~/.grok/sessions/<percent-encoded-cwd>/ for a session subdir).
+                // `SpawnMode::downgraded_for` turns Resume→Fresh when there is
+                // nothing to resume, so fresh spawns and the --agents path never
+                // append a doomed `--continue`.
+                resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 // Shared AGENTS.md (also Codex/OpenCode). Grok reads project rules
                 // from AGENTS.md / Claude.md automatically.
@@ -768,6 +771,9 @@ impl Backend {
         match self {
             Backend::ClaudeCode => {
                 claude_session::has_resumable(working_dir, &claude_session::default_projects_root())
+            }
+            Backend::Grok => {
+                grok_session::has_resumable(working_dir, &grok_session::default_sessions_root())
             }
             _ => true,
         }
@@ -926,6 +932,142 @@ impl Backend {
             // Patterns + trust dismiss calibrated against live PTY smoke.
             Backend::Grok => "0.2.93",
             Backend::Shell | Backend::Raw(_) => "n/a",
+        }
+    }
+}
+
+/// Detection helpers for `Backend::Grok`'s on-disk session storage.
+///
+/// Grok persists sessions under `~/.grok/sessions/<percent-encoded-cwd>/`, where
+/// the cwd is percent-encoded RFC-3986-style (`/` → `%2F`; unreserved
+/// `A-Za-z0-9-._~` kept) — reversible, not a hash. Inside each cwd dir live a
+/// `prompt_history.jsonl` file plus one UUIDv7 SUBDIRECTORY per session. `grok
+/// --continue` resumes the most recent session for the current cwd.
+pub(crate) mod grok_session {
+    use std::path::{Path, PathBuf};
+
+    /// `~/.grok/sessions/`. Falls back to `$TMPDIR/.grok/sessions` when `$HOME`
+    /// is unresolvable — that path almost certainly won't exist and
+    /// `has_resumable` returns false, the correct conservative answer.
+    pub fn default_sessions_root() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".grok")
+            .join("sessions")
+    }
+
+    /// Whether `working_dir` has a resumable Grok session under `sessions_root`.
+    ///
+    /// "Resumable" = the encoded-cwd dir exists AND holds at least one session
+    /// SUBDIRECTORY (a UUIDv7 dir). A cwd dir with only `prompt_history.jsonl`
+    /// (a file — no session yet) is NOT resumable, matching `grok --continue`,
+    /// which exits ("No session found for current directory") when there is no
+    /// session dir to resume.
+    pub fn has_resumable(working_dir: &Path, sessions_root: &Path) -> bool {
+        let canonical = canonicalize_for_encode(working_dir);
+        let session_dir = sessions_root.join(encode_session_dir(&canonical));
+        let Ok(entries) = std::fs::read_dir(&session_dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| e.path().is_dir())
+    }
+
+    /// Canonicalize `working_dir` before naming the session dir (Grok resolves
+    /// the real cwd), mirroring `claude_session::canonicalize_for_encode`. Falls
+    /// back to the raw input on canonicalize Err so a cold spawn (cwd not yet on
+    /// disk) preserves the conservative-false branch of [`has_resumable`].
+    fn canonicalize_for_encode(working_dir: &Path) -> PathBuf {
+        dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
+    }
+
+    /// Percent-encode an absolute path the way Grok names session dirs: every
+    /// byte that is not an RFC-3986 unreserved char (`A-Za-z0-9-._~`) is
+    /// `%`-escaped as uppercase hex, so `/` → `%2F`. Verified against the live
+    /// dir `%2FUsers%2Fsuzuke%2F.agend-terminal%2Fworkspace%2Fgrok-soak`.
+    pub(crate) fn encode_session_dir(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        let mut out = String::new();
+        for &b in s.as_bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn unique_tmp(label: &str) -> PathBuf {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "agend-grok-session-test-{}-{}-{}",
+                std::process::id(),
+                label,
+                id
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn encode_session_dir_matches_groks_percent_scheme() {
+            // Real dir name observed under ~/.grok/sessions/ on macOS.
+            assert_eq!(
+                encode_session_dir(Path::new(
+                    "/Users/suzuke/.agend-terminal/workspace/grok-soak"
+                )),
+                "%2FUsers%2Fsuzuke%2F.agend-terminal%2Fworkspace%2Fgrok-soak"
+            );
+            // A branch slash in a worktree cwd also encodes to %2F; `.`/`-` kept.
+            assert_eq!(
+                encode_session_dir(Path::new("/w/fix/grok-resume.wiring")),
+                "%2Fw%2Ffix%2Fgrok-resume.wiring"
+            );
+        }
+
+        #[test]
+        fn has_resumable_true_only_when_a_session_subdir_exists() {
+            let root = unique_tmp("root");
+            // The cwd we probe never exists on disk, so canonicalize is a no-op
+            // fallback and the encoded name matches what has_resumable computes.
+            let wd = Path::new("/nonexistent/grok/cwd/xyz");
+
+            // No encoded-cwd dir at all → not resumable.
+            assert!(!has_resumable(wd, &root));
+
+            // Encoded-cwd dir with ONLY prompt_history.jsonl (no session) → false.
+            let enc = root.join(encode_session_dir(wd));
+            std::fs::create_dir_all(&enc).unwrap();
+            std::fs::write(enc.join("prompt_history.jsonl"), b"{}\n").unwrap();
+            assert!(
+                !has_resumable(wd, &root),
+                "a cwd dir with only prompt_history.jsonl has no session to resume"
+            );
+
+            // Add a UUIDv7 session SUBDIR → resumable.
+            std::fs::create_dir_all(enc.join("019f4a82-05c2-7263-a0e7-8fcdf1b4fe95")).unwrap();
+            assert!(
+                has_resumable(wd, &root),
+                "a session subdir makes the cwd resumable"
+            );
+        }
+
+        #[test]
+        fn backend_grok_gates_resume_on_real_sessions() {
+            // Wiring pin: `Backend::Grok` no longer optimistically returns `true`
+            // (the old `_ => true` arm) — a unique cwd with no grok session under
+            // the real ~/.grok/sessions/ resolves to false, so `downgraded_for`
+            // turns Resume→Fresh instead of appending a doomed `--continue`.
+            let wd = unique_tmp("no-session");
+            assert!(!crate::backend::Backend::Grok.has_resumable_session(&wd));
         }
     }
 }
@@ -1424,7 +1566,13 @@ mod tests {
         assert_eq!(p.instructions_path, "AGENTS.md");
         assert!(p.instructions_shared);
         assert!(p.fleet_mcp_supported);
-        assert!(matches!(p.resume_mode, ResumeMode::NotSupported));
+        // Grok resumes the most recent cwd session via `--continue`, gated by
+        // `has_resumable_session` (grok_session probe of ~/.grok/sessions/).
+        assert!(matches!(
+            p.resume_mode,
+            ResumeMode::ContinueInCwd { flag: "--continue" }
+        ));
+        assert_eq!(p.resume_mode.args_for(), vec!["--continue".to_string()]);
         let trust = p
             .dismiss_patterns
             .iter()
