@@ -1,56 +1,34 @@
 //! Verification/reproduction test for the `mcp-dispatch-comms` review batch,
 //! finding 4 (low / resource-leak).
 //!
-//! A plain self-dispatch with a `branch` leases + binds a worktree BEFORE
-//! the API rejects the self-send, orphaning the worktree.
+//! A plain self-dispatch with a `branch` must not lease + bind a worktree
+//! before the self-send is rejected (orphan worktree).
 //!
-//! `handle_delegate_task` (src/mcp/handlers/comms.rs) rejects a self-send
-//! only when team-orchestrator resolution actually CHANGED the target:
-//!   `if *sender == target && raw_target != target { return ...self-loop... }`
-//! A plain self-dispatch where `raw_target == resolved_target == sender`
-//! skips that guard, falls through to `dispatch_auto_bind_lease_with_source_and_chain`
-//! (which creates a worktree + writes a binding), and only THEN reaches the
-//! API SEND which rejects the self-send — leaving a leased worktree +
-//! binding for a dispatch that never delivered, with no rollback on this
-//! path.
+//! W2.2: `handle_delegate_task` lives in `src/mcp/handlers/comms_delegate.rs`
+//! (phase pipeline). The fix is an UNCONDITIONAL self-send rejection
+//! (`*sender == target`) in the **resolve** phase, which always runs before
+//! the **lease** phase (`dispatch_auto_bind_lease_with_source_and_chain`).
 //!
-//! Static-invariant method (source scan): the runtime leak cannot be
-//! driven without registering instances + a real API/daemon. Instead we
-//! pin the FIX: an UNCONDITIONAL self-send rejection (`*sender == target`,
-//! regardless of whether resolution changed the target) must appear in
-//! `handle_delegate_task` BEFORE the `dispatch_auto_bind_lease_with_chain`
-//! call — so no worktree is leased for a dispatch the API will reject.
-//!
-//! RED now: the only `*sender == target` check before the auto-bind is the
-//! qualified `*sender == target && raw_target != target` guard, so a plain
-//! self-dispatch reaches the lease. No unconditional self-send rejection
-//! precedes the auto-bind.
-//!
-//! GREEN after fix: moving an unconditional `*sender == target` rejection
-//! ahead of the auto-bind makes this scan find it.
+//! Static-invariant method: pin that resolve-phase still has the unconditional
+//! self-reject, and that the lease call still exists in this module (so the
+//! fix surface is not accidentally deleted).
 
 use std::path::PathBuf;
 
-fn comms_src() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers/comms.rs");
-    std::fs::read_to_string(&p).expect("read src/mcp/handlers/comms.rs")
+fn delegate_src() -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers/comms_delegate.rs");
+    std::fs::read_to_string(&p).expect("read src/mcp/handlers/comms_delegate.rs")
 }
 
-/// Return the lines of `fn handle_delegate_task` up to (and excluding) the
-/// first `dispatch_auto_bind_lease_with_source_and_chain(` call — i.e. everything that
-/// runs BEFORE the auto-bind/lease side effect. Comment/blank lines stripped.
-fn pre_auto_bind_lines() -> Vec<String> {
-    let src = comms_src();
-    let fn_start = src
-        .find("fn handle_delegate_task")
-        .expect("fn handle_delegate_task not found");
-    let region = &src[fn_start..];
-    let auto_bind = region
-        .find("dispatch_auto_bind_lease_with_source_and_chain(")
-        .expect(
-            "dispatch_auto_bind_lease_with_source_and_chain call not found in handle_delegate_task",
-        );
-    region[..auto_bind]
+/// Lines of `fn resolve_delegate` (where self-dispatch rejection lives).
+fn resolve_phase_lines(src: &str) -> Vec<String> {
+    let start = src
+        .find("fn resolve_delegate")
+        .expect("fn resolve_delegate not found in comms_delegate.rs");
+    let region = &src[start..];
+    // End at next top-level fn after resolve_delegate body.
+    let after = region.find("\nfn ").unwrap_or(region.len());
+    region[..after]
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|t| !t.starts_with("//") && !t.starts_with('*') && !t.is_empty())
@@ -59,28 +37,40 @@ fn pre_auto_bind_lines() -> Vec<String> {
 
 #[test]
 fn self_dispatch_rejected_before_auto_bind_lease_mcp_dispatch_comms() {
-    let lines = pre_auto_bind_lines();
+    let src = delegate_src();
 
-    // Sanity: the region must actually contain the auto-bind-preceding code.
+    // Lease phase still present (the side-effect this pin protects against).
     assert!(
-        !lines.is_empty(),
-        "could not isolate the pre-auto-bind region of handle_delegate_task"
+        src.contains("dispatch_auto_bind_lease_with_source_and_chain"),
+        "comms_delegate.rs must still call dispatch_auto_bind_lease_with_source_and_chain \
+         (lease phase); if lease moves, update this invariant to the new module"
     );
 
-    // An UNCONDITIONAL self-send rejection: a `*sender == target` check that
-    // is NOT gated behind `raw_target != target`. The current code's only
-    // self-target check before the lease is the qualified team-orchestrator
-    // loop guard, which lets a plain self-dispatch slip through to the lease.
+    // Resolve phase still runs first in the public choreography.
+    let handle_pos = src
+        .find("fn handle_delegate_task")
+        .expect("fn handle_delegate_task not found");
+    let resolve_call_pos = src[handle_pos..]
+        .find("resolve_delegate(")
+        .expect("handle_delegate_task must call resolve_delegate");
+    let lease_call_in_handle = src[handle_pos..].find("maybe_auto_bind_lease(");
+    assert!(
+        lease_call_in_handle.is_some_and(|lp| resolve_call_pos < lp),
+        "handle_delegate_task must call resolve_delegate before maybe_auto_bind_lease"
+    );
+
+    let lines = resolve_phase_lines(&src);
+    assert!(!lines.is_empty(), "resolve_delegate body empty?");
+
+    // UNCONDITIONAL self-send rejection in resolve (not only the team-orch loop guard).
     let has_unconditional_self_reject = lines
         .iter()
         .any(|l| l.contains("*sender == target") && !l.contains("raw_target != target"));
 
     assert!(
         has_unconditional_self_reject,
-        "handle_delegate_task leases + binds a worktree for a plain self-dispatch before the API \
-         rejects the self-send (orphan worktree). The only `*sender == target` check before \
-         `dispatch_auto_bind_lease_with_source_and_chain` is gated behind `raw_target != target`, so a plain \
-         self-dispatch (raw_target == resolved == sender) is NOT rejected pre-lease. Move an \
-         unconditional `*sender == target` rejection ahead of the auto-bind."
+        "resolve_delegate must reject plain self-dispatch before lease phase \
+         (orphan worktree). Expected unconditional `*sender == target` rejection \
+         in src/mcp/handlers/comms_delegate.rs::resolve_delegate."
     );
 }
