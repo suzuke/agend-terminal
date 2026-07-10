@@ -251,6 +251,9 @@ pub fn create(
                     chrono::Utc::now().to_rfc3339()
                 ),
             );
+            // Fresh worktree: `git worktree add` copies gitlinks + .gitmodules
+            // but does NOT populate submodule content — init recursively here.
+            init_submodules_after_create(&wt_dir);
             Some(WorktreeInfo {
                 path: wt_dir,
                 source_repo: repo_dir.to_path_buf(),
@@ -289,6 +292,7 @@ pub fn create(
                             chrono::Utc::now().to_rfc3339()
                         ),
                     );
+                    init_submodules_after_create(&wt_dir);
                     Some(WorktreeInfo {
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
@@ -330,6 +334,59 @@ fn warn_worktree_add_spawn_err(e: &std::io::Error) {
         tracing::warn!(error = %e, "worktree add timed out (lock contention?)");
     } else {
         tracing::warn!(error = %e, "git not available");
+    }
+}
+
+/// After a **fresh** `git worktree add`, populate configured submodules.
+///
+/// `git worktree add` materializes the superproject tree (including
+/// `.gitmodules` and gitlink entries) but leaves submodule directories empty.
+/// Without `--init --recursive`, builds that depend on nested content
+/// (e.g. `vendor/agentic-git`) fail on every fresh daemon-managed worktree.
+///
+/// Soft-warn policy: optional/private submodules may be unavailable offline —
+/// a non-zero update must not turn a previously successful lease into a hard
+/// failure. One actionable warn carries worktree path + stderr; caller still
+/// returns `WorktreeInfo`.
+///
+/// Uses [`crate::git_helpers::git_cmd`] (AGEND_GIT_BYPASS + LOCAL_GIT_TIMEOUT).
+/// No-op when `.gitmodules` is absent. Reuse-path and deployments are out of scope.
+///
+/// `-c protocol.file.allow=always` is intentional: git's submodule clone helper
+/// ignores the superproject's local `protocol.file.allow` config (security
+/// default post-2.38), so hermetic file-path submodule fixtures — and rare
+/// local-path submodules — need the command-line override. https/ssh remotes
+/// are unaffected (file protocol only).
+fn init_submodules_after_create(wt_dir: &Path) {
+    if !wt_dir.join(".gitmodules").is_file() {
+        return;
+    }
+    match crate::git_helpers::git_cmd(
+        wt_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
+    ) {
+        Ok(_) => {
+            tracing::info!(
+                path = %wt_dir.display(),
+                "initialized submodules after worktree create"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %wt_dir.display(),
+                error = %e,
+                "submodule update --init --recursive failed after worktree create \
+                 (soft-warn: lease still succeeds; nested content may be missing — \
+                 run: git -C <worktree> submodule update --init --recursive)"
+            );
+        }
     }
 }
 
@@ -1039,11 +1096,7 @@ mod tests {
             id
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        git_run_ok(
-            &dir,
-            &["init", "-b", "main"],
-            /*allow_file*/ false,
-        );
+        git_run_ok(&dir, &["init", "-b", "main"], /*allow_file*/ false);
         git_run_ok(&dir, &["config", "user.email", "test@test"], false);
         git_run_ok(&dir, &["config", "user.name", "test"], false);
         if let Some(parent) = Path::new(rel).parent() {
@@ -1104,11 +1157,7 @@ mod tests {
             git_run_ok(&dir, &["init", "-b", "main"], false);
             git_run_ok(&dir, &["config", "user.email", "test@test"], false);
             git_run_ok(&dir, &["config", "user.name", "test"], false);
-            git_run_ok(
-                &dir,
-                &["config", "protocol.file.allow", "always"],
-                false,
-            );
+            git_run_ok(&dir, &["config", "protocol.file.allow", "always"], false);
             git_run_ok(
                 &dir,
                 &["submodule", "add", &b.display().to_string(), "nested"],
@@ -1128,19 +1177,10 @@ mod tests {
             git_run_ok(&dir, &["config", "user.name", "test"], false);
             // Shared by linked worktrees — required for recursive local-path
             // submodule fetch inside production `git_cmd`.
+            git_run_ok(&dir, &["config", "protocol.file.allow", "always"], false);
             git_run_ok(
                 &dir,
-                &["config", "protocol.file.allow", "always"],
-                false,
-            );
-            git_run_ok(
-                &dir,
-                &[
-                    "submodule",
-                    "add",
-                    &a.display().to_string(),
-                    "vendor/mid",
-                ],
+                &["submodule", "add", &a.display().to_string(), "vendor/mid"],
                 true,
             );
             git_run_ok(&dir, &["commit", "-m", "super with A→B nest"], false);
@@ -1168,9 +1208,7 @@ mod tests {
         // Nested content must be present in the *source* super (already inited
         // by `submodule add`); the bug is only on the *fresh worktree* side.
         assert!(
-            super_repo
-                .join("vendor/mid/nested/nested_b.txt")
-                .is_file()
+            super_repo.join("vendor/mid/nested/nested_b.txt").is_file()
                 || super_repo.join("vendor/mid").join(".gitmodules").is_file(),
             "fixture: A must be present under super (init by submodule add)"
         );
