@@ -26,9 +26,12 @@
 //! (#2713) wired the L0–L2 auto-release path
 //! ([`crate::daemon::auto_release::should_release_now`]); D3 wired the shared L0
 //! gate ([`l0_protected`]) + the L4 branch decision ([`branch_disposition`]) into
-//! the sweep ([`crate::worktree_cleanup`]). Only the still-unwired L3 GC reclaim
-//! states (`ReclaimState`'s non-`NotEligible` variants) carry a targeted
-//! `#[allow(dead_code)]`, until D4 lands the GC `evaluate_candidate` call site.
+//! the sweep ([`crate::worktree_cleanup`]); D4 wired the L3 GC reclaim judgment
+//! (the GC `evaluate_candidate` produces a [`ReclaimState`] + `agent_alive` and
+//! delegates the Keep/Delete/Archive routing here). The ONLY remaining
+//! `#[allow(dead_code)]` is on [`ReclaimState::CleanReleaseArchive`] — the
+//! removal-time archive-belt outcome the disposition ladder (D5) still routes
+//! natively, matched here but not yet constructed outside tests.
 
 use crate::daemon::auto_release::ReleaseDecision;
 
@@ -54,17 +57,21 @@ pub(crate) enum Disposition {
 /// L3 (binding-absent, GC) reclaim classification. Produced by the GC system's
 /// `evaluate_candidate` (D4 wires it); the pure part the classifier routes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// L3 GC states: only `NotEligible` is constructed so far (by the auto-release
-// caller); D4 wires the constructors for the reclaim variants.
-#[allow(dead_code)]
 pub(crate) enum ReclaimState {
     /// Not a GC candidate (in grace, not aged, or spared) → Keep.
     NotEligible,
     /// `released_at` present, past the 24h grace, worktree clean → hard delete.
     CleanReleaseHardDelete,
     /// `released_at` present + past grace, but the hard delete is unactionable
-    /// (lock contention / owning-repo unresolved / remove failed) and the
-    /// archive gate is on → archive instead.
+    /// (lock contention / owning-repo unresolved / remove failed) and the archive
+    /// gate is on → archive instead. PR-D·D4: this is a REMOVAL-time archive-belt
+    /// outcome (`gc_remove_one`'s #2550 W5 `AGEND_WORKTREE_GC` fall-through), NOT an
+    /// `evaluate_candidate` verdict — the candidate JUDGMENT D4 delegates only
+    /// produces `NotEligible`/`CleanReleaseHardDelete`/`ForceReclaim`. This belt
+    /// outcome routes natively still (the disposition LADDER is D5), so it is
+    /// matched by [`terminal_disposition`] but not yet constructed outside tests →
+    /// a targeted `dead_code` allow until D5 wires it.
+    #[allow(dead_code)]
     CleanReleaseArchive,
     /// Never-released OR malformed `released_at`, dead agent, past the age cap →
     /// ForceReclaim: ALWAYS archived, never hard-deleted (t-worktree-leak PR-2).
