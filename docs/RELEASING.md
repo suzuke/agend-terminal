@@ -96,9 +96,24 @@ Also edit the GitHub Release: mark it as a pre-release or add a warning to
 the notes pointing at the fixed version. Then ship the fix as a new patch
 release through the normal flow — never reuse or move a published tag.
 
+## Toolchain policy (MSRV floor vs CI Check)
+
+Two different pins, on purpose (#1994 / #2339 / #2340):
+
+| Role | Toolchain | Where | Purpose |
+|------|-----------|--------|---------|
+| **MSRV floor** | **1.88** (declared) | `Cargo.toml` `rust-version`, `ci.yml` job `MSRV check (1.88)`, `release.yml` gate | Anyone on rustc ≥ 1.88 can `cargo install` / compile the locked tree. Blocks Dependabot from silently raising the floor (the sysinfo 0.39 → rustc 1.95 class). |
+| **CI Check** | **current stable** (floating) | `ci.yml` `check` matrix (`dtolnay/rust-toolchain@stable` + fmt/clippy/test) | Catch new clippy lints and compiler behavior. **Not** pinned to 1.88. |
+
+Do **not** bump `rust-version` just because stable advanced (e.g. 1.96 / 1.97).
+Clippy denials on a new stable are fixed with a small mechanical PR on `main`
+while leaving MSRV at 1.88. Raise MSRV only when a dependency **must** move
+and no 1.88-compatible pin exists — see below.
+
 ## MSRV bumps
 
 `rust-version` in `Cargo.toml` is the source of truth; the gate's
 `cargo +1.88 check` pin must be updated in the same PR that bumps it
-(grep release.yml for `1.88`). Treat an MSRV bump as a minor-version event
-and call it out in the changelog.
+(grep `ci.yml` and `release.yml` for `1.88`). Treat an MSRV bump as a
+minor-version event and call it out in the changelog. Prefer a still-
+conservative new floor over tracking the latest stable.

@@ -20,6 +20,17 @@ cargo clippy -- -D warnings          # must be warning-free
 
 CI mirrors these steps on Ubuntu + macOS + Windows (`.github/workflows/ci.yml`).
 
+**Toolchain split (do not conflate):**
+
+- **MSRV 1.88** (`Cargo.toml` `rust-version`) — the supported install floor.
+  CI enforces it with a dedicated `MSRV check (1.88)` job (`cargo +1.88 check
+  --locked`). Do not raise it casually; see `docs/RELEASING.md`.
+- **CI Check uses current stable** (`dtolnay/rust-toolchain@stable`) for
+  fmt / clippy / tests. Develop with a recent rustup stable so local
+  `clippy -D warnings` matches CI. When stable advances and clippy newly
+  denies existing code, fix on `main` with a small PR — that is expected,
+  not a signal to bump MSRV.
+
 ### Before pushing: `scripts/preflight.sh`
 
 Run the one-shot CI-parity preflight to catch failures locally instead of after a push:
