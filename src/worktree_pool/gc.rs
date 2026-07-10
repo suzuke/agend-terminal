@@ -780,18 +780,12 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
         );
     };
 
-    // git-raw-allowed: kept raw (not git_cmd) per the decided #2128 migration
-    // scope; cwd is now always the resolved owning repo.
-    let mut cmd = std::process::Command::new("git");
-    cmd.args([
-        "worktree",
-        "remove",
-        "--force",
-        &wt_path.display().to_string(),
-    ])
-    .env("AGEND_GIT_BYPASS", "1")
-    .current_dir(&source_repo);
-    match cmd.output() {
+    // W1.2: route through `git_worktree::remove_force` (always-bypass +
+    // LOCAL_GIT_TIMEOUT via git_bypass when source_repo is set — same argv as
+    // the prior raw Command, plus the timeout bound the raw path lacked).
+    // source_repo is Some after resolve above, so the empty-cwd raw branch is
+    // never taken here.
+    match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
         Ok(o) if o.status.success() => GcResult {
             path: wt_path.clone(),
             agent: candidate.agent.clone(),
