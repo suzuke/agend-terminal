@@ -1134,9 +1134,10 @@ mod tests {
     /// Proves fresh `worktree::create` initializes submodules **recursively**
     /// (`--init --recursive`). A single-level fixture would not pin recursion.
     ///
-    /// Local `file://` URLs need `protocol.file.allow=always` recorded in the
-    /// superproject config so production `git_cmd` (no extra `-c`) can recurse
-    /// during the post-worktree-add init. Prod remotes (https/ssh) do not need this.
+    /// Fixture `submodule add` uses `-c protocol.file.allow=always` (via
+    /// `git_run_ok(..., true)`). Production `init_submodules_after_create`
+    /// also passes that `-c` on `git_cmd` — local-path clone helpers ignore
+    /// repo-stored `protocol.file.allow` alone. No stored config required.
     fn tmp_super_with_nested_submodules(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "agend-wt-nest-root-{}-{}-{}",
@@ -1157,7 +1158,6 @@ mod tests {
             git_run_ok(&dir, &["init", "-b", "main"], false);
             git_run_ok(&dir, &["config", "user.email", "test@test"], false);
             git_run_ok(&dir, &["config", "user.name", "test"], false);
-            git_run_ok(&dir, &["config", "protocol.file.allow", "always"], false);
             git_run_ok(
                 &dir,
                 &["submodule", "add", &b.display().to_string(), "nested"],
@@ -1175,9 +1175,6 @@ mod tests {
             git_run_ok(&dir, &["init", "-b", "main"], false);
             git_run_ok(&dir, &["config", "user.email", "test@test"], false);
             git_run_ok(&dir, &["config", "user.name", "test"], false);
-            // Shared by linked worktrees — required for recursive local-path
-            // submodule fetch inside production `git_cmd`.
-            git_run_ok(&dir, &["config", "protocol.file.allow", "always"], false);
             git_run_ok(
                 &dir,
                 &["submodule", "add", &a.display().to_string(), "vendor/mid"],
@@ -1193,7 +1190,7 @@ mod tests {
         super_repo
     }
 
-    /// RED: fresh daemon worktree provision must materialize nested submodule
+    /// Fresh daemon worktree provision must materialize nested submodule
     /// content (level B file) without a manual `git submodule update`.
     #[test]
     fn create_initializes_nested_submodules_recursively() {
@@ -1233,6 +1230,55 @@ mod tests {
         if let Some(root) = super_repo.parent() {
             std::fs::remove_dir_all(root).ok();
         }
+    }
+
+    /// Soft-warn contract: when a committed submodule's source is unavailable
+    /// (optional/private/offline), `create` must still return `Some` with a
+    /// managed worktree — never hard-fail the lease. Nested content stays empty.
+    #[test]
+    fn create_soft_fails_when_submodule_source_unavailable() {
+        let home = tmp_home("submod-soft");
+        let root = std::env::temp_dir().join(format!(
+            "agend-wt-soft-root-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let sub = tmp_repo_with_file("soft-sub", "payload.txt", "should-not-appear\n");
+        let super_repo = {
+            let dir = root.join("super");
+            std::fs::create_dir_all(&dir).unwrap();
+            git_run_ok(&dir, &["init", "-b", "main"], false);
+            git_run_ok(&dir, &["config", "user.email", "test@test"], false);
+            git_run_ok(&dir, &["config", "user.name", "test"], false);
+            git_run_ok(
+                &dir,
+                &["submodule", "add", &sub.display().to_string(), "vendor/dep"],
+                true,
+            );
+            git_run_ok(&dir, &["commit", "-m", "super with dep"], false);
+            dir
+        };
+        assert!(super_repo.join(".gitmodules").is_file());
+
+        // Make the recorded submodule URL unusable BEFORE production create.
+        std::fs::remove_dir_all(&sub).expect("remove submodule source");
+
+        let info = create(&home, &super_repo, "agent-soft", Some("feat/submod-soft"))
+            .expect("create must soft-warn and still return Some when submodule init fails");
+
+        assert!(
+            info.path.join(".agend-managed").is_file(),
+            "managed marker must still land on soft-fail path"
+        );
+        assert!(
+            !info.path.join("vendor/dep/payload.txt").is_file(),
+            "nested content must remain unavailable when source is gone"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── #2158-adjacent: dirty-WIP preservation helpers ──────────────────
