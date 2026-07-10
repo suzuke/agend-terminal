@@ -409,6 +409,18 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // on every restart. In-session changes update the in-process global directly
     // via `runtime_config::set` (the `Ctrl+B e` toggle and `:set`/`:config set`).
     crate::runtime_config::reload(&home);
+
+    // PR-D6/F1: fail LOUD if the retired `AGEND_WORKTREE_PRUNE_LIVE` is still set.
+    // The LIVE fleet daemon runs THIS app-mode path — never `run_core` (see
+    // `main.rs`'s subcommand dispatch: `App` → `app::run` → here, vs `Start` →
+    // `daemon::run`/`run_core`; the two are mutually exclusive per process). So
+    // the run_core:764 boot-warn is DEAD in production without this call. Fired
+    // ONCE per app boot here: `run_app` is invoked exactly once (from `run`, not
+    // in any retry loop) and this sits before the sweep/TUI event loop. Mirrors
+    // run_core's placement — a single startup warn so an operator carrying the
+    // stale flag learns it is ignored (not silent).
+    crate::worktree_cleanup::warn_if_prune_live_retired();
+
     let fleet_path = fleet_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));

@@ -133,11 +133,30 @@ fn stress_dry_run_only_when_flag_unset() {
         format!("agent=noflag-agent\nleased_at={old}\n"),
     )
     .ok();
+    // PR-D6/F3: dual-name gate read mirroring production alias precedence
+    // (`archive_fallback_enabled`): the new `AGEND_WORKTREE_ARCHIVE_FALLBACK`
+    // wins; the old `AGEND_WORKTREE_GC` is honored only as a deprecated fallback.
+    // Inlined because the crate-internal `archive_fallback_enabled()` is
+    // `pub(crate)` and unreachable from this integration test. (NOT
+    // `auto_cleanup_enabled()` — that gates a DIFFERENT var, AGEND_WORKTREE_AUTO_CLEANUP.)
+    let archive_belt_enabled = || -> bool {
+        if let Ok(v) = std::env::var("AGEND_WORKTREE_ARCHIVE_FALLBACK") {
+            return v == "1";
+        }
+        if let Ok(v) = std::env::var("AGEND_WORKTREE_GC") {
+            return v == "1";
+        }
+        false
+    };
+    std::env::remove_var("AGEND_WORKTREE_ARCHIVE_FALLBACK");
     std::env::remove_var("AGEND_WORKTREE_GC");
-    // 100 cutover attempts without flag → all must be no-ops.
+    // 100 cutover attempts without either flag → archive belt off, all no-ops.
     for _ in 0..100 {
-        // Simulate: check flag → skip.
-        assert!(std::env::var("AGEND_WORKTREE_GC").is_err());
+        // Simulate: check gate → skip.
+        assert!(
+            !archive_belt_enabled(),
+            "neither gate name set ⇒ archive-fallback belt OFF"
+        );
     }
     assert!(
         wt.exists(),

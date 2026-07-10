@@ -711,8 +711,12 @@ pub fn run_skills_update(home: &Path, name: Option<&str>) -> anyhow::Result<()> 
 /// Phase 4 GC visibility wrapping `worktree_pool::gc_dry_run`) — moved out of
 /// `src/mcp/` entirely so #1505's MCP-schema undeclared-arg scanner (which
 /// walks the whole `src/mcp/` tree) stops treating this CLI-only `format` arg
-/// as an MCP handler read. Non-destructive (removal gated behind
-/// `AGEND_WORKTREE_GC=1`). Also previews the `target/` retention-sweep
+/// as an MCP handler read. Non-destructive because THIS is the dry-run entry
+/// point — it only lists candidates and never removes anything, regardless of
+/// any env var. (`AGEND_WORKTREE_ARCHIVE_FALLBACK` does NOT gate collection: it
+/// only enables the archive-fallback belt inside the real cutover path — archive
+/// a worktree to `.trash` when hard-delete FAILS. It has no bearing on this
+/// preview.) Also previews the `target/` retention-sweep
 /// candidates (t-…50793-9) so an operator sees what will be reclaimed before
 /// the gc_tick runs it. Format: `"human"` (default) or `"json"`.
 pub(crate) fn handle_gc_dry_run(home: &Path, args: &Value) -> Value {

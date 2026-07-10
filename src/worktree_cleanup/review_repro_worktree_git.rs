@@ -202,19 +202,18 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
         "precondition: branch must exist before the sweep"
     );
 
-    // Drive the phase-1 sweep (auto-cleanup is on by default; set explicitly for
-    // determinism — the git-subprocess serialize group prevents an env race).
-    // #2605: also opt into live deletion (default is dry-run) since this test
-    // asserts the worktree dir was actually reclaimed.
+    // Drive the phase-1 sweep. PR-D6: gating is AUTO_CLEANUP only, and when it is
+    // on the sweep runs LIVE (the old AGEND_WORKTREE_PRUNE_LIVE dry-run toggle is
+    // retired) — set it explicitly for determinism (the git-subprocess serialize
+    // group prevents an env race). This test asserts the worktree dir was actually
+    // reclaimed, so it relies on that live behavior.
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
-    std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
     let home = scratch("p1-remote-gone-home");
     let mut configs: HashMap<String, Option<PathBuf>> = HashMap::new();
     configs.insert("other".to_string(), Some(repo.join("other")));
     write_source_repo_binding(&home, "other", &repo);
     let removed = sweep_from_registry(&home, &configs, &[]);
     std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
-    std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
 
     // The stale worktree DIR IS still reclaimed (harmless disk cleanup)...
     assert!(
