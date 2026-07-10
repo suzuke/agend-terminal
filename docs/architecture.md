@@ -247,11 +247,10 @@ entry; none is free to "just clean up" without the listed care.
    `tests/daemon_git_helper_invariant.rs` (`MODULE_SCOPE` grows
    monotonically; never shrink; authority list — do not duplicate it here).
    **Production closeout (2026-07):** every daemon/MCP module that performs
-   LOCAL git is sealed (worktree lifecycle, pool GC, admin, conflict_notify,
-   dispatch_hook, force_release, …). Intentional residual raw:
-   `git_helpers` (bypass implementation) and `bin/agend-git` (gated shim).
-   Optional backlog: no-cwd bypass for `git_worktree::remove_force`'s empty-
-   `source_repo` allow-marked branch.
+   LOCAL git is sealed; empty-`source_repo` worktree remove goes through
+   `git_helpers::git_bypass_no_cwd` (timeout-bounded). Intentional residual
+   raw: only inside `git_helpers` (spawn implementation) and `bin/agend-git`
+   (gated shim).
 4. **Size-driven extraction at the MCP cap**: `instance.rs`/`comms.rs` at
    the 750-LOC cap with "extracted for file_size_invariant" cross-file
    seams; `handle_delegate_task` is a 317-LOC god-fn with gates inlined.

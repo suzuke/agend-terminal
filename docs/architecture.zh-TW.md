@@ -243,11 +243,9 @@ Release → crates.io publish（見 RELEASING.md）。
    （#2068）導入 helper，並以 `tests/daemon_git_helper_invariant.rs` 做
    per-slice 封印（`MODULE_SCOPE` 單調成長、永不縮小；**權威列表在該檔，
    此處不重複抄**）。**Production closeout（2026-07）：** 所有會跑 LOCAL
-   git 的 daemon/MCP module 皆已 seal（worktree 生命週期、pool GC、admin、
-   conflict_notify、dispatch_hook、force_release…）。刻意保留的 raw：
-   `git_helpers`（bypass 實作）與 `bin/agend-git`（gated 端）。可選
-   backlog：`git_worktree::remove_force` empty-`source_repo` 的
-   allow-marked 分支，若有「無 cwd 的 bypass helper」可再收掉。
+   git 的 daemon/MCP module 皆已 seal；empty-`source_repo` 的 worktree
+   remove 走 `git_helpers::git_bypass_no_cwd`（含 timeout）。刻意保留的 raw：
+   只在 `git_helpers`（spawn 實作）與 `bin/agend-git`（gated 端）。
 4. **MCP 上限處的 size-driven 拆分**：`instance.rs`/`comms.rs` 卡在
    750-LOC 上限，帶有「為了 file_size_invariant 而拆分」的 cross-file
    接縫；`handle_delegate_task` 是一個 317-LOC 的 god-fn，gate 都 inline 在裡頭。
