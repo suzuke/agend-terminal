@@ -526,13 +526,37 @@ pub fn sweep_from_registry(
                 dry_run,
                 "removing stale worktree"
             );
-            if remove_worktree(
-                repo,
-                &entry.path,
-                &entry.branch,
-                branch_safe_to_delete,
-                dry_run,
-            ) {
+            // PR-D·D5: route the dir-Delete through the shared `janitor::dispose`
+            // Delete arm — the sweep passes its OWN remover (`remove_worktree`:
+            // git_ok + windows-retry + `branch -D`), so its deliberate wrapper is
+            // preserved (D5-Q3 ruling B; the git_ok↔git_bypass unify is a separate
+            // PR, decision m-20260703064336281447-62). Byte-identical to the prior
+            // direct call: same args, push on success. `agent`/`candidate` are inert
+            // on the Delete arm; the Err reason is unused here (the sweep skips, it
+            // does not archive-fallthrough).
+            let removed_ok = matches!(
+                crate::daemon::janitor::dispose(
+                    home,
+                    crate::worktree::disposition::Disposition::Delete,
+                    "",
+                    None,
+                    || {
+                        if remove_worktree(
+                            repo,
+                            &entry.path,
+                            &entry.branch,
+                            branch_safe_to_delete,
+                            dry_run,
+                        ) {
+                            Ok(())
+                        } else {
+                            Err("sweep worktree remove failed".to_string())
+                        }
+                    },
+                ),
+                crate::daemon::janitor::DispositionOutcome::Deleted(Ok(()))
+            );
+            if removed_ok {
                 removed.push((entry.branch.clone(), entry.path.clone(), reason));
             }
         }

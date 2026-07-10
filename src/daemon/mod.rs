@@ -27,6 +27,7 @@ pub mod hook_shadow;
 pub(crate) mod idle_watchdog;
 pub(crate) mod inbox_stuck_watchdog;
 pub(crate) mod inject_delivery;
+pub(crate) mod janitor;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;

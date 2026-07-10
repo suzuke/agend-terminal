@@ -753,8 +753,23 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // irrecoverable delete. Clean-release candidates keep the historical
     // hard-delete below (ungated, unconditional — decision Q3).
     if candidate.kind == GcKind::ForceReclaim {
-        use crate::daemon::retention::worktrees::{maybe_remove_candidate, RemovalOutcome};
-        let outcome = maybe_remove_candidate(home, candidate);
+        // PR-D·D5: route through the shared `janitor::dispose` Archive arm — the
+        // ForceReclaim→Archive binding IS the D4 gc.rs:706 archive-only invariant,
+        // now expressed as the disposition switch. `maybe_remove_candidate`
+        // (archive-only: liveness re-check + atomic `.trash` + unbind + ALERT) is
+        // unchanged behind it.
+        use crate::daemon::janitor::{dispose, DispositionOutcome};
+        use crate::daemon::retention::worktrees::RemovalOutcome;
+        use crate::worktree::disposition::Disposition;
+        let DispositionOutcome::Archived(outcome) = dispose(
+            home,
+            Disposition::Archive,
+            &candidate.agent,
+            Some(candidate),
+            || Ok(()),
+        ) else {
+            unreachable!("Archive disposition yields Archived");
+        };
         return GcResult {
             path: wt_path.clone(),
             agent: candidate.agent.clone(),
@@ -834,50 +849,59 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // the prior raw Command, plus the timeout bound the raw path lacked).
     // source_repo is Some after resolve above, so the empty-cwd raw branch is
     // never taken here.
-    match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
-        Ok(o) if o.status.success() => GcResult {
+    // W1.2 / PR-D·D5: the CleanRelease dir-remove is the `janitor::dispose` Delete
+    // arm — GC passes `remove_force` (always-bypass + LOCAL_GIT_TIMEOUT) as its
+    // remover (D5-Q3 ruling B keeps the sweep's git_ok+windows-retry wrapper
+    // separate). The remover returns `Ok(())` on success (incl. the remove_dir_all
+    // fallback path) or `Err(reason)`; this wrapper keeps the #2550 archive-
+    // fallthrough on `Err` (deliberate fail-closed pre/post, D5-Q1). Every reason
+    // string is preserved byte-for-byte.
+    use crate::daemon::janitor::{dispose, DispositionOutcome};
+    use crate::worktree::disposition::Disposition;
+    let outcome = dispose(home, Disposition::Delete, &candidate.agent, None, || {
+        match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                tracing::warn!(
+                    agent = %candidate.agent,
+                    path = %wt_path.display(),
+                    error = %stderr,
+                    "gc: git worktree remove failed — falling back to remove_dir_all"
+                );
+                let _ = std::fs::remove_dir_all(wt_path);
+                if !wt_path.exists() {
+                    // W1.2: best-effort prune (result already ignored).
+                    let _ = crate::git_helpers::git_ok(&source_repo, &["worktree", "prune"]);
+                    Ok(())
+                } else {
+                    // Both `git worktree remove` and `remove_dir_all` failed — the
+                    // worktree is still on disk and still eligible. Fall through.
+                    Err(format!("git worktree remove failed: {stderr}"))
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %candidate.agent,
+                    path = %wt_path.display(),
+                    error = %e,
+                    "gc: git command failed"
+                );
+                Err(format!("git command failed: {e}"))
+            }
+        }
+    });
+    match outcome {
+        DispositionOutcome::Deleted(Ok(())) => GcResult {
             path: wt_path.clone(),
             agent: candidate.agent.clone(),
             removed: true,
             error: None,
         },
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            tracing::warn!(
-                agent = %candidate.agent,
-                path = %wt_path.display(),
-                error = %stderr,
-                "gc: git worktree remove failed — falling back to remove_dir_all"
-            );
-            let _ = std::fs::remove_dir_all(wt_path);
-            if !wt_path.exists() {
-                // W1.2: best-effort prune (result already ignored).
-                let _ = crate::git_helpers::git_ok(&source_repo, &["worktree", "prune"]);
-                GcResult {
-                    path: wt_path.clone(),
-                    agent: candidate.agent.clone(),
-                    removed: true,
-                    error: None,
-                }
-            } else {
-                // Both `git worktree remove` and `remove_dir_all` failed — the
-                // worktree is still on disk and still eligible. Fall through.
-                archive_fallthrough_result(
-                    home,
-                    candidate,
-                    format!("git worktree remove failed: {stderr}"),
-                )
-            }
+        DispositionOutcome::Deleted(Err(reason)) => {
+            archive_fallthrough_result(home, candidate, reason)
         }
-        Err(e) => {
-            tracing::warn!(
-                agent = %candidate.agent,
-                path = %wt_path.display(),
-                error = %e,
-                "gc: git command failed"
-            );
-            archive_fallthrough_result(home, candidate, format!("git command failed: {e}"))
-        }
+        _ => unreachable!("Delete disposition yields Deleted"),
     }
 }
 
