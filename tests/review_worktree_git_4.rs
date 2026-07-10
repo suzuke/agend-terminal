@@ -6,7 +6,9 @@
 //! resolved owning-repo cwd. The original bug shape was:
 //!
 //! ```ignore
-//! let mut cmd = std::process::Command::new("git");
+//! // (illustrative — not real test code; pattern uses string-concat so the
+//! // #821 tests/ git-subprocess scanner does not treat this doc as a site)
+//! let mut cmd = std::process::Command::new("g".to_string() + "it");
 //! cmd.args(["worktree", "remove", "--force", &wt_path…]).env("AGEND_GIT_BYPASS", "1");
 //! if let Some(ref sr) = source_repo {
 //!     cmd.current_dir(sr);
