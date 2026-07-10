@@ -241,18 +241,11 @@ Release → crates.io publish（見 RELEASING.md）。
    decider 盲目改走 operated_state。
 3. **原始 `Command::new("git")` vs `git_cmd`/`git_ok`/`git_bypass`**：W1.2
    （#2068）導入 helper，並以 `tests/daemon_git_helper_invariant.rs` 做
-   per-slice 封印（`MODULE_SCOPE` 單調成長、永不縮小）。**截至 2026-07 已
-   seal 的 module**（只掃 production 區段；`// git-raw-allowed:` 標記豁免
-   刻意保留的 raw site）：
-
-   `worktree_pool.rs`、`worktree_cleanup.rs`、`branch_sweep.rs`、
-   `binding.rs`、`mcp_config.rs`、`instructions.rs`、`skills.rs`、
-   `claim_verifier.rs`、`deployments.rs`、`bootstrap/canonical_hygiene.rs`、
-   `agent_ops.rs`、`mcp/handlers/ci/release.rs`、`daemon/auto_release.rs`、
-   `daemon/retention/worktrees.rs`、`worktree.rs`。
-
-   尚未 seal 的 production 呼叫端（以及 `agend-git` 本體——那是 gated 端，
-   本來就該 raw）仍是 backlog——封印絕不宣稱尚未掙得的覆蓋率。
+   per-slice 封印（`MODULE_SCOPE` 單調成長、永不縮小；**權威列表在該檔，
+   此處不重複抄**）。**Production closeout（2026-07）：** 所有會跑 LOCAL
+   git 的 daemon/MCP module 皆已 seal；empty-`source_repo` 的 worktree
+   remove 走 `git_helpers::git_bypass_no_cwd`（含 timeout）。刻意保留的 raw：
+   只在 `git_helpers`（spawn 實作）與 `bin/agend-git`（gated 端）。
 4. **MCP 上限處的 size-driven 拆分**：`instance.rs`/`comms.rs` 卡在
    750-LOC 上限，帶有「為了 file_size_invariant 而拆分」的 cross-file
    接縫；`handle_delegate_task` 是一個 317-LOC 的 god-fn，gate 都 inline 在裡頭。

@@ -245,17 +245,12 @@ entry; none is free to "just clean up" without the listed care.
 3. **Raw `Command::new("git")` vs `git_cmd`/`git_ok`/`git_bypass`**: W1.2
    (#2068) landed helpers and a per-slice seal in
    `tests/daemon_git_helper_invariant.rs` (`MODULE_SCOPE` grows
-   monotonically; never shrink). **Sealed modules as of 2026-07** (production
-   portion; `// git-raw-allowed:` markers exempt deliberate raw sites):
-
-   `worktree_pool.rs`, `worktree_cleanup.rs`, `branch_sweep.rs`,
-   `binding.rs`, `mcp_config.rs`, `instructions.rs`, `skills.rs`,
-   `claim_verifier.rs`, `deployments.rs`, `bootstrap/canonical_hygiene.rs`,
-   `agent_ops.rs`, `mcp/handlers/ci/release.rs`, `daemon/auto_release.rs`,
-   `daemon/retention/worktrees.rs`, `worktree.rs`.
-
-   Unsealed production callers (and all of `agend-git` itself, which is the
-   gated side) remain the backlog — the seal never claims unearned coverage.
+   monotonically; never shrink; authority list — do not duplicate it here).
+   **Production closeout (2026-07):** every daemon/MCP module that performs
+   LOCAL git is sealed; empty-`source_repo` worktree remove goes through
+   `git_helpers::git_bypass_no_cwd` (timeout-bounded). Intentional residual
+   raw: only inside `git_helpers` (spawn implementation) and `bin/agend-git`
+   (gated shim).
 4. **Size-driven extraction at the MCP cap**: `instance.rs`/`comms.rs` at
    the 750-LOC cap with "extracted for file_size_invariant" cross-file
    seams; `handle_delegate_task` is a 317-LOC god-fn with gates inlined.

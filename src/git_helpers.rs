@@ -37,6 +37,47 @@ pub(crate) fn git_bypass(cwd: &Path, args: &[&str]) -> std::io::Result<std::proc
     git_bypass_timeout(cwd, args, LOCAL_GIT_TIMEOUT)
 }
 
+/// W1.2 closeout: always-bypass + [`LOCAL_GIT_TIMEOUT`] git spawn with **no**
+/// `current_dir`. Use when git must resolve the repo from absolute path args
+/// alone (e.g. `git worktree remove --force /abs/path` with empty owning-repo
+/// cwd). Same timeout + process-group kill as [`git_bypass`]; only the cwd
+/// binding differs.
+pub(crate) fn git_bypass_no_cwd(args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_bypass_no_cwd_timeout(args, LOCAL_GIT_TIMEOUT)
+}
+
+/// Like [`git_bypass_no_cwd`] with an explicit timeout bound.
+pub(crate) fn git_bypass_no_cwd_timeout(
+    args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    if let Some(sub) = args.first() {
+        if matches!(
+            *sub,
+            "worktree" | "branch" | "checkout" | "switch" | "reset" | "clean" | "commit" | "push"
+        ) {
+            tracing::info!(
+                target: "agend_git_bypass",
+                op = %sub,
+                args = ?args,
+                cwd = "(none)",
+                ctx = %crate::event_log::caller_process_context(),
+                "#2158 AGEND_GIT_BYPASS mutating git op (no-cwd)"
+            );
+        }
+    }
+    // git-raw-allowed: no-cwd path is the single intentional raw Command in
+    // git_helpers outside the cwd-bound git_bypass_timeout chokepoint — still
+    // always AGEND_GIT_BYPASS + spawn_group_bounded timeout/kill.
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args).env("AGEND_GIT_BYPASS", "1");
+    spawn_group_bounded(
+        cmd,
+        &format!("git {:?}", &args[..1.min(args.len())]),
+        timeout,
+    )
+}
+
 /// Like `git_bypass` but with a process-level timeout. Spawns the git
 /// subprocess and polls `try_wait` until either the process exits or the
 /// deadline is reached, at which point the git process group is killed.

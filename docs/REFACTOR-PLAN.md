@@ -55,14 +55,13 @@ wanting raw control. Makes "forgot `AGEND_GIT_BYPASS`" structurally
 impossible daemon-side and kills a flaky-test class.
 **Effort** 0.5–1 day · **Risk** low, mechanical, reviewable per call-site ·
 **Source** survey 05-R1.
-**Status** ✅ First slice done — PR #2068. `git_cmd`/`git_ok` landed; 4 modules
-migrated + sealed (`branch_sweep`, `worktree_cleanup`, `worktree_pool`,
-`binding`) by the `tests/daemon_git_helper_invariant.rs` per-slice
-`MODULE_SCOPE` scanner (FAILs CI on an unmarked raw `Command::new("git")` in a
-sealed module). **Scope correction**: the daemon has **~150** raw git sites
-across **~25** modules (not the ~51 estimate above); `MODULE_SCOPE` grows
-monotonically as each later slice adds its module, so the seal never claims
-unearned coverage. Remaining-module migration is the backlog: task `t-…766-17`.
+**Status** ✅ Complete (2026-07). `git_cmd`/`git_ok` landed in #2068; modules
+sealed through #2702/#2705 (`MODULE_SCOPE` authority list). Closeout helper
+`git_bypass_no_cwd` (+ timeout) routes empty-`source_repo` worktree remove
+through the same bypass/timeout/process-group kill as cwd-bound calls —
+`git_worktree::remove_force` has zero production raw `Command::new("git")`.
+Intentional residual raw: only inside `git_helpers` (the spawn implementation)
+and `bin/agend-git` (gated shim).
 
 ### W1.3 Quick wins (one small PR each)
 - Unify the duplicated tool-timeout maps (`request_dedup.rs:465` ↔
@@ -94,6 +93,9 @@ existing size-driven `instance_spawn.rs` + `instance_lifecycle.rs` into a
 coherent module) / `instance_metadata` (metadata + pane + health).
 Zero API change; the three concerns share no state.
 **Effort** M · **Risk** low · **Source** survey 02-#1.
+**Status** ✅ Largely landed — `instance.rs` is a thin re-export; queries /
+metadata / `instance_state/{spawn,lifecycle}` already split. Further
+concept-driven cleanup optional if LOC pressure returns.
 
 ### W2.2 Break up `handle_delegate_task` + extract `comms_gates`
 comms.rs at cap; `handle_delegate_task` (317 LOC) inlines busy-gate,
@@ -105,6 +107,9 @@ evidence_gate / anti_stall sibling files).
 **Effort** M · **Risk** low-medium (failure ordering must be preserved —
 route failure must still suppress provenance/dispatch side-effects) ·
 **Source** survey 02-#2, 03-A.
+**Status** 🔶 Partial — `comms_gates::run_dispatch_pre_checks` extracted;
+`handle_delegate_task` still owns message build + lease + send choreography
+(~comms.rs still near the 750-LOC cap). Remaining split is Wave-2 backlog.
 
 ### W2.3 `feed_with_fg` gate-pipeline extraction
 Decompose the 549-LOC classifier method into named `apply_*_gate` steps in
@@ -112,6 +117,10 @@ an explicit call sequence (ordering stays encoded in one place). This is
 the legibility prerequisite for every other state-detection change,
 including #1523 phase-2.
 **Effort** M · **Risk** low (structure-only) · **Source** survey 04-#2.
+**Status** ✅ Done — `feed_with_fg` / `feed_with_lazy_fg` → hash-dedup gate +
+`feed_after_dedup` with named `apply_anchor_gate` / `apply_position_gate` /
+`apply_working_marker_override` / `apply_srl_phantom_gate` /
+`apply_usage_limit_lifecycle_gate` + `gate_on_heartbeat` sequence.
 
 ### W2.4 `CadenceGate` + `PerAgentLatch<T>` utilities
 Collapse ~15 hand-rolled cadence counters and ~10 per-agent latch maps;
@@ -138,11 +147,14 @@ is a separate behaviour-fix backlog item (the #1923 G5 cleanup-on-delete class);
 `backend.rs preset()` 300-LOC 6-arm factory with repeated fields → table /
 default-merge. Adding a profile field currently means 7 edits.
 **Effort** M · **Risk** low · **Source** survey 04-#3.
+**Status** ✅ Done — `DEFAULTS` + `..DEFAULTS` per-arm overrides; pinned by
+`preset_default_merged_fields_byte_identical_w2_5`.
 
 ### W2.6 Name the resize contract
 Keep both resize chokepoints (#2048), extract a shared
 `PaneContentRect`/`ResizeDecision` helper, and document the invariant:
 layout pre-computes, render is authoritative for the final inner rect.
+**Status** ⏳ Open.
 **Effort** S-M · **Risk** medium — do NOT remove render-time resize
 without PTY tests · **Source** survey 03-C.
 
