@@ -107,9 +107,9 @@ evidence_gate / anti_stall sibling files).
 **Effort** M · **Risk** low-medium (failure ordering must be preserved —
 route failure must still suppress provenance/dispatch side-effects) ·
 **Source** survey 02-#2, 03-A.
-**Status** 🔶 Partial — `comms_gates::run_dispatch_pre_checks` extracted;
-`handle_delegate_task` still owns message build + lease + send choreography
-(~comms.rs still near the 750-LOC cap). Remaining split is Wave-2 backlog.
+**Status** ✅ Done — `comms_gates::run_dispatch_pre_checks` + phase pipeline in
+`comms_delegate.rs` (resolve → validate → compose → lease → create → send →
+track). `comms.rs` re-exports the handler; failure order preserved.
 
 ### W2.3 `feed_with_fg` gate-pipeline extraction
 Decompose the 549-LOC classifier method into named `apply_*_gate` steps in
@@ -154,7 +154,9 @@ default-merge. Adding a profile field currently means 7 edits.
 Keep both resize chokepoints (#2048), extract a shared
 `PaneContentRect`/`ResizeDecision` helper, and document the invariant:
 layout pre-computes, render is authoritative for the final inner rect.
-**Status** ⏳ Open.
+**Status** ✅ Done — `src/render/resize.rs` names [`PaneContentRect`] /
+[`ResizeDecision`]; `core_render` + `scratch` use them; layout still
+pre-computes via `collect_resize_needs` / `resize_pty`.
 **Effort** S-M · **Risk** medium — do NOT remove render-time resize
 without PTY tests · **Source** survey 03-C.
 

@@ -251,17 +251,16 @@ entry; none is free to "just clean up" without the listed care.
    `git_helpers::git_bypass_no_cwd` (timeout-bounded). Intentional residual
    raw: only inside `git_helpers` (spawn implementation) and `bin/agend-git`
    (gated shim).
-4. **Size-driven extraction at the MCP cap**: `instance.rs`/`comms.rs` at
-   the 750-LOC cap with "extracted for file_size_invariant" cross-file
-   seams; `handle_delegate_task` is a 317-LOC god-fn with gates inlined.
-   Concept-driven re-split is W2.
+4. **Size-driven extraction at the MCP cap**: mostly relieved — `instance_*`
+   split and `comms_delegate` / `comms_gates` hold the heavy paths. `comms.rs`
+   still hosts unified send + report/broadcast; further concept splits optional.
 5. **Channel trait vs legacy notify functions**: `Channel::notify`
    delegates to older concrete `notify_telegram*` entrypoints; the trait
    is not yet the only production path. Ownership decision before any
    adapter work (W4 design call).
-6. **Two resize chokepoints after #2048**: intentional (layout pre-pass +
-   render last-mile authority) but undocumented as an invariant until now;
-   keep both, name the contract (W2).
+6. **Two resize chokepoints after #2048**: ✅ named — `render::resize`
+   (`PaneContentRect` / `ResizeDecision`); layout pre-computes, render
+   remains authoritative for the final inner rect.
 
 ## 7. Testing & enforcement landscape
 
