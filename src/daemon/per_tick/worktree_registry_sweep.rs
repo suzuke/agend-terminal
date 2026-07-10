@@ -187,10 +187,10 @@ mod test_hooks {
 ///
 /// #2605: repo discovery moved to live `binding.json` state
 /// (`sweep_from_registry` reads it via `home`) instead of the removed
-/// `AgentConfig.worktree_source` cache. Real deletion is gated by
-/// `worktree_cleanup::prune_live_enabled` (default LIVE since #2695 — opt-out
-/// via `AGEND_WORKTREE_PRUNE_LIVE=0`, which keeps the same candidates identified
-/// but not deleted, logged under a distinct dry-run event kind).
+/// `AgentConfig.worktree_source` cache. PR-D6: real deletion is gated by
+/// `AGEND_WORKTREE_AUTO_CLEANUP` ONLY — when the sweep returns candidates they
+/// were actually removed (the retired `AGEND_WORKTREE_PRUNE_LIVE` dry-run toggle
+/// is gone), so every returned entry is logged as a live removal.
 fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry, count_warned: &AtomicBool) {
     let cfgs = configs.lock();
     let config_data: std::collections::HashMap<String, Option<std::path::PathBuf>> = cfgs
@@ -209,43 +209,25 @@ fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry, count_warned: &A
             })
             .unwrap_or_default();
     let cleaned = crate::worktree_cleanup::sweep_from_registry(home, &config_data, &fleet_dirs);
-    let dry_run = !crate::worktree_cleanup::prune_live_enabled();
-    let event_kind = if dry_run {
-        "worktree_prune_dry_run_candidate"
-    } else {
-        "worktree_auto_removed"
-    };
+    // PR-D6: sweep is always live (gated by AUTO_CLEANUP only) — every returned
+    // entry was actually removed.
     for (branch, path, reason) in &cleaned {
-        let detail = if dry_run {
-            format!("path={path}, reason={reason} (dry-run candidate, not deleted)")
-        } else {
-            format!("path={path}, reason={reason}")
-        };
-        crate::event_log::log(home, event_kind, branch, &detail);
-        if dry_run {
-            tracing::info!(
-                branch,
-                path,
-                reason,
-                "worktree prune candidate (dry-run, not deleted)"
-            );
-        } else {
-            tracing::info!(branch, path, reason, "worktree auto-removed");
-        }
+        let detail = format!("path={path}, reason={reason}");
+        crate::event_log::log(home, "worktree_auto_removed", branch, &detail);
+        tracing::info!(branch, path, reason, "worktree auto-removed");
     }
 
     // #P4 (branch-residue): end-of-sweep residue alarm. If any bound repo has
     // accumulated more than 15 non-default local branches, worktree/branch GC is
-    // not keeping up (GC stalled, or the prune gate opted out). Warn + notify the
+    // not keeping up (GC stalled, or AUTO_CLEANUP disabled). Warn + notify the
     // operator ONCE per episode (de-duped via `count_warned`, reset when back
-    // under). Independent of `dry_run` — the count is observational, so a
-    // dry-run daemon still surfaces accumulating residue.
+    // under). The count is observational, independent of whether the sweep ran.
     let max_count = max_nondefault_branch_count(home);
     if branch_count_alert(max_count, count_warned) {
         tracing::warn!(
             count = max_count,
             "non-default local branch count exceeds 15 — residue may be accumulating \
-             (is AGEND_WORKTREE_PRUNE_LIVE=0 / GC stalled?)"
+             (is AGEND_WORKTREE_AUTO_CLEANUP=0 / GC stalled?)"
         );
         let text = format!(
             "Local non-default branch count is {max_count} (>15) in a bound repo; \

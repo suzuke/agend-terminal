@@ -16,7 +16,7 @@ absorbed from the former standalone `force_release_worktree` tool — #2548),
 
 **Mid-lifecycle recovery.** An agent's worktree binding becomes stale after a crash or daemon restart. The agent uses `bind_self` to re-establish its binding to the existing worktree, optionally with `rebase_mode=true` to rebase onto the latest upstream changes before resuming work.
 
-**Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC (`gc_cutover` with `AGEND_WORKTREE_GC=1`) removes it automatically. For stuck or orphaned worktrees, the operator can use `release_worktree(force:true)` as an emergency measure.
+**Controlled cleanup.** After a task is completed and the PR is merged, the daemon soft-releases the worktree (marking it with `released_at`). The worktree remains on disk for a 24-hour grace period. If no one reclaims it, GC removes it automatically (its archive-to-`.trash` fallthrough belt is gated by `AGEND_WORKTREE_ARCHIVE_FALLBACK=1`, renamed from the now-deprecated `AGEND_WORKTREE_GC`). For stuck or orphaned worktrees, the operator can use `release_worktree(force:true)` as an emergency measure.
 
 **Auto-release on merge (#1344).** When the pr_state scanner detects a PR has been merged, it automatically calls `auto_release_for_merged_branch` to free the worktree before emitting the `[pr-merged]` notification. This ensures `gh pr merge --delete-branch` succeeds without manual intervention. Dirty worktrees are skipped (with a warning log) and retried on the next scanner tick.
 
@@ -128,7 +128,7 @@ worktree's own agent or its team orchestrator (AUDIT2-002).
 ## 11. Garbage Collection Semantics
 
 - `gc_dry_run()` lists candidates without deleting anything.
-- `gc_cutover()` performs actual deletion; requires `AGEND_WORKTREE_GC=1`.
+- `gc_cutover()` performs actual deletion; its archive-fallthrough belt (archive a hard-delete-blocked candidate to `.trash` in the same pass) is gated by `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` (renamed from `AGEND_WORKTREE_GC` in PR-D6; the old name is honored as a deprecated alias for one release cycle).
 - GC skips: non-daemon-managed worktrees, pinned worktrees, worktrees with active bindings, and worktrees without `released_at`.
 - Grace window: 24 hours after `released_at`.
 - Both dry-run and cutover record to the event log.
@@ -175,7 +175,7 @@ Both the new layout (`<home>/worktrees/<agent>/<branch>/`) and legacy layout (`<
 3. Ready to release: `release_worktree`.
 4. Stale directory remains: `release_worktree(force:true)`.
 5. Preview candidates: `gc_dry_run`.
-6. Execute collection: set `AGEND_WORKTREE_GC=1`, run cutover.
+6. Execute collection: set `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` (deprecated alias: `AGEND_WORKTREE_GC`), run cutover.
 7. Preserve a worktree: `pin`.
 8. Remove preservation: `unpin`.
 
