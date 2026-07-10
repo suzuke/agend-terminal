@@ -12,8 +12,7 @@
 
 狀態說明：**Upstream-blocker**（修正屬於另一個專案）·
 **Unsupported**（目前刻意不維護）· **Needs-operator-input**
-（卡在只有 maintainer 能提供的擷取資料或決策）·
-**Stale**（目前無人負責）。
+（卡在只有 maintainer 能提供的擷取資料或決策）。
 
 ---
 
@@ -59,9 +58,9 @@
 - **Revisit when：** operator 凍結政策且工作完成分階段拆解。
 - **Refs：** #1339
 
-## Stale — 目前無人負責
-
-### Schedule fire-strategy
-- **Status：** Stale
-- **Why：** 目前無人負責；策略尚未拍板。
-- **Refs：** #1521
+<!--
+#1521 Schedule fire-strategy — 已出貨（2026-07 自本清單移除）。
+`FireStrategy::{Always, UntilSuccess}` 定義於 `src/schedules.rs`，
+由 `src/daemon/cron_tick.rs` 執行（linked-task gate + 當日 suppress）。
+勿再標為「尚未拍板」。
+-->

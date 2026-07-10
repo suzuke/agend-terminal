@@ -14,8 +14,7 @@ say so explicitly in your report.
 
 Status legend: **Upstream-blocker** (fix lives in another project) ·
 **Unsupported** (intentionally not maintained for now) · **Needs-operator-input**
-(blocked on a capture or decision only the maintainer can provide) ·
-**Stale** (no current owner).
+(blocked on a capture or decision only the maintainer can provide).
 
 ---
 
@@ -67,9 +66,9 @@ Status legend: **Upstream-blocker** (fix lives in another project) ·
 - **Revisit when:** the operator freezes the policy and the work is phased.
 - **Refs:** #1339
 
-## Stale — no current owner
-
-### Schedule fire-strategy
-- **Status:** Stale
-- **Why:** no current owner; the strategy is undecided.
-- **Refs:** #1521
+<!--
+#1521 Schedule fire-strategy — SHIPPED (removed from this list 2026-07).
+`FireStrategy::{Always, UntilSuccess}` lives in `src/schedules.rs` and is
+enforced by `src/daemon/cron_tick.rs` (linked-task gate + per-day suppress).
+Do not re-add as "undecided".
+-->

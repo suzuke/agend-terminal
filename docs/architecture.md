@@ -22,9 +22,11 @@ git-worktree isolation, health monitoring with auto-respawn, and TUI +
 Telegram remote control. The core value is **multi-agent orchestration**;
 everything else serves it.
 
-~198K LOC Rust across 286 files. Three binaries: `agend-terminal` (daemon +
-TUI + CLI), `agend-mcp-bridge` (per-agent stdio↔TCP MCP relay),
-`agend-git` (PATH-shim `git` policy gate).
+~292K LOC Rust across ~429 files under `src/` (integration tests extra).
+Four binaries: `agend-terminal` (daemon + TUI + CLI), `agend-mcp-bridge`
+(per-agent stdio↔TCP MCP relay), `agend-git` (PATH-shim `git` policy gate),
+and vendored `agentic-git` (flag-gated shim alternative; see fleet
+`use_agentic_git_shim`).
 
 ## 2. Subsystem map
 
@@ -38,27 +40,32 @@ The heart: observe each agent's state machine, react, recover.
 | Module | LOC | Role |
 |---|---|---|
 | `daemon/supervisor.rs` | 5408 | Per-agent state OBSERVATION + reaction emission + error recovery (SRL/ApiError). The 12 inline slow-tracker scans moved to `PerTickHandler`s in W1.1 (#2065) |
-| `daemon/mod.rs` | 2764 | Entry/init/shutdown; builds the per-tick handler set (`build_default_handlers` → 32 handlers) |
-| `daemon/per_tick/` | — | `PerTickHandler` trait + 32 handler impls, panic-guarded dispatch, boot-grace gate |
+| `daemon/mod.rs` | 2764 | Entry/init/shutdown; re-exports `build_default_handlers` from `per_tick` (35 registered handlers as of 2026-07) |
+| `daemon/per_tick/` | — | `PerTickHandler` trait + 35 handler impls, panic-guarded dispatch, boot-grace / `CadenceGate` |
 | `daemon/crash_respawn.rs` | 568 | Crash→respawn decision: health budget, escalation persist, respawn worker |
 | `health.rs` | 2385 | Per-agent hang/crash budgets, blocked-reason, escalation persist+rehydrate |
 | `state/mod.rs` | 2176 | Per-agent `StateTracker` — screen-heuristic state machine (see 2.4) |
 
 Periodic work is now a single pipeline (W1.1 / #2065, see §6.1): the daemon
-loop dispatches all 32 `PerTickHandler`s with per-handler `catch_unwind` +
-timing (per_tick/mod.rs:182-214). The 12 trackers that used to run inline in
-the supervisor `run_loop` were wrapped as handlers and appended in their
-original relative order; the supervisor `run_loop` now hosts only `tick()` /
-`process_error_recovery()` / a boot-time sidecar GC (still its own 10s thread).
+loop dispatches all registered `PerTickHandler`s (35 in
+`per_tick::build_default_handlers` as of 2026-07; count drifts as merges/
+extractions land — pin via the completeness invariant) with per-handler
+`catch_unwind` + timing. The 12 trackers that used to run inline in the
+supervisor `run_loop` were wrapped as handlers and appended in their
+original relative order; later waves collapsed some slots (e.g. #2549
+notification/GC/context composites). The supervisor `run_loop` now hosts
+only `tick()` / `process_error_recovery()` / a boot-time sidecar GC
+(still its own 10s thread).
 
 ### 2.2 MCP layer + inter-agent comms (~22K LOC)
 
-Macro-architecturally sound: a single immutable 36-entry registry
-(`mcp/registry.rs:20`) pairs JSON-schema definitions with handler
-fn-pointers, dispatched through one validated chokepoint
-(`mcp/handlers/dispatch.rs:77-117`). The strain is micro: two handler files
-sit at the 750-LOC `file_size_invariant` cap, and extraction so far has been
-size-driven rather than concept-driven (see §6.4).
+Macro-architecturally sound: a single immutable 29-entry registry
+(`mcp/registry.rs` `ALL_TOOLS`; count pinned by
+`tool_definitions_count_invariant_post_sprint_30`) pairs JSON-schema
+definitions with handler fn-pointers, dispatched through one validated
+chokepoint (`mcp/handlers/dispatch.rs`). The strain is micro: two handler
+files sit at the 750-LOC `file_size_invariant` cap, and extraction so far
+has been size-driven rather than concept-driven (see §6.4).
 
 The transport spine (an agent-to-agent `send`):
 
@@ -224,24 +231,31 @@ entry; none is free to "just clean up" without the listed care.
 
 1. **Two periodic-work mechanisms** (§2.1): ✅ RESOLVED by W1.1 (#2065). The 12
    inline supervisor `maybe_scan` trackers are now `PerTickHandler`s in the one
-   `build_default_handlers` pipeline (32 handlers); a completeness invariant
-   pins the full set so the two-mechanism split can't silently reappear.
-2. **Heuristic vs hook state, dual readers** (§2.4): the snapshot path is
-   promoted (hook-aware), but hang/watchdog/recovery/supervisor escalation
-   still read raw heuristic — in a single tick, dispatch_idle can suppress
-   a nudge (snapshot=ToolUse) while hang_detection escalates
-   (raw=heuristic-Idle). Bounded today by the #1999 escalation throttle.
-   Convergence = #1523 phase-2 (W3; lock-ordering design required — a
-   naive shared cache inverts registry⨯core order).
-3. **Raw `Command::new("git")` vs `git_bypass`**: ~150 daemon raw git sites
-   across ~25 modules; any site that forgets `AGEND_GIT_BYPASS=1` silently hits
-   the shim (a whole flaky-test class). W1.2 (#2068) landed `git_cmd`/`git_ok`
-   and SEALED its first 4 modules (`branch_sweep`, `worktree_cleanup`,
-   `worktree_pool`, `binding`) behind `tests/daemon_git_helper_invariant.rs`, a
-   per-slice `MODULE_SCOPE` scanner that grows monotonically as each later
-   slice migrates its module. The remaining modules are the backlog
-   (`t-…766-17`) — the seal makes regression structurally impossible only for
-   already-migrated modules, never claiming unearned coverage.
+   `build_default_handlers` pipeline; a completeness invariant pins the full
+   set so the two-mechanism split can't silently reappear. (Registered count
+   moves with later merges — 35 handlers as of 2026-07.)
+2. **Heuristic vs hook / observed state, dual readers** (§2.4): snapshot and
+   several dispatch consumers use `operated_state` (#2413/#2465 — Shadow
+   Observer high-confidence correction when `AGEND_OBSERVED_DISPATCH` is on).
+   Health/hang/recovery/respawn and the SRL arm deliberately **KEEP-RAW**
+   (`core.state.current`) so a stale Active observed status cannot mask a
+   truly stuck agent. Same-tick dual truths remain possible; bounded by
+   escalation throttle. Further promotion is #2466 / REFACTOR W3.3 — not
+   "blindly route every decider through operated_state".
+3. **Raw `Command::new("git")` vs `git_cmd`/`git_ok`/`git_bypass`**: W1.2
+   (#2068) landed helpers and a per-slice seal in
+   `tests/daemon_git_helper_invariant.rs` (`MODULE_SCOPE` grows
+   monotonically; never shrink). **Sealed modules as of 2026-07** (production
+   portion; `// git-raw-allowed:` markers exempt deliberate raw sites):
+
+   `worktree_pool.rs`, `worktree_cleanup.rs`, `branch_sweep.rs`,
+   `binding.rs`, `mcp_config.rs`, `instructions.rs`, `skills.rs`,
+   `claim_verifier.rs`, `deployments.rs`, `bootstrap/canonical_hygiene.rs`,
+   `agent_ops.rs`, `mcp/handlers/ci/release.rs`, `daemon/auto_release.rs`,
+   `daemon/retention/worktrees.rs`, `worktree.rs`.
+
+   Unsealed production callers (and all of `agend-git` itself, which is the
+   gated side) remain the backlog — the seal never claims unearned coverage.
 4. **Size-driven extraction at the MCP cap**: `instance.rs`/`comms.rs` at
    the 750-LOC cap with "extracted for file_size_invariant" cross-file
    seams; `handle_delegate_task` is a 317-LOC god-fn with gates inlined.
