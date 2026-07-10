@@ -100,7 +100,8 @@ fn gc_remove_one_worktree_remove_has_mandatory_cwd_worktree_git_4() {
     // before remove (not a soft Option that still spawns).
     assert!(
         body.contains("resolve_source_repo")
-            && (body.contains("let Some(source_repo)") || body.contains("let Some(ref source_repo)")),
+            && (body.contains("let Some(source_repo)")
+                || body.contains("let Some(ref source_repo)")),
         "gc_remove_one must resolve source_repo and require Some before remove \
          (mandatory cwd / no inherit-daemon-cwd spawn)\n\n--- body ---\n{body}"
     );
