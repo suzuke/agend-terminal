@@ -2,30 +2,30 @@
 
 //! Review-repro static invariant (scope: worktree-git), finding #4 (low).
 //!
-//! `worktree_pool::gc_remove_one` resolves `source_repo` via
-//! `resolve_source_repo(wt_path)` and then spawns `git worktree remove --force
-//! <abs path>` with the cwd set ONLY conditionally:
+//! `worktree_pool::gc_remove_one` must not run `git worktree remove` without a
+//! resolved owning-repo cwd. The original bug shape was:
 //!
 //! ```ignore
-//! let mut cmd = std::process::Command::new(git_bin); // git_bin == "git"
+//! let mut cmd = std::process::Command::new("git");
 //! cmd.args(["worktree", "remove", "--force", &wt_path…]).env("AGEND_GIT_BYPASS", "1");
 //! if let Some(ref sr) = source_repo {
 //!     cmd.current_dir(sr);
 //! }
-//! match cmd.output() { … }   // ← runs even when source_repo is None
+//! match cmd.output() { … }   // ← ran even when source_repo is None
 //! ```
 //!
-//! When `source_repo` is `None`, git inherits the daemon process's cwd. If that
-//! cwd is inside an unrelated repo/worktree, `git worktree remove` resolves the
-//! WRONG repo (typically fails), then the `remove_dir_all` fallback physically
-//! deletes the dir but CANNOT prune the owning repo's registry (the prune is
-//! guarded by `if let Some(ref sr)`), re-introducing the prunable-registry leak.
+//! When `source_repo` is `None`, git inherits the daemon process's cwd → wrong
+//! repo, then `remove_dir_all` can delete the dir without pruning the owning
+//! registry (prunable-registry leak).
 //!
-//! This invariant is RED while the removal command's cwd is set conditionally on
-//! `source_repo` being `Some`. It goes GREEN when the fix makes the cwd
-//! MANDATORY before the worktree-remove (e.g. early-return / skip when the owning
-//! repo cannot be resolved) — so the conditional `cmd.current_dir(sr)` for the
-//! removal command no longer exists.
+//! GREEN shapes (either is fine):
+//! - early-return / archive fallthrough when `resolve_source_repo` is `None`,
+//!   then remove only with a mandatory cwd; OR
+//! - route through `git_worktree::remove_force(&source_repo, …)` after a
+//!   mandatory `let Some(source_repo) = resolve… else { fallthrough }` so the
+//!   empty-cwd raw branch is never taken from this caller.
+//!
+//! RED: a conditional `cmd.current_dir(sr)` still wrapping the removal spawn.
 
 use std::path::PathBuf;
 
@@ -87,20 +87,29 @@ fn gc_remove_one_worktree_remove_has_mandatory_cwd_worktree_git_4() {
     let src = std::fs::read_to_string(&path).expect("read src/worktree_pool/gc.rs");
     let body = fn_body(&src, "fn gc_remove_one(");
 
-    // Sanity: the body really is the git-worktree-remove path.
+    // Sanity: still the worktree-remove path (raw argv OR remove_force helper).
+    let has_raw_remove = body.contains("\"remove\",") && body.contains("\"--force\",");
+    let has_remove_force = body.contains("remove_force");
     assert!(
-        body.contains("\"remove\",") && body.contains("\"--force\","),
-        "gc_remove_one body must contain the `git worktree remove --force` call"
+        has_raw_remove || has_remove_force,
+        "gc_remove_one body must remove via raw `worktree remove --force` or \
+         `git_worktree::remove_force`"
+    );
+
+    // Production fix shape: mandatory `let Some(source_repo) = resolve… else`
+    // before remove (not a soft Option that still spawns).
+    assert!(
+        body.contains("resolve_source_repo")
+            && (body.contains("let Some(source_repo)") || body.contains("let Some(ref source_repo)")),
+        "gc_remove_one must resolve source_repo and require Some before remove \
+         (mandatory cwd / no inherit-daemon-cwd spawn)\n\n--- body ---\n{body}"
     );
 
     assert!(
         !has_conditional_removal_cwd(&body),
-        "worktree-git #4: `gc_remove_one` sets the `git worktree remove` cwd ONLY \
-         `if let Some(ref sr) = source_repo`, but spawns `cmd.output()` regardless — \
-         so when source_repo is None git runs against the daemon's INHERITED cwd \
-         (wrong repo) and the registry prune is skipped (leak). Make the owning-repo \
-         cwd MANDATORY before the worktree-remove (resolve it or early-return/skip), \
-         so the removal command never runs with an unset cwd.\n\n\
+        "worktree-git #4: `gc_remove_one` must not set the removal cwd only via \
+         `if let Some(ref sr) = source_repo {{ cmd.current_dir(sr) }}` while still \
+         spawning when None — that reopens the inherited-cwd registry leak.\n\n\
          --- gc_remove_one() body ---\n{body}"
     );
 }
