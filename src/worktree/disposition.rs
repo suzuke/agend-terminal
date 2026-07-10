@@ -21,7 +21,14 @@
 //! from `auto_release::releasable_by_invariant`, a [`ReclaimState`] from the GC
 //! `evaluate_candidate` classification. It re-encodes NONE of that logic; it only
 //! adds the cross-system routing that unifies the three decision systems.
-#![allow(dead_code)] // D1 additive: no production caller until D2–D4 wire the call sites.
+//!
+//! PR-D · D2 (#2711) narrowed D1's blanket `#![allow(dead_code)]`: the L0–L2
+//! auto-release path now has a real production caller
+//! ([`crate::daemon::auto_release::should_release_now`]), so `terminal_disposition`
+//! + `DispositionInput` are live. Only the still-unwired L3 GC reclaim states
+//! (`ReclaimState`) and the L4 branch-ref decision (`branch_disposition` +
+//! `BranchSignal` / `BranchDisposition`) carry targeted `#[allow(dead_code)]`,
+//! until D3/D4 land their call sites.
 
 use crate::daemon::auto_release::ReleaseDecision;
 
@@ -47,6 +54,9 @@ pub(crate) enum Disposition {
 /// L3 (binding-absent, GC) reclaim classification. Produced by the GC system's
 /// `evaluate_candidate` (D4 wires it); the pure part the classifier routes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// L3 GC states: only `NotEligible` is constructed so far (by the auto-release
+// caller); D4 wires the constructors for the reclaim variants.
+#[allow(dead_code)]
 pub(crate) enum ReclaimState {
     /// Not a GC candidate (in grace, not aged, or spared) → Keep.
     NotEligible,
@@ -66,6 +76,8 @@ pub(crate) enum ReclaimState {
 /// may be reclaimed while its branch ref is KEPT (CR-2026-06-14 — remote-gone
 /// alone is never a `branch -D` trigger).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// L4 branch-ref axis: D3/D4 wire `branch_disposition` into the sweep/GC paths.
+#[allow(dead_code)]
 pub(crate) enum BranchSignal {
     /// Merged-ancestor, squash-merged past the age floor, or an authoritative
     /// merged PR (#2698) → the work is provably in `default`.
@@ -79,6 +91,8 @@ pub(crate) enum BranchSignal {
 
 /// Branch-ref disposition (spike §1 L4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// L4 branch-ref axis: D3/D4 wire `branch_disposition` into the sweep/GC paths.
+#[allow(dead_code)]
 pub(crate) enum BranchDisposition {
     KeepBranch,
     DeleteBranch,
@@ -159,6 +173,8 @@ pub(crate) fn terminal_disposition(input: &DispositionInput) -> Disposition {
 
 /// The branch-ref decision (spike §1 L4), independent of the worktree dir.
 /// Delete only on provable-in-default; remote-gone alone never deletes.
+// L4 branch-ref axis: no production caller until D3/D4 wire the sweep/GC paths.
+#[allow(dead_code)]
 pub(crate) fn branch_disposition(signal: BranchSignal) -> BranchDisposition {
     match signal {
         BranchSignal::ProvablyInDefault => BranchDisposition::DeleteBranch,
