@@ -188,7 +188,7 @@
 - 它只列候選。
 - `gc_cutover()` 才真的刪。
 - `gc_cutover()` 的封存 fallthrough 補救帶需要 `AGEND_WORKTREE_ARCHIVE_FALLBACK=1`（PR-D6 由 `AGEND_WORKTREE_GC` 更名而來；舊名以棄用別名身分再保留一個 release cycle）。
-- 沒設 env 會直接跳過。
+- 沒設這個 env 只代表關掉封存補救帶；硬刪／收集照常執行，不會因此被跳過。
 - GC 只看 daemon-managed worktree。
 - GC 也會跳過 pinned。
 - GC 也會跳過還有 active binding 的 worktree。
@@ -261,7 +261,7 @@
 - 準備釋放時先用 `release_worktree`。
 - 若還有殘留 dir，再用 `release_worktree(force:true)`。
 - 只想看候選，先跑 `gc_dry_run`。
-- 確認無誤且要切回收，再設 `AGEND_WORKTREE_ARCHIVE_FALLBACK=1`（棄用別名：`AGEND_WORKTREE_GC`）。
+- 確認無誤即可跑 cutover 收集；硬刪／收集與這個 env 無關，一律執行。若要開啟封存補救帶（僅在硬刪失敗時把 worktree 封存到 `.trash`），再另外設 `AGEND_WORKTREE_ARCHIVE_FALLBACK=1`（棄用別名：`AGEND_WORKTREE_GC`）——它不 gate 收集。
 - 若要保留工作樹，先 pin。
 - 若要解除保留，再 unpin。
 - 若要清理整條路徑，先確認 binding 與 marker。

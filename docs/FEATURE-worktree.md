@@ -175,7 +175,7 @@ Both the new layout (`<home>/worktrees/<agent>/<branch>/`) and legacy layout (`<
 3. Ready to release: `release_worktree`.
 4. Stale directory remains: `release_worktree(force:true)`.
 5. Preview candidates: `gc_dry_run`.
-6. Execute collection: set `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` (deprecated alias: `AGEND_WORKTREE_GC`), run cutover.
+6. Execute collection: run cutover. Collection/hard-delete runs regardless of any env var. Optionally set `AGEND_WORKTREE_ARCHIVE_FALLBACK=1` (deprecated alias: `AGEND_WORKTREE_GC`) to opt into the archive-fallback belt, which archives a worktree to `.trash` only when hard-delete FAILS — it does not gate collection.
 7. Preserve a worktree: `pin`.
 8. Remove preservation: `unpin`.
 

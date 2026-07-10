@@ -46,7 +46,7 @@ pub fn auto_cleanup_enabled() -> bool {
 /// value), warn once at daemon boot so they learn it is ignored. Returns whether
 /// the retired var was present (so a test can assert the boot-warn path fired);
 /// the daemon calls this for its logging side effect at startup.
-pub fn warn_if_prune_live_retired() -> bool {
+pub(crate) fn warn_if_prune_live_retired() -> bool {
     if std::env::var("AGEND_WORKTREE_PRUNE_LIVE").is_ok() {
         tracing::warn!(
             "AGEND_WORKTREE_PRUNE_LIVE is retired and ignored — sweep gating is now \
@@ -997,6 +997,10 @@ mod tests {
 
     /// PR-D6 (a): the retired var, when set to ANY value, is detected so the
     /// boot path warns (fail-loud, not silent) and returns `true`.
+    /// F3: `traced_test` asserts the ACTUAL `tracing::warn!` fired via
+    /// `logs_contain` — a return-value-only assert stayed green even with the
+    /// warn deleted (the exact bug this fix closes).
+    #[tracing_test::traced_test]
     #[test]
     fn prune_live_retired_boot_warn_fires_when_set_d6() {
         let _lock = ENV_LOCK.lock();
@@ -1011,9 +1015,16 @@ mod tests {
             "even PRUNE_LIVE=0 must be detected + warned — it is honored no longer"
         );
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        assert!(
+            logs_contain("is retired and ignored"),
+            "the retired-flag boot warn must actually be emitted (not just a true return)"
+        );
     }
 
     /// PR-D6 (a): unset ⇒ no warn (nothing to fail loud about).
+    /// F3: negative-direction — `traced_test` + `!logs_contain` proves the warn
+    /// stays SILENT when the flag is unset.
+    #[tracing_test::traced_test]
     #[test]
     fn prune_live_retired_no_warn_when_unset_d6() {
         let _lock = ENV_LOCK.lock();
@@ -1021,6 +1032,10 @@ mod tests {
         assert!(
             !warn_if_prune_live_retired(),
             "PRUNE_LIVE unset ⇒ boot check must be silent (return false)"
+        );
+        assert!(
+            !logs_contain("is retired and ignored"),
+            "no retired-flag warn may be emitted when the flag is unset"
         );
     }
 

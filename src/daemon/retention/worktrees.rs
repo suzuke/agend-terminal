@@ -1589,6 +1589,10 @@ mod tests {
     /// PR-D6 (d): with the new name UNSET, the deprecated `AGEND_WORKTREE_GC=1`
     /// alias is honored for one release cycle (the gate enables; the same code
     /// path emits the deprecation warn). Old name unset ⇒ OFF.
+    /// F3: `traced_test` asserts the deprecation `tracing::warn!` ACTUALLY fired
+    /// via `logs_contain` — the previous boolean-only assert stayed green even
+    /// with the warn deleted (the exact bug this fix closes).
+    #[tracing_test::traced_test]
     #[test]
     fn archive_fallback_honors_deprecated_gc_alias_d6() {
         let _env_guard = gc_trash_env_guard();
@@ -1597,6 +1601,10 @@ mod tests {
         assert!(
             archive_fallback_enabled(),
             "deprecated AGEND_WORKTREE_GC=1 (new name unset) must still enable + warn"
+        );
+        assert!(
+            logs_contain("AGEND_WORKTREE_GC is deprecated"),
+            "honoring the deprecated alias must actually emit the deprecation warn"
         );
         std::env::remove_var("AGEND_WORKTREE_GC");
         assert!(!archive_fallback_enabled(), "neither name set ⇒ gate OFF");
