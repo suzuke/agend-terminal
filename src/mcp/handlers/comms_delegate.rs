@@ -209,97 +209,99 @@ fn maybe_auto_create_task(
     }
 }
 
-/// Phase 6 — SEND via API with envelope fallback.
-fn deliver_delegate(
-    home: &Path,
-    sender: &Sender,
-    target: &str,
-    msg: &str,
-    task: &str,
-    task_id_str: Option<&str>,
+/// Shared inputs for send + post-success track (avoids clippy::too_many_arguments).
+struct DeliveryCtx<'a> {
+    home: &'a Path,
+    args: &'a Value,
+    sender: &'a Sender,
+    target: &'a str,
+    task: &'a str,
+    msg: &'a str,
+    task_id: Option<&'a str>,
     force_meta_json: Option<Value>,
-    args: &Value,
-) -> Value {
+    auto_created_task_id: Option<String>,
+}
+
+/// Phase 6 — SEND via API with envelope fallback.
+fn deliver_delegate(ctx: &DeliveryCtx<'_>) -> Value {
     let env = SendEnvelope {
-        from: sender.as_str().to_string(),
-        target: target.to_string(),
-        text: msg.to_string(),
+        from: ctx.sender.as_str().to_string(),
+        target: ctx.target.to_string(),
+        text: ctx.msg.to_string(),
         kind: Some("task".to_string()),
-        thread_id: args["thread_id"].as_str().map(String::from),
-        parent_id: args["parent_id"].as_str().map(String::from),
-        task_id: task_id_str.map(String::from),
-        force_meta: force_meta_json,
-        provenance: Some(json!({ "from": sender.as_str(), "task": task })),
-        branch: args["branch"].as_str().map(String::from),
-        ..SendEnvelope::directives_from_args(args)
+        thread_id: ctx.args["thread_id"].as_str().map(String::from),
+        parent_id: ctx.args["parent_id"].as_str().map(String::from),
+        task_id: ctx.task_id.map(String::from),
+        force_meta: ctx.force_meta_json.clone(),
+        provenance: Some(json!({ "from": ctx.sender.as_str(), "task": ctx.task })),
+        branch: ctx.args["branch"].as_str().map(String::from),
+        ..SendEnvelope::directives_from_args(ctx.args)
     };
     match crate::api::call(
-        home,
+        ctx.home,
         &json!({
             "request_id": uuid::Uuid::new_v4().to_string(),
             "method": crate::api::method::SEND,
             "params": env.to_send_params(),
         }),
     ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": ctx.target}),
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
             let inbox_msg = env.to_inbox_message();
-            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, msg, inbox_msg, &e)
+            crate::agent_ops::fallback_deliver(
+                ctx.home,
+                ctx.sender.as_str(),
+                ctx.target,
+                ctx.msg,
+                inbox_msg,
+                &e,
+            )
         }
     }
 }
 
 /// Phase 7 — post-success tracking / UX / auto_created_task_id.
-fn track_delegate_success(
-    home: &Path,
-    args: &Value,
-    sender: &Sender,
-    target: &str,
-    task: &str,
-    task_id_str: Option<&str>,
-    auto_created_task_id: Option<String>,
-    mut result: Value,
-) -> Value {
+fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
     if is_ok_result(&result) {
-        let task_id = task_id_str.map(str::to_string);
-        let status = if args["no_report_expected"].as_bool().unwrap_or(false) {
+        let task_id = ctx.task_id.map(str::to_string);
+        let status = if ctx.args["no_report_expected"].as_bool().unwrap_or(false) {
             "no_report_expected"
         } else {
             "pending"
         };
         crate::dispatch_tracking::track_dispatch(
-            home,
+            ctx.home,
             crate::dispatch_tracking::DispatchEntry {
                 task_id: task_id.clone(),
-                from: sender.as_str().to_string(),
-                to: target.to_string(),
-                from_id: crate::agent::resolve_instance(home, sender.as_str())
+                from: ctx.sender.as_str().to_string(),
+                to: ctx.target.to_string(),
+                from_id: crate::agent::resolve_instance(ctx.home, ctx.sender.as_str())
                     .ok()
                     .map(|(id, _)| id.full()),
-                to_id: crate::agent::resolve_instance(home, target)
+                to_id: crate::agent::resolve_instance(ctx.home, ctx.target)
                     .ok()
                     .map(|(id, _)| id.full()),
                 delegated_at: chrono::Utc::now().to_rfc3339(),
                 status: status.to_string(),
             },
         );
-        if let Some(branch) = args["branch"].as_str() {
+        if let Some(branch) = ctx.args["branch"].as_str() {
             tracing::info!(
-                target = %target,
+                target = %ctx.target,
                 branch = %branch,
-                task_id = ?task_id_str,
+                task_id = ?ctx.task_id,
                 "delegate_task branch hint — implementer should work on this branch"
             );
         }
         ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
-            from: sender.as_str().to_string(),
-            to: target.to_string(),
-            summary: task.to_string(),
+            from: ctx.sender.as_str().to_string(),
+            to: ctx.target.to_string(),
+            summary: ctx.task.to_string(),
             task_id,
         }));
     }
-    if let Some(tid) = auto_created_task_id {
+    if let Some(tid) = ctx.auto_created_task_id.as_ref() {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("auto_created_task_id".into(), json!(tid));
         }
@@ -336,24 +338,17 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         msg.push_str(&format!(" (task id: {tid})"));
     }
 
-    let result = deliver_delegate(
-        home,
-        sender,
-        target,
-        &msg,
-        task,
-        task_id_str,
-        composed.force_meta_json,
-        args,
-    );
-    track_delegate_success(
+    let ctx = DeliveryCtx {
         home,
         args,
         sender,
         target,
         task,
-        task_id_str,
+        msg: &msg,
+        task_id: task_id_str,
+        force_meta_json: composed.force_meta_json,
         auto_created_task_id,
-        result,
-    )
+    };
+    let result = deliver_delegate(&ctx);
+    track_delegate_success(&ctx, result)
 }
