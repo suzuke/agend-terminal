@@ -94,6 +94,22 @@ const MODULE_SCOPE: &[&str] = &[
     "git_worktree.rs",
     "worktree_pool/gc.rs",
     "worktree_pool/workspace.rs",
+    // W1.2 closeout: remaining daemon/MCP modules that already route LOCAL git
+    // through git_cmd/git_ok/git_bypass/git_worktree (zero production raw
+    // Command::new("git")). Seal so a reintroduced raw site fails CI. After this
+    // list, the only intentional production raw-git lives in git_helpers (the
+    // bypass implementation) and bin/agend-git (the gated shim side).
+    "admin/mod.rs",
+    "daemon/conflict_notify.rs",
+    "daemon/per_tick/canonical_heartbeat.rs",
+    "daemon/per_tick/tmp_review_gc.rs",
+    "mcp/handlers/binding_state.rs",
+    "mcp/handlers/ci/checkout.rs",
+    "mcp/handlers/dispatch_hook/branch_start_point.rs",
+    "mcp/handlers/dispatch_hook/from_ref.rs",
+    "mcp/handlers/dispatch_hook/mod.rs",
+    "mcp/handlers/force_release/gc.rs",
+    "mcp/handlers/force_release/repair.rs",
 ];
 
 /// One violation entry — `(file, line_number, snippet)`.
