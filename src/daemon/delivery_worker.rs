@@ -63,6 +63,18 @@ enum DeliveryJob {
         agent: String,
         text: Vec<u8>,
     },
+    /// PR4: an out-of-band tick-stall page. The stall monitor thread `try_send`s
+    /// this (never blocking the tick host it watches); the worker — off that
+    /// thread — owns the escalation fan-out + `event_log` write. `host` / `phase`
+    /// / `handler` are the captured stall identity, `generation` the seqlock
+    /// progress marker at the time of the page.
+    TickStallAlert {
+        home: std::path::PathBuf,
+        host: String,
+        phase: String,
+        handler: String,
+        generation: u64,
+    },
 }
 
 /// Payload for an offloaded Telegram send. Carries the already-resolved channel
@@ -138,6 +150,46 @@ fn dispatch(job: DeliveryJob) {
                 tracing::debug!(agent = %agent, error = %e, "delivery_worker: cron inject failed");
             }
         }
+        DeliveryJob::TickStallAlert {
+            home,
+            host,
+            phase,
+            handler,
+            generation,
+        } => {
+            // PR4: the worker (NOT the monitor sampler) owns the escalation +
+            // event-log side effects, so the sampler never blocks on channel /
+            // disk I/O while the tick host it watches is wedged.
+            //
+            // Observe the routed identity FIRST (tests only): the assertion is
+            // "the correct TickStallAlert reached the worker via the real
+            // monitor→enqueue path", which must not hinge on the downstream
+            // escalation/event-log I/O succeeding in a bare test $HOME.
+            #[cfg(test)]
+            crate::daemon::tick_stall::test_probe::emit(&host, &handler);
+            let msg = format!(
+                "[tick-stall] {host} made no progress for the configured threshold \
+                 while in phase '{phase}' (handler={handler}, generation={generation}). \
+                 The tick thread is wedged — hang-detection, recovery-dispatch and \
+                 crash handling on this host are stalled until it clears; \
+                 investigate the named handler."
+            );
+            let dispatched = crate::channel::notify_all_escalation_channels(
+                &host,
+                crate::channel::NotifySeverity::Error,
+                &msg,
+                false,
+            );
+            crate::event_log::log(&home, "tick_stall", &host, &msg);
+            tracing::error!(
+                host = %host,
+                phase = %phase,
+                handler = %handler,
+                generation,
+                channels = dispatched,
+                "tick_stall: tick host wedged — out-of-band page dispatched"
+            );
+        }
     }
 }
 
@@ -177,6 +229,38 @@ pub(crate) fn enqueue_cron_inject(
         agent: agent.to_string(),
         text,
     })
+}
+
+/// PR4: offload an out-of-band tick-stall page. The stall monitor calls this; it
+/// `try_send`s and NEVER blocks. A full queue is the *observable drop path* —
+/// `Err(())` plus a `tracing::error` carrying host / phase / generation — because
+/// a wedged tick host is exactly when the operator must not silently lose the
+/// page. The monitor treats `Err` as "page dropped" and simply moves on.
+pub(crate) fn enqueue_tick_stall_alert(
+    home: &std::path::Path,
+    host: &str,
+    phase: &str,
+    handler: &str,
+    generation: u64,
+) -> Result<(), ()> {
+    let result = try_enqueue(DeliveryJob::TickStallAlert {
+        home: home.to_path_buf(),
+        host: host.to_string(),
+        phase: phase.to_string(),
+        handler: handler.to_string(),
+        generation,
+    });
+    if result.is_err() {
+        tracing::error!(
+            host = %host,
+            phase = %phase,
+            handler = %handler,
+            generation,
+            "tick_stall alert DROPPED: delivery queue full — the tick host is \
+             wedged and its out-of-band page was lost"
+        );
+    }
+    result
 }
 
 fn try_enqueue(job: DeliveryJob) -> Result<(), ()> {
@@ -249,6 +333,28 @@ mod tests {
         assert!(
             enqueue_pty_wake(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_err(),
             "AUDIT2-006: a full delivery queue must drop (Err), never block the tick thread"
+        );
+        test_support::set_force_full(false);
+    }
+
+    /// PR4 (#8): a full delivery queue drops the tick-stall page (`Err`) — the
+    /// observable drop path (the enqueue also logs a `tracing::error` with
+    /// host/phase/generation) — instead of blocking the monitor thread.
+    #[test]
+    fn tick_stall_alert_drops_when_queue_full() {
+        let _ff = test_support::force_full_guard();
+        let home = std::env::temp_dir();
+
+        test_support::set_force_full(false);
+        assert!(
+            enqueue_tick_stall_alert(&home, "daemon-tick", "handler", "slow_handler", 7).is_ok(),
+            "a non-full delivery queue accepts the tick-stall page"
+        );
+
+        test_support::set_force_full(true);
+        assert!(
+            enqueue_tick_stall_alert(&home, "daemon-tick", "handler", "slow_handler", 7).is_err(),
+            "a full delivery queue must drop the page (Err), never block the monitor"
         );
         test_support::set_force_full(false);
     }

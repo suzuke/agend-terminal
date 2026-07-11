@@ -253,11 +253,43 @@ pub(crate) fn snapshot_handler_timings() -> HashMap<String, HandlerStats> {
 /// the unit test (`per_tick::tests::panicking_handler_does_not_skip_siblings`)
 /// constructs a fixture vec with a panicking handler in the middle and
 /// asserts the trailing handler runs.
+///
+/// PR4: the untracked entry is now a `#[cfg(test)]` convenience wrapper. Both
+/// tick hosts (daemon `run_core` + owned app) call [`run_handlers_with_progress`]
+/// directly (with `None` when diagnostics are off), so the untracked form has no
+/// production caller — gating it to `cfg(test)` keeps the existing panic-isolation
+/// tests (`per_tick` + `canonical_heartbeat`) unchanged with zero production dead
+/// code.
+#[cfg(test)]
 pub(crate) fn run_handlers_with_panic_guard(
     handlers: &[Box<dyn PerTickHandler>],
     ctx: &TickContext<'_>,
 ) {
-    for handler in handlers {
+    run_handlers_with_progress(handlers, ctx, None);
+}
+
+/// PR4 companion: identical per-handler panic isolation to
+/// [`run_handlers_with_panic_guard`], plus optional out-of-band stall tracking.
+///
+/// When `progress` is `Some`, the current [`Phase::Handler`](crate::daemon::tick_stall)
+/// index is published BEFORE each handler runs and advanced AFTER its
+/// `catch_unwind` — on both the Ok and the panic paths, so a wedged/panicked
+/// handler never leaves stale identity (the next iteration's `enter_handler`, or
+/// the closing `enter_post`, IS that transition). The daemon `run_core` and the
+/// owned app pass `Some`; the untracked wrapper above and every existing caller
+/// pass `None` and are byte-for-byte unaffected.
+///
+/// The tracker is written ONLY here, on the tick thread; the stall monitor reads
+/// it lock-free (see [`crate::daemon::tick_stall`]).
+pub(crate) fn run_handlers_with_progress(
+    handlers: &[Box<dyn PerTickHandler>],
+    ctx: &TickContext<'_>,
+    progress: Option<&crate::daemon::tick_stall::TickProgress>,
+) {
+    for (index, handler) in handlers.iter().enumerate() {
+        if let Some(p) = progress {
+            p.enter_handler(index as u32);
+        }
         let start = std::time::Instant::now();
         let name = handler.name();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -274,6 +306,12 @@ pub(crate) fn run_handlers_with_panic_guard(
                  in this tick continue; next tick re-invokes this handler"
             );
         }
+        // PR4: the handler-identity transition is the NEXT iteration's
+        // `enter_handler(index+1)`, or — after the last handler — the closing
+        // `enter_post()` below; both run AFTER this catch_unwind (Ok or panic).
+    }
+    if let Some(p) = progress {
+        p.enter_post();
     }
 }
 
