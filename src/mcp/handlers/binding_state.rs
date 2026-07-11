@@ -60,10 +60,7 @@ use std::path::Path;
 /// }
 /// ```
 ///
-/// `signature_valid` is **diagnostic only**: whether `runtime/<agent>/binding.json.sig`
-/// verifies against the on-disk binding body via the same
-/// `agentic_git_core::integrity_core::verify` primitive the agend-git shim uses.
-/// It does **not** change daemon `binding::read` or shim fail-closed auth.
+/// `signature_valid` is diagnostic only (on-disk body+sig via shim-same verify).
 ///
 /// Returns (unbound case):
 /// ```json
@@ -159,9 +156,8 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         let branch = b["branch"].as_str().unwrap_or("");
         let cross_branch_holders = cross_branch_holders_for(home, branch, agent);
 
-        // PR2 F2: diagnostic HMAC status. Read on-disk body+sidecar bytes
-        // (shim contract) — never re-serialize the in-memory index value.
-        let signature_valid = binding_signature_valid(home, agent);
+        // PR2 F2: diagnostic HMAC status (shim-parity; see binding::signature_valid).
+        let signature_valid = crate::binding::signature_valid(home, agent);
 
         json!({
             "agent": agent,
@@ -194,26 +190,6 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "pending_response_to": pending_response_to,
         })
     }
-}
-
-/// Whether `runtime/<agent>/binding.json.sig` verifies against the on-disk
-/// binding body. Same sidecar name + `integrity_core::verify` as the shim
-/// (`agentic-git` `read_binding`). Missing/malformed/mismatched → `false`.
-/// Does not alter daemon auth paths — observability only.
-fn binding_signature_valid(home: &Path, agent: &str) -> bool {
-    let dir = crate::paths::runtime_dir(home).join(agent);
-    let body = match std::fs::read(dir.join("binding.json")) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    // Pass the sidecar tag byte-for-byte (no trim). The shim's `read_binding`
-    // does the same — a trailing newline on an otherwise-valid MAC must fail
-    // closed here so binding_state does not diverge from shim unbound.
-    let tag = match std::fs::read_to_string(dir.join("binding.json.sig")) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    agentic_git_core::integrity_core::verify(home, &body, &tag).is_ok()
 }
 
 /// Return the list of CI watches that include `agent` as a subscriber,
