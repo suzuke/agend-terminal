@@ -1259,24 +1259,14 @@ fn build_tick_infrastructure(
         supervisor::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
     }
     router::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
-    crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&ctx.registry));
-    // #2413 Phase 1: out-of-path lsof API-activity probe (feeds
-    // AgentCore::api_activity for false-idle detection). Self-disables if
-    // `lsof` is absent.
-    crate::api_activity_probe::spawn(Arc::clone(&ctx.registry));
-    // #2413 Phase D: codex rollout-tail observer source (Stream plane) — read-only tail of
-    // ~/.codex/sessions/.../rollout-*.jsonl → Evidence → the shared buffer the reducer
-    // consumes. No-op under the AGEND_SHADOW_OBSERVER=0 kill-switch (default-ON).
-    // ALSO wired into run_app (the live fleet daemon is app mode — #2434 lesson).
-    crate::daemon::shadow::rollout::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
-    // #2413 opencode plane: SSE `/event` observer source (Stream plane). Subscribes to each
-    // opencode agent's embedded server (port injected at spawn) → Evidence → shared buffer.
-    // No-op under AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434).
-    crate::daemon::shadow::opencode::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
-    // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/<uuid>.jsonl → Evidence →
-    // shared buffer (attribution via the <uuid>.json sidecar cwd). No-op under
-    // AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434 lesson).
-    crate::daemon::shadow::kiro::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
+    // #2453 Stage 1a: monitoring (instance_monitor + api_activity_probe) via the
+    // shared owner-services helper — identical call in owned `run_app`.
+    crate::daemon::owner_services::start_shared_monitoring_services(home, &ctx.registry);
+    // #2453 Stage 1a: the three Shadow Observer stream planes (rollout + opencode
+    // + kiro) via the shared owner-services helper — identical call in owned
+    // `run_app`. No-op under AGEND_SHADOW_OBSERVER=0 (default-ON). shadow::start
+    // (the socket-ingest plane) stays host-local (separate fork).
+    crate::daemon::owner_services::start_shared_stream_observers(home, &ctx.registry);
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a

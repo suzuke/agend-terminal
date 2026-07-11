@@ -11,8 +11,36 @@
 //! `shadow::start` (different ordering per host), `supervisor::spawn` (`#[cfg(unix)]`
 //! delta), `router`/`TaskSweep`/recovery (headless-only), bootstrap/restart/shutdown.
 
-// (Stage 1a helpers are added in the implementation commit; this RED commit
-// carries only the structural guards below.)
+use crate::agent::AgentRegistry;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Owner-only agent liveness/activity monitoring services. Each spawns a
+/// process-lifetime thread internally and returns `()` — this helper owns the
+/// WIRING, not a `JoinHandle`. Called identically by owned `run_app` and headless
+/// `build_tick_infrastructure`.
+pub(crate) fn start_shared_monitoring_services(home: &Path, registry: &AgentRegistry) {
+    crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(registry));
+    // #2413 Phase 1: out-of-path lsof API-activity probe (feeds
+    // AgentCore::api_activity for false-idle detection). Self-disables if `lsof`
+    // is absent.
+    crate::api_activity_probe::spawn(Arc::clone(registry));
+}
+
+/// Owner-only Shadow Observer per-backend Evidence-SOURCE planes (Stream plane).
+/// Each is a no-op under `AGEND_SHADOW_OBSERVER=0` (default-ON). The live fleet
+/// daemon is app mode, so gating these run_core-only would leave each backend's
+/// observer source dead in production (#2434). `shadow::start` (the socket-ingest
+/// plane) is deliberately NOT here — its per-host ordering differs (separate fork).
+pub(crate) fn start_shared_stream_observers(home: &Path, registry: &AgentRegistry) {
+    // #2413 Phase D: codex rollout-tail — read-only tail of
+    // ~/.codex/sessions/.../rollout-*.jsonl → Evidence → shared buffer.
+    crate::daemon::shadow::rollout::spawn(Arc::clone(registry), home.to_path_buf());
+    // #2413 opencode plane: SSE `/event` observer (per-agent embedded server).
+    crate::daemon::shadow::opencode::spawn(Arc::clone(registry), home.to_path_buf());
+    // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/<uuid>.jsonl.
+    crate::daemon::shadow::kiro::spawn(Arc::clone(registry), home.to_path_buf());
+}
 
 #[cfg(test)]
 mod tests {
@@ -39,16 +67,23 @@ mod tests {
             .unwrap_or_else(|_| panic!("source file must be readable from test cwd: {rel}"))
     }
 
-    /// Production region only (everything before the first `#[cfg(test)]`), with
-    /// comments stripped and string-literal CONTENTS blanked — so neither a
-    /// commented-out call nor a string literal that happens to contain a needle
-    /// can satisfy (or defeat) a wiring pin. String/char/raw-string/lifetime
-    /// aware. Local test-only helper (the equivalent in `app::tests` is private;
-    /// production visibility is intentionally NOT widened for tests).
+    /// Production region only, with comments stripped and string-literal CONTENTS
+    /// blanked — so neither a commented-out call nor a string literal that
+    /// happens to contain a needle can satisfy (or defeat) a wiring pin.
+    /// String/char/raw-string/lifetime aware. Local test-only helper (the
+    /// equivalent in `app::tests` is private; production visibility is
+    /// intentionally NOT widened for tests).
+    ///
+    /// Masks FIRST, then drops the test module at the first `mod tests {` in the
+    /// masked source. This is robust to a stray item-level `#[cfg(test)]` before
+    /// the real module (e.g. daemon's `test_env_lock`) and to an attribute
+    /// between the `#[cfg(test)]` and `mod tests {` (e.g. `#[allow(...)]`) — a
+    /// naive "cut at the first `#[cfg(test)]`" truncates those files early and
+    /// makes the absence pins pass vacuously.
     fn prod_masked(rel: &str) -> String {
-        let src = read_source(rel);
-        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        mask_code(prod)
+        let masked = mask_code(&read_source(rel));
+        let end = masked.find("mod tests {").unwrap_or(masked.len());
+        masked[..end].to_string()
     }
 
     /// Strip `//` line + `/* */` block comments and BLANK the contents of string

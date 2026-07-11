@@ -462,11 +462,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // the app must not also poll a disjoint (empty) registry.
     if !attached_mode {
         crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
-        crate::instance_monitor::spawn_monitor_tick(home.clone(), Arc::clone(&registry));
-        // #2413 Phase 1: out-of-path lsof API-activity probe (feeds
-        // AgentCore::api_activity for false-idle detection). Self-disables if
-        // `lsof` is absent.
-        crate::api_activity_probe::spawn(Arc::clone(&registry));
+        // #2453 Stage 1a: monitoring (instance_monitor + api_activity_probe)
+        // wired via the shared owner-services helper — identical call in
+        // run_core's build_tick_infrastructure, so a service can't be wired in
+        // one host and silently dead in the other (#982/#1002/#1720/#2434).
+        crate::daemon::owner_services::start_shared_monitoring_services(&home, &registry);
         // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
         // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
         // only other caller), so without this the whole Shadow Observer plane was dead in
@@ -478,23 +478,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // detached accept loop that exits with the process; the stale socket is cleared on
         // next bind (start_unix removes it before binding).
         crate::daemon::shadow::start(&home);
-        // #2413 Phase D: codex rollout-tail observer source (Stream plane). Owner-only +
-        // app-mode-wired for the SAME reason as shadow::start above (#2434): the live fleet
-        // daemon is app mode, so gating it run_core-only would leave codex agents' observer
-        // source dead in production. Read-only tail of ~/.codex/sessions; no-op unless the
-        // flag is on (flag-OFF default ⇒ zero behaviour change).
-        crate::daemon::shadow::rollout::spawn(Arc::clone(&registry), home.clone());
-        // #2413 opencode plane: SSE `/event` observer source (Stream plane). Owner-only +
-        // app-mode-wired for the SAME #2434 reason as rollout above — the live fleet daemon
-        // is app mode, so gating it run_core-only would leave opencode agents' observer
-        // source dead in production. Subscribes to each opencode agent's embedded server
-        // (port injected at spawn); no-op unless the flag is on (flag-OFF ⇒ zero change).
-        crate::daemon::shadow::opencode::spawn(Arc::clone(&registry), home.clone());
-        // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/*.jsonl (Stream plane).
-        // Owner-only + app-mode-wired for the SAME #2434 reason as rollout/opencode above —
-        // gating it run_core-only would leave kiro agents' observer source dead in the
-        // app-mode live daemon. No-op unless the flag is on (flag-OFF ⇒ zero change).
-        crate::daemon::shadow::kiro::spawn(Arc::clone(&registry), home.clone());
+        // #2453 Stage 1a: the three Shadow Observer stream planes (rollout +
+        // opencode + kiro) wired via the shared owner-services helper. #2434: the
+        // live fleet daemon is app mode, so these must be app-wired (not
+        // run_core-only) or each backend's observer source is dead in production.
+        // Identical call in run_core's build_tick_infrastructure. shadow::start
+        // (the socket-ingest plane above) stays host-local — separate fork.
+        crate::daemon::owner_services::start_shared_stream_observers(&home, &registry);
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
@@ -2418,17 +2408,19 @@ mod tests {
     /// `rollout::spawn(...)` call in run_app turn this RED.
     #[test]
     fn run_app_wires_codex_rollout_tailer_2413() {
-        let source = std::fs::read_to_string("src/app/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+        // #2453 Stage 1a: rollout::spawn moved into the shared helper both hosts
+        // call — scan owner_services (production region) instead of run_app.
+        let source = std::fs::read_to_string("src/daemon/owner_services.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/owner_services.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
         let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
             prod_code.contains("crate::daemon::shadow::rollout::spawn("),
-            "run_app must spawn the codex rollout-tail observer in the PRODUCTION region \
-             (#2413 Phase D) — gating it run_core-only (or commenting it out) would leave codex \
-             agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+            "owner_services::start_shared_stream_observers must spawn the codex rollout-tail \
+             observer (#2413 Phase D) — both hosts call this helper, so gating it (or commenting \
+             it out) would leave codex agents' Stream observer dead. No ACTIVE \
              'crate::daemon::shadow::rollout::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
@@ -2443,17 +2435,19 @@ mod tests {
     /// `opencode::spawn(...)` call in run_app turn this RED.
     #[test]
     fn run_app_wires_opencode_sse_observer_2413() {
-        let source = std::fs::read_to_string("src/app/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+        // #2453 Stage 1a: opencode::spawn moved into the shared helper both hosts
+        // call — scan owner_services (production region) instead of run_app.
+        let source = std::fs::read_to_string("src/daemon/owner_services.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/owner_services.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
         let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
             prod_code.contains("crate::daemon::shadow::opencode::spawn("),
-            "run_app must spawn the opencode SSE observer in the PRODUCTION region \
-             (#2413 opencode plane) — gating it run_core-only (or commenting it out) would leave \
-             opencode agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+            "owner_services::start_shared_stream_observers must spawn the opencode SSE observer \
+             (#2413 opencode plane) — both hosts call this helper, so gating it (or commenting \
+             it out) would leave opencode agents' Stream observer dead. No ACTIVE \
              'crate::daemon::shadow::opencode::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
@@ -2790,17 +2784,19 @@ mod tests {
     /// call in run_app turn this RED.
     #[test]
     fn run_app_wires_kiro_session_tailer_2413() {
-        let source = std::fs::read_to_string("src/app/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+        // #2453 Stage 1a: kiro::spawn moved into the shared helper both hosts
+        // call — scan owner_services (production region) instead of run_app.
+        let source = std::fs::read_to_string("src/daemon/owner_services.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/owner_services.rs"))
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         // Strip comments FIRST: a commented-out call must not pass the pin (r6 vacuity fix).
         let prod_code = strip_comments_and_blank_strings(prod);
         assert!(
             prod_code.contains("crate::daemon::shadow::kiro::spawn("),
-            "run_app must spawn the kiro session-tail observer in the PRODUCTION region \
-             (#2413 kiro plane) — gating it run_core-only (or commenting it out) would leave \
-             kiro agents' Stream observer dead in the app-mode live daemon. No ACTIVE \
+            "owner_services::start_shared_stream_observers must spawn the kiro session-tail \
+             observer (#2413 kiro plane) — both hosts call this helper, so gating it (or \
+             commenting it out) would leave kiro agents' Stream observer dead. No ACTIVE \
              'crate::daemon::shadow::kiro::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
