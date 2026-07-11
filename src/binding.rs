@@ -565,10 +565,11 @@ fn binding_sig_path(dir: &Path) -> PathBuf {
 }
 
 /// Diagnostic: does `runtime/<agent>/binding.json.sig` verify against the
-/// **on-disk** binding body? Same sidecar name + `integrity_core::verify` as
-/// the shim (`agentic-git` `read_binding`). Tag is passed raw (no call-site
-/// trim). Missing/malformed/mismatched → `false`. Does **not** alter
-/// [`read`] / auth paths — observability only (`binding_state`).
+/// **on-disk** binding body? Same sidecar + `integrity_core::verify` as the
+/// shim (`agentic-git` `read_binding`). Passes the tag raw (call-site parity
+/// with the shim); `integrity_core` owns tag parsing/whitespace policy
+/// (`tag_to_hex` trims). Missing/malformed/mismatched → `false`. Does **not**
+/// alter [`read`] / auth paths — observability only (`binding_state`).
 pub(crate) fn signature_valid(home: &Path, agent: &str) -> bool {
     let dir = crate::paths::runtime_dir(home).join(agent);
     let body = match std::fs::read(dir.join("binding.json")) {
