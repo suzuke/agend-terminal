@@ -53,8 +53,9 @@ const TICK_PERIOD_SLACK: Duration = Duration::from_secs(10);
 /// the 0-based index into the host's immutable handler-name table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Phase {
-    /// Idle, blocked awaiting the next tick signal — never alerted (a long wait
-    /// between ticks is normal, not a stall).
+    /// Idle, blocked awaiting the next tick signal. Ordinary between-tick cadence
+    /// stays silent (the generation advances every tick); a host frozen here past
+    /// the larger waiting-threshold — a dead tick producer — pages as `<waiting>`.
     Waiting,
     /// Per-tick config reloads before the handler sweep.
     Preflight,
@@ -288,11 +289,20 @@ pub(crate) struct MonitorConfig {
 }
 
 impl MonitorConfig {
-    /// Build from `AGEND_TICK_STALL_SECS`; `None` when disabled / invalid.
+    /// Build from `AGEND_TICK_STALL_SECS`; `None` when disabled / invalid / so
+    /// large the waiting threshold would overflow `Duration`.
     pub(crate) fn from_env(home: &Path) -> Option<Self> {
         let threshold = threshold_from_env()?;
+        let Some(waiting_threshold) = waiting_threshold_for(threshold) else {
+            tracing::warn!(
+                threshold_secs = threshold.as_secs(),
+                "{ENV_VAR} is so large the waiting threshold overflows Duration — \
+                 tick-stall diagnostics DISABLED"
+            );
+            return None;
+        };
         Some(Self {
-            waiting_threshold: threshold + TICK_PERIOD_SLACK,
+            waiting_threshold,
             sample_interval: sample_interval_for(threshold),
             threshold,
             home: home.to_path_buf(),
@@ -319,6 +329,15 @@ impl MonitorConfig {
 /// ≤ ~1.25× threshold), floored at 1s so the monitor never busy-loops.
 fn sample_interval_for(threshold: Duration) -> Duration {
     (threshold / 4).max(Duration::from_secs(1))
+}
+
+/// The `Waiting`-phase threshold for a base threshold (`threshold + slack`).
+/// Returns `None` when the base is so large the add would overflow `Duration`
+/// (e.g. `AGEND_TICK_STALL_SECS=u64::MAX`): the caller disables the diagnostics
+/// with a warning rather than panicking at startup — `Duration + Duration` panics
+/// on overflow, so the addition MUST stay checked.
+fn waiting_threshold_for(threshold: Duration) -> Option<Duration> {
+    threshold.checked_add(TICK_PERIOD_SLACK)
 }
 
 /// Parse `AGEND_TICK_STALL_SECS`. Unset / `0` → disabled (no warning). `1..=9` →
@@ -446,18 +465,20 @@ fn monitor_loop(progress: &TickProgress, config: &MonitorConfig, stop_rx: &Recei
 }
 
 /// Start the tick-stall diagnostics for a host, IF `AGEND_TICK_STALL_SECS`
-/// enables them. Returns `(Some(progress), Some(guard))` when enabled and
-/// `(None, None)` when disabled — so the default-OFF tick loop stays byte-for-
-/// byte untracked (no atomic writes, no monitor thread). The progress `Arc` is
-/// the loop's writer handle; the guard stops+joins the monitor on drop. One-line
-/// wiring for the daemon `run_core` and owned-app tick loops.
+/// enables them. Returns `(Some(progress), Some(guard))` only when enabled AND
+/// the monitor thread spawned; `(None, None)` when the diagnostics are disabled
+/// (default OFF / invalid / overflowing value) OR the monitor thread failed to
+/// spawn — either way the tick loop stays untracked (no orphan atomic writes with
+/// nothing reading them). The progress `Arc` is the loop's writer handle; the
+/// guard stops+joins the monitor on drop. One-line wiring for the daemon
+/// `run_core` and owned-app tick loops.
 pub(crate) fn start_for_host(
     host: &'static str,
     handlers: &[Box<dyn super::per_tick::PerTickHandler>],
     home: &Path,
 ) -> (Option<Arc<TickProgress>>, Option<TickStallMonitorGuard>) {
     let Some(config) = MonitorConfig::from_env(home) else {
-        return (None, None); // disabled → truly untracked
+        return (None, None); // disabled / invalid / overflowing → truly untracked
     };
     let names: Arc<[&'static str]> = handlers.iter().map(|h| h.name()).collect();
     let progress = TickProgress::new(host, names);
@@ -755,7 +776,7 @@ mod tests {
             .expect("monitor thread must spawn in tests");
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let dropper = std::thread::spawn(move || {
             drop(guard); // stop + join
             let _ = done_tx.send(());
         });
@@ -763,6 +784,9 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "Stop must wake recv_timeout and join promptly; a hang would exceed the watchdog"
         );
+        // Reached only on success (the assert panics on timeout before this): the
+        // dropper already signalled, so the join completes at once — no leaked thread.
+        let _ = dropper.join();
     }
 
     // ── Detector unit tests (deterministic, no threads) ────────────────────
@@ -1092,6 +1116,32 @@ mod tests {
             "whitespace-tolerant; enabled at 45s"
         );
         assert_eq!(parse_threshold(Some("nope")), None, "malformed → disabled");
+    }
+
+    /// r2 regression: `AGEND_TICK_STALL_SECS=u64::MAX` parses fine (>= 10) but the
+    /// waiting threshold (`base + 10s`) would overflow `Duration` and panic at
+    /// startup. The checked add must instead disable (`None`), never crash.
+    #[test]
+    fn oversized_threshold_disables_instead_of_overflowing() {
+        use super::{parse_threshold, waiting_threshold_for};
+        // The parser accepts any u64 >= 10, u64::MAX included (r1 semantics).
+        assert_eq!(
+            parse_threshold(Some("18446744073709551615")),
+            Some(Duration::from_secs(u64::MAX)),
+            "parser accepts u64::MAX"
+        );
+        // But composing the waiting threshold must NOT overflow-panic — it
+        // returns None so from_env disables the diagnostics.
+        assert_eq!(
+            waiting_threshold_for(Duration::from_secs(u64::MAX)),
+            None,
+            "u64::MAX base → overflow → disabled (no panic)"
+        );
+        // A normal value still composes to base + 10s.
+        assert_eq!(
+            waiting_threshold_for(Duration::from_secs(10)),
+            Some(Duration::from_secs(20))
+        );
     }
 
     // ── #6: attached app starts no monitor (structural source-pin) ─────────
