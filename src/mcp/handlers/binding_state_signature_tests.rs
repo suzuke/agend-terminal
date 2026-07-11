@@ -107,5 +107,27 @@ fn binding_state_signature_valid_true_false_missing() {
         "missing sidecar must report signature_valid=false: {r_missing}"
     );
 
+    // Malformed sidecar: valid MAC + non-hex suffix. Call site passes the tag
+    // raw like the shim; integrity_core::tag_to_hex trims whitespace (so a bare
+    // trailing "\n" is NOT a divergence), but a non-hex character is MalformedTag
+    // for both paths — signature_valid must stay false while bound stays true.
+    plant_binding(
+        &home,
+        agent,
+        &original_body,
+        Some(&format!("{original_sig}x")),
+    );
+    let r_mal = handle_binding_state(&home, &json!({"instance": agent}), &None);
+    assert_eq!(
+        r_mal["bound"].as_bool(),
+        Some(true),
+        "malformed sidecar still leaves parseable body bound: {r_mal}"
+    );
+    assert_eq!(
+        r_mal["signature_valid"].as_bool(),
+        Some(false),
+        "valid MAC + non-hex suffix must be signature_valid=false (shim-parity): {r_mal}"
+    );
+
     let _ = std::fs::remove_dir_all(&home);
 }

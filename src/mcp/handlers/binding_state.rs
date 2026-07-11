@@ -206,11 +206,14 @@ fn binding_signature_valid(home: &Path, agent: &str) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
+    // Pass the sidecar tag byte-for-byte (no trim). The shim's `read_binding`
+    // does the same — a trailing newline on an otherwise-valid MAC must fail
+    // closed here so binding_state does not diverge from shim unbound.
     let tag = match std::fs::read_to_string(dir.join("binding.json.sig")) {
         Ok(t) => t,
         Err(_) => return false,
     };
-    agentic_git_core::integrity_core::verify(home, &body, tag.trim()).is_ok()
+    agentic_git_core::integrity_core::verify(home, &body, &tag).is_ok()
 }
 
 /// Return the list of CI watches that include `agent` as a subscriber,
