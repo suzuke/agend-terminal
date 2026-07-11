@@ -53,11 +53,14 @@ use std::path::Path;
 ///   "worktree_exists_on_disk": true,
 ///   "worktree_valid": true,
 ///   "marker_present": true,
+///   "signature_valid": true,
 ///   "ci_watches": ["repo:branch", ...],
 ///   "bind_in_flight": false,
 ///   "cross_branch_holders": []
 /// }
 /// ```
+///
+/// `signature_valid` is diagnostic only (on-disk body+sig via shim-same verify).
 ///
 /// Returns (unbound case):
 /// ```json
@@ -153,6 +156,9 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         let branch = b["branch"].as_str().unwrap_or("");
         let cross_branch_holders = cross_branch_holders_for(home, branch, agent);
 
+        // PR2 F2: diagnostic HMAC status (shim-parity; see binding::signature_valid).
+        let signature_valid = crate::binding::signature_valid(home, agent);
+
         json!({
             "agent": agent,
             "bound": true,
@@ -166,6 +172,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "worktree_resolves": worktree_resolves,
             "invalid_reason": invalid_reason,
             "marker_present": marker_present,
+            "signature_valid": signature_valid,
             "ci_watches": ci_watches,
             "bind_in_flight": bind_in_flight,
             "cross_branch_holders": cross_branch_holders,
@@ -244,6 +251,11 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
 #[cfg(test)]
 #[path = "binding_state_liveness_tests.rs"]
 mod liveness_tests;
+
+// PR2 architecture F2: signature_valid observability pins (sibling file).
+#[cfg(test)]
+#[path = "binding_state_signature_tests.rs"]
+mod signature_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
