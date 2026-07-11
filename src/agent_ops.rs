@@ -38,6 +38,8 @@ pub fn fallback_deliver(
     if !in_fleet {
         return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {api_error})")});
     }
+    // Capture the answered parent before `msg` is moved into enqueue below.
+    let parent_id = msg.parent_id.clone();
     // #bughunt2: this is the last-resort path (the daemon API is already down),
     // so the inbox is the SOLE channel. A swallowed enqueue here is total,
     // unrecoverable message loss reported as success — surface it instead.
@@ -48,6 +50,10 @@ pub fn fallback_deliver(
             )
         });
     }
+    // Confirmed-successful fallback delivery: settle the SENDER's own parent row
+    // so an answered obligation stops re-nagging via poll-reminder. No-ops when
+    // parent_id is None; the failed-enqueue early return above skips it.
+    crate::inbox::settle_parent_after_successful_send(home, from, parent_id.as_deref());
     crate::inbox::notify_agent(home, target, &crate::inbox::NotifySource::Agent(from), text);
     json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {api_error}")})
 }

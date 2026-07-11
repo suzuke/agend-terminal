@@ -60,6 +60,23 @@ pub use notify::{
     PENDING_HEADER_PREFIX,
 };
 
+/// Settle the SENDER's own parent inbox row after a confirmed-successful
+/// parented inter-agent send, so an answered obligation stops cycling
+/// delivering→unread (reclaim TTL) and re-nagging via poll-reminder. Mirrors
+/// the channel targeted-reply path (`mcp/handlers/channel.rs` #2622 Fork C).
+/// Kind-independent, sender-scoped, idempotent. NO warn on the returned bool
+/// (`false` = already-read/not-found/no-transition, all benign); genuine
+/// lock/write failures are already warned inside `storage::settle_read_by_id`.
+pub(crate) fn settle_parent_after_successful_send(
+    home: &std::path::Path,
+    sender: &str,
+    parent_id: Option<&str>,
+) {
+    if let Some(pid) = parent_id {
+        let _ = storage::settle_read_by_id(home, sender, pid);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests.rs"]

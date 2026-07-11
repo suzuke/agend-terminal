@@ -732,6 +732,10 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             });
         }
     };
+    // Answered-parent settlement: a confirmed-successful parented send discharges
+    // the SENDER's own parent row so it stops re-nagging via poll-reminder. Runs
+    // only past the failed-send early return above; no-ops when parent_id is None.
+    crate::inbox::settle_parent_after_successful_send(ctx.home, vs.from, msg.parent_id.as_deref());
     inject_provenance(params, vs.from, vs.target);
     let branch_checked_out = checkout_branch_if_requested(params, ctx.home, vs.target);
     process_verdicts(ctx.home, vs.from, &msg);
