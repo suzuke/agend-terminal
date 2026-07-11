@@ -108,10 +108,15 @@ fn failed_parented_send_does_not_settle_sender_parent() {
     .unwrap();
     crate::inbox::drain(&home, sender); // parent: unread → delivering
 
-    // Force ONLY the target's enqueue to fail: its inbox jsonl as a DIRECTORY
-    // makes the append inside route_and_deliver error, without touching the
-    // sender's inbox.
-    std::fs::create_dir_all(home.join("inbox").join(format!("{target}.jsonl"))).unwrap();
+    // Force ONLY the target's enqueue to fail, without touching the sender's
+    // inbox: make the target's RESOLVED inbox path a directory so the append
+    // inside route_and_deliver errors. Must be the RESOLVED (not raw-name) path —
+    // on Windows inbox_path_resolved migrates name→UUID, so a raw-name-path
+    // directory is bypassed and the UUID path succeeds (#2730 r2 Windows failure).
+    // Breaking the resolved path makes enqueue hit the id_path-exists branch on
+    // BOTH platforms (no symlink/copy migration divergence).
+    let target_path = crate::inbox::storage::inbox_path_resolved(&home, target);
+    std::fs::create_dir_all(&target_path).unwrap();
 
     let ctx = test_ctx(&home);
     let resp = handle_send(

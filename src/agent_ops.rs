@@ -858,8 +858,14 @@ mod tests {
         .unwrap();
         crate::inbox::drain(&home, sender); // parent: unread → delivering
 
-        // Break ONLY the target's inbox jsonl (dir) so the fallback enqueue fails.
-        std::fs::create_dir_all(home.join("inbox").join(format!("{target}.jsonl"))).unwrap();
+        // Break ONLY the target's RESOLVED inbox path (dir) so the fallback
+        // enqueue fails. Must be the RESOLVED (not raw-name) path — on Windows
+        // inbox_path_resolved migrates name→UUID, so a raw-name-path directory is
+        // bypassed and the UUID path succeeds (#2730 r2 Windows failure). Breaking
+        // the resolved path makes enqueue hit the id_path-exists branch on BOTH
+        // platforms (no symlink/copy migration divergence).
+        let target_path = crate::inbox::storage::inbox_path_resolved(&home, target);
+        std::fs::create_dir_all(&target_path).unwrap();
 
         let reply = crate::inbox::InboxMessage {
             schema_version: 1,
