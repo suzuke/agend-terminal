@@ -988,6 +988,40 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
     })
 }
 
+/// Test-only: force one row's `delivering_at` to an explicit rfc3339 timestamp so
+/// a test can age a `delivering` row past [`RECLAIM_TTL_SECS`] deterministically
+/// (no wall-clock sleep) and then exercise the real [`reclaim_stale_delivering`]
+/// path. Rewrites via raw JSON so forward-schema fields survive.
+#[cfg(test)]
+pub(crate) fn set_row_delivering_at_for_test(
+    home: &Path,
+    name: &str,
+    msg_id: &str,
+    ts_rfc3339: &str,
+) {
+    let path = inbox_path_resolved(home, name);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut out = String::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut v) => {
+                if v.get("id").and_then(|x| x.as_str()) == Some(msg_id) {
+                    v["delivering_at"] = serde_json::Value::String(ts_rfc3339.to_string());
+                }
+                out.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| line.to_string()));
+            }
+            Err(_) => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    let _ = std::fs::write(&path, out);
+}
+
 /// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
 /// transitioning them to `processed` so [`reclaim_stale_delivering`] will not
 /// revert them to `unread` for re-delivery.
