@@ -28,11 +28,22 @@
 //!
 //! Dedup: a per-repo latch pages ONCE on the present→missing transition; recovery
 //! (missing→present) clears the latch so a later re-deletion pages again.
+//!
+//! # Offload (architecture-fix PR3 / F3)
+//!
+//! `git_ok` is bounded by `LOCAL_GIT_TIMEOUT` (60s). Running that inline on the
+//! daemon/app tick host freezes later handlers (ThreadDump) and the app TUI
+//! maintenance arm for up to 60s × N repos — same liveness class as #P1-2607.
+//! The round therefore runs on a fire-and-forget background thread with an
+//! `in_flight` re-entrancy guard + `ClearOnDrop`, matching `worktree_registry_sweep`
+//! / `hourly_gc`. Cadence and missing/recovery/dedup semantics are unchanged.
 
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Per-tick canonical-existence watchdog. Default cadence 60 ticks (~10 min at
 /// the 10 s tick) — a 4× improvement over the incident's 40-min silence; the
@@ -40,15 +51,24 @@ use std::path::Path;
 pub(crate) struct CanonicalHeartbeatHandler {
     gate: crate::daemon::cadence_gate::CadenceGate,
     /// Repos currently in the alerted-missing state (dedup: one page per outage).
-    alerted: Mutex<HashSet<String>>,
+    /// `Arc` so the background round can own a clone without borrowing `self`.
+    alerted: Arc<Mutex<HashSet<String>>>,
+    /// #P1-2607-class: at most one background round at a time.
+    in_flight: Arc<AtomicBool>,
 }
 
 impl CanonicalHeartbeatHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
         Self {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
-            alerted: Mutex::new(HashSet::new()),
+            alerted: Arc::new(Mutex::new(HashSet::new())),
+            in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    fn is_in_flight(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire)
     }
 }
 
@@ -61,26 +81,61 @@ impl PerTickHandler for CanonicalHeartbeatHandler {
         if !self.gate.fire() {
             return;
         }
-        // #[cfg(test)] only: deterministic body-entry seam for the RED liveness
-        // pin. Production builds omit this; production control flow is otherwise
-        // byte-identical to pre-PR3. No production in_flight/spawn here (RED).
-        #[cfg(test)]
-        test_hooks::body_entry_gate();
-        let repos = crate::binding::bound_source_repos(ctx.home);
-        let registered: HashSet<String> = repos
-            .iter()
-            .map(|r| r.to_string_lossy().into_owned())
-            .collect();
-        let mut alerted = self.alerted.lock();
-        for repo in &repos {
-            let key = repo.to_string_lossy().into_owned();
-            let Some(reason) = canonical_missing_reason(repo) else {
-                alerted.remove(&key); // healthy → reset latch so a future loss re-pages
-                continue;
-            };
-            if !alerted.insert(key.clone()) {
-                continue; // already paged this outage — don't re-page every cadence
+        // Previous round still running — skip rather than stacking git storms.
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                "canonical_heartbeat: previous round still in flight, \
+                 skipping this tick's fire (will retry next cadence)"
+            );
+            return;
+        }
+        let home = ctx.home.to_path_buf();
+        let alerted = Arc::clone(&self.alerted);
+        let in_flight = Arc::clone(&self.in_flight);
+        // fire-and-forget: #P1-2607-class / F3 — `git_ok` (LOCAL_GIT_TIMEOUT 60s)
+        // must not block the daemon/app tick host (TUI, ThreadDump, later handlers).
+        // No JoinHandle; completion is signaled via `in_flight`, released by
+        // `ClearOnDrop` on normal return OR panic.
+        std::thread::spawn(move || {
+            // Guard scoped so `in_flight` clears BEFORE the test completion signal.
+            {
+                let _guard = super::ClearOnDrop::new(in_flight);
+                #[cfg(test)]
+                test_hooks::body_entry_gate();
+                run_round(&home, &alerted);
             }
+            #[cfg(test)]
+            test_hooks::signal_round_complete();
+        });
+    }
+}
+
+/// One offloaded check+page round. Latch lock is held only for remove/insert/retain;
+/// git and notifications run unlocked.
+fn run_round(home: &Path, alerted: &Mutex<HashSet<String>>) {
+    let repos = crate::binding::bound_source_repos(home);
+    let registered: HashSet<String> = repos
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+
+    for repo in &repos {
+        let key = repo.to_string_lossy().into_owned();
+        // 1) path/git OUTSIDE the latch lock (may take up to LOCAL_GIT_TIMEOUT).
+        let reason = canonical_missing_reason(repo);
+        // 2) lock ONLY for remove / insert decision.
+        let should_page = {
+            let mut guard = alerted.lock();
+            match reason {
+                None => {
+                    guard.remove(&key);
+                    false
+                }
+                Some(_) => guard.insert(key.clone()), // true iff first page this outage
+            }
+        }; // lock released
+           // 3) notifications + event_log UNLOCKED.
+        if let (true, Some(reason)) = (should_page, reason) {
             let msg = format!(
                 "[canonical-missing] registered source_repo '{}' is GONE ({reason}). \
                  Every worktree bound to it is now unusable (dangling gitdir) and \
@@ -94,7 +149,7 @@ impl PerTickHandler for CanonicalHeartbeatHandler {
                 &msg,
                 false,
             );
-            crate::event_log::log(ctx.home, "canonical_repo_missing", &key, &msg);
+            crate::event_log::log(home, "canonical_repo_missing", &key, &msg);
             tracing::error!(
                 repo = %repo.display(),
                 reason,
@@ -102,9 +157,11 @@ impl PerTickHandler for CanonicalHeartbeatHandler {
                 "canonical_repo_missing: registered source_repo vanished"
             );
         }
-        // De-registered repos (no live binding references them) drop out of the
-        // latch so it can't grow unbounded.
-        alerted.retain(|k| registered.contains(k));
+    }
+    // 4) retain under lock only (short critical section).
+    {
+        let mut guard = alerted.lock();
+        guard.retain(|k| registered.contains(k));
     }
 }
 
@@ -123,7 +180,9 @@ fn canonical_missing_reason(repo: &Path) -> Option<&'static str> {
     None
 }
 
-/// Test-only seams for the RED liveness pin. No production offload state.
+/// Offload-determinism seams (PR3 / #P1-2607 pattern): body-entry GATE (signals
+/// entered, then blocks), COMPLETIONS after ClearOnDrop, optional panic-once.
+/// `recv_timeout` / wait timeouts are harness watchdogs only.
 #[cfg(test)]
 mod test_hooks {
     use parking_lot::{Condvar, Mutex};
@@ -131,15 +190,19 @@ mod test_hooks {
 
     static GATE_ARMED: Mutex<bool> = Mutex::new(false);
     static GATE_CV: Condvar = Condvar::new();
-    /// Monotone count of times `body_entry_gate` was entered (before wait).
     static BODY_ENTERED: Mutex<u64> = Mutex::new(0);
     static BODY_ENTERED_CV: Condvar = Condvar::new();
+    static COMPLETIONS: Mutex<u64> = Mutex::new(0);
+    static COMPLETIONS_CV: Condvar = Condvar::new();
+    static PANIC_ONCE: Mutex<bool> = Mutex::new(false);
 
     pub(super) fn reset() {
         *GATE_ARMED.lock() = false;
         GATE_CV.notify_all();
         *BODY_ENTERED.lock() = 0;
         BODY_ENTERED_CV.notify_all();
+        *COMPLETIONS.lock() = 0;
+        *PANIC_ONCE.lock() = false;
     }
 
     pub(super) fn arm_gate() {
@@ -159,8 +222,6 @@ mod test_hooks {
         *BODY_ENTERED.lock()
     }
 
-    /// Block until `body_entry_gate` has been entered at least once after reset.
-    /// `timeout` is a harness watchdog only (not a functional elapsed bound).
     pub(super) fn wait_for_body_entered(timeout: Duration) {
         let deadline = Instant::now() + timeout;
         let mut n = BODY_ENTERED.lock();
@@ -168,23 +229,16 @@ mod test_hooks {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 drop(n);
-                panic!(
-                    "watchdog: body_entry_gate never entered within {:?}",
-                    timeout
-                );
+                panic!("watchdog: body_entry_gate never entered within {timeout:?}");
             }
             if BODY_ENTERED_CV.wait_for(&mut n, remaining).timed_out() && *n == 0 {
                 drop(n);
-                panic!(
-                    "watchdog: body_entry_gate never entered within {:?}",
-                    timeout
-                );
+                panic!("watchdog: body_entry_gate never entered within {timeout:?}");
             }
         }
     }
 
-    /// Signal body-entered **before** blocking on the armed gate, so tests can
-    /// prove the worker reached the gated body (not just that a flag was set).
+    /// Signal body-entered **before** blocking on the armed gate.
     pub(super) fn body_entry_gate() {
         {
             *BODY_ENTERED.lock() += 1;
@@ -194,13 +248,33 @@ mod test_hooks {
         while *armed {
             GATE_CV.wait(&mut armed);
         }
+        if std::mem::take(&mut *PANIC_ONCE.lock()) {
+            panic!("canonical_heartbeat test: intentional body panic");
+        }
     }
 
-    /// Join a worker with a bounded watchdog; panics if join does not complete.
-    pub(super) fn join_with_watchdog(
-        handle: std::thread::JoinHandle<()>,
-        timeout: Duration,
-    ) {
+    pub(super) fn arm_panic_once() {
+        *PANIC_ONCE.lock() = true;
+    }
+
+    pub(super) fn signal_round_complete() {
+        *COMPLETIONS.lock() += 1;
+        COMPLETIONS_CV.notify_all();
+    }
+
+    pub(super) fn completions() -> u64 {
+        *COMPLETIONS.lock()
+    }
+
+    pub(super) fn wait_for_completion(prev: u64) {
+        let mut n = COMPLETIONS.lock();
+        while *n <= prev {
+            COMPLETIONS_CV.wait(&mut n);
+        }
+    }
+
+    /// Bounded join watchdog for a test-spawned runner thread.
+    pub(super) fn join_with_watchdog(handle: std::thread::JoinHandle<()>, timeout: Duration) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = handle.join();
@@ -220,18 +294,19 @@ mod tests {
     use crate::daemon::per_tick::{run_handlers_with_panic_guard, PerTickHandler, TickContext};
     use parking_lot::Mutex as ParkingMutex;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
+    fn tmp(tag: &str) -> PathBuf {
         static C: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
             "agend-canon-hb-{tag}-{}-{}",
             std::process::id(),
-            C.fetch_add(1, Ordering::Relaxed)
+            C.fetch_add(1, AtomicOrdering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -256,18 +331,28 @@ mod tests {
         )
     }
 
-    /// RAII: release gate, join any runner worker, then reset globals so a failed
-    /// assertion cannot leak a blocked worker into the next serial test.
+    /// RAII: release gate, join tracked runner (if any), wait for bg completion
+    /// when `in_flight`, then reset globals — no leak into the next serial test.
     struct HookCleanup {
         runner: Option<std::thread::JoinHandle<()>>,
+        hb: Option<Arc<CanonicalHeartbeatHandler>>,
+        completions_before: u64,
     }
 
     impl HookCleanup {
         fn new() -> Self {
-            Self { runner: None }
+            Self {
+                runner: None,
+                hb: None,
+                completions_before: test_hooks::completions(),
+            }
         }
+        #[allow(dead_code)] // used by RED path when runner is spawned off the test thread
         fn track_runner(&mut self, h: std::thread::JoinHandle<()>) {
             self.runner = Some(h);
+        }
+        fn track_hb(&mut self, hb: Arc<CanonicalHeartbeatHandler>) {
+            self.hb = Some(hb);
         }
     }
 
@@ -277,11 +362,38 @@ mod tests {
             if let Some(h) = self.runner.take() {
                 test_hooks::join_with_watchdog(h, Duration::from_secs(30));
             }
+            // Drain any in-flight bg round (offload path) with a bounded poll.
+            if let Some(hb) = self.hb.take() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while hb.is_in_flight() {
+                    if std::time::Instant::now() > deadline {
+                        test_hooks::reset();
+                        panic!("watchdog: in_flight never cleared during HookCleanup");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                // Best-effort: if a completion was expected, wait briefly via counter.
+                let before = self.completions_before;
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while test_hooks::completions() <= before && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             test_hooks::reset();
         }
     }
 
-    /// Sibling probe: sends one token when its `run` executes.
+    struct ArcHb(Arc<CanonicalHeartbeatHandler>);
+    impl PerTickHandler for ArcHb {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn run(&self, ctx: &TickContext<'_>) {
+            self.0.run(ctx);
+        }
+    }
+
     struct ProbeHandler {
         tx: ParkingMutex<Option<mpsc::Sender<()>>>,
     }
@@ -323,17 +435,6 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// THE SOUL of this fix (#t-…83936-4): the check must resolve by ABSOLUTE PATH
-    /// and stay correct even when the process cwd is itself a deleted directory —
-    /// exactly the incident, where the daemon's cwd was the orphaned canonical.
-    /// A future refactor to a `.`/cwd-relative check would silently reintroduce
-    /// the 40-min blind spot; this pins against that.
-    ///
-    /// `#[cfg(unix)]`: the hazard being pinned is a POSIX semantic — an orphaned
-    /// inode keeps answering cwd-relative lookups after its dir is unlinked.
-    /// Windows LOCKS the process cwd, so it cannot even be deleted (the fixture's
-    /// `remove_dir_all(cwd)` errors) and the blind spot cannot occur there. The
-    /// production check is cross-platform; only this simulation is Unix-only.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -355,33 +456,12 @@ mod tests {
         if let Some(p) = prev_cwd {
             std::env::set_current_dir(p).ok();
         }
-        assert_eq!(
-            gone_verdict,
-            Some("path missing"),
-            "a deleted absolute repo must be flagged even from a deleted cwd"
-        );
-        assert_eq!(
-            healthy_verdict, None,
-            "a healthy absolute repo must resolve even from a deleted cwd"
-        );
+        assert_eq!(gone_verdict, Some("path missing"));
+        assert_eq!(healthy_verdict, None);
         std::fs::remove_dir_all(&healthy).ok();
     }
 
-    /// RED liveness pin (PR3): through real `run_handlers_with_panic_guard`.
-    ///
-    /// Sequence:
-    /// 1. Arm body gate.
-    /// 2. Run handlers on a worker thread (so the test thread can observe).
-    /// 3. Wait for **body-entered** signal (proves worker reached gated body).
-    /// 4. Assert Probe sibling progressed **while gate still armed**.
-    ///
-    /// Pre-offload (this commit): body enters and blocks → body-entered fires,
-    /// but Probe never runs → step 4 fails (RED).
-    /// Post-offload: body enters on bg thread, `run()` returns, Probe runs while
-    /// gate armed (GREEN).
-    ///
-    /// Production struct/run unchanged except `#[cfg(test)] body_entry_gate`.
-    /// No `in_flight` / spawn / latch restructure in this RED commit.
+    /// GREEN liveness: body-entered + Probe while gate armed via real runner.
     #[test]
     #[serial_test::serial(canonical_heartbeat_gate)]
     fn tick_runner_progresses_while_body_gated_pr3() {
@@ -390,63 +470,142 @@ mod tests {
 
         let home = tmp("offload-probe");
         let (registry, externals, configs) = empty_regs();
+        let hb = Arc::new(CanonicalHeartbeatHandler::new(1));
+        cleanup.track_hb(Arc::clone(&hb));
         let (probe_tx, probe_rx) = mpsc::channel();
         let handlers: Vec<Box<dyn PerTickHandler>> = vec![
-            Box::new(CanonicalHeartbeatHandler::new(1)),
+            Box::new(ArcHb(Arc::clone(&hb))),
             Box::new(ProbeHandler {
                 tx: ParkingMutex::new(Some(probe_tx)),
             }),
         ];
 
         test_hooks::arm_gate();
-        let home2 = home.clone();
-        let reg = Arc::clone(&registry);
-        let ext = Arc::clone(&externals);
-        let cfg = Arc::clone(&configs);
-        let join = std::thread::spawn(move || {
-            let tick_ctx = TickContext {
-                home: &home2,
-                registry: &reg,
-                externals: &ext,
-                configs: &cfg,
-            };
-            run_handlers_with_panic_guard(&handlers, &tick_ctx);
-        });
-        cleanup.track_runner(join);
+        let tick_ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        // Offload: returns while body gated on bg thread.
+        run_handlers_with_panic_guard(&handlers, &tick_ctx);
 
-        // Prove the worker reached the gated body (not just that a flag exists).
+        // Prove worker reached gated body (not merely in_flight).
         test_hooks::wait_for_body_entered(Duration::from_secs(30));
-        assert!(
-            test_hooks::body_entered_count() >= 1,
-            "body_entry_gate must have been entered"
-        );
-        assert!(
-            test_hooks::is_armed(),
-            "gate must still be armed after body entered"
-        );
+        assert!(test_hooks::body_entered_count() >= 1);
+        assert!(hb.is_in_flight());
+        assert!(test_hooks::is_armed());
 
-        // GREEN contract: Probe fires while body gate is still armed.
-        // RED (sync): Timeout → fail. recv_timeout is watchdog-only.
-        match probe_rx.recv_timeout(Duration::from_secs(3)) {
+        match probe_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(()) => {
                 assert!(
                     test_hooks::is_armed(),
-                    "Probe ran but body gate already released"
+                    "Probe must progress while body gate still armed"
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Drop cleanup joins/releases; then fail the RED pin.
-                drop(cleanup);
-                std::fs::remove_dir_all(&home).ok();
-                panic!(
-                    "RED: body entered and blocked on sync gate — Probe did not run \
-                     while gated (pre-offload liveness failure)"
-                );
+                panic!("watchdog: Probe did not run while body gated (offload broken?)");
             }
             Err(e) => panic!("{e}"),
         }
-        // GREEN path: release and join via Drop
+
+        assert!(hb.is_in_flight(), "body still in flight after Probe");
+        let before = test_hooks::completions();
+        test_hooks::release_gate();
+        test_hooks::wait_for_completion(before);
+        assert!(!hb.is_in_flight());
+        // prevent Drop from double-waiting incorrectly
+        cleanup.hb = None;
         drop(cleanup);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial_test::serial(canonical_heartbeat_gate)]
+    fn skip_when_previous_round_in_flight() {
+        let mut cleanup = HookCleanup::new();
+        test_hooks::reset();
+
+        let home = tmp("skip-inflight");
+        let (registry, externals, configs) = empty_regs();
+        let h = Arc::new(CanonicalHeartbeatHandler::new(1));
+        cleanup.track_hb(Arc::clone(&h));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        test_hooks::arm_gate();
+        h.run(&ctx);
+        test_hooks::wait_for_body_entered(Duration::from_secs(30));
+        assert!(h.is_in_flight());
+        h.run(&ctx);
+        assert!(h.is_in_flight());
+
+        let before = test_hooks::completions();
+        test_hooks::release_gate();
+        test_hooks::wait_for_completion(before);
+        assert_eq!(
+            test_hooks::completions(),
+            before + 1,
+            "exactly one round completes; re-entrant run must skip"
+        );
+        assert!(!h.is_in_flight());
+        cleanup.hb = None;
+        drop(cleanup);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial_test::serial(canonical_heartbeat_gate)]
+    fn panic_in_body_clears_in_flight_guard() {
+        let mut cleanup = HookCleanup::new();
+        test_hooks::reset();
+
+        let home = tmp("panic-clear");
+        let (registry, externals, configs) = empty_regs();
+        let h = Arc::new(CanonicalHeartbeatHandler::new(1));
+        cleanup.track_hb(Arc::clone(&h));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        test_hooks::arm_panic_once();
+        h.run(&ctx);
+        // body enters, panics after gate wait (gate not armed) — ClearOnDrop clears
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while h.is_in_flight() {
+            if std::time::Instant::now() > deadline {
+                panic!("watchdog: in_flight never cleared after body panic");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!h.is_in_flight());
+        cleanup.hb = None;
+        drop(cleanup);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fires_on_first_tick_then_every_n() {
+        let h = CanonicalHeartbeatHandler::new(4);
+        let fires: Vec<bool> = (0..9).map(|_| h.gate.fire()).collect();
+        assert_eq!(
+            fires,
+            vec![true, false, false, false, true, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn name_matches_module() {
+        assert_eq!(
+            CanonicalHeartbeatHandler::new(60).name(),
+            "canonical_heartbeat"
+        );
     }
 }
