@@ -15,7 +15,7 @@ mod mouse;
 mod overlay;
 mod pane_factory;
 mod ui_state;
-use ui_state::{KeyDeps, UiState};
+use ui_state::{UiDeps, UiState};
 mod session;
 mod telegram_hooks;
 mod tui_events;
@@ -524,8 +524,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         name_counter: HashMap::new(),
         overlay: Overlay::None,
         key_handler: KeyHandler::new(),
+        mouse_state: mouse::MouseState::default(),
     };
-    let mut mouse_state = mouse::MouseState::default();
 
     let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
 
@@ -836,8 +836,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let attaches_expected = pending_fwd.len();
     let mut booting = true;
 
-    // #2453: loop-stable shared deps for handle_key_event, built once.
-    let key_deps = KeyDeps {
+    // #2453: loop-stable shared deps for handle_key_event/handle_mouse_event,
+    // built once.
+    let ui_deps = UiDeps {
         registry: &registry,
         home: &home,
         fleet_path: &fleet_path,
@@ -1051,7 +1052,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     Event::Key(key) if key.kind != KeyEventKind::Press => {}
                     Event::Key(key) => {
                         // #2453: former inline overlay/dispatch branch, now behind UiState.
-                        let out = ui.handle_key_event(key, &key_deps);
+                        let out = ui.handle_key_event(key, &ui_deps);
                         if out.needs_resize {
                             needs_resize = true;
                         }
@@ -1063,23 +1064,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     // etc.) are modal — mouse events must not reach hidden panes,
                     // otherwise drag/selection state accumulates on panes the user
                     // can't see. Swallow mouse events while any overlay is active.
-                    Event::Mouse(_) if !matches!(ui.overlay, Overlay::None) => {}
+                    // #2453: overlays are modal — mouse must not reach hidden
+                    // panes. The modal-swallow guard + mouse routing now live in
+                    // UiState::handle_mouse_event (mirrors the Event::Key branch).
                     Event::Mouse(mouse_evt) => {
-                        let out = mouse::handle(
-                            mouse_evt,
-                            &mut ui.layout,
-                            &mut mouse_state,
-                            &fleet_path,
-                            &registry,
-                        );
-                        if out.needs_resize {
+                        if ui.handle_mouse_event(mouse_evt, &ui_deps) {
                             needs_resize = true;
-                        }
-                        if let Some(prev) = out.new_last_tab {
-                            ui.last_tab = prev;
-                        }
-                        if let Some(ov) = out.new_overlay {
-                            ui.overlay = ov;
                         }
                     }
                     Event::Paste(text) => {
