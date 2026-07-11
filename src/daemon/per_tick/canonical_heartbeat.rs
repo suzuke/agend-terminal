@@ -342,11 +342,13 @@ mod tests {
     }
 
     /// RAII cleanup order (required):
+    ///
     /// 1. `release_gate` so any blocked body can proceed
     /// 2. join any test-spawned runner (bounded watchdog)
     /// 3. wait for offload worker completion (`in_flight` clear / completions)
     /// 4. only then `reset()` globals
-    /// so a failed assertion cannot leak a worker into the next serial test.
+    ///
+    /// A failed assertion must not leak a worker into the next serial test.
     struct HookCleanup {
         runner: Option<std::thread::JoinHandle<()>>,
         hb: Option<Arc<CanonicalHeartbeatHandler>>,
