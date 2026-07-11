@@ -1,5 +1,6 @@
 use crate::agent_ops::{save_metadata, save_metadata_batch};
 use crate::identity::Sender;
+use crate::mcp::handlers::dispatch::RuntimeContext;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -241,74 +242,74 @@ pub(super) fn handle_report_health(
     args: &Value,
     instance_name: &str,
     sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
 ) -> Value {
     let Some(_) = sender.as_ref() else {
         return err_needs_identity("report_health");
     };
-    let reason = match args["reason"].as_str() {
+    let reason_str = match args["reason"].as_str() {
         Some(r) => r,
         None => return json!({"error": "missing 'reason'"}),
     };
-    match crate::api::call(
-        home,
-        &json!({
-            "method": crate::api::method::SET_BLOCKED_REASON,
-            "params": {
-                "name": instance_name,
-                "reason": reason,
-                "retry_after_secs": args.get("retry_after_secs"),
-                // #1933: forward the operator-readable note (was dropped here — the
-                // schema advertised it but no mechanism consumed it).
-                "note": args.get("note")
-            }
+    // #2454: write IN-PROCESS via the forwarded live registry — no api::call
+    // loopback. `runtime` is absent only on the test-only `handle_tool` entry
+    // (production is always mcp_proxy → execute_tool_with_runtime(Some)); return
+    // an explicit error, never fall back to api::call.
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: health write requires the in-process daemon runtime"});
+    };
+    // Parse the kind (+ payload) at the boundary; unknown kind keeps the API's
+    // `unknown reason: <kind>` message. #1933: `note` forwarded (empty → none).
+    let Some(reason) = crate::health::BlockedReason::parse_kind(reason_str, args) else {
+        return json!({"error": format!("unknown reason: {reason_str}")});
+    };
+    let note = args["note"].as_str();
+    match crate::agent_ops::set_blocked_reason(&runtime.registry, home, instance_name, reason, note)
+    {
+        Some(out) => json!({
+            "status": "reason_set",
+            "reason": reason_str,
+            "current_state": out.current_state
         }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({
-                "status": "reason_set",
-                "reason": reason,
-                "current_state": resp["current_state"]
-            })
-        }
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("set_blocked_reason failed")})
-        }
-        Err(e) => json!({"error": format!("{e}")}),
+        None => json!({"error": format!("instance '{instance_name}' not found")}),
     }
 }
 
-pub(super) fn handle_clear_blocked_reason(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_clear_blocked_reason(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let instance = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
     };
     // CR-2026-06-14: validate the instance name at the MCP boundary before the
-    // CLEAR_BLOCKED_REASON RPC, mirroring the sibling handlers in this file
-    // (handle_interrupt / handle_pane_snapshot). Without it a malformed name
-    // (`../evil`) was forwarded straight to the daemon.
+    // write, mirroring the sibling handlers in this file (handle_interrupt /
+    // handle_pane_snapshot). Without it a malformed name (`../evil`) was
+    // forwarded straight to the daemon.
     crate::validate_name_or_err!(instance);
-    let mut params = json!({"name": instance});
-    if let Some(r) = args["reason"].as_str() {
-        params["reason"] = json!(r);
-    }
-    match crate::api::call(
-        home,
-        &json!({
-            "method": crate::api::method::CLEAR_BLOCKED_REASON,
-            "params": params
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({
-                "status": "cleared",
-                "instance": instance,
-                "was": resp["was"]
-            })
+    // #2454: in-process clear via the forwarded live registry (no `api::call`).
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: health write requires the in-process daemon runtime"});
+    };
+    // `filter` is a reason-KIND token; unknown kind is a legal never-match filter.
+    let filter = args["reason"].as_str();
+    match crate::agent_ops::clear_blocked_reason(&runtime.registry, home, instance, filter) {
+        Ok(out) => {
+            let was = out
+                .was
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or_default());
+            json!({"status": "cleared", "instance": instance, "was": was})
         }
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("clear_blocked_reason failed")})
+        // Match the pre-migration MCP shape: surface only the error string.
+        Err(crate::agent_ops::ClearBlockedError::FilterMismatch { .. }) => {
+            json!({"error": "reason mismatch"})
         }
-        Err(e) => json!({"error": format!("{e}")}),
+        Err(crate::agent_ops::ClearBlockedError::NotFound) => {
+            json!({"error": format!("instance '{instance}' not found")})
+        }
     }
 }
 
@@ -346,5 +347,126 @@ mod snapshot_file_tests {
             "summary mode must not return full text"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #2454: deterministic no-daemon tests that the MCP `health` write handlers
+/// mutate the live registry via the forwarded `RuntimeContext` (in-process) and
+/// return an explicit error — never `api::call` — when it is absent. `unix`-gated
+/// (`mk_test_handle` is `cfg(all(test, unix))`).
+#[cfg(all(test, unix))]
+mod blocked_reason_runtime_2454_tests {
+    use super::*;
+    use crate::agent::{self, mk_test_handle};
+    use crate::health::BlockedReason;
+    use crate::mcp::handlers::dispatch::RuntimeContext;
+    use crate::types::InstanceId;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Sole fixture: a temp home + fleet.yaml + a `true`-backed registry handle.
+    fn runtime_with_agent(name: &str) -> (RuntimeContext, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!(
+            "agend-blocked-mcp-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).expect("create tmp home");
+        let id = InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {name}:\n    id: {}\n", id.full()),
+        )
+        .expect("seed fleet.yaml");
+        let handle = mk_test_handle(name, id);
+        let rt = RuntimeContext {
+            registry: Arc::new(Mutex::new(HashMap::from([(id, handle)]))),
+            externals: Arc::new(Mutex::new(HashMap::new())),
+        };
+        (rt, home)
+    }
+
+    fn current_reason(rt: &RuntimeContext, home: &Path, name: &str) -> Option<BlockedReason> {
+        let guard = agent::lock_registry(&rt.registry);
+        let id = crate::fleet::resolve_uuid(home, name).expect("resolve uuid");
+        let handle = guard.get(&id).expect("handle in registry");
+        let core = handle.core.lock();
+        core.health.current_reason.clone()
+    }
+
+    // (a) set then clear via the runtime registry mutate the in-mem handle, no
+    // daemon / socket.
+    #[test]
+    fn set_then_clear_via_runtime_mutate_registry() {
+        let (rt, home) = runtime_with_agent("agent-x");
+        let sender = Sender::new("agent-x");
+        let set = handle_report_health(
+            &home,
+            &json!({"reason": "hang"}),
+            "agent-x",
+            &sender,
+            Some(&rt),
+        );
+        assert_eq!(set["status"].as_str(), Some("reason_set"), "{set}");
+        assert_eq!(
+            current_reason(&rt, &home, "agent-x"),
+            Some(BlockedReason::Hang)
+        );
+
+        let cleared =
+            handle_clear_blocked_reason(&home, &json!({"instance": "agent-x"}), Some(&rt));
+        assert_eq!(cleared["status"].as_str(), Some("cleared"), "{cleared}");
+        assert_eq!(current_reason(&rt, &home, "agent-x"), None);
+    }
+
+    // (b) runtime=None is an explicit error, never an api::call fallback — for
+    // both write actions.
+    #[test]
+    fn runtime_none_never_falls_back() {
+        let home = std::env::temp_dir().join("agend-blocked-mcp-none");
+        let sender = Sender::new("agent-x");
+        let report =
+            handle_report_health(&home, &json!({"reason": "hang"}), "agent-x", &sender, None);
+        let clear = handle_clear_blocked_reason(&home, &json!({"instance": "agent-x"}), None);
+        for (label, result) in [("report", &report), ("clear", &clear)] {
+            let err = result["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("runtime unavailable"),
+                "{label}: runtime=None must be an explicit error, not an api::call fallback: {result}"
+            );
+        }
+    }
+
+    // (c) an unknown (never-matching) filter kind does NOT clear — pins the
+    // unknown-filter compatibility (no silent unconditional clear).
+    #[test]
+    fn unknown_filter_does_not_clear() {
+        let (rt, home) = runtime_with_agent("agent-x");
+        let sender = Sender::new("agent-x");
+        handle_report_health(
+            &home,
+            &json!({"reason": "hang"}),
+            "agent-x",
+            &sender,
+            Some(&rt),
+        );
+        let result = handle_clear_blocked_reason(
+            &home,
+            &json!({"instance": "agent-x", "reason": "bogus_kind"}),
+            Some(&rt),
+        );
+        assert_eq!(
+            result["error"].as_str(),
+            Some("reason mismatch"),
+            "{result}"
+        );
+        assert_eq!(
+            current_reason(&rt, &home, "agent-x"),
+            Some(BlockedReason::Hang)
+        );
     }
 }

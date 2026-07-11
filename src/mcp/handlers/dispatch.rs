@@ -286,10 +286,25 @@ action_adapter!(dispatch_deployment, "deployment", [
     "list"     => schedule::handle_list_deployments,      h;
 ]);
 
-action_adapter!(dispatch_health, "health", [
-    "report" => instance::handle_report_health,         hais;
-    "clear"  => instance::handle_clear_blocked_reason,  ha;
-]);
+/// #2454: custom (not `action_adapter!`) because the health WRITE actions now
+/// call the in-process `agent_ops` blocked-reason service and so need the
+/// `RuntimeContext` forwarded — a handler shape the shared `adapter!` macro
+/// doesn't cover (mirrors `dispatch_instance`/`dispatch_list_instances`).
+/// `runtime = None` (the test-only `handle_tool` entry) makes the handlers
+/// return an explicit "runtime unavailable" error, never a self-IPC `api::call`.
+pub(crate) fn dispatch_health(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "report" => instance::handle_report_health(
+            ctx.home,
+            ctx.args,
+            ctx.instance_name,
+            ctx.sender,
+            ctx.runtime,
+        ),
+        "clear" => instance::handle_clear_blocked_reason(ctx.home, ctx.args, ctx.runtime),
+        other => json!({"error": format!("unknown health action: {other}")}),
+    }
+}
 
 action_adapter!(dispatch_repo, "repo", [
     "checkout"                => ci::handle_checkout_repo,              hai;

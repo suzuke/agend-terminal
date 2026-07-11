@@ -443,21 +443,12 @@ pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Val
         Some(r) => r,
         None => return json!({"ok": false, "error": format!("unknown reason: {reason_str}")}),
     };
-    let reg = agent::lock_registry(ctx.registry);
-    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(handle) => {
-            let mut core = handle.core.lock();
-            let state = core.state.get_state().display_name().to_string();
-            core.health.set_blocked_reason(reason);
-            // #1933: attach the optional operator-readable note (set_blocked_reason
-            // above reset it). Empty/absent → no annotation.
-            core.health.set_blocked_note(
-                params["note"]
-                    .as_str()
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string),
-            );
-            json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": state})
+    // #2454: thin API adapter over the in-process `agent_ops` service (JSON in/out
+    // here; lock + mutation in the service). `None` = instance not registered.
+    let note = params["note"].as_str();
+    match crate::agent_ops::set_blocked_reason(ctx.registry, ctx.home, name, reason, note) {
+        Some(out) => {
+            json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": out.current_state})
         }
         None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
     }
@@ -469,30 +460,24 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
         None => return json!({"ok": false, "error": "missing 'name'"}),
     };
     let filter_reason = params["reason"].as_str();
-    let reg = agent::lock_registry(ctx.registry);
-    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(handle) => {
-            let mut core = handle.core.lock();
-            let was = core
-                .health
-                .current_reason
+    // #2454: thin API transport adapter over the in-process `agent_ops` service.
+    match crate::agent_ops::clear_blocked_reason(ctx.registry, ctx.home, name, filter_reason) {
+        Ok(out) => {
+            let was = out
+                .was
                 .as_ref()
                 .map(|r| serde_json::to_value(r).unwrap_or_default());
-            // If a reason filter is specified, only clear if it matches
-            if let Some(filter) = filter_reason {
-                let matches = core
-                    .health
-                    .current_reason
-                    .as_ref()
-                    .is_some_and(|r| r.kind_str() == filter);
-                if !matches {
-                    return json!({"ok": false, "error": "reason mismatch", "current": was});
-                }
-            }
-            core.health.clear_blocked_reason();
             json!({"ok": true, "status": "cleared", "instance": name, "was": was})
         }
-        None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
+        Err(crate::agent_ops::ClearBlockedError::FilterMismatch { current }) => {
+            let current = current
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or_default());
+            json!({"ok": false, "error": "reason mismatch", "current": current})
+        }
+        Err(crate::agent_ops::ClearBlockedError::NotFound) => {
+            json!({"ok": false, "error": format!("instance '{name}' not found")})
+        }
     }
 }
 

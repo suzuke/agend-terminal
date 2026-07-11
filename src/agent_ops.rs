@@ -130,6 +130,88 @@ pub fn send_to(
 }
 
 // ---------------------------------------------------------------------------
+// Blocked-reason (health) — #2454 in-process MCP→API service
+// ---------------------------------------------------------------------------
+
+/// Successful [`set_blocked_reason`] outcome (the agent's display state when the
+/// reason was recorded).
+#[derive(Debug)]
+pub struct BlockedReasonSet {
+    pub current_state: String,
+}
+
+/// Successful [`clear_blocked_reason`] outcome; `was` is the prior reason (or
+/// `None` if the agent was not blocked).
+#[derive(Debug)]
+pub struct BlockedReasonCleared {
+    pub was: Option<crate::health::BlockedReason>,
+}
+
+/// [`clear_blocked_reason`] failure. Distinct variants so the transport adapters
+/// map each exhaustively (no wildcard). `set_blocked_reason` cannot mismatch, so
+/// it returns `Option` rather than sharing this type.
+#[derive(Debug)]
+pub enum ClearBlockedError {
+    /// No registry entry resolves for the name.
+    NotFound,
+    /// The filter kind did not match the current reason (left unchanged).
+    FilterMismatch {
+        current: Option<crate::health::BlockedReason>,
+    },
+}
+
+/// #2454: set an agent's blocked reason IN-PROCESS against the live registry —
+/// the transport-neutral owner shared by the API handler and the MCP `health
+/// report` handler (previously reached over the MCP→API self-IPC loopback). Locks
+/// registry (tier-0) then core (tier-1), callers hold neither. `None` = the
+/// instance is not registered.
+pub fn set_blocked_reason(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    reason: crate::health::BlockedReason,
+    note: Option<&str>,
+) -> Option<BlockedReasonSet> {
+    let reg = agent::lock_registry(registry);
+    let handle = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))?;
+    let mut core = handle.core.lock();
+    let current_state = core.state.get_state().display_name().to_string();
+    // set_blocked_reason resets the note, so apply the note AFTER (empty → none).
+    core.health.set_blocked_reason(reason);
+    core.health
+        .set_blocked_note(note.filter(|n| !n.is_empty()).map(str::to_string));
+    Some(BlockedReasonSet { current_state })
+}
+
+/// #2454: clear an agent's blocked reason IN-PROCESS (owner shared by the API and
+/// MCP `health clear` handlers). `filter_kind` is a reason-KIND token compared to
+/// [`crate::health::BlockedReason::kind_str`], NOT a full `BlockedReason`: an
+/// unknown kind stays a legal never-match filter (a parsed reason would silently
+/// make an unknown filter clear unconditionally). `None` = clear unconditionally.
+/// Lock order as [`set_blocked_reason`].
+pub fn clear_blocked_reason(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    filter_kind: Option<&str>,
+) -> Result<BlockedReasonCleared, ClearBlockedError> {
+    let reg = agent::lock_registry(registry);
+    let handle = crate::fleet::resolve_uuid(home, name)
+        .and_then(|id| reg.get(&id))
+        .ok_or(ClearBlockedError::NotFound)?;
+    let mut core = handle.core.lock();
+    let was = core.health.current_reason.clone();
+    if let Some(filter) = filter_kind {
+        let matches = was.as_ref().is_some_and(|r| r.kind_str() == filter);
+        if !matches {
+            return Err(ClearBlockedError::FilterMismatch { current: was });
+        }
+    }
+    core.health.clear_blocked_reason();
+    Ok(BlockedReasonCleared { was })
+}
+
+// ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 

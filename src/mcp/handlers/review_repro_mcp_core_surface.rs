@@ -165,9 +165,12 @@ fn create_instance_team_count_capped_mcp_core_surface() {
 fn clear_blocked_reason_validates_instance_name_mcp_core_surface() {
     let home = tmp_home("f4-clear-blocked");
 
+    // #2454: name validation fires at the MCP boundary BEFORE the runtime check,
+    // so `None` runtime still exercises the malformed-name rejection path.
     let result = super::instance::handle_clear_blocked_reason(
         &home,
         &json!({ "instance": "../evil-mcp-core-surface" }),
+        None,
     );
 
     let err = error_str(&result).to_lowercase();
