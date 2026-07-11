@@ -245,6 +245,11 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
 #[path = "binding_state_liveness_tests.rs"]
 mod liveness_tests;
 
+// PR2 architecture F2: signature_valid observability pins (sibling file).
+#[cfg(test)]
+#[path = "binding_state_signature_tests.rs"]
+mod signature_tests;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
