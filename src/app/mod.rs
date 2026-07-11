@@ -14,6 +14,8 @@ mod menu;
 mod mouse;
 mod overlay;
 mod pane_factory;
+mod ui_state;
+use ui_state::{KeyDeps, UiState};
 mod session;
 mod telegram_hooks;
 mod tui_events;
@@ -29,7 +31,7 @@ use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
 use crate::notification_queue;
 use crate::render;
-use overlay::{CloseTarget, Overlay, OverlayCtx};
+use overlay::{CloseTarget, Overlay};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -514,13 +516,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     }
 
-    let mut layout = Layout::new();
-    let mut key_handler = KeyHandler::new();
-    let mut overlay = Overlay::None;
-    let mut last_tab: usize = 0;
+    // #2453: the five cohesive key/UI-interaction fields, owned by one type.
+    // `name_counter` counts auto-dedup agent names.
+    let mut ui = UiState {
+        layout: Layout::new(),
+        last_tab: 0,
+        name_counter: HashMap::new(),
+        overlay: Overlay::None,
+        key_handler: KeyHandler::new(),
+    };
     let mut mouse_state = mouse::MouseState::default();
-    // Counter for auto-dedup agent names
-    let mut name_counter: HashMap<String, usize> = HashMap::new();
 
     let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
 
@@ -575,14 +580,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             &home,
             &fleet_path,
             run_dir,
-            &mut layout,
+            &mut ui.layout,
             &wakeup_tx,
             pane_cols,
             pane_rows,
         );
         // Populate the remote-agent roster from the placed tabs so the periodic
         // sync (lines 615-665) tracks them correctly.
-        for tab in &layout.tabs {
+        for tab in &ui.layout.tabs {
             for name in tab.root().agent_names() {
                 known_remote_agents.insert(name);
             }
@@ -598,15 +603,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         let started = session::restore_with_reconciliation(
             &home,
             &fleet_path,
-            &mut layout,
-            &mut name_counter,
+            &mut ui.layout,
+            &mut ui.name_counter,
             &mut attach_jobs,
             pane_cols,
             pane_rows,
         );
         if !started {
             pane_factory::spawn_pane_tab(
-                &mut layout,
+                &mut ui.layout,
                 &registry,
                 &home,
                 "shell",
@@ -619,7 +624,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 pane_cols,
                 pane_rows,
                 &wakeup_tx,
-                &mut name_counter,
+                &mut ui.name_counter,
                 pane_factory::SpawnIdentity::UnmanagedLocalShell,
             )?;
         }
@@ -831,6 +836,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let attaches_expected = pending_fwd.len();
     let mut booting = true;
 
+    // #2453: loop-stable shared deps for handle_key_event, built once.
+    let key_deps = KeyDeps {
+        registry: &registry,
+        home: &home,
+        fleet_path: &fleet_path,
+        wakeup_tx: &wakeup_tx,
+    };
+
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
@@ -840,17 +853,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
         // 50ms `default` arm of the main `select!` below guarantees this
         // runs at least every 50ms even without new PTY output.
-        if let Overlay::ScratchShell { pane } = &overlay {
+        if let Overlay::ScratchShell { pane } = &ui.overlay {
             if !agent_is_alive(&registry, &pane.agent_name) {
                 let name = pane.agent_name.clone();
-                overlay = Overlay::None;
+                ui.overlay = Overlay::None;
                 kill_agent(&home, &registry, &name);
             }
         }
         if needs_resize {
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
             let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
-            crate::layout::resize_panes(pane_area, &mut layout, &registry);
+            crate::layout::resize_panes(pane_area, &mut ui.layout, &registry);
             // #1140: force full redraw to clear wide-char ghost artifacts.
             // ratatui's Buffer::diff() can leave stale spacer cells when
             // wide chars are replaced by narrow chars across frames.
@@ -862,13 +875,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         let notif_now = std::time::Instant::now();
         if should_sync_notifications(last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
             last_notif_sync = Some(notif_now);
-            sync_notification_state(&home, &mut layout);
+            sync_notification_state(&home, &mut ui.layout);
         }
         // #2524 P2b / #2313: same throttle idiom, separate cadence state — the
         // decision-badge scan is independent of the notification scan above.
         if should_sync_notifications(last_decision_sync, notif_now, DECISION_SYNC_INTERVAL) {
             last_decision_sync = Some(notif_now);
-            pending_decisions_total = sync_decision_badge_state(&home, &mut layout);
+            pending_decisions_total = sync_decision_badge_state(&home, &mut ui.layout);
         }
         // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm).
         // std::sync::Mutex is fine here: only the main thread touches this,
@@ -887,14 +900,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 })
                 .unwrap_or(true);
             if should_flush {
-                flush_idle_notifications(&home, &mut layout);
+                flush_idle_notifications(&home, &mut ui.layout);
                 if let Ok(mut guard) = LAST_FLUSH.lock() {
                     *guard = Some(now);
                 }
             }
         }
 
-        let repeat_mode = key_handler.in_repeat();
+        let repeat_mode = ui.key_handler.in_repeat();
 
         // #2057 instrumentation (env-gated, AGEND_TUI_SIZE_DEBUG=1): the
         // operator sees ~3 blank rows below the status bar (frame shorter than
@@ -912,7 +925,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 crossterm_cols = cross.0,
                 crossterm_rows = cross.1,
                 terminal_size = ?term_sz,
-                tabs = layout.tabs.len(),
+                tabs = ui.layout.tabs.len(),
                 "TUI draw size probe"
             );
         }
@@ -932,7 +945,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             // pane's rx is drained, or after MAX_BOOT_CATCHUP (so boot can't hang).
             if booting {
                 let backlog_remains =
-                    render::drain_all_panes_until(&mut layout, BOOT_FRAME_TIME_CAP);
+                    render::drain_all_panes_until(&mut ui.layout, BOOT_FRAME_TIME_CAP);
                 let timed_out = boot_start.elapsed() >= MAX_BOOT_CATCHUP;
                 if (pending_fwd.is_empty() && !backlog_remains) || timed_out {
                     booting = false;
@@ -952,7 +965,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // backgrounded busy tab's `rx` stays bounded instead of replaying a
                 // multi-second catch-up when switched to. Background panes are drained
                 // but not redrawn; only the active tab is painted below.
-                render::drain_all_panes(&mut layout);
+                render::drain_all_panes(&mut ui.layout);
             }
             terminal.draw(|frame| {
                 // #1027: snapshot the shared daemon-binary-stale flag once
@@ -975,7 +988,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
                 render::render(
                     frame,
-                    &mut layout,
+                    &mut ui.layout,
                     repeat_mode,
                     &registry,
                     telegram_status,
@@ -984,7 +997,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
-                render_active_overlay(frame, &mut overlay, &layout, &registry, &home);
+                render_active_overlay(frame, &mut ui.overlay, &ui.layout, &registry, &home);
                 // #freeze-4: loading indicator while the boot catch-up phase absorbs
                 // the restart flood (so it reads as loading-with-progress, not a freeze).
                 if booting {
@@ -1004,7 +1017,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             // over a few frames instead of one input-stalling mega-draw. Background
             // backlog needs no redraw: the loop's ≤50ms idle cadence + per-output
             // wakeups guarantee `drain_all_panes` runs again to bound every pane's `rx`.
-            if booting || render::active_tab_has_pending_output(&layout) {
+            if booting || render::active_tab_has_pending_output(&ui.layout) {
                 dirty = true;
             }
         }
@@ -1037,39 +1050,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     // firing the handler twice (breaks Ctrl+B prefix state, etc.).
                     Event::Key(key) if key.kind != KeyEventKind::Press => {}
                     Event::Key(key) => {
-                        // Overlay input handling
-                        if !matches!(overlay, Overlay::None) {
-                            let mut octx = OverlayCtx {
-                                layout: &mut layout,
-                                registry: &registry,
-                                home: &home,
-                                fleet_path: &fleet_path,
-                                wakeup_tx: &wakeup_tx,
-                                name_counter: &mut name_counter,
-                            };
-                            let outcome = overlay::handle_key(&mut overlay, key, &mut octx);
-                            if outcome.needs_resize {
-                                needs_resize = true;
-                            }
-                            continue;
-                        }
-
-                        let action = key_handler.handle(key);
-                        let mut dctx = dispatch::DispatchCtx {
-                            layout: &mut layout,
-                            registry: &registry,
-                            home: &home,
-                            fleet_path: &fleet_path,
-                            last_tab: &mut last_tab,
-                            wakeup_tx: &wakeup_tx,
-                            name_counter: &mut name_counter,
-                        };
-                        let out = dispatch::dispatch(action, &mut dctx);
+                        // #2453: former inline overlay/dispatch branch, now behind UiState.
+                        let out = ui.handle_key_event(key, &key_deps);
                         if out.needs_resize {
                             needs_resize = true;
-                        }
-                        if let Some(ov) = out.new_overlay {
-                            overlay = ov;
                         }
                         if out.should_break {
                             break;
@@ -1079,11 +1063,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     // etc.) are modal — mouse events must not reach hidden panes,
                     // otherwise drag/selection state accumulates on panes the user
                     // can't see. Swallow mouse events while any overlay is active.
-                    Event::Mouse(_) if !matches!(overlay, Overlay::None) => {}
+                    Event::Mouse(_) if !matches!(ui.overlay, Overlay::None) => {}
                     Event::Mouse(mouse_evt) => {
                         let out = mouse::handle(
                             mouse_evt,
-                            &mut layout,
+                            &mut ui.layout,
                             &mut mouse_state,
                             &fleet_path,
                             &registry,
@@ -1092,14 +1076,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             needs_resize = true;
                         }
                         if let Some(prev) = out.new_last_tab {
-                            last_tab = prev;
+                            ui.last_tab = prev;
                         }
                         if let Some(ov) = out.new_overlay {
-                            overlay = ov;
+                            ui.overlay = ov;
                         }
                     }
                     Event::Paste(text) => {
-                        match &mut overlay {
+                        match &mut ui.overlay {
                             Overlay::RenameTab { ref mut input }
                             | Overlay::RenamePane { ref mut input } => {
                                 input.push_str(&text);
@@ -1119,14 +1103,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 pane.write_input(&registry, text.as_bytes());
                             }
                             Overlay::None => {
-                                write_to_focused(&home, &mut layout, &registry, text.as_bytes());
+                                write_to_focused(&home, &mut ui.layout, &registry, text.as_bytes());
                             }
                             _ => {} // ignore paste in non-input overlays
                         }
                     }
                     Event::Resize(cols, rows) => {
                         let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
-                        crate::layout::resize_panes(pane_area, &mut layout, &registry);
+                        crate::layout::resize_panes(pane_area, &mut ui.layout, &registry);
                         // #1140: an interactive terminal resize reflows pane widths
                         // (the wide→narrow transition that leaves stale wide-char
                         // spacer cells in ratatui's Buffer::diff), so force the same
@@ -1156,7 +1140,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 if let Ok(outcome) = outcome {
                     let pane_id = outcome.pane_id();
                     if let Some(fwd_tx) = pending_fwd.remove(&pane_id) {
-                        if let Some(pane) = layout.find_pane_mut(pane_id) {
+                        if let Some(pane) = ui.layout.find_pane_mut(pane_id) {
                             pane_factory::apply_attach_outcome(
                                 pane, &registry, outcome, fwd_tx, &wakeup_tx,
                             );
@@ -1173,7 +1157,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             recv(tui_event_rx) -> ev => {
                 dirty = true;
                 if let Ok(event) = ev {
-                    tui_events::handle_tui_event(event, &mut layout, &registry, &wakeup_tx);
+                    tui_events::handle_tui_event(event, &mut ui.layout, &registry, &wakeup_tx);
                     needs_resize = true;
                 }
             }
@@ -1213,7 +1197,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 // crash. Graceful exit still saves unconditionally below.
                 if last_session_save.elapsed() >= std::time::Duration::from_secs(10) {
                     last_session_save = std::time::Instant::now();
-                    session::save_session_if_changed(&home, &layout, &mut last_session_json);
+                    session::save_session_if_changed(&home, &ui.layout, &mut last_session_json);
                 }
                 // Periodic redraw for state updates. In Attached mode, also
                 // poll the daemon's `*.port` directory every 2s and open a
@@ -1246,7 +1230,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 name,
                                 &home,
                                 &fleet_path,
-                                &mut layout,
+                                &mut ui.layout,
                                 dc.saturating_sub(2),
                                 dr.saturating_sub(4),
                                 &wakeup_tx,
@@ -1265,9 +1249,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     // instead of appending a DUPLICATE tab.
                                     // Preserves tab position + focus.
                                     if let Some(idx) =
-                                        layout.single_pane_tab_index_for_agent(&tab_name)
+                                        ui.layout.single_pane_tab_index_for_agent(&tab_name)
                                     {
-                                        layout.tabs[idx] = crate::layout::Tab::new(
+                                        ui.layout.tabs[idx] = crate::layout::Tab::new(
                                             tab_name.to_string(),
                                             pane,
                                         );
@@ -1276,7 +1260,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             "reused retained tab for re-appeared remote agent (no duplicate)"
                                         );
                                     } else {
-                                        layout.push_tab_preserve_focus(
+                                        ui.layout.push_tab_preserve_focus(
                                             crate::layout::Tab::new(tab_name.to_string(), pane),
                                         );
                                         tracing::info!(
@@ -1324,7 +1308,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // same reconciliation path Owned mode uses (parameterized over agent
     // source: fleet.yaml for Owned, `runtime::list_agents_with_fallback`
     // for Attached — see #910 for the registry-truth migration).
-    app_teardown(&home, &layout, &registry, attached_mode, attach_workers);
+    app_teardown(&home, &ui.layout, &registry, attached_mode, attach_workers);
 
     Ok(())
 }
