@@ -104,22 +104,38 @@ pub(crate) fn scan_and_emit(
         |target, unread| {
             crate::inbox::notify::renudge_actionable_unread(home, target, HANDOFF_KIND, unread);
         },
+        |target, msg| {
+            // #2729 real operator-P0 route. The return is the number of REGISTERED
+            // escalation channels the alert was DISPATCHED to — a route count, NOT a
+            // delivery receipt (the channel layer may still suppress/authorize per its
+            // own rules; `notify_all_escalation_channels` reports `channels.len()`).
+            crate::channel::notify_all_escalation_channels(
+                target,
+                crate::channel::NotifySeverity::Error,
+                msg,
+                false,
+            )
+        },
     );
 }
 
-/// Test-seam variant: `renudge` is the per-target re-nudge emitter (real path is
-/// the direct PTY inject; tests pass a capturing closure so the daemon API
-/// loopback isn't required). The busy/interval GATING lives here (not in the
-/// emitter) so a test driving the real `scan_and_emit_with` entry can assert
-/// exactly when a re-nudge fires.
-pub(crate) fn scan_and_emit_with<F>(
+/// Test-seam variant: `renudge` is the per-target re-nudge emitter and
+/// `page_operator` is the self-orchestrator operator-P0 emitter (real paths are the
+/// PTY inject / the channel fan-out; tests pass capturing closures so no
+/// process-global state or daemon loopback is needed). `page_operator(target, msg)`
+/// returns the number of REGISTERED channel routes the alert was dispatched to (NOT
+/// a delivery receipt). The busy/interval/escalation GATING lives here (not in the
+/// emitters) so a test driving the real entry can assert exactly when each fires.
+pub(crate) fn scan_and_emit_with<F, G>(
     home: &Path,
     now: &chrono::DateTime<chrono::Utc>,
     last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     mut renudge: F,
+    mut page_operator: G,
 ) where
     F: FnMut(&str, usize),
+    G: FnMut(&str, &str) -> usize,
 {
     // #1888 phase-2: backstop sweep BEFORE the scan — an expired track must
     // neither re-nudge nor escalate this tick.
@@ -203,6 +219,25 @@ pub(crate) fn scan_and_emit_with<F>(
             // throttle and re-nudge a burst for every live handoff. In-mem stays
             // primary (fast); the persisted value is the restart-survival fallback
             // (they're stamped together, so in-mem present ⟹ equals the persisted).
+            //
+            // #2729: resolve the escalation recipient + a "recently DISPATCHED a
+            // self-orch operator page" throttle flag up front. A self-orchestrator's
+            // own handoff has no peer to relay, so once an operator P0 has been
+            // DISPATCHED to at least one registered channel route (→ the durable
+            // `last_escalated` stamp — a route/throttle fact, NOT a delivery receipt),
+            // stop the 2-min re-nudge storm until the REALERT window elapses. Peer
+            // tracks are unaffected.
+            let recipient = crate::fleet::team_orchestrator_for(home, target)
+                .unwrap_or_else(|| FALLBACK_RECIPIENT.to_string());
+            let is_self_orch = recipient == *target;
+            let escalated_recently = last_escalated
+                .get(&key)
+                .copied()
+                .or_else(|| parse_stamp(&track.last_escalated_at))
+                .is_some_and(|prev| {
+                    now.signed_duration_since(prev).num_minutes() < REALERT_AFTER_MINS
+                });
+            let self_orch_dispatched_recently = is_self_orch && escalated_recently;
             let busy = crate::snapshot::agent_is_busy(home, target);
             let effective_last_renudged = last_renudged
                 .get(&key)
@@ -223,10 +258,15 @@ pub(crate) fn scan_and_emit_with<F>(
                 agent_is_busy = busy,
                 renudge_due,
                 age_ok = age_min >= RENUDGE_AFTER_MINS,
-                will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due,
+                self_orch_dispatched_recently,
+                will_fire = age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due && !self_orch_dispatched_recently,
                 "ci-handoff re-nudge decision"
             );
-            if age_min >= RENUDGE_AFTER_MINS && !busy && renudge_due {
+            if age_min >= RENUDGE_AFTER_MINS
+                && !busy
+                && renudge_due
+                && !self_orch_dispatched_recently
+            {
                 // Stamp EVERY due key (per-key cross-tick interval honesty — so a
                 // collapsed key isn't treated as never-nudged next scan, which would
                 // let the target re-fire inside the interval).
@@ -251,26 +291,42 @@ pub(crate) fn scan_and_emit_with<F>(
             if age_min < HANDOFF_TIMEOUT_MINS {
                 continue;
             }
-            // #35896-11 ⑥: same restart-survival fallback as the re-nudge throttle —
-            // consult the track's PERSISTED `last_escalated_at` when the in-mem map
-            // lacks the key (post-restart), so a boot doesn't re-escalate every
-            // timed-out handoff inside its REALERT window.
-            let effective_last_escalated = last_escalated
-                .get(&key)
-                .copied()
-                .or_else(|| parse_stamp(&track.last_escalated_at));
-            if let Some(prev) = effective_last_escalated {
-                if now.signed_duration_since(prev).num_minutes() < REALERT_AFTER_MINS {
-                    continue;
-                }
+            // Dedup: don't re-alert inside the REALERT window. `escalated_recently`
+            // was computed above from the in-mem map + the persisted restart-survival
+            // fallback (byte-identical source to the pre-#2729 inline check).
+            if escalated_recently {
+                continue;
             }
-            let recipient = crate::fleet::team_orchestrator_for(home, target)
-                .unwrap_or_else(|| FALLBACK_RECIPIENT.to_string());
-            if recipient == *target {
-                // #1859: `next_after_ci` IS the team orchestrator — there is no
-                // higher authority to escalate to. This is no longer a silent
-                // total-skip (the Scenario A bug): the re-nudge above already
-                // redelivers the handoff to the orchestrator itself.
+            if is_self_orch {
+                // #2729: `next_after_ci` IS the team orchestrator — no peer to relay.
+                // Dispatch an operator P0 (via the `page_operator` seam) exactly like
+                // #1701's self-orch Hung path, instead of the pre-#2729 silent
+                // `continue`. `dispatched` is the number of REGISTERED channel routes
+                // the alert was handed to — NOT a delivery receipt. Stamp / suppress
+                // ONLY when at least one route was registered; zero registered routes
+                // must record nothing and suppress nothing, so the retry (re-nudge +
+                // re-escalation) continues and a channel registering later still pages.
+                let text = format!(
+                    "🛑 {target} (team orchestrator) has an unclaimed CI handoff for \
+                     {corr} for {age_min}min and is its own orchestrator — no peer can \
+                     relay. Manual intervention likely (check the pane / interrupt / re-prime)."
+                );
+                let dispatched = page_operator(target, &text);
+                if dispatched > 0 {
+                    tracing::info!(
+                        %target, %corr, age_min, channel_routes = dispatched,
+                        "#2729 handoff_timeout_watchdog: dispatched self-orchestrator operator page to registered channel route(s)"
+                    );
+                    last_escalated.insert(key, *now);
+                    crate::daemon::ci_handoff_track::stamp_throttle(
+                        home, path, target, &corr, now, false, true,
+                    );
+                } else {
+                    tracing::warn!(
+                        %target, %corr,
+                        "#2729 handoff_timeout_watchdog: no escalation channel registered — self-orch operator page not dispatched, will retry"
+                    );
+                }
                 continue;
             }
             // #1923 G11: the recipient is the hardcoded `FALLBACK_RECIPIENT`
@@ -409,10 +465,31 @@ mod tests {
         last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
         last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     ) -> Vec<String> {
+        // Default operator-page emitter: no route registered (returns 0), for the
+        // re-nudge/escalation tests that don't exercise the self-orch page.
+        run_watchdog_pageable(home, now, last_escalated, last_renudged, |_, _| 0)
+    }
+
+    /// Like `run_watchdog` but with an injectable operator-page emitter
+    /// (`(target, msg) -> dispatched-route-count`), so the #2729 self-orch tests
+    /// drive the REAL state machine deterministically — no process-global channel
+    /// registry, no shared mutable state, so they stay isolated under parallelism.
+    fn run_watchdog_pageable(
+        home: &Path,
+        now: &chrono::DateTime<chrono::Utc>,
+        last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+        last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+        page_operator: impl FnMut(&str, &str) -> usize,
+    ) -> Vec<String> {
         let mut nudged = Vec::new();
-        scan_and_emit_with(home, now, last_escalated, last_renudged, |t, _| {
-            nudged.push(t.to_string())
-        });
+        scan_and_emit_with(
+            home,
+            now,
+            last_escalated,
+            last_renudged,
+            |t, _| nudged.push(t.to_string()),
+            page_operator,
+        );
         nudged
     }
 
@@ -1003,6 +1080,203 @@ mod tests {
             "a REJECTED (merge-blocked) PR's ci-ready handoff must not keep \
              re-nudging — the pr_state cache already shows the outcome, \
              independent of ci_watch state: {nudged:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── #2729: self-orchestrator handoff-timeout operator escalation ─────────
+
+    /// Fleet where `solo` is its OWN team orchestrator
+    /// (`team_orchestrator_for(solo) == solo`), so the watchdog's
+    /// `recipient == target` self-orchestrator branch is exercised.
+    fn write_self_orch_fleet(home: &Path) {
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            "instances:\n  solo:\n    backend: claude\n\
+             teams:\n  s:\n    members: [solo]\n    orchestrator: solo\n",
+        )
+        .unwrap();
+    }
+
+    /// #2729: a timed-out handoff whose target is its own orchestrator has no peer
+    /// to relay — it must DISPATCH an operator page exactly once, persist the
+    /// escalation stamp, and stop the 2-min renudge storm once dispatched.
+    #[test]
+    fn self_orch_timed_out_handoff_pages_operator_once_and_stops_renudge() {
+        let home = tmp_home("2729-selforch-page");
+        write_self_orch_fleet(&home);
+        seed_snapshot(&home, "solo", "idle"); // idle → renudge-eligible absent suppression
+        seed_handoff(&home, "solo", "o/r@feat", 11, false); // past HANDOFF_TIMEOUT_MINS(10)
+        let now = chrono::Utc::now();
+        let mut last = HashMap::new();
+        let pages = std::cell::Cell::new(0usize);
+
+        run_watchdog_pageable(&home, &now, &mut last, &mut HashMap::new(), |_t, _m| {
+            pages.set(pages.get() + 1);
+            1 // one registered channel route
+        });
+        assert_eq!(
+            pages.get(),
+            1,
+            "a timed-out self-orchestrator handoff must dispatch the operator page once"
+        );
+        let track = crate::daemon::ci_handoff_track::list(&home)[0].1.clone();
+        assert!(
+            track.last_escalated_at.is_some(),
+            "the self-orch escalation must persist a last_escalated_at stamp on the track"
+        );
+
+        // Second tick within REALERT_AFTER_MINS: no re-dispatch, and the renudge stops.
+        let nudged = run_watchdog_pageable(
+            &home,
+            &(now + chrono::Duration::minutes(3)),
+            &mut last,
+            &mut HashMap::new(),
+            |_t, _m| {
+                pages.set(pages.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            pages.get(),
+            1,
+            "re-dispatch within the REALERT window must be deduped"
+        );
+        assert!(
+            !nudged.contains(&"solo".to_string()),
+            "once the operator is paged, the 2-min renudge storm must stop (self-orch): {nudged:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2729 review boundary: ZERO dispatched routes must NOT stamp nor suppress —
+    /// nothing was dispatched, so the renudge/retry continues and no escalation stamp
+    /// is recorded (a route registering later still pages).
+    #[test]
+    fn self_orch_page_without_route_does_not_stamp_or_suppress_renudge() {
+        let home = tmp_home("2729-selforch-noroute");
+        write_self_orch_fleet(&home);
+        seed_snapshot(&home, "solo", "idle");
+        seed_handoff(&home, "solo", "o/r@feat", 11, false);
+        let mut last = HashMap::new();
+        let pages = std::cell::Cell::new(0usize);
+        let nudged = run_watchdog_pageable(
+            &home,
+            &chrono::Utc::now(),
+            &mut last,
+            &mut HashMap::new(),
+            |_t, _m| {
+                pages.set(pages.get() + 1);
+                0 // no route registered
+            },
+        );
+
+        assert_eq!(pages.get(), 1, "the operator page is still attempted");
+        let track = crate::daemon::ci_handoff_track::list(&home)[0].1.clone();
+        assert!(
+            track.last_escalated_at.is_none(),
+            "zero dispatched routes must NOT persist an escalation stamp"
+        );
+        assert!(
+            !last.contains_key(&("solo".to_string(), "o/r@feat".to_string())),
+            "zero dispatched routes must NOT record an in-mem escalation"
+        );
+        assert!(
+            nudged.contains(&"solo".to_string()),
+            "with zero routes dispatched, the renudge/retry must continue: {nudged:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2729: once the REALERT window elapses, a still-unresolved self-orch handoff
+    /// re-alerts the operator exactly once more.
+    #[test]
+    fn self_orch_re_alerts_after_realert_window() {
+        let home = tmp_home("2729-selforch-realert");
+        write_self_orch_fleet(&home);
+        seed_snapshot(&home, "solo", "thinking"); // busy → isolate escalation from renudge
+        seed_handoff(&home, "solo", "o/r@feat", 11, false);
+        let now = chrono::Utc::now();
+        let mut last = HashMap::new();
+        let pages = std::cell::Cell::new(0usize);
+
+        run_watchdog_pageable(&home, &now, &mut last, &mut HashMap::new(), |_t, _m| {
+            pages.set(pages.get() + 1);
+            1
+        });
+        assert_eq!(pages.get(), 1, "first operator page");
+        run_watchdog_pageable(
+            &home,
+            &(now + chrono::Duration::minutes(REALERT_AFTER_MINS + 1)),
+            &mut last,
+            &mut HashMap::new(),
+            |_t, _m| {
+                pages.set(pages.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            pages.get(),
+            2,
+            "a self-orch page must re-alert once REALERT_AFTER_MINS has elapsed"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2729 pre-timeout preservation: a fresh (< HANDOFF_TIMEOUT_MINS) self-orch
+    /// handoff must not dispatch a page.
+    #[test]
+    fn self_orch_fresh_handoff_does_not_page() {
+        let home = tmp_home("2729-selforch-fresh");
+        write_self_orch_fleet(&home);
+        seed_snapshot(&home, "solo", "idle");
+        seed_handoff(&home, "solo", "o/r@feat", 3, false); // < HANDOFF_TIMEOUT_MINS(10)
+        let pages = std::cell::Cell::new(0usize);
+        run_watchdog_pageable(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |_t, _m| {
+                pages.set(pages.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            pages.get(),
+            0,
+            "a fresh (<10min) self-orch handoff must not dispatch a page"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2729 peer preservation: a PEER escalation (recipient != target) must go to
+    /// the lead INBOX and never dispatch an operator page.
+    #[test]
+    fn peer_escalation_does_not_dispatch_operator_page() {
+        let home = tmp_home("2729-peer-preserved");
+        write_fleet(&home); // reviewer's orchestrator = lead (peer)
+        seed_handoff(&home, "reviewer", "o/r@feat", 15, false);
+        let pages = std::cell::Cell::new(0usize);
+        run_watchdog_pageable(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |_t, _m| {
+                pages.set(pages.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            pages.get(),
+            0,
+            "a peer escalation must NOT dispatch an operator page (it goes to the lead inbox)"
+        );
+        assert_eq!(
+            crate::inbox::drain(&home, "lead").len(),
+            1,
+            "peer escalation to the lead inbox is preserved"
         );
         std::fs::remove_dir_all(home).ok();
     }
