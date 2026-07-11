@@ -2397,15 +2397,17 @@ mod tests {
         );
     }
 
-    /// #2413 Phase D: the codex rollout-tail observer source (Stream plane) must be started
-    /// in app mode too — same #1720/#685 reasoning as the hook socket above. The live fleet
-    /// daemon is `run_app`, so gating `rollout::spawn` to run_core-only would leave codex
-    /// agents' observer source dead in production (their `observed_status` would never get
-    /// Stream evidence). Production-region scan only (the assert literal lives in the test
-    /// module below — #2434's vacuous-pin lesson). Production-region scan, **comments
-    /// stripped** (#2447 r6 helper) so a commented-out call does NOT satisfy the pin.
-    /// REVERSE-MUTATION verified: both DELETING and COMMENTING-OUT the real
-    /// `rollout::spawn(...)` call in run_app turn this RED.
+    /// #2413 Phase D + #2453 Stage 1a: the codex rollout-tail observer source
+    /// (Stream plane) must stay wired at the shared owner-service site
+    /// `start_shared_stream_observers`. This pin proves `rollout::spawn` remains
+    /// present in `owner_services` production (comments + string literals masked —
+    /// #2447 r6 — so a commented-out or literal call does NOT satisfy it).
+    /// REVERSE-MUTATION: deleting or commenting the real `rollout::spawn(...)` in
+    /// `owner_services` turns THIS test RED. That the helper is actually reached by
+    /// BOTH hosts (owned `run_app` + headless `run_core`) — the #1720/#685/#2434
+    /// "dead in the app-mode live daemon" class — is proven SEPARATELY by
+    /// `owner_services_called_by_both_hosts`; the two compose the full
+    /// "observer live in both hosts" invariant.
     #[test]
     fn run_app_wires_codex_rollout_tailer_2413() {
         // #2453 Stage 1a: rollout::spawn moved into the shared helper both hosts
@@ -2419,20 +2421,23 @@ mod tests {
         assert!(
             prod_code.contains("crate::daemon::shadow::rollout::spawn("),
             "owner_services::start_shared_stream_observers must spawn the codex rollout-tail \
-             observer (#2413 Phase D) — both hosts call this helper, so gating it (or commenting \
-             it out) would leave codex agents' Stream observer dead. No ACTIVE \
+             observer (#2413 Phase D) — deleting or commenting it here leaves codex agents' \
+             Stream observer dead in every host that calls the helper (both do — see \
+             owner_services_called_by_both_hosts). No ACTIVE \
              'crate::daemon::shadow::rollout::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
     }
 
-    /// #2413 opencode plane: the opencode SSE `/event` observer source (Stream plane) must
-    /// be started in app mode too — SAME #2434 reasoning as the rollout tailer above. The
-    /// live fleet daemon is `run_app`, so gating `opencode::spawn` to run_core-only would
-    /// leave opencode agents' observer source dead in production. Production-region scan,
-    /// **comments stripped** (#2447 r6 helper) so a commented-out call does NOT satisfy the
-    /// pin. REVERSE-MUTATION verified: both DELETING and COMMENTING-OUT the real
-    /// `opencode::spawn(...)` call in run_app turn this RED.
+    /// #2413 opencode plane + #2453 Stage 1a: the opencode SSE `/event` observer
+    /// source (Stream plane) must stay wired at the shared owner-service site
+    /// `start_shared_stream_observers`. This pin proves `opencode::spawn` remains
+    /// present in `owner_services` production (comments + string literals masked —
+    /// #2447 r6 — so a commented-out or literal call does NOT satisfy it).
+    /// REVERSE-MUTATION: deleting or commenting the real `opencode::spawn(...)` in
+    /// `owner_services` turns THIS test RED. That both hosts (owned `run_app` +
+    /// headless `run_core`) actually reach the helper — the #2434 dead-in-app class
+    /// — is proven SEPARATELY by `owner_services_called_by_both_hosts`.
     #[test]
     fn run_app_wires_opencode_sse_observer_2413() {
         // #2453 Stage 1a: opencode::spawn moved into the shared helper both hosts
@@ -2446,8 +2451,9 @@ mod tests {
         assert!(
             prod_code.contains("crate::daemon::shadow::opencode::spawn("),
             "owner_services::start_shared_stream_observers must spawn the opencode SSE observer \
-             (#2413 opencode plane) — both hosts call this helper, so gating it (or commenting \
-             it out) would leave opencode agents' Stream observer dead. No ACTIVE \
+             (#2413 opencode plane) — deleting or commenting it here leaves opencode agents' \
+             Stream observer dead in every host that calls the helper (both do — see \
+             owner_services_called_by_both_hosts). No ACTIVE \
              'crate::daemon::shadow::opencode::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
@@ -2775,13 +2781,15 @@ mod tests {
         );
     }
 
-    /// #2413 kiro plane: the kiro session-tail observer source (Stream plane) must be
-    /// started in app mode too — SAME #2434 reasoning as rollout/opencode above. The live
-    /// fleet daemon is `run_app`, so gating `kiro::spawn` to run_core-only would leave kiro
-    /// agents' observer source dead in production. Production-region scan, **comments
-    /// stripped** so a commented-out call does NOT satisfy the pin. REVERSE-MUTATION
-    /// verified (#2447 r6): both DELETING and COMMENTING-OUT the real `kiro::spawn(...)`
-    /// call in run_app turn this RED.
+    /// #2413 kiro plane + #2453 Stage 1a: the kiro session-tail observer source
+    /// (Stream plane) must stay wired at the shared owner-service site
+    /// `start_shared_stream_observers`. This pin proves `kiro::spawn` remains
+    /// present in `owner_services` production (comments + string literals masked —
+    /// #2447 r6 — so a commented-out or literal call does NOT satisfy it).
+    /// REVERSE-MUTATION: deleting or commenting the real `kiro::spawn(...)` in
+    /// `owner_services` turns THIS test RED. That both hosts (owned `run_app` +
+    /// headless `run_core`) actually reach the helper — the #2434 dead-in-app class
+    /// — is proven SEPARATELY by `owner_services_called_by_both_hosts`.
     #[test]
     fn run_app_wires_kiro_session_tailer_2413() {
         // #2453 Stage 1a: kiro::spawn moved into the shared helper both hosts
@@ -2795,8 +2803,9 @@ mod tests {
         assert!(
             prod_code.contains("crate::daemon::shadow::kiro::spawn("),
             "owner_services::start_shared_stream_observers must spawn the kiro session-tail \
-             observer (#2413 kiro plane) — both hosts call this helper, so gating it (or \
-             commenting it out) would leave kiro agents' Stream observer dead. No ACTIVE \
+             observer (#2413 kiro plane) — deleting or commenting it here leaves kiro agents' \
+             Stream observer dead in every host that calls the helper (both do — see \
+             owner_services_called_by_both_hosts). No ACTIVE \
              'crate::daemon::shadow::kiro::spawn(' (comments + string-literal contents masked) before the \
              #[cfg(test)] cutoff"
         );
