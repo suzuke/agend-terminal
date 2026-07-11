@@ -266,10 +266,20 @@ mod test_hooks {
         *COMPLETIONS.lock()
     }
 
-    pub(super) fn wait_for_completion(prev: u64) {
+    /// Wait until completions > `prev`. `timeout` is a harness watchdog only.
+    pub(super) fn wait_for_completion(prev: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         let mut n = COMPLETIONS.lock();
         while *n <= prev {
-            COMPLETIONS_CV.wait(&mut n);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(n);
+                panic!("watchdog: completions never advanced past {prev} within {timeout:?}");
+            }
+            if COMPLETIONS_CV.wait_for(&mut n, remaining).timed_out() && *n <= prev {
+                drop(n);
+                panic!("watchdog: completions never advanced past {prev} within {timeout:?}");
+            }
         }
     }
 
@@ -331,8 +341,12 @@ mod tests {
         )
     }
 
-    /// RAII: release gate, join tracked runner (if any), wait for bg completion
-    /// when `in_flight`, then reset globals — no leak into the next serial test.
+    /// RAII cleanup order (required):
+    /// 1. `release_gate` so any blocked body can proceed
+    /// 2. join any test-spawned runner (bounded watchdog)
+    /// 3. wait for offload worker completion (`in_flight` clear / completions)
+    /// 4. only then `reset()` globals
+    /// so a failed assertion cannot leak a worker into the next serial test.
     struct HookCleanup {
         runner: Option<std::thread::JoinHandle<()>>,
         hb: Option<Arc<CanonicalHeartbeatHandler>>,
@@ -347,22 +361,30 @@ mod tests {
                 completions_before: test_hooks::completions(),
             }
         }
-        #[allow(dead_code)] // used by RED path when runner is spawned off the test thread
+        #[allow(dead_code)] // RED path spawns the tick runner off the test thread
         fn track_runner(&mut self, h: std::thread::JoinHandle<()>) {
             self.runner = Some(h);
         }
         fn track_hb(&mut self, hb: Arc<CanonicalHeartbeatHandler>) {
             self.hb = Some(hb);
         }
+        /// Clear tracked handles after a successful explicit drain (Drop is then a no-op drain).
+        fn disarm_after_success(&mut self) {
+            self.runner = None;
+            self.hb = None;
+            self.completions_before = test_hooks::completions();
+        }
     }
 
     impl Drop for HookCleanup {
         fn drop(&mut self) {
+            // (1) always release first
             test_hooks::release_gate();
+            // (2) join test-spawned runner if any
             if let Some(h) = self.runner.take() {
                 test_hooks::join_with_watchdog(h, Duration::from_secs(30));
             }
-            // Drain any in-flight bg round (offload path) with a bounded poll.
+            // (3) drain offload worker — prefer in_flight; else completions
             if let Some(hb) = self.hb.take() {
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 while hb.is_in_flight() {
@@ -373,13 +395,20 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             } else {
-                // Best-effort: if a completion was expected, wait briefly via counter.
                 let before = self.completions_before;
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                while test_hooks::completions() <= before && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
+                // If a round may still be finishing, wait with bounded watchdog.
+                // No-op if nothing was in flight (completions already advanced or never started).
+                if test_hooks::completions() <= before {
+                    // short window only — do not hang cleanup when no work was spawned
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while test_hooks::completions() <= before
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 }
             }
+            // (4) reset globals only after workers are gone
             test_hooks::reset();
         }
     }
@@ -512,10 +541,9 @@ mod tests {
         assert!(hb.is_in_flight(), "body still in flight after Probe");
         let before = test_hooks::completions();
         test_hooks::release_gate();
-        test_hooks::wait_for_completion(before);
+        test_hooks::wait_for_completion(before, Duration::from_secs(30));
         assert!(!hb.is_in_flight());
-        // prevent Drop from double-waiting incorrectly
-        cleanup.hb = None;
+        cleanup.disarm_after_success();
         drop(cleanup);
         std::fs::remove_dir_all(&home).ok();
     }
@@ -546,14 +574,14 @@ mod tests {
 
         let before = test_hooks::completions();
         test_hooks::release_gate();
-        test_hooks::wait_for_completion(before);
+        test_hooks::wait_for_completion(before, Duration::from_secs(30));
         assert_eq!(
             test_hooks::completions(),
             before + 1,
             "exactly one round completes; re-entrant run must skip"
         );
         assert!(!h.is_in_flight());
-        cleanup.hb = None;
+        cleanup.disarm_after_success();
         drop(cleanup);
         std::fs::remove_dir_all(&home).ok();
     }
@@ -586,7 +614,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(!h.is_in_flight());
-        cleanup.hb = None;
+        cleanup.disarm_after_success();
         drop(cleanup);
         std::fs::remove_dir_all(&home).ok();
     }
