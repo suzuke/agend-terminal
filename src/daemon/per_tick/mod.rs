@@ -254,13 +254,13 @@ pub(crate) fn snapshot_handler_timings() -> HashMap<String, HandlerStats> {
 /// constructs a fixture vec with a panicking handler in the middle and
 /// asserts the trailing handler runs.
 ///
-/// PR4 (Q3): retained as the untracked entry point. Both tick hosts (daemon
-/// `run_core` + owned app) now call [`run_handlers_with_progress`] directly, so
-/// in a non-test build this wrapper is currently reached only by its unit test
-/// (`per_tick::tests::panicking_handler_does_not_skip_siblings`) — hence the
-/// `not(test)` dead-code allowance, not a `#[cfg(test)]` gate (it stays a real
-/// `pub(crate)` untracked entry for future callers).
-#[cfg_attr(not(test), allow(dead_code))]
+/// PR4: the untracked entry is now a `#[cfg(test)]` convenience wrapper. Both
+/// tick hosts (daemon `run_core` + owned app) call [`run_handlers_with_progress`]
+/// directly (with `None` when diagnostics are off), so the untracked form has no
+/// production caller — gating it to `cfg(test)` keeps the existing panic-isolation
+/// tests (`per_tick` + `canonical_heartbeat`) unchanged with zero production dead
+/// code.
+#[cfg(test)]
 pub(crate) fn run_handlers_with_panic_guard(
     handlers: &[Box<dyn PerTickHandler>],
     ctx: &TickContext<'_>,

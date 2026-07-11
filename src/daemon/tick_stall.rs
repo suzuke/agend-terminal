@@ -42,11 +42,12 @@ const ENV_VAR: &str = "AGEND_TICK_STALL_SECS";
 /// Minimum enabled threshold (seconds). Below this the diagnostics stay OFF — a
 /// sub-10s window would false-alarm on ordinary slow ticks.
 const MIN_THRESHOLD_SECS: u64 = 10;
-/// A single monitor sample gap larger than `sample_interval * SUSPEND_GAP_FACTOR`
-/// means the monitor thread itself was frozen (laptop sleep / gross CPU
-/// starvation) — the tick host was frozen too, so it is not a real stall. See
-/// [`StallDetector::observe`].
-const SUSPEND_GAP_FACTOR: u32 = 4;
+/// Extra slack added to the base threshold for the `Waiting` phase. A full tick
+/// period (10s) of `Waiting` between ticks is normal cadence, not a stall, so the
+/// waiting threshold must clear it. A host stuck in `Waiting` beyond
+/// `threshold + TICK_PERIOD_SLACK` (a dead tick producer) still pages as
+/// `<waiting>`.
+const TICK_PERIOD_SLACK: Duration = Duration::from_secs(10);
 
 /// The tick host's coarse lifecycle position within one tick. `Handler` carries
 /// the 0-based index into the host's immutable handler-name table.
@@ -191,8 +192,11 @@ struct Alert {
 /// monitor thread feeds it `(now, snapshot)` each sample; unit tests feed
 /// synthetic values for fully deterministic coverage.
 struct StallDetector {
+    /// Base threshold for the active phases (Preflight / Handler / PostHandlers).
     threshold: Duration,
-    sample_interval: Duration,
+    /// Threshold for the `Waiting` phase — `threshold + TICK_PERIOD_SLACK` — so
+    /// ordinary between-tick cadence never alerts but a dead tick producer does.
+    waiting_threshold: Duration,
     last_sample: Instant,
     /// Settled generation at the last observed progress (`None` before the first
     /// clean snapshot).
@@ -206,17 +210,27 @@ struct StallDetector {
 impl StallDetector {
     fn new(
         threshold: Duration,
-        sample_interval: Duration,
+        waiting_threshold: Duration,
         now: Instant,
         initial: Option<Snapshot>,
     ) -> Self {
         Self {
             threshold,
-            sample_interval,
+            waiting_threshold,
             last_sample: now,
             last_progress_gen: initial.map(|s| s.generation),
             last_progress_at: now,
             alerted_gen: None,
+        }
+    }
+
+    /// The stall threshold for a phase: `Waiting` gets the extra tick-period
+    /// slack, every other phase uses the base threshold.
+    fn phase_threshold(&self, phase: Phase) -> Duration {
+        if phase == Phase::Waiting {
+            self.waiting_threshold
+        } else {
+            self.threshold
         }
     }
 
@@ -225,10 +239,13 @@ impl StallDetector {
         let gap = now.duration_since(self.last_sample);
         self.last_sample = now;
 
-        // Suspend / sample-gap reset: the monitor thread was itself frozen far
-        // longer than its cadence, so the tick host was frozen too — not a stall.
-        // Re-baseline and skip alerting so wake never false-alarms.
-        if gap > self.sample_interval * SUSPEND_GAP_FACTOR {
+        // Suspend / gross-gap reset: a SINGLE monitor sample gap wider than the
+        // base threshold means the monitor thread itself was frozen for a whole
+        // stall window (laptop sleep / severe CPU starvation) — the tick host was
+        // frozen too, so any "no progress" reading is unreliable. Under normal or
+        // even CI-loaded sampling the gap is ~`sample_interval` (≤ `threshold/4`),
+        // so this never fires during a genuine tick stall. Re-baseline, no alert.
+        if gap > self.threshold {
             self.last_progress_at = now;
             self.alerted_gen = None;
             self.last_progress_gen = snap.map(|s| s.generation);
@@ -245,9 +262,10 @@ impl StallDetector {
             return None;
         }
 
-        // No progress since `last_progress_at`. Waiting is never a stall.
-        if snap.phase != Phase::Waiting
-            && now.duration_since(self.last_progress_at) >= self.threshold
+        // No progress since `last_progress_at`. Every phase can stall — even
+        // `Waiting` (a dead tick producer) — but Waiting uses the larger
+        // waiting_threshold so ordinary cadence stays silent.
+        if now.duration_since(self.last_progress_at) >= self.phase_threshold(snap.phase)
             && self.alerted_gen != Some(snap.generation)
         {
             self.alerted_gen = Some(snap.generation);
@@ -264,6 +282,7 @@ impl StallDetector {
 /// ([`MonitorConfig::from_env`]); tests build it directly with tiny durations.
 pub(crate) struct MonitorConfig {
     threshold: Duration,
+    waiting_threshold: Duration,
     sample_interval: Duration,
     home: PathBuf,
 }
@@ -273,6 +292,7 @@ impl MonitorConfig {
     pub(crate) fn from_env(home: &Path) -> Option<Self> {
         let threshold = threshold_from_env()?;
         Some(Self {
+            waiting_threshold: threshold + TICK_PERIOD_SLACK,
             sample_interval: sample_interval_for(threshold),
             threshold,
             home: home.to_path_buf(),
@@ -280,9 +300,15 @@ impl MonitorConfig {
     }
 
     #[cfg(test)]
-    fn for_test(threshold: Duration, sample_interval: Duration, home: PathBuf) -> Self {
+    fn for_test(
+        threshold: Duration,
+        waiting_threshold: Duration,
+        sample_interval: Duration,
+        home: PathBuf,
+    ) -> Self {
         Self {
             threshold,
+            waiting_threshold,
             sample_interval,
             home,
         }
@@ -339,25 +365,28 @@ pub(crate) struct TickStallMonitorGuard {
 
 impl TickStallMonitorGuard {
     /// Spawn the monitor for `progress`. Holds a clone of the `Arc` for reading;
-    /// the caller keeps its own clone for writing.
-    pub(crate) fn spawn(progress: Arc<TickProgress>, config: MonitorConfig) -> Self {
+    /// the caller keeps its own clone for writing. Returns `None` when the OS
+    /// refuses the thread (thread exhaustion) — the caller then leaves the host
+    /// UNTRACKED rather than pretending tracking is on with a dead handle.
+    pub(crate) fn spawn(progress: Arc<TickProgress>, config: MonitorConfig) -> Option<Self> {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         // store JoinHandle: the guard joins on drop (no fire-and-forget — a stall
         // monitor must not outlive the host it watches).
-        let handle = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("agend-tick-stall".into())
             .spawn(move || monitor_loop(&progress, &config, &stop_rx))
-            .map_err(|e| {
+        {
+            Ok(handle) => Some(Self {
+                stop_tx: Some(stop_tx),
+                handle: Some(handle),
+            }),
+            Err(e) => {
                 tracing::error!(
                     error = %e,
                     "tick_stall: failed to spawn monitor thread — diagnostics inactive for this host"
                 );
-                e
-            })
-            .ok();
-        Self {
-            stop_tx: Some(stop_tx),
-            handle,
+                None
+            }
         }
     }
 }
@@ -381,7 +410,7 @@ impl Drop for TickStallMonitorGuard {
 fn monitor_loop(progress: &TickProgress, config: &MonitorConfig, stop_rx: &Receiver<()>) {
     let mut detector = StallDetector::new(
         config.threshold,
-        config.sample_interval,
+        config.waiting_threshold,
         Instant::now(),
         progress.snapshot(),
     );
@@ -392,11 +421,24 @@ fn monitor_loop(progress: &TickProgress, config: &MonitorConfig, stop_rx: &Recei
             Err(RecvTimeoutError::Timeout) => {}
         }
         if let Some(alert) = detector.observe(Instant::now(), progress.snapshot()) {
+            let handler = progress.handler_label(alert.phase);
+            // Log the detection on THIS thread first. The monitor thread is never
+            // wedged, so a stall stays locally observable even if the single
+            // delivery worker accepts the job but is stuck on prior channel I/O —
+            // detection must not depend on the escalation path draining.
+            tracing::error!(
+                host = progress.host,
+                phase = alert.phase.label(),
+                handler,
+                generation = alert.generation,
+                "tick_stall DETECTED — tick host made no progress past its threshold"
+            );
+            // Then hand the escalation off the tick+monitor threads to the worker.
             let _ = super::delivery_worker::enqueue_tick_stall_alert(
                 &config.home,
                 progress.host,
                 alert.phase.label(),
-                progress.handler_label(alert.phase),
+                handler,
                 alert.generation,
             );
         }
@@ -419,8 +461,13 @@ pub(crate) fn start_for_host(
     };
     let names: Arc<[&'static str]> = handlers.iter().map(|h| h.name()).collect();
     let progress = TickProgress::new(host, names);
-    let guard = TickStallMonitorGuard::spawn(Arc::clone(&progress), config);
-    (Some(progress), Some(guard))
+    match TickStallMonitorGuard::spawn(Arc::clone(&progress), config) {
+        // Enabled: hand the writer `Arc` back to the tick loop + keep the guard.
+        Some(guard) => (Some(progress), Some(guard)),
+        // Monitor thread failed to spawn: leave the host UNTRACKED (no orphan
+        // progress writes with nothing reading them), not enabled-with-dead-handle.
+        None => (None, None),
+    }
 }
 
 /// Process-global alert-observation seam (test-only). The production alert path
@@ -576,12 +623,17 @@ mod tests {
         let probe = test_probe::install();
         let names: Arc<[&'static str]> = handlers.iter().map(|h| h.name()).collect();
         let progress = TickProgress::new(host, names);
+        // Generous margins so ordinary CI scheduling jitter can't trip the
+        // suspend reset (gap > threshold) or blow the watchdog: detection is
+        // ~threshold + a sample (~220ms) vs the 2s watchdog.
         let config = super::MonitorConfig::for_test(
-            Duration::from_millis(40),
-            Duration::from_millis(5),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
             std::env::temp_dir(),
         );
-        let monitor = super::TickStallMonitorGuard::spawn(Arc::clone(&progress), config);
+        let monitor = super::TickStallMonitorGuard::spawn(Arc::clone(&progress), config)
+            .expect("monitor thread must spawn in tests");
         let progress_for_runner = Arc::clone(&progress);
         let runner = std::thread::spawn(move || {
             let home = std::env::temp_dir();
@@ -684,7 +736,10 @@ mod tests {
     // ── #7: guard stop/join is prompt ──────────────────────────────────────
 
     /// Dropping the guard must wake the monitor's `recv_timeout` at once and
-    /// join — teardown far faster than the (deliberately long) sample interval.
+    /// join. Proven with a completion channel + watchdog (NOT a wall-clock speed
+    /// assertion): a helper thread drops the guard and signals when the join
+    /// returns. If Stop failed to wake `recv_timeout`, the join would block the
+    /// full 30s sample interval and the watchdog `recv_timeout` would fire first.
     #[test]
     fn monitor_guard_stops_and_joins_promptly() {
         let _serial = TEST_LOCK.lock();
@@ -692,15 +747,21 @@ mod tests {
         let progress = TickProgress::new(DAEMON_HOST, names);
         let config = super::MonitorConfig::for_test(
             Duration::from_secs(30),
-            Duration::from_secs(30), // long: a naive join would wait this long
+            Duration::from_secs(30),
+            Duration::from_secs(30), // long: a naive join would block this long
             std::env::temp_dir(),
         );
-        let guard = super::TickStallMonitorGuard::spawn(Arc::clone(&progress), config);
-        let start = Instant::now();
-        drop(guard);
+        let guard = super::TickStallMonitorGuard::spawn(Arc::clone(&progress), config)
+            .expect("monitor thread must spawn in tests");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(guard); // stop + join
+            let _ = done_tx.send(());
+        });
         assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "Stop must wake recv_timeout + join promptly, not wait the 30s interval"
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "Stop must wake recv_timeout and join promptly; a hang would exceed the watchdog"
         );
     }
 
@@ -710,21 +771,59 @@ mod tests {
         Snapshot { generation, phase }
     }
 
-    /// #2: a host parked in `Waiting` between ticks is never a stall, no matter
-    /// how long it waits.
+    /// #2 + waiting-stall: ordinary Waiting cadence (a tick advances the
+    /// generation each period) never alerts, but a host frozen in Waiting past
+    /// the waiting-threshold (a dead tick producer) pages as `<waiting>`.
     #[test]
-    fn detector_never_alerts_while_waiting() {
+    fn detector_waiting_cadence_silent_but_dead_producer_alerts() {
         let thr = Duration::from_millis(40);
+        let wait_thr = Duration::from_millis(140);
         let si = Duration::from_millis(5);
+        let period_samples = 20u64; // 20 * 5ms = 100ms < wait_thr → ordinary cadence
         let t0 = Instant::now();
-        let mut d = StallDetector::new(thr, si, t0, Some(snap(0, Phase::Waiting)));
-        for k in 1..=40u64 {
-            let now = t0 + si * k as u32;
-            assert!(
-                d.observe(now, Some(snap(0, Phase::Waiting))).is_none(),
-                "Waiting is never a stall (sample {k})"
-            );
+        let mut d = StallDetector::new(thr, wait_thr, t0, Some(snap(0, Phase::Waiting)));
+
+        // Ordinary cadence: a tick advances the generation every ~100ms while the
+        // host sits in Waiting between ticks. Must never alert.
+        let mut gen = 0u64;
+        let mut k = 0u64;
+        for _cycle in 0..5 {
+            for _ in 0..period_samples {
+                k += 1;
+                assert!(
+                    d.observe(t0 + si * k as u32, Some(snap(gen, Phase::Waiting)))
+                        .is_none(),
+                    "ordinary Waiting cadence must not alert"
+                );
+            }
+            // A tick fired → generation advances (progress), resetting the clock.
+            gen += 2;
+            k += 1;
+            assert!(d
+                .observe(t0 + si * k as u32, Some(snap(gen, Phase::Waiting)))
+                .is_none());
         }
+
+        // The tick producer dies: Waiting with NO further generation advance. Past
+        // the waiting-threshold it must alert as <waiting>.
+        let mut fired = None;
+        for _ in 0..40 {
+            k += 1;
+            if let Some(a) = d.observe(t0 + si * k as u32, Some(snap(gen, Phase::Waiting))) {
+                fired = Some(a);
+                break;
+            }
+        }
+        assert!(
+            matches!(
+                fired,
+                Some(Alert {
+                    phase: Phase::Waiting,
+                    ..
+                })
+            ),
+            "an unchanged Waiting past the waiting-threshold pages as <waiting>"
+        );
     }
 
     /// #3: one alert per outage (dedup), then re-arm after progress and alert
@@ -732,9 +831,10 @@ mod tests {
     #[test]
     fn detector_alerts_once_dedups_then_rearms() {
         let thr = Duration::from_millis(40);
+        let wait_thr = Duration::from_millis(140);
         let si = Duration::from_millis(5);
         let t0 = Instant::now();
-        let mut d = StallDetector::new(thr, si, t0, Some(snap(2, Phase::Handler(0))));
+        let mut d = StallDetector::new(thr, wait_thr, t0, Some(snap(2, Phase::Handler(0))));
 
         // Step at the sampling cadence until the first alert.
         let mut first_at = None;
@@ -793,9 +893,10 @@ mod tests {
     #[test]
     fn detector_suspend_gap_resets_and_suppresses_false_alert() {
         let thr = Duration::from_millis(40);
+        let wait_thr = Duration::from_millis(140);
         let si = Duration::from_millis(5);
         let t0 = Instant::now();
-        let mut d = StallDetector::new(thr, si, t0, Some(snap(2, Phase::Handler(0))));
+        let mut d = StallDetector::new(thr, wait_thr, t0, Some(snap(2, Phase::Handler(0))));
 
         // One normal sample, still stuck, before threshold.
         assert!(d
@@ -830,9 +931,10 @@ mod tests {
     #[test]
     fn detector_skips_torn_snapshots() {
         let thr = Duration::from_millis(40);
+        let wait_thr = Duration::from_millis(140);
         let si = Duration::from_millis(5);
         let t0 = Instant::now();
-        let mut d = StallDetector::new(thr, si, t0, Some(snap(2, Phase::Handler(0))));
+        let mut d = StallDetector::new(thr, wait_thr, t0, Some(snap(2, Phase::Handler(0))));
         // Interleave torn reads with real stuck reads; still alerts once elapsed.
         let mut fired = None;
         for k in 1..=20u64 {
@@ -858,10 +960,11 @@ mod tests {
     #[test]
     fn detectors_two_hosts_are_independent() {
         let thr = Duration::from_millis(40);
+        let wait_thr = Duration::from_millis(140);
         let si = Duration::from_millis(5);
         let t0 = Instant::now();
-        let mut daemon = StallDetector::new(thr, si, t0, Some(snap(2, Phase::Handler(0))));
-        let mut app = StallDetector::new(thr, si, t0, Some(snap(2, Phase::Handler(0))));
+        let mut daemon = StallDetector::new(thr, wait_thr, t0, Some(snap(2, Phase::Handler(0))));
+        let mut app = StallDetector::new(thr, wait_thr, t0, Some(snap(2, Phase::Handler(0))));
 
         // The app host keeps progressing; the daemon host is stuck.
         let mut daemon_fired = false;
@@ -888,29 +991,44 @@ mod tests {
 
     // ── Seqlock concurrency stress (#3.9 concurrent-state) ─────────────────
 
-    /// Under a concurrent writer, every accepted snapshot is torn-free: settled
-    /// (even) generation, monotonic non-decreasing, and a valid phase.
+    /// Under a concurrent writer, every accepted snapshot is torn-free AND
+    /// coherent: the handler index corresponds to the generation of the SAME
+    /// publish (a torn read pairing phase-A with generation-B would mismatch).
+    /// A writer-start handshake guarantees the reader observes real concurrent
+    /// progress, not just the initial state.
     #[test]
-    fn seqlock_reader_never_sees_torn_state() {
-        let progress = TickProgress::new("stress-tick", Arc::from(vec!["h0", "h1", "h2"]));
+    fn seqlock_reader_sees_coherent_phase_generation_pairs() {
+        // Encode the write count in the handler index: publish #n sets
+        // generation = 2n and index = n % LIMIT, so a coherent read has
+        // Handler((generation / 2) % LIMIT).
+        const LIMIT: u64 = 1_000_000;
+        let progress = TickProgress::new("stress-tick", Arc::from(vec!["stress"]));
         let writer = Arc::clone(&progress);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = Arc::clone(&stop);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let mut i = 0u32;
-            while !stop_w.load(Ordering::Relaxed) {
-                match i % 4 {
-                    0 => writer.enter_waiting(),
-                    1 => writer.enter_preflight(),
-                    2 => writer.enter_handler(i % 3),
-                    _ => writer.enter_post(),
+            let mut count = 0u64;
+            loop {
+                count += 1;
+                writer.enter_handler((count % LIMIT) as u32);
+                if count == 1 {
+                    let _ = started_tx.send(()); // writer-start handshake
                 }
-                i = i.wrapping_add(1);
+                if stop_w.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         });
+        // Progress handshake: don't read until the writer has published at least once.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer must start publishing");
 
         let mut last_gen = 0u64;
-        for _ in 0..200_000 {
+        let mut first_gen: Option<u64> = None;
+        let mut coherent_reads = 0u64;
+        for _ in 0..500_000 {
             if let Some(s) = progress.snapshot() {
                 assert_eq!(
                     s.generation % 2,
@@ -922,12 +1040,25 @@ mod tests {
                     "generation is monotonic non-decreasing"
                 );
                 last_gen = s.generation;
-                // `unpack` always yields a valid variant — a torn tag can't panic.
-                let _ = s.phase.label();
+                first_gen.get_or_insert(s.generation);
+                match s.phase {
+                    Phase::Handler(idx) => assert_eq!(
+                        u64::from(idx),
+                        (s.generation / 2) % LIMIT,
+                        "phase index must correspond to the generation (coherent seqlock read)"
+                    ),
+                    other => panic!("writer only publishes Handler; torn variant {other:?}"),
+                }
+                coherent_reads += 1;
             }
         }
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
+        assert!(coherent_reads > 0, "reader must observe concurrent writes");
+        assert!(
+            last_gen > first_gen.unwrap_or(0),
+            "the writer must make progress during the read window"
+        );
     }
 
     // ── Env gating (Q4) ────────────────────────────────────────────────────

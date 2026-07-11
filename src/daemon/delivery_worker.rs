@@ -160,6 +160,13 @@ fn dispatch(job: DeliveryJob) {
             // PR4: the worker (NOT the monitor sampler) owns the escalation +
             // event-log side effects, so the sampler never blocks on channel /
             // disk I/O while the tick host it watches is wedged.
+            //
+            // Observe the routed identity FIRST (tests only): the assertion is
+            // "the correct TickStallAlert reached the worker via the real
+            // monitor→enqueue path", which must not hinge on the downstream
+            // escalation/event-log I/O succeeding in a bare test $HOME.
+            #[cfg(test)]
+            crate::daemon::tick_stall::test_probe::emit(&host, &handler);
             let msg = format!(
                 "[tick-stall] {host} made no progress for the configured threshold \
                  while in phase '{phase}' (handler={handler}, generation={generation}). \
@@ -182,8 +189,6 @@ fn dispatch(job: DeliveryJob) {
                 channels = dispatched,
                 "tick_stall: tick host wedged — out-of-band page dispatched"
             );
-            #[cfg(test)]
-            crate::daemon::tick_stall::test_probe::emit(&host, &handler);
         }
     }
 }
