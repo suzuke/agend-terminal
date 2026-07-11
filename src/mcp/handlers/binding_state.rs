@@ -53,11 +53,17 @@ use std::path::Path;
 ///   "worktree_exists_on_disk": true,
 ///   "worktree_valid": true,
 ///   "marker_present": true,
+///   "signature_valid": true,
 ///   "ci_watches": ["repo:branch", ...],
 ///   "bind_in_flight": false,
 ///   "cross_branch_holders": []
 /// }
 /// ```
+///
+/// `signature_valid` is **diagnostic only**: whether `runtime/<agent>/binding.json.sig`
+/// verifies against the on-disk binding body via the same
+/// `agentic_git_core::integrity_core::verify` primitive the agend-git shim uses.
+/// It does **not** change daemon `binding::read` or shim fail-closed auth.
 ///
 /// Returns (unbound case):
 /// ```json
@@ -153,6 +159,10 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         let branch = b["branch"].as_str().unwrap_or("");
         let cross_branch_holders = cross_branch_holders_for(home, branch, agent);
 
+        // PR2 F2: diagnostic HMAC status. Read on-disk body+sidecar bytes
+        // (shim contract) — never re-serialize the in-memory index value.
+        let signature_valid = binding_signature_valid(home, agent);
+
         json!({
             "agent": agent,
             "bound": true,
@@ -166,6 +176,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "worktree_resolves": worktree_resolves,
             "invalid_reason": invalid_reason,
             "marker_present": marker_present,
+            "signature_valid": signature_valid,
             "ci_watches": ci_watches,
             "bind_in_flight": bind_in_flight,
             "cross_branch_holders": cross_branch_holders,
@@ -183,6 +194,23 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "pending_response_to": pending_response_to,
         })
     }
+}
+
+/// Whether `runtime/<agent>/binding.json.sig` verifies against the on-disk
+/// binding body. Same sidecar name + `integrity_core::verify` as the shim
+/// (`agentic-git` `read_binding`). Missing/malformed/mismatched → `false`.
+/// Does not alter daemon auth paths — observability only.
+fn binding_signature_valid(home: &Path, agent: &str) -> bool {
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    let body = match std::fs::read(dir.join("binding.json")) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let tag = match std::fs::read_to_string(dir.join("binding.json.sig")) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    agentic_git_core::integrity_core::verify(home, &body, tag.trim()).is_ok()
 }
 
 /// Return the list of CI watches that include `agent` as a subscriber,

@@ -255,14 +255,15 @@ pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
 /// the git registry leaves a stale prunable entry after a manual `remove_dir_all`
 /// fallback. Pass an empty path when unknown — `release_full` falls back to
 /// deriving the source from the worktree path's `.worktrees/<agent>` ancestor.
-/// #779 P2 (Option B): hard-break signature now returns `Result<(), String>`
-/// so callers can surface partial-failure diagnostics. The two pre-existing
-/// silent failure points (`create_dir_all` + `atomic_write`) become explicit
-/// `Err` cases. Two non-target callers (`worktree_pool::lease`,
-/// `dispatch_auto_bind_lease`) preserve their pre-#779-P2 silent semantic
-/// via `let _ = bind_full(...).ok();` — zero observable behavior change to
-/// the dispatch path. Only `ci::handle_checkout_repo` consumes the Result
-/// to populate its new `warnings` array.
+/// #779 P2 (Option B): hard-break API now returns `Result<(), String>` so
+/// callers can surface partial-failure diagnostics. I/O failures
+/// (`create_dir_all`, lock, `atomic_write`) are explicit `Err` cases.
+///
+/// Production callers match the Result (they do **not** swallow with
+/// `.ok()`): `dispatch_auto_bind_lease` rolls back a fresh lease on `Err`
+/// (`dispatch_hook`); `ci::handle_checkout_repo` hard-fails + rolls back;
+/// `binding::bind` logs and stays fail-closed. `worktree_pool::lease` no
+/// longer writes bindings — the authoritative caller binds after lease.
 pub fn bind_full(
     home: &Path,
     agent: &str,
