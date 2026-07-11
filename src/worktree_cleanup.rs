@@ -14,10 +14,11 @@
 //! empty, so this module's git-mutating paths had never actually run against
 //! the canonical repo in production (see `BRANCH-AUDIT-20260704.md`). Fixing
 //! repo discovery activated a delete path that was, for a rollout window,
-//! gated opt-in via `AGEND_WORKTREE_PRUNE_LIVE`. As of PR-A (branch-residue,
-//! #2695) that gate is **default-LIVE, opt-OUT**: real deletion runs unless
-//! `AGEND_WORKTREE_PRUNE_LIVE=0` (see `prune_live_enabled`); when opted out,
-//! candidates are only logged (`tracing` + `event_log`), nothing is deleted.
+//! gated opt-in via `AGEND_WORKTREE_PRUNE_LIVE`, then flipped to default-LIVE
+//! opt-out (PR-A, #2695). PR-D6 RETIRED that gate entirely: sweep gating is now
+//! `AGEND_WORKTREE_AUTO_CLEANUP` ONLY (on ⇒ live sweep, real deletion; `"0"` ⇒
+//! no sweep). `AGEND_WORKTREE_PRUNE_LIVE` is ignored — a boot-time check
+//! (`warn_if_prune_live_retired`) fails LOUD if an operator still has it set.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,23 +34,28 @@ pub fn auto_cleanup_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Whether the worktree/branch prune runs LIVE (real `git branch -D` /
-/// `git worktree remove`) vs dry-run (compute the same eligibility, log
-/// would-delete candidates, mutate nothing).
+/// PR-D6: `AGEND_WORKTREE_PRUNE_LIVE` is RETIRED. Sweep gating collapsed to
+/// `AGEND_WORKTREE_AUTO_CLEANUP` only — when cleanup is enabled the sweep always
+/// mutates (live); there is no dry-run env toggle anymore. History: the flag was
+/// a first-activation dry-run/live selector (opt-in, then default-LIVE opt-out
+/// under PR-A #2695) for a delete path that has since matured over a long
+/// operator soak; a second, separate dry-run toggle overlapping the master
+/// off-switch was pure confusion surface.
 ///
-/// PR-A P2 (branch-residue RCA §3): **default LIVE, opt-OUT** — only the exact
-/// value `AGEND_WORKTREE_PRUNE_LIVE=0` returns to dry-run. Originally this was
-/// opt-IN ("1" required) as a first-activation safety gate for a delete path
-/// with no production track record; it has since matured over a 3-day operator
-/// soak (from 2026-07-06) with no mis-deletion, and the eligibility gate
-/// (merged/squash + tip-age floor + worktree-occupancy fail-closed check) is
-/// well-tested. A default dry-run had inverted into the larger risk: any daemon
-/// restart that forgot the flag silently stopped all GC and let residue
-/// re-accumulate with no signal (RCA H2). The independent master off-switch
-/// `AGEND_WORKTREE_AUTO_CLEANUP` is unchanged — it can still disable cleanup
-/// wholesale.
-pub fn prune_live_enabled() -> bool {
-    std::env::var("AGEND_WORKTREE_PRUNE_LIVE").ok().as_deref() != Some("0")
+/// FAIL-LOUD, not silent: if an operator still has the retired var set (any
+/// value), warn once at daemon boot so they learn it is ignored. Returns whether
+/// the retired var was present (so a test can assert the boot-warn path fired);
+/// the daemon calls this for its logging side effect at startup.
+pub(crate) fn warn_if_prune_live_retired() -> bool {
+    if std::env::var("AGEND_WORKTREE_PRUNE_LIVE").is_ok() {
+        tracing::warn!(
+            "AGEND_WORKTREE_PRUNE_LIVE is retired and ignored — sweep gating is now \
+             AGEND_WORKTREE_AUTO_CLEANUP only"
+        );
+        true
+    } else {
+        false
+    }
 }
 
 /// Entry for a git worktree.
@@ -231,8 +237,10 @@ fn is_worktree_dirty(worktree_path: &Path) -> bool {
 /// to absorb transient EACCES from file locks held by preceding git processes.
 ///
 /// #2605: `dry_run` skips both git calls entirely and reports success (as if
-/// removed) so the caller's candidate list reflects what WOULD happen —
-/// see `prune_live_enabled`.
+/// removed) so a caller's candidate list can reflect what WOULD happen. PR-D6:
+/// the runtime sweep always passes `false` now (gating is `AUTO_CLEANUP` only);
+/// the param is retained for the audit-style callers/tests that still exercise
+/// the compute-but-don't-mutate path.
 fn remove_worktree(
     repo_root: &Path,
     worktree_path: &str,
@@ -368,10 +376,10 @@ fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
 /// `configs`: map of agent name → working_dir from daemon's live registry.
 /// `fleet_dirs`: fallback working_directories from fleet.yaml for stopped agents.
 ///
-/// Returns list of (branch, path, reason) that were removed — or, while
-/// `prune_live_enabled()` is false, that WOULD have been removed (dry-run
-/// candidates; no git mutation beyond the always-on `fetch --prune` below).
-/// `reason` is one of `"merged"` / `"remote-gone"` / `"squash-merged"` — the
+/// Returns list of (branch, path, reason) that were removed. PR-D6: gating is
+/// `AGEND_WORKTREE_AUTO_CLEANUP` only — when cleanup is enabled the sweep runs
+/// LIVE (real removal); there is no dry-run env toggle. `reason` is one of
+/// `"merged"` / `"remote-gone"` / `"squash-merged"` — the
 /// ACTUAL eligibility signal, not a hardcoded guess (#2605 review finding:
 /// the dry-run/audit-diff this PR exists for is meaningless if every
 /// candidate claims to be "merged" regardless of why it was really swept).
@@ -385,7 +393,6 @@ pub fn sweep_from_registry(
     if !auto_cleanup_enabled() {
         return Vec::new();
     }
-    let dry_run = !prune_live_enabled();
 
     let repos: HashSet<PathBuf> = crate::binding::bound_source_repos(home)
         .into_iter()
@@ -420,13 +427,11 @@ pub fn sweep_from_registry(
     let mut removed = Vec::new();
 
     for repo in &repos {
-        // #2605: fetch runs UNCONDITIONALLY, including during dry_run — unlike
-        // e.g. `worktree_pool::cleanup_merged_branch`'s dry-run-skips-fetch
-        // convention, this sweep's dry-run window exists partly to observe the
-        // fetch itself: `repos` was always empty before #2605, so this
-        // background `fetch --prune` has never actually run against the
-        // canonical repo in production. The operator needs to see its real
-        // behavior (including failures) during the observation period.
+        // #2605: fetch runs UNCONDITIONALLY as the first step of every sweep —
+        // `repos` was always empty before #2605, so this background
+        // `fetch --prune` had never actually run against the canonical repo in
+        // production; surfacing its real behavior (including failures) matters
+        // regardless of what the eligibility checks below decide.
         //
         // #2004: fail-direction is safe (stale local refs → merge/gone checks
         // below run on possibly-stale data, never MORE aggressive than
@@ -472,8 +477,19 @@ pub fn sweep_from_registry(
         for entry in &entries {
             let wt_path = Path::new(&entry.path);
 
-            if is_in_use(wt_path, &active_dirs) {
-                tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (in use by agent)");
+            // PR-D·D3: occupancy/marker protection (L0) delegated to the shared
+            // `disposition::l0_protected` — the SAME fail-direction the classifier
+            // applies (in-use `Some(true)` / unresolvable `None` → protected). The
+            // sweep never consulted the marker/pin dims, so they are pass-through
+            // (daemon_managed=true, pinned=false) → byte-identical to the prior
+            // `is_in_use`-only skip. (The tick-level `list_worktrees Err → continue`
+            // above is the `None`/unresolvable arm of the same L0 fail-direction.)
+            if crate::worktree::disposition::l0_protected(
+                true,
+                false,
+                Some(is_in_use(wt_path, &active_dirs)),
+            ) {
+                tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (in use by agent — L0 protected)");
                 continue;
             }
 
@@ -495,8 +511,16 @@ pub fn sweep_from_registry(
             // committed-but-unpushed local work; deleting the ref would lose it
             // irrecoverably (phase-1 only skips *dirty* worktrees, not
             // committed-but-unpushed ones). The worktree dir is still reclaimed.
-            let branch_safe_to_delete =
-                merged || is_squash_gc_eligible(repo, &entry.branch, &default);
+            // PR-D·D3: the branch-safe-to-delete (L4) decision delegates to
+            // `branch_disposition` via `branch_reap_delete`. `merged || squash` is
+            // the ProvablyInDefault signal; `gone` alone keeps the branch
+            // (CR-2026-06-14). No scaffold-TTL arm here — that is phase-2's
+            // orphaned-branch concern (this entry still HAS a worktree).
+            let branch_safe_to_delete = branch_reap_delete(
+                merged || is_squash_gc_eligible(repo, &entry.branch, &default),
+                gone,
+                false,
+            );
             let reason = if merged { "merged" } else { "remote-gone" };
 
             tracing::info!(
@@ -504,23 +528,48 @@ pub fn sweep_from_registry(
                 path = %entry.path,
                 reason,
                 delete_branch = branch_safe_to_delete,
-                dry_run,
                 "removing stale worktree"
             );
-            if remove_worktree(
-                repo,
-                &entry.path,
-                &entry.branch,
-                branch_safe_to_delete,
-                dry_run,
-            ) {
+            // PR-D·D5: route the dir-Delete through the shared `janitor::dispose`
+            // Delete arm — the sweep passes its OWN remover (`remove_worktree`:
+            // git_ok + windows-retry + `branch -D`), so its deliberate wrapper is
+            // preserved (D5-Q3 ruling B; the git_ok↔git_bypass unify is a separate
+            // PR, decision m-20260703064336281447-62). Byte-identical to the prior
+            // direct call: same args, push on success. `agent`/`candidate` are inert
+            // on the Delete arm; the Err reason is unused here (the sweep skips, it
+            // does not archive-fallthrough).
+            let removed_ok = matches!(
+                crate::daemon::janitor::dispose(
+                    home,
+                    crate::worktree::disposition::Disposition::Delete,
+                    "",
+                    None,
+                    || {
+                        if remove_worktree(
+                            repo,
+                            &entry.path,
+                            &entry.branch,
+                            branch_safe_to_delete,
+                            false,
+                        ) {
+                            Ok(())
+                        } else {
+                            Err("sweep worktree remove failed".to_string())
+                        }
+                    },
+                ),
+                crate::daemon::janitor::DispositionOutcome::Deleted(Ok(()))
+            );
+            if removed_ok {
                 removed.push((entry.branch.clone(), entry.path.clone(), reason));
             }
         }
 
-        // Phase 2: prune orphaned branches (no worktree, remote gone or merged)
-        prune_stale_worktrees(repo, dry_run);
-        let pruned = prune_orphaned_branches(repo, dry_run);
+        // Phase 2: prune orphaned branches (no worktree, remote gone or merged).
+        // PR-D6: sweep is always live now (gated by AUTO_CLEANUP only), so the
+        // helpers' still-supported `dry_run` param is passed `false` here.
+        prune_stale_worktrees(repo, false);
+        let pruned = prune_orphaned_branches(repo, false);
         for (branch, reason) in pruned {
             removed.push((branch, "(no worktree)".to_string(), reason));
         }
@@ -581,6 +630,35 @@ fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     Duration::from_secs(now.saturating_sub(tip_ts)) >= REVIEW_SCAFFOLD_TTL
+}
+
+/// PR-D·D3: the branch-reap decision, delegated to the shared
+/// [`crate::worktree::disposition::branch_disposition`] classifier (L4). The
+/// SHARED "provably in default → delete" fail-direction lives in the classifier;
+/// this caller only gathers the signals and adds the one override the classifier
+/// does not encode.
+///
+/// - `provably_in_default` (merged-ancestor OR squash-merged past the age floor)
+///   → `BranchSignal::ProvablyInDefault → DeleteBranch`.
+/// - `remote_gone` alone → `BranchSignal::RemoteGoneOnly → KeepBranch`
+///   (CR-2026-06-14: remote-gone is NEVER an independent delete trigger — the
+///   branch may hold committed-but-unpushed local work).
+/// - `scaffold_ttl` is a review-scaffold branch that is `NotMerged` (the classifier
+///   KEEPS it) but has aged past its TTL — an EXPLICIT external arm reproduces the
+///   reap the classifier can't model. Same shape as D2's #2010 `reviewer_bypass`:
+///   an override the pure classifier deliberately does not encode, kept outside so
+///   the delegation stays honest. Locked byte-for-byte by
+///   [`tests::branch_reap_delete_equals_pre_d3_gate`].
+fn branch_reap_delete(provably_in_default: bool, remote_gone: bool, scaffold_ttl: bool) -> bool {
+    use crate::worktree::disposition::{branch_disposition, BranchDisposition, BranchSignal};
+    let signal = if provably_in_default {
+        BranchSignal::ProvablyInDefault
+    } else if remote_gone {
+        BranchSignal::RemoteGoneOnly
+    } else {
+        BranchSignal::NotMerged
+    };
+    matches!(branch_disposition(signal), BranchDisposition::DeleteBranch) || scaffold_ttl
 }
 
 /// #P1-2607: process-wide cache of the STRUCTURAL squash-merged check (git
@@ -755,7 +833,13 @@ fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'st
         // so the merged/squash paths never reap them — a TTL is their only live
         // terminal path (H1 in the RCA).
         let scaffold = !merged && !squash && is_stale_review_scaffold(repo_root, branch);
-        if !merged && !squash && !scaffold {
+        // PR-D·D3: the reap decision (L4) delegates to `branch_disposition` via
+        // `branch_reap_delete`. `merged || squash` = ProvablyInDefault → delete;
+        // `scaffold` is the explicit external-arm override (a NotMerged branch the
+        // classifier keeps, aged past its TTL). Phase-2 does not compute remote-gone
+        // (CR-2026-06-14 dropped it as a trigger) → remote_gone=false. Byte-identical
+        // to the prior `!merged && !squash && !scaffold` continue-gate.
+        if !branch_reap_delete(merged || squash, false, scaffold) {
             continue;
         }
         // The scaffolding path never merged, so its commits survive only in the
@@ -904,43 +988,55 @@ mod tests {
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
     }
 
-    // ── #2605: first-activation safety gate ──
+    // ── PR-D6: AGEND_WORKTREE_PRUNE_LIVE retired ──
+    // The old #2695 prune_live-gate tests (`prune_live_enabled_by_default_p2`,
+    // `prune_live_disabled_only_for_explicit_0_p2`, `prune_live_enabled_when_set_to_1`)
+    // asserted the now-removed dry-run/live selector. They are RE-TARGETED to the
+    // retirement contract below: the retired var is detected + warned at boot and
+    // otherwise ignored; sweep gating is `AGEND_WORKTREE_AUTO_CLEANUP` only.
 
+    /// PR-D6 (a): the retired var, when set to ANY value, is detected so the
+    /// boot path warns (fail-loud, not silent) and returns `true`.
+    /// F3: `traced_test` asserts the ACTUAL `tracing::warn!` fired via
+    /// `logs_contain` — a return-value-only assert stayed green even with the
+    /// warn deleted (the exact bug this fix closes).
+    #[tracing_test::traced_test]
     #[test]
-    fn prune_live_enabled_by_default_p2() {
-        // PR-A P2 (RED5): unset ⇒ LIVE (default flipped to opt-out).
-        let _lock = ENV_LOCK.lock();
-        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
-        assert!(
-            prune_live_enabled(),
-            "PR-A P2: prune must default to LIVE when the flag is unset (opt-out design)"
-        );
-    }
-
-    #[test]
-    fn prune_live_disabled_only_for_explicit_0_p2() {
-        // PR-A P2 (RED5): only the exact "0" opts back out to dry-run; any other
-        // value (incl. truthy-looking strings) stays LIVE under the new default.
-        let _lock = ENV_LOCK.lock();
-        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "0");
-        assert!(
-            !prune_live_enabled(),
-            "PR-A P2: AGEND_WORKTREE_PRUNE_LIVE=0 must opt out to dry-run"
-        );
-        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "true");
-        assert!(
-            prune_live_enabled(),
-            "PR-A P2: only the exact \"0\" opts out — other values stay live"
-        );
-        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
-    }
-
-    #[test]
-    fn prune_live_enabled_when_set_to_1() {
+    fn prune_live_retired_boot_warn_fires_when_set_d6() {
         let _lock = ENV_LOCK.lock();
         std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
-        assert!(prune_live_enabled());
+        assert!(
+            warn_if_prune_live_retired(),
+            "retired PRUNE_LIVE set ⇒ boot check must fire the warn (return true)"
+        );
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "0");
+        assert!(
+            warn_if_prune_live_retired(),
+            "even PRUNE_LIVE=0 must be detected + warned — it is honored no longer"
+        );
         std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        assert!(
+            logs_contain("is retired and ignored"),
+            "the retired-flag boot warn must actually be emitted (not just a true return)"
+        );
+    }
+
+    /// PR-D6 (a): unset ⇒ no warn (nothing to fail loud about).
+    /// F3: negative-direction — `traced_test` + `!logs_contain` proves the warn
+    /// stays SILENT when the flag is unset.
+    #[tracing_test::traced_test]
+    #[test]
+    fn prune_live_retired_no_warn_when_unset_d6() {
+        let _lock = ENV_LOCK.lock();
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        assert!(
+            !warn_if_prune_live_retired(),
+            "PRUNE_LIVE unset ⇒ boot check must be silent (return false)"
+        );
+        assert!(
+            !logs_contain("is retired and ignored"),
+            "no retired-flag warn may be emitted when the flag is unset"
+        );
     }
 
     // ── PR-B rider (dev2 #2695 seat2): occupancy fail-CLOSED ──
@@ -992,10 +1088,16 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// PR-D6 re-target of `test_sweep_dry_run_by_default_identifies_but_does_not_delete`
+    /// (a #2695 prune_live-gate test). Old contract: `PRUNE_LIVE=0` forced dry-run,
+    /// so the merged worktree was REPORTED but NOT removed. New contract: the
+    /// retired var is IGNORED — with `AUTO_CLEANUP=1` the sweep runs LIVE and the
+    /// worktree IS removed, PROVING `PRUNE_LIVE` no longer gates anything (covers
+    /// new groups (a)-ignored + (b)-on-live in one live-removal assertion).
     #[test]
-    fn test_sweep_dry_run_by_default_identifies_but_does_not_delete() {
+    fn sweep_ignores_retired_prune_live_and_runs_live_d6() {
         let _lock = ENV_LOCK.lock();
-        let repo = setup_test_repo("v2-dry-run");
+        let repo = setup_test_repo("v2-d6-live");
         // #t-…81457-1: `is_branch_merged` now age-gates on the shared tip's
         // commit date (indistinguishable, from git state alone, between a
         // zero-commit branch and a genuinely ff-merged one) — give feat/done
@@ -1009,21 +1111,58 @@ mod tests {
         git_in(&repo, &["merge", "feat/done"]);
 
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
-        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "0"); // PR-A P2: explicit opt-out to dry-run (default is now live)
-        let home = tmp_home("v2-dry-run");
+        // Retired var set to its old "dry-run" value — must have NO effect now.
+        std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "0");
+        let home = tmp_home("v2-d6-live");
         let mut configs = HashMap::new();
         configs.insert("other-agent".to_string(), Some(repo.join("other")));
         write_source_repo_binding(&home, "other-agent", &repo);
         let removed = sweep_from_registry(&home, &configs, &[]);
         assert!(
             removed.iter().any(|(b, _, _)| b == "feat/done"),
-            "dry-run must still report the candidate: {removed:?}"
+            "the merged worktree must still be reported: {removed:?}"
+        );
+        assert!(
+            !wt.exists(),
+            "PR-D6: PRUNE_LIVE=0 is retired/ignored — AUTO_CLEANUP=1 ⇒ LIVE sweep must \
+             actually remove the worktree"
+        );
+        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR-D6 (b), OFF half: master switch `AGEND_WORKTREE_AUTO_CLEANUP=0` ⇒ NO
+    /// sweep, even for a genuinely-merged reclaimable worktree. Pairs with
+    /// `sweep_ignores_retired_prune_live_and_runs_live_d6` (the ON/live half) to
+    /// pin the full collapsed contract: gating is AUTO_CLEANUP only.
+    #[test]
+    fn sweep_off_when_auto_cleanup_disabled_d6() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("v2-d6-off");
+        make_old_dated_branch(&repo, "feat/done", "2024-01-01T00:00:00 +0000");
+        let wt = repo.join("wt-done");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
+        );
+        git_in(&repo, &["merge", "feat/done"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
+        let home = tmp_home("v2-d6-off");
+        let mut configs = HashMap::new();
+        configs.insert("other-agent".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        assert!(
+            removed.is_empty(),
+            "AUTO_CLEANUP=0 ⇒ no sweep, nothing reported: {removed:?}"
         );
         assert!(
             wt.exists(),
-            "dry-run (AGEND_WORKTREE_PRUNE_LIVE=0) must NOT actually remove the worktree"
+            "AUTO_CLEANUP=0 ⇒ the merged worktree must survive untouched"
         );
-        std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&home).ok();
@@ -1626,6 +1765,30 @@ mod tests {
         git_in(repo, &["add", "."]);
         git_in(repo, &["commit", "-m", "main diverge"]);
         git_in(repo, &["cherry-pick", branch]);
+    }
+
+    /// PR-D·D3 equivalence pin: `branch_reap_delete` — the `branch_disposition`
+    /// delegation — must reproduce BOTH pre-D3 branch-reap gates byte-for-byte:
+    ///   phase-2 `prune_orphaned_branches`: delete iff `merged || squash || scaffold`
+    ///   phase-1 `branch_safe_to_delete`:   delete iff `merged || squash` (scaffold=false)
+    /// Both reduce to `provably_in_default || scaffold_ttl`. The CR-2026-06-14
+    /// invariant — remote-gone ALONE is never a delete trigger — is pinned by
+    /// asserting `remote_gone` NEVER changes the result across the full domain.
+    #[test]
+    fn branch_reap_delete_equals_pre_d3_gate() {
+        for provably_in_default in [true, false] {
+            for remote_gone in [true, false] {
+                for scaffold_ttl in [true, false] {
+                    assert_eq!(
+                        branch_reap_delete(provably_in_default, remote_gone, scaffold_ttl),
+                        provably_in_default || scaffold_ttl,
+                        "branch reap DRIFT: provably={provably_in_default} \
+                         remote_gone={remote_gone} scaffold={scaffold_ttl} \
+                         (remote-gone must NEVER flip the result — CR-2026-06-14)"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

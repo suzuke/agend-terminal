@@ -79,7 +79,8 @@ Stage 1 閘門是**以值判定**（必須等於 `"1"`）；關閉時它會以
 |------|---------|-----------------|-----------------------|--------|-------|
 | `AGEND_WORKTREE_AUTO_CLEANUP` | 控管 runtime 的 worktree 自動清理掃描（移除已合併的 worktree、清掉孤兒分支）。 | **開啟**（`unwrap_or(true)`）。 | 除 `"0"` 以外的任何值 → 啟用；只有 `"0"` 才停用。 | `src/worktree_cleanup.rs:17` | opt-**out**。⚠️ Module doc 註解寫「`=1` opt-in」但程式碼是 opt-out——以程式碼為準。 |
 | `AGEND_WORKTREE_ENFORCEMENT` | 在 messaging handler 中，決定 task target 是否必須先綁定到受管理的 worktree 才能投遞。 | `"warn"`（記錄警告但仍允許投遞）。 | `"off"`（略過）、`"enforce"`（拒絕並回 `worktree_not_managed`），其餘（含 `"warn"`）→ 警告後放行。 | `src/api/handlers/messaging.rs:282` | ⚠️ Security-sensitive（控管對未綁定 agent 的訊息傳遞）。是三態，不是 bool。 |
-| `AGEND_WORKTREE_GC` | worktree GC 掃描的總閘門（把乾淨的孤兒 worktree 封存到 `.trash`，並清除舊的 trash）。 | **關閉**（no-op）。 | `"1"` 啟用；否則關閉。 | `src/daemon/retention/worktrees.rs:391` | ⚠️ 控管 worktree 刪除。嚴格比對 `=="1"`。 |
+| `AGEND_WORKTREE_ARCHIVE_FALLBACK` | 僅啟用 worktree-GC 的**封存 fallthrough 補救帶（archive-fallthrough belt）**：當 CleanRelease 候選的無條件硬刪除無法執行（鎖競爭／owning repo 無法解析／remove 失敗）時，在同一輪把它封存到 `.trash`。**不會**控管整個 GC。 | **關閉**（no-op）。 | `"1"` 啟用；否則關閉。 | `src/daemon/retention/worktrees.rs:497` | ⚠️ 嚴格比對 `=="1"`。由 `AGEND_WORKTREE_GC` 更名而來（PR-D6）；舊名以**棄用別名（deprecated alias）身分再保留一個 release cycle**（會發出 warn），僅在新名未設定時才會參考。 |
+| `AGEND_WORKTREE_PRUNE_LIVE` | *（已退役，PR-D6）* 原本用來為 auto-cleanup 掃描選擇 live-vs-dry-run。 | — | — | `src/worktree_cleanup.rs:49` | ❌ **已退役且被忽略。** 掃描閘門現在只看 `AGEND_WORKTREE_AUTO_CLEANUP`（開啟 ⇒ live）。若仍設定，daemon 會在啟動時警告一次（`warn_if_prune_live_retired`）。 |
 | `AGEND_WORKTREE_GC_TRASH_DAYS` | `.trash/worktrees/*` 的保留視窗（天數）；更舊的條目會在 GC 掃描時被清除。 | `7`。 | `u64` 天數；`0` = 同一次掃描就清除；不過濾正負值。 | `src/daemon/retention/worktrees.rs:49` | 調校旋鈕。 |
 | `AGEND_WORKTREE_FORCE_RECLAIM_DAYS` | 強制回收（force-reclaim）後援機制的年齡上限（天數）：一個從未被釋放、且沒有 agent liveness、又比此值更舊的 lease，會被強制回收。 | `7`（`<=0` 時也是）。 | `i64` 天數，過濾為 `>0`。 | `src/worktree_pool.rs:534` | ⚠️ 控管破壞性的回收行為。 |
 

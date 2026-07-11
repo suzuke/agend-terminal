@@ -27,6 +27,7 @@ pub mod hook_shadow;
 pub(crate) mod idle_watchdog;
 pub(crate) mod inbox_stuck_watchdog;
 pub(crate) mod inject_delivery;
+pub(crate) mod janitor;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
@@ -756,6 +757,11 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     // is safe here. The handoff successor also runs through run_core, so it
     // inherits this and can restart normally in turn.
     RUN_CORE_ACTIVE.store(true, Ordering::Release);
+
+    // PR-D6: fail LOUD if the retired `AGEND_WORKTREE_PRUNE_LIVE` is still set —
+    // sweep gating is now `AGEND_WORKTREE_AUTO_CLEANUP` only. One warn at boot so
+    // an operator carrying the stale flag learns it is ignored (not silent).
+    crate::worktree_cleanup::warn_if_prune_live_retired();
 
     // For the handoff path, the channel inits post-lock (its registry attaches
     // via the #945 pending-registry bridge that `init_daemon_services` arms),

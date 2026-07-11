@@ -774,6 +774,89 @@ fn pattern_does_not_cross_backends() {
 }
 
 #[test]
+fn grok_busy_screen_fires_active_not_false_idle() {
+    // #2707 N1+N3 false-idle live fix. REAL grok 0.2.93 PTY capture (soak
+    // t-20260710050344357464-64079-13): a BUSY turn (tool_running) whose footer
+    // STILL shows the PERMANENT `always-approve` mode indicator + a bare `❯`
+    // input box. Pre-fix the Active pattern (Thinking…/Responding…/esc to
+    // interrupt) matched NOTHING on grok's real busy chrome, while the Idle
+    // pattern matched the permanent `always-approve` → first-match-wins returned
+    // Idle → the daemon mis-read an 18s busy turn as idle (observed_status idle
+    // throughout) → a working席 is eligible for dispatch. RED pre-fix.
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    let busy = "◆ Thought for 1.0s
+收到 gapfix-dev3 的說明請求，撰寫完整回覆並回傳。
+◆ Agend-terminal Send
+⠧ Run (Agend-terminal) Send 0.0s                       14s ⇣25.5k [stop]
+│ ❯                                                    │
+╰──────────── Grok 4.5 (high) · always-approve ─╯
+Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts";
+    assert_eq!(
+        patterns.detect(busy),
+        Some(AgentState::Active),
+        "grok busy screen (has [stop] / Ctrl+c:cancel) must fire Active — \
+         NOT false-idle via the permanent always-approve footer",
+    );
+}
+
+#[test]
+fn grok_idle_screen_fires_idle() {
+    // REAL grok 0.2.93 idle capture (same soak): a completed turn at rest — no
+    // busy chrome. Idle keys on idle-associated anchors (`Turn completed in …` /
+    // `Space:prompt` / `Enter:open`), NOT the permanent `always-approve` footer
+    // (removed as an Idle marker, N1) nor the bare `❯` (present during busy too).
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    let idle = "已處理 gapfix-dev3 的純推理題：
+Turn completed in 14s.
+│ ❯ Build anything                                     │
+╰──────────── Grok 4.5 (high) · always-approve ─╯
+Space:prompt  │  Enter:open  │  Ctrl+e:expand thinking  │  Ctrl+.:shortcuts";
+    assert_eq!(
+        patterns.detect(idle),
+        Some(AgentState::Idle),
+        "grok idle screen must fire Idle",
+    );
+}
+
+#[test]
+fn grok_responding_phase_fires_active() {
+    // Second busy sub-phase, a distinct LIVE grok-soak capture (#2707 soak):
+    // the `responding` phase renders `⠴ Responding… <t>` on the status line
+    // AND `[stop]` + a `Ctrl+c:cancel` hint. Unlike `tool_running`, the old
+    // pattern's `Responding…` DID match here — but the FIX keys on the
+    // busy-EXCLUSIVE `[stop]`/`Ctrl+c:cancel` present across ALL busy
+    // sub-phases, so both responding and tool_running land on Active uniformly.
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    let responding = "◆ Thought for 1.2s
+直接撰寫 ACID 說明並回
+⠴ Responding… 0.1s                                     4.1s ⇣27.3k [stop]
+│ ❯                                                    │
+╰──────────── Grok 4.5 (high) · always-approve ─╯
+Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts";
+    assert_eq!(
+        patterns.detect(responding),
+        Some(AgentState::Active),
+        "grok responding-phase screen must fire Active",
+    );
+}
+
+#[test]
+fn grok_always_approve_footer_is_not_an_idle_marker() {
+    // N1: `always-approve` is a PERMANENT footer mode indicator (present during
+    // BUSY too, see grok_busy_screen_fires_active_not_false_idle), so it carries
+    // ZERO state semantics. A fragment whose only idle-ish token is the footer
+    // (no completion line, no prompt affordance, no busy chrome) must NOT fire
+    // Idle — else it re-opens the false-idle hole. RED pre-fix. #2707 N1.
+    let patterns = StatePatterns::for_backend(&Backend::Grok);
+    let footer_only = "╰──────────── Grok 4.5 (high) · always-approve ─╯";
+    assert_ne!(
+        patterns.detect(footer_only),
+        Some(AgentState::Idle),
+        "#N1: bare always-approve footer must NOT fire Idle",
+    );
+}
+
+#[test]
 fn empty_input_no_change() {
     let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
     t.feed("");

@@ -456,6 +456,9 @@ pub(crate) fn evaluate_candidate(
     wt_path: &Path,
     live_agents: &std::collections::HashSet<String>,
 ) -> Option<GcCandidate> {
+    use crate::worktree::disposition::{
+        terminal_disposition, Disposition, DispositionInput, ReclaimState,
+    };
     // Must be daemon-managed (R14).
     if !is_daemon_managed(wt_path) {
         return None;
@@ -486,8 +489,14 @@ pub(crate) fn evaluate_candidate(
         .lines()
         .find_map(|l| l.strip_prefix("released_at="));
 
-    match released_at {
-        // ── Clean-release path: explicitly released, past the grace TTL. ──
+    // ── PR-D·D4: gather the L3 signals (native, impure — spike §5), reduce them to
+    // a `ReclaimState` + `agent_alive`, then delegate the Keep/Delete/Archive
+    // JUDGMENT to the shared `terminal_disposition` classifier (spike §1 L3). Only
+    // the disposition routing converges on the classifier; the signal-gathering
+    // stays here. Locked byte-identical by the behavioral pins +
+    // `tests::gc_l3_delegation_equals_pre_d4_disposition`. ──
+    let (reclaim, agent_alive, kind, reason) = match released_at {
+        // ── Clean-release: explicitly released, past the 24h grace, clean. ──
         Some(ts) => {
             // A released lease should already be unbound; if it is still bound,
             // that is a contradiction — leave it alone (conservative).
@@ -501,6 +510,17 @@ pub(crate) fn evaluate_candidate(
                     if age < chrono::Duration::hours(GC_GRACE_HOURS) {
                         return None; // still within grace
                     }
+                    // Past grace. Liveness is INAPPLICABLE to an explicit release
+                    // (the agent voluntarily gave up the lease) → feed `Some(false)`
+                    // so the classifier's L3 liveness gate PASSES, reproducing the
+                    // pre-D4 CleanRelease arm that hard-deleted regardless of
+                    // liveness. (Locked by the equivalence pin.)
+                    (
+                        ReclaimState::CleanReleaseHardDelete,
+                        Some(false),
+                        GcKind::CleanRelease,
+                        format!("daemon-tagged, released >{}h, not pinned", GC_GRACE_HOURS),
+                    )
                 }
                 // #1870 (H1): a malformed `released_at=` (e.g. a partial-write /
                 // crash-truncated marker) MUST NOT be treated as "past grace" — the
@@ -515,22 +535,16 @@ pub(crate) fn evaluate_candidate(
                 // worktree is reclaimed. This does NOT reintroduce the H1
                 // WIP-destruction (that was the grace-window bypass).
                 Err(_) => {
-                    return force_reclaim_candidate(
-                        home,
-                        wt_path,
-                        agent_name,
-                        &marker_content,
-                        live_agents,
-                        "malformed released_at marker",
-                    );
+                    let alive =
+                        force_reclaim_state(home, &agent_name, &marker_content, live_agents)?;
+                    (
+                        ReclaimState::ForceReclaim,
+                        Some(alive),
+                        GcKind::ForceReclaim,
+                        force_reclaim_reason("malformed released_at marker"),
+                    )
                 }
             }
-            Some(GcCandidate {
-                path: wt_path.to_path_buf(),
-                agent: agent_name,
-                reason: format!("daemon-tagged, released >{}h, not pinned", GC_GRACE_HOURS),
-                kind: GcKind::CleanRelease,
-            })
         }
         // ── t-worktree-leak PR-2 force-reclaim backstop: NEVER released. ──
         // This is ONLY the no-event-abandonment / dead-agent tail (the
@@ -538,56 +552,91 @@ pub(crate) fn evaluate_candidate(
         // merge/close/task-done event; the 7-day expired-intent path hands off
         // here). liveness-AND-age: ANY live signal → never reclaim (even past the
         // cap); otherwise require the per-agent-jittered age cap.
-        None => force_reclaim_candidate(
-            home,
-            wt_path,
-            agent_name,
-            &marker_content,
-            live_agents,
-            "never-released lease",
-        ),
+        None => {
+            let alive = force_reclaim_state(home, &agent_name, &marker_content, live_agents)?;
+            (
+                ReclaimState::ForceReclaim,
+                Some(alive),
+                GcKind::ForceReclaim,
+                force_reclaim_reason("never-released lease"),
+            )
+        }
+    };
+
+    // Delegate the disposition JUDGMENT (spike §1 L3). Binding-absent GC path: L0
+    // fed pass-through (a managed, unpinned, resolvable worktree already reached
+    // here); L1/L2 inert (binding_present=false → the classifier never reads them).
+    let disposition = terminal_disposition(&DispositionInput {
+        daemon_managed: true,
+        pinned: false,
+        in_use: Some(false),
+        binding_present: false,
+        release_decision: crate::daemon::auto_release::ReleaseDecision::SkipNotBound,
+        releasable_by_invariant: false,
+        agent_alive,
+        reclaim,
+    });
+
+    match disposition {
+        // Delete → the CleanRelease hard-delete tier; Archive → the ForceReclaim
+        // `.trash` tier. `gc_remove_one` routes each `GcKind` to its mechanism
+        // (the disposition LADDER stays native — D5). `reason`/`kind` come from the
+        // arm above; they are consistent with the classifier's verdict by
+        // construction (locked by the equivalence pin).
+        Disposition::Delete | Disposition::Archive => Some(GcCandidate {
+            path: wt_path.to_path_buf(),
+            agent: agent_name,
+            reason,
+            kind,
+        }),
+        // Keep (liveness-spared / not eligible) → not a candidate. Release is
+        // unreachable here (binding_present=false).
+        Disposition::Keep | Disposition::Release => None,
     }
 }
 
-/// t-worktree-leak PR-2 force-reclaim backstop: reclaim a worktree ONLY when it
-/// is genuinely abandoned — not in the daemon's post-boot grace window (#5), NO
-/// liveness signal for its agent, AND its `leased_at` is past the per-agent
-/// force-reclaim age cap. ANY live signal → never reclaim (even past the cap).
-/// Shared by the never-released (`released_at` absent) arm AND the #1882 WT-LEAK-1
-/// corrupt-`released_at` fall-through. `marker_state` names why we're here, for
-/// the candidate's reason. The liveness + age-cap guards (NOT the grace window)
-/// are what protect a just-leased / just-released worktree from premature reclaim.
-fn force_reclaim_candidate(
+/// t-worktree-leak PR-2 force-reclaim backstop: the NATIVE age/boot guards that
+/// gate the ForceReclaim `ReclaimState`. Returns the agent's liveness
+/// (`Some(alive)`) when the lease is past BOTH the daemon post-boot grace window
+/// (#5) AND its per-agent `leased_at` age cap, or `None` when those native guards
+/// rule it out (so the classifier never sees a non-candidate). Shared by the
+/// never-released (`released_at` absent) arm AND the #1882 WT-LEAK-1 corrupt-
+/// `released_at` fall-through.
+///
+/// PR-D·D4: liveness is NOT gated here — it is delegated to `terminal_disposition`'s
+/// L3 gate, fed the real `alive` this returns, so the byte-identical
+/// `liveness-AND-age` contract holds (past boot ∧ past age ∧ classifier keeps if
+/// alive). `agent_has_liveness` fails toward alive on any read error. The grace
+/// window is NOT the guard — the age cap + liveness are (protecting a just-leased /
+/// just-released worktree from premature reclaim).
+fn force_reclaim_state(
     home: &Path,
-    wt_path: &Path,
-    agent_name: String,
+    agent_name: &str,
     marker_content: &str,
     live_agents: &std::collections::HashSet<String>,
-    marker_state: &str,
-) -> Option<GcCandidate> {
+) -> Option<bool> {
     // reviewer-2 #5: suspend force-reclaim during the daemon's post-boot grace
     // window (the process-liveness signal is still re-establishing).
     if daemon_within_boot_grace(home) {
         return None;
     }
-    if agent_has_liveness(home, &agent_name, live_agents) {
-        return None;
-    }
     let leased_at = marker_content
         .lines()
         .find_map(|l| l.strip_prefix("leased_at="));
-    if !leased_at_force_reclaimable(leased_at, &agent_name) {
+    if !leased_at_force_reclaimable(leased_at, agent_name) {
         return None;
     }
-    Some(GcCandidate {
-        path: wt_path.to_path_buf(),
-        agent: agent_name,
-        reason: format!(
-            "force-reclaim: {marker_state}, no liveness signal, leased >{}d (abandoned)",
-            force_reclaim_age_days()
-        ),
-        kind: GcKind::ForceReclaim,
-    })
+    // Past boot + age. Liveness is the classifier's gate — return the real signal.
+    Some(agent_has_liveness(home, agent_name, live_agents))
+}
+
+/// The `reason` string for a force-reclaim candidate. `marker_state` names why we
+/// entered the backstop (never-released lease vs malformed `released_at` marker).
+fn force_reclaim_reason(marker_state: &str) -> String {
+    format!(
+        "force-reclaim: {marker_state}, no liveness signal, leased >{}d (abandoned)",
+        force_reclaim_age_days()
+    )
 }
 
 /// Dry-run: log candidates without deleting. Returns candidate list.
@@ -704,8 +753,23 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // irrecoverable delete. Clean-release candidates keep the historical
     // hard-delete below (ungated, unconditional — decision Q3).
     if candidate.kind == GcKind::ForceReclaim {
-        use crate::daemon::retention::worktrees::{maybe_remove_candidate, RemovalOutcome};
-        let outcome = maybe_remove_candidate(home, candidate);
+        // PR-D·D5: route through the shared `janitor::dispose` Archive arm — the
+        // ForceReclaim→Archive binding IS the D4 gc.rs:706 archive-only invariant,
+        // now expressed as the disposition switch. `maybe_remove_candidate`
+        // (archive-only: liveness re-check + atomic `.trash` + unbind + ALERT) is
+        // unchanged behind it.
+        use crate::daemon::janitor::{dispose, DispositionOutcome};
+        use crate::daemon::retention::worktrees::RemovalOutcome;
+        use crate::worktree::disposition::Disposition;
+        let DispositionOutcome::Archived(outcome) = dispose(
+            home,
+            Disposition::Archive,
+            &candidate.agent,
+            Some(candidate),
+            || Ok(()),
+        ) else {
+            unreachable!("Archive disposition yields Archived");
+        };
         return GcResult {
             path: wt_path.clone(),
             agent: candidate.agent.clone(),
@@ -785,50 +849,59 @@ pub(crate) fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     // the prior raw Command, plus the timeout bound the raw path lacked).
     // source_repo is Some after resolve above, so the empty-cwd raw branch is
     // never taken here.
-    match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
-        Ok(o) if o.status.success() => GcResult {
+    // W1.2 / PR-D·D5: the CleanRelease dir-remove is the `janitor::dispose` Delete
+    // arm — GC passes `remove_force` (always-bypass + LOCAL_GIT_TIMEOUT) as its
+    // remover (D5-Q3 ruling B keeps the sweep's git_ok+windows-retry wrapper
+    // separate). The remover returns `Ok(())` on success (incl. the remove_dir_all
+    // fallback path) or `Err(reason)`; this wrapper keeps the #2550 archive-
+    // fallthrough on `Err` (deliberate fail-closed pre/post, D5-Q1). Every reason
+    // string is preserved byte-for-byte.
+    use crate::daemon::janitor::{dispose, DispositionOutcome};
+    use crate::worktree::disposition::Disposition;
+    let outcome = dispose(home, Disposition::Delete, &candidate.agent, None, || {
+        match crate::git_worktree::remove_force(&source_repo, &wt_path.display().to_string()) {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                tracing::warn!(
+                    agent = %candidate.agent,
+                    path = %wt_path.display(),
+                    error = %stderr,
+                    "gc: git worktree remove failed — falling back to remove_dir_all"
+                );
+                let _ = std::fs::remove_dir_all(wt_path);
+                if !wt_path.exists() {
+                    // W1.2: best-effort prune (result already ignored).
+                    let _ = crate::git_helpers::git_ok(&source_repo, &["worktree", "prune"]);
+                    Ok(())
+                } else {
+                    // Both `git worktree remove` and `remove_dir_all` failed — the
+                    // worktree is still on disk and still eligible. Fall through.
+                    Err(format!("git worktree remove failed: {stderr}"))
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %candidate.agent,
+                    path = %wt_path.display(),
+                    error = %e,
+                    "gc: git command failed"
+                );
+                Err(format!("git command failed: {e}"))
+            }
+        }
+    });
+    match outcome {
+        DispositionOutcome::Deleted(Ok(())) => GcResult {
             path: wt_path.clone(),
             agent: candidate.agent.clone(),
             removed: true,
             error: None,
         },
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            tracing::warn!(
-                agent = %candidate.agent,
-                path = %wt_path.display(),
-                error = %stderr,
-                "gc: git worktree remove failed — falling back to remove_dir_all"
-            );
-            let _ = std::fs::remove_dir_all(wt_path);
-            if !wt_path.exists() {
-                // W1.2: best-effort prune (result already ignored).
-                let _ = crate::git_helpers::git_ok(&source_repo, &["worktree", "prune"]);
-                GcResult {
-                    path: wt_path.clone(),
-                    agent: candidate.agent.clone(),
-                    removed: true,
-                    error: None,
-                }
-            } else {
-                // Both `git worktree remove` and `remove_dir_all` failed — the
-                // worktree is still on disk and still eligible. Fall through.
-                archive_fallthrough_result(
-                    home,
-                    candidate,
-                    format!("git worktree remove failed: {stderr}"),
-                )
-            }
+        DispositionOutcome::Deleted(Err(reason)) => {
+            archive_fallthrough_result(home, candidate, reason)
         }
-        Err(e) => {
-            tracing::warn!(
-                agent = %candidate.agent,
-                path = %wt_path.display(),
-                error = %e,
-                "gc: git command failed"
-            );
-            archive_fallthrough_result(home, candidate, format!("git command failed: {e}"))
-        }
+        _ => unreachable!("Delete disposition yields Deleted"),
     }
 }
 

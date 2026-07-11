@@ -2890,6 +2890,138 @@ fn gc_run_force_reclaim_archives_never_hard_deletes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// PR-D·D4 (spike-vet, NON-NEGOTIABLE): the UNCONDITIONAL `gc_remove_one`
+/// archive-only invariant for ForceReclaim. t-worktree-leak PR-2's load-bearing
+/// safety property — a ForceReclaim MUST NEVER be hard-deleted — currently rests
+/// ONLY on the control-flow POSITION of the `kind == ForceReclaim` early-return
+/// (gc.rs:706, before the hard-delete code). That is too fragile. This pins it
+/// BEHAVIORALLY so it fail-LOUD even if the routing moves.
+///
+/// Unlike `gc_run_force_reclaim_archives_never_hard_deletes` (which uses a fresh
+/// lease → a moved early-return trips the CleanRelease re-validation SKIP, not a
+/// hard-delete), this backdates a dead-agent lease so EVERY hard-delete gate
+/// WOULD pass: `evaluate_candidate` re-validation succeeds, the worktree's real
+/// `.git` resolves its source repo, and `git worktree remove` would actually
+/// hard-delete it. The archive-only routing is therefore the SOLE thing keeping
+/// the dir recoverable — move it and the dir is hard-deleted → absent from
+/// `.trash` → this test goes RED.
+#[test]
+fn force_reclaim_gc_remove_one_is_archive_only_unconditional() {
+    let home = tmp_home("fr-archive-inv");
+    let repo = tmp_repo("fr-archive-inv-repo");
+    let lease = lease(&home, &repo, "fr-inv-agent", "feat/x").expect("lease");
+    // Backdated + dead agent → this candidate passes EVERY hard-delete gate
+    // (re-validation, source-repo resolve, `git worktree remove`). Only the
+    // archive-only routing prevents an irrecoverable hard-delete.
+    backdate_lease(&lease.path, force_reclaim_age_days() + 5);
+    let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let cand = evaluate_candidate(&home, &lease.path, &live)
+        .expect("backdated dead-agent never-released lease → ForceReclaim candidate");
+    assert_eq!(
+        cand.kind,
+        GcKind::ForceReclaim,
+        "precondition: the candidate must be a ForceReclaim"
+    );
+
+    let result = gc_remove_one(&home, &cand);
+    assert!(
+        result.removed,
+        "ForceReclaim gc_remove_one must archive (Removed): {:?}",
+        result.error
+    );
+    assert!(
+        !lease.path.exists(),
+        "worktree dir must leave its original path"
+    );
+    let trash = home.join(".trash").join("worktrees");
+    let archived = std::fs::read_dir(&trash)
+        .map(|d| d.flatten().count() > 0)
+        .unwrap_or(false);
+    assert!(
+        archived,
+        "INVARIANT: a ForceReclaim MUST be ARCHIVED to .trash (recoverable), NEVER \
+         hard-deleted — the gc.rs:706 archive-only routing is load-bearing \
+         (t-worktree-leak PR-2). An empty .trash ⇒ the dir was hard-deleted ⇒ the \
+         routing regressed."
+    );
+    assert!(
+        crate::binding::read(&home, "fr-inv-agent").is_none(),
+        "binding unbound after force-reclaim archive"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// PR-D·D4 equivalence pin: the GC L3 judgment `evaluate_candidate` now delegates
+/// to [`terminal_disposition`] reproduces the pre-D4 disposition table byte-for-
+/// byte over the reachable `(ReclaimState, agent_alive)` domain. This locks the
+/// exact `DispositionInput` `evaluate_candidate` builds (binding-absent GC path:
+/// L0 pass-through, L1/L2 inert) AND the `Disposition → Option<GcKind>` map, so a
+/// classifier drift fails LOUD here rather than silently changing which worktree
+/// GC reclaims.
+#[test]
+fn gc_l3_delegation_equals_pre_d4_disposition() {
+    use crate::worktree::disposition::{
+        terminal_disposition, Disposition, DispositionInput, ReclaimState,
+    };
+    // The DispositionInput `evaluate_candidate` builds for the binding-absent GC
+    // path — L0 pass-through, L1/L2 inert.
+    let gc_input = |reclaim, agent_alive| DispositionInput {
+        daemon_managed: true,
+        pinned: false,
+        in_use: Some(false),
+        binding_present: false,
+        release_decision: crate::daemon::auto_release::ReleaseDecision::SkipNotBound,
+        releasable_by_invariant: false,
+        agent_alive,
+        reclaim,
+    };
+    // The map `evaluate_candidate` applies: Delete→CleanRelease, Archive→
+    // ForceReclaim, Keep→None (Release is unreachable — binding_present=false).
+    let to_kind = |d| match d {
+        Disposition::Delete => Some(GcKind::CleanRelease),
+        Disposition::Archive => Some(GcKind::ForceReclaim),
+        Disposition::Keep | Disposition::Release => None,
+    };
+
+    // CleanRelease arm — past grace, clean, liveness INAPPLICABLE (Some(false)):
+    // pre-D4 hard-deleted → CleanRelease candidate, regardless of real liveness.
+    assert_eq!(
+        to_kind(terminal_disposition(&gc_input(
+            ReclaimState::CleanReleaseHardDelete,
+            Some(false)
+        ))),
+        Some(GcKind::CleanRelease),
+        "clean-release past grace → CleanRelease (hard-delete tier), the pre-D4 outcome"
+    );
+    // ForceReclaim arm — past boot+age. Dead → archive; live → spared (the L3
+    // liveness gate now reproduces the pre-D4 native liveness-AND-age spare).
+    assert_eq!(
+        to_kind(terminal_disposition(&gc_input(
+            ReclaimState::ForceReclaim,
+            Some(false)
+        ))),
+        Some(GcKind::ForceReclaim),
+        "abandoned (dead, past cap) → ForceReclaim archive tier, the pre-D4 outcome"
+    );
+    assert_eq!(
+        to_kind(terminal_disposition(&gc_input(
+            ReclaimState::ForceReclaim,
+            Some(true)
+        ))),
+        None,
+        "live agent past cap → spared (liveness-AND-age), the pre-D4 None"
+    );
+    // NotEligible (within grace / boot-grace / recent lease) → Keep → None.
+    assert_eq!(
+        to_kind(terminal_disposition(&gc_input(
+            ReclaimState::NotEligible,
+            Some(false)
+        ))),
+        None,
+        "not eligible → spared, the pre-D4 None"
+    );
+}
+
 #[test]
 fn collect_managed_worktrees_finds_slash_branch_nested() {
     // reviewer-2 #4: a slash-branch worktree nests an extra level
