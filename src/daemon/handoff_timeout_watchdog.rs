@@ -132,9 +132,7 @@ pub(crate) fn scan_and_emit_with<F, G>(
     last_escalated: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     last_renudged: &mut HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     mut renudge: F,
-    // #2729 (RED): the page-emitter seam is threaded but not yet invoked — GREEN
-    // wires it into the `recipient == target` branch.
-    mut _page_operator: G,
+    mut page_operator: G,
 ) where
     F: FnMut(&str, usize),
     G: FnMut(&str, &str) -> usize,
@@ -300,11 +298,35 @@ pub(crate) fn scan_and_emit_with<F, G>(
                 continue;
             }
             if is_self_orch {
-                // #1859: `next_after_ci` IS the team orchestrator — there is no
-                // higher authority to escalate to. This is no longer a silent
-                // total-skip (the Scenario A bug): the re-nudge above already
-                // redelivers the handoff to the orchestrator itself.
-                // #2729 (RED): the operator-page seam is wired but not yet fired here.
+                // #2729: `next_after_ci` IS the team orchestrator — no peer to relay.
+                // Dispatch an operator P0 (via the `page_operator` seam) exactly like
+                // #1701's self-orch Hung path, instead of the pre-#2729 silent
+                // `continue`. `dispatched` is the number of REGISTERED channel routes
+                // the alert was handed to — NOT a delivery receipt. Stamp / suppress
+                // ONLY when at least one route was registered; zero registered routes
+                // must record nothing and suppress nothing, so the retry (re-nudge +
+                // re-escalation) continues and a channel registering later still pages.
+                let text = format!(
+                    "🛑 {target} (team orchestrator) has an unclaimed CI handoff for \
+                     {corr} for {age_min}min and is its own orchestrator — no peer can \
+                     relay. Manual intervention likely (check the pane / interrupt / re-prime)."
+                );
+                let dispatched = page_operator(target, &text);
+                if dispatched > 0 {
+                    tracing::info!(
+                        %target, %corr, age_min, channel_routes = dispatched,
+                        "#2729 handoff_timeout_watchdog: dispatched self-orchestrator operator page to registered channel route(s)"
+                    );
+                    last_escalated.insert(key, *now);
+                    crate::daemon::ci_handoff_track::stamp_throttle(
+                        home, path, target, &corr, now, false, true,
+                    );
+                } else {
+                    tracing::warn!(
+                        %target, %corr,
+                        "#2729 handoff_timeout_watchdog: no escalation channel registered — self-orch operator page not dispatched, will retry"
+                    );
+                }
                 continue;
             }
             // #1923 G11: the recipient is the hardcoded `FALLBACK_RECIPIENT`
