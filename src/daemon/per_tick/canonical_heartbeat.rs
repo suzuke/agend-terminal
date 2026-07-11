@@ -94,18 +94,18 @@ impl PerTickHandler for CanonicalHeartbeatHandler {
         let in_flight = Arc::clone(&self.in_flight);
         // fire-and-forget: #P1-2607-class / F3 — `git_ok` (LOCAL_GIT_TIMEOUT 60s)
         // must not block the daemon/app tick host (TUI, ThreadDump, later handlers).
-        // No JoinHandle; completion is signaled via `in_flight`, released by
-        // `ClearOnDrop` on normal return OR panic.
+        // No JoinHandle. `ClearOnDrop` clears `in_flight`; tests join via a
+        // worker-exit completion signal that fires *after* that clear (RAII).
         std::thread::spawn(move || {
-            // Guard scoped so `in_flight` clears BEFORE the test completion signal.
-            {
-                let _guard = super::ClearOnDrop::new(in_flight);
-                #[cfg(test)]
-                test_hooks::body_entry_gate();
-                run_round(&home, &alerted);
-            }
+            // Drop order is reverse of declaration: ClearOnDrop runs first
+            // (in_flight=false), then WorkerExitGuard signals completion so
+            // HookCleanup cannot race a stale COMPLETIONS into the next test.
             #[cfg(test)]
-            test_hooks::signal_round_complete();
+            let _worker_exit = test_hooks::WorkerExitGuard;
+            let _guard = super::ClearOnDrop::new(in_flight);
+            #[cfg(test)]
+            test_hooks::body_entry_gate();
+            run_round(&home, &alerted);
         });
     }
 }
@@ -257,7 +257,7 @@ mod test_hooks {
         *PANIC_ONCE.lock() = true;
     }
 
-    pub(super) fn signal_round_complete() {
+    fn signal_round_complete() {
         *COMPLETIONS.lock() += 1;
         COMPLETIONS_CV.notify_all();
     }
@@ -292,6 +292,17 @@ mod test_hooks {
         });
         if rx.recv_timeout(timeout).is_err() {
             panic!("watchdog: worker JoinHandle did not finish within {timeout:?}");
+        }
+    }
+
+    /// Declared **before** `ClearOnDrop` in the worker so Drop order is:
+    /// ClearOnDrop (in_flight=false) → then this (signal COMPLETIONS).
+    /// Fires on normal return **and** panic (no explicit post-body signal).
+    pub(super) struct WorkerExitGuard;
+
+    impl Drop for WorkerExitGuard {
+        fn drop(&mut self) {
+            signal_round_complete();
         }
     }
 }
@@ -345,36 +356,37 @@ mod tests {
     ///
     /// 1. `release_gate` so any blocked body can proceed
     /// 2. join any test-spawned runner (bounded watchdog)
-    /// 3. wait for offload worker completion (`in_flight` clear / completions)
+    /// 3. wait for **worker-exit completion** (not `in_flight` as join surrogate)
     /// 4. only then `reset()` globals
     ///
     /// A failed assertion must not leak a worker into the next serial test.
+    /// `in_flight` alone is insufficient: ClearOnDrop can clear it before
+    /// `WorkerExitGuard` signals COMPLETIONS, racing the next serial test.
     struct HookCleanup {
         runner: Option<std::thread::JoinHandle<()>>,
-        hb: Option<Arc<CanonicalHeartbeatHandler>>,
-        completions_before: u64,
+        /// Snapshot of COMPLETIONS before the tracked offload spawn; wait for exit.
+        worker_exit_before: Option<u64>,
     }
 
     impl HookCleanup {
         fn new() -> Self {
             Self {
                 runner: None,
-                hb: None,
-                completions_before: test_hooks::completions(),
+                worker_exit_before: None,
             }
         }
         #[allow(dead_code)] // RED path spawns the tick runner off the test thread
         fn track_runner(&mut self, h: std::thread::JoinHandle<()>) {
             self.runner = Some(h);
         }
-        fn track_hb(&mut self, hb: Arc<CanonicalHeartbeatHandler>) {
-            self.hb = Some(hb);
+        /// Snapshot COMPLETIONS *before* `run()` spawns the worker.
+        fn expect_worker_exit(&mut self) {
+            self.worker_exit_before = Some(test_hooks::completions());
         }
-        /// Clear tracked handles after a successful explicit drain (Drop is then a no-op drain).
+        /// After an explicit bounded wait_for_completion, Drop becomes a no-op drain.
         fn disarm_after_success(&mut self) {
             self.runner = None;
-            self.hb = None;
-            self.completions_before = test_hooks::completions();
+            self.worker_exit_before = None;
         }
     }
 
@@ -386,31 +398,11 @@ mod tests {
             if let Some(h) = self.runner.take() {
                 test_hooks::join_with_watchdog(h, Duration::from_secs(30));
             }
-            // (3) drain offload worker — prefer in_flight; else completions
-            if let Some(hb) = self.hb.take() {
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                while hb.is_in_flight() {
-                    if std::time::Instant::now() > deadline {
-                        test_hooks::reset();
-                        panic!("watchdog: in_flight never cleared during HookCleanup");
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            } else {
-                let before = self.completions_before;
-                // If a round may still be finishing, wait with bounded watchdog.
-                // No-op if nothing was in flight (completions already advanced or never started).
-                if test_hooks::completions() <= before {
-                    // short window only — do not hang cleanup when no work was spawned
-                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                    while test_hooks::completions() <= before
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
+            // (3) wait for worker-exit COMPLETIONS (WorkerExitGuard), not in_flight
+            if let Some(before) = self.worker_exit_before.take() {
+                test_hooks::wait_for_completion(before, Duration::from_secs(30));
             }
-            // (4) reset globals only after workers are gone
+            // (4) reset globals only after the worker has fully exited
             test_hooks::reset();
         }
     }
@@ -496,13 +488,13 @@ mod tests {
     #[test]
     #[serial_test::serial(canonical_heartbeat_gate)]
     fn tick_runner_progresses_while_body_gated_pr3() {
-        let mut cleanup = HookCleanup::new();
         test_hooks::reset();
+        let mut cleanup = HookCleanup::new();
 
         let home = tmp("offload-probe");
         let (registry, externals, configs) = empty_regs();
         let hb = Arc::new(CanonicalHeartbeatHandler::new(1));
-        cleanup.track_hb(Arc::clone(&hb));
+        cleanup.expect_worker_exit();
         let (probe_tx, probe_rx) = mpsc::channel();
         let handlers: Vec<Box<dyn PerTickHandler>> = vec![
             Box::new(ArcHb(Arc::clone(&hb))),
@@ -553,13 +545,13 @@ mod tests {
     #[test]
     #[serial_test::serial(canonical_heartbeat_gate)]
     fn skip_when_previous_round_in_flight() {
-        let mut cleanup = HookCleanup::new();
         test_hooks::reset();
+        let mut cleanup = HookCleanup::new();
 
         let home = tmp("skip-inflight");
         let (registry, externals, configs) = empty_regs();
         let h = Arc::new(CanonicalHeartbeatHandler::new(1));
-        cleanup.track_hb(Arc::clone(&h));
+        cleanup.expect_worker_exit();
         let ctx = TickContext {
             home: &home,
             registry: &registry,
@@ -591,13 +583,13 @@ mod tests {
     #[test]
     #[serial_test::serial(canonical_heartbeat_gate)]
     fn panic_in_body_clears_in_flight_guard() {
-        let mut cleanup = HookCleanup::new();
         test_hooks::reset();
+        let mut cleanup = HookCleanup::new();
 
         let home = tmp("panic-clear");
         let (registry, externals, configs) = empty_regs();
         let h = Arc::new(CanonicalHeartbeatHandler::new(1));
-        cleanup.track_hb(Arc::clone(&h));
+        cleanup.expect_worker_exit();
         let ctx = TickContext {
             home: &home,
             registry: &registry,
@@ -606,16 +598,14 @@ mod tests {
         };
 
         test_hooks::arm_panic_once();
+        let before = test_hooks::completions();
         h.run(&ctx);
-        // body enters, panics after gate wait (gate not armed) — ClearOnDrop clears
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while h.is_in_flight() {
-            if std::time::Instant::now() > deadline {
-                panic!("watchdog: in_flight never cleared after body panic");
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(!h.is_in_flight());
+        // WorkerExitGuard signals after ClearOnDrop even when the body panics.
+        test_hooks::wait_for_completion(before, Duration::from_secs(30));
+        assert!(
+            !h.is_in_flight(),
+            "ClearOnDrop must clear in_flight before worker-exit signal"
+        );
         cleanup.disarm_after_success();
         drop(cleanup);
         std::fs::remove_dir_all(&home).ok();
