@@ -212,6 +212,28 @@ pub fn clear_blocked_reason(
 }
 
 // ---------------------------------------------------------------------------
+// Pane scrollback (pane_snapshot) — #2454 in-process MCP→API service
+// ---------------------------------------------------------------------------
+
+/// #2454: read an agent's PTY scrollback IN-PROCESS against the live registry —
+/// the transport-neutral owner shared by the API `handle_pane_snapshot` adapter,
+/// the MCP `pane_snapshot` tool, and the interrupt-snapshot (each previously
+/// reached over the self-IPC loopback). Locks registry (tier-0) then core
+/// (tier-1); callers hold neither. `lines` is already bounded by the transport
+/// (MCP: explicit >10k reject; API: `min(10_000)`). `None` = not registered.
+pub fn pane_scrollback(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    lines: usize,
+) -> Option<String> {
+    let reg = agent::lock_registry(registry);
+    let handle = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))?;
+    let core = handle.core.lock();
+    Some(core.vterm.read_scrollback(lines))
+}
+
+// ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 

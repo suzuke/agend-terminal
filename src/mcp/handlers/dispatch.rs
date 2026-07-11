@@ -211,7 +211,7 @@ pub(crate) fn dispatch_instance(ctx: &HandlerCtx<'_>) -> Value {
             ctx.instance_name,
             ctx.runtime,
         ),
-        "pane_snapshot" => instance::handle_pane_snapshot(ctx.home, ctx.args),
+        "pane_snapshot" => instance::handle_pane_snapshot(ctx.home, ctx.args, ctx.runtime),
         other => json!({"error": format!("unknown instance action: {other}")}),
     }
 }
@@ -220,7 +220,12 @@ adapter!(
     hai,
     instance::handle_create_instance
 );
-adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
+/// #2454: custom (not `adapter!`) so `handle_interrupt` receives the
+/// `RuntimeContext` for its in-process best-effort snapshot (its INJECT stays a
+/// loopback). Mirrors `dispatch_instance`/`dispatch_list_instances`.
+pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_interrupt(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_delete_instance,
     has,
@@ -257,7 +262,11 @@ adapter!(
     channel::handle_download_attachment
 );
 adapter!(dispatch_reply, hai, channel::handle_reply);
-adapter!(dispatch_pane_snapshot, ha, instance::handle_pane_snapshot);
+/// #2454: custom (not `adapter!`) so the standalone `pane_snapshot` tool
+/// receives the `RuntimeContext` and reads scrollback in-process via `agent_ops`.
+pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_pane_snapshot(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(dispatch_restart_daemon, h, restart::handle_restart_daemon);
 
 // ---------------------------------------------------------------------
