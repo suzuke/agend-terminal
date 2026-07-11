@@ -98,10 +98,10 @@ impl PerTickHandler for CanonicalHeartbeatHandler {
         // worker-exit completion signal that fires *after* that clear (RAII).
         std::thread::spawn(move || {
             // Drop order is reverse of declaration: ClearOnDrop runs first
-            // (in_flight=false), then WorkerExitGuard signals completion so
-            // HookCleanup cannot race a stale COMPLETIONS into the next test.
+            // (in_flight=false), then WorkerExitOnDrop signals COMPLETIONS so
+            // HookCleanup cannot race a stale completion into the next test.
             #[cfg(test)]
-            let _worker_exit = test_hooks::WorkerExitGuard;
+            let _worker_exit = test_hooks::WorkerExitOnDrop::new();
             let _guard = super::ClearOnDrop::new(in_flight);
             #[cfg(test)]
             test_hooks::body_entry_gate();
@@ -295,12 +295,18 @@ mod test_hooks {
         }
     }
 
-    /// Declared **before** `ClearOnDrop` in the worker so Drop order is:
-    /// ClearOnDrop (in_flight=false) → then this (signal COMPLETIONS).
+    /// Zero-sized RAII: declare **before** `ClearOnDrop` so Drop order is
+    /// ClearOnDrop (`in_flight=false`) → then this (increment COMPLETIONS).
     /// Fires on normal return **and** panic (no explicit post-body signal).
-    pub(super) struct WorkerExitGuard;
+    pub(super) struct WorkerExitOnDrop;
 
-    impl Drop for WorkerExitGuard {
+    impl WorkerExitOnDrop {
+        pub(super) fn new() -> Self {
+            Self
+        }
+    }
+
+    impl Drop for WorkerExitOnDrop {
         fn drop(&mut self) {
             signal_round_complete();
         }
@@ -356,37 +362,42 @@ mod tests {
     ///
     /// 1. `release_gate` so any blocked body can proceed
     /// 2. join any test-spawned runner (bounded watchdog)
-    /// 3. wait for **worker-exit completion** (not `in_flight` as join surrogate)
+    /// 3. when a heartbeat worker was tracked: `wait_for_completion(before, 30s)`,
+    ///    then verify `!in_flight` (completion is join; in_flight is post-check)
     /// 4. only then `reset()` globals
     ///
-    /// A failed assertion must not leak a worker into the next serial test.
-    /// `in_flight` alone is insufficient: ClearOnDrop can clear it before
-    /// `WorkerExitGuard` signals COMPLETIONS, racing the next serial test.
+    /// Never poll `in_flight` as a join surrogate — ClearOnDrop can clear it
+    /// before `WorkerExitOnDrop` signals COMPLETIONS.
     struct HookCleanup {
         runner: Option<std::thread::JoinHandle<()>>,
-        /// Snapshot of COMPLETIONS before the tracked offload spawn; wait for exit.
-        worker_exit_before: Option<u64>,
+        hb: Option<Arc<CanonicalHeartbeatHandler>>,
+        /// Snapshot of COMPLETIONS before the tracked offload spawn.
+        completions_before: Option<u64>,
     }
 
     impl HookCleanup {
         fn new() -> Self {
             Self {
                 runner: None,
-                worker_exit_before: None,
+                hb: None,
+                completions_before: None,
             }
         }
         #[allow(dead_code)] // RED path spawns the tick runner off the test thread
         fn track_runner(&mut self, h: std::thread::JoinHandle<()>) {
             self.runner = Some(h);
         }
-        /// Snapshot COMPLETIONS *before* `run()` spawns the worker.
-        fn expect_worker_exit(&mut self) {
-            self.worker_exit_before = Some(test_hooks::completions());
+        /// Snapshot COMPLETIONS *before* `run()` spawns the worker; retain `hb`
+        /// so Drop can verify `!in_flight` after the exit signal.
+        fn track_hb(&mut self, hb: Arc<CanonicalHeartbeatHandler>) {
+            self.completions_before = Some(test_hooks::completions());
+            self.hb = Some(hb);
         }
         /// After an explicit bounded wait_for_completion, Drop becomes a no-op drain.
         fn disarm_after_success(&mut self) {
             self.runner = None;
-            self.worker_exit_before = None;
+            self.hb = None;
+            self.completions_before = None;
         }
     }
 
@@ -398,9 +409,17 @@ mod tests {
             if let Some(h) = self.runner.take() {
                 test_hooks::join_with_watchdog(h, Duration::from_secs(30));
             }
-            // (3) wait for worker-exit COMPLETIONS (WorkerExitGuard), not in_flight
-            if let Some(before) = self.worker_exit_before.take() {
+            // (3) wait for WorkerExitOnDrop COMPLETIONS, then verify !in_flight
+            if let Some(before) = self.completions_before.take() {
                 test_hooks::wait_for_completion(before, Duration::from_secs(30));
+                if let Some(hb) = self.hb.take() {
+                    assert!(
+                        !hb.is_in_flight(),
+                        "WorkerExitOnDrop fired but in_flight still true — ClearOnDrop order broken"
+                    );
+                }
+            } else {
+                self.hb = None;
             }
             // (4) reset globals only after the worker has fully exited
             test_hooks::reset();
@@ -494,7 +513,7 @@ mod tests {
         let home = tmp("offload-probe");
         let (registry, externals, configs) = empty_regs();
         let hb = Arc::new(CanonicalHeartbeatHandler::new(1));
-        cleanup.expect_worker_exit();
+        cleanup.track_hb(Arc::clone(&hb));
         let (probe_tx, probe_rx) = mpsc::channel();
         let handlers: Vec<Box<dyn PerTickHandler>> = vec![
             Box::new(ArcHb(Arc::clone(&hb))),
@@ -551,7 +570,7 @@ mod tests {
         let home = tmp("skip-inflight");
         let (registry, externals, configs) = empty_regs();
         let h = Arc::new(CanonicalHeartbeatHandler::new(1));
-        cleanup.expect_worker_exit();
+        cleanup.track_hb(Arc::clone(&h));
         let ctx = TickContext {
             home: &home,
             registry: &registry,
@@ -589,7 +608,7 @@ mod tests {
         let home = tmp("panic-clear");
         let (registry, externals, configs) = empty_regs();
         let h = Arc::new(CanonicalHeartbeatHandler::new(1));
-        cleanup.expect_worker_exit();
+        cleanup.track_hb(Arc::clone(&h));
         let ctx = TickContext {
             home: &home,
             registry: &registry,
@@ -600,11 +619,12 @@ mod tests {
         test_hooks::arm_panic_once();
         let before = test_hooks::completions();
         h.run(&ctx);
-        // WorkerExitGuard signals after ClearOnDrop even when the body panics.
+        // WorkerExitOnDrop signals after ClearOnDrop even when the body panics —
+        // proves actual thread exit, not just in_flight clear.
         test_hooks::wait_for_completion(before, Duration::from_secs(30));
         assert!(
             !h.is_in_flight(),
-            "ClearOnDrop must clear in_flight before worker-exit signal"
+            "ClearOnDrop must clear in_flight before WorkerExitOnDrop signals"
         );
         cleanup.disarm_after_success();
         drop(cleanup);
