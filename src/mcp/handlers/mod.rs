@@ -64,7 +64,7 @@ fn err_needs_identity(tool: &str) -> Value {
 ///
 /// Call sites use `let x = match super::require_instance(args) { Ok(t) => t,
 /// Err(e) => return e };` (the `?` operator can't be used in a `-> Value` fn).
-fn require_instance(args: &Value) -> Result<&str, Value> {
+pub(super) fn require_instance(args: &Value) -> Result<&str, Value> {
     match args["instance"].as_str() {
         Some(t) => Ok(t),
         None => Err(json!({"error": "missing 'instance'"})),

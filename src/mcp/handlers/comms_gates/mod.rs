@@ -28,8 +28,8 @@ pub(super) use anti_stall::enforce_send_invariants;
 // (handle_unified_send / handle_broadcast).
 pub(super) use request_kind_gate::validate_request_kind;
 
-// Delegate-task pre-send gates (handle_delegate_task).
-pub(super) use dispatch::run_dispatch_pre_checks;
+// Delegate-task pre-send gates (handle_delegate_task / comms_delegate).
+pub(super) use dispatch::{run_dispatch_pre_checks, DispatchPreChecks};
 
 // #2537/#2524 P6: triaged pre-send gate (handle_send_to_instance / handle_report_result).
 pub(super) use triaged_gate::{record_triaged_if_present, validate_triaged};

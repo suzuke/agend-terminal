@@ -246,16 +246,15 @@ Release → crates.io publish（見 RELEASING.md）。
    git 的 daemon/MCP module 皆已 seal；empty-`source_repo` 的 worktree
    remove 走 `git_helpers::git_bypass_no_cwd`（含 timeout）。刻意保留的 raw：
    只在 `git_helpers`（spawn 實作）與 `bin/agend-git`（gated 端）。
-4. **MCP 上限處的 size-driven 拆分**：`instance.rs`/`comms.rs` 卡在
-   750-LOC 上限，帶有「為了 file_size_invariant 而拆分」的 cross-file
-   接縫；`handle_delegate_task` 是一個 317-LOC 的 god-fn，gate 都 inline 在裡頭。
-   concept-driven 的重新拆分是 W2。
+4. **MCP 上限處的 size-driven 拆分**：多已緩解——`instance_*` 與
+   `comms_delegate` / `comms_gates` 承接重路徑。`comms.rs` 仍放 unified
+   send + report/broadcast；進一步 concept 拆分可選。
 5. **Channel trait vs 舊式 notify 函式**：`Channel::notify`
    委派給較舊的具體 `notify_telegram*` 進入點；該 trait
    尚未成為唯一的 production 路徑。任何 adapter 工作前都需先做歸屬決策（W4 設計決議）。
-6. **#2048 之後的兩個 resize chokepoint**：刻意如此（layout pre-pass +
-   render last-mile 權威），但在此之前一直未被記錄為 invariant；
-   兩者都保留，並把這份合約命名（W2）。
+6. **#2048 之後的兩個 resize chokepoint**：✅ 已命名——`render::resize`
+   （`PaneContentRect` / `ResizeDecision`）；layout 預先計算，render 對
+   最終 inner rect 仍具權威。
 
 ## 7. 測試與強制執行的全貌
 

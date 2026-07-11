@@ -13,6 +13,14 @@ use super::{
     err_needs_identity, is_ok_result,
 };
 
+// W2.2: delegate_task phase pipeline (resolve→validate→compose→lease→create→send→track).
+#[path = "comms_delegate.rs"]
+mod comms_delegate;
+pub(crate) use comms_delegate::handle_delegate_task;
+// p0c_tests (cfg test child) pin `super::dispatch_should_skip_auto_bind`.
+#[cfg(test)]
+pub(super) use comms_delegate::dispatch_should_skip_auto_bind;
+
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
 /// → delegate, summary → report, question → query, default → send_to).
@@ -161,272 +169,6 @@ fn attach_report_parent_warning(result: &mut Value) {
             json!("parent_id recommended for report kind; will be required in future version"),
         );
     }
-}
-
-pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
-    let Some(sender) = sender.as_ref() else {
-        return err_needs_identity("delegate_task");
-    };
-    let raw_target = match super::require_instance(args) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    crate::validate_name_or_err!(raw_target);
-    // Sprint 46 P2: resolve target via InstanceId — replaces P1 name-lookup bandaid.
-    // If raw_target resolves to a known instance (by id, short-id, or name), route
-    // directly. Otherwise fall through to team-orchestrator resolution.
-    let resolved_target = match crate::agent::resolve_instance(home, raw_target) {
-        Ok((_id, name)) => name,
-        Err(crate::agent::ResolveError::NotFound(_)) => {
-            // Not a known instance — try team-orchestrator resolution
-            match crate::teams::resolve_team_orchestrator(home, raw_target) {
-                Ok(Some(orch)) => orch,
-                Ok(None) => raw_target.to_string(),
-                Err(e) => return json!({"error": e}),
-            }
-        }
-    };
-    let target = resolved_target.as_str();
-    // M5: reject if team-orchestrator resolution collapsed target to sender.
-    // Only fires when resolution actually changed the target (raw_target !=
-    // resolved_target), so plain self-sends still hit the API-layer check
-    // with its own error message.
-    if *sender == target && raw_target != target {
-        return json!({"error": format!(
-            "task target '{}' resolved to sender '{}' (team orchestrator loop) \
-             — verify instance name does not collide with a team template name",
-            raw_target, sender.as_str()
-        )});
-    }
-    // CR-2026-06-14 (resource-leak): reject a plain self-dispatch BEFORE the
-    // auto-bind/lease. The qualified guard above only fires when team-orchestrator
-    // resolution COLLAPSED the target onto the sender; a plain self-dispatch
-    // (raw_target == resolved == sender) skipped it and fell through to
-    // the dispatch auto-bind call (which leases a worktree + writes a binding)
-    // before the API-layer self-send check rejected the send — orphaning the
-    // leased worktree with no rollback on this path. Reject unconditionally here
-    // so no lease happens for a dispatch the send would reject anyway.
-    if *sender == target {
-        return json!({"error": "cannot delegate task to self — use a different instance"});
-    }
-    let task = match args["task"].as_str() {
-        Some(t) => t,
-        None => return json!({"error": "missing 'task'"}),
-    };
-
-    // Pre-send gates (busy / #1286 branch-dedup / #1496 enrich / §3.5
-    // second-reviewer / #812 test-name) — side-effect-free, short-circuit in
-    // order; see comms_gates::dispatch. The returned scalars (force /
-    // force_reason / second_reviewer) feed the message build, force_meta, and
-    // lease stages below, so they are derived exactly once.
-    let checks = match super::comms_gates::run_dispatch_pre_checks(home, sender, args, target, task)
-    {
-        Ok(checks) => checks,
-        Err(rejection) => return rejection,
-    };
-    let force = checks.force;
-    let force_reason = checks.force_reason.as_deref();
-    let second_reviewer = checks.second_reviewer;
-
-    let mut msg = format!("[delegate_task] {task}");
-    if force {
-        if let Some(r) = force_reason {
-            msg.push_str(&format!("\n\n⚠️ FORCED (reason: {r})"));
-        }
-    }
-    if let Some(criteria) = args["success_criteria"].as_str() {
-        msg.push_str(&format!("\n\nSuccess criteria: {criteria}"));
-    }
-    if let Some(ctx) = args["context"].as_str() {
-        msg.push_str(&format!("\n\nContext: {ctx}"));
-    }
-    if let Some(branch) = args["branch"].as_str() {
-        msg.push_str(&format!("\n\nBranch: {branch}"));
-    }
-    let force_meta_json = if force {
-        Some(json!({
-            "forced": true,
-            "reason": force_reason.unwrap_or(""),
-            "forced_at": chrono::Utc::now().to_rfc3339()
-        }))
-    } else {
-        None
-    };
-
-    // Sprint 53 P0-1+P0-2: lease + watch_ci gate BEFORE send (Q2 ordering fix).
-    if let Some(branch) = args["branch"].as_str() {
-        let task_id_val = args["task_id"].as_str().unwrap_or("");
-        if dispatch_should_skip_auto_bind(args) {
-            tracing::info!(
-                %target, %branch, task_id = %task_id_val,
-                "dispatch_auto_bind_lease skipped (bind: false)"
-            );
-        } else {
-            // #1877: second_reviewer → review_class="dual" on the auto-armed watch.
-            let next_after_ci = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
-                &args["next_after_ci"],
-            );
-            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain(
-                home,
-                target,
-                task_id_val,
-                branch,
-                args["repository"].as_str(),
-                None,
-                &next_after_ci,
-                if second_reviewer { Some("dual") } else { None },
-                true,
-            ) {
-                return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
-            }
-        }
-    }
-
-    // #1050: auto-create board task after ALL rejectable checks pass
-    // (validation, busy gate, lease/bind). Only for single-target with
-    // empty task_id and sender != target. Task creation is the
-    // dispatch-commit step — no orphan tasks on any rejection path.
-    let (effective_task_id, auto_created_task_id): (Option<String>, Option<String>) =
-        if args["task_id"].as_str().unwrap_or("").is_empty() && *sender != target {
-            let auto_title = args["message"]
-                .as_str()
-                .or_else(|| args["task"].as_str())
-                .unwrap_or("(untitled dispatch)")
-                .chars()
-                .take(80)
-                .collect::<String>();
-            // #2117 P2: route the auto-created task to the TARGET's board, not
-            // the dispatcher's. `handle` is called with `sender` as the emitter,
-            // so without an explicit `project` the create would default to the
-            // *caller's* project (resolve_current_project(sender)) — the P1 leak
-            // the epic flagged. Stamp the target's project so the task is born on
-            // the board the assignee actually works. Single-project → both resolve
-            // to DEFAULT → home board → byte-identical.
-            let target_project = crate::tasks::resolve_target_project(home, target);
-            // #2249: forward the pre-checked plan-ack gate flag into the
-            // auto-created task. `checks.plan_ack_required` already passed
-            // the plan_ack_reason non-empty validation above (mirrors
-            // second_reviewer's own forwarding).
-            let create_args = json!({
-                "action": "create",
-                "title": auto_title,
-                "assignee": target,
-                "branch": args["branch"].as_str(),
-                "priority": "normal",
-                "project": target_project,
-                "plan_ack_required": checks.plan_ack_required,
-                "plan_ack_reason": args["plan_ack_reason"].as_str(),
-            });
-            let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
-            match task_result["id"].as_str() {
-                Some(id) => {
-                    crate::daemon::task_progress::touch(
-                        home,
-                        id,
-                        crate::daemon::task_progress::ProgressSource::Broadcast,
-                    );
-                    (Some(id.to_string()), Some(id.to_string()))
-                }
-                None => (None, None),
-            }
-        } else {
-            (args["task_id"].as_str().map(String::from), None)
-        };
-    let task_id_str = effective_task_id.as_deref();
-    if let Some(tid) = task_id_str {
-        msg.push_str(&format!(" (task id: {tid})"));
-    }
-
-    // HIGH-1/#1833: the dispatch directives the SEND handler reads — now carried
-    // by the shared SendEnvelope into BOTH params and the fallback, so the
-    // re-marshal can't drop them again (smells#2). #2099 `no_report_expected`
-    // included.
-    let env = SendEnvelope {
-        from: sender.as_str().to_string(),
-        target: target.to_string(),
-        text: msg.clone(),
-        kind: Some("task".to_string()),
-        thread_id: args["thread_id"].as_str().map(String::from),
-        parent_id: args["parent_id"].as_str().map(String::from),
-        task_id: task_id_str.map(String::from),
-        force_meta: force_meta_json.clone(),
-        provenance: Some(json!({ "from": sender.as_str(), "task": task })),
-        branch: args["branch"].as_str().map(String::from),
-        ..SendEnvelope::directives_from_args(args)
-    };
-    let result = match crate::api::call(
-        home,
-        &json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "method": crate::api::method::SEND,
-            "params": env.to_send_params(),
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-        Err(e) => {
-            // Centralised fallback (Sprint 40 T-7 B4). HIGH-1/#1833: the directive
-            // set is carried by the SAME envelope projected to the inbox message,
-            // so it can't drift from `params`.
-            let inbox_msg = env.to_inbox_message();
-            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
-        }
-    };
-    if is_ok_result(&result) {
-        let task_id = task_id_str.map(str::to_string);
-        // #2099: a fire-and-forget dispatch (`no_report_expected`) is recorded
-        // with a terminal-like status so the 30-min stuck sweep never false-fires
-        // for it — the audit row is kept, but sweep_stuck/sweep_orphans skip it.
-        // Default (flag absent/false) stays "pending" → normal stuck tracking.
-        let status = if args["no_report_expected"].as_bool().unwrap_or(false) {
-            "no_report_expected"
-        } else {
-            "pending"
-        };
-        // Track dispatch for timeout detection
-        crate::dispatch_tracking::track_dispatch(
-            home,
-            crate::dispatch_tracking::DispatchEntry {
-                task_id: task_id.clone(),
-                from: sender.as_str().to_string(),
-                to: target.to_string(),
-                from_id: crate::agent::resolve_instance(home, sender.as_str())
-                    .ok()
-                    .map(|(id, _)| id.full()),
-                to_id: crate::agent::resolve_instance(home, target)
-                    .ok()
-                    .map(|(id, _)| id.full()),
-                delegated_at: chrono::Utc::now().to_rfc3339(),
-                status: status.to_string(),
-            },
-        );
-        // Sprint 30: log branch hint for operator visibility when
-        // delegate_task carries branch metadata.
-        // P0-2: auto-watch_ci moved into `dispatch_auto_bind_lease` above so it
-        // fires on agent-to-agent `send` too (Hotfix C #451 was post-SEND and
-        // required explicit `repo` arg, which `send`'s schema never carried).
-        if let Some(branch) = args["branch"].as_str() {
-            tracing::info!(
-                target = %target,
-                branch = %branch,
-                task_id = ?task_id_str,
-                "delegate_task branch hint — implementer should work on this branch"
-            );
-        }
-        ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
-            from: sender.as_str().to_string(),
-            to: target.to_string(),
-            summary: task.to_string(),
-            task_id,
-        }));
-    }
-    let mut result = result;
-    if let Some(tid) = auto_created_task_id {
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert("auto_created_task_id".into(), json!(tid));
-        }
-    }
-    result
 }
 
 pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
@@ -734,15 +476,8 @@ pub(super) use comms_inbox::{
     handle_describe_message, handle_describe_thread, handle_inbox_ack, handle_inbox_clear,
 };
 
-/// Sprint 55 P0-C — true when the caller passed `bind: false`, signaling
-/// a read-only RCA/audit/design dispatch that should NOT trigger
-/// `dispatch_auto_bind_lease`. Default (absent or `Some(true)`) preserves
-/// the auto-bind behavior all 50+ existing dispatch sites rely on.
-fn dispatch_should_skip_auto_bind(args: &Value) -> bool {
-    args["bind"].as_bool() == Some(false)
-}
-
 // Sprint 55 P0-C — helper tests in sibling file (file_size_invariant ceiling).
+// `dispatch_should_skip_auto_bind` is re-exported from `comms_delegate` above.
 #[cfg(test)]
 #[path = "comms_p0c_tests.rs"]
 mod p0c_tests;
