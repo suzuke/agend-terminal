@@ -487,16 +487,12 @@ pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
         None => return json!({"ok": false, "error": "missing 'name'"}),
     };
     let lines = (params["lines"].as_u64().unwrap_or(100) as usize).min(10_000);
-    let reg = agent::lock_registry(ctx.registry);
-    let handle = match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(h) => h,
-        None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
-    };
-    let core = handle.core.lock();
-    let text = core.vterm.read_scrollback(lines);
-    drop(core);
-    drop(reg);
-    json!({"ok": true, "text": text})
+    // #2454: thin API adapter over the in-process `agent_ops` service (keeps the
+    // `min(10_000)` wire bound here; the lock + read live in the service).
+    match crate::agent_ops::pane_scrollback(ctx.registry, ctx.home, name, lines) {
+        Some(text) => json!({"ok": true, "text": text}),
+        None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
+    }
 }
 
 #[cfg(test)]

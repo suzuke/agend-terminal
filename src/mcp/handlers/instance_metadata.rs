@@ -45,13 +45,32 @@ pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &
     set_string_attr(home, instance_name, desc, "description", 1024)
 }
 
-pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_interrupt(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    handle_interrupt_impl(home, args, runtime, &crate::api::call)
+}
+
+/// Inner impl parameterized on the INJECT RPC — the deterministic test seam
+/// (patterned on `spawn_single_instance_impl`). Production passes
+/// [`crate::api::call`]; a test injects a stub so the interrupt(snapshot=true)
+/// path can be exercised with no live daemon. #2454: the INJECT self-IPC stays a
+/// loopback (untouched, separate op), but the optional post-interrupt snapshot
+/// now runs IN-PROCESS via `agent_ops::pane_scrollback`.
+fn handle_interrupt_impl(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+    inject_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+) -> Value {
     let target = match super::require_instance(args) {
         Ok(t) => t,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
-    match crate::api::call(home, &super::interrupt_esc_params(target)) {
+    match inject_fn(home, &super::interrupt_esc_params(target)) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             if let Some(reason) = args["reason"].as_str() {
                 let header = crate::inbox::format_event_header("interrupt", &[("reason", reason)]);
@@ -59,13 +78,14 @@ pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
             }
             let mut result = json!({"ok": true, "target": target});
             if args["snapshot"].as_bool() == Some(true) {
-                if let Ok(snap) = crate::api::call(
-                    home,
-                    &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": 40}}),
-                ) {
-                    if snap["ok"].as_bool() == Some(true) {
-                        result["snapshot"] = snap["text"].clone();
-                    }
+                // #2454: best-effort in-process snapshot (no api::call). A missing
+                // runtime or a lookup miss simply OMITS the snapshot — it never
+                // turns a successful interrupt into a failure (same intent as the
+                // former `if let Ok(snap) = api::call { if snap.ok {…} }`).
+                if let Some(text) = runtime.and_then(|rt| {
+                    crate::agent_ops::pane_scrollback(&rt.registry, home, target, 40)
+                }) {
+                    result["snapshot"] = json!(text);
                 }
             }
             result
@@ -139,38 +159,39 @@ pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
     }
 }
 
-pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_pane_snapshot(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let target = match super::require_instance(args) {
         Ok(t) => t,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     let lines_u64 = args["lines"].as_u64().unwrap_or(100);
-    // M1: explicit bounds check before u64→usize cast (32-bit safety)
+    // MCP keeps the stricter explicit >10k reject (the API adapter clamps via
+    // min(10_000)); M1: explicit bounds check before the u64→usize cast.
     if lines_u64 > 10000 {
         return json!({"error": "lines must be <= 10000 (scrolling_history limit)"});
     }
     let lines = lines_u64 as usize;
-    match crate::api::call(
-        home,
-        &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": lines}}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            // #2478: diagnostic-capture "summary, not context-flood" mode. A raw
-            // pane dump (hundreds of scrollback lines for a render investigation)
-            // is heavy context that lingers for the whole session. When
-            // `to_file:true`, write the full snapshot to a capture file and return
-            // only a compact summary (counts + head/tail preview + the path) so the
-            // agent can hexdump / inspect the file in scratch WITHOUT the full dump
-            // entering its context.
-            let full = resp["text"].as_str().unwrap_or("");
+    // #2454: in-process read via the forwarded live registry — no api::call
+    // loopback. runtime is absent only on the test-only handle_tool entry.
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: pane_snapshot requires the in-process daemon runtime"});
+    };
+    match crate::agent_ops::pane_scrollback(&runtime.registry, home, target, lines) {
+        Some(full) => {
+            // #2478: `to_file` diagnostic-capture mode (unchanged) — write the full
+            // snapshot to a capture file and return a compact summary instead of
+            // flooding the agent's context.
             if args["to_file"].as_bool().unwrap_or(false) {
-                return pane_snapshot_to_file(home, target, full, args);
+                return pane_snapshot_to_file(home, target, &full, args);
             }
-            json!({"ok": true, "text": resp["text"]})
+            json!({"ok": true, "text": full})
         }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("pane_snapshot failed")}),
-        Err(e) => json!({"error": format!("pane_snapshot: {e}")}),
+        None => json!({"error": format!("instance '{target}' not found")}),
     }
 }
 
@@ -467,6 +488,76 @@ mod blocked_reason_runtime_2454_tests {
         assert_eq!(
             current_reason(&rt, &home, "agent-x"),
             Some(BlockedReason::Hang)
+        );
+    }
+
+    // #2454 pane_snapshot family: the standalone tool + the interrupt-chained
+    // snapshot read PTY scrollback IN-PROCESS via the forwarded RuntimeContext
+    // (no api::call). Reuses the module's `runtime_with_agent` fixture.
+    #[test]
+    fn pane_snapshot_reads_via_runtime_registry_no_daemon() {
+        let (rt, home) = runtime_with_agent("agent-x");
+        // In-process read succeeds with NO daemon (an api::call loopback would error).
+        let ok = handle_pane_snapshot(&home, &json!({"instance": "agent-x"}), Some(&rt));
+        assert_eq!(
+            ok["ok"].as_bool(),
+            Some(true),
+            "runtime read must succeed no-daemon: {ok}"
+        );
+        assert!(ok["text"].is_string(), "must return scrollback text: {ok}");
+        // runtime=None → explicit error, never an api::call fallback.
+        let none = handle_pane_snapshot(&home, &json!({"instance": "agent-x"}), None);
+        assert!(
+            none["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("runtime unavailable"),
+            "runtime=None must be an explicit error: {none}"
+        );
+    }
+
+    #[test]
+    fn interrupt_snapshot_runs_in_process_and_is_best_effort() {
+        let (rt, home) = runtime_with_agent("agent-x");
+        let inject_ok = |_: &Path, _: &Value| -> anyhow::Result<Value> { Ok(json!({"ok": true})) };
+        // snapshot=true + runtime present → snapshot populated IN-PROCESS (no daemon).
+        let with_snap = handle_interrupt_impl(
+            &home,
+            &json!({"instance": "agent-x", "snapshot": true}),
+            Some(&rt),
+            &inject_ok,
+        );
+        assert_eq!(with_snap["ok"].as_bool(), Some(true), "{with_snap}");
+        assert!(
+            with_snap["snapshot"].is_string(),
+            "snapshot must be populated in-process: {with_snap}"
+        );
+        // runtime=None → snapshot OMITTED, interrupt still succeeds (best-effort).
+        let no_rt = handle_interrupt_impl(
+            &home,
+            &json!({"instance": "agent-x", "snapshot": true}),
+            None,
+            &inject_ok,
+        );
+        assert_eq!(no_rt["ok"].as_bool(), Some(true), "{no_rt}");
+        assert!(
+            no_rt.get("snapshot").is_none(),
+            "no runtime → snapshot omitted, interrupt still ok: {no_rt}"
+        );
+        // INJECT failure still fails the interrupt (unchanged).
+        let inject_err = |_: &Path, _: &Value| -> anyhow::Result<Value> { anyhow::bail!("boom") };
+        let failed = handle_interrupt_impl(
+            &home,
+            &json!({"instance": "agent-x", "snapshot": true}),
+            Some(&rt),
+            &inject_err,
+        );
+        assert!(
+            failed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not reachable"),
+            "INJECT failure must fail the interrupt: {failed}"
         );
     }
 }
