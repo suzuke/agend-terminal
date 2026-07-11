@@ -2802,6 +2802,113 @@ mod tests {
         );
     }
 
+    // ----- #2453 Stage 1a: shared owner-service wiring guards (STATIC) -----
+    // These reuse the module's existing `strip_comments_and_blank_strings`
+    // masker; no parser is duplicated. Source-scan only — no helper is called and
+    // no thread is spawned. Runtime-host coverage is intentionally ABSENT for
+    // this pure refactor (no non-invasive host entry exists).
+
+    const OWNER_HELPERS: [&str; 2] = [
+        "start_shared_monitoring_services(",
+        "start_shared_stream_observers(",
+    ];
+    const OWNER_MOVED_SPAWNS: [&str; 5] = [
+        "instance_monitor::spawn_monitor_tick(",
+        "api_activity_probe::spawn(",
+        "shadow::rollout::spawn(",
+        "shadow::opencode::spawn(",
+        "shadow::kiro::spawn(",
+    ];
+
+    /// A source file's production region (before its test module), comments
+    /// stripped and string literals blanked. Masks FIRST, then cuts at the first
+    /// `mod tests {` in masked source — robust to a stray item-level
+    /// `#[cfg(test)]` before the module (e.g. daemon's `test_env_lock`) and to an
+    /// attribute between `#[cfg(test)]` and the module (e.g. `#[allow(...)]`).
+    fn owner_wiring_prod(rel: &str) -> String {
+        let src = std::fs::read_to_string(rel)
+            .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{rel}")))
+            .unwrap_or_else(|_| panic!("source file must be readable from test cwd: {rel}"));
+        let masked = strip_comments_and_blank_strings(&src);
+        let end = masked.find("mod tests {").unwrap_or(masked.len());
+        masked[..end].to_string()
+    }
+
+    /// STATIC: BOTH production hosts (owned `run_app`, headless
+    /// `build_tick_infrastructure`) call BOTH shared helpers — deleting either
+    /// host's call turns this RED (the dual-host wiring path is required).
+    #[test]
+    fn owner_services_called_by_both_hosts() {
+        for host in ["src/app/mod.rs", "src/daemon/mod.rs"] {
+            let code = owner_wiring_prod(host);
+            for helper in OWNER_HELPERS {
+                assert!(
+                    code.contains(helper),
+                    "{host} production must call `{helper}` (dual-host shared-wiring path)"
+                );
+            }
+        }
+    }
+
+    /// STATIC: the five spawn calls are absent from BOTH host bodies and present
+    /// at the shared owner_services wiring site. Scope is the two run hosts + the
+    /// wiring module — NOT a global-uniqueness claim.
+    #[test]
+    fn owner_services_spawns_absent_from_hosts_present_at_wiring_site() {
+        for host in ["src/app/mod.rs", "src/daemon/mod.rs"] {
+            let code = owner_wiring_prod(host);
+            for spawn in OWNER_MOVED_SPAWNS {
+                assert!(
+                    !code.contains(spawn),
+                    "{host} host body must NOT call `{spawn}` — it moved to the shared \
+                     owner_services wiring site (a host-local copy reintroduces dual-host drift)"
+                );
+            }
+        }
+        let wiring = owner_wiring_prod("src/daemon/owner_services.rs");
+        for spawn in OWNER_MOVED_SPAWNS {
+            assert!(
+                wiring.contains(spawn),
+                "owner_services must contain `{spawn}` (the shared wiring site both hosts call)"
+            );
+        }
+    }
+
+    /// STATIC: in app mode both helper calls sit INSIDE the `if !attached_mode`
+    /// owner guard — an attached TUI must never start the shared daemon services.
+    /// Moving a call outside the guard turns this RED.
+    #[test]
+    fn owner_services_calls_inside_attached_mode_guard() {
+        let code = owner_wiring_prod("src/app/mod.rs");
+        let start = code
+            .find("if !attached_mode {")
+            .expect("app production must contain the `if !attached_mode {` owner guard");
+        let after = &code[start..];
+        let mut depth = 0i32;
+        let mut end = after.len();
+        for (idx, ch) in after.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = idx + ch.len_utf8();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &after[..end];
+        for helper in OWNER_HELPERS {
+            assert!(
+                block.contains(helper),
+                "app must call `{helper}` INSIDE the `if !attached_mode` owner guard \
+                 (attached TUI must not start shared services)"
+            );
+        }
+    }
+
     /// #1726 must-verify: app-standalone runs these handlers with EMPTY
     /// externals/configs (it has no external-agent / AgentConfig registry) and a
     /// possibly-empty registry. None may panic — `run_handlers` has catch_unwind,
