@@ -32,6 +32,7 @@ pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
 pub(crate) mod orphan_sweep;
+pub(crate) mod owner_services;
 pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state;
