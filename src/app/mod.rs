@@ -774,6 +774,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // moved off the supervisor thread.
     let app_handlers = app_tick_handlers(Arc::clone(&daemon_binary_stale));
 
+    // PR4: opt-in out-of-band tick-stall diagnostics for the OWNED-app maintenance
+    // tick host. An attached app never ticks (tick_rx is `None` → never_rx), so it
+    // starts NO monitor. `_app_stall_monitor` lives across the render loop and
+    // stops+joins its thread on teardown; both are `None` when the env gate is off.
+    let (app_tick_progress, _app_stall_monitor) = if attached_mode {
+        (None, None)
+    } else {
+        crate::daemon::tick_stall::start_for_host("app-owned-tick", &app_handlers, &home)
+    };
+
     // #2057 milestone 3: just BEFORE the render loop. If this is < the baseline,
     // a startup phase shrank the controlling TTY; milestone 2 brackets whether
     // it was the fleet spawn/restore vs the post-spawn wiring (subscribers /
@@ -1185,7 +1195,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     &app_externals,
                     &app_configs,
                     &app_handlers,
+                    app_tick_progress.as_deref(),
                 );
+                // PR4: back to Waiting between maintenance ticks so the monitor
+                // never attributes render/idle time to the maintenance host.
+                if let Some(p) = app_tick_progress.as_deref() {
+                    p.enter_waiting();
+                }
             }
             default(select_timeout) => {
                 // #t-84833-10: periodic idle refresh — mark dirty so the cap above
@@ -1388,6 +1404,7 @@ fn app_maintenance_tick(
     externals: &crate::agent::ExternalRegistry,
     configs: &crate::api::ConfigRegistry,
     handlers: &[Box<dyn crate::daemon::per_tick::PerTickHandler>],
+    progress: Option<&crate::daemon::tick_stall::TickProgress>,
 ) {
     let tick_ctx = crate::daemon::per_tick::TickContext {
         home,
@@ -1395,7 +1412,9 @@ fn app_maintenance_tick(
         externals,
         configs,
     };
-    crate::daemon::per_tick::run_handlers_with_panic_guard(handlers, &tick_ctx);
+    // PR4: `progress` is `Some` only for an owned app with diagnostics enabled;
+    // `None` (attached or gate-off) runs the untracked path, byte-identical.
+    crate::daemon::per_tick::run_handlers_with_progress(handlers, &tick_ctx, progress);
 }
 
 /// App exit teardown: persist the on-screen layout, then (Owned mode only) sync

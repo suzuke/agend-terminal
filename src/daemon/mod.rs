@@ -862,6 +862,12 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     let (_keepalive, handlers, tick_rx) = build_tick_infrastructure(home, &ctx);
 
+    // PR4: opt-in out-of-band tick-stall diagnostics for the daemon tick host.
+    // `_stall_monitor` is `None` unless `AGEND_TICK_STALL_SECS` enables it; it
+    // lives for the whole `'serve` loop and stops+joins its thread on teardown.
+    let (tick_progress, _stall_monitor) =
+        crate::daemon::tick_stall::start_for_host("daemon-tick", &handlers, home);
+
     // #1814 round-2: `'serve` wraps the tick loop + teardown so the final
     // recover-as-primary gate (below) can `continue 'serve` to resume serving if
     // the successor dies during the predecessor's teardown — instead of exiting
@@ -878,6 +884,10 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 continue;
             }
 
+            // PR4: idle, blocked awaiting the next tick/crash/shutdown signal.
+            if let Some(p) = &tick_progress {
+                p.enter_waiting();
+            }
             let exit_event: Option<crate::agent::AgentExitEvent>;
             crossbeam_channel::select! {
                 recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
@@ -891,11 +901,18 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
                 externals: &ctx.externals,
                 configs: &ctx.configs,
             };
+            // PR4: Preflight — the per-tick config reloads run before the sweep.
+            if let Some(p) = &tick_progress {
+                p.enter_preflight();
+            }
             crate::runtime_config::reload(home);
             // #1339: operator-mode.json reloaded each tick — a mode change (via the
             // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
             crate::operator_mode::reload(home);
-            per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
+            // PR4: the tracked runner publishes Handler(i) per handler and closes
+            // with PostHandlers, which also covers the crash-dispatch below. When
+            // diagnostics are OFF, `tick_progress` is None → untracked (byte-identical).
+            per_tick::run_handlers_with_progress(&handlers, &tick_ctx, tick_progress.as_deref());
 
             let exit_event = match exit_event {
                 Some(e) => e,
