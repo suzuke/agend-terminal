@@ -43,6 +43,7 @@ pub mod shadow;
 pub(crate) mod supervisor;
 pub(crate) mod task_progress;
 pub(crate) mod task_sweep;
+pub(crate) mod tick_stall;
 pub(crate) mod ticker;
 mod tui_bridge;
 pub(crate) mod usage_limit;
