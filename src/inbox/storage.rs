@@ -2281,10 +2281,18 @@ pub(crate) fn set_row_delivering_at_for_test(
     ts_rfc3339: &str,
 ) {
     let path = inbox_path_resolved(home, name);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return;
+    // Fail loudly, never silently no-op: a read failure, wrong id/inbox, or a
+    // setup regression that ages ZERO rows would leave the parent freshly
+    // delivering — reclaim would skip it and a positive poll-reminder test could
+    // pass WITHOUT exercising aged reclaim (false GREEN). #2730 reviewer boundary.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            panic!("set_row_delivering_at_for_test: cannot read {name}'s inbox at {path:?}: {e}")
+        }
     };
     let mut out = String::new();
+    let mut aged = 0usize;
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -2293,6 +2301,7 @@ pub(crate) fn set_row_delivering_at_for_test(
             Ok(mut v) => {
                 if v.get("id").and_then(|x| x.as_str()) == Some(msg_id) {
                     v["delivering_at"] = serde_json::Value::String(ts_rfc3339.to_string());
+                    aged += 1;
                 }
                 out.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| line.to_string()));
             }
@@ -2300,7 +2309,13 @@ pub(crate) fn set_row_delivering_at_for_test(
         }
         out.push('\n');
     }
-    let _ = std::fs::write(&path, out);
+    assert_eq!(
+        aged, 1,
+        "set_row_delivering_at_for_test: expected exactly one row with id={msg_id} in {name}'s inbox, aged {aged} — the aging seam would silently no-op and could produce a false GREEN"
+    );
+    if let Err(e) = std::fs::write(&path, out) {
+        panic!("set_row_delivering_at_for_test: cannot write {name}'s inbox at {path:?}: {e}");
+    }
 }
 
 #[cfg(test)]

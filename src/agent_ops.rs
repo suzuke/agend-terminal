@@ -826,6 +826,79 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #2730: the API-down fallback fork must NOT settle the sender's parent row
+    /// when the fallback enqueue itself fails. Mirror of the normal-fork test
+    /// (`messaging/tests.rs::failed_parented_send_does_not_settle_sender_parent`)
+    /// through `fallback_deliver`: the settle seam is wired only past the enqueue
+    /// Ok, so a lost fallback message must leave the parent unprocessed.
+    #[test]
+    fn failed_fallback_delivery_does_not_settle_sender_parent() {
+        let home = tmp_home("fallback-fail-no-settle");
+        let (sender, target) = ("ffns-worker", "ffns-peer");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {target}:\n    backend: claude\n"),
+        )
+        .unwrap();
+        // Seed + drain a real delivering parent row in the SENDER's own inbox.
+        let pid = "m-ffns-parent";
+        crate::inbox::enqueue(
+            &home,
+            sender,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some(pid.to_string()),
+                from: "codex".to_string(),
+                text: "q".to_string(),
+                kind: Some("query".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::inbox::drain(&home, sender); // parent: unread → delivering
+
+        // Break ONLY the target's inbox jsonl (dir) so the fallback enqueue fails.
+        std::fs::create_dir_all(home.join("inbox").join(format!("{target}.jsonl"))).unwrap();
+
+        let reply = crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-ffns-reply".to_string()),
+            from: sender.to_string(),
+            text: "answered".to_string(),
+            kind: Some("report".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            parent_id: Some(pid.to_string()),
+            ..Default::default()
+        };
+        let resp = fallback_deliver(
+            &home,
+            sender,
+            target,
+            "answered",
+            reply,
+            &anyhow::anyhow!("api down"),
+        );
+        assert!(
+            resp.get("error").is_some(),
+            "the fallback enqueue must fail when the target inbox is broken: {resp}"
+        );
+
+        // The sender's parent row must remain unprocessed — settle must NOT fire.
+        let path = crate::inbox::storage::inbox_path_resolved(&home, sender);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let row = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(pid))
+            .expect("sender parent row must still exist");
+        assert!(
+            row.get("read_at").is_none_or(|r| r.is_null()),
+            "a FAILED fallback delivery must not settle the sender parent: {row}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// t-20260705005551919287-14440-22: `send_to`'s API-down fallback hardcoded
     /// `kind: None` when handing off to `inbox::deliver` — losing the ORIGINAL
     /// message kind (`"query"`/`"task"`/etc, threaded through fine on the
