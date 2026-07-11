@@ -360,6 +360,209 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── #interagent-parent-settlement RED anchor ───────────────────────────
+    // A successful parented inter-agent send must settle the SENDER's own
+    // parent inbox row so the answered obligation stops cycling
+    // delivering→unread (reclaim 600s TTL) and re-nagging via poll-reminder.
+    // These drive the REAL send entries (handle_send / fallback_deliver /
+    // real task-send record_dispatch) → age the parent row past the reclaim
+    // TTL → real reclaim_stale_delivering → real collect_poll_reminders, and
+    // assert the sender is NOT nagged. RED (pre-fix): the sender IS nagged, so
+    // each `assert!(!nagged)` FAILS behaviorally. GREEN wires the settle seam.
+
+    fn write_fleet(home: &Path, names: &[&str]) {
+        let mut s = String::from("instances:\n");
+        for n in names {
+            s.push_str(&format!("  {n}:\n    backend: claude\n"));
+        }
+        std::fs::write(crate::fleet::fleet_yaml_path(home), s).ok();
+    }
+
+    fn inbox_msg(
+        id: &str,
+        from: &str,
+        kind: &str,
+        parent_id: Option<&str>,
+    ) -> crate::inbox::InboxMessage {
+        crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some(id.to_string()),
+            from: from.to_string(),
+            text: "x".to_string(),
+            kind: Some(kind.to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            parent_id: parent_id.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn empty_registry() -> AgentRegistry {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn handler_ctx<'a>(
+        home: &'a Path,
+        registry: &'a AgentRegistry,
+    ) -> crate::api::handlers::HandlerCtx<'a> {
+        // Leak the auxiliary registries for 'static — acceptable in tests
+        // (mirrors messaging/tests.rs::test_ctx).
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static crate::agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        crate::api::handlers::HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home,
+        }
+    }
+
+    fn aged_601s() -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(601)).to_rfc3339()
+    }
+
+    fn sender_is_nagged(home: &Path, registry: &AgentRegistry, sender: &str) -> bool {
+        reset_dedup(sender);
+        collect_poll_reminders(home, registry)
+            .iter()
+            .any(|(n, _)| n == sender)
+    }
+
+    /// Q: a bare query answered via the REAL `handle_send` (kind=report,
+    /// parent_id) must not re-nag its sender.
+    #[test]
+    fn answered_query_parent_not_nagged_via_handle_send() {
+        let home = tmp_home("psq");
+        let (a, b) = ("psq-worker", "psq-peer");
+        write_fleet(&home, &[b]);
+        let qid = "m-psq-query";
+        crate::inbox::enqueue(&home, a, inbox_msg(qid, "codex", "query", None)).unwrap();
+        crate::inbox::drain(&home, a); // Q: unread → delivering
+        let registry = mock_registry(a, AgentState::Idle);
+        let ctx = handler_ctx(&home, &registry);
+        let resp = crate::api::handlers::messaging::handle_send(
+            &serde_json::json!({"from": a, "target": b, "kind": "report", "parent_id": qid, "text": "answered"}),
+            &ctx,
+        );
+        assert_eq!(resp["ok"], true, "real send must succeed: {resp}");
+        crate::inbox::storage::set_row_delivering_at_for_test(&home, a, qid, &aged_601s());
+        crate::inbox::reclaim_stale_delivering(&home);
+        assert!(
+            !sender_is_nagged(&home, &registry, a),
+            "answered query parent must not re-nag via poll-reminder"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// F: same as Q but the reply is delivered through the API-down
+    /// `fallback_deliver` entry.
+    #[test]
+    fn answered_query_parent_not_nagged_via_fallback_deliver() {
+        let home = tmp_home("psf");
+        let (a, b) = ("psf-worker", "psf-peer");
+        write_fleet(&home, &[b]);
+        let qid = "m-psf-query";
+        crate::inbox::enqueue(&home, a, inbox_msg(qid, "codex", "query", None)).unwrap();
+        crate::inbox::drain(&home, a);
+        let registry = mock_registry(a, AgentState::Idle);
+        let reply = inbox_msg("m-psf-reply", a, "report", Some(qid));
+        let resp = crate::agent_ops::fallback_deliver(
+            &home,
+            a,
+            b,
+            "answered",
+            reply,
+            &anyhow::anyhow!("api down"),
+        );
+        assert!(
+            resp.get("error").is_none(),
+            "fallback delivery must succeed: {resp}"
+        );
+        crate::inbox::storage::set_row_delivering_at_for_test(&home, a, qid, &aged_601s());
+        crate::inbox::reclaim_stale_delivering(&home);
+        assert!(
+            !sender_is_nagged(&home, &registry, a),
+            "answered query parent (fallback path) must not re-nag"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T: a REAL task send (handle_send kind=task) creates BOTH the task inbox
+    /// row on the worker AND the PendingDispatch sidecar. After the worker
+    /// answers with a parented `handle_send` (kind=update, parent_id=D), the
+    /// task row must stop nagging AND the original sidecar must stay Pending
+    /// (settlement is orthogonal to the dispatch-idle nudge input).
+    #[test]
+    fn answered_task_parent_not_nagged_and_real_sidecar_stays_pending() {
+        use crate::daemon::dispatch_idle::{list_pending, DispatchStatus};
+        let home = tmp_home("pst");
+        let (a, lead) = ("pst-worker", "pst-lead");
+        write_fleet(&home, &[a, lead]);
+        let corr = "t-pst-1";
+
+        // First REAL task send lead→A: inbox delivery (A not in this send's
+        // registry) enqueues the task row AND track_dispatch records the sidecar.
+        let empty = empty_registry();
+        let ctx1 = handler_ctx(&home, &empty);
+        let dispatch = crate::api::handlers::messaging::handle_send(
+            &serde_json::json!({
+                "from": lead, "target": a, "kind": "task",
+                "task_id": corr, "expect_reply_within_secs": 1800,
+                "text": "do the thing"
+            }),
+            &ctx1,
+        );
+        assert_eq!(
+            dispatch["ok"], true,
+            "task dispatch must succeed: {dispatch}"
+        );
+        assert!(
+            list_pending(&home)
+                .iter()
+                .any(|d| d.correlation_id.as_deref() == Some(corr)),
+            "the REAL task send must create a PendingDispatch sidecar (setup precondition)"
+        );
+
+        // A receives the task row (unread → delivering) and learns its id.
+        let drained = crate::inbox::drain(&home, a);
+        let d_id = drained
+            .iter()
+            .find(|m| m.kind.as_deref() == Some("task"))
+            .and_then(|m| m.id.clone())
+            .expect("task row must have been delivered to the worker");
+
+        // Second REAL send A→lead answering the dispatch row (kind=update, no
+        // correlation_id → does NOT resolve the sidecar).
+        let registry = mock_registry(a, AgentState::Idle);
+        let ctx2 = handler_ctx(&home, &registry);
+        let reply = crate::api::handlers::messaging::handle_send(
+            &serde_json::json!({"from": a, "target": lead, "kind": "update", "parent_id": d_id, "text": "progress"}),
+            &ctx2,
+        );
+        assert_eq!(reply["ok"], true, "parented reply must succeed: {reply}");
+
+        // The dispatch-idle sidecar (sole nudge input) must be UNCHANGED by the
+        // parent-row settle.
+        assert!(
+            list_pending(&home)
+                .iter()
+                .any(|d| d.correlation_id.as_deref() == Some(corr)
+                    && matches!(d.status, DispatchStatus::Pending)),
+            "the REAL PendingDispatch must remain Pending after the parent inbox row is settled"
+        );
+
+        // The answered task-dispatch row must not re-nag via poll-reminder.
+        crate::inbox::storage::set_row_delivering_at_for_test(&home, a, &d_id, &aged_601s());
+        crate::inbox::reclaim_stale_delivering(&home);
+        assert!(
+            !sender_is_nagged(&home, &registry, a),
+            "answered task parent must not re-nag via poll-reminder"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Restore an env var to its pre-test value on drop. The shadow-observer tests mutate
     /// `AGEND_SHADOW_OBSERVER` / `AGEND_OBSERVED_DISPATCH` process-globally, so they run
     /// `#[serial_test::serial(shadow_observer)]` (same group as the snapshot operated-state

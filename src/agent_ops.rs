@@ -38,6 +38,8 @@ pub fn fallback_deliver(
     if !in_fleet {
         return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {api_error})")});
     }
+    // Capture the answered parent before `msg` is moved into enqueue below.
+    let parent_id = msg.parent_id.clone();
     // #bughunt2: this is the last-resort path (the daemon API is already down),
     // so the inbox is the SOLE channel. A swallowed enqueue here is total,
     // unrecoverable message loss reported as success — surface it instead.
@@ -48,6 +50,10 @@ pub fn fallback_deliver(
             )
         });
     }
+    // Confirmed-successful fallback delivery: settle the SENDER's own parent row
+    // so an answered obligation stops re-nagging via poll-reminder. No-ops when
+    // parent_id is None; the failed-enqueue early return above skips it.
+    crate::inbox::settle_parent_after_successful_send(home, from, parent_id.as_deref());
     crate::inbox::notify_agent(home, target, &crate::inbox::NotifySource::Agent(from), text);
     json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {api_error}")})
 }
@@ -816,6 +822,85 @@ mod tests {
             result.get("delivery_mode").and_then(|d| d.as_str()),
             Some("inbox_fallback"),
             "must NOT report success when the message was lost"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2730: the API-down fallback fork must NOT settle the sender's parent row
+    /// when the fallback enqueue itself fails. Mirror of the normal-fork test
+    /// (`messaging/tests.rs::failed_parented_send_does_not_settle_sender_parent`)
+    /// through `fallback_deliver`: the settle seam is wired only past the enqueue
+    /// Ok, so a lost fallback message must leave the parent unprocessed.
+    #[test]
+    fn failed_fallback_delivery_does_not_settle_sender_parent() {
+        let home = tmp_home("fallback-fail-no-settle");
+        let (sender, target) = ("ffns-worker", "ffns-peer");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!("instances:\n  {target}:\n    backend: claude\n"),
+        )
+        .unwrap();
+        // Seed + drain a real delivering parent row in the SENDER's own inbox.
+        let pid = "m-ffns-parent";
+        crate::inbox::enqueue(
+            &home,
+            sender,
+            crate::inbox::InboxMessage {
+                schema_version: 1,
+                id: Some(pid.to_string()),
+                from: "codex".to_string(),
+                text: "q".to_string(),
+                kind: Some("query".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::inbox::drain(&home, sender); // parent: unread → delivering
+
+        // Break ONLY the target's RESOLVED inbox path (dir) so the fallback
+        // enqueue fails. Must be the RESOLVED (not raw-name) path — on Windows
+        // inbox_path_resolved migrates name→UUID, so a raw-name-path directory is
+        // bypassed and the UUID path succeeds (#2730 r2 Windows failure). Breaking
+        // the resolved path makes enqueue hit the id_path-exists branch on BOTH
+        // platforms (no symlink/copy migration divergence).
+        let target_path = crate::inbox::storage::inbox_path_resolved(&home, target);
+        std::fs::create_dir_all(&target_path).unwrap();
+
+        let reply = crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-ffns-reply".to_string()),
+            from: sender.to_string(),
+            text: "answered".to_string(),
+            kind: Some("report".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            parent_id: Some(pid.to_string()),
+            ..Default::default()
+        };
+        let resp = fallback_deliver(
+            &home,
+            sender,
+            target,
+            "answered",
+            reply,
+            &anyhow::anyhow!("api down"),
+        );
+        assert!(
+            resp.get("error").is_some(),
+            "the fallback enqueue must fail when the target inbox is broken: {resp}"
+        );
+
+        // The sender's parent row must remain unprocessed — settle must NOT fire.
+        let path = crate::inbox::storage::inbox_path_resolved(&home, sender);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let row = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(pid))
+            .expect("sender parent row must still exist");
+        assert!(
+            row.get("read_at").is_none_or(|r| r.is_null()),
+            "a FAILED fallback delivery must not settle the sender parent: {row}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

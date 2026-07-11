@@ -75,6 +75,75 @@ fn send_surfaces_enqueue_failure_not_fake_ok() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2730: a FAILED parented send must NOT settle the sender's parent row. The
+/// settle seam is wired only past a successful `route_and_deliver`; a delivery
+/// failure early-returns before it. Seed + drain a real delivering parent row in
+/// the SENDER's own inbox, force ONLY the target's enqueue to fail (its inbox
+/// jsonl is made a directory, so the sender's inbox stays usable), then prove the
+/// parent row is still unprocessed (`read_at` unset) — settle did not fire.
+#[test]
+fn failed_parented_send_does_not_settle_sender_parent() {
+    let home = tmp_home("failed-send-no-settle");
+    let (sender, target) = ("fsns-worker", "fsns-peer");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  {target}:\n    backend: claude\n"),
+    )
+    .unwrap();
+    // Seed + drain a real delivering parent row in the SENDER's own inbox.
+    let pid = "m-fsns-parent";
+    crate::inbox::enqueue(
+        &home,
+        sender,
+        crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some(pid.to_string()),
+            from: "codex".to_string(),
+            text: "q".to_string(),
+            kind: Some("query".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::inbox::drain(&home, sender); // parent: unread → delivering
+
+    // Force ONLY the target's enqueue to fail, without touching the sender's
+    // inbox: make the target's RESOLVED inbox path a directory so the append
+    // inside route_and_deliver errors. Must be the RESOLVED (not raw-name) path —
+    // on Windows inbox_path_resolved migrates name→UUID, so a raw-name-path
+    // directory is bypassed and the UUID path succeeds (#2730 r2 Windows failure).
+    // Breaking the resolved path makes enqueue hit the id_path-exists branch on
+    // BOTH platforms (no symlink/copy migration divergence).
+    let target_path = crate::inbox::storage::inbox_path_resolved(&home, target);
+    std::fs::create_dir_all(&target_path).unwrap();
+
+    let ctx = test_ctx(&home);
+    let resp = handle_send(
+        &json!({"from": sender, "target": target, "kind": "report", "parent_id": pid, "text": "answered"}),
+        &ctx,
+    );
+    assert_eq!(
+        resp["ok"], false,
+        "the send must fail when the target enqueue is broken: {resp}"
+    );
+
+    // The sender's parent row must remain unprocessed — settle must NOT fire on
+    // the failure path.
+    let path = crate::inbox::storage::inbox_path_resolved(&home, sender);
+    let body = std::fs::read_to_string(&path).unwrap();
+    let row = body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(pid))
+        .expect("sender parent row must still exist");
+    assert!(
+        row.get("read_at").is_none_or(|r| r.is_null()),
+        "a FAILED send must not settle the sender parent (read_at must stay unset): {row}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_send_to_fleet_defined_instance_succeeds() {
     let home = tmp_home("fleet-defined");

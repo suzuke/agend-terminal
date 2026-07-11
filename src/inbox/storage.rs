@@ -2264,6 +2264,60 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
     false
 }
 
+/// Test-only: force one row's `delivering_at` to an explicit rfc3339 timestamp so
+/// a test can age a `delivering` row past [`RECLAIM_TTL_SECS`] deterministically
+/// (no wall-clock sleep) and then exercise the real [`reclaim_stale_delivering`]
+/// path. Rewrites via raw JSON so forward-schema fields survive.
+///
+/// Placed here (below the production fns) so its `#[cfg(test)]` attribute never
+/// becomes the first one in the file — the #1617 source-scan invariant test
+/// slices production up to the first `#[cfg(test)]`, so a test helper above
+/// `reclaim_stale_delivering` would truncate its scan region.
+#[cfg(test)]
+pub(crate) fn set_row_delivering_at_for_test(
+    home: &Path,
+    name: &str,
+    msg_id: &str,
+    ts_rfc3339: &str,
+) {
+    let path = inbox_path_resolved(home, name);
+    // Fail loudly, never silently no-op: a read failure, wrong id/inbox, or a
+    // setup regression that ages ZERO rows would leave the parent freshly
+    // delivering — reclaim would skip it and a positive poll-reminder test could
+    // pass WITHOUT exercising aged reclaim (false GREEN). #2730 reviewer boundary.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            panic!("set_row_delivering_at_for_test: cannot read {name}'s inbox at {path:?}: {e}")
+        }
+    };
+    let mut out = String::new();
+    let mut aged = 0usize;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut v) => {
+                if v.get("id").and_then(|x| x.as_str()) == Some(msg_id) {
+                    v["delivering_at"] = serde_json::Value::String(ts_rfc3339.to_string());
+                    aged += 1;
+                }
+                out.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| line.to_string()));
+            }
+            Err(_) => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    assert_eq!(
+        aged, 1,
+        "set_row_delivering_at_for_test: expected exactly one row with id={msg_id} in {name}'s inbox, aged {aged} — the aging seam would silently no-op and could produce a false GREEN"
+    );
+    if let Err(e) = std::fs::write(&path, out) {
+        panic!("set_row_delivering_at_for_test: cannot write {name}'s inbox at {path:?}: {e}");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;
