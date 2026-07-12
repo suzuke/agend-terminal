@@ -262,7 +262,10 @@ pub(crate) fn parse_double_quoted(s: &str) -> String {
 #[derive(Parser)]
 #[command(
     name = "agend-terminal",
-    version,
+    // Slice α build provenance: `<semver> (build <sha|unknown>[ dirty])`,
+    // baked by build.rs — keeps the leading `agend-terminal <semver>`
+    // compatibility tokens (§7.1 output-shape idiom).
+    version = env!("AGEND_CLI_VERSION"),
     about = "Orchestrate AI coding agents"
 )]
 struct Cli {

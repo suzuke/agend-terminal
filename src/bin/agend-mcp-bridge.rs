@@ -108,7 +108,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "agend-terminal", "version": env!("CARGO_PKG_VERSION") }
+                    // Slice α build provenance: semver + build metadata
+                    // (`<semver>+g<sha12>[.dirty]`, bare semver when unknown).
+                    "serverInfo": { "name": "agend-terminal", "version": env!("AGEND_MCP_VERSION") }
                 }
             })
             .to_string(),
