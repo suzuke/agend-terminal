@@ -83,12 +83,20 @@ pub(crate) mod test_sync {
 
     /// Scoped arming: dropping the guard clears the gate, so an armed
     /// barrier can never leak into later tests/threads (r3 blocker on
-    /// 8bf5b73e: static gate was set and never reset).
+    /// 8bf5b73e: static gate was set and never reset). The guard OWNS its
+    /// generation and Drop compares before clearing (r4 blocker on
+    /// 1beac4e6: an unconditional take() let a stale guard A clear a newer
+    /// arming B). Overlapping-arm policy: `arm` safely REPLACES any active
+    /// gate — the superseded guard's Drop becomes a no-op via the gen
+    /// compare, pinned by `overlapping_arm_stale_guard_drop_is_noop`.
     #[must_use = "the gate stays armed only while this guard lives"]
-    pub(crate) struct GateGuard;
+    pub(crate) struct GateGuard(u64);
     impl Drop for GateGuard {
         fn drop(&mut self) {
-            GATE.lock().expect("gate lock").take();
+            let mut gate = GATE.lock().expect("gate lock");
+            if gate.as_ref().is_some_and(|(gen, _)| *gen == self.0) {
+                gate.take();
+            }
         }
     }
 
@@ -97,7 +105,12 @@ pub(crate) mod test_sync {
         let gen = *next;
         *next += 1;
         *GATE.lock().expect("gate lock") = Some((gen, Arc::new(Barrier::new(parties))));
-        GateGuard
+        GateGuard(gen)
+    }
+
+    /// Test-only observation for the overlap regression.
+    pub fn armed_gen() -> Option<u64> {
+        GATE.lock().expect("gate lock").as_ref().map(|(g, _)| *g)
     }
 
     pub fn wait_if_armed() {
@@ -334,6 +347,30 @@ mod tests {
             .filter(|t| t.metadata.contains_key(ALERT_KEY_META))
             .count();
         assert_eq!(hygiene_count, 1);
+    }
+
+    /// r4 (codex REJECTED@1beac4e6): overlapping arms — a STALE guard's Drop
+    /// must not clear a newer generation. Policy: arm() replaces; superseded
+    /// guard drop is a gen-compared no-op.
+    #[test]
+    fn overlapping_arm_stale_guard_drop_is_noop() {
+        let a = test_sync::arm(2);
+        let gen_a = test_sync::armed_gen().unwrap();
+        let b = test_sync::arm(2);
+        let gen_b = test_sync::armed_gen().unwrap();
+        assert_ne!(gen_a, gen_b, "re-arm must advance the generation");
+        drop(a);
+        assert_eq!(
+            test_sync::armed_gen(),
+            Some(gen_b),
+            "stale guard A must NOT clear newer arming B"
+        );
+        drop(b);
+        assert_eq!(
+            test_sync::armed_gen(),
+            None,
+            "owning guard clears its own gate"
+        );
     }
 
     /// r2 (§3.20 deterministic RED): force the exact stale-probe interleaving
