@@ -414,13 +414,13 @@ pub(super) fn enumerate_projects(home: &Path) -> Vec<String> {
 // ── board handles + cross-board listing ────────────────────────────
 
 /// Board root for an existing task (via [`resolve_task_project`]).
-pub(super) fn board_for_task(home: &Path, task_id: &str) -> PathBuf {
+pub(crate) fn board_for_task(home: &Path, task_id: &str) -> PathBuf {
     board_root(home, &resolve_task_project(home, task_id))
 }
 
 /// All tasks across every board, tagged with their project id — for the
 /// `list project=all` / `scope=fleet` aggregate view.
-pub(super) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
+pub(crate) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
     enumerate_projects(home)
         .into_iter()
         .map(|project| {

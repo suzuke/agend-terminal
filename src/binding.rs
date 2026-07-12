@@ -29,7 +29,7 @@ static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::n
 /// [`present_including_future`] instead, so they never mistake a future binding
 /// for absent and reclaim a newer daemon's live worktree. The missing-signature
 /// fail-closed path is unchanged.
-fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
     let found = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
     if found > BINDING_SCHEMA_VERSION {

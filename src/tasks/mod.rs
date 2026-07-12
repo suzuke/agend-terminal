@@ -40,7 +40,8 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // auto-create (target board) and the per-board task sweep (project id from a
 // team's source_repo).
 pub(crate) use board_router::{
-    project_id_from_source_repo, resolve_target_project, resolve_task_project,
+    board_for_task, list_all_boards, project_id_from_source_repo, resolve_target_project,
+    resolve_task_project,
 };
 // #2127 Phase 1 / #2117 P3: shared per-board mutation ACL primitive, re-exported
 // for callers outside the `tasks` module (the reclaim per-tick handler).

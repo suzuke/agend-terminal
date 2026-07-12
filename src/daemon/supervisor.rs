@@ -24,6 +24,7 @@ const TICK: Duration = Duration::from_secs(10);
 mod usage_limit;
 pub(crate) use usage_limit::*;
 mod reactions;
+mod usage_limit_control;
 pub(crate) use reactions::*;
 
 /// Vterm tail size pushed to Telegram when a stall is detected.
@@ -760,6 +761,11 @@ fn tick(
         // lock drops — keeps blocking file IO out of the per-agent core-mutex
         // hold that the PTY read-loop `feed` contends on.
         let waiting_on_heartbeat_stale: bool;
+        // UsageLimit Slice 1 consumes the same authoritative raw state for
+        // detection and recovery. Capture it with the pane tail under the core
+        // lock, then perform all disk/registry work after the guard drops.
+        let usage_limit_raw_state: crate::state::AgentState;
+        let usage_limit_pane_tail: String;
         // CR-2026-06-14 (concurrency): hoist the two per-agent disk reads that
         // feed the awaiting-operator gate OUT of the core lock. Both depend only
         // on (home, name), not on core state, so reading them lock-free here
@@ -870,6 +876,8 @@ fn tick(
             // gate's non-decisive 'Other' screen, which is never overridden), and this is a
             // recovery/escalation decider that must see raw. See `operated_state` docstring.
             let agent_state = core.state.current;
+            usage_limit_raw_state = agent_state;
+            usage_limit_pane_tail = core.vterm.tail_lines(10);
             // #1523: capture how long AuthError has been continuously held (state
             // age) for the post-lock stability gate. `Some` iff currently in
             // AuthError; the gate uses it to confirm/cancel a deferred notify.
@@ -1013,6 +1021,17 @@ fn tick(
         // was contending with the PTY read-loop `feed` under the core lock. The
         // staleness bool was captured under the lock above.
         clear_waiting_on_if_stale(home, &name, waiting_on_heartbeat_stale);
+
+        if let Err(error) = usage_limit_control::observe_supervisor_tick(
+            home,
+            registry,
+            &name,
+            usage_limit_raw_state,
+            &backend_command,
+            &usage_limit_pane_tail,
+        ) {
+            tracing::warn!(agent = %name, %error, "UsageLimit control-plane tick failed closed");
+        }
 
         if !reaction_intents.is_empty() {
             let config = crate::runtime_config::get();
