@@ -163,7 +163,10 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         // the owner/repo slug from the binding source_repo so `current_binding` in
         // ci_watches_detail matches BOTH repo and branch (a same-branch watch on a
         // different repo is NOT current). Non-derivable remote ⇒ "" ⇒ nothing current.
-        let current_repo = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
+        // r2 (#2746): provider-neutral so a reachable Bitbucket-Cloud watch's own
+        // binding matches (a GitHub-only derivation regressed it to ""); MUST stay in
+        // lockstep with watch-storage canonicalization — see provider_neutral_slug.
+        let current_repo = crate::mcp::handlers::dispatch_hook::derive_repo_slug_any_forge_pub(
             Path::new(source_repo),
         )
         .unwrap_or_default();

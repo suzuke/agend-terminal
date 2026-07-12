@@ -40,12 +40,7 @@ fn write_binding(home: &std::path::Path, agent: &str, repo_slug: &str, branch: &
 /// Creates a REAL git repo so `current_repo` derivation resolves (or, for a
 /// non-GitHub forge, fails to resolve) exactly as production would — the
 /// current_binding projection needs the bound repo identity, not just the branch.
-fn write_binding_with_origin(
-    home: &std::path::Path,
-    agent: &str,
-    branch: &str,
-    origin_url: &str,
-) {
+fn write_binding_with_origin(home: &std::path::Path, agent: &str, branch: &str, origin_url: &str) {
     let src = home.join(format!("src-{agent}"));
     std::fs::create_dir_all(&src).unwrap();
     let git = |args: &[&str]| {
