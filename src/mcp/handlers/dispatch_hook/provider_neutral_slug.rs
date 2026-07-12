@@ -148,4 +148,22 @@ mod tests {
         assert_eq!(canon(""), None);
         assert_eq!(canon("   "), None);
     }
+
+    /// r3 (codex #2746): unknown/look-alike SCP + SSH transports must be `None`.
+    /// r2 did NOT strip these, and a `host:owner/repo` SCP form splits into exactly
+    /// two slash-parts → was wrongly ACCEPTED as the bogus slug `host:owner/repo`
+    /// (the false boundary-safety claim: earlier tests only exercised HTTPS shapes,
+    /// which split into >2 parts and were already `None`).
+    #[test]
+    fn unknown_scp_and_ssh_transports_rejected() {
+        // SCP form for an unknown host (the r2 gap): git@host:owner/repo.
+        assert_eq!(canon("git@example.com:o/r"), None);
+        // SCP look-alike host — github.com.evil.com is NOT github.com.
+        assert_eq!(canon("git@github.com.evil.com:o/r"), None);
+        // SCP without a user (host:path) is still an unknown-host transport.
+        assert_eq!(canon("example.com:o/r"), None);
+        // SSH URL + HTTPS look-alike (already >2 parts, kept for the boundary set).
+        assert_eq!(canon("ssh://git@example.com/o/r"), None);
+        assert_eq!(canon("https://github.com.evil.com/o/r"), None);
+    }
 }
