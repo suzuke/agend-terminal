@@ -33,6 +33,21 @@ pub const WATCH_TTL_HOURS: i64 = 72;
 /// leaks, never a live watch.
 pub const MAX_WATCH_AGE_HOURS: i64 = 7 * 24;
 
+/// S1 exact-head watch: is `s` a full immutable commit SHA? Accepts a 40-hex
+/// (SHA-1) or 64-hex (SHA-256, future object-format repos) hash, case-insensitive.
+/// Rejects abbreviated / non-hex / empty — an exact-head protected watch requires
+/// an UNAMBIGUOUS immutable target so a later main push can never alias it.
+pub fn is_full_commit_sha(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// S1: canonical (lowercase) form of a commit SHA for storage + comparison, so a
+/// caller-supplied `HEAD_SHA` matches the provider's lowercase `head_sha`. Callers
+/// MUST have validated with [`is_full_commit_sha`] first (this only lowercases).
+pub fn normalize_head_sha(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
 // Pre-#701 callers reached these names via `crate::daemon::ci_watch::X`.
 // The re-exports preserve that path even when the only in-tree use of
 // some items is via the trait object inside `watcher::check_ci_watches`.
@@ -52,7 +67,7 @@ pub use provider::{
 #[allow(unused_imports)]
 pub use registry::{
     ci_watches_dir, cleanup_watches_for_instance, has_instance_anywhere, reassign_next_after_ci,
-    remove_watch, watch_filename,
+    remove_watch, watch_filename, watch_filename_exact_head,
 };
 #[allow(unused_imports)]
 pub use sweep::{gc_stale_watches, startup_sweep};

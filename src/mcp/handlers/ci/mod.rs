@@ -111,3 +111,10 @@ fn resolve_repo_or_error(home: &Path, instance_name: &str, args: &Value) -> Resu
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
+
+// S1 exact-head protected-main watch — handler gate tests in a sibling file
+// (test-named ⇒ file_size_invariant-exempt; keeps watch.rs under its ceiling).
+#[cfg(test)]
+#[path = "exact_head_watch_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod exact_head_watch_tests;

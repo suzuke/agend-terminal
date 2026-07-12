@@ -264,6 +264,19 @@ pub fn watch_filename(repo: &str, branch: &str) -> String {
     )
 }
 
+/// S1 exact-head watch identity: keyed on `repo:branch:head_sha` so a pinned
+/// post-merge watch on a protected ref (a) never collides with a generic
+/// `repo:branch` watch and (b) lets multiple post-merge SHAs coexist and
+/// self-terminate independently. `head_sha` MUST already be lowercase-normalized
+/// (`normalize_head_sha`) so the filename is stable across mixed-case callers.
+pub fn watch_filename_exact_head(repo: &str, branch: &str, head_sha: &str) -> String {
+    let composite = format!("{repo}:{branch}:{head_sha}");
+    format!(
+        "{}.json",
+        crate::daemon::utils::sha256_hex(composite.as_bytes())
+    )
+}
+
 /// Persist updated tracking state (last_run_id + head_sha) to the watch file.
 /// Retained for tests that exercise the legacy per-field write path.
 #[cfg(test)]

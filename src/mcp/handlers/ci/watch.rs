@@ -18,17 +18,66 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);
 
-    // Sprint 57 Wave 2 Track B (#546 Item 3) — E4.5 protected-ref
-    // gate. Closes the bypass that let any agent subscribe to `main`
-    // (or `master`) CI by calling `ci action=watch` directly. Mirrors
-    // the worktree-lease gate in `worktree_pool::lease`; both go
-    // through `agent_ops::is_protected_ref` so the protected set is
-    // edited in exactly one place. The "main" default at the line
-    // above is the backstop the gate catches when callers omit both
-    // `branch` and explicit-protected branch — both flows land here.
-    if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
-        return e;
-    }
+    // S1 exact-head protected-ref gate (decision d-20260712033954660984-4).
+    // A protected ref (main/master) is mutation-free to WATCH, but a GENERIC
+    // watch resolves on any later run and can falsely complete the wrong task —
+    // so it stays E4.5-rejected (via the shared `agent_ops::is_protected_ref`,
+    // same protected set as the worktree-lease gate). The ONLY allowed protected
+    // watch is an EXACT-HEAD post-merge watch: a full immutable target SHA +
+    // `task_id` + explicit `next_after_ci`, created by the target team
+    // orchestrator or operator, on a GitHub repo. The poller then resolves THAT
+    // SHA only (`poll_runs_for_sha`). Non-protected branches are unaffected;
+    // lease/bind/dispatch E4.5 gates are untouched.
+    let exact_head_sha: Option<String> = if crate::agent_ops::is_protected_ref(branch) {
+        let head_sha = match args["head_sha"].as_str().filter(|s| !s.is_empty()) {
+            // Generic protected watch (no pinned SHA) → unchanged E4.5 rejection.
+            None => match crate::agent_ops::ensure_not_protected_json(branch) {
+                Err(e) => return e,
+                Ok(()) => unreachable!("is_protected_ref ⇒ ensure_not_protected_json errs"),
+            },
+            Some(s) => s,
+        };
+        if !crate::daemon::ci_watch::is_full_commit_sha(head_sha) {
+            return json!({
+                "error": format!("exact-head protected watch requires a FULL immutable commit SHA (40- or 64-hex); got {head_sha:?}"),
+                "code": "protected_watch_invalid_sha",
+            });
+        }
+        let has_task_id = args["task_id"].as_str().is_some_and(|s| !s.is_empty());
+        let next_targets = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
+            args.get("next_after_ci").unwrap_or(&Value::Null),
+        );
+        if !has_task_id || next_targets.is_empty() {
+            return json!({
+                "error": "exact-head protected watch requires BOTH `task_id` and an explicit `next_after_ci` target",
+                "code": "protected_watch_missing_requirements",
+            });
+        }
+        // Authority: operator (anonymous CLI, empty caller) bypasses; otherwise
+        // the caller must be the orchestrator of EVERY next_after_ci target's team.
+        let authorized = instance_name.is_empty()
+            || next_targets
+                .iter()
+                .all(|m| crate::teams::is_orchestrator_of(home, instance_name, m));
+        if !authorized {
+            return json!({
+                "error": format!("'{instance_name}' may not arm a protected-branch exact-head watch — only the target team orchestrator or operator may"),
+                "code": "protected_watch_unauthorized",
+            });
+        }
+        // By-SHA resolution is GitHub-only this wave — fail loud rather than arm a
+        // watch the poller could never resolve.
+        let (provider_kind, _) = crate::daemon::ci_watch::detect_provider_from_remote(repo);
+        if provider_kind != "github" {
+            return json!({
+                "error": format!("exact-head protected watch is GitHub-only this wave (detected provider: {provider_kind})"),
+                "code": "protected_watch_provider_unsupported",
+            });
+        }
+        Some(crate::daemon::ci_watch::normalize_head_sha(head_sha))
+    } else {
+        None
+    };
 
     // Reject unsupported providers early with operator-actionable error.
     if args["ci_provider"].as_str() == Some("bitbucket_server") {
@@ -45,7 +94,12 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             "code": "ci_watches_dir_create_failed",
         });
     }
-    let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
+    // Exact-head protected watches key on repo:branch:head_sha so they never
+    // collide with a generic branch watch and multiple post-merge SHAs coexist.
+    let filename = match exact_head_sha.as_deref() {
+        Some(sha) => crate::daemon::ci_watch::watch_filename_exact_head(repo, branch, sha),
+        None => crate::daemon::ci_watch::watch_filename(repo, branch),
+    };
     let watch_path = ci_dir.join(&filename);
 
     // H5 (CR-2026-06-14): flock the read→mutate→atomic_write window (mirrors
@@ -174,6 +228,13 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // exposure.
     if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
         watch["review_class"] = json!(rc);
+    }
+    // S1: persist the (validated, lowercased) exact-head pin. Its PRESENCE marks
+    // this as a protected post-merge watch the poller resolves by target SHA and
+    // `gc_stale_watches` preserves across restart. Only reachable here after the
+    // exact-head gate above, so a non-protected watch never carries it.
+    if let Some(sha) = exact_head_sha.as_deref() {
+        watch["target_head_sha"] = json!(sha);
     }
 
     // #779 P2 Piece 3 site B: atomic_write failure (disk full,
