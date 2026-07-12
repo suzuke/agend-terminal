@@ -1561,6 +1561,28 @@ fn handle_metadata_set(
                     "id": id, "event": "metadata_set", "task": task, "noop": true
                 });
             }
+            // Fail-closed status policy (PR #2761 r1): a content-CHANGING plan
+            // write is permitted ONLY in the pre-work window {Backlog, Open,
+            // Claimed} — where no work is active because the →in_progress ack gate
+            // has not yet been passed. At in_progress and every later/terminal/
+            // blocked state the plan is FROZEN for EVERY identity, creator
+            // included. Reopening the gate would require an
+            // in_progress→claimed/open transition that this handler deliberately
+            // does NOT grant (I5: no creator status authority); silently resetting
+            // plan_acks WITHOUT a transition (the r0 defect) leaves work running
+            // under an unacked replacement plan. metadata_set never mutates status
+            // — the remedy for a wrong plan mid-work is cancel + recreate.
+            if !matches!(
+                record.status,
+                crate::task_events::TaskStatus::Backlog
+                    | crate::task_events::TaskStatus::Open
+                    | crate::task_events::TaskStatus::Claimed
+            ) {
+                return serde_json::json!({
+                    "error": "the plan is frozen once work has started (in_progress or later); cancel + recreate the task to re-plan — it cannot be hot-swapped under running work",
+                    "code": "plan_frozen_work_started",
+                });
+            }
             let acks_present = record
                 .metadata
                 .get("plan_acks")

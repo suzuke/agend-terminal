@@ -1877,3 +1877,181 @@ fn gov_r8_counter_write_denied_for_every_identity_t74() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&orch_home).ok();
 }
+
+/// Drive a task all the way to in_progress: create (gated at 1), claim, creator
+/// authors the plan, a non-assignee acks, assignee transitions to in_progress.
+/// Returns the task id, now with status == InProgress and 1 ack recorded.
+fn gov_seed_in_progress(home: &std::path::Path) -> String {
+    let id = gov_seed_claimed(home, 1);
+    handle(
+        home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    handle(
+        home,
+        "reviewer-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    let started = handle(
+        home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        started["error"].is_null(),
+        "precondition: in_progress reached: {started}"
+    );
+    id
+}
+
+/// R9 (PR #2761 r1) — once WORK HAS STARTED (in_progress), the plan is frozen
+/// for EVERYONE, creator included. r0's bug: a GOV_AUTHOR content-change reset
+/// plan_acks but performed NO status transition, so work kept running under an
+/// unacked replacement plan. The fix rejects the content-change (no silent
+/// reset, no status mutation). Same-content stays an idempotent no-op.
+#[test]
+fn gov_r9_plan_frozen_once_in_progress_t74() {
+    let home = tmp_home("gov-r9");
+    let id = gov_seed_in_progress(&home);
+
+    // Creator content-change while in_progress → frozen (NOT reset).
+    let creator_change = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan B"
+        }),
+    );
+    assert_eq!(
+        creator_change["code"], "plan_frozen_work_started",
+        "creator must not content-change the plan once work started: {creator_change}"
+    );
+    // Owner content-change while in_progress → also frozen.
+    let owner_change = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan C"
+        }),
+    );
+    assert_eq!(
+        owner_change["code"], "plan_frozen_work_started",
+        "owner must not content-change the plan once work started: {owner_change}"
+    );
+
+    // No mutation: plan unchanged, acks NOT reset, status still in_progress.
+    assert_eq!(gov_plan_text(&home, &id).as_deref(), Some("plan A"));
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        1,
+        "a rejected in_progress content-change must NOT reset acks"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("exists").status,
+        crate::task_events::TaskStatus::InProgress,
+        "status must stay in_progress (metadata_set never transitions status)"
+    );
+
+    // Same-content write is STILL an idempotent no-op, even in_progress.
+    let noop = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    assert!(
+        noop["error"].is_null(),
+        "same-content plan write must remain a no-op in_progress: {noop}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R10 (PR #2761 r1) — the freeze holds in a later lifecycle state (in_review):
+/// a content-change past the pre-work window is rejected regardless of how far
+/// the task has progressed.
+#[test]
+fn gov_r10_plan_frozen_in_review_t74() {
+    let home = tmp_home("gov-r10");
+    let id = gov_seed_in_progress(&home);
+    let review = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_review"}),
+    );
+    assert!(
+        review["error"].is_null(),
+        "precondition: in_review reached: {review}"
+    );
+
+    let change = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan B"
+        }),
+    );
+    assert_eq!(
+        change["code"], "plan_frozen_work_started",
+        "plan must stay frozen in in_review: {change}"
+    );
+    assert_eq!(gov_plan_text(&home, &id).as_deref(), Some("plan A"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R11 (PR #2761 r1) — Blocked-ambiguity resolved fail-closed: a Blocked task
+/// has (in general) already started work, so the plan is frozen there too. A
+/// content-change while Blocked is rejected for every identity.
+#[test]
+fn gov_r11_plan_frozen_when_blocked_t74() {
+    let home = tmp_home("gov-r11");
+    let id = gov_seed_in_progress(&home);
+    let blocked = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "blocked"}),
+    );
+    assert!(
+        blocked["error"].is_null(),
+        "precondition: blocked reached: {blocked}"
+    );
+
+    // Creator and owner both frozen while Blocked.
+    for who in ["lead", "worker"] {
+        let change = handle(
+            &home,
+            who,
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan", "metadata_value": "plan B"
+            }),
+        );
+        assert_eq!(
+            change["code"], "plan_frozen_work_started",
+            "{who} must not content-change the plan while Blocked: {change}"
+        );
+    }
+    assert_eq!(gov_plan_text(&home, &id).as_deref(), Some("plan A"));
+    // Same-content no-op still holds while Blocked.
+    let noop = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    assert!(
+        noop["error"].is_null(),
+        "same-content no-op must hold while Blocked: {noop}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
