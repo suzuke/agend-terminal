@@ -581,6 +581,11 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                 WorktreeRemoval::Removed => {
                     managed_verified = true;
                     out.worktree_removed = true;
+                    // Success path: a prior refused release may have left a
+                    // per-worktree unpreservable-nested-dirt notice marker; clear
+                    // it (+ its lock) so a future re-lease of this path re-notifies
+                    // from a clean slate. Best-effort.
+                    crate::worktree::clear_nested_refusal_marker(home, wt_path);
                 }
                 WorktreeRemoval::AlreadyAbsent => {
                     worktree_absent = true;
