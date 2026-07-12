@@ -1425,4 +1425,150 @@ teams:
         );
         std::fs::remove_dir_all(home).ok();
     }
+    /// #2759 r1 RED — same-key UsageLimit recurrence after a COMPLETED
+    /// (Recovered) episode. A Recovered episode is terminal history, not an
+    /// active one: a NEW raw-UsageLimit observation on the SAME task/binding
+    /// generation must start a fresh two-tick cycle (no one-tick re-block),
+    /// and after the limit lifts the task must return to InProgress. Pre-fix,
+    /// the `key == current_key` arm shadowed the Recovered arm: ONE tick
+    /// re-Blocked via `reconcile_active`, then both recovery paths skipped
+    /// Recovered episodes — the task wedged Blocked forever, silently.
+    #[test]
+    fn same_key_recurrence_after_recovered_needs_two_ticks_and_reheals() {
+        let home = tmp_home("same-key-recurrence");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            r#"
+instances:
+  worker-a: { backend: codex, role: dev }
+  lead: { backend: claude, role: orchestrator }
+teams:
+  archfix:
+    members: [worker-a, lead]
+    orchestrator: lead
+"#,
+        )
+        .expect("write fleet");
+        let runtime = crate::paths::runtime_dir(&home).join("worker-a");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let binding = serde_json::json!({
+            "version": 1,
+            "agent": "worker-a",
+            "task_id": "t-slice-1",
+            "branch": "feat/slice-1",
+            "issued_at": "2026-07-12T13:00:00Z",
+            "worktree": home.join("worktrees/worker-a/feat/slice-1"),
+            "source_repo": home.join("repo")
+        });
+        let binding_bytes = serde_json::to_vec_pretty(&binding).expect("binding json");
+        std::fs::write(runtime.join("binding.json"), &binding_bytes).expect("binding write");
+
+        let task_id = crate::task_events::TaskId("t-slice-1".into());
+        let owner = crate::task_events::InstanceName("worker-a".into());
+        crate::task_events::append_batch(
+            &home,
+            &owner,
+            vec![
+                crate::task_events::TaskEvent::Created {
+                    task_id: task_id.clone(),
+                    title: "slice 1".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(owner.clone()),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some("feat/slice-1".into()),
+                    bind: Some(true),
+                    eta_secs: None,
+                    tags: Vec::new(),
+                    parent_id: None,
+                },
+                crate::task_events::TaskEvent::Claimed {
+                    task_id: task_id.clone(),
+                    by: owner.clone(),
+                },
+                crate::task_events::TaskEvent::InProgress {
+                    task_id: task_id.clone(),
+                    by: owner.clone(),
+                },
+            ],
+        )
+        .expect("seed task");
+
+        // A COMPLETED prior episode: Recovered, SAME generation as the binding.
+        let recovered = Episode {
+            key: key(),
+            state: EpisodeState::Recovered,
+            consecutive_ticks: 2,
+            candidate: None,
+            unlock_at: None,
+            recipient: "lead".into(),
+        };
+        std::fs::write(
+            runtime.join("usage_limit_episode.json"),
+            serde_json::to_vec_pretty(&recovered).expect("episode json"),
+        )
+        .expect("episode write");
+
+        let _binding_guard = super::acquire_binding_lock(&home, "worker-a").expect("binding lock");
+        let make_input = |state| TickInput {
+            now: now(),
+            raw_state: state,
+            source_backend: "codex".into(),
+            source_team: Some("archfix".into()),
+            source_role: Some("dev".into()),
+            unlock_at: Some(now() + Duration::seconds(29 * 60 + 59)),
+            correlation: super::correlation_from_disk(&home, "worker-a"),
+            candidates: Vec::new(),
+            recipient: "lead".into(),
+        };
+
+        // Tick 1 (UsageLimit): fresh detection — must NOT block on one tick.
+        let mut tick1 = super::FsEffects::load(&home, "worker-a").expect("tick1 load");
+        let outcome1 =
+            super::observe_tick(&mut tick1, make_input(AgentState::UsageLimit)).expect("tick1");
+        assert_eq!(
+            outcome1,
+            TickOutcome::Detected,
+            "a Recovered episode is history: a new same-key UsageLimit must start a fresh cycle"
+        );
+        let after_one = crate::task_events::replay(&home).expect("replay tick1");
+        assert_ne!(
+            after_one.tasks.get(&task_id).expect("task").status,
+            crate::task_events::TaskStatus::Blocked,
+            "two-tick invariant: one UsageLimit tick after Recovered must not Block"
+        );
+
+        // Tick 2 (UsageLimit): second consecutive tick activates and blocks.
+        let mut tick2 = super::FsEffects::load(&home, "worker-a").expect("tick2 load");
+        let outcome2 =
+            super::observe_tick(&mut tick2, make_input(AgentState::UsageLimit)).expect("tick2");
+        assert_eq!(outcome2, TickOutcome::AwaitReset);
+        assert_eq!(
+            crate::task_events::replay(&home)
+                .expect("replay tick2")
+                .tasks
+                .get(&task_id)
+                .expect("task")
+                .status,
+            crate::task_events::TaskStatus::Blocked,
+            "second consecutive tick must re-block"
+        );
+
+        // Tick 3 (Idle): limit lifted — the re-blocked task must re-heal.
+        let mut tick3 = super::FsEffects::load(&home, "worker-a").expect("tick3 load");
+        let outcome3 =
+            super::observe_tick(&mut tick3, make_input(AgentState::Idle)).expect("tick3");
+        assert_eq!(outcome3, TickOutcome::Recovered);
+        let healed = crate::task_events::replay(&home).expect("replay tick3");
+        let healed = healed.tasks.get(&task_id).expect("task");
+        assert_eq!(
+            healed.status,
+            crate::task_events::TaskStatus::InProgress,
+            "recurrence episode must stay recoverable — no permanent wedge"
+        );
+        assert_eq!(healed.owner.as_ref(), Some(&owner));
+        std::fs::remove_dir_all(home).ok();
+    }
 }
