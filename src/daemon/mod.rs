@@ -7,6 +7,7 @@ pub(crate) mod boot_sweep;
 pub(crate) mod cadence_gate;
 pub(crate) mod canonical_drift;
 pub(crate) mod channel_reply_discharge;
+pub(crate) mod ci_delivery_ledger;
 pub(crate) mod ci_handoff_track;
 pub(crate) mod ci_watch;
 pub(crate) mod conflict_notify;
