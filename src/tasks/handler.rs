@@ -1277,13 +1277,17 @@ fn handle_update(
             // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
             "status": "updated",
         })
-    } else if result_idempotent {
+    } else if result_idempotent
+        && !["status", "priority", "assignee", "description", "tags"]
+            .iter()
+            .any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+    {
         // The ONLY zero-event success: `result` was supplied as a string equal to
-        // the current value, and no other mutable field was supplied (every other
-        // field emits an event when supplied, so it would be in `had_events`).
-        // Every other zero-event request — unknown/unmapped status, non-string
-        // result, or no recognized field — already returned a structured error
-        // above. Honest idempotent no-op instead of a false "updated".
+        // the current value AND no OTHER mutable key was supplied. The
+        // presence-not-emission check is load-bearing: a malformed other field
+        // (e.g. `description: 123`, a non-string that emits no event) must NOT be
+        // silently absorbed into a false "unchanged" — it falls through to the
+        // fail-loud branch below. Honest idempotent no-op.
         serde_json::json!({
             "id": id,
             "event": "unchanged",
@@ -1291,12 +1295,15 @@ fn handle_update(
             "status": "unchanged",
         })
     } else {
-        // No supported mutable field supplied (`depends_on` was already rejected
-        // above). Fail loud rather than the historical false "updated".
+        // Zero events and not the idempotent-result case: either nothing updatable
+        // was supplied, or a supplied field produced no change (e.g. a malformed
+        // non-string value that emits no event). Fail loud rather than the
+        // historical false "updated" / a value-absorbing false "unchanged".
+        // (`depends_on` was already rejected above.)
         serde_json::json!({
             "error": format!(
-                "no updatable field supplied for task {id} \
-                 (supported: status, priority, assignee, description, tags, result)"
+                "no effective update for task {id}: no supported mutable field produced \
+                 a change (supported: status, priority, assignee, description, tags, result)"
             ),
             "code": "no_op",
         })
