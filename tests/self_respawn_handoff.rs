@@ -785,8 +785,10 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
 /// and exec-lifecycle merge-blockers. A real `restart_daemon` MCP call over the LIVE
 /// app api socket must:
 ///
-/// 1. return `committing` — receiving it proves the reply crossed the socket
-///    BEFORE teardown dropped it (ORDERING: reply precedes teardown/exec);
+/// 1. return `prepared` — receiving it proves the reply crossed the socket BEFORE
+///    teardown dropped it (ORDERING: reply precedes teardown/exec). `prepared` (not
+///    `committing`) is the honest pre-ack wording: the commit happens only after the
+///    transport ack the TUI polls for, so the reply is an indeterminate attempt;
 /// 2. re-exec IN PLACE — the SAME pid stays alive across the exec (exec, not a
 ///    spawned successor; execve preserves the pid);
 /// 3. bring the control plane back on the RE-READ api.port and serve a real
@@ -825,9 +827,10 @@ fn app_mode_restart_reexecs_in_place_2453() {
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
 
-    // Real restart_daemon over the real app api socket. Receiving the committing
+    // Real restart_daemon over the real app api socket. Receiving the `prepared`
     // reply IS the ordering proof: it crossed the socket BEFORE teardown dropped it
-    // (the arm replies Committing before the ordered teardown + exec).
+    // (the arm replies `prepared`, the transport flushes it, then the TUI polls the
+    // post-flush ack and commits → ordered teardown + exec).
     let resp = trigger_restart(&home, pid);
 
     // Bounded, EVENT-DRIVEN settle for the in-place re-exec. execve preserves the
@@ -868,9 +871,9 @@ fn app_mode_restart_reexecs_in_place_2453() {
     let _ = child.wait();
     cleanup_test_home(&home);
 
-    // (1) ORDERING: the committing reply was received before the socket dropped.
+    // (1) ORDERING: the `prepared` reply was received before the socket dropped.
     let resp =
-        resp.expect("app-mode restart must return a committing reply before the socket drops");
+        resp.expect("app-mode restart must return a prepared reply before the socket drops");
     let result_ok = resp
         .get("result")
         .and_then(|r| r.get("ok"))
@@ -882,12 +885,12 @@ fn app_mode_restart_reexecs_in_place_2453() {
     assert_eq!(
         result_ok,
         Some(true),
-        "app-mode restart_daemon must report result.ok=true (re-exec committing), got {resp}"
+        "app-mode restart_daemon must report result.ok=true (re-exec prepared), got {resp}"
     );
     assert_eq!(
         restart,
-        Some("committing"),
-        "app-mode restart_daemon must report restart=committing (reply precedes teardown/exec), got {resp}"
+        Some("prepared"),
+        "app-mode restart_daemon must report restart=prepared (reply precedes teardown/exec), got {resp}"
     );
 
     // (2) EXEC-NOT-SPAWN + NO BRICK: the ORIGINAL pid stayed alive across the exec

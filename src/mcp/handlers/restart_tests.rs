@@ -61,10 +61,15 @@ mod app_restart_strategy_tests {
         );
     }
 
-    /// A duplicate request while the gate is already claimed → idempotent
-    /// "already in progress", and NO request is sent to the loop.
+    /// #2453 R2 P0 (immediate-retry-before-abort): a duplicate/retry arriving while
+    /// the gate is already claimed (winner still Probing, NOT yet committed) must get
+    /// a RETRYABLE NON-SUCCESS — NOT `ok:true "already in progress"`. Otherwise, if
+    /// the winner later ABORTS on a flush failure, this retry received a FALSE success
+    /// while no restart happened. It returns `ok:false, restart:"in_progress",
+    /// retryable:true` and sends NO request to the loop (the gate is the idempotence
+    /// authority). RED against the old `ok:true "already in progress"`.
     #[test]
-    fn duplicate_while_in_flight_is_already_in_progress() {
+    fn duplicate_while_in_flight_is_retryable_not_false_success() {
         let (ar, rx) = make();
         assert!(ar.gate.try_begin_probe()); // simulate an in-flight probe holding the claim
         let resp = handle_restart_daemon(
@@ -73,21 +78,60 @@ mod app_restart_strategy_tests {
             Some(ar),
             Some(PostFlushSlot::new()),
         );
-        assert_eq!(resp["ok"], true);
-        assert_eq!(resp["restart"], "already in progress");
+        assert_eq!(
+            resp["ok"], false,
+            "a CAS loser must NOT report success (the winner may still abort)"
+        );
+        assert_eq!(resp["restart"], "in_progress");
+        assert_eq!(
+            resp["retryable"], true,
+            "the loser must be told to retry — the in-flight restart is not yet committed"
+        );
         assert!(
             rx.try_recv().is_err(),
             "no request must be sent while a restart is in flight"
         );
     }
 
+    /// #2453 R2 P0 (retry-after-abort): once the in-flight winner has ABORTED (its
+    /// probe failed / flush dropped → gate rolled back to `Serving`), a retry must be
+    /// able to WIN a FRESH restart — it CAS-claims `Serving→Probing` and, on a passing
+    /// probe, returns `prepared` (arming a new barrier). Proves the gate is reusable
+    /// after abort so a retry is never permanently wedged as a loser.
+    #[test]
+    fn retry_after_abort_wins_fresh_prepared() {
+        let (ar, rx) = make();
+        let slot = PostFlushSlot::new();
+        // The prior attempt aborted: the gate is back at Serving (its default).
+        assert!(ar.gate.is_serving());
+        let t = std::thread::spawn(move || {
+            let req = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request delivered to loop");
+            req.reply
+                .send(AppRestartVerdict::Prepared)
+                .expect("verdict reply sent");
+        });
+        let resp = handle_restart_daemon(
+            Path::new("/tmp"),
+            Some(RestartCapability::App),
+            Some(ar),
+            Some(slot),
+        );
+        t.join().expect("stub loop thread joined");
+        assert_eq!(resp["ok"], true, "a retry after abort must win a fresh restart");
+        assert_eq!(resp["restart"], "prepared");
+    }
+
     /// Happy path: the stub loop replies `Prepared`; the handler REGISTERS a
-    /// post-flush ack into the slot and returns ok:true restart:committing. The stub
-    /// uses `recv_timeout` (not blocking `recv`) so a never-sending handler surfaces
-    /// as a fast RED rather than a hung test. Proving the barrier is armed: a second
+    /// post-flush ack into the slot and returns ok:true restart:"prepared" (an honest
+    /// indeterminate attempt — the commit happens only after the transport ack, so the
+    /// pre-ack reply must NEVER say "committing"/"re-exec'ing"). The stub uses
+    /// `recv_timeout` (not blocking `recv`) so a never-sending handler surfaces as a
+    /// fast RED rather than a hung test. Proving the barrier is armed: a second
     /// `register` on the same slot is rejected.
     #[test]
-    fn prepared_arms_barrier_and_returns_committing() {
+    fn prepared_arms_barrier_and_returns_prepared() {
         let (ar, rx) = make();
         let slot = PostFlushSlot::new();
         let t = std::thread::spawn(move || {
@@ -106,7 +150,7 @@ mod app_restart_strategy_tests {
         );
         t.join().expect("stub loop thread joined");
         assert_eq!(resp["ok"], true);
-        assert_eq!(resp["restart"], "committing");
+        assert_eq!(resp["restart"], "prepared");
         // The handler armed the barrier — the slot holds an action, so a second
         // register is rejected (the "concurrent response cannot consume the slot"
         // invariant). Running it must not panic (the ack receiver is already gone).
@@ -178,7 +222,7 @@ mod app_restart_strategy_tests {
             Some(slot.clone()),
         );
         let flush_ack = t.join().expect("stub loop thread joined");
-        assert_eq!(resp["restart"], "committing");
+        assert_eq!(resp["restart"], "prepared");
         // BEFORE the flush: the handler must NOT have committed, and no commit-
         // permission has been delivered.
         assert!(

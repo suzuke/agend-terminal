@@ -105,6 +105,20 @@ impl PostFlushSlot {
         }
         // else: `action` drops here un-run → sender drops → TUI flush_ack disconnects.
     }
+
+    /// #2453 R2 P0-1: peek whether an action is registered and the slot is still
+    /// OPEN (not yet processed). `handle_session` calls this AFTER dispatch to
+    /// detect a DEFERRED-COMMIT response — one whose side effect (the app re-exec)
+    /// commits only after this reply flushes, gated by the [`AppRestartGate`], not
+    /// the dedup cache. Such a response must be evicted from the dedup cache so a
+    /// retry re-invokes the handler (a failed flush drops the restart but would
+    /// leave a cached `restart:prepared` that lies about a restart to the retry).
+    /// Non-consuming: this only inspects, so the subsequent
+    /// [`PostFlushSlot::run_after_flush`] still runs the action.
+    pub fn is_armed(&self) -> bool {
+        let st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        !st.closed && st.action.is_some()
+    }
 }
 
 /// A restart request handed from the handler to the TUI loop. `reply` carries the

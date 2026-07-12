@@ -612,6 +612,69 @@ fn poll_restart_probe(
     }
 }
 
+/// #2453 R2 P0-2: how long the TUI keeps a `prepared` (commit-pending) restart alive
+/// waiting for the transport's post-flush ack before a watchdog aborts it. Generous:
+/// a successful flush delivers the ack near-instantly, so only a genuinely wedged API
+/// writer reaches this. The `prepared` reply is honestly indeterminate (it never
+/// promises completion), so a watchdog abort — even after a very-late delivered
+/// `prepared` — stays contract-consistent ("if the app is still running, retry").
+const RESTART_COMMIT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #2453 R2 P0-2: the TUI's commit-pending restart state. After a passing probe the
+/// loop replies `Prepared` and parks THIS (the `flush_ack` receiver + a watchdog
+/// `deadline`) instead of BLOCKING — the loop polls it non-blockingly each tick so
+/// the UI never freezes on a wedged API writer (codex R3 correction).
+struct CommitPending {
+    flush_ack: crossbeam_channel::Receiver<()>,
+    deadline: std::time::Instant,
+}
+
+/// #2453 R2 P0-2: the decision from one non-blocking poll of the commit-pending
+/// state — extracted so the "commit ONLY on the transport's post-flush ack, else
+/// abort" rule (gating the irreversible teardown+exec) is unit-testable without the
+/// TUI. Pure: reads the ack channel + compares `now` to the deadline; the caller
+/// owns the gate CAS + teardown.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitPoll {
+    /// The post-flush ack arrived — the reply flushed. Caller CAS `Probing→Committing`
+    /// and breaks to teardown+exec.
+    Commit,
+    /// Abort (roll the gate back to `Serving`, keep serving). Either the ack channel
+    /// disconnected (the action dropped un-run: write/flush failed or the session
+    /// ended) or the watchdog `deadline` passed with no ack. The `&'static str` names
+    /// which, for an observable log.
+    Abort(&'static str),
+    /// No ack yet and still within the deadline — keep serving (UI responsive).
+    Pending,
+}
+
+/// #2453 R2 P0-2: poll the commit-pending state once (NON-BLOCKING). `try_recv` is
+/// checked FIRST, so an already-buffered ack always commits and the watchdog can
+/// never preempt an ack the TUI has yet to observe. NOTE (codex R3 truthfulness
+/// correction): a delivered `prepared` reply and this ack's visibility can straddle
+/// the deadline, so a watchdog `Abort` may occur even after the client received
+/// `prepared` — which is why the reply is worded as an indeterminate attempt.
+fn poll_commit_pending(cp: &CommitPending, now: std::time::Instant) -> CommitPoll {
+    // RED (guard disabled): a BOUNDED-timeout decision that, on no ack, COMMITS at the
+    // deadline instead of aborting — the P0-2 defect (the commit hinges on a timer, not
+    // on the transport actually delivering `prepared`). `watchdog_aborts_at_deadline`
+    // fails RED (expects Abort, gets Commit). The GREEN commit flips the no-ack/expired
+    // branch to a watchdog Abort so the app never re-execs on an undelivered reply.
+    match cp.flush_ack.try_recv() {
+        Ok(()) => CommitPoll::Commit,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            CommitPoll::Abort("flush_disconnected")
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => {
+            if now >= cp.deadline {
+                CommitPoll::Commit
+            } else {
+                CommitPoll::Pending
+            }
+        }
+    }
+}
+
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<RunOutcome> {
     let home = crate::home_dir();
     // #2325: the app process (unlike the daemon's `run_core`, the only other
@@ -1100,6 +1163,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // the loop to drive the in-place re-exec in `run()`.
     let mut restart_outcome = RunOutcome::Normal;
     let mut restart_probe: Option<RestartProbe> = None;
+    // #2453 R2 P0-2: the commit-pending state after a passing probe. The loop NEVER
+    // blocks on the transport ack (that would freeze the UI on a wedged API writer —
+    // codex R3): it parks the `flush_ack` receiver here and polls it each tick.
+    let mut restart_commit_pending: Option<CommitPending> = None;
 
     loop {
         if crate::bootstrap::signals::term_requested() {
@@ -1112,31 +1179,63 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             use crate::api::app_restart::AppRestartVerdict;
             match poll_restart_probe(&mut restart_probe, &app_restart_gate) {
                 ProbePoll::Prepared(reply, flush_ack) => {
-                    // Probe passed; the gate is still Probing. Tell the handler
-                    // PREPARED, then BLOCK (bounded) for the transport's commit-
-                    // permission: the handler returns the committing reply,
-                    // handle_session writes+flushes it, and its post-flush action sends
-                    // `()` here. ONLY THEN do we CAS Probing→Committing and break to
-                    // teardown+exec — so the committing reply is on the socket before we
-                    // drop it (decision d-…034222169749-5). A disconnect (the action
-                    // dropped un-run: write/flush failure or the session died) or a
-                    // timeout means the reply never reached the client → abort, gate
-                    // back to Serving, keep the app running.
-                    if reply.send(AppRestartVerdict::Prepared).is_ok()
-                        && flush_ack
-                            .recv_timeout(std::time::Duration::from_secs(5))
-                            .is_ok()
-                        && app_restart_gate.to_committing()
-                    {
-                        restart_outcome = RunOutcome::RestartRequested;
-                        break;
+                    // Probe passed; the gate is still Probing. Reply PREPARED, then park
+                    // the transport ack (do NOT block): the handler returns the
+                    // `prepared` reply, handle_session writes+flushes it, and its
+                    // post-flush action sends `()` on `flush_ack`. We poll that below,
+                    // non-blockingly, and CAS Probing→Committing only on the ack — so the
+                    // UI stays responsive even if the API writer wedges. If the handler
+                    // is already gone (send fails), roll the gate back now.
+                    if reply.send(AppRestartVerdict::Prepared).is_ok() {
+                        restart_commit_pending = Some(CommitPending {
+                            flush_ack,
+                            deadline: std::time::Instant::now() + RESTART_COMMIT_WATCHDOG,
+                        });
+                    } else {
+                        app_restart_gate.abort_to_serving();
                     }
-                    app_restart_gate.abort_to_serving();
                 }
                 ProbePoll::Abort(reply, reason) => {
                     let _ = reply.send(AppRestartVerdict::Aborted(reason));
                 }
                 ProbePoll::Pending => {}
+            }
+        }
+        // #2453 R2 P0-2: poll the commit-pending state (NON-BLOCKING). The ack means
+        // the `prepared` reply flushed → CAS Probing→Committing + break to teardown+
+        // exec. A disconnect (reply not flushed) or the watchdog deadline aborts the
+        // restart with the app intact and an observable log; the `prepared` reply is
+        // an honest indeterminate attempt, so a watchdog abort stays truthful.
+        if restart_commit_pending.is_some() {
+            let now = std::time::Instant::now();
+            let poll = poll_commit_pending(
+                restart_commit_pending
+                    .as_ref()
+                    .expect("commit-pending present (checked above)"),
+                now,
+            );
+            match poll {
+                CommitPoll::Commit => {
+                    restart_commit_pending = None;
+                    if app_restart_gate.to_committing() {
+                        restart_outcome = RunOutcome::RestartRequested;
+                        break;
+                    }
+                    // Could not advance Probing→Committing (should not happen for the
+                    // claim owner) — fail safe: roll back, keep serving.
+                    app_restart_gate.abort_to_serving();
+                }
+                CommitPoll::Abort(reason) => {
+                    restart_commit_pending = None;
+                    app_restart_gate.abort_to_serving();
+                    tracing::warn!(
+                        target: "handoff",
+                        event = "app_restart_abort",
+                        reason,
+                        "#2453 app restart aborted before commit — app intact (retry)"
+                    );
+                }
+                CommitPoll::Pending => {}
             }
         }
         // Auto-close the scratch shell overlay once its backing process
@@ -2195,6 +2294,80 @@ mod tests {
     use crate::backend::Backend;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
+
+    /// #2453 R2 P0-2 witnesses (RED with the `Pending`-stub `poll_commit_pending`):
+    /// the NON-BLOCKING commit-pending decision the TUI polls each tick. Deterministic
+    /// (now-vs-deadline arithmetic, no wall-clock waiting): a buffered ack commits
+    /// (even past the deadline — `try_recv` is checked FIRST); a disconnect aborts; an
+    /// empty channel is `Pending` before the deadline and a watchdog `Abort` at/after
+    /// it. GREEN once `poll_commit_pending` runs the real try_recv + watchdog logic.
+    mod commit_pending {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn cp(rx: crossbeam_channel::Receiver<()>, deadline: Instant) -> CommitPending {
+            CommitPending {
+                flush_ack: rx,
+                deadline,
+            }
+        }
+
+        #[test]
+        fn commits_on_buffered_ack() {
+            let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+            tx.send(()).expect("send ack");
+            let now = Instant::now();
+            assert_eq!(
+                poll_commit_pending(&cp(rx, now + Duration::from_secs(3600)), now),
+                CommitPoll::Commit
+            );
+        }
+
+        #[test]
+        fn aborts_on_disconnect() {
+            let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+            drop(tx); // the post-flush action dropped un-run → the sender is gone
+            let now = Instant::now();
+            assert_eq!(
+                poll_commit_pending(&cp(rx, now + Duration::from_secs(3600)), now),
+                CommitPoll::Abort("flush_disconnected")
+            );
+        }
+
+        #[test]
+        fn pending_before_deadline() {
+            let (_tx, rx) = crossbeam_channel::bounded::<()>(1); // sender alive, no ack
+            let now = Instant::now();
+            assert_eq!(
+                poll_commit_pending(&cp(rx, now + Duration::from_secs(3600)), now),
+                CommitPoll::Pending
+            );
+        }
+
+        #[test]
+        fn watchdog_aborts_at_deadline() {
+            let (_tx, rx) = crossbeam_channel::bounded::<()>(1); // alive, no ack, no disconnect
+            let now = Instant::now();
+            assert_eq!(
+                poll_commit_pending(&cp(rx, now), now + Duration::from_millis(1)),
+                CommitPoll::Abort("flush_ack_watchdog")
+            );
+        }
+
+        /// A buffered ack must WIN over the watchdog (`try_recv` checked first): even
+        /// past the deadline a delivered reply commits rather than aborting.
+        #[test]
+        fn buffered_ack_beats_watchdog() {
+            let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+            tx.send(()).expect("send ack");
+            let now = Instant::now();
+            assert_eq!(
+                poll_commit_pending(&cp(rx, now), now + Duration::from_secs(1)),
+                CommitPoll::Commit,
+                "a buffered ack must commit even past the watchdog deadline"
+            );
+        }
+    }
 
     /// #t-84833-10 redraw-storm frame cap — the `should_draw` rate-limit decision.
     #[test]

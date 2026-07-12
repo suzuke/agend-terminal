@@ -413,6 +413,32 @@ pub(crate) fn def_binding_state() -> Value {
 mod tests {
     use super::*;
 
+    /// #2453 R2 P1: the restart_daemon schema must describe app-mode IN-PLACE re-exec
+    /// (Unix) and its `prepared` reply — the pre-R2 text ("app mode has no in-process
+    /// restart consumer; quit and relaunch") is now STALE and misleads operators/agents
+    /// into thinking app restart is unsupported. Pin the honest contract: Unix re-exec +
+    /// `prepared`, Windows fail-closed. RED against the stale description; GREEN once
+    /// `def_restart_daemon` is updated.
+    #[test]
+    fn restart_daemon_schema_describes_app_reexec() {
+        let d = def_restart_daemon();
+        let desc = d["description"].as_str().expect("description is a string");
+        assert!(
+            desc.contains("re-exec") && desc.contains("prepared"),
+            "restart_daemon description must document app-mode in-place re-exec + the \
+             `prepared` reply — got: {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("windows")
+                && desc.to_lowercase().contains("fail-closed"),
+            "must document Windows app mode fail-closed — got: {desc}"
+        );
+        assert!(
+            !desc.contains("no in-process restart consumer"),
+            "must NOT keep the stale 'no in-process restart consumer' claim — got: {desc}"
+        );
+    }
+
     #[test]
     fn create_instance_has_backend_param() {
         let defs = tool_definitions();
