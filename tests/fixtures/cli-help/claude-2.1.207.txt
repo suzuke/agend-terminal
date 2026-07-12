@@ -1,0 +1,8 @@
+# Provenance: captured 2026-07-12 on Darwin via `claude --help` (claude 2.1.207)
+# Purpose: pins the model-flag grammar ModelCapability depends on (issue #2744 PR-A, L2 fixture)
+# Minimal excerpt: only the model-flag-relevant help lines are retained.
+#
+  --model <model>                       Model for the current session. Provide
+                                        an alias for the latest model (e.g.
+                                        'fable', 'opus', or 'sonnet') or a
+                                        model's full name (e.g.

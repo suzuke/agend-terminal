@@ -2105,6 +2105,99 @@ mod tests {
         assert_eq!(args, vec!["--continue"]);
     }
 
+    /// #2744 PR-A: Shell/Raw (any command without a declared model
+    /// capability) must never receive a blind `--model` injection — `bash
+    /// --model X` fails to spawn, and an arbitrary executable's argv
+    /// semantics are unknown. Reachable today via create_instance's
+    /// unrestricted `model` param.
+    #[test]
+    fn push_model_arg_shell_raw_never_inject_2744() {
+        let mut args: Vec<String> = Vec::new();
+        Backend::push_model_arg(&mut args, "bash", "opus");
+        assert!(
+            args.is_empty(),
+            "shell must not receive --model, got {args:?}"
+        );
+
+        let mut args: Vec<String> = Vec::new();
+        Backend::push_model_arg(&mut args, "/opt/custom/agent-bin", "opus");
+        assert!(args.is_empty(), "raw must not receive --model, got {args:?}");
+    }
+
+    /// #2744 PR-A (B8): dedupe must recognize the short `-m` spelling on
+    /// backends whose CLI help declares it (codex/opencode/grok — see
+    /// tests/fixtures/cli-help/) instead of appending a second model flag.
+    #[test]
+    fn push_model_arg_dedupes_short_m_on_declaring_backends_b8_2744() {
+        for cmd in ["codex", "opencode", "grok"] {
+            let mut args = vec!["-m".to_string(), "explicit".to_string()];
+            Backend::push_model_arg(&mut args, cmd, "from-fleet");
+            assert_eq!(
+                args,
+                vec!["-m", "explicit"],
+                "backend {cmd}: separate -m must dedupe"
+            );
+        }
+    }
+
+    /// #2744 PR-A: claude/kiro-cli/agy help declares NO `-m` short flag — a
+    /// `-m` token there is not a model flag, so fleet injection must still
+    /// happen. Pins the per-backend alias set so the scanner never
+    /// over-matches on long-flag-only backends.
+    #[test]
+    fn push_model_arg_ignores_short_m_on_non_declaring_backends_2744() {
+        for cmd in ["claude", "kiro-cli", "agy"] {
+            let mut args = vec!["-m".to_string(), "unrelated".to_string()];
+            Backend::push_model_arg(&mut args, cmd, "from-fleet");
+            assert_eq!(
+                args,
+                vec!["-m", "unrelated", "--model", "from-fleet"],
+                "backend {cmd}: undeclared -m must not suppress injection"
+            );
+        }
+    }
+
+    /// #2744 PR-A: `-m=X` / `-mVAL` glued spellings are a CONSERVATIVE
+    /// conflict on -m-declaring backends: the glued-value acceptance is not
+    /// fixture-proven per CLI (clap vs yargs differ), so suppressing
+    /// injection is the fail-loud choice vs risking a double model flag.
+    #[test]
+    fn push_model_arg_conservative_conflict_on_glued_short_m_2744() {
+        for tok in ["-m=explicit", "-mexplicit"] {
+            let mut args = vec![tok.to_string()];
+            Backend::push_model_arg(&mut args, "codex", "from-fleet");
+            assert_eq!(
+                args,
+                vec![tok],
+                "glued {tok} must suppress injection (conservative conflict)"
+            );
+        }
+    }
+
+    /// #2744 PR-A: a bare `--` is the end-of-options delimiter. Injection
+    /// must place the flag pair BEFORE it (options territory), and model
+    /// tokens AFTER it are payload — never a dedupe/conflict match.
+    #[test]
+    fn push_model_arg_respects_double_dash_delimiter_2744() {
+        // Inject before the delimiter, not appended into payload.
+        let mut args = vec!["--".to_string(), "some prompt text".to_string()];
+        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        assert_eq!(args, vec!["--model", "from-fleet", "--", "some prompt text"]);
+
+        // `--model` inside payload is prompt text, not a real flag: fleet
+        // injection must still happen (before the delimiter).
+        let mut args = vec![
+            "--".to_string(),
+            "--model".to_string(),
+            "quoted".to_string(),
+        ];
+        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        assert_eq!(
+            args,
+            vec!["--model", "from-fleet", "--", "--model", "quoted"]
+        );
+    }
+
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);

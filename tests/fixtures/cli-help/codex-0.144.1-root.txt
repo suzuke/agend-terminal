@@ -1,0 +1,7 @@
+# Provenance: captured 2026-07-12 on Darwin via `codex --help` (codex-cli 0.144.1)
+# Purpose: pins the model-flag grammar ModelCapability depends on (issue #2744 PR-A, L2 fixture)
+# Minimal excerpt: only the model-flag-relevant help lines are retained.
+#
+  -m, --model <MODEL>
+          Model the agent should use
+

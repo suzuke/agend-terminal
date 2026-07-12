@@ -1,0 +1,7 @@
+# Provenance: captured 2026-07-12 on Darwin via `agy --help` (agy 1.0.15)
+# Purpose: pins the model-flag grammar ModelCapability depends on (issue #2744 PR-A, L2 fixture)
+# Minimal excerpt: only the model-flag-relevant help lines are retained.
+#
+  --model                         Model for the current CLI session
+  --new-project                   Create a new project for this session
+  -p                              Short alias for --print
