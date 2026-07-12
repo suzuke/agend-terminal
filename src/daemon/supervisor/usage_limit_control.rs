@@ -256,7 +256,14 @@ fn observe_tick<E: ControlEffects>(
     };
 
     match existing {
-        Some(mut episode) if episode.key == current_key => {
+        // #2759 r1: `Recovered` is terminal HISTORY, never an active episode —
+        // without this exclusion a same-key recurrence hit reconcile_active on
+        // ONE tick (no two-tick cycle) and the re-blocked task could never
+        // heal, because both recovery paths skip Recovered episodes. Same-key
+        // Recovered falls through to the fresh-Detected arm below.
+        Some(mut episode)
+            if episode.key == current_key && episode.state != EpisodeState::Recovered =>
+        {
             if episode.state != EpisodeState::Detected {
                 let recipient = if episode.recipient.is_empty() {
                     input.recipient.as_str()
@@ -901,6 +908,13 @@ struct MemoryEffects {
     notification_ids: HashSet<String>,
     generation_matches_at_atomic_append: bool,
     registry_len: usize,
+    /// Mirrors the board state FsEffects::block_task reads: `true` ⟺ the task
+    /// is already Blocked with THIS episode's reason, so a re-block is an
+    /// idempotent no-op (the FsEffects early-return). #2759 r1: without this
+    /// mirror the default no-op `reconcile_active` hid every reconcile side
+    /// effect from the memory harness — the exact blind spot that let the
+    /// same-key one-tick re-block ship green.
+    task_blocked_with_episode_reason: bool,
 }
 
 #[cfg(test)]
@@ -912,6 +926,7 @@ impl Default for MemoryEffects {
             notification_ids: HashSet::new(),
             generation_matches_at_atomic_append: true,
             registry_len: 7,
+            task_blocked_with_episode_reason: false,
         }
     }
 }
@@ -929,7 +944,11 @@ impl ControlEffects for MemoryEffects {
     }
 
     fn block_task(&mut self, key: &EpisodeKey) -> anyhow::Result<()> {
+        if self.task_blocked_with_episode_reason {
+            return Ok(());
+        }
         self.effects.push(Effect::BlockTask(key.clone()));
+        self.task_blocked_with_episode_reason = true;
         Ok(())
     }
 
@@ -955,6 +974,14 @@ impl ControlEffects for MemoryEffects {
             });
         }
         Ok(())
+    }
+
+    // #2759 r1 (M1): mirror FsEffects::reconcile_active instead of inheriting
+    // the trait's no-op default, so active-episode ticks surface their
+    // block/notify side effects to memory-level assertions.
+    fn reconcile_active(&mut self, key: &EpisodeKey, recipient: &str) -> anyhow::Result<()> {
+        self.block_task(key)?;
+        self.notify_once(key, recipient, false)
     }
 }
 
@@ -1121,12 +1148,17 @@ mod tests {
 
     #[test]
     fn restart_replay_deduplicates_block_and_notification() {
+        // Restart precondition: the pre-restart activation already Blocked the
+        // task with this episode's reason and enqueued the notification —
+        // mirror BOTH durable states so the honest (#2759 r1 M1) reconcile
+        // path no-ops exactly like FsEffects would against the real board.
         let mut fx = MemoryEffects {
             episode: Some(Episode::activated(
                 key(),
                 EpisodeState::CandidateReady,
                 Some("worker-b".into()),
             )),
+            task_blocked_with_episode_reason: true,
             ..Default::default()
         };
         fx.notification_ids.insert(key().notification_id());
@@ -1136,6 +1168,32 @@ mod tests {
         assert!(
             fx.effects.is_empty(),
             "restart must not duplicate durable effects"
+        );
+    }
+
+    /// #2759 r1: memory-level pin of the same-key recurrence guard. With the
+    /// honest reconcile mirror (M1), an unguarded arm-1 would surface
+    /// `BlockTask` here on ONE tick — the fixed guard must instead start a
+    /// fresh Detected cycle with no board mutation and no notification.
+    #[test]
+    fn single_ul_tick_after_recovered_same_key_starts_fresh_cycle() {
+        let mut fx = MemoryEffects {
+            episode: Some(Episode {
+                key: key(),
+                state: EpisodeState::Recovered,
+                consecutive_ticks: 2,
+                candidate: None,
+                unlock_at: None,
+                recipient: "lead".into(),
+            }),
+            ..Default::default()
+        };
+        let outcome = observe_tick(&mut fx, input(AgentState::UsageLimit)).expect("single tick");
+        assert_eq!(outcome, TickOutcome::Detected);
+        assert_eq!(
+            fx.effects,
+            vec![Effect::Persist(EpisodeState::Detected)],
+            "one tick after Recovered: fresh cycle only — no re-block, no notify"
         );
     }
 
