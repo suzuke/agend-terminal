@@ -80,9 +80,9 @@ impl PostFlushSlot {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn register(&self, action: AfterFlushAction) -> bool {
         let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if st.closed || st.action.is_some() {
-            return false;
-        }
+        // #2453 R2 RED WITNESS (temporary; GREEN restores the closed/occupied guard):
+        // accept every register, ignoring closed/occupied → a late/timed-out/concurrent
+        // worker can hijack a later response's flush.
         st.action = Some(action);
         true
     }
@@ -98,12 +98,13 @@ impl PostFlushSlot {
             st.closed = true;
             st.action.take()
         };
-        if flushed_ok {
-            if let Some(action) = action {
-                action();
-            }
+        // #2453 R2 RED WITNESS (temporary; GREEN restores the `if flushed_ok` gate):
+        // run the action regardless of flush success → a FAILED flush wrongly delivers
+        // the commit-permission instead of dropping it un-run.
+        let _ = flushed_ok;
+        if let Some(action) = action {
+            action();
         }
-        // else: `action` drops here un-run → sender drops → TUI flush_ack disconnects.
     }
 }
 
@@ -247,5 +248,57 @@ mod tests {
         assert!(g2.abort_to_serving(), "Probing→Serving on abort");
         assert!(g2.is_serving());
         assert!(g2.try_begin_probe(), "gate reusable after abort");
+    }
+
+    /// #2453 R2 barrier: PostFlushSlot is single-shot AND closes after the response.
+    /// A second `register` on an occupied slot, or ANY `register` after the response
+    /// flushed (closed), is rejected — a late / timed-out / concurrent worker cannot
+    /// hijack a later response's flush.
+    #[test]
+    fn post_flush_slot_is_single_shot_and_closes() {
+        let slot = PostFlushSlot::new();
+        assert!(slot.register(Box::new(|| {})), "first register wins");
+        assert!(
+            !slot.register(Box::new(|| {})),
+            "a second register on an occupied slot must be rejected"
+        );
+        slot.run_after_flush(true); // runs the action + CLOSES the slot
+        assert!(
+            !slot.register(Box::new(|| {})),
+            "register after the response flushed (slot closed) must be rejected"
+        );
+    }
+
+    /// #2453 R2 barrier: a FAILED write/flush must drop the registered action UN-RUN
+    /// so its captured sender drops and the receiver DISCONNECTS — that disconnect is
+    /// how the TUI learns to abort (roll the gate back to Serving). A successful flush
+    /// runs the action (delivers the commit-permission).
+    #[test]
+    fn post_flush_failure_drops_action_success_runs_it() {
+        // Failure path: the action is dropped un-run → the receiver disconnects.
+        let slot = PostFlushSlot::new();
+        let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+        assert!(slot.register(Box::new(move || {
+            let _ = tx.send(());
+        })));
+        slot.run_after_flush(false);
+        assert_eq!(
+            rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected),
+            "a failed flush must drop the ack un-run → disconnect (the TUI aborts)"
+        );
+
+        // Success path: the action runs → the commit-permission is delivered.
+        let slot = PostFlushSlot::new();
+        let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+        assert!(slot.register(Box::new(move || {
+            let _ = tx.send(());
+        })));
+        slot.run_after_flush(true);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(()),
+            "a successful flush must run the action → deliver commit-permission"
+        );
     }
 }

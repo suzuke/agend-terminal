@@ -144,6 +144,87 @@ mod app_restart_strategy_tests {
             "an aborted probe must NOT arm the barrier — the slot stays free"
         );
     }
+
+    /// #2453 R2 barrier (real-entry): on `Prepared` the handler returns committing and
+    /// ARMS the slot, but does NOT itself commit — the gate stays `Probing`, and the
+    /// commit-permission is delivered ONLY when the transport runs the slot after a
+    /// successful flush. Proves the "commit only after the reply flushes" invariant
+    /// (delayed-writer): nothing commits until the exact response flush.
+    #[test]
+    fn prepared_does_not_commit_until_flush() {
+        let (ar, rx) = make();
+        let gate = ar.gate.clone();
+        let slot = PostFlushSlot::new();
+        let t = std::thread::spawn(move || {
+            let req = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request delivered to loop");
+            req.reply
+                .send(AppRestartVerdict::Prepared)
+                .expect("verdict reply sent");
+            req.flush_ack // hand the receiver back so the test can observe the ack
+        });
+        let resp = handle_restart_daemon(
+            Path::new("/tmp"),
+            Some(RestartCapability::App),
+            Some(ar),
+            Some(slot.clone()),
+        );
+        let flush_ack = t.join().expect("stub loop thread joined");
+        assert_eq!(resp["restart"], "committing");
+        // BEFORE the flush: the handler must NOT have committed, and no commit-
+        // permission has been delivered.
+        assert!(
+            !gate.is_committing(),
+            "the handler must NOT commit before the committing reply flushes"
+        );
+        assert!(
+            flush_ack.try_recv().is_err(),
+            "no commit-permission before the flush"
+        );
+        // The transport flushes THIS committing reply → the commit-permission fires.
+        slot.run_after_flush(true);
+        assert!(
+            flush_ack.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "commit-permission is delivered ONLY after the successful flush"
+        );
+    }
+
+    /// #2453 R2 barrier: if the TUI loop delivers NO verdict (its reply sender drops —
+    /// a stuck/gone loop, or equivalently the 7s timeout), the handler rolls the gate
+    /// back to `Serving`. It can NEVER be left `Committing`, so it can NEVER report
+    /// "fleet intact" while a commit is in flight (the gate reaches `Committing` only
+    /// AFTER the flush ack, which is post-return — the timeout branch sees only
+    /// `Probing`). Dropping the sender makes this deterministic (no 7s wait).
+    #[test]
+    fn no_verdict_rolls_gate_to_serving() {
+        let (ar, rx) = make();
+        let gate = ar.gate.clone();
+        let slot = PostFlushSlot::new();
+        let t = std::thread::spawn(move || {
+            // Receive the request and DROP it without replying → the handler's
+            // reply_rx disconnects → its timeout/error branch runs (fast, no 7s wait).
+            let _req = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request delivered to loop");
+        });
+        let resp = handle_restart_daemon(
+            Path::new("/tmp"),
+            Some(RestartCapability::App),
+            Some(ar),
+            Some(slot),
+        );
+        t.join().expect("stub loop thread joined");
+        assert_eq!(resp["ok"], false);
+        assert!(
+            gate.is_serving(),
+            "no verdict must roll the gate back to Serving (fleet intact)"
+        );
+        assert!(
+            !gate.is_committing(),
+            "no verdict must NEVER leave the gate Committing"
+        );
+    }
 }
 
 /// #2453 R2: Windows `App` owner-restart is an isolated fail-closed strategy —

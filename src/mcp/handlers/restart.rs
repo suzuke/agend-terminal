@@ -86,6 +86,10 @@ fn app_restart_strategy(
     // Probing→Serving; it can never lie "fleet intact" while the app execs.
     match reply_rx.recv_timeout(std::time::Duration::from_secs(7)) {
         Ok(AppRestartVerdict::Prepared) => {
+            // #2453 R2 RED WITNESS (temporary; GREEN removes this early commit): commit
+            // BEFORE the reply flushes → the gate is Committing at handler-return, so a
+            // slow/failed flush loses the reply while the app commits (the bug).
+            ar.gate.to_committing();
             // Arm the barrier: register the commit-permission ack into THIS request's
             // slot. Only a successful write+flush of the committing reply runs it (→
             // `ack_tx.send(())` → the TUI, blocked on `flush_ack`, commits
@@ -118,7 +122,8 @@ fn app_restart_strategy(
         Err(_) => {
             // Timeout: gate is still Probing (the TUI hasn't committed) → roll back.
             // No lie possible. `ack_tx` drops → TUI's `flush_ack` disconnects → aborts.
-            ar.gate.abort_to_serving();
+            // #2453 R2 RED WITNESS (temporary; GREEN restores abort_to_serving): skip
+            // the rollback → the gate is left stuck at Probing on a no-verdict timeout.
             json!({
                 "ok": false,
                 "error": "restart_daemon preflight timed out; fleet + TUI intact — no restart"
