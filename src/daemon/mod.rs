@@ -25,6 +25,7 @@ pub(crate) mod handoff_timeout_watchdog;
 pub(crate) mod heartbeat_pair;
 pub(crate) mod helper_staleness_watchdog;
 pub mod hook_shadow;
+pub(crate) mod hygiene_task;
 pub(crate) mod idle_watchdog;
 pub(crate) mod inbox_stuck_watchdog;
 pub(crate) mod inject_delivery;
