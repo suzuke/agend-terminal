@@ -105,7 +105,10 @@ fn app_restart_strategy(_app_restart: Option<crate::api::app_restart::AppRestart
 
 /// #2453 Stage R2: `App` capability but NO injected restart channel (e.g. a
 /// standalone bridge call that never traversed the in-process app api ingress).
-/// Fail closed — there is no TUI loop to consume a request.
+/// Fail closed — there is no TUI loop to consume a request. Unix-only: its sole
+/// caller is the Unix `app_restart_strategy` (the Windows arm fail-closes directly),
+/// so gating it keeps the Windows build free of dead_code.
+#[cfg(unix)]
 fn app_no_channel_fail_closed() -> Value {
     tracing::warn!(
         target: "handoff",

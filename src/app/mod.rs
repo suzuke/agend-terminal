@@ -456,6 +456,9 @@ fn spawn_restart_probe() -> std::io::Result<std::process::Child> {
 /// #2453 R2: the argv the app re-execs into on a committed restart. Preserves the
 /// `app` subcommand + the `--fleet <override>` the operator launched with.
 /// Factored out so it is unit-testable without performing the irreversible `exec`.
+/// Unix-only: the in-place re-exec (`commit_app_restart`) exists only on Unix — its
+/// sole caller — so gating this with it keeps the Windows build free of dead_code.
+#[cfg(unix)]
 fn restart_argv(fleet_override: Option<&str>) -> Vec<String> {
     let mut argv = vec!["app".to_string()];
     if let Some(f) = fleet_override {
