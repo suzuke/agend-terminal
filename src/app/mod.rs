@@ -477,7 +477,11 @@ fn commit_app_restart(fleet_override: Option<&str>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(restart_argv(fleet_override));
-    let err = cmd.exec(); // on success, never returns
+    // #2453 R2 RED WITNESS (temporary — GREEN restores `cmd.exec()` on this line):
+    // the in-place re-exec is disabled, so this fn falls through to exit(70) and
+    // the app EXITS after teardown instead of re-exec'ing. The PTY exec-lifecycle
+    // test MUST fail against this (the original pid dies; the app never serves again).
+    let err = std::io::Error::other("#2453 R2 RED witness: in-place re-exec disabled");
     eprintln!(
         "agend-terminal: restart re-exec failed: {err}. Agents were stopped and the \
          session was saved — relaunch `agend-terminal app`."

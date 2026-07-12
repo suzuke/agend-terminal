@@ -788,23 +788,34 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
     Some(reply.is_object())
 }
 
-/// #2098 §3.9 — `agend-terminal app` (combined TUI+daemon) must NOT brick its
-/// control plane on `restart_daemon`. With self-respawn the DEFAULT (#2094) and
-/// no external supervisor, the pre-fix handler set RESTART_PENDING in the app
-/// process — which has NO run_core consumer — so api/mod.rs broke every session
-/// and the held-flock successor 30s-timed-out and died, latching the brick
-/// permanently. The fix fails CLOSED in app mode: restart_daemon returns
-/// ok:false (actionable) and the app's control plane stays fully alive.
+/// #2453 R2 (supersedes the #2098 app-mode fail-closed placeholder): `agend-terminal
+/// app` owner-restart now RE-EXECS in place. The pre-R2 handler fail-closed as a
+/// stopgap against the #2098 app-mode brick; R2 replaces it with a real in-place
+/// re-exec. This is the real-entry lifecycle witness that consolidates the ordering
+/// + exec-lifecycle merge-blockers. A real `restart_daemon` MCP call over the LIVE
+/// app api socket must:
+///   1. return `committing` — receiving it proves the reply crossed the socket
+///      BEFORE teardown dropped it (ORDERING: reply precedes teardown/exec);
+///   2. re-exec IN PLACE — the SAME pid stays alive across the exec (exec, not a
+///      spawned successor; execve preserves the pid);
+///   3. bring the control plane back on the RE-READ api.port and serve a real
+///      request (NO BRICK). We do NOT require the port VALUE to change — the OS may
+///      legitimately reuse the same ephemeral port after close+rebind, so asserting
+///      a change would flake (per #2453 R2 review);
+///   4. leave EXACTLY ONE active pid — no successor / RESTART_PENDING / flock
+///      competitor. This is why the #2098 brick class cannot recur under R2:
+///      re-exec sets no RESTART_PENDING and spawns no flock rival.
 ///
-/// Plugs the dual-review blind spot: the sibling `self_respawn_*` tests boot
-/// `start --foreground` (run_core mode, which DOES consume RESTART_PENDING), so
-/// they never exercised the app-mode brick. Here the predecessor is the REAL
-/// `app` binary (under a PTY so ratatui::init succeeds headlessly). Post-fix the
-/// handler fail-closes BEFORE spawning any successor, so this GREEN run brings up
-/// only the one app process (no successor subprocess).
+/// The #2098 brick guarantee is preserved here by assertions 3 + 4. The sibling
+/// `self_respawn_*` tests keep DAEMON-mode (`start --foreground`) fail-close /
+/// regression coverage SEPARATELY. The app runs under a PTY so `ratatui::init`
+/// succeeds headlessly. Unix-only (in-place exec is Unix-only; Windows fail-closes
+/// at the handler — covered by the `#[cfg(windows)]` unit test in restart.rs). Per
+/// decision d-20260712034222169749-5.
+#[cfg(unix)]
 #[test]
-fn app_mode_restart_fails_closed_no_brick_2098() {
-    let home = std::env::temp_dir().join(format!("agend-2098-appmode-{}", std::process::id()));
+fn app_mode_restart_reexecs_in_place_2453() {
+    let home = std::env::temp_dir().join(format!("agend-2453-reexec-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
 
     let mut child = boot_app_under_pty(&home);
@@ -823,57 +834,90 @@ fn app_mode_restart_fails_closed_no_brick_2098() {
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
 
-    // Real restart_daemon over the real app api socket.
+    // Real restart_daemon over the real app api socket. Receiving the committing
+    // reply IS the ordering proof: it crossed the socket BEFORE teardown dropped it
+    // (the arm replies Committing before the ordered teardown + exec).
     let resp = trigger_restart(&home, pid);
 
-    // ── Load-bearing: NO BRICK ── a NEW session must STILL be served after
-    // restart_daemon. Pre-fix the app latched RESTART_PENDING → api/mod.rs broke
-    // every session → this STATUS round-trip fails. Post-fix (fail-closed, no
-    // flag set) it succeeds.
-    let still_alive = api_status_ok_within(&home, pid, Duration::from_secs(15));
-    // The SAME app process must remain the single active daemon (no exit, no
-    // successor double-bind).
-    let same_single = active_pids(&home) == vec![pid] && pid_alive(pid);
+    // Bounded, EVENT-DRIVEN settle for the in-place re-exec. execve preserves the
+    // pid and the process NEVER exits (`child.try_wait()` stays `None`); the
+    // disabled-exec RED path runs `exit(70)` after teardown (`try_wait` returns
+    // `Some`). The re-exec'd control plane then serves again on the RE-READ api.port
+    // (`api_status_once` re-reads run_dir/api.port each attempt, so a rebound port —
+    // same OR different value — is handled). We conclude "re-exec'd" ONLY after the
+    // process has been continuously alive AND serving for a stability window that
+    // OUTLASTS the RED teardown→exit — this rejects the brief "old server answers
+    // mid-teardown" transient (which occurs on BOTH the exec and the exit path) that
+    // a one-shot alive+serving check would mistake for success.
+    const STABLE: Duration = Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut exited = false;
+    let mut serving_since: Option<Instant> = None;
+    let mut reexec_confirmed = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            exited = true; // process exited → did NOT re-exec in place (the RED path)
+            break;
+        }
+        if api_status_once(&home, pid) == Some(true) {
+            if serving_since.get_or_insert_with(Instant::now).elapsed() >= STABLE {
+                reexec_confirmed = true; // alive + serving continuously past teardown→exit
+                break;
+            }
+        } else {
+            serving_since = None; // teardown/exec gap (not serving) → reset the timer
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let single_active = active_pids(&home) == vec![pid];
 
     // Cleanup BEFORE asserting so a failure never leaks the child. (The drain
-    // thread is detached — see boot_app_under_pty — so there is nothing to join;
-    // cleanup_test_home reaps any spawned successor on the pre-fix brick path.)
+    // thread is detached — see boot_app_under_pty — nothing to join.)
     let _ = child.kill();
     let _ = child.wait();
     cleanup_test_home(&home);
 
-    // restart_daemon must report fail-closed (mcp_tool wraps handler output as
-    // {ok:true, result:{...}}; the app-mode refusal is result.ok == false).
-    if let Some(resp) = resp {
-        let result_ok = resp
-            .get("result")
-            .and_then(|r| r.get("ok"))
-            .and_then(|b| b.as_bool());
-        assert_eq!(
-            result_ok,
-            Some(false),
-            "app-mode restart_daemon must report result.ok=false (fail-closed), got {resp}"
-        );
-        let err = resp
-            .get("result")
-            .and_then(|r| r.get("error"))
-            .and_then(|e| e.as_str())
-            .unwrap_or("");
-        assert!(
-            err.contains("app"),
-            "fail-closed error must name `app` mode (actionable) — got {err:?}"
-        );
-    } else {
-        panic!(
-            "app-mode restart must return a reply (the predecessor is never signalled — it stays alive to answer)"
-        );
-    }
-    assert!(
-        still_alive,
-        "app control plane must stay alive after restart_daemon (no brick) — a new STATUS round-trip failed"
+    // (1) ORDERING: the committing reply was received before the socket dropped.
+    let resp =
+        resp.expect("app-mode restart must return a committing reply before the socket drops");
+    let result_ok = resp
+        .get("result")
+        .and_then(|r| r.get("ok"))
+        .and_then(|b| b.as_bool());
+    let restart = resp
+        .get("result")
+        .and_then(|r| r.get("restart"))
+        .and_then(|s| s.as_str());
+    assert_eq!(
+        result_ok,
+        Some(true),
+        "app-mode restart_daemon must report result.ok=true (re-exec committing), got {resp}"
     );
+    assert_eq!(
+        restart,
+        Some("committing"),
+        "app-mode restart_daemon must report restart=committing (reply precedes teardown/exec), got {resp}"
+    );
+
+    // (2) EXEC-NOT-SPAWN + NO BRICK: the ORIGINAL pid stayed alive across the exec
+    // (never exited) AND the re-exec'd control plane serves again on the re-read
+    // api.port for a stable window. A disabled exec would exit(70) after teardown →
+    // `exited` and this fails RED.
     assert!(
-        same_single,
-        "the SAME app process must remain the single active daemon (no exit, no double-bind)"
+        !exited && reexec_confirmed,
+        "the app must re-exec IN PLACE: the SAME pid stays alive across the exec (execve preserves \
+         the pid; a disabled exec exits instead) AND serves again on the re-read api.port (no brick) \
+         — exited={exited}, reexec_confirmed={reexec_confirmed}"
+    );
+    // (3) EXACTLY ONE active pid — no successor / flock competitor / RESTART_PENDING latch.
+    assert!(
+        single_active,
+        "exactly one active pid (the re-exec'd original) — no successor double-bind or flock competitor"
+    );
+
+    eprintln!(
+        "#2453 R2 evidence: app-mode in-place re-exec lifecycle verified on {} (pid {} survived exec + served again)",
+        std::env::consts::OS,
+        pid
     );
 }
