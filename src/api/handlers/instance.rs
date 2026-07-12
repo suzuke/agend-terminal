@@ -584,6 +584,7 @@ mod tests {
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
         (ctx, home)
     }
@@ -654,6 +655,7 @@ mod tests {
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
         (ctx, home)
     }
@@ -739,6 +741,7 @@ mod tests {
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
 
         let resp = handle_spawn(&json!({"name": "twin", "backend": "claude"}), &ctx);
@@ -1131,6 +1134,7 @@ mod tests {
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
         (ctx, home)
     }

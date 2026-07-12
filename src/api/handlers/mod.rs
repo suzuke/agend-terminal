@@ -124,4 +124,10 @@ pub(crate) struct HandlerCtx<'a> {
     /// #2453 Stage R2: the app owner-restart request channel + gate (app root
     /// only). Carried into the MCP `RuntimeContext`. `None` on daemon/verify.
     pub app_restart: Option<&'a crate::api::app_restart::AppRestart>,
+    /// #2453 Stage R2 (flush barrier): a fresh per-request slot for a post-flush
+    /// action. `handle_session` creates it, threads a clone into the MCP
+    /// `RuntimeContext` (so the restart handler can register its commit-permission
+    /// ack), and — after writing the response — calls `run_after_flush`. Cheap
+    /// `Arc` clone; unused by non-restart tools.
+    pub post_flush: crate::api::app_restart::PostFlushSlot,
 }

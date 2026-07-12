@@ -149,6 +149,9 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         externals: ctx.externals.clone(),
         capability: ctx.capability,
         app_restart: ctx.app_restart.cloned(),
+        // #2453 R2 flush barrier: carry THIS request's slot so `restart_daemon` can
+        // register its commit-permission ack, run by `handle_session` after flush.
+        post_flush: Some(ctx.post_flush.clone()),
     };
     handle_mcp_tool_inner(
         tool,
@@ -510,6 +513,7 @@ mod tests {
             home: &dir,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
 
         let full = crate::mcp::tools::tool_definitions()["tools"]
@@ -568,6 +572,7 @@ mod tests {
             home: &dir,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
 
         let resp = handle_mcp_tool(
@@ -614,6 +619,7 @@ mod tests {
             home: &dir,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
 
         let resp = handle_mcp_tool(
@@ -663,6 +669,7 @@ mod tests {
             home: &dir,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
 
         let resp = handle_mcp_tools_list(&json!({"instance": "bad"}), &ctx);
@@ -704,6 +711,7 @@ mod tests {
             home: &dir,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         };
 
         let full = crate::mcp::tools::tool_definitions()["tools"]

@@ -56,6 +56,12 @@ pub(crate) struct RuntimeContext {
     /// injected at the app API composition root. `Some` only under
     /// `RestartCapability::App`; `None` everywhere else (daemon/verify fail-closed).
     pub app_restart: Option<crate::api::app_restart::AppRestart>,
+    /// #2453 Stage R2 (flush barrier): a clone of the CURRENT API request's
+    /// `PostFlushSlot`, carried from the API `HandlerCtx` so the restart handler can
+    /// register a post-flush commit-permission ack that `handle_session` runs after
+    /// it flushes THIS response. `None` off the api `mcp_tool` ingress (no request to
+    /// tie a flush to → the handler cannot arm the barrier and fails closed).
+    pub post_flush: Option<crate::api::app_restart::PostFlushSlot>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -289,6 +295,7 @@ pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
         ctx.home,
         ctx.runtime.map(|r| r.capability),
         ctx.runtime.and_then(|r| r.app_restart.clone()),
+        ctx.runtime.and_then(|r| r.post_flush.clone()),
     )
 }
 
@@ -452,6 +459,7 @@ mod tests {
             )),
             capability: crate::api::RestartCapability::App,
             app_restart: None,
+            post_flush: None,
         };
         let ctx = HandlerCtx {
             home: &home,

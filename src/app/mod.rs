@@ -426,10 +426,13 @@ pub(crate) enum RunOutcome {
 }
 
 /// #2453 R2: an in-flight app-restart preflight probe (a direct child running
-/// `--restart-probe`), owned + polled non-blocking by the TUI loop.
+/// `--restart-probe`), owned + polled non-blocking by the TUI loop. Carries the
+/// request's `reply` (TUI→handler verdict) and `flush_ack` (the transport's
+/// post-flush commit-permission the TUI waits on before it commits + re-execs).
 struct RestartProbe {
     child: std::process::Child,
     reply: crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>,
+    flush_ack: crossbeam_channel::Receiver<()>,
     deadline: std::time::Instant,
 }
 
@@ -523,19 +526,25 @@ pub(crate) fn run_restart_probe() -> ! {
     std::process::exit(code);
 }
 
-/// #2453 R2: the decision the TUI loop reaches when it polls the in-flight
-/// restart probe on a tick. Extracted from the loop so the commit-vs-abort branch
-/// — the one that gates the IRREVERSIBLE teardown+exec — is unit-testable without
-/// driving the full TUI (mirrors `restart_argv`). The loop maps `Commit` to
-/// reply-Committing + break-to-teardown, and `Abort` to reply-Aborted + keep
-/// serving (NO teardown). Ownership: on any terminal verdict the probe is `take`n
-/// out of the slot (and killed+reaped on timeout).
+/// #2453 R2: the decision the TUI loop reaches when it polls the in-flight restart
+/// probe on a tick. Extracted from the loop so the prepare-vs-abort branch — the one
+/// gating the IRREVERSIBLE teardown+exec — is unit-testable without driving the full
+/// TUI (mirrors `restart_argv`). A passing probe does NOT commit here; it yields
+/// `Prepared` (gate still `Probing`) and the loop replies `Prepared`, waits for the
+/// transport's post-flush ack, and ONLY THEN CAS `Probing→Committing` + breaks to
+/// teardown+exec. `Abort` rolls the gate to `Serving` and keeps serving. Ownership:
+/// on any terminal verdict the probe is `take`n out of the slot (killed+reaped on timeout).
 enum ProbePoll {
     /// Probe still running and within its deadline — keep serving this tick.
     Pending,
-    /// Probe passed AND the gate advanced `Probing → Committing`. The loop must
-    /// reply `Committing`, set `RestartRequested`, and break to teardown + exec.
-    Commit(crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>),
+    /// Probe passed; gate is STILL `Probing` (NOT yet committed). The loop replies
+    /// `Prepared`, then blocks on the `flush_ack` receiver for the transport's
+    /// commit-permission; on the ack it CAS `Probing→Committing`, sets
+    /// `RestartRequested`, and breaks to teardown+exec. A disconnect/timeout aborts.
+    Prepared(
+        crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>,
+        crossbeam_channel::Receiver<()>,
+    ),
     /// Probe failed / timed out / errored — the gate was rolled back to `Serving`
     /// and NO restart happens. The loop replies `Aborted(reason)` and keeps
     /// serving; teardown + exec are never reached.
@@ -545,11 +554,11 @@ enum ProbePoll {
     ),
 }
 
-/// #2453 R2: poll `probe` once (non-blocking). A passing probe transitions the
-/// gate to `Committing` (the ONLY path to teardown+exec); every failure mode
-/// (non-zero exit, timeout, wait error) rolls the gate back to `Serving` and
-/// yields `Abort`, PROVING a failed preflight performs zero teardown. Behavior is
-/// identical to the pre-extraction inline block.
+/// #2453 R2: poll `probe` once (non-blocking). A passing probe yields `Prepared`
+/// WITHOUT touching the gate (it stays `Probing`) — the loop commits only after the
+/// transport's post-flush ack. Every failure mode (non-zero exit, timeout, wait
+/// error) rolls the gate back to `Serving` and yields `Abort`, PROVING a failed
+/// preflight performs zero teardown.
 fn poll_restart_probe(
     probe: &mut Option<RestartProbe>,
     gate: &crate::api::app_restart::AppRestartGate,
@@ -565,8 +574,12 @@ fn poll_restart_probe(
     {
         Ok(Some(status)) => {
             let p = probe.take().expect("probe present (checked above)");
-            if status.success() && gate.to_committing() {
-                ProbePoll::Commit(p.reply)
+            if status.success() {
+                // Probe passed: DO NOT commit here — leave the gate at `Probing`. The
+                // loop replies `Prepared` and CAS `Probing→Committing` only after the
+                // transport's post-flush ack, so the committing reply can't be lost to
+                // a teardown that outran the writer.
+                ProbePoll::Prepared(p.reply, p.flush_ack)
             } else {
                 gate.abort_to_serving();
                 ProbePoll::Abort(
@@ -1098,11 +1111,27 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         if restart_probe.is_some() {
             use crate::api::app_restart::AppRestartVerdict;
             match poll_restart_probe(&mut restart_probe, &app_restart_gate) {
-                ProbePoll::Commit(reply) => {
-                    // Success reply BEFORE teardown/exec (decision d-…034222169749-5).
-                    let _ = reply.send(AppRestartVerdict::Committing);
-                    restart_outcome = RunOutcome::RestartRequested;
-                    break;
+                ProbePoll::Prepared(reply, flush_ack) => {
+                    // Probe passed; the gate is still Probing. Tell the handler
+                    // PREPARED, then BLOCK (bounded) for the transport's commit-
+                    // permission: the handler returns the committing reply,
+                    // handle_session writes+flushes it, and its post-flush action sends
+                    // `()` here. ONLY THEN do we CAS Probing→Committing and break to
+                    // teardown+exec — so the committing reply is on the socket before we
+                    // drop it (decision d-…034222169749-5). A disconnect (the action
+                    // dropped un-run: write/flush failure or the session died) or a
+                    // timeout means the reply never reached the client → abort, gate
+                    // back to Serving, keep the app running.
+                    if reply.send(AppRestartVerdict::Prepared).is_ok()
+                        && flush_ack
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .is_ok()
+                        && app_restart_gate.to_committing()
+                    {
+                        restart_outcome = RunOutcome::RestartRequested;
+                        break;
+                    }
+                    app_restart_gate.abort_to_serving();
                 }
                 ProbePoll::Abort(reply, reason) => {
                     let _ = reply.send(AppRestartVerdict::Aborted(reason));
@@ -1318,6 +1347,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 restart_probe = Some(RestartProbe {
                                     child,
                                     reply: req.reply,
+                                    flush_ack: req.flush_ack,
                                     deadline: std::time::Instant::now()
                                         + std::time::Duration::from_secs(5),
                                 });
@@ -3231,11 +3261,11 @@ mod tests {
     }
 }
 
-/// #2453 R2 slice 2 — preflight failure proves ZERO teardown. `Commit` is the
-/// ONLY `ProbePoll` variant that breaks the TUI loop into the irreversible
-/// teardown+exec; every probe failure mode must instead roll the gate back to
-/// `Serving` and yield `Abort`, leaving the app serving. This unit-checks that
-/// invariant on the extracted `poll_restart_probe` without driving the full TUI.
+/// #2453 R2 slice 2 — preflight failure proves ZERO teardown. `Prepared` is the
+/// ONLY `ProbePoll` variant that can lead the TUI loop into the irreversible
+/// teardown+exec (and only after the post-flush ack); every probe failure mode must
+/// instead roll the gate back to `Serving` and yield `Abort`, leaving the app
+/// serving. This unit-checks that on the extracted `poll_restart_probe` without the TUI.
 #[cfg(all(test, unix))]
 mod probe_poll_tests {
     use super::*;
@@ -3252,11 +3282,14 @@ mod probe_poll_tests {
             .spawn()
             .expect("spawn probe child");
         let (reply, rx) = crossbeam_channel::unbounded::<AppRestartVerdict>();
+        // The failure path never reads flush_ack; a disconnected receiver is fine.
+        let (_ack_tx, flush_ack) = crossbeam_channel::bounded::<()>(1);
         let deadline = Instant::now() + Duration::from_secs(60);
         (
             RestartProbe {
                 child,
                 reply,
+                flush_ack,
                 deadline,
             },
             rx,

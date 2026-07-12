@@ -16,27 +16,41 @@ pub(super) fn handle_restart_daemon(
     home: &Path,
     capability: Option<crate::api::RestartCapability>,
     app_restart: Option<crate::api::app_restart::AppRestart>,
+    post_flush: Option<crate::api::app_restart::PostFlushSlot>,
 ) -> Value {
     use crate::api::RestartCapability;
     match capability {
         Some(RestartCapability::Daemon) => daemon_restart_strategy(home),
-        Some(RestartCapability::App) => app_restart_strategy(app_restart),
+        Some(RestartCapability::App) => app_restart_strategy(app_restart, post_flush),
         Some(RestartCapability::Unsupported) | None => unsupported_fail_closed(),
     }
 }
 
-/// #2453 Stage R2: the `agend-terminal app` owner-restart strategy (Unix). The
-/// job-control proof (bash+zsh PTY harness) shows a spawned successor is
-/// backgrounded when the launching process exits, so restart is a RE-EXEC (same
-/// PID → same shell job). Flow: atomically CAS-claim the shared gate; on win hand
-/// a request to the TUI loop and BLOCK (bounded) for its verdict — the loop runs a
-/// read-only preflight probe and, on PASS, transitions the gate to Committing and
-/// replies BEFORE teardown + re-exec (decision d-20260712034222169749-5). A
-/// concurrent duplicate loses the CAS claim → idempotent "already in progress".
+/// #2453 Stage R2: the `agend-terminal app` owner-restart strategy (Unix). Restart
+/// is a RE-EXEC (same PID → same shell job; job-control proof, R2 PTY harness). TWO
+/// PHASES with a transport commit barrier (decision d-20260712034222169749-5):
+/// CAS-claim the gate `Serving→Probing`; hand a request to the TUI loop and BLOCK
+/// (bounded) for its verdict. On `Prepared` (probe passed — gate STILL `Probing`)
+/// register a post-flush commit-permission ack into THIS request's [`PostFlushSlot`]
+/// and return the committing JSON; `handle_session` runs that ack ONLY after it
+/// writes+flushes the reply, at which point the TUI commits `Probing→Committing` and
+/// re-execs. So the committing reply cannot be lost to a teardown that outran the
+/// writer, and a failed flush leaves the gate recoverable at `Probing`. A concurrent
+/// duplicate loses the CAS claim → idempotent "already in progress".
 #[cfg(unix)]
-fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
+fn app_restart_strategy(
+    app_restart: Option<crate::api::app_restart::AppRestart>,
+    post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+) -> Value {
     use crate::api::app_restart::{AppRestartRequest, AppRestartVerdict};
     let Some(ar) = app_restart else {
+        return app_no_channel_fail_closed();
+    };
+    // The two-phase barrier NEEDS this request's slot to arm: the TUI commits + execs
+    // only after `handle_session` confirms THIS committing reply flushed. A standalone
+    // bridge call (no api mcp_tool ingress → no slot) can't guarantee that handshake,
+    // so fail closed rather than risk a lost committing reply.
+    let Some(slot) = post_flush else {
         return app_no_channel_fail_closed();
     };
     // Genuine CAS claim: only one concurrent worker enters Probing.
@@ -47,13 +61,16 @@ fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>
             "note": "an app restart is already being processed; this request was a no-op"
         });
     }
-    // Hand the request to the TUI loop; block (bounded) for its verdict. Bounded
-    // oneshot (capacity 1). The loop runs the probe on its tick (≤5s); wait a
-    // little longer as a safety net.
+    // reply: TUI→handler verdict. flush_ack: transport→TUI commit-permission (a `()`
+    // on a successful flush of this reply; a DISCONNECT means abort). Both bounded(1).
     let (reply_tx, reply_rx) = crossbeam_channel::bounded::<AppRestartVerdict>(1);
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
     if ar
         .tx
-        .try_send(AppRestartRequest { reply: reply_tx })
+        .try_send(AppRestartRequest {
+            reply: reply_tx,
+            flush_ack: ack_rx,
+        })
         .is_err()
     {
         ar.gate.abort_to_serving();
@@ -62,19 +79,45 @@ fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>
             "error": "restart_daemon: could not deliver the restart request to the TUI loop; fleet intact"
         });
     }
+    // Block (bounded) for the verdict. Probe ≤5s; 7s safety net. restart_daemon's mcp
+    // tool timeout is 60s (SLOW) > 7s, so this returns before the worker is abandoned.
+    // The gate is NEVER Committing while we are here — the TUI commits only AFTER our
+    // committing reply flushes (post-return) — so the timeout branch can only roll
+    // Probing→Serving; it can never lie "fleet intact" while the app execs.
     match reply_rx.recv_timeout(std::time::Duration::from_secs(7)) {
-        Ok(AppRestartVerdict::Committing) => json!({
-            "ok": true,
-            "restart": "committing",
-            "note": "preflight passed; the app is re-exec'ing in place (this connection will drop)"
-        }),
+        Ok(AppRestartVerdict::Prepared) => {
+            // Arm the barrier: register the commit-permission ack into THIS request's
+            // slot. Only a successful write+flush of the committing reply runs it (→
+            // `ack_tx.send(())` → the TUI, blocked on `flush_ack`, commits
+            // Probing→Committing + re-execs). Any non-success drops the action un-run
+            // → `ack_tx` drops → the TUI's `flush_ack` disconnects → it aborts.
+            if slot.register(Box::new(move || {
+                let _ = ack_tx.send(());
+            })) {
+                json!({
+                    "ok": true,
+                    "restart": "committing",
+                    "note": "preflight passed; the app is re-exec'ing in place (this connection will drop)"
+                })
+            } else {
+                // Slot already closed/occupied (a timed-out prior worker, or this
+                // response already flushed) — cannot guarantee the barrier. Roll the
+                // gate back; `ack_tx` just dropped so the TUI's `flush_ack`
+                // disconnects and it aborts too.
+                ar.gate.abort_to_serving();
+                json!({
+                    "ok": false,
+                    "error": "restart_daemon: could not arm the flush barrier; fleet + TUI intact — no restart"
+                })
+            }
+        }
         Ok(AppRestartVerdict::Aborted(reason)) => json!({
             "ok": false,
             "error": format!("restart_daemon aborted: {reason}. Fleet + TUI intact — no restart.")
         }),
         Err(_) => {
-            // Safety-net timeout. Best-effort release (CAS from Probing; a no-op if
-            // the loop already advanced to Committing).
+            // Timeout: gate is still Probing (the TUI hasn't committed) → roll back.
+            // No lie possible. `ack_tx` drops → TUI's `flush_ack` disconnects → aborts.
             ar.gate.abort_to_serving();
             json!({
                 "ok": false,
@@ -89,7 +132,10 @@ fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>
 /// tab-lifetime on predecessor exit is UNVERIFIED. Fail closed until a Windows
 /// console/ConPTY handoff is proven (decision d-20260712012329422433-1).
 #[cfg(windows)]
-fn app_restart_strategy(_app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
+fn app_restart_strategy(
+    _app_restart: Option<crate::api::app_restart::AppRestart>,
+    _post_flush: Option<crate::api::app_restart::PostFlushSlot>,
+) -> Value {
     tracing::warn!(
         target: "handoff",
         event = "fail_closed_app_windows",
@@ -435,7 +481,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None);
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None, None);
                 assert_eq!(
                     response["ok"], false,
                     "unsupervised invocation must return ok:false, got {response}"
@@ -493,7 +539,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None);
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None, None);
                 assert_eq!(
                     response["ok"], false,
                     "ambient XPC_SERVICE_NAME alone must NOT be accepted as a \
@@ -548,7 +594,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None);
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None, None);
                 assert_eq!(
                     response["ok"], false,
                     "app-mode (no run_core consumer) restart must fail-closed, got {response}"
@@ -606,7 +652,7 @@ mod tests {
             || {
                 let tmp = unique_tmp("daemon-cap");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None);
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None, None);
                 assert_eq!(
                     response["ok"], false,
                     "unsupervised daemon restart fails closed on the supervisor check, got {response}"
@@ -634,7 +680,7 @@ mod tests {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("app-cap");
             let response =
-                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None);
+                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None, None);
             assert_eq!(
                 response["ok"], false,
                 "app-capability restart must fail closed, got {response}"
@@ -665,7 +711,7 @@ mod tests {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("unsupported-cap");
             let response =
-                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Unsupported), None);
+                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Unsupported), None, None);
             assert_eq!(
                 response["ok"], false,
                 "unsupported-host restart must default-deny, got {response}"
@@ -689,7 +735,7 @@ mod tests {
     fn absent_capability_none_default_deny() {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("none-cap");
-            let response = handle_restart_daemon(&tmp, None, None);
+            let response = handle_restart_daemon(&tmp, None, None, None);
             assert_eq!(
                 response["ok"], false,
                 "absent capability (None) must default-deny, got {response}"

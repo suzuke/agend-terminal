@@ -198,6 +198,7 @@ mod tests {
             externals,
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: None,
         };
 
         let result =
@@ -225,6 +226,7 @@ mod tests {
             )]))),
             capability: crate::api::RestartCapability::Unsupported,
             app_restart: None,
+            post_flush: None,
         }
     }
 

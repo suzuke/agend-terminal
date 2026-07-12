@@ -11,28 +11,111 @@
 //! API workers (decision d-20260712034222169749-5).
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const SERVING: u8 = 0;
 const PROBING: u8 = 1;
 const COMMITTING: u8 = 2;
 
-/// The verdict the TUI loop returns to the (blocking) API worker over the request's
-/// bounded oneshot.
+/// #2453 R2: the verdict the TUI loop returns to the (blocking) API handler over the
+/// request's bounded oneshot, in response to the preflight probe.
+///
+/// `Prepared` (probe passed) does NOT commit — the gate STAYS `Probing`. The handler
+/// returns the committing JSON and registers a post-flush ack; the TUI transitions
+/// `Probing → Committing` and re-execs ONLY after the transport confirms that reply
+/// was flushed to the socket (see [`PostFlushSlot`]). This closes the pre-flush-commit
+/// race: a failed flush leaves the gate recoverable at `Probing`, and the committing
+/// reply can't be lost to a teardown that outran the writer. Unix-only machinery
+/// (Windows fail-closes at the handler and never reads this).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub enum AppRestartVerdict {
-    /// Probe passed, gate is `Committing`, exec is imminent (the API socket drops
-    /// as the process re-execs). Emitted BEFORE teardown/exec.
-    Committing,
+    /// Probe passed; gate is `Probing`. The handler emits the committing reply and
+    /// registers a [`PostFlushSlot`] ack. NOT yet committed.
+    Prepared,
     /// Probe failed / errored / timed out. Fleet + TUI intact; no restart.
     Aborted(String),
 }
 
-/// A restart request handed from the handler to the TUI loop, carrying a bounded
-/// oneshot for the verdict.
+/// #2453 R2: a typed, single-shot action the restart handler registers into the
+/// per-request [`PostFlushSlot`]. `handle_session` runs it EXACTLY ONCE, and ONLY
+/// when the response write+flush both succeeded — it sends the TUI its
+/// commit-permission (a `()` on `flush_ack`). On ANY non-success path (write fail,
+/// flush fail, session exit before flush) the action is DROPPED un-run, so the
+/// captured sender drops and the TUI's `flush_ack` receiver DISCONNECTS → the TUI
+/// aborts (gate back to `Serving`). Drop-disconnect IS the cancel; there is no
+/// explicit "cancelled" value. `Send` because the tool handler runs in a spawned
+/// worker thread while `handle_session` runs the action on the API thread.
+pub type AfterFlushAction = Box<dyn FnOnce() + Send>;
+
+/// #2453 R2: a per-API-request, thread-safe, single-shot slot for an
+/// [`AfterFlushAction`]. `handle_session` creates a fresh slot per request iteration
+/// and threads a cheap `Arc` clone through `HandlerCtx` → `RuntimeContext` to the
+/// tool handler — which runs in a SEPARATE worker thread (`handle_mcp_tool_inner`
+/// spawns it and may abandon it on the tool timeout), so this is `Mutex`-guarded, not
+/// a `RefCell`. After writing the response, `handle_session` calls
+/// [`PostFlushSlot::run_after_flush`], which atomically takes the action and CLOSES
+/// the slot under the lock, then (outside the lock) runs it on success / drops it on
+/// failure. A late/timed-out worker's [`PostFlushSlot::register`] then no-ops, so a
+/// stale worker can never act against a LATER request's flush.
+#[derive(Clone, Default)]
+pub struct PostFlushSlot(Arc<Mutex<PostFlushState>>);
+
+#[derive(Default)]
+struct PostFlushState {
+    action: Option<AfterFlushAction>,
+    closed: bool,
+}
+
+impl PostFlushSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register the action to run after THIS request's response flushes. Returns
+    /// `false` (no-op) when the slot is already closed (its response was processed)
+    /// or already holds an action — so a late / duplicate / timed-out worker cannot
+    /// hijack a later response's flush (the #2453 R2 "a concurrent response cannot
+    /// consume the slot" invariant). Only the Unix restart handler registers.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn register(&self, action: AfterFlushAction) -> bool {
+        let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed || st.action.is_some() {
+            return false;
+        }
+        st.action = Some(action);
+        true
+    }
+
+    /// Called by `handle_session` after the write+flush attempt. Atomically takes the
+    /// registered action AND closes the slot under the lock (so any late `register`
+    /// sees `closed`), then releases the lock and — only if `flushed_ok` — runs it.
+    /// On `!flushed_ok` the action is dropped un-run → its captured sender drops →
+    /// the TUI's `flush_ack` disconnects → abort. Idempotent.
+    pub fn run_after_flush(&self, flushed_ok: bool) {
+        let action = {
+            let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            st.closed = true;
+            st.action.take()
+        };
+        if flushed_ok {
+            if let Some(action) = action {
+                action();
+            }
+        }
+        // else: `action` drops here un-run → sender drops → TUI flush_ack disconnects.
+    }
+}
+
+/// A restart request handed from the handler to the TUI loop. `reply` carries the
+/// TUI's verdict ([`AppRestartVerdict`]); `flush_ack` is how the TUI waits for the
+/// transport's post-flush commit-permission (a `()` on success; a DISCONNECT — the
+/// action dropped un-run — means abort) before it commits + re-execs.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug)]
 pub struct AppRestartRequest {
     pub reply: crossbeam_channel::Sender<AppRestartVerdict>,
+    pub flush_ack: crossbeam_channel::Receiver<()>,
 }
 
 /// Injected sender (handler → TUI loop); bounded (capacity 1) at the composition root.
@@ -42,7 +125,10 @@ pub type AppRestartSender = crossbeam_channel::Sender<AppRestartRequest>;
 /// Created at the app API composition root ([`crate::app`]), threaded through
 /// `serve` → API `HandlerCtx` → MCP `RuntimeContext` to the `restart_daemon`
 /// handler. `Clone` is cheap (a channel `Sender` + an `Arc`). Absent (`None`) on
-/// the daemon / verify roots, which fail-closed.
+/// the daemon / verify roots, which fail-closed. Unix-only: Windows fail-closes at
+/// the handler and never reads these fields → precise per-item allow (NOT a broad
+/// module suppression).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone)]
 pub struct AppRestart {
     pub tx: AppRestartSender,
@@ -63,7 +149,9 @@ impl AppRestartGate {
     /// Atomically claim the gate `Serving → Probing`. Returns `true` iff THIS
     /// caller won the claim. Genuine CAS — at most one concurrent caller wins; a
     /// loser (gate already `Probing`/`Committing`) gets `false` so the handler
-    /// fails closed "already in progress" WITHOUT sending a second request.
+    /// fails closed "already in progress" WITHOUT sending a second request. Only the
+    /// Unix restart handler (+ unit tests) call this → unused on the Windows bin build.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn try_begin_probe(&self) -> bool {
         // Genuine CAS: only the caller that atomically flips SERVING→PROBING wins.
         // No read-then-write TOCTOU (decision d-20260712034222169749-5).

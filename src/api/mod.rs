@@ -670,6 +670,11 @@ fn handle_session(
         // that don't emit the field; see `request_dedup::DedupCache::dispatch`).
         let request_id = req["request_id"].as_str();
 
+        // #2453 R2 flush barrier: a fresh per-request slot. `restart_daemon` (if this
+        // request is one) registers a commit-permission ack into it; we run that ack
+        // AFTER writing+flushing this response (see below), so the app tears down and
+        // re-execs only once its committing reply is on the socket.
+        let post_flush = crate::api::app_restart::PostFlushSlot::new();
         let ctx = handlers::HandlerCtx {
             registry,
             configs,
@@ -678,6 +683,7 @@ fn handle_session(
             home,
             capability: host,
             app_restart: app_restart.as_ref(),
+            post_flush: post_flush.clone(),
         };
 
         // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
@@ -759,8 +765,15 @@ fn handle_session(
             )
         };
 
-        let _ = writeln!(writer, "{}", response);
-        let _ = writer.flush();
+        // #2453 R2 flush barrier: write+flush THIS response, then run any registered
+        // post-flush action with whether BOTH succeeded. On success the restart ack
+        // fires (→ the TUI commits + re-execs); on any failure the action is dropped
+        // un-run → the TUI's `flush_ack` disconnects → it aborts (gate back to
+        // Serving). If the session loop exits before reaching here, `post_flush`
+        // drops with an un-run action → same disconnect → abort.
+        let wrote = writeln!(writer, "{}", response).is_ok();
+        let flushed = wrote && writer.flush().is_ok();
+        post_flush.run_after_flush(flushed);
     }
 }
 
