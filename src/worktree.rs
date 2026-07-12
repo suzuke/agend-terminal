@@ -584,14 +584,26 @@ pub(crate) enum WipPreservation {
     /// contended index) — the caller MUST NOT remove the worktree, so the operator
     /// can recover the WIP in place. Carries a human-readable reason.
     Blocked(String),
+    /// `git status` is dirty, but a non-destructive parent snapshot proves BOTH
+    /// the live-index tree AND the working-tree tree equal `HEAD^{tree}` — i.e. the
+    /// ONLY residual dirt is a submodule's INTERNAL working tree (unchanged
+    /// gitlinks), which a parent recovery ref cannot capture. Minting a ref would
+    /// be a false "preserved". Fail-closed: the caller MUST NOT remove the worktree
+    /// (the nested WIP lives only in the worktree dir); a serialized, de-duped
+    /// actionable notice is emitted so the operator resolves the nested repo in
+    /// place. Distinct from `Blocked` (a genuine snapshot FAILURE).
+    UnpreservableNestedDirty(String),
 }
 
 impl WipPreservation {
-    /// The block reason when preservation was needed but FAILED — `Some` iff the
-    /// caller must refuse to remove the worktree (fail-closed).
+    /// The reason the caller MUST refuse to remove the worktree (fail-closed):
+    /// preservation FAILED (`Blocked`) OR the dirt is nested-submodule-internal and
+    /// unpreservable by a parent snapshot (`UnpreservableNestedDirty`). `None` for
+    /// `Clean`/`Preserved` (safe to remove).
     pub(crate) fn blocked_reason(&self) -> Option<&str> {
         match self {
-            WipPreservation::Blocked(reason) => Some(reason),
+            WipPreservation::Blocked(reason)
+            | WipPreservation::UnpreservableNestedDirty(reason) => Some(reason),
             WipPreservation::Clean | WipPreservation::Preserved => None,
         }
     }
@@ -799,6 +811,26 @@ fn notify_wip_preserved(
     let text = wip_preserved_notice(agent, branch, ref_name);
     let source = crate::inbox::NotifySource::System("release_dirty_wip_preserved");
     crate::inbox::notify_agent(home, &recipient, &source, &text);
+}
+
+// ── RED PLACEHOLDERS (real bodies land in the GREEN commit) ─────────────────
+// The test matrix calls these two directly; they must EXIST so the RED test
+// binary COMPILES, but return degenerate values so their tests fail on the
+// intended ASSERTION (not a build error). The GREEN commit replaces both bodies.
+
+fn enumerate_nested_dirty(_wt_path: &Path) -> String {
+    String::new()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn notify_unpreservable_nested_dirty(
+    _home: &Path,
+    _agent: &str,
+    _branch: &str,
+    _wt_path: &Path,
+    _nested_status: &str,
+    _sender: Option<&str>,
+) {
 }
 
 /// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,
@@ -1309,6 +1341,7 @@ mod tests {
             WipPreservation::Clean => "Clean",
             WipPreservation::Preserved => "Preserved",
             WipPreservation::Blocked(_) => "Blocked",
+            WipPreservation::UnpreservableNestedDirty(_) => "UnpreservableNestedDirty",
         }
     }
 
@@ -1426,6 +1459,493 @@ mod tests {
             "no caller and no team → operator inbox as last resort"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── release RCA: unpreservable nested-submodule WIP (data-safety) ─────────
+    //
+    // A super-repo worktree whose ONLY dirt lives inside a submodule's working
+    // tree (gitlink unchanged) MUST NOT be reported `Preserved`: a parent
+    // recovery ref (tree = super's `add -A`) captures nothing of the nested WIP,
+    // so removing the worktree silently loses it. The fix classifies this via a
+    // dual-tree compare and refuses removal (`UnpreservableNestedDirty`), while
+    // ordinary parent WIP + submodule-pointer moves still preserve+release.
+
+    /// Superproject with `commit_marker_gitignore` + one committed submodule at
+    /// `vendor/dep` holding `sub_file`. `create()` inits it recursively.
+    fn tmp_super_one_sub_file(name: &str, sub_file: &str) -> PathBuf {
+        let sub = tmp_repo_with_file(&format!("{name}-sub"), sub_file, "vendored-v1\n");
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-wt-super1-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_run_ok(&dir, &["init", "-b", "main"], false);
+        git_run_ok(&dir, &["config", "user.email", "test@test"], false);
+        git_run_ok(&dir, &["config", "user.name", "test"], false);
+        commit_marker_gitignore(&dir); // marker gitignored, like a real repo
+        git_run_ok(
+            &dir,
+            &["submodule", "add", &sub.display().to_string(), "vendor/dep"],
+            true,
+        );
+        git_run_ok(&dir, &["commit", "-m", "add vendor/dep submodule"], false);
+        dir
+    }
+
+    fn tmp_super_one_sub(name: &str) -> PathBuf {
+        tmp_super_one_sub_file(name, "vendored.txt")
+    }
+
+    /// Run git with piped stdin; panic with stderr on non-zero.
+    fn git_stdin_ok(dir: &Path, args: &[&str], input: &[u8]) {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(args)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git");
+        child
+            .stdin
+            .take()
+            .expect("stdin pipe")
+            .write_all(input)
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait git");
+        assert!(
+            out.status.success(),
+            "git {:?} in {} failed: {}",
+            args,
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Count inbox messages for `recipient` under `home` whose `from` matches
+    /// `from_marker` (reads the JSONL file directly — fresh test home ⇒ no
+    /// id-redirect, so the file is `home/inbox/<recipient>.jsonl`).
+    fn inbox_count_from(home: &Path, recipient: &str, from_marker: &str) -> usize {
+        let path = home.join("inbox").join(format!("{recipient}.jsonl"));
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| l.contains(from_marker))
+            .count()
+    }
+
+    const NESTED_FROM: &str = "system:release_unpreservable_nested_dirty";
+
+    /// (1) Nested-only dirt (tracked file inside the submodule, gitlink unchanged)
+    /// ⇒ `UnpreservableNestedDirty`, `blocked_reason().is_some()`, NO recovery ref,
+    /// and the LIVE index/worktree are UNCHANGED by classification.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_refuses_nested_only_dirt() {
+        let home = tmp_home("nested-refuse");
+        let super_repo = tmp_super_one_sub("nested-refuse");
+        let info = create(&home, &super_repo, "agent1", Some("feat/nest")).expect("worktree");
+        let vendored = info.path.join("vendor/dep/vendored.txt");
+        assert!(vendored.is_file(), "fixture: submodule file present in worktree");
+
+        let status_before = git_out(&info.path, &["status", "--porcelain"]);
+        std::fs::write(&vendored, b"DIRTY-nested-edit\n").unwrap();
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/nest", None);
+        assert_eq!(
+            pres_kind(&outcome),
+            "UnpreservableNestedDirty",
+            "nested-only dirt must refuse (not falsely Preserved)"
+        );
+        assert!(
+            outcome.blocked_reason().is_some(),
+            "refusal must be fail-closed (blocked_reason Some)"
+        );
+        assert!(
+            recovery_ref_names(&super_repo, "feat/nest").is_empty(),
+            "no recovery ref may be minted for unpreservable nested dirt"
+        );
+        // Non-destructive: classification must not stage/mutate the live index or
+        // touch the working tree. `status --porcelain` is identical before/after
+        // (still shows the nested dirt, nothing staged).
+        let status_after = git_out(&info.path, &["status", "--porcelain"]);
+        assert!(
+            status_after.contains("vendor/dep"),
+            "post-call status must still show the nested-dirty submodule: {status_after}"
+        );
+        assert_eq!(
+            status_before.lines().filter(|l| l.contains("vendor/dep")).count(),
+            status_after.lines().filter(|l| l.contains("vendor/dep")).count(),
+            "classification must not change how the submodule is reported"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        if let Some(root) = super_repo.parent() {
+            std::fs::remove_dir_all(root).ok();
+        }
+        std::fs::remove_dir_all(&super_repo).ok();
+    }
+
+    /// (2) Staged-only WIP (index=v2, working tree reverted to HEAD=v1) ⇒
+    /// `Preserved`, a ref exists, the staged content is recoverable, and the LIVE
+    /// index still has v2 staged afterwards (non-destructive).
+    #[cfg(unix)]
+    #[test]
+    fn preserve_keeps_staged_only_wip_recoverable() {
+        let home = tmp_home("staged-only");
+        let repo = tmp_repo_with_file("staged-only", "f", "v1\n");
+        commit_marker_gitignore(&repo);
+        let info = create(&home, &repo, "agent1", Some("feat/staged")).expect("worktree");
+        let f = info.path.join("f");
+        std::fs::write(&f, b"v2\n").unwrap();
+        git_run_ok(&info.path, &["add", "f"], false); // stage v2
+        std::fs::write(&f, b"v1\n").unwrap(); // revert working tree to HEAD
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/staged", None);
+        assert_eq!(
+            pres_kind(&outcome),
+            "Preserved",
+            "staged-only WIP is preservable (parent tree captures it)"
+        );
+        let refs = recovery_ref_names(&repo, "feat/staged");
+        assert_eq!(refs.len(), 1, "exactly one recovery ref: {refs:?}");
+        // Staged v2 must be recoverable: dual-parent (staged ≠ worktree) ⇒ `^2`.
+        let staged = git_out(&repo, &["show", &format!("{}^2:f", refs[0])]);
+        assert_eq!(staged, "v2", "staged snapshot recoverable at ref^2: got {staged:?}");
+        // CRUCIAL non-destructive: the LIVE index still has v2 staged.
+        let live_staged = git_out(&info.path, &["show", ":f"]);
+        assert_eq!(live_staged, "v2", "live index must still hold staged v2 after call");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (3) Staged (v2) DIFFERS from working tree (v3), both ≠ HEAD (v1) ⇒ ONE ref,
+    /// dual-parent: `ref:f`==v3, `ref^2:f`==v2, and both commits are reachable.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_dual_parent_when_staged_differs_from_worktree() {
+        let home = tmp_home("dual-parent");
+        let repo = tmp_repo_with_file("dual-parent", "f", "v1\n");
+        commit_marker_gitignore(&repo);
+        let info = create(&home, &repo, "agent1", Some("feat/dual")).expect("worktree");
+        let f = info.path.join("f");
+        std::fs::write(&f, b"v2\n").unwrap();
+        git_run_ok(&info.path, &["add", "f"], false); // stage v2
+        std::fs::write(&f, b"v3\n").unwrap(); // working tree v3
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/dual", None);
+        assert_eq!(pres_kind(&outcome), "Preserved");
+        let refs = recovery_ref_names(&repo, "feat/dual");
+        assert_eq!(refs.len(), 1, "exactly one recovery ref: {refs:?}");
+        assert_eq!(
+            git_out(&repo, &["show", &format!("{}:f", refs[0])]),
+            "v3",
+            "ref tree captures the WORKING tree (v3)"
+        );
+        assert_eq!(
+            git_out(&repo, &["show", &format!("{}^2:f", refs[0])]),
+            "v2",
+            "ref^2 captures the STAGED index (v2)"
+        );
+        let staged_commit = git_out(&repo, &["rev-parse", &format!("{}^2", refs[0])]);
+        let reachable = git_out(&repo, &["rev-list", &refs[0]]);
+        assert!(
+            reachable.lines().any(|l| l == staged_commit),
+            "staged parent must be reachable from the recovery ref"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// (4) Nested submodule dirt AND an untracked PARENT file ⇒ prefer Preserve
+    /// (the parent WIP is real), and the ref captures the untracked parent file.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_mixed_parent_and_submodule_prefers_preserve() {
+        let home = tmp_home("mixed");
+        let super_repo = tmp_super_one_sub("mixed");
+        let info = create(&home, &super_repo, "agent1", Some("feat/mixed")).expect("worktree");
+        // Dirty the submodule internal file AND drop an untracked parent file.
+        std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-dirty\n").unwrap();
+        std::fs::write(info.path.join("parent-wip.txt"), b"parent untracked WIP\n").unwrap();
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/mixed", None);
+        assert_eq!(
+            pres_kind(&outcome),
+            "Preserved",
+            "mixed parent+submodule dirt must Preserve, not refuse"
+        );
+        let refs = recovery_ref_names(&super_repo, "feat/mixed");
+        assert_eq!(refs.len(), 1, "one recovery ref: {refs:?}");
+        let tree = git_out(&super_repo, &["ls-tree", "-r", "--name-only", &refs[0]]);
+        assert!(
+            tree.contains("parent-wip.txt"),
+            "recovery ref must capture the untracked parent file: {tree}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        if let Some(root) = super_repo.parent() {
+            std::fs::remove_dir_all(root).ok();
+        }
+        std::fs::remove_dir_all(&super_repo).ok();
+    }
+
+    /// (5) A submodule POINTER move (new commit inside the submodule ⇒ gitlink
+    /// changes) is a real, preservable parent change ⇒ `Preserved`, not refused.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_submodule_pointer_move_is_preserved() {
+        let home = tmp_home("ptr-move");
+        let super_repo = tmp_super_one_sub("ptr-move");
+        let info = create(&home, &super_repo, "agent1", Some("feat/ptr")).expect("worktree");
+        let sub = info.path.join("vendor/dep");
+        // Commit INSIDE the submodule so its HEAD (the gitlink) moves.
+        std::fs::write(sub.join("vendored.txt"), b"vendored-v2\n").unwrap();
+        git_run_ok(&sub, &["add", "vendored.txt"], false);
+        git_run_ok(
+            &sub,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "bump inside submodule",
+            ],
+            false,
+        );
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/ptr", None);
+        assert_eq!(
+            pres_kind(&outcome),
+            "Preserved",
+            "submodule gitlink move is preservable via the parent tree"
+        );
+        assert_eq!(
+            recovery_ref_names(&super_repo, "feat/ptr").len(),
+            1,
+            "one recovery ref for the pointer move"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        if let Some(root) = super_repo.parent() {
+            std::fs::remove_dir_all(root).ok();
+        }
+        std::fs::remove_dir_all(&super_repo).ok();
+    }
+
+    /// (6) An UNMERGED live index makes `git write-tree` fail ⇒ `Blocked`
+    /// (fail-closed), no ref. Planted deterministically via `update-index
+    /// --index-info` with stage 1/2/3 entries for one path.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_unmerged_index_is_blocked() {
+        let home = tmp_home("unmerged");
+        let repo = tmp_repo_with_file("unmerged", "f.txt", "base\n");
+        commit_marker_gitignore(&repo);
+        let info = create(&home, &repo, "agent1", Some("feat/unmerged")).expect("worktree");
+        // Object for the conflict path (hash-object on a real file → no stdin).
+        std::fs::write(info.path.join("c.txt"), b"conflicted\n").unwrap();
+        let blob = git_out(&info.path, &["hash-object", "-w", "c.txt"]);
+        let index_info = format!(
+            "100644 {blob} 1\tc.txt\n100644 {blob} 2\tc.txt\n100644 {blob} 3\tc.txt\n"
+        );
+        git_stdin_ok(
+            &info.path,
+            &["update-index", "--index-info"],
+            index_info.as_bytes(),
+        );
+        // Sanity: the live index is genuinely unmerged (write-tree fails).
+        assert!(
+            crate::git_helpers::git_cmd(&info.path, &["write-tree"]).is_err(),
+            "precondition: unmerged index ⇒ write-tree fails"
+        );
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/unmerged", None);
+        assert_eq!(
+            pres_kind(&outcome),
+            "Blocked",
+            "unmerged index (snapshot failure) is Blocked, not nested-refused"
+        );
+        assert!(
+            recovery_ref_names(&repo, "feat/unmerged").is_empty(),
+            "Blocked must not mint a recovery ref"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Marker directory for the per-worktree refusal notice (test-visible mirror
+    /// of the production path).
+    fn refusal_marker_dir(home: &Path) -> PathBuf {
+        crate::paths::runtime_dir(home).join("release_refusal_notices")
+    }
+
+    /// (7) `release_full` on a nested-only-dirty bound worktree ⇒ refused:
+    /// NOT released, NOT removed, path intact, no ref, binding retained. Then a
+    /// CLEAN re-release removes the worktree AND clears the refusal marker.
+    #[cfg(unix)]
+    #[test]
+    fn release_full_refuses_nested_only() {
+        let home = tmp_home("release-refuse");
+        let super_repo = tmp_super_one_sub("release-refuse");
+        let info = create(&home, &super_repo, "agent1", Some("feat/rel")).expect("worktree");
+        crate::binding::bind_full(
+            &home,
+            "agent1",
+            "",
+            "feat/rel",
+            &info.path,
+            &super_repo,
+            false,
+        )
+        .expect("bind");
+        let vendored = info.path.join("vendor/dep/vendored.txt");
+        std::fs::write(&vendored, b"nested-dirty\n").unwrap();
+
+        let out = crate::worktree_pool::release_full(&home, "agent1", false);
+        assert!(!out.released, "release must be refused for unpreservable nested WIP");
+        assert!(!out.worktree_removed, "worktree must NOT be removed on refusal");
+        assert!(info.path.exists(), "worktree dir must remain for in-place recovery");
+        assert!(
+            recovery_ref_names(&super_repo, "feat/rel").is_empty(),
+            "no recovery ref for refused nested dirt"
+        );
+        assert!(
+            crate::binding::read(&home, "agent1").is_some(),
+            "binding must be retained on refusal"
+        );
+        // The refusal wrote a per-worktree marker.
+        let markers: Vec<_> = std::fs::read_dir(refusal_marker_dir(&home))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) != Some("lock"))
+            .collect();
+        assert!(!markers.is_empty(), "refusal must persist a de-dup marker");
+
+        // Now make the worktree clean and re-release: it removes + clears marker.
+        std::fs::write(&vendored, b"vendored-v1\n").unwrap(); // revert nested dirt
+        assert!(
+            !has_uncommitted_changes(&info.path),
+            "precondition: worktree is clean before re-release"
+        );
+        let out2 = crate::worktree_pool::release_full(&home, "agent1", false);
+        assert!(out2.released, "clean re-release must succeed");
+        assert!(out2.worktree_removed, "clean worktree must be removed");
+        let leftover = std::fs::read_dir(refusal_marker_dir(&home))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .count();
+        assert_eq!(leftover, 0, "clean release must clear this worktree's marker + lock");
+
+        std::fs::remove_dir_all(&home).ok();
+        if let Some(root) = super_repo.parent() {
+            std::fs::remove_dir_all(root).ok();
+        }
+        std::fs::remove_dir_all(&super_repo).ok();
+    }
+
+    /// (8) The refusal notice de-dups per (worktree, nested-status) and re-notifies
+    /// on a status TRANSITION: A,A ⇒ 1 msg; then B ⇒ 2; then A again ⇒ 3.
+    #[cfg(unix)]
+    #[test]
+    fn nested_notice_dedups_and_transition_renotifies() {
+        let home = tmp_home("notice-dedup");
+        let wt = tmp_repo("notice-dedup-wt"); // any stable path for the marker key
+        let notify = |status: &str| {
+            notify_unpreservable_nested_dirty(&home, "agent1", "feat/x", &wt, status, None)
+        };
+        notify("nested-A");
+        notify("nested-A");
+        assert_eq!(
+            inbox_count_from(&home, "general", NESTED_FROM),
+            1,
+            "identical status must be notified once"
+        );
+        notify("nested-B");
+        assert_eq!(
+            inbox_count_from(&home, "general", NESTED_FROM),
+            2,
+            "a changed nested status must re-notify"
+        );
+        notify("nested-A");
+        assert_eq!(
+            inbox_count_from(&home, "general", NESTED_FROM),
+            3,
+            "A→B→A: returning to A differs from the last-seen B ⇒ re-notify"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// (9) Two threads racing the SAME (worktree, status) notice ⇒ EXACTLY one
+    /// inbox message (the per-worktree file lock serializes claim+enqueue+marker).
+    #[cfg(unix)]
+    #[test]
+    fn nested_notice_concurrent_claim_single_notify() {
+        let home = tmp_home("notice-concurrent");
+        let wt = tmp_repo("notice-concurrent-wt");
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                let home = &home;
+                let wt = &wt;
+                s.spawn(move || {
+                    notify_unpreservable_nested_dirty(
+                        home, "agent1", "feat/x", wt, "same-status", None,
+                    );
+                });
+            }
+        });
+        assert_eq!(
+            inbox_count_from(&home, "general", NESTED_FROM),
+            1,
+            "concurrent identical notices must collapse to one message"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// (10) `enumerate_nested_dirty` handles a nested tracked file whose name has a
+    /// SPACE (porcelain-v2 `-z` NUL parsing) — the exact path appears in the output.
+    #[cfg(unix)]
+    #[test]
+    fn nested_dirty_enumeration_includes_paths_with_spaces() {
+        let home = tmp_home("enum-spaces");
+        let super_repo = tmp_super_one_sub_file("enum-spaces", "my file.txt");
+        let info = create(&home, &super_repo, "agent1", Some("feat/space")).expect("worktree");
+        let spaced = info.path.join("vendor/dep/my file.txt");
+        assert!(spaced.is_file(), "fixture: spaced submodule file present");
+        std::fs::write(&spaced, b"dirtied\n").unwrap();
+
+        let listing = enumerate_nested_dirty(&info.path);
+        assert!(
+            listing.contains("my file.txt"),
+            "enumeration must preserve the spaced nested path: {listing:?}"
+        );
+        assert!(
+            listing.contains("vendor/dep"),
+            "enumeration must name the dirty submodule: {listing:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        if let Some(root) = super_repo.parent() {
+            std::fs::remove_dir_all(root).ok();
+        }
+        std::fs::remove_dir_all(&super_repo).ok();
     }
 
     /// Bug1 middle fallback: no caller but the agent belongs to a team → route to
