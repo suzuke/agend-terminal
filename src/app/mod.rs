@@ -465,71 +465,71 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // attached); the owned-only maintenance tick REQUIRES it, so a run_app that
     // skips the seam fails to compile (structural I2, replacing the old
     // `owner_services_called_by_both_hosts` string-scan).
-    let owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted> = if !attached_mode
-    {
-        crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
-        // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
-        // api_activity_probe) via the typed phase-1 seam — identical position/args
-        // in run_core's build_tick_infrastructure, so a service can't be wired in
-        // one host and silently dead in the other (#982/#1002/#1720/#2434). The
-        // returned OwnerMonitoringStarted token is required by phase 2 below, so
-        // monitoring is compile-forced to precede the stream observers (exact
-        // order preserved: monitoring → shadow::start → stream).
-        let monitoring = crate::daemon::owner_services::start_owner_monitoring(
-            crate::daemon::owner_services::OwnerRole::Owned,
-            &home,
-            &registry,
-            &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
-        );
-        // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
-        // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
-        // only other caller), so without this the whole Shadow Observer plane was dead in
-        // production (observed_status null on every agent under the flag — #1720/#685
-        // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
-        // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
-        // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
-        // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
-        // detached accept loop that exits with the process; the stale socket is cleared on
-        // next bind (start_unix removes it before binding).
-        crate::daemon::shadow::start(&home);
-        // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout
-        // + opencode + kiro) via the typed phase-2 seam. Requires the phase-1
-        // OwnerMonitoringStarted token (compile-enforced order). #2434: the live
-        // fleet daemon is app mode, so these must be app-wired (not run_core-only)
-        // or each backend's observer source is dead in production. Identical
-        // position/args in run_core's build_tick_infrastructure. shadow::start
-        // (the socket-ingest plane above) stays host-local — separate fork.
-        let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
-            crate::daemon::owner_services::OwnerRole::Owned,
-            &monitoring,
-            &home,
-            &registry,
-            &crate::daemon::owner_services::OwnerStreamStarters::real(),
-        );
-        // Attached mode stays unwired: that process never owns the registry,
-        // and the Telegram bot (if any) runs under the other daemon which
-        // already did its own attach.
-        //
-        // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
-        // is always None at this point post-backgrounding. Publish registry
-        // to the pending slot so the background thread can attach when its
-        // ~6s HTTP init completes. The if-let path below covers the eager
-        // (fast/mocked init) case.
-        crate::agent::set_pending_registry(Arc::clone(&registry));
-        if let Some(tg) = telegram_state.as_ref() {
-            tg.attach_registry(Arc::clone(&registry));
-        } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
-            // Multi-channel-safe (t-20260703164240502572-50899-11): this
-            // fallback is telegram-specific (the `tg`/`telegram_state`
-            // naming already assumed it); `active_channel()` would silently
-            // no-op here once discord is also registered.
-            tg.attach_registry(Arc::clone(&registry));
-        }
-        // #2737: hand the final witness to the owned-only maintenance tick below.
-        Some(owner_services)
-    } else {
-        None
-    };
+    let owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted> =
+        if !attached_mode {
+            crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
+            // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
+            // api_activity_probe) via the typed phase-1 seam — identical position/args
+            // in run_core's build_tick_infrastructure, so a service can't be wired in
+            // one host and silently dead in the other (#982/#1002/#1720/#2434). The
+            // returned OwnerMonitoringStarted token is required by phase 2 below, so
+            // monitoring is compile-forced to precede the stream observers (exact
+            // order preserved: monitoring → shadow::start → stream).
+            let monitoring = crate::daemon::owner_services::start_owner_monitoring(
+                crate::daemon::owner_services::OwnerRole::Owned,
+                &home,
+                &registry,
+                &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
+            );
+            // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
+            // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
+            // only other caller), so without this the whole Shadow Observer plane was dead in
+            // production (observed_status null on every agent under the flag — #1720/#685
+            // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
+            // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
+            // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
+            // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
+            // detached accept loop that exits with the process; the stale socket is cleared on
+            // next bind (start_unix removes it before binding).
+            crate::daemon::shadow::start(&home);
+            // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout
+            // + opencode + kiro) via the typed phase-2 seam. Requires the phase-1
+            // OwnerMonitoringStarted token (compile-enforced order). #2434: the live
+            // fleet daemon is app mode, so these must be app-wired (not run_core-only)
+            // or each backend's observer source is dead in production. Identical
+            // position/args in run_core's build_tick_infrastructure. shadow::start
+            // (the socket-ingest plane above) stays host-local — separate fork.
+            let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
+                crate::daemon::owner_services::OwnerRole::Owned,
+                &monitoring,
+                &home,
+                &registry,
+                &crate::daemon::owner_services::OwnerStreamStarters::real(),
+            );
+            // Attached mode stays unwired: that process never owns the registry,
+            // and the Telegram bot (if any) runs under the other daemon which
+            // already did its own attach.
+            //
+            // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
+            // is always None at this point post-backgrounding. Publish registry
+            // to the pending slot so the background thread can attach when its
+            // ~6s HTTP init completes. The if-let path below covers the eager
+            // (fast/mocked init) case.
+            crate::agent::set_pending_registry(Arc::clone(&registry));
+            if let Some(tg) = telegram_state.as_ref() {
+                tg.attach_registry(Arc::clone(&registry));
+            } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
+                // Multi-channel-safe (t-20260703164240502572-50899-11): this
+                // fallback is telegram-specific (the `tg`/`telegram_state`
+                // naming already assumed it); `active_channel()` would silently
+                // no-op here once discord is also registered.
+                tg.attach_registry(Arc::clone(&registry));
+            }
+            // #2737: hand the final witness to the owned-only maintenance tick below.
+            Some(owner_services)
+        } else {
+            None
+        };
 
     // #2453: the five cohesive key/UI-interaction fields, owned by one type.
     // `name_counter` counts auto-dedup agent names.
@@ -2431,472 +2431,6 @@ mod tests {
              the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \
              #[cfg(test)] cutoff"
         );
-    }
-
-    /// #2413 Phase D + #2453 Stage 1a: the codex rollout-tail observer source
-    /// (Stream plane) must stay wired at the shared owner-service site
-    /// `start_shared_stream_observers`. This pin proves `rollout::spawn` remains
-    /// present in `owner_services` production (comments + string literals masked —
-    /// #2447 r6 — so a commented-out or literal call does NOT satisfy it).
-    /// REVERSE-MUTATION: deleting or commenting the real `rollout::spawn(...)` in
-    /// `owner_services` turns THIS test RED. That the helper is actually reached by
-    /// BOTH hosts (owned `run_app` + headless `run_core`) — the #1720/#685/#2434
-    /// "dead in the app-mode live daemon" class — is proven SEPARATELY by
-    /// `owner_services_called_by_both_hosts`; the two compose the full
-    /// "observer live in both hosts" invariant.
-    #[test]
-    fn run_app_wires_codex_rollout_tailer_2413() {
-        // #2453 Stage 1a: rollout::spawn moved into the shared helper both hosts
-        // call — scan owner_services (production region) instead of run_app.
-        let source = std::fs::read_to_string("src/daemon/owner_services.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/owner_services.rs"))
-            .expect("source file must be readable from test cwd");
-        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
-        let prod_code = strip_comments_and_blank_strings(prod);
-        assert!(
-            prod_code.contains("crate::daemon::shadow::rollout::spawn("),
-            "owner_services::start_shared_stream_observers must spawn the codex rollout-tail \
-             observer (#2413 Phase D) — deleting or commenting it here leaves codex agents' \
-             Stream observer dead in every host that calls the helper (both do — see \
-             owner_services_called_by_both_hosts). No ACTIVE \
-             'crate::daemon::shadow::rollout::spawn(' (comments + string-literal contents masked) before the \
-             #[cfg(test)] cutoff"
-        );
-    }
-
-    /// #2413 opencode plane + #2453 Stage 1a: the opencode SSE `/event` observer
-    /// source (Stream plane) must stay wired at the shared owner-service site
-    /// `start_shared_stream_observers`. This pin proves `opencode::spawn` remains
-    /// present in `owner_services` production (comments + string literals masked —
-    /// #2447 r6 — so a commented-out or literal call does NOT satisfy it).
-    /// REVERSE-MUTATION: deleting or commenting the real `opencode::spawn(...)` in
-    /// `owner_services` turns THIS test RED. That both hosts (owned `run_app` +
-    /// headless `run_core`) actually reach the helper — the #2434 dead-in-app class
-    /// — is proven SEPARATELY by `owner_services_called_by_both_hosts`.
-    #[test]
-    fn run_app_wires_opencode_sse_observer_2413() {
-        // #2453 Stage 1a: opencode::spawn moved into the shared helper both hosts
-        // call — scan owner_services (production region) instead of run_app.
-        let source = std::fs::read_to_string("src/daemon/owner_services.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/owner_services.rs"))
-            .expect("source file must be readable from test cwd");
-        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        // Strip comments FIRST: a commented-out call must not pass the pin (#2447 r6 vacuity fix).
-        let prod_code = strip_comments_and_blank_strings(prod);
-        assert!(
-            prod_code.contains("crate::daemon::shadow::opencode::spawn("),
-            "owner_services::start_shared_stream_observers must spawn the opencode SSE observer \
-             (#2413 opencode plane) — deleting or commenting it here leaves opencode agents' \
-             Stream observer dead in every host that calls the helper (both do — see \
-             owner_services_called_by_both_hosts). No ACTIVE \
-             'crate::daemon::shadow::opencode::spawn(' (comments + string-literal contents masked) before the \
-             #[cfg(test)] cutoff"
-        );
-    }
-
-    /// Strip `//` line + `/* */` block comments from Rust source so a wiring-pin
-    /// contains-check can't be satisfied by a COMMENTED-OUT call (#2447 r6: the raw
-    /// contains() was vacuous — commenting the production call left the text present and the
-    /// pin still passed, the exact #2434 dead-wiring class it must catch).
-    ///
-    /// **String-literal-aware** (#2447 r6 round-2): a `//` or `/*` INSIDE a string / char /
-    /// raw-string literal is NOT a comment and is preserved verbatim — so e.g. a
-    /// `"http://x"` URL or a `"/* x */"` payload on a line cannot make the stripper eat the
-    /// rest of that line (a false-RED for the pin). Handles `"..."` (with `\` escapes),
-    /// `'...'` char literals (escape + simple; lifetimes like `'a` are left as-is), and raw
-    /// strings `r"..."` / `r#"..."#` / `br"..."` (hash-count matched, no escapes). Unicode-
-    /// correct. Shared so the codex/opencode app-pins can adopt it (follow-up).
-    fn strip_rust_comments(src: &str) -> String {
-        let s: Vec<char> = src.chars().collect();
-        let n = s.len();
-        let mut out = String::with_capacity(src.len());
-        let mut i = 0;
-        while i < n {
-            let c = s[i];
-            // line comment → skip to (but keep) the newline.
-            if c == '/' && i + 1 < n && s[i + 1] == '/' {
-                i += 2;
-                while i < n && s[i] != '\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            // block comment → skip to `*/`.
-            if c == '/' && i + 1 < n && s[i + 1] == '*' {
-                i += 2;
-                while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') {
-                    i += 1;
-                }
-                i = (i + 2).min(n);
-                continue;
-            }
-            // raw string `r"..."` / `r#"..."#` / `br"..."` — copy verbatim (no escapes;
-            // close on `"` + the same number of `#`).
-            if c == 'r' || (c == 'b' && i + 1 < n && s[i + 1] == 'r') {
-                let r_pos = if c == 'b' { i + 1 } else { i };
-                let mut k = r_pos + 1;
-                let mut hashes = 0;
-                while k < n && s[k] == '#' {
-                    hashes += 1;
-                    k += 1;
-                }
-                if k < n && s[k] == '"' {
-                    for ch in &s[i..=k] {
-                        out.push(*ch);
-                    }
-                    i = k + 1;
-                    loop {
-                        if i >= n {
-                            break;
-                        }
-                        if s[i] == '"' {
-                            let mut h = 0;
-                            while i + 1 + h < n && h < hashes && s[i + 1 + h] == '#' {
-                                h += 1;
-                            }
-                            if h == hashes {
-                                for ch in &s[i..i + 1 + hashes] {
-                                    out.push(*ch);
-                                }
-                                i += 1 + hashes;
-                                break;
-                            }
-                        }
-                        out.push(s[i]);
-                        i += 1;
-                    }
-                    continue;
-                }
-                // not a raw string (plain identifier starting with r/b) → fall through.
-            }
-            // normal / byte string `"..."` — copy verbatim, honoring `\` escapes.
-            if c == '"' {
-                out.push(c);
-                i += 1;
-                while i < n {
-                    if s[i] == '\\' && i + 1 < n {
-                        out.push(s[i]);
-                        out.push(s[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    out.push(s[i]);
-                    let closing = s[i] == '"';
-                    i += 1;
-                    if closing {
-                        break;
-                    }
-                }
-                continue;
-            }
-            // char literal `'x'` / `'\n'` (vs a lifetime `'a`, left as a normal char).
-            if c == '\'' {
-                if i + 1 < n && s[i + 1] == '\\' {
-                    // escape char literal: `'`, `\`, escaped-char, …, `'`.
-                    out.push(s[i]);
-                    out.push(s[i + 1]);
-                    i += 2;
-                    if i < n {
-                        out.push(s[i]); // the escaped char (covers `'\''`)
-                        i += 1;
-                    }
-                    while i < n && s[i] != '\'' {
-                        out.push(s[i]);
-                        i += 1;
-                    }
-                    if i < n {
-                        out.push(s[i]); // closing `'`
-                        i += 1;
-                    }
-                    continue;
-                }
-                if i + 2 < n && s[i + 2] == '\'' {
-                    // simple char literal `'x'` (x may be `"` / `/`, must not start a string).
-                    out.push(s[i]);
-                    out.push(s[i + 1]);
-                    out.push(s[i + 2]);
-                    i += 3;
-                    continue;
-                }
-                // lifetime / stray `'` → normal char.
-            }
-            out.push(c);
-            i += 1;
-        }
-        out
-    }
-
-    /// Replace the CONTENTS of every string / raw-string literal with spaces (delimiters
-    /// kept) in ALREADY-comment-free Rust source; char literals are passed through verbatim
-    /// (they can't hold a multi-char needle, but must be consumed so a `"` inside `'"'`
-    /// doesn't mis-start a string scan). Sibling of [`strip_rust_comments`] used only by the
-    /// wiring pins via [`strip_comments_and_blank_strings`].
-    ///
-    /// #2450 reviewer-6: comment-stripping alone left the pins **string-literal-blind** — a
-    /// needle hidden in a string (`let _ = "…::spawn(";`) survived the strip, so the pin's
-    /// `contains()` still falsely passed (the exact #2434 dead-wiring vacuity, just relocated
-    /// from a comment into a string). Blanking string interiors closes that: the only place
-    /// the needle survives is an ACTIVE code call.
-    fn blank_string_contents(src: &str) -> String {
-        let s: Vec<char> = src.chars().collect();
-        let n = s.len();
-        let mut out = String::with_capacity(src.len());
-        let mut i = 0;
-        while i < n {
-            let c = s[i];
-            // raw string `r"..."` / `r#"..."#` / `br"..."` — blank interior, keep delimiters.
-            if c == 'r' || (c == 'b' && i + 1 < n && s[i + 1] == 'r') {
-                let r_pos = if c == 'b' { i + 1 } else { i };
-                let mut k = r_pos + 1;
-                let mut hashes = 0;
-                while k < n && s[k] == '#' {
-                    hashes += 1;
-                    k += 1;
-                }
-                if k < n && s[k] == '"' {
-                    for ch in &s[i..=k] {
-                        out.push(*ch); // opening `r#"` delimiter, verbatim
-                    }
-                    i = k + 1;
-                    loop {
-                        if i >= n {
-                            break;
-                        }
-                        if s[i] == '"' {
-                            let mut h = 0;
-                            while i + 1 + h < n && h < hashes && s[i + 1 + h] == '#' {
-                                h += 1;
-                            }
-                            if h == hashes {
-                                for ch in &s[i..i + 1 + hashes] {
-                                    out.push(*ch); // closing `"#`, verbatim
-                                }
-                                i += 1 + hashes;
-                                break;
-                            }
-                        }
-                        out.push(' '); // blank one interior char
-                        i += 1;
-                    }
-                    continue;
-                }
-                // not a raw string (identifier starting with r/b) → fall through.
-            }
-            // normal / byte string `"..."` — blank interior (honor `\` escapes), keep quotes.
-            if c == '"' {
-                out.push('"');
-                i += 1;
-                while i < n {
-                    if s[i] == '\\' && i + 1 < n {
-                        out.push(' ');
-                        out.push(' ');
-                        i += 2;
-                        continue;
-                    }
-                    if s[i] == '"' {
-                        out.push('"');
-                        i += 1;
-                        break;
-                    }
-                    out.push(' ');
-                    i += 1;
-                }
-                continue;
-            }
-            // char literal `'x'` / `'\n'` — pass through verbatim (consume so a `"` inside a
-            // char literal can't start a string scan); a lifetime `'a` is a normal char.
-            if c == '\'' {
-                if i + 1 < n && s[i + 1] == '\\' {
-                    out.push(s[i]);
-                    out.push(s[i + 1]);
-                    i += 2;
-                    if i < n {
-                        out.push(s[i]);
-                        i += 1;
-                    }
-                    while i < n && s[i] != '\'' {
-                        out.push(s[i]);
-                        i += 1;
-                    }
-                    if i < n {
-                        out.push(s[i]);
-                        i += 1;
-                    }
-                    continue;
-                }
-                if i + 2 < n && s[i + 2] == '\'' {
-                    out.push(s[i]);
-                    out.push(s[i + 1]);
-                    out.push(s[i + 2]);
-                    i += 3;
-                    continue;
-                }
-                // lifetime / stray `'` → normal char.
-            }
-            out.push(c);
-            i += 1;
-        }
-        out
-    }
-
-    /// The wiring-pin matcher: strip comments AND blank string-literal contents, so a
-    /// `…::spawn(` needle counts ONLY when it is an ACTIVE code call — not commented out
-    /// (#2447) and not hidden in a string literal (#2450 reviewer-6). Composition of the two
-    /// proven passes; `strip_rust_comments` body is left untouched.
-    fn strip_comments_and_blank_strings(src: &str) -> String {
-        blank_string_contents(&strip_rust_comments(src))
-    }
-
-    /// #2450 reviewer-6 regression: the wiring-pin matcher must treat a `…::spawn(` needle as
-    /// PRESENT only when it is ACTIVE code — not in a comment (#2447) and not hidden inside a
-    /// string / raw-string literal (#2450). Pins reviewer-6's exact false-green break-probe.
-    #[test]
-    fn strip_comments_and_blank_strings_masks_string_and_comment_needles() {
-        let needle = "crate::daemon::shadow::rollout::spawn(";
-        // ACTIVE code call → still present (must NOT false-kill the real wiring).
-        assert!(strip_comments_and_blank_strings(&format!("    {needle}x);")).contains(needle));
-        // reviewer-6 break-probe: needle hidden in a NORMAL string literal → masked.
-        assert!(
-            !strip_comments_and_blank_strings(&format!("let _p = \"{needle}\";")).contains(needle)
-        );
-        // needle hidden in a RAW string literal → masked.
-        assert!(
-            !strip_comments_and_blank_strings(&format!("let _p = r#\"{needle}\"#;"))
-                .contains(needle)
-        );
-        // needle in a comment → masked (the comment-strip pass still applies).
-        assert!(!strip_comments_and_blank_strings(&format!("// {needle}\n")).contains(needle));
-        // string-literal-AWARE preserved: a `"http://x"` URL must not eat the rest of its
-        // line, so real code after it survives (no false-RED).
-        assert!(
-            strip_comments_and_blank_strings("let u = \"http://x\"; keep_me();")
-                .contains("keep_me()")
-        );
-    }
-
-    /// #2447 r6 round-2: `strip_rust_comments` must strip REAL comments yet preserve
-    /// `//` / `/*` that live inside string / char / raw-string literals (else a `"http://x"`
-    /// URL would false-strip its line → a vacuity-fix that introduces a false-RED). Covers
-    /// r6's requested cases.
-    #[test]
-    fn strip_rust_comments_is_string_literal_aware() {
-        // Real comments ARE stripped.
-        assert!(!strip_rust_comments("keep // dropme\n").contains("dropme"));
-        let blk = strip_rust_comments("alpha /* dropme */ omega");
-        assert!(!blk.contains("dropme") && blk.contains("alpha") && blk.contains("omega"));
-        // `//` inside a normal string is NOT a comment.
-        assert!(strip_rust_comments(r#"let u = "http://example.com/a";"#)
-            .contains("http://example.com/a"));
-        // `/* */` inside a string is preserved.
-        assert!(strip_rust_comments(r#"let s = "/* not a comment */";"#)
-            .contains("/* not a comment */"));
-        // raw string content (incl. `//`) is preserved.
-        assert!(strip_rust_comments(r##"let r = r#"// not comment"#;"##).contains("// not comment"));
-        // a quote/slash inside a CHAR literal must not start a string / a comment.
-        assert!(strip_rust_comments(r#"let c = '"'; live_after_quote();"#)
-            .contains("live_after_quote()"));
-        assert!(
-            strip_rust_comments("let c = '/'; live_after_slash();").contains("live_after_slash()")
-        );
-        // escaped-quote char literal `'\''` must not desync the scanner.
-        assert!(
-            strip_rust_comments(r"let c = '\''; live_after_esc();").contains("live_after_esc()")
-        );
-        // a real trailing line comment AFTER an in-string `//` is still stripped.
-        let mixed = strip_rust_comments("let u = \"a//b\"; keep(); // dropme\n");
-        assert!(mixed.contains("a//b") && mixed.contains("keep()") && !mixed.contains("dropme"));
-        // the pin's own case: active call survives; commented-out does not.
-        assert!(
-            strip_rust_comments("    crate::daemon::shadow::kiro::spawn(x);")
-                .contains("crate::daemon::shadow::kiro::spawn(")
-        );
-        assert!(
-            !strip_rust_comments("    // crate::daemon::shadow::kiro::spawn(x);")
-                .contains("crate::daemon::shadow::kiro::spawn(")
-        );
-    }
-
-    /// #2413 kiro plane + #2453 Stage 1a: the kiro session-tail observer source
-    /// (Stream plane) must stay wired at the shared owner-service site
-    /// `start_shared_stream_observers`. This pin proves `kiro::spawn` remains
-    /// present in `owner_services` production (comments + string literals masked —
-    /// #2447 r6 — so a commented-out or literal call does NOT satisfy it).
-    /// REVERSE-MUTATION: deleting or commenting the real `kiro::spawn(...)` in
-    /// `owner_services` turns THIS test RED. That both hosts (owned `run_app` +
-    /// headless `run_core`) actually reach the helper — the #2434 dead-in-app class
-    /// — is proven SEPARATELY by `owner_services_called_by_both_hosts`.
-    #[test]
-    fn run_app_wires_kiro_session_tailer_2413() {
-        // #2453 Stage 1a: kiro::spawn moved into the shared helper both hosts
-        // call — scan owner_services (production region) instead of run_app.
-        let source = std::fs::read_to_string("src/daemon/owner_services.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/owner_services.rs"))
-            .expect("source file must be readable from test cwd");
-        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        // Strip comments FIRST: a commented-out call must not pass the pin (r6 vacuity fix).
-        let prod_code = strip_comments_and_blank_strings(prod);
-        assert!(
-            prod_code.contains("crate::daemon::shadow::kiro::spawn("),
-            "owner_services::start_shared_stream_observers must spawn the kiro session-tail \
-             observer (#2413 kiro plane) — deleting or commenting it here leaves kiro agents' \
-             Stream observer dead in every host that calls the helper (both do — see \
-             owner_services_called_by_both_hosts). No ACTIVE \
-             'crate::daemon::shadow::kiro::spawn(' (comments + string-literal contents masked) before the \
-             #[cfg(test)] cutoff"
-        );
-    }
-
-    // ----- #2453 Stage 1a: shared owner-service wiring guards (STATIC) -----
-    // These reuse the module's existing `strip_comments_and_blank_strings`
-    // masker; no parser is duplicated. Source-scan only — no helper is called and
-    // no thread is spawned. Runtime-host coverage is intentionally ABSENT for
-    // this pure refactor (no non-invasive host entry exists).
-
-    const OWNER_MOVED_SPAWNS: [&str; 5] = [
-        "instance_monitor::spawn_monitor_tick(",
-        "api_activity_probe::spawn(",
-        "shadow::rollout::spawn(",
-        "shadow::opencode::spawn(",
-        "shadow::kiro::spawn(",
-    ];
-
-    /// A source file's production region (before its test module), comments
-    /// stripped and string literals blanked. Masks FIRST, then cuts at the first
-    /// `mod tests {` in masked source — robust to a stray item-level
-    /// `#[cfg(test)]` before the module (e.g. daemon's `test_env_lock`) and to an
-    /// attribute between `#[cfg(test)]` and the module (e.g. `#[allow(...)]`).
-    fn owner_wiring_prod(rel: &str) -> String {
-        let src = std::fs::read_to_string(rel)
-            .or_else(|_| std::fs::read_to_string(format!("agend-terminal/{rel}")))
-            .unwrap_or_else(|_| panic!("source file must be readable from test cwd: {rel}"));
-        let masked = strip_comments_and_blank_strings(&src);
-        let end = masked.find("mod tests {").unwrap_or(masked.len());
-        masked[..end].to_string()
-    }
-
-    /// STATIC: the five spawn calls are absent from BOTH host bodies and present
-    /// at the shared owner_services wiring site. Scope is the two run hosts + the
-    /// wiring module — NOT a global-uniqueness claim.
-    #[test]
-    fn owner_services_spawns_absent_from_hosts_present_at_wiring_site() {
-        for host in ["src/app/mod.rs", "src/daemon/mod.rs"] {
-            let code = owner_wiring_prod(host);
-            for spawn in OWNER_MOVED_SPAWNS {
-                assert!(
-                    !code.contains(spawn),
-                    "{host} host body must NOT call `{spawn}` — it moved to the shared \
-                     owner_services wiring site (a host-local copy reintroduces dual-host drift)"
-                );
-            }
-        }
-        let wiring = owner_wiring_prod("src/daemon/owner_services.rs");
-        for spawn in OWNER_MOVED_SPAWNS {
-            assert!(
-                wiring.contains(spawn),
-                "owner_services must contain `{spawn}` (the shared wiring site both hosts call)"
-            );
-        }
     }
 
     /// #1726 must-verify: app-standalone runs these handlers with EMPTY
