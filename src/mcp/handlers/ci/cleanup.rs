@@ -90,9 +90,22 @@ pub(crate) fn handle_cleanup_merged_branches(
         }
     };
     if !apply {
+        let (categories_with_observability, spike_residue) =
+            match crate::branch_sweep::dry_run_observability(&source_repo, base, &categories) {
+                Ok(report) => report,
+                Err(e) => {
+                    return json!({
+                        "error": format!("branch sweep observability failed: {e}"),
+                        "code": "scan_failed",
+                    });
+                }
+            };
         return json!({
             "dry_run": true,
-            "categories": &categories,
+            "categories": categories_with_observability,
+            "annotations": {
+                "spike_residue": spike_residue,
+            },
             "candidate_ids": categories.deletable_ids(),
             "total_candidates": categories.total(),
             "to_apply_hint": "repo action=cleanup_merged_branches apply=true confirm_ids=<subset> audit_reason=<...>",
