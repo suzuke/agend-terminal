@@ -520,6 +520,69 @@ pub(crate) fn run_restart_probe() -> ! {
     std::process::exit(code);
 }
 
+/// #2453 R2: the decision the TUI loop reaches when it polls the in-flight
+/// restart probe on a tick. Extracted from the loop so the commit-vs-abort branch
+/// — the one that gates the IRREVERSIBLE teardown+exec — is unit-testable without
+/// driving the full TUI (mirrors `restart_argv`). The loop maps `Commit` to
+/// reply-Committing + break-to-teardown, and `Abort` to reply-Aborted + keep
+/// serving (NO teardown). Ownership: on any terminal verdict the probe is `take`n
+/// out of the slot (and killed+reaped on timeout).
+enum ProbePoll {
+    /// Probe still running and within its deadline — keep serving this tick.
+    Pending,
+    /// Probe passed AND the gate advanced `Probing → Committing`. The loop must
+    /// reply `Committing`, set `RestartRequested`, and break to teardown + exec.
+    Commit(crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>),
+    /// Probe failed / timed out / errored — the gate was rolled back to `Serving`
+    /// and NO restart happens. The loop replies `Aborted(reason)` and keeps
+    /// serving; teardown + exec are never reached.
+    Abort(
+        crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>,
+        String,
+    ),
+}
+
+/// #2453 R2: poll `probe` once (non-blocking). A passing probe transitions the
+/// gate to `Committing` (the ONLY path to teardown+exec); every failure mode
+/// (non-zero exit, timeout, wait error) rolls the gate back to `Serving` and
+/// yields `Abort`, PROVING a failed preflight performs zero teardown. Behavior is
+/// identical to the pre-extraction inline block.
+fn poll_restart_probe(
+    probe: &mut Option<RestartProbe>,
+    gate: &crate::api::app_restart::AppRestartGate,
+) -> ProbePoll {
+    if probe.is_none() {
+        return ProbePoll::Pending;
+    }
+    match probe.as_mut().unwrap().child.try_wait() {
+        Ok(Some(status)) => {
+            let p = probe.take().unwrap();
+            if status.success() && gate.to_committing() {
+                ProbePoll::Commit(p.reply)
+            } else {
+                gate.abort_to_serving();
+                ProbePoll::Abort(p.reply, format!("preflight failed (exit {:?})", status.code()))
+            }
+        }
+        Ok(None) => {
+            if std::time::Instant::now() >= probe.as_ref().unwrap().deadline {
+                let mut p = probe.take().unwrap();
+                let _ = p.child.kill();
+                let _ = p.child.wait(); // reap — no zombie
+                gate.abort_to_serving();
+                ProbePoll::Abort(p.reply, "preflight timed out (5s)".to_string())
+            } else {
+                ProbePoll::Pending
+            }
+        }
+        Err(e) => {
+            let p = probe.take().unwrap();
+            gate.abort_to_serving();
+            ProbePoll::Abort(p.reply, format!("preflight wait error: {e}"))
+        }
+    }
+}
+
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<RunOutcome> {
     let home = crate::home_dir();
     // #2325: the app process (unlike the daemon's `run_core`, the only other
@@ -1018,40 +1081,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // loop tick so the TUI never freezes on it.
         if restart_probe.is_some() {
             use crate::api::app_restart::AppRestartVerdict;
-            let verdict = match restart_probe.as_mut().unwrap().child.try_wait() {
-                Ok(Some(status)) => {
-                    let probe = restart_probe.take().unwrap();
-                    if status.success() && app_restart_gate.to_committing() {
-                        // Success reply BEFORE teardown/exec (decision d-…034222169749-5).
-                        let _ = probe.reply.send(AppRestartVerdict::Committing);
-                        restart_outcome = RunOutcome::RestartRequested;
-                        break;
-                    }
-                    app_restart_gate.abort_to_serving();
-                    Some((
-                        probe.reply,
-                        format!("preflight failed (exit {:?})", status.code()),
-                    ))
+            match poll_restart_probe(&mut restart_probe, &app_restart_gate) {
+                ProbePoll::Commit(reply) => {
+                    // Success reply BEFORE teardown/exec (decision d-…034222169749-5).
+                    let _ = reply.send(AppRestartVerdict::Committing);
+                    restart_outcome = RunOutcome::RestartRequested;
+                    break;
                 }
-                Ok(None) => {
-                    if std::time::Instant::now() >= restart_probe.as_ref().unwrap().deadline {
-                        let mut probe = restart_probe.take().unwrap();
-                        let _ = probe.child.kill();
-                        let _ = probe.child.wait(); // reap — no zombie
-                        app_restart_gate.abort_to_serving();
-                        Some((probe.reply, "preflight timed out (5s)".to_string()))
-                    } else {
-                        None
-                    }
+                ProbePoll::Abort(reply, reason) => {
+                    let _ = reply.send(AppRestartVerdict::Aborted(reason));
                 }
-                Err(e) => {
-                    let probe = restart_probe.take().unwrap();
-                    app_restart_gate.abort_to_serving();
-                    Some((probe.reply, format!("preflight wait error: {e}")))
-                }
-            };
-            if let Some((reply, reason)) = verdict {
-                let _ = reply.send(AppRestartVerdict::Aborted(reason));
+                ProbePoll::Pending => {}
             }
         }
         // Auto-close the scratch shell overlay once its backing process
