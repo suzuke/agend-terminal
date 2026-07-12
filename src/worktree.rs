@@ -1202,6 +1202,50 @@ fn walk_nested_dirty(
         }
         walk_nested_dirty(&sub_canon, &disp, root, visited, out);
     }
+    // r6 (P3b): an UNTRACKED directory that is itself a git repo (an in-worktree
+    // clone / `git init`, NOT a registered submodule — so it shows as a porcelain
+    // `?` row with no `S` field and the submodule descent above never saw it) holds
+    // content a superproject `add -A` records only as a GITLINK. On removal the
+    // embedded repo's uncommitted WIP AND its `.git` object store are destroyed and
+    // any recovery ref's gitlink dangles — the SAME unpreservable-content invariant
+    // as a dirty submodule. Surface it so the refusal + notice fire. (A commit-LESS
+    // embed already fails the temp-index `add -A` upstream → `Blocked`, so only the
+    // committed shape reaches here.)
+    for e in &entries {
+        if e.token != "??" {
+            continue; // only an untracked `?` row can be an unregistered embedded repo
+        }
+        let candidate = dir_canon.join(&e.path);
+        if !candidate.join(".git").exists() {
+            continue; // an ordinary untracked file/dir, not an embedded repo
+        }
+        let disp = if display_prefix.is_empty() {
+            e.path.clone()
+        } else {
+            format!("{display_prefix}/{}", e.path)
+        };
+        let embed_canon = match std::fs::canonicalize(&candidate) {
+            Ok(p) => p,
+            Err(err) => {
+                out.push_str(&format!(
+                    "{disp}: [untracked embedded git repo — skipped: canonicalize failed: {err}]\n"
+                ));
+                continue;
+            }
+        };
+        if !embed_canon.starts_with(root) {
+            out.push_str(&format!(
+                "{disp}: [untracked embedded git repo — skipped: containment]\n"
+            ));
+            continue;
+        }
+        if !visited.insert(embed_canon) {
+            continue; // already surfaced via the submodule descent or a prior entry
+        }
+        out.push_str(&format!(
+            "{disp}: [untracked embedded git repo — internal WIP/object store is unpreservable by a parent ref]\n"
+        ));
+    }
 }
 
 /// Hex digest of a `Hash`-able value via `DefaultHasher` (bounded, allocation-free
