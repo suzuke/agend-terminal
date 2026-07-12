@@ -950,19 +950,40 @@ fn handle_update(
     // "updated" so callers don't need to special-case.
     if let Some(ref s) = new_status {
         let prev_status = record.status;
+        // Reject an UNKNOWN status value outright — previously `from_str` returning
+        // None fell through to a silent no-op that falsely reported success
+        // (#task-result-rca review).
+        let Some(target) = crate::task_events::TaskStatus::from_str(s) else {
+            return serde_json::json!({
+                "error": format!(
+                    "unknown status '{s}' (task {id}); valid: backlog, open, claimed, \
+                     in_progress, in_review, blocked, verified, done, cancelled"
+                ),
+                "code": "unknown_status",
+            });
+        };
+        // `verified` is produced by the reviewer VERDICT path, not an operator
+        // update — return an actionable error rather than inventing a verdict.
+        if target == crate::task_events::TaskStatus::Verified {
+            return serde_json::json!({
+                "error": format!(
+                    "status 'verified' is set by the review/verdict path (send kind=report \
+                     with a VERIFIED verdict), not task update (task {id})"
+                ),
+                "code": "unsupported_status_transition",
+            });
+        }
         // #1265: transition enforcement — reject illegal status changes.
-        if let Some(target) = crate::task_events::TaskStatus::from_str(s) {
-            if !prev_status.can_transition_to(target) {
-                return serde_json::json!({
-                    "error": format!(
-                        "illegal transition: {} → {} (task {})",
-                        crate::tasks::status_to_legacy_str(prev_status),
-                        s,
-                        id
-                    ),
-                    "code": "illegal_transition",
-                });
-            }
+        if !prev_status.can_transition_to(target) {
+            return serde_json::json!({
+                "error": format!(
+                    "illegal transition: {} → {} (task {})",
+                    crate::tasks::status_to_legacy_str(prev_status),
+                    s,
+                    id
+                ),
+                "code": "illegal_transition",
+            });
         }
         // #2249 pre-work alignment gate: the ONE live chokepoint for the
         // claimed→in_progress transition (verified during the #2524 P2a
@@ -1075,13 +1096,20 @@ fn handle_update(
                 }),
                 _ => None,
             };
-        // PR4 F1 (PR3 r1 reviewer-2 LOW) — collect events into
-        // a Vec and emit via `append_batch` so all transitions
-        // produced by a single update call land under one fsync.
-        // F7 atomic-batch contract: either all land or none do
-        // (a partial-write window can't surface to readers).
-        if let Some(ev) = event_for_transition {
-            pending_events.push(ev);
+        // PR4 F1 (PR3 r1 reviewer-2 LOW) — collect events into a Vec and emit via
+        // `append_batch` so all transitions produced by a single update call land
+        // under one fsync. F7 atomic-batch contract: either all land or none do.
+        match event_for_transition {
+            Some(ev) => pending_events.push(ev),
+            // A parseable, legal status with no `update`-arm mapping must fail loud
+            // rather than silently no-op. Defensive: today only `verified` is
+            // unmapped, and it is already rejected above.
+            None => {
+                return serde_json::json!({
+                    "error": format!("status '{s}' is not settable via task update (task {id})"),
+                    "code": "unsupported_status_transition",
+                });
+            }
         }
     }
     // Priority change without status transition: queue
@@ -1127,15 +1155,23 @@ fn handle_update(
                 .map(|s| crate::task_events::InstanceName(s.clone())),
         });
     }
-    // F2: result backfill via the additive `ResultSet` event. Emitted only when
-    // the supplied value actually differs from the current record — an equal
-    // value produces no event, so the response below reports an honest
-    // `unchanged` rather than a false `updated`. Rides the same atomic
-    // `append_batch` + ownership ACL as every other update event (no separate
-    // authority surface). Allowed on any state so an owner/orchestrator can
-    // backfill the outcome on an already-done task (the witnessed case).
-    if let Some(new_result) = args.get("result").and_then(|v| v.as_str()) {
-        if record.result.as_deref() != Some(new_result) {
+    // F2: result backfill via the additive `ResultSet` event. A present-but-
+    // non-string `result` fails loud (was: silently ignored → false "unchanged").
+    // An equal string value emits no event (honest "unchanged" below); a differing
+    // value emits `ResultSet`. Rides the same atomic `append_batch` + ownership ACL
+    // as every other update event. Allowed on any state so an owner/orchestrator
+    // can backfill the outcome on an already-done task (the witnessed case).
+    let mut result_idempotent = false;
+    if let Some(result_val) = args.get("result") {
+        let Some(new_result) = result_val.as_str() else {
+            return serde_json::json!({
+                "error": format!("'result' must be a string (task {id})"),
+                "code": "invalid_result",
+            });
+        };
+        if record.result.as_deref() == Some(new_result) {
+            result_idempotent = true;
+        } else {
             pending_events.push(crate::task_events::TaskEvent::ResultSet {
                 task_id: crate::task_events::TaskId(id.clone()),
                 by: crate::task_events::InstanceName::from(caller.as_str()),
@@ -1241,20 +1277,13 @@ fn handle_update(
             // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
             "status": "updated",
         })
-    } else if [
-        "status",
-        "priority",
-        "assignee",
-        "description",
-        "tags",
-        "result",
-    ]
-    .iter()
-    .any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
-    {
-        // A recognized field was supplied but equalled the current value (only
-        // `result` can reach here — status/priority/description/tags/owner always
-        // emit an event). Honest idempotent no-op instead of a false "updated".
+    } else if result_idempotent {
+        // The ONLY zero-event success: `result` was supplied as a string equal to
+        // the current value, and no other mutable field was supplied (every other
+        // field emits an event when supplied, so it would be in `had_events`).
+        // Every other zero-event request — unknown/unmapped status, non-string
+        // result, or no recognized field — already returned a structured error
+        // above. Honest idempotent no-op instead of a false "updated".
         serde_json::json!({
             "id": id,
             "event": "unchanged",
