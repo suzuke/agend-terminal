@@ -155,14 +155,23 @@ impl ReviewClassRefusal {
                 "review_class unspecified for merge-authority dispatch on `{branch}` — \
                  set the task's `review_class` metadata to `single` or `dual` and \
                  re-dispatch. A PR-producing dispatch must declare its review threshold; \
-                 no CI watch was armed (fail-closed #2745)."
+                 the dispatch was refused (fail-closed #2745)."
             ),
             ReviewClassRefusal::Mismatch { task_class } => format!(
                 "review_class MISMATCH for dispatch on `{branch}` — task authority is \
                  `{task_class}` but second_reviewer=true implies dual. second_reviewer \
                  cannot override the task's declared class; reconcile them and re-dispatch. \
-                 No CI watch was armed (fail-closed #2745)."
+                 the dispatch was refused (fail-closed #2745)."
             ),
+        }
+    }
+
+    /// Stable machine code for the structured dispatch-refusal error — lets the
+    /// caller distinguish "no class declared" from "class contradicted".
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            ReviewClassRefusal::Unspecified => "review_class_unspecified",
+            ReviewClassRefusal::Mismatch { .. } => "review_class_mismatch",
         }
     }
 }
@@ -221,8 +230,9 @@ fn maybe_auto_bind_lease(
     // authority BEFORE arming. Authority = the dispatched task's `review_class`
     // metadata; `args["review_class"]` is the fallback for the auto-create path
     // (the board row isn't written until after this lease). Fail-closed: an absent
-    // / unknown / mismatched class refuses the watch arm (the bind still proceeds)
-    // and logs an actionable re-arm diagnostic — never a silent Single.
+    // / unknown / mismatched class REJECTS the whole dispatch atomically (structured
+    // error, no bind/create/send side effect) — never a silent Single, never a
+    // dispatched PR without a review gate.
     let task_review_class = (!task_id_val.is_empty())
         .then(|| crate::tasks::load_by_id(home, task_id_val))
         .flatten()
@@ -236,18 +246,39 @@ fn maybe_auto_bind_lease(
         .as_deref()
         .or_else(|| args["review_class"].as_str());
     let armed_review_class = match resolve_dispatch_review_class(raw_review_class, second_reviewer) {
-        Ok(class) => Some(class.as_token()),
+        Ok(class) => class.as_token(),
         Err(refusal) => {
+            // #2745 fail-closed (root pre-review finding 2): REJECT the
+            // merge-authority dispatch ATOMICALLY — before any bind / task-create /
+            // send side effect — so the caller receives a structured error and no PR
+            // work is ever dispatched without a review gate (never a silent Ok with
+            // an un-armed watch). `code` distinguishes unspecified vs mismatch; the
+            // error carries branch + task remediation.
             tracing::error!(
-                %target, %branch, task_id = %task_id_val,
-                diagnostic = %refusal.diagnostic(branch),
-                "#2745 dispatch review_class UNRESOLVED — CI watch NOT armed (fail-closed); \
-                 set the task's review_class metadata to single|dual and re-dispatch"
+                %target, %branch, task_id = %task_id_val, code = refusal.code(),
+                "#2745 merge-authority dispatch REJECTED — review_class unresolved \
+                 (no bind / watch / create / send)"
             );
-            None
+            let remediation = if task_id_val.is_empty() {
+                "declare `review_class: single|dual` on the send (auto-create path), or \
+                 create the task with a review_class first, then re-dispatch"
+                    .to_string()
+            } else {
+                format!(
+                    "set the review_class metadata (single|dual) on task {task_id_val}, \
+                     then re-dispatch"
+                )
+            };
+            return Err(json!({
+                "ok": false,
+                "error": refusal.diagnostic(branch),
+                "code": refusal.code(),
+                "remediation": remediation,
+                "branch": branch,
+                "task_id": task_id_val,
+            }));
         }
     };
-    let arm_ci_watch = armed_review_class.is_some();
     dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain(
         home,
         target,
@@ -256,8 +287,8 @@ fn maybe_auto_bind_lease(
         args["repository"].as_str(),
         None,
         &next_after_ci,
-        armed_review_class,
-        arm_ci_watch,
+        Some(armed_review_class),
+        true,
     )
     .map(|_| ())
     .map_err(|e| json!({"ok": false, "error": format!("dispatch rejected: {e}")}))
@@ -291,6 +322,10 @@ fn maybe_auto_create_task(
         "project": target_project,
         "plan_ack_required": plan_ack_required,
         "plan_ack_reason": args["plan_ack_reason"].as_str(),
+        // #2745: forward the dispatch's review_class into the auto-created task's
+        // metadata so the durable authority survives past this dispatch (the
+        // resolver already validated it via the args fallback in the lease above).
+        "review_class": args["review_class"].as_str(),
     });
     let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
     match task_result["id"].as_str() {

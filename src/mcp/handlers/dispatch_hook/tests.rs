@@ -546,6 +546,9 @@ fn delegate_task_main_branch_rejects_without_delivering() {
         "task": "implement feature X",
         "task_id": "T-999",
         "branch": "main",  // ← E4.5 rejection trigger
+        // #2745: valid review_class so the fail-closed gate passes → this test
+        // isolates the lease's main-branch rejection, not the review_class gate.
+        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -605,6 +608,9 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
         "task": "implement feature Y",
         "task_id": "T-2",
         "branch": "feat/end2end",
+        // #2745: valid review_class so the fail-closed gate passes → isolates the
+        // lease's cross-agent conflict rejection under test.
+        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -723,6 +729,9 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
         "task": "implement feature B",
         "task_id": "T-2",
         "branch": "feat/B",
+        // #2745: valid review_class so the fail-closed gate passes → isolates the
+        // lease's same-agent different-branch rejection under test.
+        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
     let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
@@ -942,6 +951,10 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
         "task_id": "T-100",
         "branch": "feat/p02-integration",
         "repository": "owner/repo",
+        // #2745 fail-closed: a merge-authority (branch) dispatch MUST declare an
+        // explicit review_class or it is rejected before arming — this test proves
+        // the positive path still creates the ci-watch when the class is declared.
+        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -969,6 +982,70 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     );
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2745 fail-closed (root pre-review finding 2): a merge-authority (branch)
+/// dispatch whose review_class is UNRESOLVED (omitted / typo) or MISMATCHED
+/// (task=single vs second_reviewer=true) is REJECTED atomically at the handler
+/// entry — a structured error with a distinguishing `code`, and crucially NO
+/// ci-watch side effect. This is the "no dispatched PR work without a review gate"
+/// guarantee: the reject returns before the bind/create/send.
+#[test]
+fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
+    use crate::identity::Sender;
+
+    for (label, rc, second_reviewer, expected_code) in [
+        ("omitted", None, false, "review_class_unspecified"),
+        ("typo", Some("duel"), false, "review_class_unspecified"),
+        ("mismatch", Some("single"), true, "review_class_mismatch"),
+    ] {
+        let home = std::env::temp_dir().join(format!(
+            "agend-2745-reject-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "target-agent");
+
+        let mut args = serde_json::json!({
+            "instance": "target-agent",
+            "task": "implement feature X",
+            "task_id": "T-100",
+            "branch": "feat/p02-reject",
+            "repository": "owner/repo",
+        });
+        if let Some(v) = rc {
+            args["review_class"] = serde_json::json!(v);
+        }
+        if second_reviewer {
+            args["second_reviewer"] = serde_json::json!(true);
+            args["second_reviewer_reason"] = serde_json::json!("risky change");
+        }
+        let sender = Some(Sender::new("lead").expect("sender"));
+
+        let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+
+        // Structured atomic rejection with the distinguishing code.
+        assert_eq!(
+            result.get("code").and_then(|v| v.as_str()),
+            Some(expected_code),
+            "[{label}] expected atomic reject code; got {result}"
+        );
+        assert!(
+            result.get("error").and_then(|v| v.as_str()).is_some(),
+            "[{label}] reject must carry an actionable diagnostic error: {result}"
+        );
+        // The fail-closed guarantee: NO ci-watch is armed for a rejected dispatch.
+        let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-reject");
+        let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+        assert!(
+            !watch_path.exists(),
+            "[{label}] rejected dispatch must NOT arm a ci-watch: {}",
+            watch_path.display()
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 /// #2117 P2: a dispatch from teamA's member to teamB's member auto-creates the
