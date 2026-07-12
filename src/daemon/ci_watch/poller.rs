@@ -65,6 +65,26 @@ impl CiProvider for CachedCiProvider {
         Ok(result)
     }
 
+    /// S1 (#2743 r1, P0): forward the exact-head by-SHA fetch to `inner`. WITHOUT
+    /// this override the wrapper falls to the trait default (`ApiError 501
+    /// unsupported`), so EVERY production exact-head watch (which is always wrapped
+    /// in `CachedCiProvider` by the fan-out) hits 501, stays armed forever, and
+    /// never reaches `GitHubCiProvider::poll_runs_for_sha`. No tick-cache here: the
+    /// `poll_cache` is keyed by `(repo, branch)` and would alias distinct target
+    /// SHAs on the same branch; each exact-head watch is one-shot + low-frequency,
+    /// so a direct forward is correct and simplest.
+    /// S1 (#2743 r1, P0): forward the exact-head by-SHA fetch to `inner`. WITHOUT
+    /// this override the wrapper falls to the trait default (`ApiError 501
+    /// unsupported`), so EVERY production exact-head watch (which is always wrapped
+    /// in `CachedCiProvider` by the fan-out) hits 501, stays armed forever, and
+    /// never reaches `GitHubCiProvider::poll_runs_for_sha`. No tick-cache here: the
+    /// `poll_cache` is keyed by `(repo, branch)` and would alias distinct target
+    /// SHAs on the same branch; each exact-head watch is one-shot + low-frequency,
+    /// so a direct forward is correct and simplest.
+    async fn poll_runs_for_sha(&self, repo: &str, head_sha: &str) -> anyhow::Result<CiPollResult> {
+        self.inner.poll_runs_for_sha(repo, head_sha).await
+    }
+
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
         self.inner.check_pr_terminal(repo, branch).await
     }

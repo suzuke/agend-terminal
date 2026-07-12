@@ -7227,3 +7227,72 @@ fn exact_head_provider_error_keeps_watch_armed() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #2743 r1 (P0): PRODUCTION wraps EVERY provider in `CachedCiProvider`
+/// (fan-out site poller.rs:611). Before the wrapper override, `poll_runs_for_sha`
+/// fell to the trait-default `ApiError 501` there, so every production exact-head
+/// watch stayed armed forever and never reached `GitHubCiProvider::poll_runs_for_sha`.
+/// This drives the exact-head resolution THROUGH `CachedCiProvider` deterministically
+/// (wrap the inner fake, run `ci_check_repo`) — the inner succeeds ONLY from
+/// `poll_runs_for_sha` (branch page empty), proving the wrapper forwards it.
+#[test]
+fn exact_head_resolves_through_cached_provider_wrapper() {
+    let dir = tmp_dir("s1-exact-head-cached");
+    let inner = ExactHeadMock::new(
+        vec![], // branch page: nothing (a raw poll_runs would find no target)
+        vec![wf_run("CI", 100, 1, Some("success"), S1_TARGET_SHA)], // by-SHA: target terminal
+    );
+    let cached = super::CachedCiProvider {
+        inner: Box::new(inner),
+        poll_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+    run_ci_check(&dir, &exact_head_watch_json(), &cached).unwrap();
+    assert!(
+        !exact_head_watch_path(&dir).exists(),
+        "exact-head watch must resolve + clear THROUGH CachedCiProvider (not the 501 default)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #2743 r1 (P0): the FULL production fan-out through `check_ci_watches_with_provider`
+/// — which itself constructs the `CachedCiProvider` wrapper (proving the real wrapping
+/// applies, not just that the wrapper forwards). The inner fake succeeds ONLY from
+/// `poll_runs_for_sha`; the exact-head watch must resolve + one-shot-clear. The fan-out
+/// spawns a detached task, so we wait (bounded) for the clear.
+#[test]
+fn exact_head_resolves_through_production_fanout() {
+    let dir = tmp_dir("s1-exact-head-fanout");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).unwrap();
+    let watch_path = ci_dir.join(watch_filename("o/r", "main"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&exact_head_watch_json()).unwrap(),
+    )
+    .unwrap();
+
+    let registry: AgentRegistry =
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    // make_provider yields the inner fake; check_ci_watches_with_provider wraps it in
+    // CachedCiProvider (the production wrapping site) before ci_check_repo.
+    super::check_ci_watches_with_provider(&dir, &registry, |_ws| {
+        Some(Box::new(ExactHeadMock::new(
+            vec![],
+            vec![wf_run("CI", 100, 1, Some("success"), S1_TARGET_SHA)],
+        )) as Box<dyn CiProvider>)
+    });
+    // Detached fan-out task → wait (bounded, ~2s) for the one-shot terminal-clear.
+    let mut cleared = false;
+    for _ in 0..200 {
+        if !watch_path.exists() {
+            cleared = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        cleared,
+        "exact-head watch must resolve + clear through the real check_ci_watches fan-out (CachedCiProvider wrapping)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
