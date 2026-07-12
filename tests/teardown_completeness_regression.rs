@@ -216,7 +216,9 @@ fn run_scenario(home: &Path) {
         &h,
         "lead",
         "task",
-        json!({"action": "create", "title": "do work"}),
+        // #2745 R3: the durable review_class authority lives on the TASK (a send arg
+        // can no longer fill a missing one), so the dispatched task is created tagged.
+        json!({"action": "create", "title": "do work", "review_class": "single"}),
     );
     let tid = created["result"]["id"].as_str().unwrap_or("").to_string();
     let _ = mcp(
@@ -226,6 +228,10 @@ fn run_scenario(home: &Path) {
         json!({
             "instance": VICTIM, "message": "do it", "request_kind": "task",
             "task_id": tid, "branch": BRANCH, "repository": REPO_SLUG, "next_after_ci": "lead",
+            // #2745 fail-closed: a merge-authority (branch) dispatch must declare an
+            // explicit review_class or it is rejected before the auto-bind that this
+            // teardown test needs to seed the victim's binding.
+            "review_class": "single",
         }),
     );
 

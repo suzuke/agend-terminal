@@ -59,6 +59,7 @@ pub(crate) fn def_send() -> Value {
             "force_reason": {"type": "string"},
             "second_reviewer": {"type": "boolean", "description": "Signal dual review (§3.5)"},
             "second_reviewer_reason": {"type": "string"},
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: durable review threshold for a PR-producing (branch) dispatch — `single` (§3.6, one VERIFIED) or `dual` (§3.5, two distinct VERIFIED). Fail-closed AUTHORITY: a merge-authority (branch) dispatch is REJECTED unless the referenced or auto-created task carries a resolvable review_class. On an auto-create dispatch (empty task_id) this value seeds the created task's metadata; when task_id references an existing task, that task's review_class metadata is the authority and must not be contradicted (second_reviewer=true is consistency-evidence only: single+true is a mismatch → reject)."},
             "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: number of distinct non-assignee acks a plan (set via `task action=metadata_set metadata_key=plan`) needs before the task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior. Only meaningful when this send auto-creates a task (empty task_id) — forwarded into that task's create; ignored when task_id references an existing task."},
             "plan_ack_reason": {"type": "string", "description": "Required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
             "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
@@ -254,7 +255,8 @@ pub(crate) fn def_task() -> Value {
             "project": {"type": "string", "description": "#2117 P1: target project board. create: route the task to this project (default: the caller's current project, derived from its team's source_repo). list: show this project, or `all` to aggregate every board."},
             "scope": {"type": "string", "enum": ["fleet"], "description": "#2117 P1: list scope. `fleet` aggregates tasks across ALL project boards (each task tagged with its project id). Equivalent to `project=all`."},
             "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: create only — number of distinct non-assignee `ack_plan` calls needed before this task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior."},
-            "plan_ack_reason": {"type": "string", "description": "#2249: create only — required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."}
+            "plan_ack_reason": {"type": "string", "description": "#2249: create only — required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: create only — durable review-threshold AUTHORITY for a PR-producing task. `single` (§3.6) or `dual` (§3.5). Persisted into Task.metadata; the dispatch/poll fail-closed gate reads it (absent/unknown → Unresolved → the merge-authority dispatch is rejected + the poller emits a [review-class-unresolved] re-arm diagnostic, never a silent default)."}
         }, "required": ["action"]}})
 }
 
@@ -890,6 +892,34 @@ mod tests {
     ///
     /// RED proof: add a `"ghost"` field to any coordination tool's schema (and no
     /// consumer) → this test fails naming `<tool>.ghost` as unclassified.
+    /// #2745 (root pre-review finding 1): the public MCP schemas must ADVERTISE
+    /// `review_class` so schema-valid callers can supply the fail-closed authority
+    /// (`task` create) and the auto-create fallback (`send`). Without this the
+    /// handler reads are undeclared-input blind spots. The sibling
+    /// consumed-or-deferred + source-scan contract tests enforce the wiring in both
+    /// directions; this pins the advertised shape.
+    #[test]
+    fn review_class_is_advertised_on_send_and_task_schemas_2745() {
+        for def in [crate::mcp::tools::def_send(), crate::mcp::tools::def_task()] {
+            let name = def["name"].as_str().unwrap_or("?").to_string();
+            let rc = &def["inputSchema"]["properties"]["review_class"];
+            assert_eq!(
+                rc["type"].as_str(),
+                Some("string"),
+                "{name}: review_class must be an advertised string property"
+            );
+            let enum_vals: Vec<&str> = rc["enum"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                enum_vals,
+                vec!["single", "dual"],
+                "{name}: review_class must be enum[single,dual]"
+            );
+        }
+    }
+
     #[test]
     fn coordination_tool_schema_fields_are_consumed_or_deferred() {
         use std::collections::BTreeSet;
@@ -926,6 +956,7 @@ mod tests {
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
             ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
+            ("send", "review_class", "comms_delegate.rs maybe_auto_bind_lease → resolve_dispatch_review_class authority/fallback (atomic reject on unresolved) + maybe_auto_create_task create_args seed (#2745)"),
             ("send", "triaged", "comms_gates/triaged_gate.rs pre-check validation + comms.rs handle_send_to_instance/handle_report_result → daemon/discharge_ledger.rs record_discharge (#2537/#2524 P6 PR-1)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
@@ -966,6 +997,7 @@ mod tests {
             ("task", "scope", "tasks/handler.rs list fleet_scope aggregate (:208) (#2117 P1)"),
             ("task", "plan_ack_required", "tasks/handler.rs handle_create validation + metadata seed; handle_update in_progress gate chokepoint (#2249)"),
             ("task", "plan_ack_reason", "tasks/handler.rs handle_create validation + metadata seed (#2249)"),
+            ("task", "review_class", "tasks/handler.rs handle_create → Task.metadata review_class seed; dispatch/poll fail-closed authority (#2745)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),

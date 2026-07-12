@@ -218,6 +218,24 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
                     },
                 );
             }
+            // #2745 (decision d-…-11): seed the durable `review_class` authority
+            // for a PR-producing task. Stored verbatim; validity ({single,dual})
+            // is enforced fail-closed downstream at dispatch/poll time via
+            // `ReviewClass::parse_fail_closed` (an unknown/typo resolves Unresolved
+            // → refuse-to-arm + diagnostic, never a silent default). Absent → no
+            // key (the common non-PR task), byte-identical to pre-#2745.
+            if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
+                let _ = crate::task_events::append_at(
+                    &board,
+                    &emitter,
+                    crate::task_events::TaskEvent::MetadataSet {
+                        task_id: crate::task_events::TaskId(id.clone()),
+                        by: emitter.clone(),
+                        key: "review_class".to_string(),
+                        value: serde_json::json!(rc),
+                    },
+                );
+            }
             let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
             // #1496 Option 1: `task(action:create)` is a PURE board record
             // with ZERO dispatch side-effects — no inbox enqueue, no

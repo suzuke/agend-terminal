@@ -16,6 +16,7 @@
 
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
+use crate::daemon::pr_state::ReviewClass;
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -131,6 +132,116 @@ fn compose_delegate_message(
     }
 }
 
+/// #2745 fail-closed (decision d-…-11 + codex seam correction): why a
+/// merge-authority dispatch's `review_class` could NOT be resolved. The caller
+/// refuses to arm the ci-watch and emits [`ReviewClassRefusal::diagnostic`] —
+/// NEVER a silent Single/Dual default.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReviewClassRefusal {
+    /// The task carried no resolvable `review_class` (absent / null / typo /
+    /// wrong-type). `second_reviewer=true` alone is NOT a fallback — it still
+    /// refuses.
+    Unspecified,
+    /// The task's explicit class contradicts the deprecated `second_reviewer`
+    /// alias (task=`single` vs `second_reviewer=true`, which implies dual).
+    Mismatch { task_class: &'static str },
+}
+
+impl ReviewClassRefusal {
+    /// Actionable operator-facing diagnostic for the refused dispatch.
+    pub(crate) fn diagnostic(&self, branch: &str) -> String {
+        match self {
+            ReviewClassRefusal::Unspecified => format!(
+                "review_class unspecified for merge-authority dispatch on `{branch}` — \
+                 set the task's `review_class` metadata to `single` or `dual` and \
+                 re-dispatch. A PR-producing dispatch must declare its review threshold; \
+                 the dispatch was refused (fail-closed #2745)."
+            ),
+            ReviewClassRefusal::Mismatch { task_class } => format!(
+                "review_class MISMATCH for dispatch on `{branch}` — task authority is \
+                 `{task_class}` but second_reviewer=true implies dual. second_reviewer \
+                 cannot override the task's declared class; reconcile them and re-dispatch. \
+                 the dispatch was refused (fail-closed #2745)."
+            ),
+        }
+    }
+
+    /// Stable machine code for the structured dispatch-refusal error — lets the
+    /// caller distinguish "no class declared" from "class contradicted".
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            ReviewClassRefusal::Unspecified => "review_class_unspecified",
+            ReviewClassRefusal::Mismatch { .. } => "review_class_mismatch",
+        }
+    }
+}
+
+/// #2745 (decision d-…-11 + codex seam correction): resolve the durable
+/// `review_class` for a MERGE-AUTHORITY (PR-producing) dispatch. Called ONLY from
+/// the merge-authority branch of [`maybe_auto_bind_lease`] — non-merge dispatches
+/// bypass it structurally, so there is no `merge_authority` bool to get wrong.
+///
+/// The TASK's `review_class` metadata is the sole AUTHORITY — parsed exactly once
+/// via [`ReviewClass::parse_fail_closed`]. `second_reviewer` is compatibility
+/// EVIDENCE only, never an independent source of dual:
+/// - task `dual` → `Ok(Dual)` (`second_reviewer` either value is consistent)
+/// - task `single`, `sr=false` → `Ok(Single)`
+/// - task `single`, `sr=true` → `Err(Mismatch)` (sr cannot override the task)
+/// - task Unresolved (absent/typo), any `sr` → `Err(Unspecified)` (missing+true
+///   still refuses; no fallback)
+pub(crate) fn resolve_dispatch_review_class(
+    task_review_class_raw: Option<&str>,
+    second_reviewer: bool,
+) -> Result<ReviewClass, ReviewClassRefusal> {
+    match ReviewClass::parse_fail_closed(task_review_class_raw) {
+        ReviewClass::Dual => Ok(ReviewClass::Dual),
+        ReviewClass::Single if second_reviewer => Err(ReviewClassRefusal::Mismatch {
+            task_class: "single",
+        }),
+        ReviewClass::Single => Ok(ReviewClass::Single),
+        ReviewClass::Unresolved => Err(ReviewClassRefusal::Unspecified),
+    }
+}
+
+/// #2745 R3 (root R2 finding 2): resolve the review_class for an EXISTING-TASK
+/// merge-authority dispatch. The task's `review_class` metadata is the SOLE durable
+/// AUTHORITY — a supplied `send review_class` arg (and `second_reviewer`) is
+/// CONSISTENCY EVIDENCE only: it may confirm the task's class but can NEVER fill a
+/// missing-metadata gap or contradict it. Closes the fallback where an untagged
+/// existing task passed by supplying `send.review_class` (leaving the task
+/// authority-less, against the schema + remediation contract).
+/// - task Unresolved (absent/typo metadata), any arg → `Err(Unspecified)` (the arg
+///   can't supply durable authority — the task must be tagged first).
+/// - task `single`/`dual` + a DIFFERING arg → `Err(Mismatch)`.
+/// - task `single` + `second_reviewer=true` (implies dual) → `Err(Mismatch)`.
+/// - otherwise `Ok(task_class)`.
+pub(crate) fn resolve_existing_task_review_class(
+    task_review_class_raw: Option<&str>,
+    arg_review_class_raw: Option<&str>,
+    second_reviewer: bool,
+) -> Result<ReviewClass, ReviewClassRefusal> {
+    let resolved = match ReviewClass::parse_fail_closed(task_review_class_raw) {
+        ReviewClass::Unresolved => return Err(ReviewClassRefusal::Unspecified),
+        c => c,
+    };
+    // A supplied send review_class is consistency-evidence only — it must match the
+    // task's durable class, never fill a gap or override it.
+    if let Some(arg) = arg_review_class_raw.filter(|s| !s.is_empty()) {
+        if ReviewClass::parse_fail_closed(Some(arg)) != resolved {
+            return Err(ReviewClassRefusal::Mismatch {
+                task_class: resolved.as_token(),
+            });
+        }
+    }
+    // second_reviewer=true implies dual; it must not contradict a Single task.
+    if second_reviewer && resolved == ReviewClass::Single {
+        return Err(ReviewClassRefusal::Mismatch {
+            task_class: "single",
+        });
+    }
+    Ok(resolved)
+}
+
 /// Phase 4 — optional auto-bind lease (rejectable).
 fn maybe_auto_bind_lease(
     home: &Path,
@@ -151,6 +262,68 @@ fn maybe_auto_bind_lease(
     }
     let next_after_ci =
         crate::daemon::ci_watch::watch_state::normalize_next_after_ci(&args["next_after_ci"]);
+    // #2745 (decision d-…-11 + R3 finding 2): this is the MERGE-AUTHORITY branch — a
+    // `branch` was supplied → PR-producing / auto-watched. Resolve the durable
+    // review_class authority BEFORE arming, with the authority source keyed on the
+    // dispatch shape:
+    // - EXISTING task (task_id present): Task.metadata is the SOLE durable authority.
+    //   A `send review_class` arg is consistency-evidence only — it can neither fill
+    //   a missing-metadata gap nor contradict the task (else the task would stay
+    //   authority-less despite a "successful" dispatch).
+    // - AUTO-CREATE (empty task_id): the `send review_class` arg declares the class
+    //   (it also seeds the created task's metadata downstream).
+    // Fail-closed: an absent / unknown / mismatched class REJECTS the whole dispatch
+    // atomically (structured error, no bind/create/send) — never a silent Single.
+    let arg_review_class = args["review_class"].as_str();
+    let resolved_review_class = if task_id_val.is_empty() {
+        resolve_dispatch_review_class(arg_review_class, second_reviewer)
+    } else {
+        let task_review_class = crate::tasks::load_by_id(home, task_id_val).and_then(|t| {
+            t.metadata
+                .get("review_class")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+        resolve_existing_task_review_class(
+            task_review_class.as_deref(),
+            arg_review_class,
+            second_reviewer,
+        )
+    };
+    let armed_review_class = match resolved_review_class {
+        Ok(class) => class.as_token(),
+        Err(refusal) => {
+            // #2745 fail-closed (root pre-review finding 2): REJECT the
+            // merge-authority dispatch ATOMICALLY — before any bind / task-create /
+            // send side effect — so the caller receives a structured error and no PR
+            // work is ever dispatched without a review gate (never a silent Ok with
+            // an un-armed watch). `code` distinguishes unspecified vs mismatch; the
+            // error carries branch + task remediation.
+            tracing::error!(
+                %target, %branch, task_id = %task_id_val, code = refusal.code(),
+                "#2745 merge-authority dispatch REJECTED — review_class unresolved \
+                 (no bind / watch / create / send)"
+            );
+            let remediation = if task_id_val.is_empty() {
+                "declare `review_class: single|dual` on the send (auto-create path), or \
+                 create the task with a review_class first, then re-dispatch"
+                    .to_string()
+            } else {
+                format!(
+                    "set the review_class metadata (single|dual) on task {task_id_val}, \
+                     then re-dispatch"
+                )
+            };
+            return Err(json!({
+                "ok": false,
+                "error": refusal.diagnostic(branch),
+                "code": refusal.code(),
+                "remediation": remediation,
+                "branch": branch,
+                "task_id": task_id_val,
+            }));
+        }
+    };
     dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain(
         home,
         target,
@@ -159,7 +332,7 @@ fn maybe_auto_bind_lease(
         args["repository"].as_str(),
         None,
         &next_after_ci,
-        if second_reviewer { Some("dual") } else { None },
+        Some(armed_review_class),
         true,
     )
     .map(|_| ())
@@ -194,6 +367,10 @@ fn maybe_auto_create_task(
         "project": target_project,
         "plan_ack_required": plan_ack_required,
         "plan_ack_reason": args["plan_ack_reason"].as_str(),
+        // #2745: forward the dispatch's review_class into the auto-created task's
+        // metadata so the durable authority survives past this dispatch (the
+        // resolver already validated it via the args fallback in the lease above).
+        "review_class": args["review_class"].as_str(),
     });
     let task_result = crate::tasks::handle(home, sender.as_str(), &create_args);
     match task_result["id"].as_str() {
@@ -351,4 +528,152 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     };
     let result = deliver_delegate(&ctx);
     track_delegate_success(&ctx, result)
+}
+
+#[cfg(test)]
+mod review_class_authority_tests {
+    use super::{
+        resolve_dispatch_review_class, resolve_existing_task_review_class, ReviewClass,
+        ReviewClassRefusal,
+    };
+
+    /// #2745 case 1 (durable propagation): the TASK's `review_class` is the
+    /// authority. A task marked `dual` resolves `Dual` even when the dispatch
+    /// omits the deprecated `second_reviewer` alias.
+    #[test]
+    fn task_review_class_dual_is_authority_2745() {
+        assert_eq!(
+            resolve_dispatch_review_class(Some("dual"), false),
+            Ok(ReviewClass::Dual),
+            "task review_class=dual is the authority regardless of second_reviewer"
+        );
+        // second_reviewer=true is consistent evidence for a dual task.
+        assert_eq!(
+            resolve_dispatch_review_class(Some("dual"), true),
+            Ok(ReviewClass::Dual),
+        );
+    }
+
+    /// #2745 case: explicit single resolves single (and dedups don't matter here);
+    /// consistency guard so GREEN doesn't over-refuse the ordinary path.
+    #[test]
+    fn task_review_class_single_resolves_single_2745() {
+        assert_eq!(
+            resolve_dispatch_review_class(Some("single"), false),
+            Ok(ReviewClass::Single),
+        );
+    }
+
+    /// #2745 case 2 (mismatch refusal): `second_reviewer=true` is EVIDENCE only —
+    /// it must NOT override a task that says `single`. A contradiction fails closed
+    /// (Mismatch), never a silent pick.
+    #[test]
+    fn task_single_vs_second_reviewer_true_mismatch_refuses_2745() {
+        assert_eq!(
+            resolve_dispatch_review_class(Some("single"), true),
+            Err(ReviewClassRefusal::Mismatch {
+                task_class: "single"
+            }),
+            "task=single vs second_reviewer=true must Refuse(Mismatch)"
+        );
+    }
+
+    /// #2745 case 7 (real-entry omission fails loud): a merge-authority dispatch
+    /// that OMITS review_class — no task metadata, no second_reviewer — FAILS LOUD
+    /// (Unspecified), never silently Single.
+    #[test]
+    fn merge_authority_omission_fails_loud_2745() {
+        assert_eq!(
+            resolve_dispatch_review_class(None, false),
+            Err(ReviewClassRefusal::Unspecified),
+            "omitted review_class on a merge-authority dispatch must Refuse(Unspecified)"
+        );
+    }
+
+    /// #2745 (codex correction): `second_reviewer=true` is NOT a fallback — a
+    /// missing task class with second_reviewer=true STILL refuses (no silent dual).
+    #[test]
+    fn omission_with_second_reviewer_true_still_refuses_2745() {
+        assert_eq!(
+            resolve_dispatch_review_class(None, true),
+            Err(ReviewClassRefusal::Unspecified),
+            "missing class + second_reviewer=true still refuses — no fallback to dual"
+        );
+        // A typo'd class is likewise unresolvable, second_reviewer notwithstanding.
+        assert_eq!(
+            resolve_dispatch_review_class(Some("duel"), true),
+            Err(ReviewClassRefusal::Unspecified),
+        );
+    }
+
+    /// #2745 R3 finding 2 (existing-task authority): a REFERENCED task with missing /
+    /// typo'd metadata cannot be rescued by a send arg or second_reviewer — the send
+    /// value is consistency-evidence only, never a source of durable authority.
+    #[test]
+    fn existing_task_missing_metadata_send_arg_cannot_fill_2745() {
+        assert_eq!(
+            resolve_existing_task_review_class(None, Some("single"), false),
+            Err(ReviewClassRefusal::Unspecified),
+            "send review_class cannot fill an untagged existing task"
+        );
+        assert_eq!(
+            resolve_existing_task_review_class(None, Some("dual"), true),
+            Err(ReviewClassRefusal::Unspecified),
+        );
+        assert_eq!(
+            resolve_existing_task_review_class(None, None, false),
+            Err(ReviewClassRefusal::Unspecified),
+        );
+        // typo'd task metadata is likewise unresolvable.
+        assert_eq!(
+            resolve_existing_task_review_class(Some("duel"), Some("dual"), false),
+            Err(ReviewClassRefusal::Unspecified),
+        );
+    }
+
+    /// #2745 R3 finding 2: a supplied send class that CONTRADICTS the task's durable
+    /// class fails closed (Mismatch) — the send is evidence, never an override.
+    #[test]
+    fn existing_task_contradictory_send_class_rejects_2745() {
+        assert_eq!(
+            resolve_existing_task_review_class(Some("single"), Some("dual"), false),
+            Err(ReviewClassRefusal::Mismatch {
+                task_class: "single"
+            }),
+            "task=single vs send review_class=dual must Refuse(Mismatch)"
+        );
+        assert_eq!(
+            resolve_existing_task_review_class(Some("dual"), Some("single"), false),
+            Err(ReviewClassRefusal::Mismatch { task_class: "dual" }),
+        );
+        // second_reviewer=true (implies dual) contradicts a Single task.
+        assert_eq!(
+            resolve_existing_task_review_class(Some("single"), None, true),
+            Err(ReviewClassRefusal::Mismatch {
+                task_class: "single"
+            }),
+        );
+    }
+
+    /// #2745 R3 finding 2 (positive): a consistent or absent send class defers to the
+    /// task's durable authority; the task metadata alone resolves the class.
+    #[test]
+    fn existing_task_authority_with_consistent_send_2745() {
+        assert_eq!(
+            resolve_existing_task_review_class(Some("dual"), Some("dual"), false),
+            Ok(ReviewClass::Dual)
+        );
+        assert_eq!(
+            resolve_existing_task_review_class(Some("dual"), None, true),
+            Ok(ReviewClass::Dual)
+        );
+        assert_eq!(
+            resolve_existing_task_review_class(Some("single"), None, false),
+            Ok(ReviewClass::Single)
+        );
+        assert_eq!(
+            resolve_existing_task_review_class(Some("single"), Some("single"), false),
+            Ok(ReviewClass::Single)
+        );
+    }
 }
