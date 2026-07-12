@@ -88,9 +88,17 @@ impl AppRestartGate {
             .is_ok()
     }
 
+    /// Test-only state accessors — `#[cfg(test)]` because production has no
+    /// caller (the handler + TUI loop drive the gate via `try_begin_probe` /
+    /// `to_committing` / `abort_to_serving`; these read-only peeks exist purely
+    /// to assert gate state in unit tests). Gating them keeps the strict
+    /// `-D warnings` bin build free of a dead_code warning without a broad
+    /// `#[allow]` and without touching the CAS methods.
+    #[cfg(test)]
     pub fn is_committing(&self) -> bool {
         self.0.load(Ordering::Acquire) == COMMITTING
     }
+    #[cfg(test)]
     pub fn is_serving(&self) -> bool {
         self.0.load(Ordering::Acquire) == SERVING
     }
