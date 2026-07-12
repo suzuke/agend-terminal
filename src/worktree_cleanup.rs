@@ -2194,6 +2194,173 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).ok();
     }
+
+    // ── V1 (d-20260712065632138568-7): cleanup-failure hygiene producers ──
+
+    /// Board-side view of the hygiene tasks the sweep produced under `home`.
+    fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
+        crate::task_events::replay(home)
+            .map(|s| {
+                s.tasks
+                    .values()
+                    .filter_map(|t| {
+                        Some((
+                            t.metadata
+                                .get(crate::daemon::hygiene_task::ALERT_KEY_META)?
+                                .as_str()?
+                                .to_string(),
+                            t.metadata
+                                .get(crate::daemon::hygiene_task::EVIDENCE_META)
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// V1 RED: an ELIGIBLE (merged) worktree whose removal FAILS must produce a
+    /// durable hygiene task with the exact repo/branch/reason — the sweep may
+    /// not silently skip a proven-eligible-but-undeletable candidate.
+    #[cfg(unix)]
+    #[test]
+    fn remove_failure_upserts_hygiene_task_v1() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("v1-remove-fail");
+        make_old_dated_branch(&repo, "feat/done", "2024-01-01T00:00:00 +0000");
+        let wt = repo.join("wt-done");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
+        );
+        git_in(&repo, &["merge", "feat/done"]);
+        // Sabotage: strip write permission so the eligible worktree cannot be
+        // removed (children can't be unlinked from a non-writable dir).
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let home = tmp_home("v1-remove-fail");
+        let mut configs = HashMap::new();
+        configs.insert("other-agent".to_string(), Some(repo.join("other")));
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let removed = sweep_from_registry(&home, &configs, &[]);
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+
+        assert!(
+            !removed.iter().any(|(b, _, _)| b == "feat/done"),
+            "sabotaged removal must not be reported as removed: {removed:?}"
+        );
+        let tasks = hygiene_tasks(&home);
+        let key = format!("residue-remove-failed:{}:feat/done", repo.display());
+        let hit = tasks.iter().find(|(k, _)| *k == key);
+        let (_, evidence) = hit.unwrap_or_else(|| {
+            panic!("eligible-but-remove-failed must upsert a hygiene task; got {tasks:?}")
+        });
+        assert_eq!(evidence["repo"], repo.display().to_string());
+        assert_eq!(evidence["branch"], "feat/done");
+        assert!(
+            evidence["reason"].as_str().unwrap_or("").contains("remove failed"),
+            "exact failure reason required: {evidence}"
+        );
+
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// V1 RED: a failing `fetch --prune` (here: unreachable remote) must upsert
+    /// a fetch-degraded hygiene task — a persistently failing fetch accumulates
+    /// undeletable branches invisibly (#2004) and may no longer stay log-only.
+    #[test]
+    fn fetch_failure_upserts_ambiguity_task_v1() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("v1-fetch-fail");
+        git_in(
+            &repo,
+            &["remote", "add", "origin", "/nonexistent/agend-v1-fixture"],
+        );
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let home = tmp_home("v1-fetch-fail");
+        let configs = HashMap::new();
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let _ = sweep_from_registry(&home, &configs, &[]);
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+
+        let tasks = hygiene_tasks(&home);
+        let key = format!("residue-fetch-degraded:{}", repo.display());
+        assert!(
+            tasks.iter().any(|(k, _)| *k == key),
+            "failing fetch must upsert a fetch-degraded hygiene task; got {tasks:?}"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// V1 negative guard (production datum m-20260712065850381686-207): a
+    /// deliberately KEPT branch — young review/* scaffolding, not merged, no
+    /// matching merged PR, not a squash orphan — is NOT eligible-but-failed and
+    /// must NOT produce any hygiene task.
+    #[test]
+    fn kept_review_branch_produces_no_hygiene_task_v1() {
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("v1-kept-review");
+        // Young review scaffolding branch, no worktree: phase-2 keeps it
+        // (inside its 72h TTL, unmerged, no remote counterpart).
+        git_in(&repo, &["branch", "review/2746-codex-r1"]);
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let home = tmp_home("v1-kept-review");
+        let configs = HashMap::new();
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let _ = sweep_from_registry(&home, &configs, &[]);
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+
+        let tasks = hygiene_tasks(&home);
+        assert!(
+            !tasks.iter().any(|(k, _)| k.contains("review/2746-codex-r1")),
+            "deliberately-kept branch must not be alerted: {tasks:?}"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// V1 guard: `AGEND_WORKTREE_AUTO_CLEANUP=0` is an operator opt-out — the
+    /// sweep does not run, so NO hygiene task may appear even with a staged
+    /// failure candidate present.
+    #[cfg(unix)]
+    #[test]
+    fn auto_cleanup_opt_out_produces_no_tasks_v1() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock();
+        let repo = setup_test_repo("v1-optout");
+        make_old_dated_branch(&repo, "feat/done", "2024-01-01T00:00:00 +0000");
+        let wt = repo.join("wt-done");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
+        );
+        git_in(&repo, &["merge", "feat/done"]);
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
+        let home = tmp_home("v1-optout");
+        let configs = HashMap::new();
+        write_source_repo_binding(&home, "other-agent", &repo);
+        let _ = sweep_from_registry(&home, &configs, &[]);
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+
+        assert!(
+            hygiene_tasks(&home).is_empty(),
+            "opt-out means quiet: no sweep, no producers, no tasks"
+        );
+
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]
