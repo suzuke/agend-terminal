@@ -520,9 +520,22 @@ pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
     // exits 0 there, and trimming can't turn non-empty porcelain output empty (a
     // theoretical non-zero exit, unreachable for a valid worktree, now also maps to
     // fail-closed `true` rather than the prior raw-bytes `false`).
-    crate::git_helpers::git_cmd(worktree_dir, &["status", "--porcelain"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(true)
+    // P0/P1 (codex R2): `--ignore-submodules=none` overrides any
+    // `submodule.<name>.ignore=all|dirty` config that would HIDE submodule dirt
+    // (else a submodule-only-dirty worktree reads clean → WIP loss); global
+    // `--no-optional-locks` (first) stops `status` opportunistically rewriting the
+    // live index. Both are git GLOBAL options, so they precede `status`.
+    crate::git_helpers::git_cmd(
+        worktree_dir,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    )
+    .map(|s| !s.is_empty())
+    .unwrap_or(true)
 }
 
 // ── #2158-adjacent: dirty-WIP preservation on MANUAL worktree release ──────
@@ -562,7 +575,19 @@ const RECOVERY_MAX_PER_BRANCH: usize = 3;
 /// (`Err => true`): a status failure attempts preservation rather than risk
 /// dropping WIP — a broken git then fails the snapshot gracefully (`None`).
 fn worktree_has_preservable_wip(wt_path: &Path) -> bool {
-    match crate::git_helpers::git_cmd(wt_path, &["status", "--porcelain"]) {
+    // P0/P1 (codex R2): force submodule dirt to SHOW (`--ignore-submodules=none`
+    // overrides `submodule.<name>.ignore=all|dirty`, which would otherwise hide it
+    // and make this classifier read Clean → the worktree removed → nested WIP lost)
+    // and keep the live index byte-untouched (`--no-optional-locks`). Both global.
+    match crate::git_helpers::git_cmd(
+        wt_path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    ) {
         Ok(s) => s.lines().any(|line| {
             let path = line.get(3..).map(str::trim).unwrap_or("");
             !path.is_empty() && path != crate::worktree_pool::MANAGED_MARKER
@@ -682,7 +707,9 @@ pub(crate) fn preserve_dirty_worktree(
     // tree objects WITHOUT mutating the index file (no `add`/`read-tree`/`reset`),
     // so the live index stays byte-identical on every path below. An UNMERGED index
     // makes `write-tree` fail → Blocked (fail-closed).
-    let index_tree = match git_cmd(wt_path, &["write-tree"]) {
+    // P1 (codex R2): global `--no-optional-locks` (first) so `write-tree` does not
+    // persist a refreshed cache-tree back to the LIVE index — keeps it byte-identical.
+    let index_tree = match git_cmd(wt_path, &["--no-optional-locks", "write-tree"]) {
         Ok(t) if !t.is_empty() => t,
         other => {
             tracing::warn!(agent, branch, ?other,
@@ -1093,8 +1120,19 @@ fn walk_nested_dirty(
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
     out: &mut String,
 ) {
-    let entries = match crate::git_helpers::git_cmd(dir_canon, &["status", "--porcelain=v2", "-z"])
-    {
+    // P0/P1 (codex R2): reveal submodule dirt (`--ignore-submodules=none`) at BOTH
+    // the super and every recursive nested call (this one line serves both via the
+    // recursion), and never rewrite the live index (`--no-optional-locks`, global).
+    let entries = match crate::git_helpers::git_cmd(
+        dir_canon,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--ignore-submodules=none",
+        ],
+    ) {
         Ok(s) => parse_porcelain_v2_z(&s),
         Err(e) => {
             out.push_str(&format!(
@@ -1263,8 +1301,24 @@ fn notify_unpreservable_nested_dirty(
 pub(crate) fn clear_nested_refusal_marker(home: &Path, wt_path: &Path) {
     let dir = refusal_notice_dir(home);
     let key = hash_hex(&wt_path);
-    let _ = std::fs::remove_file(dir.join(&key));
-    let _ = std::fs::remove_file(dir.join(format!("{key}.lock")));
+    let marker_path = dir.join(&key);
+    let lock_path = dir.join(format!("{key}.lock"));
+    // P2 (codex R2): remove ONLY the marker, under the SAME per-worktree lock a
+    // concurrent notice takes — so clearing can't race a mid-flight enqueue/marker
+    // update. NEVER unlink the `.lock` inode: flock is per-inode, so a fresh inode
+    // is a fresh (useless) lock, silently breaking serialization for anyone still
+    // holding the old one. Keep it durable. If the lock can't be acquired, remove
+    // the marker best-effort anyway (idempotent) but still leave the `.lock` alone.
+    match crate::store::acquire_file_lock(&lock_path) {
+        Ok(_guard) => {
+            let _ = std::fs::remove_file(&marker_path);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "clear nested refusal marker: lock acquire failed — removing marker best-effort, keeping .lock");
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    }
 }
 
 /// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,
@@ -1906,6 +1960,9 @@ mod tests {
 
     /// Superproject with `commit_marker_gitignore` + one committed submodule at
     /// `vendor/dep` holding `sub_file`. `create()` inits it recursively.
+    // Only used by `#[cfg(unix)]` nested tests; gate to avoid dead-code on Windows
+    // (`cargo clippy --tests -D warnings` builds all cfgs).
+    #[cfg(unix)]
     fn tmp_super_one_sub_file(name: &str, sub_file: &str) -> PathBuf {
         let sub = tmp_repo_with_file(&format!("{name}-sub"), sub_file, "vendored-v1\n");
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1929,11 +1986,13 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn tmp_super_one_sub(name: &str) -> PathBuf {
         tmp_super_one_sub_file(name, "vendored.txt")
     }
 
     /// Run git with piped stdin; panic with stderr on non-zero.
+    #[cfg(unix)]
     fn git_stdin_ok(dir: &Path, args: &[&str], input: &[u8]) {
         use std::io::Write;
         let mut child = std::process::Command::new("git")
@@ -1964,6 +2023,7 @@ mod tests {
     /// Count inbox messages for `recipient` under `home` whose `from` matches
     /// `from_marker` (reads the JSONL file directly — fresh test home ⇒ no
     /// id-redirect, so the file is `home/inbox/<recipient>.jsonl`).
+    #[cfg(unix)]
     fn inbox_count_from(home: &Path, recipient: &str, from_marker: &str) -> usize {
         let path = home.join("inbox").join(format!("{recipient}.jsonl"));
         let body = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1973,6 +2033,7 @@ mod tests {
             .count()
     }
 
+    #[cfg(unix)]
     const NESTED_FROM: &str = "system:release_unpreservable_nested_dirty";
 
     /// (1) Nested-only dirt (tracked file inside the submodule, gitlink unchanged)
@@ -2228,6 +2289,7 @@ mod tests {
 
     /// Marker directory for the per-worktree refusal notice (test-visible mirror
     /// of the production path).
+    #[cfg(unix)]
     fn refusal_marker_dir(home: &Path) -> PathBuf {
         crate::paths::runtime_dir(home).join("release_refusal_notices")
     }
@@ -2294,14 +2356,28 @@ mod tests {
         let out2 = crate::worktree_pool::release_full(&home, "agent1", false);
         assert!(out2.released, "clean re-release must succeed");
         assert!(out2.worktree_removed, "clean worktree must be removed");
-        let leftover = std::fs::read_dir(refusal_marker_dir(&home))
+        // P2 (codex R2): clean release removes the MARKER but keeps the `.lock`
+        // inode durable (never unlink a lock a concurrent notice may hold). So the
+        // only residue is the `.lock`; no non-lock marker survives.
+        let residue: Vec<_> = std::fs::read_dir(refusal_marker_dir(&home))
             .into_iter()
             .flatten()
             .flatten()
+            .map(|e| e.path())
+            .collect();
+        let markers = residue
+            .iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) != Some("lock"))
             .count();
         assert_eq!(
-            leftover, 0,
-            "clean release must clear this worktree's marker + lock"
+            markers, 0,
+            "clean release must clear this worktree's marker"
+        );
+        assert!(
+            residue
+                .iter()
+                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("lock")),
+            "the per-worktree `.lock` must remain durable after clear"
         );
 
         std::fs::remove_dir_all(&home).ok();
@@ -2435,7 +2511,11 @@ mod tests {
                     false,
                 );
                 git_run_ok(&super_repo, &["add", ".gitmodules"], false);
-                git_run_ok(&super_repo, &["commit", "-m", "gitmodules ignore=all"], false);
+                git_run_ok(
+                    &super_repo,
+                    &["commit", "-m", "gitmodules ignore=all"],
+                    false,
+                );
             } else {
                 git_run_ok(
                     &super_repo,
@@ -2444,10 +2524,21 @@ mod tests {
                 );
             }
             let info = create(&home, &super_repo, "agent1", Some("feat/cfgig")).expect("worktree");
-            crate::binding::bind_full(&home, "agent1", "", "feat/cfgig", &info.path, &super_repo, false)
-                .expect("bind");
+            crate::binding::bind_full(
+                &home,
+                "agent1",
+                "",
+                "feat/cfgig",
+                &info.path,
+                &super_repo,
+                false,
+            )
+            .expect("bind");
             let vendored = info.path.join("vendor/dep/vendored.txt");
-            assert!(vendored.is_file(), "{label}: fixture submodule file present");
+            assert!(
+                vendored.is_file(),
+                "{label}: fixture submodule file present"
+            );
             std::fs::write(&vendored, b"DIRTY-nested-edit\n").unwrap();
 
             // Mechanism: plain status is BLIND to the dirt; forced status reveals it.
@@ -2489,8 +2580,14 @@ mod tests {
             // Integration: release_full must refuse and RETAIN the worktree.
             let out = crate::worktree_pool::release_full(&home, "agent1", false);
             assert!(!out.released, "{label}: release must be refused");
-            assert!(!out.worktree_removed, "{label}: worktree must not be removed");
-            assert!(info.path.exists(), "{label}: worktree dir retained for recovery");
+            assert!(
+                !out.worktree_removed,
+                "{label}: worktree must not be removed"
+            );
+            assert!(
+                info.path.exists(),
+                "{label}: worktree dir retained for recovery"
+            );
 
             std::fs::remove_dir_all(&home).ok();
             if let Some(root) = super_repo.parent() {
@@ -2527,8 +2624,10 @@ mod tests {
             .write(true)
             .open(info.path.join("a"))
             .unwrap();
-        fa.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800))
-            .unwrap();
+        fa.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800),
+        )
+        .unwrap();
         drop(fa);
         // Pre-persist the cache-tree so `write-tree` inside preserve is a pure no-op;
         // this isolates the status stat-refresh as the sole index mutator under test.
