@@ -81,7 +81,11 @@ impl ScmProvider for MergeMock {
     }
 
     fn pr_checks(&self, _r: &str, _p: u64) -> anyhow::Result<Vec<CheckState>> {
-        let state = if self.checks_pass { "SUCCESS" } else { "FAILURE" };
+        let state = if self.checks_pass {
+            "SUCCESS"
+        } else {
+            "FAILURE"
+        };
         Ok(vec![CheckState {
             name: "CI".into(),
             state: state.into(),
@@ -148,7 +152,11 @@ fn normal_merge_pins_expected_head_sha() {
     let _g = crate::scm::set_test_scm_provider(Arc::new(MergeMock::new(recorded.clone())));
     let r = super::handle_merge_repo(&home, &base_args(), "dev");
     assert_eq!(r["merged"].as_bool(), Some(true), "should merge: {r}");
-    let opts = recorded.lock().unwrap().clone().expect("pr_merge was called");
+    let opts = recorded
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("pr_merge was called");
     assert_eq!(
         opts.expected_head_sha.as_deref(),
         Some(H0),
@@ -169,7 +177,10 @@ fn head_move_between_gate_and_write_refuses() {
     let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
     let r = super::handle_merge_repo(&home, &base_args(), "dev");
     assert!(refused(&r), "P0-1: a moved head must REFUSE, got: {r}");
-    assert!(recorded.lock().unwrap().is_none(), "P0-1: pr_merge must NOT run");
+    assert!(
+        recorded.lock().unwrap().is_none(),
+        "P0-1: pr_merge must NOT run"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -189,7 +200,10 @@ fn base_oid_move_with_clean_status_refuses() {
         refused(&r),
         "P0-2: a base-OID advance (status still CLEAN) must REFUSE, got: {r}"
     );
-    assert!(recorded.lock().unwrap().is_none(), "P0-2: pr_merge must NOT run");
+    assert!(
+        recorded.lock().unwrap().is_none(),
+        "P0-2: pr_merge must NOT run"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -226,8 +240,14 @@ fn head_lookup_failure_with_force_fails_closed() {
     mock.head_err = true;
     let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
     let r = super::handle_merge_repo(&home, &force_args(), "dev");
-    assert!(refused(&r), "P0-3: head unknown + force must fail closed, got: {r}");
-    assert!(recorded.lock().unwrap().is_none(), "P0-3: pr_merge must NOT run");
+    assert!(
+        refused(&r),
+        "P0-3: head unknown + force must fail closed, got: {r}"
+    );
+    assert!(
+        recorded.lock().unwrap().is_none(),
+        "P0-3: pr_merge must NOT run"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 

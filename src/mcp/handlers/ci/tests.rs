@@ -2665,6 +2665,52 @@ fn handle_watch_ci_rejects_invalid_repo_format() {
 
 // ----- #1244 PR-B: merge preflight CI gate -----
 
+/// Minimal ScmProvider stub yielding a stable (head, base) so the P0 exact-head
+/// acquisition passes, letting the force-audit tests below reach the audit path
+/// they exercise. The force path returns at the audit-write failure BEFORE any
+/// merge/recheck, so only `pr_view` is ever called here.
+struct MergeHeadBaseStub;
+impl crate::scm::ScmProvider for MergeHeadBaseStub {
+    fn pr_view(&self, _r: &str, _p: u64, _f: &[&str]) -> anyhow::Result<crate::scm::PrSummary> {
+        Ok(crate::scm::PrSummary {
+            head_ref_oid: Some("h".repeat(40)),
+            base_ref_oid: Some("b".repeat(40)),
+            ..Default::default()
+        })
+    }
+    fn pr_checks(&self, _r: &str, _p: u64) -> anyhow::Result<Vec<crate::scm::CheckState>> {
+        unimplemented!("force path fails at audit before pr_checks")
+    }
+    fn pr_list(
+        &self,
+        _r: &str,
+        _f: &crate::scm::ListFilter,
+        _fl: &[&str],
+        _c: Option<&std::path::Path>,
+    ) -> anyhow::Result<Vec<crate::scm::PrSummary>> {
+        unimplemented!()
+    }
+    fn pr_merge(
+        &self,
+        _r: &str,
+        _p: u64,
+        _o: &crate::scm::MergeOpts,
+    ) -> anyhow::Result<crate::scm::MergeOutcome> {
+        unimplemented!("force path fails at audit before pr_merge")
+    }
+    fn issue_view(
+        &self,
+        _r: &str,
+        _n: u64,
+        _f: &[&str],
+    ) -> anyhow::Result<crate::scm::IssueSummary> {
+        unimplemented!()
+    }
+    fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<crate::scm::CompareResult> {
+        unimplemented!()
+    }
+}
+
 #[test]
 fn merge_missing_pr_returns_error() {
     let home = std::env::temp_dir().join(format!("agend-merge-test-{}", std::process::id()));
@@ -2696,6 +2742,9 @@ fn merge_force_audit_write_failure_refuses_merge() {
     let events_path = home.join("fleet_events.jsonl");
     std::fs::create_dir_all(&events_path).unwrap();
 
+    // P0: the exact-head acquisition now runs before the audit — stub a reachable
+    // head+base so the test still reaches the force-audit failure it exercises.
+    let _g = crate::scm::set_test_scm_provider(std::sync::Arc::new(MergeHeadBaseStub));
     let result = super::handle_merge_repo(
         &home,
         // #1619: explicit `repository` so resolution succeeds and the
@@ -2740,6 +2789,10 @@ fn merge_force_reaches_handler_through_full_dispatch_chain_2539() {
     let prev_home = std::env::var("AGEND_HOME").ok();
     std::env::set_var("AGEND_HOME", &home);
 
+    // P0: stub a reachable head+base so the exact-head acquisition passes and the
+    // test still reaches the force-audit failure (thread-local, same thread as
+    // handle_tool).
+    let _g = crate::scm::set_test_scm_provider(std::sync::Arc::new(MergeHeadBaseStub));
     let result = crate::mcp::handlers::handle_tool(
         "repo",
         &json!({

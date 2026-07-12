@@ -266,6 +266,13 @@ fn pr_merge_args(repo: &str, pr: u64, opts: &MergeOpts) -> Vec<String> {
     if opts.delete_branch {
         a.push("--delete-branch".into());
     }
+    // P0 exact-head: pin the merge to the exact validated head. GitHub's
+    // `--match-head-commit` (gh ≥2.92) makes `gh pr merge` FAIL if the PR head
+    // has moved, closing the residual daemon-recheck→write window at the API.
+    if let Some(sha) = opts.expected_head_sha.as_deref() {
+        a.push("--match-head-commit".into());
+        a.push(sha.into());
+    }
     a
 }
 
@@ -964,6 +971,32 @@ mod tests {
         assert_eq!(
             pr_merge_args("o/r", 7, &MergeOpts::default()),
             vec!["pr", "merge", "7", "--repo", "o/r"]
+        );
+        // P0 exact-head: `expected_head_sha` appends `--match-head-commit <sha>`
+        // AFTER the existing flags (gh ≥2.92); `None` omits it (byte-identical).
+        assert_eq!(
+            pr_merge_args(
+                "o/r",
+                7,
+                &MergeOpts {
+                    admin: true,
+                    squash: true,
+                    delete_branch: true,
+                    expected_head_sha: Some("abcabcabcabcabcabcabcabcabcabcabcabcabc0".into()),
+                }
+            ),
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--repo",
+                "o/r",
+                "--admin",
+                "--squash",
+                "--delete-branch",
+                "--match-head-commit",
+                "abcabcabcabcabcabcabcabcabcabcabcabcabc0",
+            ]
         );
         // Per-flag MergeOpts → argv mapping (each flag independent).
         assert_eq!(
