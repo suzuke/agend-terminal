@@ -87,7 +87,11 @@ fn model_flag_assembly_confined_to_push_model_arg_chokepoint_2744() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs(&src, &mut files);
-    assert!(files.len() > 100, "sanity: src walk found {} files", files.len());
+    assert!(
+        files.len() > 100,
+        "sanity: src walk found {} files",
+        files.len()
+    );
 
     let mut violations = Vec::new();
     for path in files {
