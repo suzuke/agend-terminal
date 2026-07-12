@@ -80,9 +80,9 @@ impl PostFlushSlot {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn register(&self, action: AfterFlushAction) -> bool {
         let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        // #2453 R2 RED WITNESS (temporary; GREEN restores the closed/occupied guard):
-        // accept every register, ignoring closed/occupied → a late/timed-out/concurrent
-        // worker can hijack a later response's flush.
+        if st.closed || st.action.is_some() {
+            return false;
+        }
         st.action = Some(action);
         true
     }
@@ -98,13 +98,12 @@ impl PostFlushSlot {
             st.closed = true;
             st.action.take()
         };
-        // #2453 R2 RED WITNESS (temporary; GREEN restores the `if flushed_ok` gate):
-        // run the action regardless of flush success → a FAILED flush wrongly delivers
-        // the commit-permission instead of dropping it un-run.
-        let _ = flushed_ok;
-        if let Some(action) = action {
-            action();
+        if flushed_ok {
+            if let Some(action) = action {
+                action();
+            }
         }
+        // else: `action` drops here un-run → sender drops → TUI flush_ack disconnects.
     }
 }
 
