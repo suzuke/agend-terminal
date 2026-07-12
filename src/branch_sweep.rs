@@ -685,6 +685,228 @@ mod tests {
         sha
     }
 
+    fn bind_handler_repo(home: &Path, repo: &Path, agent: &str) {
+        let binding_dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&binding_dir).expect("mkdir binding");
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::json!({
+                "source_repo": repo.display().to_string(),
+                "branch": "feature",
+                "worktree": repo.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("write binding");
+    }
+
+    fn handler_dry_run(home: &Path, repo: &Path, agent: &str) -> serde_json::Value {
+        bind_handler_repo(home, repo, agent);
+        crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            home,
+            &serde_json::json!({"instance": agent}),
+            agent,
+        )
+    }
+
+    fn reviewer_candidate<'a>(
+        response: &'a serde_json::Value,
+        name: &str,
+    ) -> &'a serde_json::Value {
+        response["categories"]["reviewer_checkout"]
+            .as_array()
+            .expect("reviewer_checkout array")
+            .iter()
+            .find(|candidate| candidate["name"] == name)
+            .unwrap_or_else(|| panic!("missing reviewer candidate {name}: {response}"))
+    }
+
+    fn add_local_bare_origin(repo: &Path) -> PathBuf {
+        let origin = repo.parent().expect("repo parent").join("origin.git");
+        git_run(
+            repo,
+            &["init", "--bare", origin.to_str().expect("origin path")],
+        );
+        git_run(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().expect("origin path"),
+            ],
+        );
+        origin
+    }
+
+    // PR-A RED: preservation evidence is returned through the real
+    // cleanup_merged_branches dry-run handler. These assertions deliberately
+    // use JSON fields so the RED commit compiles against the pre-feature
+    // Candidate type and fails at the actual public response boundary.
+    #[test]
+    fn review_preservation_main_reachable_is_observability_only() {
+        let repo = setup_repo("preservation_main");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo);
+        git_run(&repo, &["branch", "tmp_main_reachable", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-main-agent");
+        let candidate = reviewer_candidate(&response, "tmp_main_reachable");
+        assert_eq!(
+            candidate["preservation"]["classification"], "MAIN_REACHABLE",
+            "main ancestry must be surfaced as current evidence: {response}"
+        );
+        assert_eq!(candidate["preservation"]["durable"], false);
+        assert!(
+            response["candidate_ids"]
+                .as_array()
+                .expect("candidate_ids")
+                .iter()
+                .any(|id| id == "tmp_main_reachable"),
+            "PR-A is observability-only: classification must not remove the existing reviewer candidate"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_external_ancestor_uses_hermetic_pull_ref() {
+        let repo = setup_repo("preservation_external");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo);
+        let candidate_sha =
+            create_branch_with_commit(&repo, "tmp_external", "review work under inspection");
+        git_run(
+            &repo,
+            &["checkout", "-b", "external-descendant", &candidate_sha],
+        );
+        std::fs::write(repo.join("external-descendant.txt"), "sync commit\n").expect("write");
+        git_run(&repo, &["add", "external-descendant.txt"]);
+        git_run(&repo, &["commit", "-m", "external descendant"]);
+        let descendant_sha =
+            String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+                .trim()
+                .to_string();
+        git_run(
+            &repo,
+            &[
+                "push",
+                "origin",
+                &format!("{descendant_sha}:refs/pull/7/head"),
+            ],
+        );
+        git_run(&repo, &["checkout", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-external-agent");
+        let candidate = reviewer_candidate(&response, "tmp_external");
+        assert_eq!(
+            candidate["preservation"]["classification"],
+            "EXTERNALLY_REACHABLE_UNGUARANTEED",
+            "candidate ancestor of a current pull head must be visible without claiming durability: {response}"
+        );
+        assert_eq!(candidate["preservation"]["durable"], false);
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_orphaned_reports_exact_unique_count() {
+        let repo = setup_repo("preservation_orphan");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo); // successful, empty external inventory
+        create_branch_with_commit(&repo, "tmp_orphan", "orphan commit one");
+        git_run(&repo, &["checkout", "tmp_orphan"]);
+        std::fs::write(repo.join("orphan-two.txt"), "second unique commit\n").expect("write");
+        git_run(&repo, &["add", "orphan-two.txt"]);
+        git_run(&repo, &["commit", "-m", "orphan commit two"]);
+        git_run(&repo, &["checkout", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-orphan-agent");
+        let candidate = reviewer_candidate(&response, "tmp_orphan");
+        assert_eq!(
+            candidate["preservation"]["classification"], "ORPHANED_UNIQUE",
+            "orphan classification requires a successful external inventory: {response}"
+        );
+        assert_eq!(candidate["preservation"]["unique_commit_count"], 2);
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_external_failure_keeps_inventory_unknown() {
+        let repo = setup_repo("preservation_unknown");
+        let home = repo.parent().unwrap().to_path_buf();
+        create_branch_with_commit(&repo, "tmp_unknown", "review work with offline origin");
+        git_run(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "/definitely/missing/agend-origin.git",
+            ],
+        );
+
+        let response = handler_dry_run(&home, &repo, "preservation-unknown-agent");
+        assert_eq!(
+            response["dry_run"], true,
+            "local inventory must survive: {response}"
+        );
+        let candidate = reviewer_candidate(&response, "tmp_unknown");
+        assert_eq!(
+            candidate["preservation"]["classification"], "UNKNOWN_EXTERNAL_LOOKUP_FAILED",
+            "offline evidence must never fall through to ORPHANED: {response}"
+        );
+        assert_ne!(
+            candidate["preservation"]["classification"],
+            "ORPHANED_UNIQUE"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn spike_residue_is_separate_annotation_not_candidate() {
+        let repo = setup_repo("preservation_spike");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo);
+        git_run(&repo, &["checkout", "-b", "spike/preservation-probe"]);
+        std::fs::write(repo.join("spike-probe.txt"), "analysis artifact\n").expect("write");
+        git_run(&repo, &["add", "spike-probe.txt"]);
+        git_run(&repo, &["commit", "-m", "spike artifact"]);
+        git_run(&repo, &["checkout", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-spike-agent");
+        let annotations = response["annotations"]["spike_residue"]
+            .as_array()
+            .expect("separate spike_residue annotations");
+        assert!(
+            annotations.iter().any(|entry| {
+                entry["name"] == "spike/preservation-probe"
+                    && entry["annotation"] == "SPIKE_RESIDUE"
+            }),
+            "spike residue must be visible only as an annotation: {response}"
+        );
+        assert!(
+            !response["candidate_ids"]
+                .as_array()
+                .expect("candidate_ids")
+                .iter()
+                .any(|id| id == "spike/preservation-probe"),
+            "annotation must not add spike residue to candidate_ids"
+        );
+        assert!(
+            !response["categories"]["reviewer_checkout"]
+                .as_array()
+                .expect("reviewer_checkout")
+                .iter()
+                .any(|candidate| candidate["name"] == "spike/preservation-probe"),
+            "spike residue must remain outside reviewer_checkout"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
     #[test]
     fn test_branch_sweep_scan_categorizes_clean_merged() {
         // #817 RED 1: branch "feat-a" merged into main via a merge
