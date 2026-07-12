@@ -556,6 +556,7 @@ mod tests {
             externals,
             notifier: None,
             home: home_ref,
+            capability: crate::api::RestartCapability::Unsupported,
         };
         (ctx, home)
     }
@@ -624,6 +625,7 @@ mod tests {
             externals,
             notifier: None,
             home: home_ref,
+            capability: crate::api::RestartCapability::Unsupported,
         };
         (ctx, home)
     }
@@ -707,6 +709,7 @@ mod tests {
             externals,
             notifier: None,
             home: home_ref,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let resp = handle_spawn(&json!({"name": "twin", "backend": "claude"}), &ctx);
@@ -1097,6 +1100,7 @@ mod tests {
             externals,
             notifier: None,
             home: home_ref,
+            capability: crate::api::RestartCapability::Unsupported,
         };
         (ctx, home)
     }

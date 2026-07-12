@@ -416,6 +416,7 @@ mod tests {
             externals,
             notifier: None,
             home,
+            capability: crate::api::RestartCapability::Unsupported,
         }
     }
 

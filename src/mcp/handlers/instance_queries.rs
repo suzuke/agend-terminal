@@ -196,6 +196,7 @@ mod tests {
         let runtime = RuntimeContext {
             registry,
             externals,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let result =
@@ -221,6 +222,7 @@ mod tests {
                     pid: 4242,
                 },
             )]))),
+            capability: crate::api::RestartCapability::Unsupported,
         }
     }
 

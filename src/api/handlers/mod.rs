@@ -117,4 +117,8 @@ pub(crate) struct HandlerCtx<'a> {
     pub externals: &'a ExternalRegistry,
     pub notifier: Option<&'a dyn ApiNotifier>,
     pub home: &'a Path,
+    /// #2453 Stage R1: the API-server owner's restart capability, injected at
+    /// [`crate::api::serve`] from the composition root and carried into the MCP
+    /// `RuntimeContext` so `restart_daemon` dispatches on an injected value.
+    pub capability: crate::api::RestartCapability,
 }
