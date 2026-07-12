@@ -131,6 +131,46 @@ fn compose_delegate_message(
     }
 }
 
+/// #2745 fail-closed dual-review authority (decision d-…-11): the durable
+/// `review_class` a merge-authority (PR-producing / auto-watched) dispatch
+/// resolves for its auto-armed ci-watch.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DispatchReviewClass {
+    /// Resolved authority — the exact class token (`"single"`/`"dual"`) to
+    /// persist into the watch.
+    Resolved(&'static str),
+    /// FAIL-CLOSED: the review class was ABSENT / UNKNOWN / MISMATCHED on a
+    /// merge-authority dispatch. The caller MUST refuse to arm the watch and
+    /// emit an actionable diagnostic — NEVER silently default to Single or Dual.
+    Refuse { diagnostic: String },
+}
+
+/// Derive the durable `review_class` for a merge-authority dispatch from the
+/// TASK's `review_class` metadata (the authority per decision d-…-11).
+/// `second_reviewer=true` is a DEPRECATED dual ALIAS that may MATERIALIZE `dual`
+/// but must never CONTRADICT the task authority. Missing / unknown / mismatched
+/// on a merge-authority dispatch → [`DispatchReviewClass::Refuse`], never a
+/// silent default.
+///
+/// RED-first placeholder: this body reproduces the pre-#2745 behavior — it
+/// ignores the task authority and never refuses, following `second_reviewer`
+/// alone. The authority derivation + mismatch/omission validation lands in
+/// GREEN; the RED tests below fail against this placeholder.
+#[allow(dead_code)]
+pub(crate) fn derive_dispatch_review_class(
+    task_review_class: Option<&str>,
+    second_reviewer: bool,
+    merge_authority: bool,
+) -> DispatchReviewClass {
+    let _ = (task_review_class, merge_authority);
+    if second_reviewer {
+        DispatchReviewClass::Resolved("dual")
+    } else {
+        DispatchReviewClass::Resolved("single")
+    }
+}
+
 /// Phase 4 — optional auto-bind lease (rejectable).
 fn maybe_auto_bind_lease(
     home: &Path,
@@ -351,4 +391,48 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     };
     let result = deliver_delegate(&ctx);
     track_delegate_success(&ctx, result)
+}
+
+#[cfg(test)]
+mod review_class_authority_tests {
+    use super::{derive_dispatch_review_class, DispatchReviewClass};
+
+    /// #2745 RED-1 (durable propagation): the TASK's `review_class` is the
+    /// authority. A task marked `dual` propagates `dual` even when the dispatch
+    /// omits the deprecated `second_reviewer` alias. RED today: the derive
+    /// ignores the task and follows `second_reviewer` alone → resolves `single`.
+    #[test]
+    fn red1_task_review_class_is_authority_2745() {
+        assert_eq!(
+            derive_dispatch_review_class(Some("dual"), false, true),
+            DispatchReviewClass::Resolved("dual"),
+            "task review_class=dual is the authority regardless of second_reviewer"
+        );
+    }
+
+    /// #2745 RED-2 (mismatch refusal): `second_reviewer=true` may MATERIALIZE
+    /// dual but must NOT override a task that says `single`. A contradiction on a
+    /// merge-authority dispatch fails closed (Refuse + diagnostic), never a
+    /// silent pick. RED today: the derive follows second_reviewer → Resolved(dual).
+    #[test]
+    fn red2_task_vs_second_reviewer_mismatch_refuses_2745() {
+        let out = derive_dispatch_review_class(Some("single"), true, true);
+        assert!(
+            matches!(out, DispatchReviewClass::Refuse { .. }),
+            "task=single vs second_reviewer=true is a mismatch — must Refuse, got {out:?}"
+        );
+    }
+
+    /// #2745 RED-7 (real-entry omission fails loud): a merge-authority
+    /// (PR-producing) dispatch that OMITS review_class entirely — no task
+    /// metadata, no second_reviewer — must FAIL LOUD (Refuse + diagnostic),
+    /// never silently arm Single. RED today: the derive resolves Single.
+    #[test]
+    fn red7_merge_authority_omission_fails_loud_2745() {
+        let out = derive_dispatch_review_class(None, false, true);
+        assert!(
+            matches!(out, DispatchReviewClass::Refuse { .. }),
+            "omitted review_class on a merge-authority dispatch must Refuse, got {out:?}"
+        );
+    }
 }

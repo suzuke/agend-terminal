@@ -2182,13 +2182,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// T21 (reviewer-rejection fix coverage): `parse_review_class` (in
-    /// `ci_watch::poller`) is the production source of the
-    /// `ReviewClass` value passed into `record_ci_result`. Pin the
-    /// parser contract: "dual" (case-insensitive) → Dual; everything
-    /// else (absent / null / unknown string / wrong type) → Single.
+    /// #2745 RED-3 (fail-closed core, THE repro): a PrState whose `review_class`
+    /// is `Unresolved` (intent ABSENT / UNKNOWN / MISMATCHED at arm time) must
+    /// NEVER reach MergeReady — not even with CI green ∧ a VERIFIED at head. An
+    /// omitted intent can never silently take the single-VERIFIED path. RED
+    /// today: `Unresolved::required_verified_count()` is a `1` placeholder so
+    /// `is_merge_ready` fires on one verdict (the #2745 premature pr-ready).
+    /// GREEN makes `is_merge_ready` reject `Unresolved` outright + the emitter
+    /// raises an actionable diagnostic instead.
     #[test]
-    fn t21_parse_review_class_contract() {
+    fn red3_unresolved_class_never_merge_ready_2745() {
+        let mut s = new_state("sha-A", ReviewClass::Unresolved);
+        apply(
+            &mut s,
+            Event::CiObserved {
+                head_sha: "sha-A",
+                conclusion: CiConclusion::Green,
+                observed_at: now(),
+            },
+        );
+        apply(
+            &mut s,
+            Event::VerdictObserved {
+                reviewer: "rev-1",
+                reviewed_head: "sha-A",
+                kind: VerdictKind::Verified,
+            },
+        );
+        assert!(
+            !is_merge_ready(&s),
+            "Unresolved review_class must never be merge-ready (fail-closed #2745)"
+        );
+        assert_eq!(s.merge_state, MergeState::NotReady);
+    }
+
+    /// #2745 RED-6 (cold-load Dual guard): a `Dual` PrState carrying ONE VERIFIED,
+    /// saved then reloaded from disk, must come back as `Dual` with its single
+    /// verdict tally intact — NOT silently collapsed to `Single` (which would let
+    /// the one existing verdict flip it merge-ready on cold load). The 2-distinct
+    /// threshold must still hold post-restart. Guards GREEN's serde/default
+    /// changes against introducing a Single-default-on-load loss path.
+    #[test]
+    fn red6_cold_load_dual_class_and_tally_guard_2745() {
+        let dir = std::env::temp_dir().join(format!("agend-2745-coldload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = new_state("sha-A", ReviewClass::Dual);
+        s.ci_state = CiState::Green {
+            sha: "sha-A".to_string(),
+            observed_at: now(),
+        };
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
+        };
+        save(&dir, &s).unwrap();
+
+        let loaded = load(&dir, &s.repo, &s.branch).expect("reload");
+        assert_eq!(
+            loaded.review_class,
+            ReviewClass::Dual,
+            "cold load must preserve Dual — never default to Single"
+        );
+        if let VerdictState::Verified { reviewers } = &loaded.verdict_state {
+            assert_eq!(
+                reviewers.len(),
+                1,
+                "single-verdict tally preserved across reload"
+            );
+        } else {
+            panic!(
+                "expected Verified after reload, got {:?}",
+                loaded.verdict_state
+            );
+        }
+        assert!(
+            !is_merge_ready(&loaded),
+            "Dual still needs 2 distinct VERIFIED after cold load — one must not flip ready"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2745 RED (poller parser, fail-closed): `parse_review_class` — the
+    /// production source of the `ReviewClass` passed into `record_ci_result` — is
+    /// FAIL-CLOSED. Only the exact tokens `single`/`dual` (case-insensitive)
+    /// resolve; everything else (absent / null / unknown string / typo / wrong
+    /// type) is `Unresolved`, NEVER a silent `Single`. Inverts the pre-#2745
+    /// fail-OPEN contract (unknown→Single) that let an omitted/typo'd class merge
+    /// on one VERIFIED. RED today: the parser still collapses the residual to
+    /// `Single`. GREEN routes it through `ReviewClass::parse_fail_closed`.
+    #[test]
+    fn t21_parse_review_class_fail_closed_2745() {
         use crate::daemon::ci_watch::parse_review_class;
         use serde_json::json;
 
@@ -2210,22 +2294,27 @@ mod tests {
         );
         assert_eq!(
             parse_review_class(&json!({"review_class": "unknown"})),
-            ReviewClass::Single,
-            "unknown strings default to Single (safe fallback)"
+            ReviewClass::Unresolved,
+            "unknown strings FAIL CLOSED to Unresolved (never a silent Single)"
+        );
+        assert_eq!(
+            parse_review_class(&json!({"review_class": "duel"})),
+            ReviewClass::Unresolved,
+            "a typo'd 'duel' must not silently degrade to Single"
         );
         assert_eq!(
             parse_review_class(&json!({"review_class": null})),
-            ReviewClass::Single
+            ReviewClass::Unresolved
         );
         assert_eq!(
             parse_review_class(&json!({})),
-            ReviewClass::Single,
-            "absent field defaults to Single"
+            ReviewClass::Unresolved,
+            "absent field FAILS CLOSED (never a silent Single)"
         );
         assert_eq!(
             parse_review_class(&json!({"review_class": 42})),
-            ReviewClass::Single,
-            "wrong type defaults to Single"
+            ReviewClass::Unresolved,
+            "wrong type FAILS CLOSED"
         );
     }
 
