@@ -73,6 +73,11 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
     let mut cmd = Command::new(bin());
     cmd.env("AGEND_HOME", home)
         .env("AGEND_RESTART_HANDOFF", "1")
+        // #2738: pin the Shadow Observer ON (default-ON, but explicit removes any
+        // ambient AGEND_SHADOW_OBSERVER=0) so BOTH the predecessor AND the
+        // env-inheriting handoff successor deterministically bind the shadow hook
+        // socket — the precondition for the pathname-steal connectability probe.
+        .env("AGEND_SHADOW_OBSERVER", "1")
         // Strip any ambient supervisor signal so this is a genuine
         // "no external supervisor" environment (e.g. macOS GUI sets
         // XPC_SERVICE_NAME; CI/systemd may set INVOCATION_ID).
@@ -110,6 +115,26 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
 fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 only checks existence/permission, never delivers.
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// #2738: after a failed handoff the predecessor must still OWN + serve its
+/// shadow hook socket. Connect to the per-daemon socket and write ONE complete
+/// newline-terminated frame (an unknown token is fine — CONNECTABILITY is the
+/// invariant; the trailing `\n` lets the daemon's sequential accept loop's
+/// line-read return promptly instead of blocking on its 2s read timeout).
+/// Returns true iff the connect succeeds (a live listener owns the pathname).
+/// The path mirrors `daemon::shadow::socket_path` (src/daemon/shadow/mod.rs:124),
+/// inlined because it is not importable from this integration crate.
+fn shadow_socket_connectable(home: &Path) -> bool {
+    let path = home.join("shadow-events.sock");
+    match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(mut stream) => {
+            let _ = stream
+                .write_all(b"{\"token\":\"probe-2738\",\"hook_event_name\":\"SessionStart\"}\n");
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Active daemon pids: a `run/<pid>` dir whose pid is alive AND has an
@@ -410,6 +435,12 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
     let still_serves = ls_lists_probe_within(&home, Duration::from_secs(10));
 
+    // #2738: with the old PID confirmed sole primary + serving, its shadow hook
+    // socket must still be connectable — a pre-flock successor that stole the
+    // pathname (unlink+rebind) then died must NOT brick the shadow plane. Probe
+    // BEFORE cleanup (the kill below tears down the listener).
+    let shadow_ok = shadow_socket_connectable(&home);
+
     let _ = d1.kill();
     let _ = d1.wait();
     cleanup_test_home(&home);
@@ -421,6 +452,11 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     assert!(
         still_serves,
         "predecessor must keep serving its agents after the FIX2 abort"
+    );
+    assert!(
+        shadow_ok,
+        "#2738: predecessor must still own + serve the shadow hook socket after the FIX2 abort \
+         (a pre-flock successor that unlinked+rebound the pathname then died must not brick it)"
     );
 }
 
@@ -460,6 +496,11 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
     let still_serves = ls_lists_probe_within(&home, Duration::from_secs(15));
 
+    // #2738: same shadow-socket connectability invariant on the recover-as-primary
+    // path — the successor stole the pathname pre-flock, so after the predecessor
+    // recovers it must still own + serve the socket. Probe BEFORE cleanup.
+    let shadow_ok = shadow_socket_connectable(&home);
+
     let _ = d1.kill();
     let _ = d1.wait();
     cleanup_test_home(&home);
@@ -471,6 +512,11 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     assert!(
         still_serves,
         "predecessor must re-spawn + keep serving its agent after recover-as-primary"
+    );
+    assert!(
+        shadow_ok,
+        "#2738: predecessor must still own + serve the shadow hook socket after recover-as-primary \
+         (a pre-flock successor that unlinked+rebound the pathname then died must not brick it)"
     );
 }
 

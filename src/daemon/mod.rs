@@ -775,10 +775,6 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
 
     let ctx = init_daemon_services(home, telegram_pre)?;
 
-    // #2413 Shadow Observer — local plane: start the unix-socket hook-event server
-    // (no-op under AGEND_SHADOW_OBSERVER=0; default-ON). Observe-only side-channel; never blocks.
-    crate::daemon::shadow::start(home);
-
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
     // `app::run_app` so owned `agend-terminal app` mode wires the IDENTICAL
@@ -847,6 +843,18 @@ fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
             (agents, Some(lock))
         }
     };
+
+    // #2413/#2738 Shadow Observer — local plane: start the unix-socket hook-event
+    // server (no-op under AGEND_SHADOW_OBSERVER=0; default-ON; observe-only side
+    // channel, never blocks). Placed HERE — after the source match confirms SOLE
+    // ownership (normal boot: `prepare`'s OwnedFleet flock; handoff: flock acquired
+    // above) and immediately BEFORE spawn_fleet_agents. #2738: `start_unix` does a
+    // destructive `remove_file(path)` + `bind(path)`; running it PRE-flock let a
+    // handoff successor unlink+steal a live predecessor's socket pathname, then (if
+    // it aborted before the flock) leave the predecessor orphaned — shadow plane
+    // silently dead. Post-flock/pre-fleet preserves the invariant "bind after sole
+    // ownership AND before this host forks its fleet" for both boot modes.
+    crate::daemon::shadow::start(home);
 
     spawn_fleet_agents(home, &agents, &ctx);
 
