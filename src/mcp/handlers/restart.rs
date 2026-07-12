@@ -34,50 +34,16 @@ pub(super) fn handle_restart_daemon(
 /// replies BEFORE teardown + re-exec (decision d-20260712034222169749-5). A
 /// concurrent duplicate loses the CAS claim → idempotent "already in progress".
 #[cfg(unix)]
-fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
-    use crate::api::app_restart::{AppRestartRequest, AppRestartVerdict};
-    let Some(ar) = app_restart else {
-        return app_no_channel_fail_closed();
-    };
-    // Genuine CAS claim: only one concurrent worker enters Probing.
-    if !ar.gate.try_begin_probe() {
-        return json!({
-            "ok": true,
-            "restart": "already in progress",
-            "note": "an app restart is already being processed; this request was a no-op"
-        });
-    }
-    // Hand the request to the TUI loop; block (bounded) for its verdict. Bounded
-    // oneshot (capacity 1). The loop runs the probe on its tick (≤5s); wait a
-    // little longer as a safety net.
-    let (reply_tx, reply_rx) = crossbeam_channel::bounded::<AppRestartVerdict>(1);
-    if ar.tx.try_send(AppRestartRequest { reply: reply_tx }).is_err() {
-        ar.gate.abort_to_serving();
-        return json!({
-            "ok": false,
-            "error": "restart_daemon: could not deliver the restart request to the TUI loop; fleet intact"
-        });
-    }
-    match reply_rx.recv_timeout(std::time::Duration::from_secs(7)) {
-        Ok(AppRestartVerdict::Committing) => json!({
-            "ok": true,
-            "restart": "committing",
-            "note": "preflight passed; the app is re-exec'ing in place (this connection will drop)"
-        }),
-        Ok(AppRestartVerdict::Aborted(reason)) => json!({
-            "ok": false,
-            "error": format!("restart_daemon aborted: {reason}. Fleet + TUI intact — no restart.")
-        }),
-        Err(_) => {
-            // Safety-net timeout. Best-effort release (CAS from Probing; a no-op if
-            // the loop already advanced to Committing).
-            ar.gate.abort_to_serving();
-            json!({
-                "ok": false,
-                "error": "restart_daemon preflight timed out; fleet + TUI intact — no restart"
-            })
-        }
-    }
+fn app_restart_strategy(_app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
+    // #2453 R2 RED WITNESS (temporary — restored verbatim in the very next
+    // commit). The real App owner-restart arm (CAS-claim → bounded oneshot →
+    // verdict) is disabled here so the handler App-arm tests appended below prove
+    // they genuinely exercise it: against this stub they MUST fail (RED). This
+    // does NOT touch the verified CAS gate in `crate::api::app_restart`.
+    json!({
+        "ok": false,
+        "error": "restart_daemon: app owner-restart arm temporarily disabled (RED witness)"
+    })
 }
 
 /// #2453 Stage R2: Windows owner-restart is an ISOLATED fail-closed strategy —
@@ -696,5 +662,118 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&tmp);
         });
+    }
+}
+
+/// #2453 R2: the `App` owner-restart strategy — handler-side behavior. The TUI
+/// loop is stubbed by a thread that consumes the request and replies, so these
+/// exercise the real `handle_restart_daemon` App arm (CAS-claim → bounded
+/// oneshot → verdict) without a live app.
+#[cfg(all(test, unix))]
+mod app_restart_strategy_tests {
+    use super::*;
+    use crate::api::app_restart::{AppRestart, AppRestartGate, AppRestartRequest, AppRestartVerdict};
+    use crate::api::RestartCapability;
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn make() -> (AppRestart, crossbeam_channel::Receiver<AppRestartRequest>) {
+        let gate = AppRestartGate::new();
+        let (tx, rx) = crossbeam_channel::bounded::<AppRestartRequest>(1);
+        (AppRestart { tx, gate }, rx)
+    }
+
+    /// `App` capability but NO injected channel → fail-closed (no TUI loop).
+    #[test]
+    fn app_no_channel_fails_closed() {
+        let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), None);
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("no in-process app restart channel"));
+    }
+
+    /// A duplicate request while the gate is already claimed → idempotent
+    /// "already in progress", and NO second request is sent to the loop.
+    #[test]
+    fn duplicate_while_in_flight_is_already_in_progress() {
+        let (ar, rx) = make();
+        assert!(ar.gate.try_begin_probe()); // simulate an in-flight probe holding the claim
+        let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["restart"], "already in progress");
+        assert!(
+            rx.try_recv().is_err(),
+            "no second request must be sent while a restart is in flight"
+        );
+    }
+
+    /// Happy path: the stub loop commits + replies `Committing` → handler returns
+    /// ok:true restart:committing. The helper uses `recv_timeout` (not blocking
+    /// `recv`) so a disabled/never-sending arm surfaces as a fast RED (failed
+    /// join) rather than a hung test.
+    #[test]
+    fn probe_pass_returns_committing() {
+        let (ar, rx) = make();
+        let gate = ar.gate.clone();
+        let t = std::thread::spawn(move || {
+            let req = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request delivered to loop");
+            assert!(gate.to_committing(), "gate must be Probing (handler claimed it)");
+            req.reply.send(AppRestartVerdict::Committing).unwrap();
+        });
+        let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
+        t.join().unwrap();
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["restart"], "committing");
+    }
+
+    /// Abort: the stub loop replies `Aborted` → handler returns ok:false, fleet
+    /// + TUI intact.
+    #[test]
+    fn probe_abort_returns_error_fleet_intact() {
+        let (ar, rx) = make();
+        let gate = ar.gate.clone();
+        let t = std::thread::spawn(move || {
+            let req = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("request delivered to loop");
+            gate.abort_to_serving();
+            req.reply
+                .send(AppRestartVerdict::Aborted("preflight failed (exit Some(1))".into()))
+                .unwrap();
+        });
+        let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
+        t.join().unwrap();
+        assert_eq!(resp["ok"], false);
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("aborted") && err.contains("intact"), "got {err:?}");
+    }
+}
+
+/// #2453 R2: Windows `App` owner-restart is an isolated fail-closed strategy —
+/// even WITH an injected channel it must refuse. Runs on CI windows-latest.
+#[cfg(all(test, windows))]
+mod app_restart_windows_tests {
+    use super::*;
+    use crate::api::app_restart::{AppRestart, AppRestartGate, AppRestartRequest};
+    use crate::api::RestartCapability;
+
+    #[test]
+    fn app_restart_fails_closed_on_windows() {
+        let gate = AppRestartGate::new();
+        let (tx, _rx) = crossbeam_channel::bounded::<AppRestartRequest>(1);
+        let ar = AppRestart { tx, gate };
+        let resp = handle_restart_daemon(
+            std::path::Path::new("C:\\tmp"),
+            Some(RestartCapability::App),
+            Some(ar),
+        );
+        assert_eq!(
+            resp["ok"], false,
+            "windows app restart must fail closed even with a channel"
+        );
     }
 }
