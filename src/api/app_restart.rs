@@ -136,7 +136,10 @@ mod tests {
                 w1 ^ w2,
                 "iter {i}: exactly one worker must win the claim; got w1={w1} w2={w2}"
             );
-            assert!(!gate.is_committing(), "iter {i}: neither claim advances to committing");
+            assert!(
+                !gate.is_committing(),
+                "iter {i}: neither claim advances to committing"
+            );
         }
     }
 

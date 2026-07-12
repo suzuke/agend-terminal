@@ -51,7 +51,11 @@ fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>
     // oneshot (capacity 1). The loop runs the probe on its tick (≤5s); wait a
     // little longer as a safety net.
     let (reply_tx, reply_rx) = crossbeam_channel::bounded::<AppRestartVerdict>(1);
-    if ar.tx.try_send(AppRestartRequest { reply: reply_tx }).is_err() {
+    if ar
+        .tx
+        .try_send(AppRestartRequest { reply: reply_tx })
+        .is_err()
+    {
         ar.gate.abort_to_serving();
         return json!({
             "ok": false,
@@ -657,11 +661,8 @@ mod tests {
     fn unsupported_capability_default_deny_cannot_reach_daemon() {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("unsupported-cap");
-            let response = handle_restart_daemon(
-                &tmp,
-                Some(crate::api::RestartCapability::Unsupported),
-                None,
-            );
+            let response =
+                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Unsupported), None);
             assert_eq!(
                 response["ok"], false,
                 "unsupported-host restart must default-deny, got {response}"
@@ -706,7 +707,9 @@ mod tests {
 #[cfg(all(test, unix))]
 mod app_restart_strategy_tests {
     use super::*;
-    use crate::api::app_restart::{AppRestart, AppRestartGate, AppRestartRequest, AppRestartVerdict};
+    use crate::api::app_restart::{
+        AppRestart, AppRestartGate, AppRestartRequest, AppRestartVerdict,
+    };
     use crate::api::RestartCapability;
     use std::path::Path;
     use std::time::Duration;
@@ -755,7 +758,10 @@ mod app_restart_strategy_tests {
             let req = rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("request delivered to loop");
-            assert!(gate.to_committing(), "gate must be Probing (handler claimed it)");
+            assert!(
+                gate.to_committing(),
+                "gate must be Probing (handler claimed it)"
+            );
             req.reply.send(AppRestartVerdict::Committing).unwrap();
         });
         let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
@@ -776,14 +782,19 @@ mod app_restart_strategy_tests {
                 .expect("request delivered to loop");
             gate.abort_to_serving();
             req.reply
-                .send(AppRestartVerdict::Aborted("preflight failed (exit Some(1))".into()))
+                .send(AppRestartVerdict::Aborted(
+                    "preflight failed (exit Some(1))".into(),
+                ))
                 .unwrap();
         });
         let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
         t.join().unwrap();
         assert_eq!(resp["ok"], false);
         let err = resp["error"].as_str().unwrap();
-        assert!(err.contains("aborted") && err.contains("intact"), "got {err:?}");
+        assert!(
+            err.contains("aborted") && err.contains("intact"),
+            "got {err:?}"
+        );
     }
 }
 

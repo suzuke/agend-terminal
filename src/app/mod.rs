@@ -561,7 +561,10 @@ fn poll_restart_probe(
                 ProbePoll::Commit(p.reply)
             } else {
                 gate.abort_to_serving();
-                ProbePoll::Abort(p.reply, format!("preflight failed (exit {:?})", status.code()))
+                ProbePoll::Abort(
+                    p.reply,
+                    format!("preflight failed (exit {:?})", status.code()),
+                )
             }
         }
         Ok(None) => {
@@ -3237,7 +3240,14 @@ mod probe_poll_tests {
             .expect("spawn probe child");
         let (reply, rx) = crossbeam_channel::unbounded::<AppRestartVerdict>();
         let deadline = Instant::now() + Duration::from_secs(60);
-        (RestartProbe { child, reply, deadline }, rx)
+        (
+            RestartProbe {
+                child,
+                reply,
+                deadline,
+            },
+            rx,
+        )
     }
 
     #[test]
@@ -3271,7 +3281,10 @@ mod probe_poll_tests {
             !gate.is_committing(),
             "a failed preflight must NEVER reach Committing (which would teardown+exec)"
         );
-        assert!(slot.is_none(), "the failed probe must be consumed out of the slot");
+        assert!(
+            slot.is_none(),
+            "the failed probe must be consumed out of the slot"
+        );
     }
 }
 
