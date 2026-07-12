@@ -388,10 +388,11 @@ fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
 /// V1 (d-20260712065632138568-7): best-effort durable hygiene alert — a board
 /// write failure must never abort the sweep itself.
 fn upsert_hygiene(home: &Path, key: String, title: String, evidence: serde_json::Value) {
-    if let Err(e) =
-        crate::daemon::hygiene_task::upsert_system_hygiene_task(home, &key, &title, evidence)
-    {
-        tracing::warn!(error = %e, key = %key, "hygiene task upsert failed");
+    match crate::daemon::hygiene_task::upsert_system_hygiene_task(home, &key, &title, evidence) {
+        Ok(outcome) => {
+            tracing::info!(key = %key, task = %outcome.task_id().0, "hygiene task upserted");
+        }
+        Err(e) => tracing::warn!(error = %e, key = %key, "hygiene task upsert failed"),
     }
 }
 

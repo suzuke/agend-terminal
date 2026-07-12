@@ -211,7 +211,7 @@ mod tests {
         let active: Vec<_> = state
             .tasks
             .values()
-            .filter(|t| t.metadata.get(ALERT_KEY_META).is_some())
+            .filter(|t| t.metadata.contains_key(ALERT_KEY_META))
             .collect();
         assert_eq!(active.len(), 1, "exactly one hygiene task after race");
         // One side must have created, the other updated (order free).
