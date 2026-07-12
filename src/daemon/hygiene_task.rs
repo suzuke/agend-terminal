@@ -60,6 +60,58 @@ fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
     })
 }
 
+/// r2 (§3.20 deterministic RED): test-only rendezvous at the stale-probe
+/// window — between capturing `(tid, n)` from a rejected create and issuing
+/// the update append. Lets a test hold N writers at the SAME probed `n`
+/// deterministically. Each participating thread waits at most once
+/// (thread-local latch), so CAS-retry loops can never re-block; unarmed =
+/// no-op; test-only compile (nextest = process-per-test, no cross-test leak).
+#[cfg(test)]
+pub(crate) mod test_sync {
+    use std::cell::Cell;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// (generation, barrier): the generation makes a reused test-runner
+    /// thread distinguish "already rendezvoused THIS arming" from a fresh
+    /// arming by a later test in the same process (`cargo test` runs tests
+    /// as threads in one process; nextest is process-per-test).
+    static GATE: Mutex<Option<(u64, Arc<Barrier>)>> = Mutex::new(None);
+    static NEXT_GEN: Mutex<u64> = Mutex::new(1);
+    thread_local! {
+        static WAITED_GEN: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Scoped arming: dropping the guard clears the gate, so an armed
+    /// barrier can never leak into later tests/threads (r3 blocker on
+    /// 8bf5b73e: static gate was set and never reset).
+    #[must_use = "the gate stays armed only while this guard lives"]
+    pub(crate) struct GateGuard;
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            GATE.lock().expect("gate lock").take();
+        }
+    }
+
+    pub fn arm(parties: usize) -> GateGuard {
+        let mut next = NEXT_GEN.lock().expect("gen lock");
+        let gen = *next;
+        *next += 1;
+        *GATE.lock().expect("gate lock") = Some((gen, Arc::new(Barrier::new(parties))));
+        GateGuard
+    }
+
+    pub fn wait_if_armed() {
+        let gate = GATE.lock().expect("gate lock").clone();
+        if let Some((gen, b)) = gate {
+            if WAITED_GEN.with(Cell::get) == gen {
+                return; // this thread already rendezvoused this generation
+            }
+            WAITED_GEN.with(|w| w.set(gen));
+            b.wait();
+        }
+    }
+}
+
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn new_task_id() -> TaskId {
@@ -72,9 +124,10 @@ fn new_task_id() -> TaskId {
 
 /// Atomically create-or-update the hygiene task for `key`. `title` is used
 /// only on create; `evidence` (a JSON object with exact repo/branch/reason
-/// fields) replaces the previous evidence on update. Bounded retry: each
-/// attempt is individually atomic; a rejection returns the authoritative
-/// state that invalidated it, so the loop converges in ≤2 flips.
+/// fields) replaces the previous evidence on update. CAS loop: each attempt
+/// is individually atomic and validates the exact state its write assumes;
+/// rejections hand back the fresh state, so W concurrent writers converge in
+/// ≤W serialized rounds (bounded by `ATTEMPTS`, overrun = loud error).
 pub fn upsert_system_hygiene_task(
     home: &Path,
     key: &str,
@@ -88,72 +141,100 @@ pub fn upsert_system_hygiene_task(
         key: k.to_string(),
         value: v,
     };
-    // Each attempt is individually atomic (precondition + append under the
-    // board lock against a fresh replay). A rejection means the other shape
-    // won the race; ≤2 flips converge, 3rd is a hard error.
-    for _ in 0..3 {
+    // CAS loop. Every attempt validates its full assumption under the board
+    // lock against a fresh replay — "no active task" for create, the exact
+    // `(task id, occurrences)` pair for update — and every rejection hands the
+    // freshly observed state to the next attempt. An ID-only update check
+    // would let two stale probes both commit `n+1` (lost update, REJECTED
+    // verdict on 943cb54b). Each serialized round commits at least one
+    // writer, so W concurrent callers converge in ≤W rounds; the budget is a
+    // generous multiple and overrunning it is a loud error, never a silent
+    // drop.
+    const ATTEMPTS: usize = 16;
+    let mut probe: Option<(TaskId, u64)> = None;
+    for _ in 0..ATTEMPTS {
         let now = chrono::Utc::now().to_rfc3339();
-        let mut existing: Option<(TaskId, u64)> = None;
-        let task_id = new_task_id();
-        let create = vec![
-            TaskEvent::Created {
-                task_id: task_id.clone(),
-                title: title.to_string(),
-                description: format!(
-                    "system hygiene alert (episode key `{key}`) — evidence in \
-                     task metadata; close when resolved (a recurrence reopens \
-                     a fresh task)."
-                ),
-                priority: "normal".to_string(),
-                owner: None,
-                due_at: None,
-                depends_on: Vec::new(),
-                routed_to: None,
-                branch: None,
-                bind: Some(false),
-                eta_secs: None,
-                tags: vec!["system-hygiene".to_string()],
-                parent_id: None,
-            },
-            meta(&task_id, ALERT_KEY_META, key.into()),
-            meta(&task_id, EVIDENCE_META, evidence.clone()),
-            meta(&task_id, LAST_SEEN_META, now.clone().into()),
-            meta(&task_id, OCCURRENCES_META, 1u64.into()),
-        ];
-        match task_events::append_batch_checked(home, &emitter, create, |state| match find_active(
-            state, key,
-        ) {
-            Some(hit) => {
-                existing = Some(hit);
-                Err("active episode task already exists".to_string())
+        match probe.take() {
+            None => {
+                let task_id = new_task_id();
+                let mut seen: Option<(TaskId, u64)> = None;
+                let create = vec![
+                    TaskEvent::Created {
+                        task_id: task_id.clone(),
+                        title: title.to_string(),
+                        description: format!(
+                            "system hygiene alert (episode key `{key}`) — evidence in \
+                             task metadata; close when resolved (a recurrence reopens \
+                             a fresh task)."
+                        ),
+                        priority: "normal".to_string(),
+                        owner: None,
+                        due_at: None,
+                        depends_on: Vec::new(),
+                        routed_to: None,
+                        branch: None,
+                        bind: Some(false),
+                        eta_secs: None,
+                        tags: vec!["system-hygiene".to_string()],
+                        parent_id: None,
+                    },
+                    meta(&task_id, ALERT_KEY_META, key.into()),
+                    meta(&task_id, EVIDENCE_META, evidence.clone()),
+                    meta(&task_id, LAST_SEEN_META, now.clone().into()),
+                    meta(&task_id, OCCURRENCES_META, 1u64.into()),
+                ];
+                match task_events::append_batch_checked(home, &emitter, create, |state| {
+                    match find_active(state, key) {
+                        Some(hit) => {
+                            seen = Some(hit);
+                            Err("active episode task already exists".to_string())
+                        }
+                        None => Ok(()),
+                    }
+                })? {
+                    Ok(_) => return Ok(HygieneUpsert::Created(task_id)),
+                    Err(_) => {
+                        probe = seen;
+                        continue;
+                    }
+                }
             }
-            None => Ok(()),
-        })? {
-            Ok(_) => return Ok(HygieneUpsert::Created(task_id)),
-            Err(_) => {
-                let Some((tid, n)) = existing else {
-                    anyhow::bail!("hygiene upsert: rejected without an existing task");
-                };
+            Some((tid, n)) => {
+                // r2: deterministic stale-probe rendezvous — no-op in
+                // production, lets tests pin writers at the same probed `n`.
+                #[cfg(test)]
+                test_sync::wait_if_armed();
                 let update = vec![
                     meta(&tid, EVIDENCE_META, evidence.clone()),
                     meta(&tid, LAST_SEEN_META, now.into()),
                     meta(&tid, OCCURRENCES_META, (n + 1).into()),
                 ];
                 let tid_check = tid.clone();
+                let mut seen: Option<(TaskId, u64)> = None;
                 match task_events::append_batch_checked(home, &emitter, update, |state| {
                     match find_active(state, key) {
+                        // r2a RED state: identity-only check — the rendezvous
+                        // test above FAILS at this commit by construction
+                        // (two stale probes both commit n+1). Next commit
+                        // tightens this to a full CAS.
                         Some((t, _)) if t == tid_check => Ok(()),
-                        _ => Err("episode task closed since probe".to_string()),
+                        other => {
+                            seen = other;
+                            Err("episode state moved since probe".to_string())
+                        }
                     }
                 })? {
                     Ok(_) => return Ok(HygieneUpsert::Updated(tid)),
-                    // Closed between the two attempts — loop back to create.
-                    Err(_) => continue,
+                    // Fresh (tid, n) → CAS-retry; None (closed) → create path.
+                    Err(_) => {
+                        probe = seen;
+                        continue;
+                    }
                 }
             }
         }
     }
-    anyhow::bail!("hygiene upsert for `{key}`: state flipped 3 times, giving up")
+    anyhow::bail!("hygiene upsert for `{key}`: contention exceeded {ATTEMPTS} attempts, giving up")
 }
 
 #[cfg(test)]
@@ -253,6 +334,100 @@ mod tests {
             .filter(|t| t.metadata.contains_key(ALERT_KEY_META))
             .count();
         assert_eq!(hygiene_count, 1);
+    }
+
+    /// r2 (§3.20 deterministic RED): force the exact stale-probe interleaving
+    /// via the production-path rendezvous — TWO writers both create-reject
+    /// against the seeded task, both capture `n=1`, the armed barrier holds
+    /// them at the update window, then both race the append. CAS: exactly one
+    /// commit per observed `n`; the loser retries with fresh `n=2` → final
+    /// occurrences=3, always. Old ID-only predicate: both commit `n+1=2` →
+    /// final 2, always (deterministic loss — mutation-checked in the r2
+    /// report).
+    #[test]
+    fn stale_probe_rendezvous_cas_exactly_once() {
+        let home = tmp_home("cas-det");
+        let seed = upsert_system_hygiene_task(&home, "k:r:b", "residue", ev("seed")).unwrap();
+        assert!(matches!(seed, HygieneUpsert::Created(_)));
+        let gate = test_sync::arm(2);
+        let mk = |tag: &'static str| {
+            let home = home.clone();
+            std::thread::spawn(move || {
+                upsert_system_hygiene_task(&home, "k:r:b", "residue", ev(tag))
+            })
+        };
+        let (a, b) = (mk("obs-a"), mk("obs-b"));
+        let ra = a.join().unwrap().unwrap();
+        let rb = b.join().unwrap().unwrap();
+        assert!(matches!(ra, HygieneUpsert::Updated(_)), "{ra:?}");
+        assert!(matches!(rb, HygieneUpsert::Updated(_)), "{rb:?}");
+        let state = board_state(&home);
+        let t = state.tasks.get(seed.task_id()).unwrap();
+        assert_eq!(
+            t.metadata.get(OCCURRENCES_META).and_then(|v| v.as_u64()),
+            Some(3),
+            "both rendezvoused observations must land: 1 (seed) + 2"
+        );
+        // r3: same-process post-rendezvous regression — once the guard is
+        // dropped the gate is cleared, so an ordinary update must neither
+        // block on a stale barrier nor miscount.
+        drop(gate);
+        let after = upsert_system_hygiene_task(&home, "k:r:b", "residue", ev("post")).unwrap();
+        assert!(matches!(after, HygieneUpsert::Updated(_)), "{after:?}");
+        let state = board_state(&home);
+        let t = state.tasks.get(seed.task_id()).unwrap();
+        assert_eq!(
+            t.metadata.get(OCCURRENCES_META).and_then(|v| v.as_u64()),
+            Some(4),
+            "post-rendezvous ordinary update must count normally"
+        );
+    }
+
+    /// r1 contention/load coverage: N concurrent updaters against an EXISTING
+    /// episode must each be accounted exactly once — occurrences goes 1 →
+    /// 1+N, one active task, all callers report Updated. (The FINAL count is
+    /// deterministic post-fix regardless of scheduling; the deterministic
+    /// stale-probe interleaving itself is pinned by
+    /// `stale_probe_rendezvous_cas_exactly_once` above.)
+    #[test]
+    fn concurrent_updates_on_existing_episode_lose_nothing() {
+        const N: usize = 8;
+        let home = tmp_home("cas");
+        let seed = upsert_system_hygiene_task(&home, "k:r:b", "residue", ev("seed")).unwrap();
+        assert!(matches!(seed, HygieneUpsert::Created(_)));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let home = home.clone();
+                let b = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    upsert_system_hygiene_task(&home, "k:r:b", "residue", ev(&format!("obs-{i}")))
+                })
+            })
+            .collect();
+        for h in handles {
+            let r = h.join().unwrap().unwrap();
+            assert!(
+                matches!(r, HygieneUpsert::Updated(_)),
+                "existing episode: {r:?}"
+            );
+        }
+        let state = board_state(&home);
+        let t = state.tasks.get(seed.task_id()).unwrap();
+        assert_eq!(
+            t.metadata.get(OCCURRENCES_META).and_then(|v| v.as_u64()),
+            Some(1 + N as u64),
+            "every concurrent observation must be accounted exactly once"
+        );
+        assert_eq!(
+            state
+                .tasks
+                .values()
+                .filter(|t| t.metadata.contains_key(ALERT_KEY_META))
+                .count(),
+            1
+        );
     }
 
     /// C2 (RED): a Done episode re-opens as a NEW task (fresh episode), the
