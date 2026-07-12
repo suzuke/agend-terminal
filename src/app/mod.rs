@@ -554,9 +554,14 @@ fn poll_restart_probe(
     if probe.is_none() {
         return ProbePoll::Pending;
     }
-    match probe.as_mut().unwrap().child.try_wait() {
+    match probe
+        .as_mut()
+        .expect("probe present (checked above)")
+        .child
+        .try_wait()
+    {
         Ok(Some(status)) => {
-            let p = probe.take().unwrap();
+            let p = probe.take().expect("probe present (checked above)");
             if status.success() && gate.to_committing() {
                 ProbePoll::Commit(p.reply)
             } else {
@@ -568,8 +573,13 @@ fn poll_restart_probe(
             }
         }
         Ok(None) => {
-            if std::time::Instant::now() >= probe.as_ref().unwrap().deadline {
-                let mut p = probe.take().unwrap();
+            if std::time::Instant::now()
+                >= probe
+                    .as_ref()
+                    .expect("probe present (checked above)")
+                    .deadline
+            {
+                let mut p = probe.take().expect("probe present (checked above)");
                 let _ = p.child.kill();
                 let _ = p.child.wait(); // reap — no zombie
                 gate.abort_to_serving();
@@ -579,7 +589,7 @@ fn poll_restart_probe(
             }
         }
         Err(e) => {
-            let p = probe.take().unwrap();
+            let p = probe.take().expect("probe present (checked above)");
             gate.abort_to_serving();
             ProbePoll::Abort(p.reply, format!("preflight wait error: {e}"))
         }

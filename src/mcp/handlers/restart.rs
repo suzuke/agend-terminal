@@ -727,7 +727,7 @@ mod app_restart_strategy_tests {
         assert_eq!(resp["ok"], false);
         assert!(resp["error"]
             .as_str()
-            .unwrap()
+            .expect("error is a string")
             .contains("no in-process app restart channel"));
     }
 
@@ -762,10 +762,12 @@ mod app_restart_strategy_tests {
                 gate.to_committing(),
                 "gate must be Probing (handler claimed it)"
             );
-            req.reply.send(AppRestartVerdict::Committing).unwrap();
+            req.reply
+                .send(AppRestartVerdict::Committing)
+                .expect("verdict reply sent");
         });
         let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
-        t.join().unwrap();
+        t.join().expect("stub loop thread joined");
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["restart"], "committing");
     }
@@ -785,12 +787,12 @@ mod app_restart_strategy_tests {
                 .send(AppRestartVerdict::Aborted(
                     "preflight failed (exit Some(1))".into(),
                 ))
-                .unwrap();
+                .expect("verdict reply sent");
         });
         let resp = handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar));
-        t.join().unwrap();
+        t.join().expect("stub loop thread joined");
         assert_eq!(resp["ok"], false);
-        let err = resp["error"].as_str().unwrap();
+        let err = resp["error"].as_str().expect("error is a string");
         assert!(
             err.contains("aborted") && err.contains("intact"),
             "got {err:?}"

@@ -130,8 +130,8 @@ mod tests {
                 b2.wait();
                 g2.try_begin_probe()
             });
-            let w1 = h1.join().unwrap();
-            let w2 = h2.join().unwrap();
+            let w1 = h1.join().expect("worker 1 joined");
+            let w2 = h2.join().expect("worker 2 joined");
             assert!(
                 w1 ^ w2,
                 "iter {i}: exactly one worker must win the claim; got w1={w1} w2={w2}"

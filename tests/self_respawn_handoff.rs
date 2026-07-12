@@ -741,21 +741,11 @@ fn boot_app_under_pty(home: &Path) -> Child {
 }
 
 /// Connect to a SPECIFIC daemon's api socket (by pid run dir), do the cookie
-/// handshake, and send a STATUS request — true iff a well-formed reply comes
-/// back within `budget`. A live control plane answers; a bricked one
-/// (RESTART_PENDING latched → the session loop breaks before reading the
-/// request, api/mod.rs:499) completes the handshake but never replies.
-fn api_status_ok_within(home: &Path, pid: u32, budget: Duration) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if api_status_once(home, pid) == Some(true) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    false
-}
-
+/// handshake, and send a STATUS request — `Some(true)` iff a well-formed reply
+/// comes back. A live control plane answers; a bricked one (RESTART_PENDING
+/// latched → the session loop breaks before reading the request, api/mod.rs:499)
+/// completes the handshake but never replies. Re-reads run_dir/api.port each call,
+/// so it follows a rebound port across an in-place re-exec.
 fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
     let run_dir = home.join("run").join(pid.to_string());
     let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
@@ -792,19 +782,20 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
 /// app` owner-restart now RE-EXECS in place. The pre-R2 handler fail-closed as a
 /// stopgap against the #2098 app-mode brick; R2 replaces it with a real in-place
 /// re-exec. This is the real-entry lifecycle witness that consolidates the ordering
-/// + exec-lifecycle merge-blockers. A real `restart_daemon` MCP call over the LIVE
+/// and exec-lifecycle merge-blockers. A real `restart_daemon` MCP call over the LIVE
 /// app api socket must:
-///   1. return `committing` — receiving it proves the reply crossed the socket
-///      BEFORE teardown dropped it (ORDERING: reply precedes teardown/exec);
-///   2. re-exec IN PLACE — the SAME pid stays alive across the exec (exec, not a
-///      spawned successor; execve preserves the pid);
-///   3. bring the control plane back on the RE-READ api.port and serve a real
-///      request (NO BRICK). We do NOT require the port VALUE to change — the OS may
-///      legitimately reuse the same ephemeral port after close+rebind, so asserting
-///      a change would flake (per #2453 R2 review);
-///   4. leave EXACTLY ONE active pid — no successor / RESTART_PENDING / flock
-///      competitor. This is why the #2098 brick class cannot recur under R2:
-///      re-exec sets no RESTART_PENDING and spawns no flock rival.
+///
+/// 1. return `committing` — receiving it proves the reply crossed the socket
+///    BEFORE teardown dropped it (ORDERING: reply precedes teardown/exec);
+/// 2. re-exec IN PLACE — the SAME pid stays alive across the exec (exec, not a
+///    spawned successor; execve preserves the pid);
+/// 3. bring the control plane back on the RE-READ api.port and serve a real
+///    request (NO BRICK). We do NOT require the port VALUE to change — the OS may
+///    legitimately reuse the same ephemeral port after close+rebind, so asserting
+///    a change would flake (per #2453 R2 review);
+/// 4. leave EXACTLY ONE active pid — no successor / RESTART_PENDING / flock
+///    competitor. This is why the #2098 brick class cannot recur under R2:
+///    re-exec sets no RESTART_PENDING and spawns no flock rival.
 ///
 /// The #2098 brick guarantee is preserved here by assertions 3 + 4. The sibling
 /// `self_respawn_*` tests keep DAEMON-mode (`start --foreground`) fail-close /

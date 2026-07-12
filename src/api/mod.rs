@@ -241,6 +241,11 @@ pub enum RestartCapability {
 ///
 /// `host`: the [`RestartCapability`] of this API-server owner, injected from the
 /// composition root so `restart_daemon` dispatches to the owner's strategy.
+// #2453 R2: the 8th arg (`app_restart`) crosses the clippy threshold; the args are
+// the composition-root wiring (registry/config/notifier/host/restart channel) and
+// bundling them into a struct would only move the arity elsewhere. Matches the
+// existing allow on `handle_session`.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     home: &Path,
     registry: AgentRegistry,
