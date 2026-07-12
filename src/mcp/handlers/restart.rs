@@ -34,16 +34,50 @@ pub(super) fn handle_restart_daemon(
 /// replies BEFORE teardown + re-exec (decision d-20260712034222169749-5). A
 /// concurrent duplicate loses the CAS claim → idempotent "already in progress".
 #[cfg(unix)]
-fn app_restart_strategy(_app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
-    // #2453 R2 RED WITNESS (temporary — restored verbatim in the very next
-    // commit). The real App owner-restart arm (CAS-claim → bounded oneshot →
-    // verdict) is disabled here so the handler App-arm tests appended below prove
-    // they genuinely exercise it: against this stub they MUST fail (RED). This
-    // does NOT touch the verified CAS gate in `crate::api::app_restart`.
-    json!({
-        "ok": false,
-        "error": "restart_daemon: app owner-restart arm temporarily disabled (RED witness)"
-    })
+fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
+    use crate::api::app_restart::{AppRestartRequest, AppRestartVerdict};
+    let Some(ar) = app_restart else {
+        return app_no_channel_fail_closed();
+    };
+    // Genuine CAS claim: only one concurrent worker enters Probing.
+    if !ar.gate.try_begin_probe() {
+        return json!({
+            "ok": true,
+            "restart": "already in progress",
+            "note": "an app restart is already being processed; this request was a no-op"
+        });
+    }
+    // Hand the request to the TUI loop; block (bounded) for its verdict. Bounded
+    // oneshot (capacity 1). The loop runs the probe on its tick (≤5s); wait a
+    // little longer as a safety net.
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded::<AppRestartVerdict>(1);
+    if ar.tx.try_send(AppRestartRequest { reply: reply_tx }).is_err() {
+        ar.gate.abort_to_serving();
+        return json!({
+            "ok": false,
+            "error": "restart_daemon: could not deliver the restart request to the TUI loop; fleet intact"
+        });
+    }
+    match reply_rx.recv_timeout(std::time::Duration::from_secs(7)) {
+        Ok(AppRestartVerdict::Committing) => json!({
+            "ok": true,
+            "restart": "committing",
+            "note": "preflight passed; the app is re-exec'ing in place (this connection will drop)"
+        }),
+        Ok(AppRestartVerdict::Aborted(reason)) => json!({
+            "ok": false,
+            "error": format!("restart_daemon aborted: {reason}. Fleet + TUI intact — no restart.")
+        }),
+        Err(_) => {
+            // Safety-net timeout. Best-effort release (CAS from Probing; a no-op if
+            // the loop already advanced to Committing).
+            ar.gate.abort_to_serving();
+            json!({
+                "ok": false,
+                "error": "restart_daemon preflight timed out; fleet + TUI intact — no restart"
+            })
+        }
+    }
 }
 
 /// #2453 Stage R2: Windows owner-restart is an ISOLATED fail-closed strategy —
