@@ -215,6 +215,7 @@ junction = "2"
 embed-resource = "3"
 
 [dev-dependencies]
+proc-macro2 = "1"
 # #event-bus Step 2 (legacy-zero): a `#[ctor] #[cfg(test)]` fn registers the bus
 # subscribers ONCE at test-binary load — before any test — so the integration
 # tests (which `emit` to the now-sole-delivery global bus) deliver order-

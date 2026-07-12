@@ -63,13 +63,17 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         .and_then(|v| v.as_str())
         .filter(|m| !m.is_empty())
     {
-        let model_val = crate::backend::Backend::from_command(command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.to_string());
-        if !cmd_args.is_empty() {
-            cmd_args.push(' ');
-        }
-        cmd_args.push_str(&format!("--model {model_val}"));
+        // #2744 r2 (root-review Blocker 1): route through the
+        // Backend::push_model_arg chokepoint on the DECLARED identity — the
+        // create wire's `backend` param is a declared NAME (parse_str is
+        // exact alias resolution); a Raw/Shell parse has no capability and
+        // the gate withholds the flag instead of breaking the spawn. The
+        // former inline from_command + format!("--model …") assembly was a
+        // capability-gate bypass.
+        let declared = crate::backend::Backend::parse_str(command);
+        let mut argv: Vec<String> = cmd_args.split_whitespace().map(String::from).collect();
+        crate::backend::Backend::push_model_arg(&mut argv, &declared, model);
+        cmd_args = argv.join(" ");
     }
     if let Some(dir) = args.get("working_directory").and_then(|v| v.as_str()) {
         if std::path::Path::new(dir)

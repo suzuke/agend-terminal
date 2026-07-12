@@ -350,6 +350,47 @@ fn create_instance_persists_args_and_model_for_restart_parity_1858() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2744 r2 (root-review Blocker 3): create_instance (spawn.rs) must route
+/// model intent through the push_model_arg chokepoint on the DECLARED
+/// backend — a shell/raw seat never gets --model in the SPAWN argv, a
+/// declared claude seat does. Drives the real entry via the injectable
+/// api-call seam and inspects the actual SPAWN request.
+#[test]
+fn create_instance_routes_model_through_chokepoint_2744() {
+    for (backend, want_flag) in [
+        ("shell", false),
+        ("/opt/custom/agent-bin", false),
+        ("claude", true),
+    ] {
+        let home = tmp_home(&format!("2744-chokepoint-{}", backend.replace('/', "_")));
+        let captured = std::cell::RefCell::new(String::new());
+        let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+            *captured.borrow_mut() = req["params"]["args"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            Ok(json!({"ok": true, "result": {}}))
+        };
+        let r = spawn_single_instance_impl(
+            &home,
+            "spawner",
+            &json!({"name": "seat", "backend": backend, "model": "legacy-or-real"}),
+            &spawn_fn,
+        );
+        assert!(
+            r.get("error").is_none(),
+            "{backend}: create must succeed: {r}"
+        );
+        let argv = captured.borrow().clone();
+        assert_eq!(
+            argv.contains("--model"),
+            want_flag,
+            "{backend}: SPAWN argv chokepoint gate violated, got argv: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 /// #2477: create_instance accepts a symbolic `model_tier` and persists it so
 /// restart/boot resolution can map the tier through fleet.yaml `model_tiers`.
 /// It must not have to duplicate the concrete model into every spawned worker.
