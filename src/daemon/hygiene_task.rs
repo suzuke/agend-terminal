@@ -213,11 +213,11 @@ pub fn upsert_system_hygiene_task(
                 let mut seen: Option<(TaskId, u64)> = None;
                 match task_events::append_batch_checked(home, &emitter, update, |state| {
                     match find_active(state, key) {
-                        // r2a RED state: identity-only check — the rendezvous
-                        // test above FAILS at this commit by construction
-                        // (two stale probes both commit n+1). Next commit
-                        // tightens this to a full CAS.
-                        Some((t, _)) if t == tid_check => Ok(()),
+                        // CAS: identity AND the count our `n+1` was computed
+                        // from must both still hold — exactly one commit per
+                        // observed `n` can succeed (r2a commit replays the
+                        // identity-only lost-update RED).
+                        Some((t, cur)) if t == tid_check && cur == n => Ok(()),
                         other => {
                             seen = other;
                             Err("episode state moved since probe".to_string())
