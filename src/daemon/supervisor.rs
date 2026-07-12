@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 const TICK: Duration = Duration::from_secs(10);
 mod usage_limit;
 pub(crate) use usage_limit::*;
+mod usage_limit_control;
 mod reactions;
 pub(crate) use reactions::*;
 
