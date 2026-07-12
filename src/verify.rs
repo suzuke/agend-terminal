@@ -162,7 +162,15 @@ pub fn run(
                 let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
                 let externals = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-                api::serve(&api_home, api_reg, shutdown, configs, externals, None)
+                api::serve(
+                    &api_home,
+                    api_reg,
+                    shutdown,
+                    configs,
+                    externals,
+                    None,
+                    api::RestartCapability::Unsupported,
+                )
             })
             .ok();
 

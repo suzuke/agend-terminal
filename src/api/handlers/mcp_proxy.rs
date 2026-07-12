@@ -147,6 +147,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
         registry: ctx.registry.clone(),
         externals: ctx.externals.clone(),
+        capability: ctx.capability,
     };
     handle_mcp_tool_inner(
         tool,
@@ -506,6 +507,7 @@ mod tests {
             externals: &externals,
             notifier: None,
             home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let full = crate::mcp::tools::tool_definitions()["tools"]
@@ -562,6 +564,7 @@ mod tests {
             externals: &externals,
             notifier: None,
             home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let resp = handle_mcp_tool(
@@ -606,6 +609,7 @@ mod tests {
             externals: &externals,
             notifier: None,
             home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let resp = handle_mcp_tool(
@@ -653,6 +657,7 @@ mod tests {
             externals: &externals,
             notifier: None,
             home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let resp = handle_mcp_tools_list(&json!({"instance": "bad"}), &ctx);
@@ -692,6 +697,7 @@ mod tests {
             externals: &externals,
             notifier: None,
             home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
         };
 
         let full = crate::mcp::tools::tool_definitions()["tools"]

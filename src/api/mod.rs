@@ -212,11 +212,34 @@ pub mod method {
     pub const PANE_SNAPSHOT: &str = "pane_snapshot";
 }
 
+/// #2453 Stage R1: which host owns this API server, and therefore which restart
+/// strategy `restart_daemon` dispatches to. Injected at [`serve`] from the
+/// composition root (daemon / app / verify) — the explicit replacement for the
+/// former implicit `RUN_CORE_ACTIVE` global proxy. Threaded through the API
+/// [`handlers::HandlerCtx`] → MCP `RuntimeContext` so the restart handler
+/// dispatches on an injected value, never a process-global (decision
+/// d-20260712012329422433-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartCapability {
+    /// Headless `run_core` daemon: owns the in-process self-respawn / legacy
+    /// exit(42) machinery (the `RESTART_PENDING` consumer). Restart proceeds.
+    Daemon,
+    /// `agend-terminal app` (combined TUI+daemon, `run_app`): fail-closed in R1.
+    /// The staged owner-restart strategy is a later slice (decision d-…2329422433-1).
+    App,
+    /// Any other API-server owner (e.g. `verify`) — default-deny. A DISTINCT
+    /// value from `App` even though R1 routes both to a fail-closed response.
+    Unsupported,
+}
+
 /// Start API socket server (blocks calling thread).
 ///
 /// `notifier`: when running inside the TUI app, `Some(notifier)` to notify the
 /// event loop about instance/team creation and deletion. Daemon mode passes
 /// `None` and events are silently dropped.
+///
+/// `host`: the [`RestartCapability`] of this API-server owner, injected from the
+/// composition root so `restart_daemon` dispatches to the owner's strategy.
 pub fn serve(
     home: &Path,
     registry: AgentRegistry,
@@ -224,6 +247,7 @@ pub fn serve(
     configs: ConfigRegistry,
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
+    host: RestartCapability,
 ) {
     // #945 Phase 0: time the bind+port-publish step directly (not the
     // spawn of api::serve thread — that's sub-ms). Operators care about
@@ -380,6 +404,9 @@ pub fn serve(
         // own copies so the spawned closure satisfies `'static`.
         let session_cookie = cookie;
         let session_operator_token = operator_token;
+        // #2453: `host` is a `Copy` enum; each session gets its own copy so the
+        // spawned `move` closure satisfies `'static` (mirrors the cookie/token).
+        let session_host = host;
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
@@ -398,6 +425,7 @@ pub fn serve(
                     ntf.as_deref(),
                     session_operator_token,
                     session_cookie,
+                    session_host,
                 );
             })
             .is_err()
@@ -533,6 +561,7 @@ fn handle_session(
     notifier: Option<&dyn ApiNotifier>,
     operator_token: crate::auth_cookie::Cookie,
     cookie: crate::auth_cookie::Cookie,
+    host: RestartCapability,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -635,6 +664,7 @@ fn handle_session(
             externals,
             notifier,
             home,
+            capability: host,
         };
 
         // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
@@ -1243,7 +1273,15 @@ mod tests {
         std::thread::Builder::new()
             .name(format!("test_api_{label}"))
             .spawn(move || {
-                serve(&h, r, s, c, e, notifier);
+                serve(
+                    &h,
+                    r,
+                    s,
+                    c,
+                    e,
+                    notifier,
+                    crate::api::RestartCapability::Unsupported,
+                );
             })
             .unwrap();
 

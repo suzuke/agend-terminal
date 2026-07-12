@@ -407,6 +407,7 @@ mod blocked_reason_runtime_2454_tests {
         let rt = RuntimeContext {
             registry: Arc::new(Mutex::new(HashMap::from([(id, handle)]))),
             externals: Arc::new(Mutex::new(HashMap::new())),
+            capability: crate::api::RestartCapability::Unsupported,
         };
         (rt, home)
     }

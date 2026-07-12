@@ -68,6 +68,7 @@ pub(super) fn start_api_server(
                 configs,
                 externals,
                 Some(notifier),
+                crate::api::RestartCapability::App,
             );
         })
         .ok();

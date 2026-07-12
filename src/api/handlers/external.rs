@@ -126,6 +126,7 @@ mod tests {
             externals,
             notifier: None,
             home: home_ref,
+            capability: crate::api::RestartCapability::Unsupported,
         };
         (ctx, home)
     }

@@ -48,6 +48,10 @@ pub(crate) struct HandlerCtx<'a> {
 pub(crate) struct RuntimeContext {
     pub registry: crate::agent::AgentRegistry,
     pub externals: crate::agent::ExternalRegistry,
+    /// #2453 Stage R1: the API-server owner's restart capability, injected at
+    /// `crate::api::serve` and carried here from the API `HandlerCtx` so
+    /// `dispatch_restart_daemon` routes on an injected value, not a global.
+    pub capability: crate::api::RestartCapability,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -267,7 +271,13 @@ adapter!(dispatch_reply, hai, channel::handle_reply);
 pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_pane_snapshot(ctx.home, ctx.args, ctx.runtime)
 }
-adapter!(dispatch_restart_daemon, h, restart::handle_restart_daemon);
+/// #2453 Stage R1: custom (not `adapter!`) so the restart handler receives the
+/// INJECTED host capability from the `RuntimeContext`. An absent runtime (a
+/// standalone bridge call that never traversed the api `mcp_tool` ingress) maps
+/// to `None` → default-deny in the handler.
+pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
+    restart::handle_restart_daemon(ctx.home, ctx.runtime.map(|r| r.capability))
+}
 
 // ---------------------------------------------------------------------
 // Action-based adapters — match on args["action"], route to per-action
@@ -411,6 +421,58 @@ mod tests {
             sender: &EMPTY_SENDER,
             runtime: None,
         }
+    }
+
+    /// #2453 Stage R1: the restart adapter routes on the INJECTED runtime
+    /// capability, not a process-global. `Some(App)` → the app fail-close arm.
+    #[test]
+    fn dispatch_restart_daemon_app_capability_routes_app_fail_close() {
+        static EMPTY_SENDER: Option<Sender> = None;
+        let home = std::env::temp_dir();
+        let args = json!({});
+        let runtime = RuntimeContext {
+            registry: std::sync::Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            externals: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            capability: crate::api::RestartCapability::App,
+        };
+        let ctx = HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "",
+            sender: &EMPTY_SENDER,
+            runtime: Some(&runtime),
+        };
+        let resp = dispatch_restart_daemon(&ctx);
+        assert_eq!(
+            resp["ok"], false,
+            "App capability must route to app fail-close, got {resp}"
+        );
+        assert!(
+            resp["error"].as_str().unwrap_or("").contains("app"),
+            "App route must return the app-mode fail-close message — got {resp}"
+        );
+    }
+
+    /// #2453 Stage R1: an ABSENT runtime (standalone bridge, no api ingress) →
+    /// `None` → default-deny, and must NOT take the app arm.
+    #[test]
+    fn dispatch_restart_daemon_absent_runtime_default_deny() {
+        let home = std::env::temp_dir();
+        let args = json!({});
+        let ctx = ctx_for(&home, &args, ""); // runtime: None
+        let resp = dispatch_restart_daemon(&ctx);
+        assert_eq!(
+            resp["ok"], false,
+            "absent runtime must default-deny, got {resp}"
+        );
+        assert!(
+            !resp["error"].as_str().unwrap_or("").contains("agend-terminal app"),
+            "absent runtime must take the Unsupported/default-deny arm, not the app arm — got {resp}"
+        );
     }
 
     #[test]

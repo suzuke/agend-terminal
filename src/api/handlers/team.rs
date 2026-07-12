@@ -435,6 +435,7 @@ mod tests {
             externals,
             notifier: None,
             home,
+            capability: crate::api::RestartCapability::Unsupported,
         }
     }
 
@@ -524,6 +525,7 @@ mod tests_1964 {
             externals,
             notifier: None,
             home,
+            capability: crate::api::RestartCapability::Unsupported,
         }
     }
 
@@ -697,6 +699,7 @@ mod tests_2525 {
             externals,
             notifier: None,
             home,
+            capability: crate::api::RestartCapability::Unsupported,
         }
     }
 
