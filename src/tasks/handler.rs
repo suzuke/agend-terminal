@@ -1493,16 +1493,129 @@ fn handle_metadata_set(
     if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
         return deny;
     }
-    if !can_mutate_record(home, instance_name, &record) {
-        return serde_json::json!({"error": "permission denied: caller is not owner/creator"});
+    // ── t-…-74 governance-key ACL (decision d-…-22, Root ruling m-1087) ──
+    // `plan`, `plan_ack_required`, and `plan_acks` gate the #2249 pre-work
+    // alignment chokepoint — they are NOT ordinary owner-writable metadata, so
+    // each gets per-key fail-closed validation BEFORE the generic owner-ACL.
+    // GOV_AUTHOR = EXACTLY created_by (+ system), never the assignee or the
+    // orchestrator (no transitive authority — otherwise the very agent the gate
+    // constrains could self-weaken it). Every other key falls through to
+    // `can_mutate_record` (I4), byte-identical to before.
+    let is_gov_author = super::acl::is_plan_governance_author(instance_name, &record);
+    let deny_counter = |detail: &str| {
+        serde_json::json!({
+            "error": format!("plan_ack_required is protected: {detail}"),
+            "code": "plan_ack_required_protected",
+        })
+    };
+    // Set when a GOV_AUTHOR plan content-change must also reset acks (I3).
+    let mut reset_acks = false;
+    match key {
+        // I1: plan_acks is system-managed. Only `handle_ack_plan` appends it (and
+        // the reopen-reset below emits its own []-event). A direct metadata_set is
+        // rejected for EVERY identity, GOV_AUTHOR and system included.
+        "plan_acks" => {
+            return serde_json::json!({
+                "error": "plan_acks is system-managed; record acks via action=ack_plan, never metadata_set",
+                "code": "plan_acks_immutable",
+            });
+        }
+        // I2: accept ONLY a GOV_AUTHOR monotonic raise (numeric, ≥ current, after
+        // the assignee has claimed). Everything else — non-author, lower,
+        // non-numeric, pre-claim — fails closed. (Typed field promotion = t-…-79.)
+        "plan_ack_required" => {
+            let proposed = match value.as_u64() {
+                Some(n) => n,
+                None => return deny_counter("value must be a non-negative integer"),
+            };
+            if !is_gov_author {
+                return deny_counter("only the task creator (created_by) may raise it");
+            }
+            // "after assignee claim" — an unclaimed task (backlog/open, incl. one
+            // released back to open) is not yet under an assignee, so a raise is
+            // premature and fails closed.
+            if matches!(
+                record.status,
+                crate::task_events::TaskStatus::Backlog | crate::task_events::TaskStatus::Open
+            ) {
+                return deny_counter("may only be raised after the assignee has claimed the task");
+            }
+            let current = record
+                .metadata
+                .get("plan_ack_required")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if proposed < current {
+                return deny_counter(&format!(
+                    "may only be raised, never lowered ({current} → {proposed})"
+                ));
+            }
+        }
+        // I3: idempotency FIRST (a same-content write is a no-op for anyone —
+        // no reject, no event, no ack reset), then owner-pre-ack /
+        // GOV_AUTHOR-content-change(reopens acks) / else deny.
+        "plan" => {
+            if record.metadata.get("plan") == Some(&value) {
+                let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
+                return serde_json::json!({
+                    "id": id, "event": "metadata_set", "task": task, "noop": true
+                });
+            }
+            let acks_present = record
+                .metadata
+                .get("plan_acks")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let is_owner = record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name);
+            if is_gov_author {
+                // Creator/system content-change reopens the gate: reset acks.
+                reset_acks = acks_present;
+            } else if is_owner {
+                // The assignee may author/revise the plan ONLY before the first
+                // ack; after that it is frozen (only the creator may change it).
+                if acks_present {
+                    return serde_json::json!({
+                        "error": "the plan is frozen once a reviewer has acked it; only the task creator may change it (which re-opens acks)",
+                        "code": "plan_frozen_after_ack",
+                    });
+                }
+            } else {
+                return serde_json::json!({
+                    "error": "permission denied: only the assignee (pre-ack) or the task creator may set the plan",
+                    "code": "plan_write_denied",
+                });
+            }
+        }
+        // I4: every other key keeps the unchanged owner/orchestrator ACL.
+        _ => {
+            if !can_mutate_record(home, instance_name, &record) {
+                return serde_json::json!({"error": "permission denied: caller is not owner/creator"});
+            }
+        }
     }
-    let event = crate::task_events::TaskEvent::MetadataSet {
+
+    let set_event = crate::task_events::TaskEvent::MetadataSet {
         task_id: crate::task_events::TaskId(id.to_string()),
         by: emitter.clone(),
         key: key.to_string(),
         value,
     };
-    match crate::task_events::append_at(&board, &emitter, event) {
+    let append_result = if reset_acks {
+        // I6: emit the plan change + an audit-visible plan_acks=[] reset as ONE
+        // atomic batch so replay re-derives the reopened gate deterministically.
+        let reset_event = crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(id.to_string()),
+            by: emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!([]),
+        };
+        crate::task_events::append_batch_at(&board, &emitter, vec![set_event, reset_event])
+            .map(|_| 0u64)
+    } else {
+        crate::task_events::append_at(&board, &emitter, set_event)
+    };
+    match append_result {
         Ok(_) => {
             let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
             serde_json::json!({"id": id, "event": "metadata_set", "task": task})

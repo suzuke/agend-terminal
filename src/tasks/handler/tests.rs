@@ -1329,3 +1329,551 @@ fn update_idempotent_result_with_malformed_other_field_errors() {
         "equal result + malformed other field must fail loud, not unchanged: {resp}"
     );
 }
+
+// ── task-governance metadata ACL (t-…-74, decision d-…-22, Root m-1087) ──
+// RED-first through the REAL MCP handler entry `handle(home, caller, args)`.
+// Model: `create` sets created_by = caller, assignee → owner. So throughout:
+//   owner/assignee = "worker",  created_by/GOV_AUTHOR = "lead".
+// The owner can forge plan_acks, lower plan_ack_required, and rewrite the plan
+// after acks today (handle_metadata_set gates only on can_mutate_record then
+// writes ANY key). GOV_AUTHOR (created_by) has NO write authority today. These
+// tests pin the target behavior; they fail against current code (RED).
+
+fn gov_plan_acks_len(home: &std::path::Path, id: &str) -> usize {
+    read_task_record(home, id)
+        .and_then(|r| {
+            r.metadata
+                .get("plan_acks")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+        })
+        .unwrap_or(0)
+}
+
+fn gov_plan_ack_required(home: &std::path::Path, id: &str) -> u64 {
+    read_task_record(home, id)
+        .and_then(|r| r.metadata.get("plan_ack_required").and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
+fn gov_plan_text(home: &std::path::Path, id: &str) -> Option<String> {
+    read_task_record(home, id).and_then(|r| {
+        r.metadata
+            .get("plan")
+            .and_then(|v| v.as_str().map(String::from))
+    })
+}
+
+/// Create a task owned by `worker`, created by `lead`, gated at N acks, then
+/// claim it so status == Claimed (satisfies I2's "after assignee claim").
+fn gov_seed_claimed(home: &std::path::Path, required: u64) -> String {
+    let created = handle(
+        home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed task",
+            "assignee": "worker",
+            "plan_ack_required": required,
+            "plan_ack_reason": "repairs the plan-ack gate itself",
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    handle(
+        home,
+        "worker",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    id
+}
+
+/// R1 — the OWNER cannot self-weaken plan_ack_required (lower it or, being a
+/// non-author, raise it). The counter must stay at its created value.
+#[test]
+fn gov_r1_owner_cannot_lower_or_raise_plan_ack_required_t74() {
+    let home = tmp_home("gov-r1");
+    let id = gov_seed_claimed(&home, 2);
+
+    for bad in [0u64, 1] {
+        let r = handle(
+            &home,
+            "worker",
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan_ack_required", "metadata_value": bad
+            }),
+        );
+        assert_eq!(
+            r["code"], "plan_ack_required_protected",
+            "owner lowering plan_ack_required to {bad} must be rejected: {r}"
+        );
+    }
+    // Even a *raise* by the owner (non-author) is rejected — only GOV_AUTHOR raises.
+    let raise = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan_ack_required", "metadata_value": 3
+        }),
+    );
+    assert_eq!(
+        raise["code"], "plan_ack_required_protected",
+        "owner (non-author) raising plan_ack_required must be rejected: {raise}"
+    );
+    assert_eq!(
+        gov_plan_ack_required(&home, &id),
+        2,
+        "plan_ack_required must be unchanged after every rejected write"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R2 — the OWNER cannot forge plan_acks via metadata_set (only handle_ack_plan
+/// may append). plan_acks must stay empty and the gate stays shut.
+#[test]
+fn gov_r2_owner_cannot_forge_plan_acks_t74() {
+    let home = tmp_home("gov-r2");
+    let id = gov_seed_claimed(&home, 2);
+    // Owner may author the plan pre-ack (legit).
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+
+    let forged = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan_acks",
+            "metadata_value": ["reviewer-a", "reviewer-b"]
+        }),
+    );
+    assert_eq!(
+        forged["code"], "plan_acks_immutable",
+        "owner forging plan_acks must be rejected: {forged}"
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        0,
+        "plan_acks must remain empty after a rejected forge"
+    );
+    // Gate still shut: 0/2.
+    let blocked = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert_eq!(
+        blocked["code"], "plan_ack_pending",
+        "forged acks must not have opened the gate: {blocked}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R3 — once an ack lands, the OWNER can no longer content-change the plan
+/// (owner-frozen). A same-content write stays an idempotent no-op.
+#[test]
+fn gov_r3_owner_plan_frozen_after_first_ack_t74() {
+    let home = tmp_home("gov-r3");
+    let id = gov_seed_claimed(&home, 2);
+    // Owner authors the plan pre-ack (ok).
+    let set = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    assert!(
+        set["error"].is_null(),
+        "owner pre-ack plan write must succeed: {set}"
+    );
+    // A non-assignee ack lands.
+    let ack = handle(
+        &home,
+        "reviewer-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert_eq!(ack["acked"], 1, "reviewer-a ack must land: {ack}");
+
+    // Owner CONTENT-CHANGE after ack → frozen.
+    let frozen = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan B (sneaky rewrite)"
+        }),
+    );
+    assert_eq!(
+        frozen["code"], "plan_frozen_after_ack",
+        "owner rewriting the plan after an ack must be rejected: {frozen}"
+    );
+    assert_eq!(
+        gov_plan_text(&home, &id).as_deref(),
+        Some("plan A"),
+        "the acked plan content must be unchanged after a rejected rewrite"
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        1,
+        "a rejected owner rewrite must not disturb existing acks"
+    );
+
+    // Same-content owner write after ack → idempotent no-op (no reject, no reset).
+    let noop = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "plan A"
+        }),
+    );
+    assert!(
+        noop["error"].is_null(),
+        "same-content owner plan write must be an idempotent no-op, not a reject: {noop}"
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        1,
+        "idempotent same-content write must not reset acks"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R4 — the CREATOR (created_by, cross-team, post-claim) MAY author the plan and
+/// MAY raise plan_ack_required monotonically. Both are denied today.
+#[test]
+fn gov_r4_creator_governance_writes_allowed_t74() {
+    let home = tmp_home("gov-r4");
+    let id = gov_seed_claimed(&home, 1);
+    // No fleet.yaml → "lead" is neither owner nor orchestrator of "worker"
+    // (cross-team). Authority comes ONLY from being created_by.
+    let plan = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "creator-authored plan"
+        }),
+    );
+    assert!(
+        plan["error"].is_null(),
+        "created_by must be able to author the plan: {plan}"
+    );
+    assert_eq!(
+        gov_plan_text(&home, &id).as_deref(),
+        Some("creator-authored plan")
+    );
+
+    let raise = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan_ack_required", "metadata_value": 2
+        }),
+    );
+    assert!(
+        raise["error"].is_null(),
+        "created_by must be able to raise plan_ack_required monotonically: {raise}"
+    );
+    assert_eq!(gov_plan_ack_required(&home, &id), 2);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R5 — a CREATOR content-change resets plan_acks (reopening the gate) and
+/// blocks in_progress until re-acked; a same-content creator write is an
+/// idempotent no-op that preserves acks.
+#[test]
+fn gov_r5_creator_content_change_resets_acks_idempotent_preserves_t74() {
+    let home = tmp_home("gov-r5");
+    let id = gov_seed_claimed(&home, 2);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "content A"
+        }),
+    );
+    handle(
+        &home,
+        "reviewer-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    handle(
+        &home,
+        "reviewer-b",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert_eq!(gov_plan_acks_len(&home, &id), 2, "precondition: 2/2 acked");
+
+    // Creator CONTENT-CHANGE → acks reset to [].
+    let changed = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "content B"
+        }),
+    );
+    assert!(
+        changed["error"].is_null(),
+        "creator content-change must succeed: {changed}"
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        0,
+        "a creator content-change must RESET plan_acks (reopen the gate)"
+    );
+    let blocked = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert_eq!(
+        blocked["code"], "plan_ack_pending",
+        "in_progress must be blocked until the plan is re-acked: {blocked}"
+    );
+
+    // Re-ack, then a SAME-content creator write → idempotent no-op, acks preserved.
+    handle(
+        &home,
+        "reviewer-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    handle(
+        &home,
+        "reviewer-b",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert_eq!(gov_plan_acks_len(&home, &id), 2, "re-acked to 2/2");
+    let noop = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "content B"
+        }),
+    );
+    assert!(
+        noop["error"].is_null(),
+        "same-content creator write must be a no-op: {noop}"
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        2,
+        "idempotent same-content creator write must NOT reset acks"
+    );
+    let unblocked = handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+    );
+    assert!(
+        unblocked["error"].is_null(),
+        "preserved acks must keep the gate open: {unblocked}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R6 — the CREATOR has governance authority ONLY. No done / status-update /
+/// non-governance metadata authority (I5, I4). Guard against GREEN over-grant.
+#[test]
+fn gov_r6_creator_has_no_operational_authority_t74() {
+    let home = tmp_home("gov-r6");
+    let id = gov_seed_claimed(&home, 1);
+
+    let done = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "done", "id": id, "result": "sneaky close"}),
+    );
+    assert!(
+        done.get("error").is_some(),
+        "creator must not be able to `done`: {done}"
+    );
+
+    let upd = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "update", "id": id, "status": "blocked"}),
+    );
+    assert!(
+        upd.get("error").is_some(),
+        "creator must not be able to update operational status: {upd}"
+    );
+
+    let meta = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "priority_note", "metadata_value": "creator poking non-gov key"
+        }),
+    );
+    assert!(
+        meta.get("error").is_some(),
+        "creator must not write a non-governance metadata key: {meta}"
+    );
+    assert!(
+        read_task_record(&home, &id)
+            .map(|r| !r.metadata.contains_key("priority_note"))
+            .unwrap_or(false),
+        "the non-governance key must not have been written"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R7 — the OWNER's pre-ack plan authoring workflow is preserved (I3 owner
+/// branch, zero acks). Guard that GREEN doesn't over-freeze.
+#[test]
+fn gov_r7_owner_pre_ack_authoring_preserved_t74() {
+    let home = tmp_home("gov-r7");
+    let id = gov_seed_claimed(&home, 2);
+    let first = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "draft 1"
+        }),
+    );
+    assert!(
+        first["error"].is_null(),
+        "owner pre-ack plan authoring must succeed: {first}"
+    );
+    // Owner may still revise the plan while zero acks exist.
+    let revise = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "draft 2"
+        }),
+    );
+    assert!(
+        revise["error"].is_null(),
+        "owner may revise the plan while zero acks exist: {revise}"
+    );
+    assert_eq!(gov_plan_text(&home, &id).as_deref(), Some("draft 2"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R8 — a generic/invalid governance-counter write is denied for EVERY identity,
+/// including the strongest (owner, creator/GOV_AUTHOR, a SYSTEM identity, and a
+/// team ORCHESTRATOR who passes can_mutate_record). plan_acks is immutable for
+/// all; plan_ack_required rejects lower/non-numeric for all.
+#[test]
+fn gov_r8_counter_write_denied_for_every_identity_t74() {
+    let home = tmp_home("gov-r8");
+    let id = gov_seed_claimed(&home, 2);
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+
+    // plan_acks is immutable via metadata_set for owner, creator, and system.
+    for who in ["worker", "lead", "system:task_sweep"] {
+        let r = handle(
+            &home,
+            who,
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan_acks", "metadata_value": ["x", "y"]
+            }),
+        );
+        assert_eq!(
+            r["code"], "plan_acks_immutable",
+            "{who} must not be able to raw-write plan_acks: {r}"
+        );
+    }
+    assert_eq!(gov_plan_acks_len(&home, &id), 0, "plan_acks stayed empty");
+
+    // plan_ack_required: lower (by GOV_AUTHOR creator, and by SYSTEM) → rejected.
+    for who in ["lead", "system:task_sweep"] {
+        let lower = handle(
+            &home,
+            who,
+            &serde_json::json!({
+                "action": "metadata_set", "id": id,
+                "metadata_key": "plan_ack_required", "metadata_value": 1
+            }),
+        );
+        assert_eq!(
+            lower["code"], "plan_ack_required_protected",
+            "{who} must not be able to LOWER plan_ack_required: {lower}"
+        );
+    }
+    // Non-numeric raise by the creator → rejected (typed validation).
+    let non_numeric = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan_ack_required", "metadata_value": "lots"
+        }),
+    );
+    assert_eq!(
+        non_numeric["code"], "plan_ack_required_protected",
+        "non-numeric plan_ack_required must be rejected: {non_numeric}"
+    );
+    assert_eq!(gov_plan_ack_required(&home, &id), 2, "counter unchanged");
+
+    // A team ORCHESTRATOR who passes can_mutate_record but is NOT created_by is
+    // ALSO denied — no transitive authority expansion (Root m-1087).
+    let orch_home = tmp_home("gov-r8-orch");
+    write_fleet_yaml_with_team(&orch_home, "my-team", "team-lead");
+    let created = handle(
+        &orch_home,
+        "lead",
+        &serde_json::json!({
+            "action": "create", "title": "orch task", "assignee": "dev-a",
+            "plan_ack_required": 2, "plan_ack_reason": "gate repair"
+        }),
+    );
+    let oid = created["id"].as_str().expect("id").to_string();
+    handle(
+        &orch_home,
+        "dev-a",
+        &serde_json::json!({"action": "claim", "id": oid}),
+    );
+    let orch_forge = handle(
+        &orch_home,
+        "team-lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": oid,
+            "metadata_key": "plan_acks", "metadata_value": ["a", "b"]
+        }),
+    );
+    assert_eq!(
+        orch_forge["code"], "plan_acks_immutable",
+        "an orchestrator (non-created_by) must not forge plan_acks: {orch_forge}"
+    );
+    let orch_lower = handle(
+        &orch_home,
+        "team-lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": oid,
+            "metadata_key": "plan_ack_required", "metadata_value": 1
+        }),
+    );
+    assert_eq!(
+        orch_lower["code"], "plan_ack_required_protected",
+        "an orchestrator (non-created_by) must not lower plan_ack_required: {orch_lower}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&orch_home).ok();
+}

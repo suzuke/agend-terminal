@@ -92,6 +92,23 @@ pub fn is_system_identity(caller: &str) -> bool {
     SYSTEM_IDENTITIES.contains(&caller)
 }
 
+/// t-…-74 (decision d-…-22, Root ruling m-1087): the ONLY identity with
+/// governance authority over a task's plan-ack metadata (`plan` +
+/// `plan_ack_required`) is EXACTLY the task's creator (`created_by`) — or a
+/// recognized system identity. This is deliberately narrower than
+/// [`can_mutate_record`]: it is NOT the assignee/owner, NOT the team
+/// orchestrator, and NOT any transitive dispatch-authority. Keeping it a
+/// pure `created_by`/`system` check is the whole point — it must never expand
+/// authority transitively (the gate this protects can otherwise be self-weakened
+/// by the very agent it constrains). Operational authority (done / update /
+/// non-governance metadata) stays with [`can_mutate_record`], unchanged.
+pub(super) fn is_plan_governance_author(
+    caller: &str,
+    record: &crate::task_events::TaskRecord,
+) -> bool {
+    is_system_identity(caller) || record.created_by.0.as_str() == caller
+}
+
 pub(super) fn can_mutate_record(
     home: &Path,
     caller: &str,
