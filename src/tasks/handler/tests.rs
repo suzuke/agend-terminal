@@ -1303,3 +1303,29 @@ fn update_non_string_result_errors() {
         "non-string result must fail loud, not unchanged/updated: {resp}"
     );
 }
+
+/// Review correction R3 (codex): an idempotent (equal) `result` must NOT absorb a
+/// malformed second field. `result=<current>` + a non-emitting `description` (wrong
+/// type) is a zero-event request that must fail loud, never "unchanged".
+#[test]
+fn update_idempotent_result_with_malformed_other_field_errors() {
+    let home = tmp_home("combo");
+    seed_claimed(&home, "t-combo", "dev-agent");
+    // Establish result = "X".
+    let set = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-combo", "result": "X"}),
+    );
+    assert_eq!(set["status"], "updated", "precondition: result set: {set}");
+    // Equal result + a malformed (non-string) description → zero events.
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-combo", "result": "X", "description": 123}),
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "equal result + malformed other field must fail loud, not unchanged: {resp}"
+    );
+}
