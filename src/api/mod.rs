@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+pub mod app_restart;
 pub(crate) mod handlers;
 mod operator_gate;
 pub mod request_dedup;
