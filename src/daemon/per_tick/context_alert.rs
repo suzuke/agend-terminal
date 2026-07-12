@@ -181,6 +181,7 @@ impl PerTickHandler for ContextAlertHandler {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serial_test::serial;
