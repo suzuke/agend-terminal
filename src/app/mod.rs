@@ -557,7 +557,12 @@ fn poll_restart_probe(
     match probe.as_mut().unwrap().child.try_wait() {
         Ok(Some(status)) => {
             let p = probe.take().unwrap();
-            if status.success() && gate.to_committing() {
+            // #2453 R2 RED WITNESS (temporary — restored in the next commit): the
+            // `status.success() &&` guard is dropped here so ANY probe exit —
+            // including a FAILURE — advances the gate to Committing and yields
+            // Commit. The slice-2 test below MUST fail against this (it proves a
+            // failed preflight is not silently allowed to teardown+exec).
+            if gate.to_committing() {
                 ProbePoll::Commit(p.reply)
             } else {
                 gate.abort_to_serving();
@@ -3212,6 +3217,66 @@ mod tests {
             "healthy",
             "fresh tracker should remain healthy after decay tick"
         );
+    }
+}
+
+/// #2453 R2 slice 2 — preflight failure proves ZERO teardown. `Commit` is the
+/// ONLY `ProbePoll` variant that breaks the TUI loop into the irreversible
+/// teardown+exec; every probe failure mode must instead roll the gate back to
+/// `Serving` and yield `Abort`, leaving the app serving. This unit-checks that
+/// invariant on the extracted `poll_restart_probe` without driving the full TUI.
+#[cfg(all(test, unix))]
+mod probe_poll_tests {
+    use super::*;
+    use crate::api::app_restart::{AppRestartGate, AppRestartVerdict};
+    use std::time::{Duration, Instant};
+
+    /// A `RestartProbe` whose direct child exits with `code` (via `sh -c 'exit N'`)
+    /// and a far-future deadline, so polling exercises the exit-code branch (not
+    /// the timeout branch). Returns the reply receiver so the channel stays open.
+    fn exited_probe(code: i32) -> (RestartProbe, crossbeam_channel::Receiver<AppRestartVerdict>) {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .spawn()
+            .expect("spawn probe child");
+        let (reply, rx) = crossbeam_channel::unbounded::<AppRestartVerdict>();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        (RestartProbe { child, reply, deadline }, rx)
+    }
+
+    #[test]
+    fn preflight_failure_aborts_gate_to_serving_no_commit() {
+        let (probe, _rx) = exited_probe(1);
+        let gate = AppRestartGate::new();
+        assert!(gate.try_begin_probe(), "handler claimed the gate (Probing)");
+        let mut slot = Some(probe);
+        // The child exits immediately; poll until it is observed terminal.
+        let result = loop {
+            match poll_restart_probe(&mut slot, &gate) {
+                ProbePoll::Pending => std::thread::sleep(Duration::from_millis(10)),
+                other => break other,
+            }
+        };
+        let ProbePoll::Abort(_reply, reason) = result else {
+            panic!(
+                "a FAILED preflight must yield Abort (never Commit) — Commit is the ONLY \
+                 path that breaks the loop into the irreversible teardown+exec"
+            );
+        };
+        assert!(
+            reason.contains("preflight failed"),
+            "abort reason must name the preflight failure — got {reason:?}"
+        );
+        assert!(
+            gate.is_serving(),
+            "gate MUST roll back to Serving on a failed preflight (zero teardown)"
+        );
+        assert!(
+            !gate.is_committing(),
+            "a failed preflight must NEVER reach Committing (which would teardown+exec)"
+        );
+        assert!(slot.is_none(), "the failed probe must be consumed out of the slot");
     }
 }
 
