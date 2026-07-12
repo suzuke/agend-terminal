@@ -207,7 +207,9 @@ fn run_scenario(home: &Path) {
         &h,
         "lead",
         "task",
-        json!({"action": "create", "title": "e2e review"}),
+        // #2745 R3: the durable review_class authority lives on the TASK (a send arg
+        // can no longer fill a missing one), so create the dispatched task tagged.
+        json!({"action": "create", "title": "e2e review", "review_class": "single"}),
     );
     let task_id = created["result"]["id"]
         .as_str()

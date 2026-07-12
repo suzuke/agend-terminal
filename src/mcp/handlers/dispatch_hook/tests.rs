@@ -1,6 +1,19 @@
 // ── Sprint 53 P0-1: dispatch_auto_bind_lease tests ───────────────
 // These call the PRODUCTION function directly (§1.4 compliance).
 
+/// #2745 R3: create a real board task tagged `review_class=<class>` and return its
+/// id. Under R3 finding 2 an EXISTING-task dispatch must reference a task that
+/// carries durable review_class metadata (a send arg can NOT fill a missing one), so
+/// dispatch tests exercising the lease/watch path seed a real tagged task here.
+fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "seed", "review_class": class}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
 fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     let repo = crate::paths::workspace_dir(home).join(agent);
     std::fs::create_dir_all(&repo).ok();
@@ -540,15 +553,15 @@ fn delegate_task_main_branch_rejects_without_delivering() {
     ));
     std::fs::create_dir_all(&home).ok();
     setup_test_repo(&home, "target-agent");
+    // #2745 R3: a real task tagged review_class=single so the fail-closed gate
+    // resolves → this test isolates the lease's main-branch rejection.
+    let tid = create_review_class_task(&home, "single");
 
     let args = serde_json::json!({
         "instance": "target-agent",
         "task": "implement feature X",
-        "task_id": "T-999",
+        "task_id": tid,
         "branch": "main",  // ← E4.5 rejection trigger
-        // #2745: valid review_class so the fail-closed gate passes → this test
-        // isolates the lease's main-branch rejection, not the review_class gate.
-        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -603,14 +616,14 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/end2end", None);
     assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
 
+    // #2745 R3: a real task tagged review_class=single so the fail-closed gate
+    // resolves → isolates the lease's cross-agent conflict rejection under test.
+    let tid = create_review_class_task(&home, "single");
     let args = serde_json::json!({
         "instance": "agent-b",
         "task": "implement feature Y",
-        "task_id": "T-2",
+        "task_id": tid,
         "branch": "feat/end2end",
-        // #2745: valid review_class so the fail-closed gate passes → isolates the
-        // lease's cross-agent conflict rejection under test.
-        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -724,14 +737,14 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
     // Production-realistic: a second delegate_task targeting agent-x with
     // a different branch must trip the gate before SEND, not deliver the
     // [delegate_task] message to the inbox.
+    // #2745 R3: a real task tagged review_class=single so the fail-closed gate
+    // resolves → isolates the lease's same-agent different-branch rejection.
+    let tid = create_review_class_task(&home, "single");
     let args = serde_json::json!({
         "instance": "agent-x",
         "task": "implement feature B",
-        "task_id": "T-2",
+        "task_id": tid,
         "branch": "feat/B",
-        // #2745: valid review_class so the fail-closed gate passes → isolates the
-        // lease's same-agent different-branch rejection under test.
-        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
     let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
@@ -944,17 +957,16 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     ));
     std::fs::create_dir_all(&home).ok();
     setup_test_repo(&home, "target-agent");
+    // #2745 R3: reference a REAL task carrying review_class=single (the durable
+    // authority) — the positive path arms the ci-watch when the class resolves.
+    let tid = create_review_class_task(&home, "single");
 
     let args = serde_json::json!({
         "instance": "target-agent",
         "task": "implement feature X",
-        "task_id": "T-100",
+        "task_id": tid,
         "branch": "feat/p02-integration",
         "repository": "owner/repo",
-        // #2745 fail-closed: a merge-authority (branch) dispatch MUST declare an
-        // explicit review_class or it is rejected before arming — this test proves
-        // the positive path still creates the ci-watch when the class is declared.
-        "review_class": "single",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
@@ -994,11 +1006,17 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
 fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
     use crate::identity::Sender;
 
-    for (label, rc, second_reviewer, expected_code) in [
-        ("omitted", None, false, "review_class_unspecified"),
-        ("typo", Some("duel"), false, "review_class_unspecified"),
-        ("mismatch", Some("single"), true, "review_class_mismatch"),
+    // T-100 is REFERENCED but has NO review_class metadata on the board. Per R3
+    // finding 2, a send `review_class` arg / `second_reviewer` is consistency-evidence
+    // only — it can NEVER supply the missing durable authority for an existing task.
+    // So EVERY case fails closed with `review_class_unspecified` (never a silent arm).
+    for (label, rc, second_reviewer) in [
+        ("omitted", None, false),
+        ("typo", Some("duel"), false),
+        ("send-arg-cannot-fill-untagged-task", Some("single"), false),
+        ("second-reviewer-cannot-fill-untagged-task", None, true),
     ] {
+        let expected_code = "review_class_unspecified";
         let home =
             std::env::temp_dir().join(format!("agend-2745-reject-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1044,6 +1062,65 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
 
         std::fs::remove_dir_all(&home).ok();
     }
+}
+
+/// #2745 R3 finding 2 (existing-task authority, through production entry): a
+/// REFERENCED task carrying `review_class=single` metadata is the SOLE authority — a
+/// dispatch supplying a CONTRADICTORY `send review_class=dual` is REJECTED atomically
+/// (Mismatch) with NO ci-watch side effect. The send value can never override the
+/// task's durable class.
+#[test]
+fn existing_tagged_task_contradictory_send_rejects_2745() {
+    use crate::identity::Sender;
+    let home =
+        std::env::temp_dir().join(format!("agend-2745-tagged-mismatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+
+    // Create a REAL task tagged review_class=single (the durable authority).
+    let created = crate::tasks::handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "tagged single", "review_class": "single"}),
+    );
+    let tid = created["id"].as_str().expect("task id").to_string();
+    assert_eq!(
+        crate::tasks::load_by_id(&home, &tid).and_then(|t| t
+            .metadata
+            .get("review_class")
+            .and_then(|v| v.as_str())
+            .map(String::from)),
+        Some("single".to_string()),
+        "task must carry the durable review_class=single authority"
+    );
+
+    // Dispatch that task with a CONTRADICTORY send review_class=dual.
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement",
+        "task_id": tid,
+        "branch": "feat/tagged-mismatch",
+        "repository": "owner/repo",
+        "review_class": "dual",
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+
+    assert_eq!(
+        result.get("code").and_then(|v| v.as_str()),
+        Some("review_class_mismatch"),
+        "contradictory send class on a tagged task must Refuse(Mismatch): {result}"
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/tagged-mismatch");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    assert!(
+        !watch_path.exists(),
+        "rejected contradictory dispatch must NOT arm a ci-watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// #2117 P2: a dispatch from teamA's member to teamB's member auto-creates the
