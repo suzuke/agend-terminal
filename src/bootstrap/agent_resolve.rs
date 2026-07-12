@@ -446,6 +446,7 @@ mod tests {
          -> crate::fleet::ResolvedInstance {
             crate::fleet::ResolvedInstance {
                 name: "t".into(),
+                backend: crate::backend::Backend::ClaudeCode,
                 backend_command: "claude".into(),
                 args: vec![],
                 env: HashMap::new(),

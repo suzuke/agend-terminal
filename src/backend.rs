@@ -381,6 +381,75 @@ pub struct BackendPreset {
     pub redraw_after_resize: bool,
 }
 
+/// #2744 PR-A: a backend's declared model-flag grammar, captured verbatim
+/// from its CLI help into `tests/fixtures/cli-help/` at the calibrated
+/// version. `None` (Shell/Raw/custom) means the backend has no proven model
+/// semantics: the injection path skips with a warning and `set_model`
+/// hard-errors instead of guessing.
+#[derive(Debug, PartialEq)]
+pub struct ModelCapability {
+    /// Long flag exactly as the CLI help declares it.
+    pub long_flag: &'static str,
+    /// Short spelling — ONLY where the CLI help proves it (codex/opencode/
+    /// grok declare `-m`; claude/kiro-cli/agy are long-flag-only).
+    pub short_flag: Option<&'static str>,
+    /// CLI version the grammar was captured at. Evidence/health metadata
+    /// only — never a runtime gate (decision d-20260712101306674407-19).
+    pub calibrated_version: &'static str,
+}
+
+/// Classified hit from [`ModelCapability::scan`].
+///
+/// `Confirmed` spellings (`--model`, `--model=X`, separate `-m` where
+/// declared) are fixture-proven for the backend. `Ambiguous` covers glued
+/// `-mVAL` / `-m=VAL` tokens: their parser acceptance is NOT fixture-proven
+/// (clap and yargs differ), so they are treated as conservative conflicts —
+/// suppressing injection / rejecting set_model beats ever risking a double
+/// model flag. Disambiguation for operators: payload text belongs after a
+/// bare `--`; a real model choice belongs in `set_model`, not raw args.
+#[derive(Debug, PartialEq)]
+pub enum ModelFlagHit {
+    Confirmed(String),
+    Ambiguous(String),
+}
+
+impl ModelCapability {
+    /// Scan flag territory — tokens BEFORE the first bare `--` delimiter —
+    /// for existing spellings of this backend's model flag. Tokens after
+    /// `--` are payload and never match.
+    pub fn scan(&self, args: &[String]) -> Vec<ModelFlagHit> {
+        let mut hits = Vec::new();
+        for tok in args {
+            if tok == "--" {
+                break;
+            }
+            if tok == self.long_flag {
+                hits.push(ModelFlagHit::Confirmed(tok.clone()));
+                continue;
+            }
+            if let Some(rest) = tok.strip_prefix(self.long_flag) {
+                // `--model=X` is confirmed; `--model-foo` is a different
+                // flag and must not match.
+                if rest.starts_with('=') {
+                    hits.push(ModelFlagHit::Confirmed(tok.clone()));
+                }
+                continue;
+            }
+            let Some(short) = self.short_flag else {
+                continue;
+            };
+            if tok == short {
+                hits.push(ModelFlagHit::Confirmed(tok.clone()));
+            } else if tok.strip_prefix(short).is_some_and(|rest| !rest.is_empty()) {
+                // Glued value (or `=`-glued): conservative ambiguous match.
+                // Long flags never reach here: `--…` fails the `-m` prefix.
+                hits.push(ModelFlagHit::Ambiguous(tok.clone()));
+            }
+        }
+        hits
+    }
+}
+
 impl Backend {
     pub fn preset(&self) -> BackendPreset {
         // W2.5: shared defaults. Each arm below specifies ONLY the fields where
@@ -790,26 +859,102 @@ impl Backend {
         }
     }
 
-    /// #2038: append `--model <formatted>` to an argv unless the caller
-    /// already passed a `--model` flag (explicit caller args win —
-    /// `create_instance` pre-formats the flag into its SPAWN args, and a
-    /// double `--model` must never reach the backend CLI). Formatting goes
-    /// through [`Backend::format_model_arg`] when `backend_command` maps to a
-    /// known backend (OpenCode needs a provider prefix); unknown commands get
-    /// the model string verbatim. Empty model is a no-op.
-    pub fn push_model_arg(args: &mut Vec<String>, backend_command: &str, model: &str) {
-        if model.is_empty()
-            || args
-                .iter()
-                .any(|a| a == "--model" || a.starts_with("--model="))
-        {
+    /// #2744 PR-A: the DECLARED backend's model-flag grammar. Keyed off the
+    /// enum — never off a command string (`from_command` basename guessing
+    /// misclassifies wrappers like `claude-wrapper.sh` and must not appear
+    /// anywhere in the model path). Grammar pinned by
+    /// `tests/fixtures/cli-help/` at each `calibrated_version`.
+    pub fn model_capability(&self) -> Option<&'static ModelCapability> {
+        const CLAUDE: ModelCapability = ModelCapability {
+            long_flag: "--model",
+            short_flag: None,
+            calibrated_version: "2.1.207",
+        };
+        const CODEX: ModelCapability = ModelCapability {
+            long_flag: "--model",
+            short_flag: Some("-m"),
+            calibrated_version: "0.144.1",
+        };
+        const KIRO: ModelCapability = ModelCapability {
+            long_flag: "--model",
+            short_flag: None,
+            calibrated_version: "2.12.1",
+        };
+        const OPENCODE: ModelCapability = ModelCapability {
+            long_flag: "--model",
+            short_flag: Some("-m"),
+            calibrated_version: "1.17.5",
+        };
+        const AGY: ModelCapability = ModelCapability {
+            long_flag: "--model",
+            short_flag: None,
+            calibrated_version: "1.0.15",
+        };
+        const GROK: ModelCapability = ModelCapability {
+            long_flag: "--model",
+            short_flag: Some("-m"),
+            calibrated_version: "0.2.93",
+        };
+        match self {
+            Backend::ClaudeCode => Some(&CLAUDE),
+            Backend::Codex => Some(&CODEX),
+            Backend::KiroCli => Some(&KIRO),
+            Backend::OpenCode => Some(&OPENCODE),
+            Backend::Agy => Some(&AGY),
+            Backend::Grok => Some(&GROK),
+            Backend::Shell | Backend::Raw(_) => None,
+        }
+    }
+
+    /// #2038/#2744: apply the fleet-resolved model intent to a spawn argv,
+    /// gated on the DECLARED backend's [`ModelCapability`].
+    ///
+    /// - No capability (Shell/Raw/custom) → warn + skip: `bash --model X`
+    ///   breaks the spawn outright, so unsupported backends fail loud here
+    ///   (and hard-error in `set_model`) instead of guessing.
+    /// - Existing model-flag spellings win (caller args > fleet intent,
+    ///   #2038). Confirmed spellings skip silently — that precedence is by
+    ///   design. Ambiguous glued spellings also skip, but WITH a warning:
+    ///   fleet intent is being suppressed by a token whose parser
+    ///   acceptance is unproven.
+    /// - The flag pair is inserted BEFORE the first bare `--` — everything
+    ///   after the delimiter is payload, not flag territory. Presets never
+    ///   carry `--`, so production argv is unchanged (append position).
+    /// - Formatting goes through [`Backend::format_model_arg`] (OpenCode
+    ///   needs a provider prefix). Empty model is a no-op.
+    pub fn push_model_arg(args: &mut Vec<String>, backend: &Backend, model: &str) {
+        if model.is_empty() {
             return;
         }
-        let model_val = Backend::from_command(backend_command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.to_string());
-        args.push("--model".to_string());
-        args.push(model_val);
+        let Some(cap) = backend.model_capability() else {
+            tracing::warn!(
+                backend = %backend.name(),
+                model = %model,
+                "model intent configured for a backend with no declared model \
+                 capability — skipping --model injection (#2744)"
+            );
+            return;
+        };
+        let hits = cap.scan(args);
+        if !hits.is_empty() {
+            if let Some(ModelFlagHit::Ambiguous(tok)) = hits
+                .iter()
+                .find(|h| matches!(h, ModelFlagHit::Ambiguous(_)))
+            {
+                tracing::warn!(
+                    backend = %backend.name(),
+                    token = %tok,
+                    model = %model,
+                    "ambiguous model-flag-like token suppresses fleet model \
+                     injection; move payload after `--` or remove the token (#2744)"
+                );
+            }
+            return;
+        }
+        let model_val = backend.format_model_arg(model);
+        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        args.insert(at, cap.long_flag.to_string());
+        args.insert(at + 1, model_val);
     }
 
     /// Display name matching the CLI command. For [`Backend::Raw`] returns the
@@ -2076,33 +2221,108 @@ mod tests {
     #[test]
     fn push_model_arg_appends_and_dedupes_2038() {
         let mut args = vec!["--continue".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "claude-opus-4-8");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "claude-opus-4-8");
         assert_eq!(args, vec!["--continue", "--model", "claude-opus-4-8"]);
 
         // OpenCode gets the provider prefix via format_model_arg.
         let mut args = Vec::new();
-        Backend::push_model_arg(&mut args, "opencode", "opus");
+        Backend::push_model_arg(&mut args, &Backend::OpenCode, "opus");
         assert_eq!(args, vec!["--model", "anthropic/opus"]);
-
-        // Unknown command: model passes through verbatim.
-        let mut args = Vec::new();
-        Backend::push_model_arg(&mut args, "/bin/sh", "m1");
-        assert_eq!(args, vec!["--model", "m1"]);
 
         // Caller already passed --model (separate form) — no duplicate.
         let mut args = vec!["--model".to_string(), "explicit".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
         assert_eq!(args, vec!["--model", "explicit"]);
 
         // Glued form counts too.
         let mut args = vec!["--model=explicit".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
         assert_eq!(args, vec!["--model=explicit"]);
 
         // Empty model is a no-op.
         let mut args = vec!["--continue".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "");
         assert_eq!(args, vec!["--continue"]);
+    }
+
+    /// #2744 PR-A: scan classification — Confirmed (fixture-proven
+    /// spellings) vs Ambiguous (glued short, conservative), plus the
+    /// false-positive pins: `--max-turns` (grok help) and `--model-foo`
+    /// must never match.
+    #[test]
+    fn model_capability_scan_classifies_hits_2744() {
+        let cap = Backend::Grok.model_capability().unwrap();
+        let args: Vec<String> = ["--max-turns", "3", "--model-foo", "-m", "x", "-m=y", "-mz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            cap.scan(&args),
+            vec![
+                ModelFlagHit::Confirmed("-m".into()),
+                ModelFlagHit::Ambiguous("-m=y".into()),
+                ModelFlagHit::Ambiguous("-mz".into()),
+            ]
+        );
+
+        // Long-flag-only backend: `-m` never matches at all.
+        let cap = Backend::ClaudeCode.model_capability().unwrap();
+        let args: Vec<String> = ["-m", "x", "-mz"].iter().map(|s| s.to_string()).collect();
+        assert!(cap.scan(&args).is_empty());
+    }
+
+    /// #2744 PR-A L2: every declared ModelCapability is pinned by a verbatim
+    /// help fixture captured at its calibrated version; absent short flags
+    /// are pinned by ABSENCE in the fixture (kiro has no `-m` — the spike's
+    /// earlier assumption, refuted by capture, must not resurface).
+    #[test]
+    fn model_capability_grammar_pinned_by_help_fixtures_2744() {
+        let cases: Vec<(Backend, &str)> = vec![
+            (Backend::ClaudeCode, "claude-2.1.207.txt"),
+            (Backend::Codex, "codex-0.144.1-root.txt"),
+            (Backend::Codex, "codex-0.144.1-resume.txt"),
+            (Backend::KiroCli, "kiro-cli-2.12.1-chat.txt"),
+            (Backend::OpenCode, "opencode-1.17.5.txt"),
+            (Backend::Agy, "agy-1.0.15.txt"),
+            (Backend::Grok, "grok-0.2.93.txt"),
+        ];
+        for (backend, fixture) in cases {
+            let cap = backend
+                .model_capability()
+                .unwrap_or_else(|| panic!("{backend:?} must declare a capability"));
+            let path = format!(
+                "{}/tests/fixtures/cli-help/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let text =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"));
+            assert!(
+                text.contains("# Provenance:"),
+                "{fixture}: fixture must carry a provenance header"
+            );
+            assert!(
+                fixture.contains(cap.calibrated_version),
+                "{fixture}: filename must carry calibrated version {}",
+                cap.calibrated_version
+            );
+            assert!(
+                text.contains(cap.long_flag),
+                "{fixture}: help must declare {}",
+                cap.long_flag
+            );
+            match cap.short_flag {
+                Some(short) => assert!(
+                    text.contains(&format!("{short}, {}", cap.long_flag)),
+                    "{fixture}: short flag {short} must be help-declared"
+                ),
+                None => assert!(
+                    !text.contains(&format!("-m, {}", cap.long_flag)),
+                    "{fixture}: claims long-flag-only but help declares -m"
+                ),
+            }
+        }
+        assert!(Backend::Shell.model_capability().is_none());
+        assert!(Backend::Raw("/opt/x".into()).model_capability().is_none());
     }
 
     /// #2744 PR-A: Shell/Raw (any command without a declared model
@@ -2113,15 +2333,22 @@ mod tests {
     #[test]
     fn push_model_arg_shell_raw_never_inject_2744() {
         let mut args: Vec<String> = Vec::new();
-        Backend::push_model_arg(&mut args, "bash", "opus");
+        Backend::push_model_arg(&mut args, &Backend::Shell, "opus");
         assert!(
             args.is_empty(),
             "shell must not receive --model, got {args:?}"
         );
 
         let mut args: Vec<String> = Vec::new();
-        Backend::push_model_arg(&mut args, "/opt/custom/agent-bin", "opus");
-        assert!(args.is_empty(), "raw must not receive --model, got {args:?}");
+        Backend::push_model_arg(
+            &mut args,
+            &Backend::Raw("/opt/custom/agent-bin".into()),
+            "opus",
+        );
+        assert!(
+            args.is_empty(),
+            "raw must not receive --model, got {args:?}"
+        );
     }
 
     /// #2744 PR-A (B8): dedupe must recognize the short `-m` spelling on
@@ -2129,13 +2356,13 @@ mod tests {
     /// tests/fixtures/cli-help/) instead of appending a second model flag.
     #[test]
     fn push_model_arg_dedupes_short_m_on_declaring_backends_b8_2744() {
-        for cmd in ["codex", "opencode", "grok"] {
+        for backend in [Backend::Codex, Backend::OpenCode, Backend::Grok] {
             let mut args = vec!["-m".to_string(), "explicit".to_string()];
-            Backend::push_model_arg(&mut args, cmd, "from-fleet");
+            Backend::push_model_arg(&mut args, &backend, "from-fleet");
             assert_eq!(
                 args,
                 vec!["-m", "explicit"],
-                "backend {cmd}: separate -m must dedupe"
+                "backend {backend:?}: separate -m must dedupe"
             );
         }
     }
@@ -2146,13 +2373,13 @@ mod tests {
     /// over-matches on long-flag-only backends.
     #[test]
     fn push_model_arg_ignores_short_m_on_non_declaring_backends_2744() {
-        for cmd in ["claude", "kiro-cli", "agy"] {
+        for backend in [Backend::ClaudeCode, Backend::KiroCli, Backend::Agy] {
             let mut args = vec!["-m".to_string(), "unrelated".to_string()];
-            Backend::push_model_arg(&mut args, cmd, "from-fleet");
+            Backend::push_model_arg(&mut args, &backend, "from-fleet");
             assert_eq!(
                 args,
                 vec!["-m", "unrelated", "--model", "from-fleet"],
-                "backend {cmd}: undeclared -m must not suppress injection"
+                "backend {backend:?}: undeclared -m must not suppress injection"
             );
         }
     }
@@ -2165,7 +2392,7 @@ mod tests {
     fn push_model_arg_conservative_conflict_on_glued_short_m_2744() {
         for tok in ["-m=explicit", "-mexplicit"] {
             let mut args = vec![tok.to_string()];
-            Backend::push_model_arg(&mut args, "codex", "from-fleet");
+            Backend::push_model_arg(&mut args, &Backend::Codex, "from-fleet");
             assert_eq!(
                 args,
                 vec![tok],
@@ -2181,8 +2408,11 @@ mod tests {
     fn push_model_arg_respects_double_dash_delimiter_2744() {
         // Inject before the delimiter, not appended into payload.
         let mut args = vec!["--".to_string(), "some prompt text".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "from-fleet");
-        assert_eq!(args, vec!["--model", "from-fleet", "--", "some prompt text"]);
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
+        assert_eq!(
+            args,
+            vec!["--model", "from-fleet", "--", "some prompt text"]
+        );
 
         // `--model` inside payload is prompt text, not a real flag: fleet
         // injection must still happen (before the delimiter).
@@ -2191,7 +2421,7 @@ mod tests {
             "--model".to_string(),
             "quoted".to_string(),
         ];
-        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
         assert_eq!(
             args,
             vec!["--model", "from-fleet", "--", "--model", "quoted"]

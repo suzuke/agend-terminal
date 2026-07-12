@@ -147,6 +147,7 @@ pub(super) fn resolve_instance(
 
     Some(super::ResolvedInstance {
         name: name.to_string(),
+        backend: backend.clone(),
         backend_command: backend_cmd,
         args,
         env,

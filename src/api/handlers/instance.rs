@@ -251,7 +251,33 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .or(tier_model)
         .or_else(|| fleet_resolved.as_ref().and_then(|r| r.model.as_deref()))
     {
-        crate::backend::Backend::push_model_arg(&mut args, command, model);
+        // #2744: capability keys off the DECLARED identity, never the command
+        // string (wrapper basenames misclassify). The `backend` param is
+        // dual-semantic on the wire: create paths send a declared NAME, but
+        // restart_spawn_params sends the RESOLVED COMMAND (possibly a custom
+        // path). A known name parses exactly and is a declaration; a
+        // Raw-parsed value is a command guess and must yield to the fleet
+        // entry's declared backend. Params-Raw stands only when nothing else
+        // declares — a genuinely raw backend.
+        let params_backend = params["backend"]
+            .as_str()
+            .map(crate::backend::Backend::parse_str);
+        let declared_backend = params_backend
+            .clone()
+            .filter(|b| !matches!(b, crate::backend::Backend::Raw(_)))
+            .or_else(|| fleet_resolved.as_ref().map(|r| r.backend.clone()))
+            .or_else(|| {
+                fleet_config_for_model
+                    .get_or_init(|| {
+                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+                            .ok()
+                    })
+                    .as_ref()
+                    .and_then(|f| f.defaults.backend.clone())
+            })
+            .or(params_backend)
+            .unwrap_or(crate::backend::Backend::ClaudeCode);
+        crate::backend::Backend::push_model_arg(&mut args, &declared_backend, model);
     }
     let requested_work_dir = params["working_directory"]
         .as_str()
@@ -1382,7 +1408,7 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  model-fleet-test:\n    backend: shell\n    model: model-2038-fleet\n",
+            "instances:\n  model-fleet-test:\n    backend: claude\n    model: model-2038-fleet\n",
         )
         .expect("write fleet.yaml");
 
@@ -1409,6 +1435,45 @@ mod tests {
         );
     }
 
+    /// #2744 T3 (e2e): a fleet entry whose DECLARED backend is shell (or any
+    /// capability-less backend) keeps a legacy `model:` value out of the
+    /// spawned argv — warn + skip, spawn survives. Pre-#2744 the argv got a
+    /// blind `--model` appended (`bash --model X` breaks outright).
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_declared_shell_never_injects_model_2744() {
+        let (ctx, home) = env_test_ctx("handle-spawn-shell-no-model");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  shell-no-model-test:\n    backend: shell\n    model: legacy-model\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "shell-no-model-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must survive: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "shell-no-model-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("__NO_ARGS__"),
+            "a declared-shell entry's legacy model MUST be withheld from argv \
+             (warn + skip), not blindly appended (#2744)"
+        );
+    }
+
     /// #2038 ingress 2 (deploy Phase 3 / args-less SPAWN shape) — SPAWN
     /// params omit `args` entirely; handle_spawn MUST fall back to the
     /// fleet entry's resolved `args` AND append its `model`. Pre-fix an
@@ -1424,7 +1489,7 @@ mod tests {
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             format!(
-                "instances:\n  args-fleet-test:\n    backend: shell\n    args:\n      - {}\n    model: model-2038-replace\n",
+                "instances:\n  args-fleet-test:\n    backend: claude\n    args:\n      - {}\n    model: model-2038-replace\n",
                 script.display()
             ),
         )
@@ -1466,7 +1531,7 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  model-prec-test:\n    backend: shell\n    model: model-2038-loser\n",
+            "instances:\n  model-prec-test:\n    backend: claude\n    model: model-2038-loser\n",
         )
         .expect("write fleet.yaml");
 
@@ -1505,7 +1570,7 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  params-model-test:\n    backend: shell\n    model: model-2038-fleet-loser\n",
+            "instances:\n  params-model-test:\n    backend: claude\n    model: model-2038-fleet-loser\n",
         )
         .expect("write fleet.yaml");
 
@@ -1544,7 +1609,7 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: shell\n    model: model-2038-inst-wins\n",
+            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: claude\n    model: model-2038-inst-wins\n",
         )
         .expect("write fleet.yaml");
 
@@ -1571,10 +1636,15 @@ mod tests {
 
     /// #2038 ingress 4 (CREATE_TEAM Phase-2) — team members spawn through
     /// `spawn_one` directly (not handle_spawn), so the team handler needs its
-    /// own boot-parity proof: with `defaults.model` (and `defaults.args`
-    /// carrying the capture script) in fleet.yaml, the real CREATE_TEAM entry
-    /// point MUST spawn the member with `--model` in its argv. Pre-#2038 the
-    /// member spawned with empty args (`&[]`), dropping both.
+    /// own boot-parity proof: `defaults.args` (carrying the capture script)
+    /// MUST reach the member argv. #2744 UPDATE: the member's declared
+    /// backend here is Raw ("/bin/sh" is both wire command and declaration
+    /// on the team path), so `defaults.model` must now be WITHHELD (warn +
+    /// skip) instead of blindly appended — the sentinel proves both: script
+    /// ran (args plumbing) with NO --model (capability gate). Supported-
+    /// backend injection on this same call site is covered by the shared
+    /// `push_model_arg` unit pins (the team path cannot fake a supported
+    /// backend's command without spawning the real CLI).
     #[cfg(unix)]
     #[test]
     fn create_team_spawns_members_with_defaults_model_2038() {
@@ -1607,9 +1677,10 @@ mod tests {
 
         assert_eq!(
             actual.as_deref(),
-            Some("--model model-2038-team"),
-            "CREATE_TEAM Phase-2 member spawn MUST carry defaults.model (and \
-             defaults.args) — pre-#2038 it spawned with empty argv"
+            Some("__NO_ARGS__"),
+            "CREATE_TEAM Phase-2 member spawn MUST carry defaults.args (the \
+             script ran) while WITHHOLDING defaults.model from a Raw-declared \
+             member (#2744 capability gate)"
         );
     }
 }
