@@ -583,6 +583,7 @@ mod tests {
             notifier: None,
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         };
         (ctx, home)
     }
@@ -652,6 +653,7 @@ mod tests {
             notifier: None,
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         };
         (ctx, home)
     }
@@ -736,6 +738,7 @@ mod tests {
             notifier: None,
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         };
 
         let resp = handle_spawn(&json!({"name": "twin", "backend": "claude"}), &ctx);
@@ -1127,6 +1130,7 @@ mod tests {
             notifier: None,
             home: home_ref,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         };
         (ctx, home)
     }

@@ -121,4 +121,7 @@ pub(crate) struct HandlerCtx<'a> {
     /// [`crate::api::serve`] from the composition root and carried into the MCP
     /// `RuntimeContext` so `restart_daemon` dispatches on an injected value.
     pub capability: crate::api::RestartCapability,
+    /// #2453 Stage R2: the app owner-restart request channel + gate (app root
+    /// only). Carried into the MCP `RuntimeContext`. `None` on daemon/verify.
+    pub app_restart: Option<&'a crate::api::app_restart::AppRestart>,
 }

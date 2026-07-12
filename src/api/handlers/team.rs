@@ -443,6 +443,7 @@ mod tests {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         }
     }
 
@@ -533,6 +534,7 @@ mod tests_1964 {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         }
     }
 
@@ -707,6 +709,7 @@ mod tests_2525 {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         }
     }
 

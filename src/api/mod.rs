@@ -249,6 +249,7 @@ pub fn serve(
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
     host: RestartCapability,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) {
     // #945 Phase 0: time the bind+port-publish step directly (not the
     // spawn of api::serve thread — that's sub-ms). Operators care about
@@ -408,6 +409,9 @@ pub fn serve(
         // #2453: `host` is a `Copy` enum; each session gets its own copy so the
         // spawned `move` closure satisfies `'static` (mirrors the cookie/token).
         let session_host = host;
+        // #2453 R2: `AppRestart` is Clone (channel Sender + Arc gate), not Copy;
+        // each session gets its own clone so the `move` closure satisfies `'static`.
+        let session_app_restart = app_restart.clone();
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
@@ -427,6 +431,7 @@ pub fn serve(
                     session_operator_token,
                     session_cookie,
                     session_host,
+                    session_app_restart,
                 );
             })
             .is_err()
@@ -563,6 +568,7 @@ fn handle_session(
     operator_token: crate::auth_cookie::Cookie,
     cookie: crate::auth_cookie::Cookie,
     host: RestartCapability,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -666,6 +672,7 @@ fn handle_session(
             notifier,
             home,
             capability: host,
+            app_restart: app_restart.as_ref(),
         };
 
         // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
@@ -1282,6 +1289,7 @@ mod tests {
                     e,
                     notifier,
                     crate::api::RestartCapability::Unsupported,
+                    None,
                 );
             })
             .unwrap();

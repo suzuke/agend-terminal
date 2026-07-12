@@ -15,36 +15,103 @@ use std::path::Path;
 pub(super) fn handle_restart_daemon(
     home: &Path,
     capability: Option<crate::api::RestartCapability>,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) -> Value {
     use crate::api::RestartCapability;
     match capability {
         Some(RestartCapability::Daemon) => daemon_restart_strategy(home),
-        Some(RestartCapability::App) => app_fail_closed(),
+        Some(RestartCapability::App) => app_restart_strategy(app_restart),
         Some(RestartCapability::Unsupported) | None => unsupported_fail_closed(),
     }
 }
 
-/// #2453 Stage R1 (was the #2098 leading gate): the `agend-terminal app`
-/// (combined TUI+daemon, `run_app`) host has NO in-process `RESTART_PENDING`
-/// consumer — an in-process self-respawn would set `RESTART_PENDING`, brick every
-/// api session (api/mod.rs), and the held-flock successor would 30s-time-out and
-/// die, latching the brick permanently. Fail CLOSED with an actionable error and
-/// NEVER set `RESTART_PENDING`. The staged owner-restart strategy is a later
-/// slice (decision d-20260712012329422433-1).
-fn app_fail_closed() -> Value {
+/// #2453 Stage R2: the `agend-terminal app` owner-restart strategy (Unix). The
+/// job-control proof (bash+zsh PTY harness) shows a spawned successor is
+/// backgrounded when the launching process exits, so restart is a RE-EXEC (same
+/// PID → same shell job). Flow: atomically CAS-claim the shared gate; on win hand
+/// a request to the TUI loop and BLOCK (bounded) for its verdict — the loop runs a
+/// read-only preflight probe and, on PASS, transitions the gate to Committing and
+/// replies BEFORE teardown + re-exec (decision d-20260712034222169749-5). A
+/// concurrent duplicate loses the CAS claim → idempotent "already in progress".
+#[cfg(unix)]
+fn app_restart_strategy(app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
+    use crate::api::app_restart::{AppRestartRequest, AppRestartVerdict};
+    let Some(ar) = app_restart else {
+        return app_no_channel_fail_closed();
+    };
+    // Genuine CAS claim: only one concurrent worker enters Probing.
+    if !ar.gate.try_begin_probe() {
+        return json!({
+            "ok": true,
+            "restart": "already in progress",
+            "note": "an app restart is already being processed; this request was a no-op"
+        });
+    }
+    // Hand the request to the TUI loop; block (bounded) for its verdict. Bounded
+    // oneshot (capacity 1). The loop runs the probe on its tick (≤5s); wait a
+    // little longer as a safety net.
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded::<AppRestartVerdict>(1);
+    if ar.tx.try_send(AppRestartRequest { reply: reply_tx }).is_err() {
+        ar.gate.abort_to_serving();
+        return json!({
+            "ok": false,
+            "error": "restart_daemon: could not deliver the restart request to the TUI loop; fleet intact"
+        });
+    }
+    match reply_rx.recv_timeout(std::time::Duration::from_secs(7)) {
+        Ok(AppRestartVerdict::Committing) => json!({
+            "ok": true,
+            "restart": "committing",
+            "note": "preflight passed; the app is re-exec'ing in place (this connection will drop)"
+        }),
+        Ok(AppRestartVerdict::Aborted(reason)) => json!({
+            "ok": false,
+            "error": format!("restart_daemon aborted: {reason}. Fleet + TUI intact — no restart.")
+        }),
+        Err(_) => {
+            // Safety-net timeout. Best-effort release (CAS from Probing; a no-op if
+            // the loop already advanced to Committing).
+            ar.gate.abort_to_serving();
+            json!({
+                "ok": false,
+                "error": "restart_daemon preflight timed out; fleet + TUI intact — no restart"
+            })
+        }
+    }
+}
+
+/// #2453 Stage R2: Windows owner-restart is an ISOLATED fail-closed strategy —
+/// there is no in-place `exec` on Windows, and ConPTY/Windows-Terminal
+/// tab-lifetime on predecessor exit is UNVERIFIED. Fail closed until a Windows
+/// console/ConPTY handoff is proven (decision d-20260712012329422433-1).
+#[cfg(windows)]
+fn app_restart_strategy(_app_restart: Option<crate::api::app_restart::AppRestart>) -> Value {
     tracing::warn!(
         target: "handoff",
-        event = "fail_closed_app_mode",
-        "#2098 restart_daemon refused: app host has no in-process restart consumer"
+        event = "fail_closed_app_windows",
+        "#2453 restart_daemon refused on Windows app host — owner-restart unsupported (no exec; ConPTY unverified)"
     );
     json!({
         "ok": false,
-        "error": "restart_daemon is not supported in `agend-terminal app` (combined TUI+daemon) \
-                  mode: that process runs no in-process restart consumer, so an in-process \
-                  self-respawn would brick the control plane. To restart, quit the app (the TUI \
-                  owns the daemon) and relaunch `agend-terminal app` — or send the process \
-                  SIGTERM and start it again. (A standalone `agend-terminal start` daemon \
-                  restarts in-process as normal.)"
+        "error": "restart_daemon is not supported in `agend-terminal app` on Windows: in-place \
+                  re-exec is unavailable and console/ConPTY handoff is unverified. Quit and relaunch \
+                  the app."
+    })
+}
+
+/// #2453 Stage R2: `App` capability but NO injected restart channel (e.g. a
+/// standalone bridge call that never traversed the in-process app api ingress).
+/// Fail closed — there is no TUI loop to consume a request.
+fn app_no_channel_fail_closed() -> Value {
+    tracing::warn!(
+        target: "handoff",
+        event = "fail_closed_app_no_channel",
+        "#2453 restart_daemon refused: app capability without an injected restart channel"
+    );
+    json!({
+        "ok": false,
+        "error": "restart_daemon is not available: no in-process app restart channel is wired \
+                  for this request. To restart, quit and relaunch `agend-terminal app`."
     })
 }
 
@@ -361,7 +428,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon));
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None);
                 assert_eq!(
                     response["ok"], false,
                     "unsupervised invocation must return ok:false, got {response}"
@@ -419,7 +486,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon));
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None);
                 assert_eq!(
                     response["ok"], false,
                     "ambient XPC_SERVICE_NAME alone must NOT be accepted as a \
@@ -474,7 +541,7 @@ mod tests {
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App));
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None);
                 assert_eq!(
                     response["ok"], false,
                     "app-mode (no run_core consumer) restart must fail-closed, got {response}"
@@ -532,7 +599,7 @@ mod tests {
             || {
                 let tmp = unique_tmp("daemon-cap");
                 let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon));
+                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None);
                 assert_eq!(
                     response["ok"], false,
                     "unsupervised daemon restart fails closed on the supervisor check, got {response}"
@@ -559,7 +626,8 @@ mod tests {
     fn app_capability_fails_closed_leaves_restart_pending_false() {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("app-cap");
-            let response = handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App));
+            let response =
+                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None);
             assert_eq!(
                 response["ok"], false,
                 "app-capability restart must fail closed, got {response}"
@@ -589,8 +657,11 @@ mod tests {
     fn unsupported_capability_default_deny_cannot_reach_daemon() {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("unsupported-cap");
-            let response =
-                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Unsupported));
+            let response = handle_restart_daemon(
+                &tmp,
+                Some(crate::api::RestartCapability::Unsupported),
+                None,
+            );
             assert_eq!(
                 response["ok"], false,
                 "unsupported-host restart must default-deny, got {response}"
@@ -614,7 +685,7 @@ mod tests {
     fn absent_capability_none_default_deny() {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("none-cap");
-            let response = handle_restart_daemon(&tmp, None);
+            let response = handle_restart_daemon(&tmp, None, None);
             assert_eq!(
                 response["ok"], false,
                 "absent capability (None) must default-deny, got {response}"

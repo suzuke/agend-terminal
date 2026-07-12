@@ -306,6 +306,12 @@ enum Commands {
         #[arg(default_value = "shell")]
         name: String,
     },
+    /// #2453 R2 (hidden): read-only app-restart preflight probe. Spawned by the
+    /// TUI loop before an owner-restart to validate the successor can boot far
+    /// enough to parse its config, WITHOUT attaching to the live daemon. Exits 0
+    /// (ok) / non-zero (fail). Not for direct operator use.
+    #[command(hide = true)]
+    RestartProbe,
     /// #hook-state-poc (hidden): backend lifecycle-hook reporter. Invoked by
     /// the hook entries `mcp_config.rs` injects into the per-workspace Claude
     /// settings under `AGEND_HOOK_STATE_POC=1`. Reads the hook payload JSON
@@ -795,6 +801,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::App { fleet }) => {
             app::run(fleet.as_deref())?;
         }
+        // #2453 R2: read-only restart preflight — never returns (exits 0/non-zero).
+        Some(Commands::RestartProbe) => app::run_restart_probe(),
         Some(Commands::Start {
             foreground,
             fleet,

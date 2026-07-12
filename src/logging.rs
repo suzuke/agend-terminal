@@ -193,6 +193,29 @@ pub fn flush_daemon_log() {
     drop(guard);
 }
 
+/// #2453 R2: the `agend-terminal app` counterpart of [`DAEMON_LOG_GUARD`]. The app
+/// owner-restart path re-execs via `CommandExt::exec`, which REPLACES the process
+/// image and SKIPS the local guard's Drop — so the app stashes its guard here at
+/// startup and [`flush_app_log`] drops it immediately before the exec.
+static APP_LOG_GUARD: std::sync::Mutex<Option<WorkerGuard>> = std::sync::Mutex::new(None);
+
+/// Hand the app's rolling-log guard to the global flush slot. Called once at app
+/// startup, right after [`setup_rolling_tracing`]; the guard then lives for the
+/// process lifetime until [`flush_app_log`] drops it.
+pub fn store_app_flush_guard(guard: WorkerGuard) {
+    *APP_LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+}
+
+/// Flush + close the app rolling-log writer by dropping the stashed guard.
+/// Idempotent. Call IMMEDIATELY before the restart `exec` (which bypasses Drop).
+pub fn flush_app_log() {
+    let guard = APP_LOG_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    drop(guard);
+}
+
 /// Install a `panic::set_hook` that forwards panics to `tracing::error!`
 /// so the rolling-file appender captures them. Chains the previous
 /// (default) hook after so panic messages still reach stderr-if-attached

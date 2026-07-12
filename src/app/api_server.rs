@@ -41,6 +41,7 @@ pub(super) fn start_api_server(
     prepared: Box<crate::bootstrap::OwnedFleet>,
     registry: &AgentRegistry,
     tui_tx: TuiEventSender,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) -> ApiGuard {
     let run_dir = prepared.run_dir.clone();
     let api_home = prepared.home.clone();
@@ -69,6 +70,7 @@ pub(super) fn start_api_server(
                 externals,
                 Some(notifier),
                 crate::api::RestartCapability::App,
+                app_restart,
             );
         })
         .ok();

@@ -1116,6 +1116,7 @@ fn init_daemon_services(
                 api_externals,
                 None,
                 crate::api::RestartCapability::Daemon,
+                None, // #2453 R2: no app-restart channel on the headless daemon
             )
         })?;
 

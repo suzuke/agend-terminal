@@ -417,6 +417,7 @@ mod tests {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         }
     }
 

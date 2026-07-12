@@ -197,6 +197,7 @@ mod tests {
             registry,
             externals,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         };
 
         let result =
@@ -223,6 +224,7 @@ mod tests {
                 },
             )]))),
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
         }
     }
 
