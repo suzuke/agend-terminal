@@ -69,13 +69,17 @@ fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
 #[cfg(test)]
 pub(crate) mod test_sync {
     use std::cell::Cell;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier, LazyLock, Mutex};
 
-    /// (generation, barrier): the generation makes a reused test-runner
-    /// thread distinguish "already rendezvoused THIS arming" from a fresh
-    /// arming by a later test in the same process (`cargo test` runs tests
-    /// as threads in one process; nextest is process-per-test).
-    static GATE: Mutex<Option<(u64, Arc<Barrier>)>> = Mutex::new(None);
+    /// Home-scoped `(generation, barrier)` entries. `cargo test` runs tests as
+    /// threads in one process, so unrelated temp homes must never share a
+    /// rendezvous. The process-global generation still lets a reused runner
+    /// thread distinguish a fresh arming from one it already crossed.
+    type GateEntry = (u64, Arc<Barrier>);
+    type GateMap = HashMap<PathBuf, GateEntry>;
+    static GATE: LazyLock<Mutex<GateMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     static NEXT_GEN: Mutex<u64> = Mutex::new(1);
     thread_local! {
         static WAITED_GEN: Cell<u64> = const { Cell::new(0) };
@@ -90,31 +94,34 @@ pub(crate) mod test_sync {
     /// gate — the superseded guard's Drop becomes a no-op via the gen
     /// compare, pinned by `overlapping_arm_stale_guard_drop_is_noop`.
     #[must_use = "the gate stays armed only while this guard lives"]
-    pub(crate) struct GateGuard(u64);
+    pub(crate) struct GateGuard(PathBuf, u64);
     impl Drop for GateGuard {
         fn drop(&mut self) {
             let mut gate = GATE.lock().expect("gate lock");
-            if gate.as_ref().is_some_and(|(gen, _)| *gen == self.0) {
-                gate.take();
+            if gate.get(&self.0).is_some_and(|(gen, _)| *gen == self.1) {
+                gate.remove(&self.0);
             }
         }
     }
 
-    pub fn arm(parties: usize) -> GateGuard {
+    pub fn arm(home: &Path, parties: usize) -> GateGuard {
         let mut next = NEXT_GEN.lock().expect("gen lock");
         let gen = *next;
         *next += 1;
-        *GATE.lock().expect("gate lock") = Some((gen, Arc::new(Barrier::new(parties))));
-        GateGuard(gen)
+        let home = home.to_path_buf();
+        GATE.lock()
+            .expect("gate lock")
+            .insert(home.clone(), (gen, Arc::new(Barrier::new(parties))));
+        GateGuard(home, gen)
     }
 
     /// Test-only observation for the overlap regression.
-    pub fn armed_gen() -> Option<u64> {
-        GATE.lock().expect("gate lock").as_ref().map(|(g, _)| *g)
+    pub fn armed_gen(home: &Path) -> Option<u64> {
+        GATE.lock().expect("gate lock").get(home).map(|(g, _)| *g)
     }
 
-    pub fn wait_if_armed() {
-        let gate = GATE.lock().expect("gate lock").clone();
+    pub fn wait_if_armed(home: &Path) {
+        let gate = GATE.lock().expect("gate lock").get(home).cloned();
         if let Some((gen, b)) = gate {
             if WAITED_GEN.with(Cell::get) == gen {
                 return; // this thread already rendezvoused this generation
@@ -216,7 +223,7 @@ pub fn upsert_system_hygiene_task(
                 // r2: deterministic stale-probe rendezvous — no-op in
                 // production, lets tests pin writers at the same probed `n`.
                 #[cfg(test)]
-                test_sync::wait_if_armed();
+                test_sync::wait_if_armed(home);
                 let update = vec![
                     meta(&tid, EVIDENCE_META, evidence.clone()),
                     meta(&tid, LAST_SEEN_META, now.into()),
@@ -354,22 +361,35 @@ mod tests {
     /// guard drop is a gen-compared no-op.
     #[test]
     fn overlapping_arm_stale_guard_drop_is_noop() {
-        let a = test_sync::arm(2);
-        let gen_a = test_sync::armed_gen().unwrap();
-        let b = test_sync::arm(2);
-        let gen_b = test_sync::armed_gen().unwrap();
-        assert_ne!(gen_a, gen_b, "re-arm must advance the generation");
-        drop(a);
+        let home_a = tmp_home("overlap-a");
+        let home_b = tmp_home("overlap-b");
+        let stale_a = test_sync::arm(&home_a, 2);
+        let gen_stale_a = test_sync::armed_gen(&home_a).unwrap();
+        let b = test_sync::arm(&home_b, 2);
+        let gen_b = test_sync::armed_gen(&home_b).unwrap();
+        let current_a = test_sync::arm(&home_a, 2);
+        let gen_current_a = test_sync::armed_gen(&home_a).unwrap();
+        assert_ne!(gen_stale_a, gen_b, "generations are process-global");
+        assert_ne!(gen_b, gen_current_a, "every arm advances generation");
+        drop(stale_a);
         assert_eq!(
-            test_sync::armed_gen(),
-            Some(gen_b),
-            "stale guard A must NOT clear newer arming B"
+            test_sync::armed_gen(&home_a),
+            Some(gen_current_a),
+            "stale home-A guard must NOT clear newer home-A arming"
         );
+        assert_eq!(
+            test_sync::armed_gen(&home_b),
+            Some(gen_b),
+            "home-A replacement/drop must not disturb home B"
+        );
+        drop(current_a);
+        assert_eq!(test_sync::armed_gen(&home_a), None);
+        assert_eq!(test_sync::armed_gen(&home_b), Some(gen_b));
         drop(b);
         assert_eq!(
-            test_sync::armed_gen(),
+            test_sync::armed_gen(&home_b),
             None,
-            "owning guard clears its own gate"
+            "each owning guard clears only its own home"
         );
     }
 
@@ -384,7 +404,7 @@ mod tests {
         upsert_system_hygiene_task(&home_a, "a", "a", ev("seed-a")).unwrap();
         upsert_system_hygiene_task(&home_b, "b", "b", ev("seed-b")).unwrap();
 
-        let gate = test_sync::arm(2);
+        let gate = test_sync::arm(&home_a, 2);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let b_home = home_b.clone();
         let b = std::thread::spawn(move || {
@@ -426,7 +446,7 @@ mod tests {
         let home = tmp_home("cas-det");
         let seed = upsert_system_hygiene_task(&home, "k:r:b", "residue", ev("seed")).unwrap();
         assert!(matches!(seed, HygieneUpsert::Created(_)));
-        let gate = test_sync::arm(2);
+        let gate = test_sync::arm(&home, 2);
         let mk = |tag: &'static str| {
             let home = home.clone();
             std::thread::spawn(move || {
