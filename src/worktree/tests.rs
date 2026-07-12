@@ -646,30 +646,44 @@ fn preserve_dual_parent_when_staged_differs_from_worktree() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// (4) Nested submodule dirt AND an untracked PARENT file ⇒ prefer Preserve
-/// (the parent WIP is real), and the ref captures the untracked parent file.
+/// (4) Nested submodule INTERNAL dirt co-occurring with parent dirt must REFUSE
+/// (fail-closed), NOT falsely Preserve. A parent snapshot (`git add -A`) records
+/// the gitlink only, never the submodule's internal edits — so preserving here
+/// would mint a recovery ref that silently DROPS the nested WIP on removal. The
+/// prior `both-trees == HEAD` classifier caught only the SOLE-nested case; any
+/// co-occurring parent dirt made `worktree_tree != HEAD` and skipped the refusal
+/// → silent nested loss in the common mixed case (2nd-seat blocker @ fc8481d3).
 #[cfg(unix)]
 #[test]
-fn preserve_mixed_parent_and_submodule_prefers_preserve() {
+fn preserve_mixed_parent_and_nested_internal_refuses_no_silent_loss() {
     let home = tmp_home("mixed");
     let super_repo = tmp_super_one_sub("mixed");
     let info = create(&home, &super_repo, "agent1", Some("feat/mixed")).expect("worktree");
-    // Dirty the submodule internal file AND drop an untracked parent file.
-    std::fs::write(info.path.join("vendor/dep/vendored.txt"), b"nested-dirty\n").unwrap();
+    // Dirty the submodule INTERNAL file AND drop an untracked parent file.
+    let vendored = info.path.join("vendor/dep/vendored.txt");
+    std::fs::write(&vendored, b"nested-dirty\n").unwrap();
     std::fs::write(info.path.join("parent-wip.txt"), b"parent untracked WIP\n").unwrap();
 
     let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/mixed", None);
     assert_eq!(
         pres_kind(&outcome),
-        "Preserved",
-        "mixed parent+submodule dirt must Preserve, not refuse"
+        "UnpreservableNestedDirty",
+        "mixed parent+nested-internal dirt must refuse (a parent ref cannot capture nested WIP)"
     );
-    let refs = recovery_ref_names(&super_repo, "feat/mixed");
-    assert_eq!(refs.len(), 1, "one recovery ref: {refs:?}");
-    let tree = git_out(&super_repo, &["ls-tree", "-r", "--name-only", &refs[0]]);
     assert!(
-        tree.contains("parent-wip.txt"),
-        "recovery ref must capture the untracked parent file: {tree}"
+        outcome.blocked_reason().is_some(),
+        "refusal must be fail-closed (blocked_reason Some) so the caller retains the worktree"
+    );
+    assert!(
+        recovery_ref_names(&super_repo, "feat/mixed").is_empty(),
+        "no recovery ref may be minted — it would falsely claim the nested WIP was preserved"
+    );
+    // The nested WIP must survive in place (classification is non-destructive and
+    // the caller must NOT remove the worktree).
+    assert_eq!(
+        std::fs::read(&vendored).unwrap(),
+        b"nested-dirty\n",
+        "the nested edit must remain on disk for in-place recovery"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -855,6 +869,66 @@ fn release_full_refuses_nested_only() {
             .iter()
             .any(|p| p.extension().and_then(|e| e.to_str()) == Some("lock")),
         "the per-worktree `.lock` must remain durable after clear"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+    std::fs::remove_dir_all(&super_repo).ok();
+}
+
+/// (7b) Real-entry MIXED case through `release_full`: nested-submodule INTERNAL
+/// dirt co-occurring with parent dirt must be REFUSED — the worktree is NOT
+/// removed and the nested WIP survives on disk. Before the fix, the parent dirt
+/// made `worktree_tree != HEAD`, the preserve path snapshotted the gitlink only,
+/// and the caller removed the worktree → the nested edit was SILENTLY LOST.
+#[cfg(unix)]
+#[test]
+fn release_full_refuses_mixed_parent_and_nested_internal_preserving_nested() {
+    let home = tmp_home("release-mixed");
+    let super_repo = tmp_super_one_sub("release-mixed");
+    let info = create(&home, &super_repo, "agent1", Some("feat/relmix")).expect("worktree");
+    crate::binding::bind_full(
+        &home,
+        "agent1",
+        "",
+        "feat/relmix",
+        &info.path,
+        &super_repo,
+        false,
+    )
+    .expect("bind");
+    let vendored = info.path.join("vendor/dep/vendored.txt");
+    std::fs::write(&vendored, b"nested-dirty\n").unwrap();
+    // Co-occurring PARENT dirt (the trigger that bypassed the sole-nested refusal).
+    std::fs::write(info.path.join("parent-wip.txt"), b"parent untracked WIP\n").unwrap();
+
+    let out = crate::worktree_pool::release_full(&home, "agent1", false);
+    assert!(
+        !out.released,
+        "mixed nested-internal dirt must refuse release"
+    );
+    assert!(
+        !out.worktree_removed,
+        "worktree must NOT be removed — removal would discard the nested WIP"
+    );
+    assert!(
+        info.path.exists(),
+        "worktree dir must remain for in-place recovery"
+    );
+    assert_eq!(
+        std::fs::read(&vendored).unwrap(),
+        b"nested-dirty\n",
+        "the nested edit must survive on disk (no silent loss)"
+    );
+    assert!(
+        recovery_ref_names(&super_repo, "feat/relmix").is_empty(),
+        "no recovery ref for the refused mixed case"
+    );
+    assert!(
+        crate::binding::read(&home, "agent1").is_some(),
+        "binding must be retained on refusal"
     );
 
     std::fs::remove_dir_all(&home).ok();
