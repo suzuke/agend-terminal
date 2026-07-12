@@ -9,7 +9,12 @@ mod auto_watch;
 mod branch_start_point;
 mod from_ref;
 mod live_binding;
+// S2 r2 (#2746): provider-neutral binding-origin slug for the binding_state
+// current_binding projection (GitHub + Bitbucket + GitLab), sibling for LOC
+// relief. Watch-storage canonicalization stays GitHub-only in this file.
+mod provider_neutral_slug;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
+pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across
@@ -976,9 +981,18 @@ pub(crate) fn canonicalize_repo_slug(s: &str) -> Option<String> {
     ))
 }
 
-/// Returns `None` for non-GitHub remotes — `watch_ci` only knows how to poll
-/// GitHub Actions, so silently skipping non-GitHub repos is the right behavior
-/// (the alternative would be writing a stale watch entry the poller can't act on).
+/// Returns `None` for non-GitHub remotes. This GitHub-only derivation is the
+/// dispatch-time fallback that stamps a watch's stored `repo` when the caller
+/// omits an explicit `repository` (see `ci::resolve_repo_or_error`): a non-GitHub
+/// binding origin then fails loud (`non_github_remote_no_override`) rather than
+/// writing a slug the derive path can't canonicalize.
+///
+/// NOTE (#2746): this does NOT mean the whole subsystem is GitHub-only — the
+/// poller has (dormant) GitLab/Bitbucket providers, and an EXPLICIT bare
+/// `repository=owner/repo` + `ci_provider=bitbucket_cloud` reaches a Bitbucket
+/// watch. For deriving the CURRENT-BINDING identity from a binding origin
+/// (which must match such a stored slug), use the provider-neutral
+/// [`derive_repo_slug_any_forge_pub`], NOT this helper.
 ///
 /// Pre-#942 this was a separate stricter implementation; post-#942 it
 /// delegates to [`canonicalize_repo_slug`] so derived-from-remote URLs
