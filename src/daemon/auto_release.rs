@@ -868,7 +868,20 @@ fn is_worktree_clean(worktree: &Path) -> bool {
         return false;
     }
     // #1899: bounded via git_bypass (LOCAL 60s) — a stuck git → false fallback.
-    let out = match crate::git_helpers::git_bypass(worktree, &["status", "--porcelain"]) {
+    // P0/P1 (codex R2): `--ignore-submodules=none` overrides any
+    // `submodule.<name>.ignore=all|dirty` that would HIDE submodule dirt (this gates
+    // the auto-release dirty decision that can route to remove — a false "clean" here
+    // loses nested WIP); global `--no-optional-locks` (first) keeps the live index
+    // byte-untouched. Both are git GLOBAL options, so they precede `status`.
+    let out = match crate::git_helpers::git_bypass(
+        worktree,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    ) {
         Ok(o) => o,
         Err(_) => return false,
     };
