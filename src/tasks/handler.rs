@@ -926,6 +926,18 @@ fn handle_update(
             base.to_string()
         }
     };
+    // F3: `depends_on` is set at `Created` and is immutable via `update` — there
+    // is no post-create event that carries it, by design (circular-dependency
+    // containment; see the contract in `tasks/tests.rs`). Reject it explicitly
+    // instead of the historical silent no-op that falsely reported "updated".
+    if args.get("depends_on").is_some_and(|v| !v.is_null()) {
+        return serde_json::json!({
+            "error": format!(
+                "'depends_on' is set at creation and is immutable via update (task {id})"
+            ),
+            "code": "immutable_field",
+        });
+    }
     // PR4 F1 — collect transitions into a Vec then emit via
     // single `append_batch` so updates are atomic at the F7 batch
     // level (all-or-nothing fsync window).
@@ -1115,9 +1127,26 @@ fn handle_update(
                 .map(|s| crate::task_events::InstanceName(s.clone())),
         });
     }
+    // F2: result backfill via the additive `ResultSet` event. Emitted only when
+    // the supplied value actually differs from the current record — an equal
+    // value produces no event, so the response below reports an honest
+    // `unchanged` rather than a false `updated`. Rides the same atomic
+    // `append_batch` + ownership ACL as every other update event (no separate
+    // authority surface). Allowed on any state so an owner/orchestrator can
+    // backfill the outcome on an already-done task (the witnessed case).
+    if let Some(new_result) = args.get("result").and_then(|v| v.as_str()) {
+        if record.result.as_deref() != Some(new_result) {
+            pending_events.push(crate::task_events::TaskEvent::ResultSet {
+                task_id: crate::task_events::TaskId(id.clone()),
+                by: crate::task_events::InstanceName::from(caller.as_str()),
+                result: new_result.to_string(),
+            });
+        }
+    }
     // F1: single atomic append_batch over all the update arm's
     // queued events. Either all land or none do.
-    if !pending_events.is_empty() {
+    let had_events = !pending_events.is_empty();
+    if had_events {
         // #1868: re-validate the status transition UNDER the append lock against
         // FRESH committed state (mirrors `handle_claim`/`handle_done`). The
         // out-of-lock `can_transition_to` check above is a fast-reject; a
@@ -1204,13 +1233,45 @@ fn handle_update(
     }
     // #807 Item 1: see create arm note.
     let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-    serde_json::json!({
-        "id": id,
-        "event": "updated",
-        "task": task,
-        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
-        "status": "updated",
-    })
+    if had_events {
+        serde_json::json!({
+            "id": id,
+            "event": "updated",
+            "task": task,
+            // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+            "status": "updated",
+        })
+    } else if [
+        "status",
+        "priority",
+        "assignee",
+        "description",
+        "tags",
+        "result",
+    ]
+    .iter()
+    .any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+    {
+        // A recognized field was supplied but equalled the current value (only
+        // `result` can reach here — status/priority/description/tags/owner always
+        // emit an event). Honest idempotent no-op instead of a false "updated".
+        serde_json::json!({
+            "id": id,
+            "event": "unchanged",
+            "task": task,
+            "status": "unchanged",
+        })
+    } else {
+        // No supported mutable field supplied (`depends_on` was already rejected
+        // above). Fail loud rather than the historical false "updated".
+        serde_json::json!({
+            "error": format!(
+                "no updatable field supplied for task {id} \
+                 (supported: status, priority, assignee, description, tags, result)"
+            ),
+            "code": "no_op",
+        })
+    }
 }
 
 fn handle_sweep(home: &Path, args: &Value) -> Value {
@@ -1581,6 +1642,7 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
             "description updated".to_string(),
         ),
         TaskEvent::TagsSet { tags, .. } => ("tags_set", actor, format!("tags → {tags:?}")),
+        TaskEvent::ResultSet { by, .. } => ("result_set", by.0.clone(), "result set".to_string()),
         TaskEvent::MetadataSet { key, value, by, .. } => (
             "metadata_set",
             by.0.clone(),

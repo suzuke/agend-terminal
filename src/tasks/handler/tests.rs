@@ -1141,7 +1141,10 @@ fn seed_claimed(home: &std::path::Path, task_id: &str, owner: &str) {
                 tags: vec![],
                 parent_id: None,
             },
-            TaskEvent::Claimed { task_id: tid, by: InstanceName::from(owner) },
+            TaskEvent::Claimed {
+                task_id: tid,
+                by: InstanceName::from(owner),
+            },
         ],
     )
     .expect("seed claimed");
@@ -1155,7 +1158,12 @@ fn update_result_backfills_done_task() {
     let home = tmp_home("f2-backfill");
     seed_claimed(&home, "t-f2", "dev-agent");
     crate::tasks::auto_close::auto_close_on_report(
-        &home, "report", "t-f2", "dev-agent", "auto summary", true,
+        &home,
+        "report",
+        "t-f2",
+        "dev-agent",
+        "auto summary",
+        true,
     )
     .expect("auto_close");
     assert_eq!(
@@ -1187,7 +1195,10 @@ fn update_result_idempotent_reports_unchanged() {
         "dev-agent",
         &serde_json::json!({"action": "update", "id": "t-f2i", "result": "X"}),
     );
-    assert_eq!(first["status"], "updated", "first result set is a real change: {first}");
+    assert_eq!(
+        first["status"], "updated",
+        "first result set is a real change: {first}"
+    );
     let second = handle(
         &home,
         "dev-agent",
@@ -1216,7 +1227,10 @@ fn update_depends_on_is_rejected_not_silently_accepted() {
         "F3: update(depends_on=…) must return an explicit create-only error: {resp}"
     );
     let deps = read_task_record(&home, "t-f3").unwrap().depends_on;
-    assert!(deps.is_empty(), "depends_on must stay as created (immutable): {deps:?}");
+    assert!(
+        deps.is_empty(),
+        "depends_on must stay as created (immutable): {deps:?}"
+    );
 }
 
 /// Fail-loud: an update with no supported mutable field is not a success. Pre-fix
