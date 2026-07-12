@@ -1227,6 +1227,11 @@ fn spawn_fleet_agents(home: &Path, agents: &[AgentDef], ctx: &DaemonContext) {
 /// until the main loop exits.
 struct TickKeepalive {
     _task_sweep: crate::daemon::task_sweep::TaskSweep,
+    // #2737: owner-service witness held for daemon lifetime. build_tick_infrastructure
+    // cannot construct TickKeepalive without calling the two-phase seam, so run_core's
+    // dual-host reach is a COMPILE property (structural I2, replacing the old
+    // `owner_services_called_by_both_hosts` string-scan).
+    _owner_services: crate::daemon::owner_services::OwnerServicesStarted,
 }
 
 fn build_tick_infrastructure(
@@ -1245,14 +1250,28 @@ fn build_tick_infrastructure(
         supervisor::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
     }
     router::spawn(home.to_path_buf(), Arc::clone(&ctx.registry));
-    // #2453 Stage 1a: monitoring (instance_monitor + api_activity_probe) via the
-    // shared owner-services helper — identical call in owned `run_app`.
-    crate::daemon::owner_services::start_shared_monitoring_services(home, &ctx.registry);
-    // #2453 Stage 1a: the three Shadow Observer stream planes (rollout + opencode
-    // + kiro) via the shared owner-services helper — identical call in owned
+    // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
+    // api_activity_probe) via the typed phase-1 seam — identical position/args to
+    // owned `run_app`. The daemon host always owns the fleet (no attached concept),
+    // so role = Owned. The returned token is required by phase 2 (compile-enforced
+    // order).
+    let monitoring = crate::daemon::owner_services::start_owner_monitoring(
+        crate::daemon::owner_services::OwnerRole::Owned,
+        home,
+        &ctx.registry,
+        &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
+    );
+    // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout +
+    // opencode + kiro) via the typed phase-2 seam — identical call in owned
     // `run_app`. No-op under AGEND_SHADOW_OBSERVER=0 (default-ON). shadow::start
     // (the socket-ingest plane) stays host-local (separate fork).
-    crate::daemon::owner_services::start_shared_stream_observers(home, &ctx.registry);
+    let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
+        crate::daemon::owner_services::OwnerRole::Owned,
+        &monitoring,
+        home,
+        &ctx.registry,
+        &crate::daemon::owner_services::OwnerStreamStarters::real(),
+    );
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a
@@ -1288,7 +1307,14 @@ fn build_tick_infrastructure(
         rx
     };
 
-    (TickKeepalive { _task_sweep }, handlers, tick_rx)
+    (
+        TickKeepalive {
+            _task_sweep,
+            _owner_services: owner_services,
+        },
+        handlers,
+        tick_rx,
+    )
 }
 
 fn log_residual_worktrees(home: &Path) {
