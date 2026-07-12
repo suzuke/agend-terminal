@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (29 tools)
+# AgEnD MCP Tools Reference (30 tools)
 
 ## Action-based Tools
 
@@ -93,6 +93,12 @@ Kill and restart an instance. Default mode `resume` preserves conversation state
 - **instance**: instance to restart
 - mode (resume / fresh), reason, force
 - `fresh` refuses by default if the bound worktree has uncommitted changes (#2476); commit/push or leave a task-board handoff first, or pass `force: true`.
+
+### `set_model`
+#2744: persist an instance's model intent to fleet.yaml. Exactly ONE of `model`/`tier`; setting one atomically clears the other (last-write-wins intent). Takes effect on the next respawn unless `restart: true`.
+- **instance**: fleet instance whose entry to update
+- model (concrete id/alias for the DECLARED backend), tier (symbolic `model_tiers` key), restart (default false)
+- Shell/Raw/custom backends have no declared model capability → hard error; a pre-existing model flag in the entry's `args` is a hard conflict (no automatic argv rewriting; move payload after `--` or clean the args). A restart failure after a durable persist reports `persisted:true, restart_ok:false` — the intent still applies on the next respawn.
 
 ### `bind_topic`
 #991: retrofit a Telegram topic for an instance spawned with `topic_binding=deferred` (or `auto` that ended up without one, e.g. spawned during the ~6s post-boot channel-init window).

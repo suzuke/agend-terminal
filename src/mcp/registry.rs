@@ -347,7 +347,7 @@ pub(crate) fn tool_allowed_for_role_action(
     tool_allowed_for_role(role_kind, tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 29] = [
+static ALL_TOOLS: [ToolEntry; 30] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -403,6 +403,12 @@ static ALL_TOOLS: [ToolEntry; 29] = [
         name: "restart_instance",
         definition: super::tools::def_restart_instance,
         handler: super::handlers::dispatch::dispatch_restart_instance,
+        class: ToolClass::SIDE_EFFECT,
+    },
+    ToolEntry {
+        name: "set_model",
+        definition: super::tools::def_set_model,
+        handler: super::handlers::dispatch::dispatch_set_model,
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
@@ -659,12 +665,12 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_29_byte_identical() {
+    fn full_capability_roles_surface_all_30_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            29,
-            "registry baseline is 29 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27; #991 Phase 2: + bind_topic = 27->28; #2550 P1: + instance (folded read-only alias) = 28->29)"
+            30,
+            "registry baseline is 30 tools (#2547 P0: 37->33; #2548 Wave1-PR1: tui_screenshot removed, gc_dry_run/tokens/watchdog moved to CLI, config set-side moved to CLI = 33->29; #2548 Wave1-PR2: mode folded into list_instances, force_release_worktree merged into release_worktree(force:true) = 29->27; #991 Phase 2: + bind_topic = 27->28; #2550 P1: + instance (folded read-only alias) = 28->29; #2744 PR-A: + set_model = 29->30)"
         );
         for role in [
             None,
@@ -693,6 +699,7 @@ mod tests {
             "create_instance",
             "delete_instance",
             "restart_instance",
+            "set_model",
             "start_instance",
             "restart_daemon",
             "team",

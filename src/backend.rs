@@ -381,6 +381,9 @@ pub struct BackendPreset {
     pub redraw_after_resize: bool,
 }
 
+/// #2744: model-capability types re-exported from their anti-monolith home.
+pub use crate::backend_model::{ModelCapability, ModelFlagHit};
+
 impl Backend {
     pub fn preset(&self) -> BackendPreset {
         // W2.5: shared defaults. Each arm below specifies ONLY the fields where
@@ -790,26 +793,62 @@ impl Backend {
         }
     }
 
-    /// #2038: append `--model <formatted>` to an argv unless the caller
-    /// already passed a `--model` flag (explicit caller args win —
-    /// `create_instance` pre-formats the flag into its SPAWN args, and a
-    /// double `--model` must never reach the backend CLI). Formatting goes
-    /// through [`Backend::format_model_arg`] when `backend_command` maps to a
-    /// known backend (OpenCode needs a provider prefix); unknown commands get
-    /// the model string verbatim. Empty model is a no-op.
-    pub fn push_model_arg(args: &mut Vec<String>, backend_command: &str, model: &str) {
-        if model.is_empty()
-            || args
-                .iter()
-                .any(|a| a == "--model" || a.starts_with("--model="))
-        {
+    /// #2744 PR-A: the DECLARED backend's model-flag grammar — table and
+    /// types live in [`crate::backend_model`] (anti-monolith split); this is
+    /// the enum-keyed accessor. Never key off a command string.
+    pub fn model_capability(&self) -> Option<&'static ModelCapability> {
+        crate::backend_model::capability_for(self)
+    }
+
+    /// #2038/#2744: apply the fleet-resolved model intent to a spawn argv,
+    /// gated on the DECLARED backend's [`ModelCapability`].
+    ///
+    /// - No capability (Shell/Raw/custom) → warn + skip: `bash --model X`
+    ///   breaks the spawn outright, so unsupported backends fail loud here
+    ///   (and hard-error in `set_model`) instead of guessing.
+    /// - Existing model-flag spellings win (caller args > fleet intent,
+    ///   #2038). Confirmed spellings skip silently — that precedence is by
+    ///   design. Ambiguous glued spellings also skip, but WITH a warning:
+    ///   fleet intent is being suppressed by a token whose parser
+    ///   acceptance is unproven.
+    /// - The flag pair is inserted BEFORE the first bare `--` — everything
+    ///   after the delimiter is payload, not flag territory. Presets never
+    ///   carry `--`, so production argv is unchanged (append position).
+    /// - Formatting goes through [`Backend::format_model_arg`] (OpenCode
+    ///   needs a provider prefix). Empty model is a no-op.
+    pub fn push_model_arg(args: &mut Vec<String>, backend: &Backend, model: &str) {
+        if model.is_empty() {
             return;
         }
-        let model_val = Backend::from_command(backend_command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.to_string());
-        args.push("--model".to_string());
-        args.push(model_val);
+        let Some(cap) = backend.model_capability() else {
+            tracing::warn!(
+                backend = %backend.name(),
+                model = %model,
+                "model intent configured for a backend with no declared model \
+                 capability — skipping --model injection (#2744)"
+            );
+            return;
+        };
+        let hits = cap.scan(args);
+        if !hits.is_empty() {
+            if let Some(ModelFlagHit::Ambiguous(tok)) = hits
+                .iter()
+                .find(|h| matches!(h, ModelFlagHit::Ambiguous(_)))
+            {
+                tracing::warn!(
+                    backend = %backend.name(),
+                    token = %tok,
+                    model = %model,
+                    "ambiguous model-flag-like token suppresses fleet model \
+                     injection; move payload after `--` or remove the token (#2744)"
+                );
+            }
+            return;
+        }
+        let model_val = backend.format_model_arg(model);
+        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        args.insert(at, cap.long_flag.to_string());
+        args.insert(at + 1, model_val);
     }
 
     /// Display name matching the CLI command. For [`Backend::Raw`] returns the
@@ -2076,33 +2115,131 @@ mod tests {
     #[test]
     fn push_model_arg_appends_and_dedupes_2038() {
         let mut args = vec!["--continue".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "claude-opus-4-8");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "claude-opus-4-8");
         assert_eq!(args, vec!["--continue", "--model", "claude-opus-4-8"]);
 
         // OpenCode gets the provider prefix via format_model_arg.
         let mut args = Vec::new();
-        Backend::push_model_arg(&mut args, "opencode", "opus");
+        Backend::push_model_arg(&mut args, &Backend::OpenCode, "opus");
         assert_eq!(args, vec!["--model", "anthropic/opus"]);
-
-        // Unknown command: model passes through verbatim.
-        let mut args = Vec::new();
-        Backend::push_model_arg(&mut args, "/bin/sh", "m1");
-        assert_eq!(args, vec!["--model", "m1"]);
 
         // Caller already passed --model (separate form) — no duplicate.
         let mut args = vec!["--model".to_string(), "explicit".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
         assert_eq!(args, vec!["--model", "explicit"]);
 
         // Glued form counts too.
         let mut args = vec!["--model=explicit".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "from-fleet");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
         assert_eq!(args, vec!["--model=explicit"]);
 
         // Empty model is a no-op.
         let mut args = vec!["--continue".to_string()];
-        Backend::push_model_arg(&mut args, "claude", "");
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "");
         assert_eq!(args, vec!["--continue"]);
+    }
+
+    /// #2744 PR-A: Shell/Raw (any command without a declared model
+    /// capability) must never receive a blind `--model` injection — `bash
+    /// --model X` fails to spawn, and an arbitrary executable's argv
+    /// semantics are unknown. Reachable today via create_instance's
+    /// unrestricted `model` param.
+    #[test]
+    fn push_model_arg_shell_raw_never_inject_2744() {
+        let mut args: Vec<String> = Vec::new();
+        Backend::push_model_arg(&mut args, &Backend::Shell, "opus");
+        assert!(
+            args.is_empty(),
+            "shell must not receive --model, got {args:?}"
+        );
+
+        let mut args: Vec<String> = Vec::new();
+        Backend::push_model_arg(
+            &mut args,
+            &Backend::Raw("/opt/custom/agent-bin".into()),
+            "opus",
+        );
+        assert!(
+            args.is_empty(),
+            "raw must not receive --model, got {args:?}"
+        );
+    }
+
+    /// #2744 PR-A (B8): dedupe must recognize the short `-m` spelling on
+    /// backends whose CLI help declares it (codex/opencode/grok — see
+    /// tests/fixtures/cli-help/) instead of appending a second model flag.
+    #[test]
+    fn push_model_arg_dedupes_short_m_on_declaring_backends_b8_2744() {
+        for backend in [Backend::Codex, Backend::OpenCode, Backend::Grok] {
+            let mut args = vec!["-m".to_string(), "explicit".to_string()];
+            Backend::push_model_arg(&mut args, &backend, "from-fleet");
+            assert_eq!(
+                args,
+                vec!["-m", "explicit"],
+                "backend {backend:?}: separate -m must dedupe"
+            );
+        }
+    }
+
+    /// #2744 PR-A: claude/kiro-cli/agy help declares NO `-m` short flag — a
+    /// `-m` token there is not a model flag, so fleet injection must still
+    /// happen. Pins the per-backend alias set so the scanner never
+    /// over-matches on long-flag-only backends.
+    #[test]
+    fn push_model_arg_ignores_short_m_on_non_declaring_backends_2744() {
+        for backend in [Backend::ClaudeCode, Backend::KiroCli, Backend::Agy] {
+            let mut args = vec!["-m".to_string(), "unrelated".to_string()];
+            Backend::push_model_arg(&mut args, &backend, "from-fleet");
+            assert_eq!(
+                args,
+                vec!["-m", "unrelated", "--model", "from-fleet"],
+                "backend {backend:?}: undeclared -m must not suppress injection"
+            );
+        }
+    }
+
+    /// #2744 PR-A: `-m=X` / `-mVAL` glued spellings are a CONSERVATIVE
+    /// conflict on -m-declaring backends: the glued-value acceptance is not
+    /// fixture-proven per CLI (clap vs yargs differ), so suppressing
+    /// injection is the fail-loud choice vs risking a double model flag.
+    #[test]
+    fn push_model_arg_conservative_conflict_on_glued_short_m_2744() {
+        for tok in ["-m=explicit", "-mexplicit"] {
+            let mut args = vec![tok.to_string()];
+            Backend::push_model_arg(&mut args, &Backend::Codex, "from-fleet");
+            assert_eq!(
+                args,
+                vec![tok],
+                "glued {tok} must suppress injection (conservative conflict)"
+            );
+        }
+    }
+
+    /// #2744 PR-A: a bare `--` is the end-of-options delimiter. Injection
+    /// must place the flag pair BEFORE it (options territory), and model
+    /// tokens AFTER it are payload — never a dedupe/conflict match.
+    #[test]
+    fn push_model_arg_respects_double_dash_delimiter_2744() {
+        // Inject before the delimiter, not appended into payload.
+        let mut args = vec!["--".to_string(), "some prompt text".to_string()];
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
+        assert_eq!(
+            args,
+            vec!["--model", "from-fleet", "--", "some prompt text"]
+        );
+
+        // `--model` inside payload is prompt text, not a real flag: fleet
+        // injection must still happen (before the delimiter).
+        let mut args = vec![
+            "--".to_string(),
+            "--model".to_string(),
+            "quoted".to_string(),
+        ];
+        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
+        assert_eq!(
+            args,
+            vec!["--model", "from-fleet", "--", "--model", "quoted"]
+        );
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {

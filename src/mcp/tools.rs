@@ -142,6 +142,16 @@ pub(crate) fn def_bind_topic() -> Value {
         }, "required": ["instance"]}})
 }
 
+pub(crate) fn def_set_model() -> Value {
+    json!({"name": "set_model", "description": "#2744: persist an instance's model intent to fleet.yaml (exactly ONE of model/tier; setting one atomically clears the other). Takes effect on the next respawn unless restart:true. Backends without a declared model capability (shell/raw/custom) are rejected; an explicit model flag already in the entry's args is a hard conflict (no automatic rewriting).",
+    "inputSchema": {"type": "object", "properties": {
+        "instance": {"type": "string", "description": "Fleet instance whose entry to update"},
+        "model": {"type": "string", "description": "Concrete model id/alias for the declared backend. Mutually exclusive with tier."},
+        "tier": {"type": "string", "description": "Symbolic key from fleet.yaml model_tiers (e.g. cheap/strong). Mutually exclusive with model."},
+        "restart": {"type": "boolean", "description": "Restart the instance after persisting (default false). A restart failure never rolls back the persisted intent (persisted:true, restart_ok:false)."}
+    }, "required": ["instance"]}})
+}
+
 pub(crate) fn def_restart_instance() -> Value {
     json!({"name": "restart_instance", "description": "Kill and restart an instance. Default mode 'resume' preserves conversation state; 'fresh' starts clean.",
         "inputSchema": {"type": "object", "properties": {
@@ -662,7 +672,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            29,
+            30,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -671,7 +681,8 @@ mod tests {
              (#2548 Wave1-PR1, removed or moved to CLI) = 29; - mode/force_release_worktree \
              (#2548 Wave1-PR2, mode folded into list_instances, force_release_worktree merged \
              into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
-             + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29. \
+             + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
+             + set_model (#2744 PR-A, typed fleet model intent) = 30. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -1164,6 +1175,7 @@ mod tests {
         // fields are not classified here. A NEW tool must be added to EXACTLY ONE
         // of COORDINATION_TOOLS or NON_COORDINATION (drift guard below).
         const NON_COORDINATION: &[&str] = &[
+            "set_model",
             "reply",
             "download_attachment",
             "inbox",

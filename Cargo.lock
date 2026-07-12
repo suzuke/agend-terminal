@@ -47,6 +47,7 @@ dependencies = [
  "png",
  "portable-pty",
  "predicates",
+ "proc-macro2",
  "proptest",
  "ratatui",
  "regex",

@@ -905,6 +905,10 @@ impl FleetConfig {
 #[allow(dead_code)]
 pub struct ResolvedInstance {
     pub name: String,
+    /// #2744: the DECLARED backend identity (instance `backend:` field,
+    /// defaults folded in). Model-capability decisions key off this — never
+    /// off `backend_command`, whose basename can misclassify wrappers.
+    pub backend: Backend,
     pub backend_command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,

@@ -122,11 +122,9 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
     let mut args = resolved.args;
 
     if let Some(ref model) = resolved.model {
-        let model_val = backend::Backend::from_command(&resolved.backend_command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.clone());
-        args.push("--model".to_string());
-        args.push(model_val);
+        // #2744 r1: DECLARED identity + capability gate — never from_command
+        // inference or a blind append.
+        backend::Backend::push_model_arg(&mut args, &resolved.backend, model);
     }
 
     Some((
@@ -143,6 +141,70 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// #2744 r1: the bootstrap spawn path (real entry: `resolve`) routes
+    /// model intent through the Backend::push_model_arg chokepoint keyed on
+    /// the DECLARED backend — no-capability seats never get --model, a
+    /// wrapper command cannot misclassify the declared identity, explicit
+    /// args win (dedupe), and a bare `--` keeps injection in options
+    /// territory.
+    #[test]
+    fn resolve_routes_model_through_capability_chokepoint_2744() {
+        let dir = tmp_dir("model-chokepoint-2744");
+        let yaml = format!(
+            "instances:\n\
+             \x20\x20shell-seat:\n\
+             \x20\x20\x20\x20backend: shell\n\
+             \x20\x20\x20\x20model: legacy\n\
+             \x20\x20\x20\x20working_directory: {d}\n\
+             \x20\x20wrapper-seat:\n\
+             \x20\x20\x20\x20backend: opencode\n\
+             \x20\x20\x20\x20command: /opt/wrap/run-agent\n\
+             \x20\x20\x20\x20model: opus\n\
+             \x20\x20\x20\x20working_directory: {d}\n\
+             \x20\x20dedupe-seat:\n\
+             \x20\x20\x20\x20backend: claude\n\
+             \x20\x20\x20\x20model: fleet-loser\n\
+             \x20\x20\x20\x20args: [\"--model\", \"pinned\"]\n\
+             \x20\x20\x20\x20working_directory: {d}\n\
+             \x20\x20delim-seat:\n\
+             \x20\x20\x20\x20backend: claude\n\
+             \x20\x20\x20\x20model: fleet-model\n\
+             \x20\x20\x20\x20args: [\"--\", \"payload\"]\n\
+             \x20\x20\x20\x20working_directory: {d}\n",
+            d = dir.display()
+        );
+        let config: FleetConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let defs = resolve(&config, &dir, &dir);
+        let args_of = |name: &str| -> Vec<String> {
+            defs.iter()
+                .find(|d| d.0 == name)
+                .unwrap_or_else(|| panic!("{name} must resolve"))
+                .2
+                .clone()
+        };
+        assert!(
+            !args_of("shell-seat").iter().any(|a| a.contains("--model")),
+            "declared shell must never receive --model: {:?}",
+            args_of("shell-seat")
+        );
+        assert_eq!(
+            args_of("wrapper-seat"),
+            vec!["--model", "anthropic/opus"],
+            "declared opencode identity must format the value even under a wrapper command"
+        );
+        assert_eq!(
+            args_of("dedupe-seat"),
+            vec!["--model", "pinned"],
+            "explicit args model must win with no duplicate"
+        );
+        assert_eq!(
+            args_of("delim-seat"),
+            vec!["--model", "fleet-model", "--", "payload"],
+            "injection must land before the bare -- delimiter"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir =
@@ -446,6 +508,7 @@ mod tests {
          -> crate::fleet::ResolvedInstance {
             crate::fleet::ResolvedInstance {
                 name: "t".into(),
+                backend: crate::backend::Backend::ClaudeCode,
                 backend_command: "claude".into(),
                 args: vec![],
                 env: HashMap::new(),
