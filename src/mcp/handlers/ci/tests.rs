@@ -2668,12 +2668,15 @@ fn handle_watch_ci_rejects_invalid_repo_format() {
 /// Minimal ScmProvider stub yielding a stable (head, base) so the P0 exact-head
 /// acquisition passes, letting the force-audit tests below reach the audit path
 /// they exercise. The force path returns at the audit-write failure BEFORE any
-/// merge/recheck, so only `pr_view` is ever called here.
+/// merge/recheck, so only `pr_view` is ever called here. #merge-exact-head r1:
+/// the OIDs MUST be valid FULL 40-hex (`is_full_commit_sha`) — the pre-r1 stub
+/// used non-hex `"h".repeat(40)`, which the tightened identity invariant now
+/// (correctly) fails closed on.
 struct MergeHeadBaseStub;
 impl crate::scm::ScmProvider for MergeHeadBaseStub {
     fn pr_view(&self, _r: &str, _p: u64, _f: &[&str]) -> anyhow::Result<crate::scm::PrSummary> {
         Ok(crate::scm::PrSummary {
-            head_ref_oid: Some("h".repeat(40)),
+            head_ref_oid: Some("a".repeat(40)),
             base_ref_oid: Some("b".repeat(40)),
             ..Default::default()
         })

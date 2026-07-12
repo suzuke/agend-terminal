@@ -99,8 +99,19 @@ fn acquire_head_base(repo: &str, pr: u64) -> Option<(String, String)> {
     let s = crate::scm::make_scm_provider(repo, None)
         .pr_view(repo, pr, &["headRefOid", "baseRefOid"])
         .ok()?;
-    let head = s.head_ref_oid.filter(|x| !x.is_empty())?;
-    let base = s.base_ref_oid.filter(|x| !x.is_empty())?;
+    // Fail closed unless BOTH are FULL commit OIDs (40/64-hex). Non-empty is not
+    // a commit-identity invariant: an abbreviated/non-hex head would reach
+    // `--match-head-commit` ambiguously, and a malformed base returned identically
+    // across the gate+recheck reads would falsely satisfy the exact-base identity
+    // check. Reuses the canonical `is_full_commit_sha` (the same invariant that
+    // guards exact-head CI watches) so both acquire sites (gate + pre-merge
+    // recheck) and both paths (incl. force) enforce one unambiguous identity.
+    let head = s
+        .head_ref_oid
+        .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
+    let base = s
+        .base_ref_oid
+        .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
     Some((head, base))
 }
 

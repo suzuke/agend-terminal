@@ -296,7 +296,10 @@ fn assert_identity_refused(
     mock.bases = vec![base];
     let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
     let r = super::handle_merge_repo(&home, &args, "dev");
-    assert!(refused(&r), "{tag}: malformed identity must REFUSE, got: {r}");
+    assert!(
+        refused(&r),
+        "{tag}: malformed identity must REFUSE, got: {r}"
+    );
     assert!(
         recorded.lock().unwrap().is_none(),
         "{tag}: pr_merge must NOT run on a malformed identity"
