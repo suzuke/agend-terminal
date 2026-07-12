@@ -765,13 +765,14 @@ fn handle_session(
             )
         };
 
-        // #2453 R2 P0-1: a response that armed the post-flush slot is a DEFERRED-COMMIT
-        // response (app restart `prepared`) whose real commit is gated on the ack below
-        // and whose idempotence authority is the AppRestartGate, NOT this cache. Evict
-        // its request_id so a retry re-invokes the handler instead of observing a cached
-        // `prepared` that a failed flush would make a lie. Non-deferred responses (slot
-        // unarmed) stay cached exactly as before.
-        maybe_evict_deferred_commit(request_id, &post_flush, request_dedup::global());
+        // #2453 R2 P0: a NON-CACHEABLE app-restart response (the handler marked it, or it
+        // armed the post-flush slot) reflects momentary AppRestartGate state — prepared /
+        // retryable in_progress loser / aborted / timed-out. The gate, NOT this cache, is
+        // the idempotence authority, so evict its request_id: a same-id retry must re-enter
+        // the handler and be judged against CURRENT gate state, never served a stale
+        // transient (e.g. a cached in_progress after the winner aborted → the retry would
+        // never re-enter the now-Serving gate). Ordinary responses stay cached as before.
+        maybe_evict_noncacheable_restart(request_id, &post_flush, request_dedup::global());
         // #2453 R2 flush barrier: write+flush THIS response, then run any registered
         // post-flush action with whether BOTH succeeded. On success the restart ack
         // fires (→ the TUI commits + re-execs); on any failure the action is dropped
@@ -784,22 +785,22 @@ fn handle_session(
     }
 }
 
-/// #2453 R2 P0-1: a response that armed the per-request post-flush slot is a
-/// DEFERRED-COMMIT response — its side effect (app restart re-exec) commits only
-/// after this reply flushes, and the [`crate::api::app_restart::AppRestartGate`],
-/// not the dedup cache, is its idempotence authority. Such a response must NOT stay
-/// dedup-cached: a failed flush drops the restart while the cache would keep
-/// `{ok:true,restart:prepared}`, so a retry with the same request_id would return a
-/// cached `prepared` with no restart. Evict it here so the retry re-invokes the
-/// handler and the gate decides. Non-deferred responses (slot unarmed) are left
-/// cached exactly as before. Cross-platform (Windows fail-closes at the handler, so
-/// the slot is never armed there and this is a no-op).
-fn maybe_evict_deferred_commit(
+/// #2453 R2 P0: evict the dedup entry for a NON-CACHEABLE app-restart response. Every
+/// gate-dependent response the app-restart handler produces — `prepared` (armed),
+/// retryable `in_progress` (CAS loser), `aborted`, `timed-out` — reflects momentary
+/// [`crate::api::app_restart::AppRestartGate`] state, and the gate (not this cache) is
+/// the idempotence authority. Caching any of them would let a later same-id retry observe
+/// a stale transient — e.g. a cached `in_progress` after the winner aborted would wedge
+/// retry-after-abort, never re-entering the now-`Serving` gate. Evicting makes every
+/// same-id restart_daemon call re-enter the handler → the gate judges from CURRENT state.
+/// Ordinary responses (slot neither marked nor armed) stay cached. Cross-platform (Windows
+/// fail-closes at the handler → the slot is never marked/armed there → no-op).
+fn maybe_evict_noncacheable_restart(
     request_id: Option<&str>,
     post_flush: &crate::api::app_restart::PostFlushSlot,
     cache: &request_dedup::DedupCache,
 ) {
-    if post_flush.is_armed() {
+    if post_flush.is_non_cacheable() {
         if let Some(id) = request_id.filter(|s| !s.is_empty()) {
             cache.evict(id);
         }
@@ -975,47 +976,53 @@ fn api_call_read_timeout() -> std::time::Duration {
 mod tests {
     use super::*;
 
-    /// #2453 R2 P0-1 seam: `maybe_evict_deferred_commit` — the handle_session
-    /// post-flush step — evicts the request_id ONLY when the post-flush slot is
-    /// armed (a deferred-commit `prepared` response), and leaves an ordinary
-    /// (unarmed) response cached. RED with the no-op `evict` (armed id stays cached
-    /// → the retry does not re-run); GREEN once `evict` removes the entry.
+    /// #2453 R2 P0 seam: `maybe_evict_noncacheable_restart` — the handle_session
+    /// post-flush step — evicts the request_id when the post-flush slot is either
+    /// ARMED (a `prepared` response) OR MARKED non-cacheable (a transient loser /
+    /// abort / timeout), and leaves an ordinary (neither) response cached.
     #[test]
-    fn maybe_evict_deferred_commit_evicts_only_when_armed() {
+    fn maybe_evict_noncacheable_restart_evicts_armed_and_marked_only() {
         use crate::api::app_restart::PostFlushSlot;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let fp =
             request_dedup::operation_fingerprint("mcp_tool", &json!({"tool": "restart_daemon"}));
 
-        // Armed slot ⇒ the id is evicted → a retry re-invokes the handler.
-        let cache = request_dedup::DedupCache::default();
-        cache.dispatch(
-            Some("armed"),
-            fp,
-            std::time::Duration::from_secs(5),
-            || json!({"ok": true, "restart": "prepared"}),
-        );
-        let armed = PostFlushSlot::new();
-        assert!(armed.register(Box::new(|| {})));
-        maybe_evict_deferred_commit(Some("armed"), &armed, &cache);
-        let reran = Arc::new(AtomicBool::new(false));
-        let rr = Arc::clone(&reran);
-        cache.dispatch(
-            Some("armed"),
-            fp,
-            std::time::Duration::from_secs(5),
-            move || {
+        // Assert a retry re-runs the handler after `slot` (set up by `arm`) is evicted.
+        fn evict_then_retry_reruns(fp: u64, id: &str, arm: impl FnOnce(&PostFlushSlot)) -> bool {
+            let cache = request_dedup::DedupCache::default();
+            cache.dispatch(
+                Some(id),
+                fp,
+                std::time::Duration::from_secs(5),
+                || json!({"ok": true, "restart": "prepared"}),
+            );
+            let slot = PostFlushSlot::new();
+            arm(&slot);
+            maybe_evict_noncacheable_restart(Some(id), &slot, &cache);
+            let reran = Arc::new(AtomicBool::new(false));
+            let rr = Arc::clone(&reran);
+            cache.dispatch(Some(id), fp, std::time::Duration::from_secs(5), move || {
                 rr.store(true, Ordering::SeqCst);
                 json!({"ok": false})
-            },
-        );
+            });
+            reran.load(Ordering::SeqCst)
+        }
+
+        // ARMED (prepared) ⇒ evicted → retry re-runs.
         assert!(
-            reran.load(Ordering::SeqCst),
-            "an armed (deferred-commit) response must be evicted so the retry re-runs"
+            evict_then_retry_reruns(fp, "armed", |s| {
+                assert!(s.register(Box::new(|| {})));
+            }),
+            "an armed (prepared) response must be evicted so the retry re-runs"
+        );
+        // MARKED non-cacheable (transient loser/abort/timeout, NOT armed) ⇒ evicted too.
+        assert!(
+            evict_then_retry_reruns(fp, "marked", |s| s.mark_non_cacheable()),
+            "a marked (transient) restart response must be evicted so the retry re-runs"
         );
 
-        // Unarmed slot ⇒ an ordinary response stays cached (the retry does NOT re-run).
+        // Neither armed nor marked ⇒ an ordinary response stays cached (retry must NOT re-run).
         let cache2 = request_dedup::DedupCache::default();
         cache2.dispatch(
             Some("plain"),
@@ -1024,7 +1031,7 @@ mod tests {
             || json!({"ok": true, "n": 1}),
         );
         let unarmed = PostFlushSlot::new();
-        maybe_evict_deferred_commit(Some("plain"), &unarmed, &cache2);
+        maybe_evict_noncacheable_restart(Some("plain"), &unarmed, &cache2);
         let reran2 = Arc::new(AtomicBool::new(false));
         let rr2 = Arc::clone(&reran2);
         let cached = cache2.dispatch(

@@ -1270,10 +1270,10 @@ mod tests {
         });
         assert_eq!(r1["restart"], "prepared");
 
-        // handle_session's P0-1 step: an armed post-flush slot ⇒ evict this id.
+        // handle_session's P0 step: a non-cacheable (armed `prepared`) response ⇒ evict.
         assert!(
-            slot.is_armed(),
-            "the prepared response armed the post-flush slot"
+            slot.is_non_cacheable(),
+            "the prepared response is non-cacheable (armed the post-flush slot)"
         );
         cache.evict("R");
         // The flush FAILED → the restart is dropped (the action is run un-successfully).

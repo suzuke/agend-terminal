@@ -126,6 +126,101 @@ mod app_restart_strategy_tests {
         assert_eq!(resp["restart"], "prepared");
     }
 
+    /// #2453 R2 P0 (codex R4) — the INTEGRATED dedup + handler + gate composition. A
+    /// transient CAS-loser (`in_progress` retryable) response must NOT remain dedup-
+    /// cached: else, after the winner aborts, a same-id retry is served the stale loser
+    /// and never re-enters the now-`Serving` gate (retry-after-abort broken at the real
+    /// boundary — the separate handler-only and prepared-only tests miss this interleave).
+    /// Drives the REAL `DedupCache` + real `handle_restart_daemon` App arm + shared gate,
+    /// simulating `handle_session`'s dispatch→(evict if non-cacheable) step for each
+    /// same-request-id call. RED while the loser stays cacheable; GREEN once the handler
+    /// marks every gate-dependent response non-cacheable.
+    #[test]
+    fn retry_after_abort_not_wedged_by_cached_transient_loser() {
+        use crate::api::request_dedup::{operation_fingerprint, DedupCache};
+
+        let cache = DedupCache::default();
+        let gate = AppRestartGate::new();
+        let (tx, rx) = crossbeam_channel::bounded::<AppRestartRequest>(1);
+        let ar = AppRestart {
+            tx,
+            gate: gate.clone(),
+        };
+        let fp = operation_fingerprint("mcp_tool", &json!({"tool": "restart_daemon"}));
+
+        // One restart_daemon call for request_id "X" through dedup + the real handler +
+        // handle_session's post-flush eviction. Returns (response, this request's slot).
+        let call = |cache: &DedupCache, ar: &AppRestart| -> (serde_json::Value, PostFlushSlot) {
+            let slot = PostFlushSlot::new();
+            let ar_c = ar.clone();
+            let slot_c = slot.clone();
+            let resp = cache.dispatch(Some("X"), fp, Duration::from_secs(5), || {
+                handle_restart_daemon(
+                    Path::new("/tmp"),
+                    Some(RestartCapability::App),
+                    Some(ar_c),
+                    Some(slot_c),
+                )
+            });
+            // handle_session's step: evict a non-cacheable restart response.
+            if slot.is_non_cacheable() {
+                cache.evict("X");
+            }
+            (resp, slot)
+        };
+
+        // 1. Winner: a stub TUI replies Prepared → handler returns `prepared` + arms slot;
+        //    handle_session evicts X.
+        let rx1 = rx.clone();
+        let stub = std::thread::spawn(move || {
+            let req = rx1
+                .recv_timeout(Duration::from_secs(2))
+                .expect("winner request delivered");
+            req.reply
+                .send(AppRestartVerdict::Prepared)
+                .expect("winner verdict sent");
+            req // hold the request (its flush_ack) alive across the abort below
+        });
+        let (r1, slot1) = call(&cache, &ar);
+        let winner_req = stub.join().expect("winner stub joined");
+        assert_eq!(r1["restart"], "prepared");
+        assert!(!gate.is_serving(), "the winner holds Probing");
+
+        // 2. Retry X while the winner still holds Probing → transient loser (in_progress).
+        //    handle_session must ALSO evict this (the bug: it stayed cached).
+        let (r2, _slot2) = call(&cache, &ar);
+        assert_eq!(r2["restart"], "in_progress");
+        assert_eq!(r2["retryable"], true);
+
+        // 3. Winner's flush fails (or the watchdog fires) → the ack drops and the TUI
+        //    rolls the gate back to Serving.
+        slot1.run_after_flush(false);
+        gate.abort_to_serving();
+        drop(winner_req);
+        assert!(
+            gate.is_serving(),
+            "the gate rolled back after the winner aborted"
+        );
+
+        // 4. Third retry X: MUST re-enter the now-Serving gate and WIN a fresh restart —
+        //    NOT be served the cached transient `in_progress` from step 2.
+        let rx3 = rx.clone();
+        let stub3 = std::thread::spawn(move || {
+            let req = rx3
+                .recv_timeout(Duration::from_secs(2))
+                .expect("retry request delivered");
+            req.reply
+                .send(AppRestartVerdict::Prepared)
+                .expect("retry verdict sent");
+        });
+        let (r3, _slot3) = call(&cache, &ar);
+        stub3.join().expect("retry stub joined");
+        assert_eq!(
+            r3["restart"], "prepared",
+            "retry after abort must win a FRESH restart, not the cached transient loser"
+        );
+    }
+
     /// Happy path: the stub loop replies `Prepared`; the handler REGISTERS a
     /// post-flush ack into the slot and returns ok:true restart:"prepared" (an honest
     /// indeterminate attempt — the commit happens only after the transport ack, so the

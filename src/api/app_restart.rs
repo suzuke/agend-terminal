@@ -65,6 +65,15 @@ pub struct PostFlushSlot(Arc<Mutex<PostFlushState>>);
 struct PostFlushState {
     action: Option<AfterFlushAction>,
     closed: bool,
+    /// #2453 R2 P0: set by the app-restart handler on EVERY gate-dependent response
+    /// (prepared / retryable in_progress loser / aborted / timed-out) so `handle_session`
+    /// evicts this request_id from the dedup cache. These responses reflect MOMENTARY
+    /// gate state, so caching any of them would let a later same-id retry observe a
+    /// stale transient (e.g. a cached `in_progress` after the winner aborted → the retry
+    /// never re-enters the now-`Serving` gate). The gate — not the cache — is the
+    /// idempotence authority. An armed slot (a registered `prepared` action) also implies
+    /// non-cacheable, independent of this flag.
+    non_cacheable: bool,
 }
 
 impl PostFlushSlot {
@@ -106,18 +115,25 @@ impl PostFlushSlot {
         // else: `action` drops here un-run → sender drops → TUI flush_ack disconnects.
     }
 
-    /// #2453 R2 P0-1: peek whether an action is registered and the slot is still
-    /// OPEN (not yet processed). `handle_session` calls this AFTER dispatch to
-    /// detect a DEFERRED-COMMIT response — one whose side effect (the app re-exec)
-    /// commits only after this reply flushes, gated by the [`AppRestartGate`], not
-    /// the dedup cache. Such a response must be evicted from the dedup cache so a
-    /// retry re-invokes the handler (a failed flush drops the restart but would
-    /// leave a cached `restart:prepared` that lies about a restart to the retry).
-    /// Non-consuming: this only inspects, so the subsequent
-    /// [`PostFlushSlot::run_after_flush`] still runs the action.
-    pub fn is_armed(&self) -> bool {
+    /// #2453 R2 P0: mark THIS response non-cacheable. The app-restart handler calls
+    /// this on every gate-dependent path (prepared / retryable in_progress loser /
+    /// aborted / timed-out) so a same-id retry always re-enters the handler and the
+    /// [`AppRestartGate`] decides from CURRENT state — closing the "cached transient
+    /// loser wedges retry-after-abort" composition hole. Idempotent.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn mark_non_cacheable(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .non_cacheable = true;
+    }
+
+    /// #2453 R2 P0: whether `handle_session` must evict this request_id from the dedup
+    /// cache. True when the handler marked the response non-cacheable OR the slot is
+    /// armed (a registered `prepared` action is inherently non-cacheable). Non-consuming.
+    pub fn is_non_cacheable(&self) -> bool {
         let st = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        !st.closed && st.action.is_some()
+        st.non_cacheable || (!st.closed && st.action.is_some())
     }
 }
 

@@ -56,6 +56,13 @@ fn app_restart_strategy(
     let Some(slot) = post_flush else {
         return app_no_channel_fail_closed();
     };
+    // #2453 R2 P0 (codex R4): EVERY response from here on reflects momentary gate state
+    // (prepared / retryable in_progress loser / aborted / timed-out), so mark this
+    // request's response NON-CACHEABLE up front. `handle_session` then evicts the
+    // request_id on ALL of these paths — the AppRestartGate, not the dedup cache, is the
+    // idempotence authority. Without this, a cached transient loser would wedge a same-id
+    // retry after the winner aborts (it would never re-enter the now-Serving gate).
+    slot.mark_non_cacheable();
     // Genuine CAS claim: only one concurrent worker enters Probing.
     if !ar.gate.try_begin_probe() {
         // P0 (immediate-retry-before-abort): a CAS loser is NOT a success. The in-flight
