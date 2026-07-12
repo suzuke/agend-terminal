@@ -1303,20 +1303,25 @@ pub(crate) fn clear_nested_refusal_marker(home: &Path, wt_path: &Path) {
     let key = hash_hex(&wt_path);
     let marker_path = dir.join(&key);
     let lock_path = dir.join(format!("{key}.lock"));
-    // P2 (codex R2): remove ONLY the marker, under the SAME per-worktree lock a
-    // concurrent notice takes — so clearing can't race a mid-flight enqueue/marker
-    // update. NEVER unlink the `.lock` inode: flock is per-inode, so a fresh inode
-    // is a fresh (useless) lock, silently breaking serialization for anyone still
-    // holding the old one. Keep it durable. If the lock can't be acquired, remove
-    // the marker best-effort anyway (idempotent) but still leave the `.lock` alone.
-    match crate::store::acquire_file_lock(&lock_path) {
-        Ok(_guard) => {
+    // P2 (codex R2 + R3): remove the marker ONLY while HOLDING the same
+    // per-worktree lock a concurrent notice takes. NON-BLOCKING (`try_`) so that if
+    // a notice is mid-flight (lock held elsewhere) we FAIL SAFE — leave the marker
+    // untouched and return; unlinking it here would delete a marker the in-flight
+    // notifier still owns, re-opening the cleanup-vs-notify race. A later
+    // lock-owning cleanup (or the next release) removes it. NEVER remove the marker
+    // without the lock, and NEVER unlink the `.lock` inode (flock is per-inode; a
+    // fresh inode is a fresh useless lock that silently breaks serialization).
+    match crate::store::try_acquire_file_lock(&lock_path) {
+        Ok(Some(_guard)) => {
             let _ = std::fs::remove_file(&marker_path);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "clear nested refusal marker: lock held by an in-flight notice — leaving marker (fail-safe)");
         }
         Err(e) => {
             tracing::warn!(error = %e,
-                "clear nested refusal marker: lock acquire failed — removing marker best-effort, keeping .lock");
-            let _ = std::fs::remove_file(&marker_path);
+                "clear nested refusal marker: could not open lock — leaving marker untouched (fail-safe)");
         }
     }
 }
@@ -2717,6 +2722,46 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&wt).ok();
+    }
+
+    /// P2 (codex R3): cleanup must NEVER remove the marker without HOLDING the
+    /// per-worktree lock. While an in-flight notice holds the lock,
+    /// `clear_nested_refusal_marker` must FAIL SAFE (leave the marker); the marker
+    /// is only removed by a later cleanup that actually owns the lock.
+    #[cfg(unix)]
+    #[test]
+    fn clear_nested_refusal_marker_fails_safe_while_lock_held() {
+        let home = tmp_home("clear-contended");
+        let wt = home.join("wt-contended");
+        let dir = refusal_marker_dir(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = hash_hex(&wt);
+        let marker = dir.join(&key);
+        let lock = dir.join(format!("{key}.lock"));
+        std::fs::write(&marker, b"h").unwrap();
+
+        // An in-flight notice holds the per-worktree lock.
+        let held = crate::store::acquire_file_lock(&lock).expect("hold lock");
+        // Cleanup while the lock is held elsewhere MUST leave the marker (fail-safe),
+        // and must never block (non-blocking try-lock).
+        clear_nested_refusal_marker(&home, &wt);
+        assert!(
+            marker.exists(),
+            "cleanup must NOT remove the marker while the lock is held elsewhere (fail-safe)"
+        );
+        // The `.lock` inode is untouched either way.
+        assert!(lock.exists(), "the .lock inode must remain durable");
+
+        // Once the lock frees, a later lock-owning cleanup removes the marker.
+        drop(held);
+        clear_nested_refusal_marker(&home, &wt);
+        assert!(
+            !marker.exists(),
+            "a later cleanup that owns the lock removes the marker"
+        );
+        assert!(lock.exists(), "the .lock inode is never unlinked");
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// Bug1 middle fallback: no caller but the agent belongs to a team → route to
