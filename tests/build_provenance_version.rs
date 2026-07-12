@@ -129,14 +129,29 @@ fn mcp_version_shapes() {
 
 // ---- git probe on scratch repos (worktree / detached / dirty / no-git) ----
 
+/// In a fleet-agent shell, `git` on PATH is the agend-git shim, whose
+/// ChdirPass redirects agent git calls onto the daemon-bound worktree — a
+/// scratch-repo `rev-parse` would silently answer for the WRONG repo (the
+/// CLAUDE.md lesson-10.7 class). Test-fixture children therefore set both
+/// bypass env twins so the shim execs real git honoring the scratch cwd —
+/// the established pattern of `vendor/agentic-git`'s own test suite, NOT a
+/// §3.19.1 deny-escape (read-only fixtures in isolated temp dirs). Inert
+/// where the shim is absent (CI, operator shells). Process-wide because the
+/// production `git_probe` under test spawns git itself (inheriting env).
+fn isolate_from_git_shim() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("AGEND_GIT_BYPASS", "1");
+        std::env::set_var("AGENTIC_GIT_BYPASS", "1");
+    });
+}
+
 /// Scratch repo helper: fully isolated from user/system git config and from
 /// any daemon-bound worktree (cwd is always the scratch dir — never a
-/// canonical-rooted path, so the agend-git shim pass-through is inert).
+/// canonical-rooted path).
 fn scratch_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "agend-provenance-{}-{tag}",
-        std::process::id()
-    ));
+    isolate_from_git_shim(); // every git-touching test builds a scratch dir first
+    let d = std::env::temp_dir().join(format!("agend-provenance-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -238,7 +253,10 @@ fn rerun_paths_exist_and_cover_head_in_normal_repo() {
         "a git repo must yield at least the HEAD trigger"
     );
     for p in &paths {
-        assert!(p.exists(), "trigger path must exist (else cargo re-runs every build): {p:?}");
+        assert!(
+            p.exists(),
+            "trigger path must exist (else cargo re-runs every build): {p:?}"
+        );
     }
     assert!(
         paths.iter().any(|p| p.ends_with("HEAD")),
@@ -283,18 +301,36 @@ fn rerun_paths_empty_outside_any_repo() {
 
 // ---- baked build-time envs (option_env! so the RED tree compiles) ----
 
+/// RED-compilable required-env accessor: `option_env!` keeps the RED tree
+/// compiling (the env doesn't exist until GREEN's build.rs emits it) and the
+/// runtime panic makes the RED failure a test FAILURE, not a build error.
+/// A plain `option_env!(..).expect(..)` would trip the deny-by-default
+/// `clippy::option_env_unwrap`; routing through a fn keeps the identical
+/// semantics without the linted adjacency.
+#[track_caller]
+fn required_env(value: Option<&'static str>, what: &str) -> &'static str {
+    match value {
+        Some(v) => v,
+        None => panic!("build.rs must emit {what}"),
+    }
+}
+
 #[test]
 fn baked_identity_envs_present_and_well_formed() {
-    let sha = option_env!("AGEND_BUILD_SHA")
-        .expect("build.rs must emit AGEND_BUILD_SHA (sha | unknown)");
+    let sha = required_env(
+        option_env!("AGEND_BUILD_SHA"),
+        "AGEND_BUILD_SHA (sha | unknown)",
+    );
     assert!(
         sha == "unknown" || valid_full_sha(sha),
         "AGEND_BUILD_SHA must be a full lowercase hex SHA or 'unknown': {sha}"
     );
     assert_eq!(sha, sha.to_lowercase(), "baked SHA must be lowercase");
-    let dirty = option_env!("AGEND_BUILD_DIRTY")
-        .expect("build.rs must emit AGEND_BUILD_DIRTY (0|1)");
-    assert!(dirty == "0" || dirty == "1", "AGEND_BUILD_DIRTY ∈ {{0,1}}: {dirty}");
+    let dirty = required_env(option_env!("AGEND_BUILD_DIRTY"), "AGEND_BUILD_DIRTY (0|1)");
+    assert!(
+        dirty == "0" || dirty == "1",
+        "AGEND_BUILD_DIRTY ∈ {{0,1}}: {dirty}"
+    );
     if sha == "unknown" {
         assert_eq!(dirty, "0", "unknown identity is never dirty");
     }
@@ -302,16 +338,16 @@ fn baked_identity_envs_present_and_well_formed() {
 
 #[test]
 fn baked_surface_envs_match_composition() {
-    let sha = option_env!("AGEND_BUILD_SHA").expect("AGEND_BUILD_SHA");
-    let dirty = option_env!("AGEND_BUILD_DIRTY").expect("AGEND_BUILD_DIRTY") == "1";
+    let sha = required_env(option_env!("AGEND_BUILD_SHA"), "AGEND_BUILD_SHA");
+    let dirty = required_env(option_env!("AGEND_BUILD_DIRTY"), "AGEND_BUILD_DIRTY") == "1";
     let semver = env!("CARGO_PKG_VERSION");
     assert_eq!(
-        option_env!("AGEND_CLI_VERSION").expect("build.rs must emit AGEND_CLI_VERSION"),
+        required_env(option_env!("AGEND_CLI_VERSION"), "AGEND_CLI_VERSION"),
         compose_cli_version(semver, sha, dirty),
         "baked CLI version must equal the canonical composition"
     );
     assert_eq!(
-        option_env!("AGEND_MCP_VERSION").expect("build.rs must emit AGEND_MCP_VERSION"),
+        required_env(option_env!("AGEND_MCP_VERSION"), "AGEND_MCP_VERSION"),
         compose_mcp_version(semver, sha, dirty),
         "baked MCP version must equal the canonical composition"
     );
