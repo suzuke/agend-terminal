@@ -229,6 +229,8 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             admin: true,
             squash: true,
             delete_branch: true,
+            // RED scaffold: field present but unpinned; GREEN populates it.
+            expected_head_sha: None,
         },
     ) {
         // #1467: `gh pr merge` exit 0 is NECESSARY but not SUFFICIENT — a

@@ -41,6 +41,11 @@ pub(crate) struct PrSummary {
     pub author_login: Option<String>,
     pub head_ref: Option<String>,
     pub head_ref_oid: Option<String>,
+    /// P0 exact-head: the base branch's CURRENT tip OID (GitHub `baseRefOid`,
+    /// which advances as the base branch moves). Compared gate-vs-pre-merge to
+    /// detect a base advance by exact identity — `mergeStateStatus` is derived +
+    /// laggy and cannot prove `initial base == pre-merge base`.
+    pub base_ref_oid: Option<String>,
     /// #1750-B4: GitHub's `isCrossRepository` — true when the PR's head branch
     /// lives in a FORK, not the base repo. A cross-repo head_ref can collide
     /// with a base-repo branch name, so remote-orphan GC must never treat it as
@@ -90,6 +95,12 @@ pub(crate) struct MergeOpts {
     pub admin: bool,
     pub squash: bool,
     pub delete_branch: bool,
+    /// P0 exact-head precondition (#merge-exact-head): when `Some`, the merge is
+    /// pinned to this exact full commit SHA — GitHub's `--match-head-commit` (gh
+    /// ≥2.92) makes the merge FAIL if the PR head has moved, closing the residual
+    /// gate→write window. `None` = unpinned (legacy). The GitHub argv emits
+    /// `--match-head-commit <sha>` iff `Some`.
+    pub expected_head_sha: Option<String>,
 }
 
 /// Result of [`ScmProvider::pr_merge`]. `Submitted` means `gh pr merge`
@@ -300,6 +311,7 @@ fn parse_pr_summary(v: &Value) -> PrSummary {
         author_login: v["author"]["login"].as_str().map(String::from),
         head_ref: v["headRefName"].as_str().map(String::from),
         head_ref_oid: v["headRefOid"].as_str().map(String::from),
+        base_ref_oid: v["baseRefOid"].as_str().map(String::from),
         is_cross_repository: v["isCrossRepository"].as_bool(),
         is_draft: v["isDraft"].as_bool(),
         merged_at: nonempty("mergedAt"),
@@ -934,6 +946,7 @@ mod tests {
                     admin: true,
                     squash: true,
                     delete_branch: true,
+                    expected_head_sha: None,
                 }
             ),
             vec![
