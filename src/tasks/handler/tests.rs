@@ -1249,3 +1249,57 @@ fn update_with_no_supported_fields_errors() {
         "an update with no updatable field must fail loudly, not report success: {resp}"
     );
 }
+
+/// Review correction (#task-result-rca): an update with an UNKNOWN status string
+/// must fail loud, not silently no-op / report "unchanged".
+#[test]
+fn update_unknown_status_errors() {
+    let home = tmp_home("bad-status");
+    create_task(&home, "t-bs");
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-bs", "status": "foo"}),
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "unknown status must error, not unchanged/updated: {resp}"
+    );
+}
+
+/// Review correction: `verified` is produced by the reviewer verdict path, not an
+/// operator update — `update(status=verified)` must error (never invent a verdict).
+#[test]
+fn update_status_verified_is_rejected() {
+    let home = tmp_home("verified");
+    create_task(&home, "t-vf");
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-vf", "status": "verified"}),
+    );
+    // Must be the ACTIONABLE verdict-path error — not the generic illegal_transition
+    // that `open → verified` happens to raise. (codex review: "do not invent a
+    // verdict — direct callers to the review/verdict path".)
+    assert_eq!(
+        resp["code"], "unsupported_status_transition",
+        "status=verified must return the actionable verdict-path error: {resp}"
+    );
+}
+
+/// Review correction: a non-string `result` must fail loud, not be silently
+/// ignored and reported as "unchanged".
+#[test]
+fn update_non_string_result_errors() {
+    let home = tmp_home("bad-result");
+    create_task(&home, "t-br");
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-br", "result": 123}),
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "non-string result must fail loud, not unchanged/updated: {resp}"
+    );
+}
