@@ -71,13 +71,20 @@ pub(crate) mod test_sync {
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, LazyLock, Mutex};
 
     /// Home-scoped `(generation, barrier)` entries. `cargo test` runs tests as
     /// threads in one process, so unrelated temp homes must never share a
     /// rendezvous. The process-global generation still lets a reused runner
     /// thread distinguish a fresh arming from one it already crossed.
-    type GateEntry = (u64, Arc<Barrier>);
+    /// `(generation, barrier, entered)` — `entered` counts threads that have
+    /// ENTERED this arming's barrier wait (incremented immediately before
+    /// `Barrier::wait`). Fresh per `arm()`, so observations can never read a
+    /// previous arming's residue. Lets tests PROVE a foreign waiter exists
+    /// (2758 review: outcome inference by wall-clock is banned — a cleanup
+    /// party may only be spawned after `entered_count` proves a waiter).
+    type GateEntry = (u64, Arc<Barrier>, Arc<AtomicUsize>);
     type GateMap = HashMap<PathBuf, GateEntry>;
     static GATE: LazyLock<Mutex<GateMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     static NEXT_GEN: Mutex<u64> = Mutex::new(1);
@@ -98,7 +105,7 @@ pub(crate) mod test_sync {
     impl Drop for GateGuard {
         fn drop(&mut self) {
             let mut gate = GATE.lock().expect("gate lock");
-            if gate.get(&self.0).is_some_and(|(gen, _)| *gen == self.1) {
+            if gate.get(&self.0).is_some_and(|(gen, ..)| *gen == self.1) {
                 gate.remove(&self.0);
             }
         }
@@ -109,26 +116,42 @@ pub(crate) mod test_sync {
         let gen = *next;
         *next += 1;
         let home = home.to_path_buf();
-        GATE.lock()
-            .expect("gate lock")
-            .insert(home.clone(), (gen, Arc::new(Barrier::new(parties))));
+        GATE.lock().expect("gate lock").insert(
+            home.clone(),
+            (
+                gen,
+                Arc::new(Barrier::new(parties)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
         GateGuard(home, gen)
     }
 
     /// Test-only observation for the overlap regression.
     pub fn armed_gen(home: &Path) -> Option<u64> {
-        GATE.lock().expect("gate lock").get(home).map(|(g, _)| *g)
+        GATE.lock().expect("gate lock").get(home).map(|(g, ..)| *g)
     }
 
     pub fn wait_if_armed(home: &Path) {
         let gate = GATE.lock().expect("gate lock").get(home).cloned();
-        if let Some((gen, b)) = gate {
+        if let Some((gen, b, entered)) = gate {
             if WAITED_GEN.with(Cell::get) == gen {
                 return; // this thread already rendezvoused this generation
             }
             WAITED_GEN.with(|w| w.set(gen));
+            entered.fetch_add(1, Ordering::SeqCst);
             b.wait();
         }
+    }
+
+    /// How many threads have entered the CURRENT arming's barrier wait for
+    /// `home` (None = unarmed). Proof channel for tests: a releasing cleanup
+    /// party may only be spawned once this shows a real waiter.
+    pub(crate) fn entered_count(home: &Path) -> Option<usize> {
+        GATE.lock()
+            .expect("gate lock")
+            .get(home)
+            .map(|(_, _, entered)| entered.load(Ordering::SeqCst))
     }
 }
 
@@ -395,8 +418,14 @@ mod tests {
 
     /// Coverage runs the bin's unit tests as peer threads in one process. An
     /// armed rendezvous for one board must not capture an unrelated board's
-    /// update. The timeout cleanup deliberately supplies the missing home-A
-    /// party before joining, so the RED leaves no parked thread behind.
+    /// update. Outcome detection is PROOF-DRIVEN (2758 review correction):
+    /// either home-B completes (green) or `entered_count(home_a)` shows B
+    /// parked in home-A's barrier (the old-global-gate capture, red) — never
+    /// inferred from wall-clock. The releasing cleanup party is spawned ONLY
+    /// after the waiter is proven, so a merely-SLOW home-B can never send a
+    /// sole party into the armed Barrier(2) (the green-path hang this
+    /// replaces). The 10s deadline is a fail-loud bound for a third unknown
+    /// state — it never selects between outcomes.
     #[test]
     fn armed_home_does_not_block_other_home() {
         let home_a = tmp_home("gate-home-a");
@@ -413,10 +442,26 @@ mod tests {
             result
         });
 
-        let completed_without_home_a = done_rx
-            .recv_timeout(std::time::Duration::from_millis(250))
-            .is_ok();
-        if !completed_without_home_a {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let captured = loop {
+            if done_rx.try_recv().is_ok() {
+                break false; // green: B finished without touching home-A's gate
+            }
+            let entered = test_sync::entered_count(&home_a).unwrap_or(0);
+            if entered == 1 {
+                break true; // red-proof: B is parked in home-A's barrier
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "third-state hang: home-B neither completed nor entered \
+                 home-A's gate within 10s (done=false, entered={entered})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if captured {
+            // Exactly one proven waiter exists → supplying the missing
+            // home-A party is GUARANTEED to complete the Barrier(2); both
+            // joins below are bounded.
             let a_home = home_a.clone();
             let a = std::thread::spawn(move || {
                 upsert_system_hygiene_task(&a_home, "a", "a", ev("cleanup-a"))
@@ -427,10 +472,34 @@ mod tests {
         drop(gate);
 
         assert!(
-            completed_without_home_a,
+            !captured,
             "a gate armed for home A must not capture an update for home B"
         );
         assert!(matches!(b_result, HygieneUpsert::Updated(_)));
+    }
+
+    /// 2758 review pin: each `arm()` gets a FRESH entered counter — a new
+    /// arming can never read a previous arming's waiter count.
+    #[test]
+    fn entered_counter_is_fresh_per_arm() {
+        let home = tmp_home("entered-fresh");
+        upsert_system_hygiene_task(&home, "k", "t", ev("seed")).unwrap();
+        let gate = test_sync::arm(&home, 1); // 1 party: wait returns instantly
+        assert_eq!(test_sync::entered_count(&home), Some(0));
+        let h = home.clone();
+        std::thread::spawn(move || upsert_system_hygiene_task(&h, "k", "t", ev("bump")))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(test_sync::entered_count(&home), Some(1));
+        drop(gate);
+        let gate2 = test_sync::arm(&home, 1);
+        assert_eq!(
+            test_sync::entered_count(&home),
+            Some(0),
+            "re-arm must start a fresh counter"
+        );
+        drop(gate2);
     }
 
     /// r2 (§3.20 deterministic RED): force the exact stale-probe interleaving
