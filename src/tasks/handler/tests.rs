@@ -1108,3 +1108,130 @@ fn plan_ack_idempotent_reack_does_not_double_count_2249() {
     assert_eq!(second["already_acked"], true);
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── Result / depends_on update semantics (spike t-…19288-1, fix t-…46182-4) ──
+
+fn task_result(home: &std::path::Path, task_id: &str) -> Option<String> {
+    crate::task_events::replay(home)
+        .unwrap()
+        .tasks
+        .get(&crate::task_events::TaskId(task_id.into()))
+        .and_then(|r| r.result.clone())
+}
+
+fn seed_claimed(home: &std::path::Path, task_id: &str, owner: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let tid = TaskId(task_id.into());
+    crate::task_events::append_batch(
+        home,
+        &InstanceName::from("test:seed"),
+        vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::Claimed { task_id: tid, by: InstanceName::from(owner) },
+        ],
+    )
+    .expect("seed claimed");
+}
+
+/// F2 (witnessed backfill): after a terminal auto-close (owner=dev-agent,
+/// result null), the OWNER's `update(result=…)` must persist the result. Pre-fix
+/// `handle_update` never read `args["result"]`, so it was a silent no-op.
+#[test]
+fn update_result_backfills_done_task() {
+    let home = tmp_home("f2-backfill");
+    seed_claimed(&home, "t-f2", "dev-agent");
+    crate::tasks::auto_close::auto_close_on_report(
+        &home, "report", "t-f2", "dev-agent", "auto summary", true,
+    )
+    .expect("auto_close");
+    assert_eq!(
+        read_task_record(&home, "t-f2").unwrap().status,
+        crate::task_events::TaskStatus::Done,
+        "precondition: Done"
+    );
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-f2", "result": "final: shipped in PR #77"}),
+    );
+    assert!(resp.get("error").is_none(), "update must not error: {resp}");
+    assert_eq!(
+        task_result(&home, "t-f2").as_deref(),
+        Some("final: shipped in PR #77"),
+        "F2: owner update(result=…) on a done task must persist `result`"
+    );
+}
+
+/// F2 honest idempotent: `update(result=X)` when the result already equals X
+/// must report `unchanged`, not a false `updated`.
+#[test]
+fn update_result_idempotent_reports_unchanged() {
+    let home = tmp_home("f2-idempotent");
+    seed_claimed(&home, "t-f2i", "dev-agent");
+    let first = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-f2i", "result": "X"}),
+    );
+    assert_eq!(first["status"], "updated", "first result set is a real change: {first}");
+    let second = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-f2i", "result": "X"}),
+    );
+    assert_eq!(
+        second["status"], "unchanged",
+        "F2: an equal-value result update must report `unchanged`, not `updated`: {second}"
+    );
+    assert_eq!(task_result(&home, "t-f2i").as_deref(), Some("X"));
+}
+
+/// F3: `depends_on` is create-only/immutable (tests.rs:1888). `update(depends_on=…)`
+/// must return an explicit error, never a false `updated`, and never mutate deps.
+#[test]
+fn update_depends_on_is_rejected_not_silently_accepted() {
+    let home = tmp_home("f3-reject");
+    create_task(&home, "t-f3");
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-f3", "depends_on": ["t-up-1"]}),
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "F3: update(depends_on=…) must return an explicit create-only error: {resp}"
+    );
+    let deps = read_task_record(&home, "t-f3").unwrap().depends_on;
+    assert!(deps.is_empty(), "depends_on must stay as created (immutable): {deps:?}");
+}
+
+/// Fail-loud: an update with no supported mutable field is not a success. Pre-fix
+/// it returned `updated` (empty pending_events → unconditional success).
+#[test]
+fn update_with_no_supported_fields_errors() {
+    let home = tmp_home("no-fields");
+    create_task(&home, "t-nf");
+    let resp = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action": "update", "id": "t-nf"}),
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "an update with no updatable field must fail loudly, not report success: {resp}"
+    );
+}

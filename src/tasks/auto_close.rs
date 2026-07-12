@@ -552,4 +552,36 @@ mod tests {
             Some(crate::task_events::TaskStatus::Done)
         );
     }
+
+    fn task_result(home: &Path, task_id: &str) -> Option<String> {
+        crate::task_events::replay(home)
+            .unwrap()
+            .tasks
+            .get(&TaskId(task_id.into()))
+            .and_then(|r| r.result.clone())
+    }
+
+    /// F1 (spike t-…19288-1): a terminal report auto-close must project the
+    /// report body into the task's `result`. Pre-fix `apply_done` set `result`
+    /// only from `DoneSource::OperatorManual`, so `ReportAutoClose.report_summary`
+    /// was dropped and the closed task's `result` stayed null.
+    #[test]
+    fn report_auto_close_projects_report_into_result() {
+        let home = tmp_home("f1_result");
+        seed_claimed_task(&home, "t-f1-result", "dev-agent");
+        let report = "RESULT: fixed the parser; PR #123 merged; all suites green.";
+        let closed =
+            auto_close_on_report(&home, "report", "t-f1-result", "dev-agent", report, true).unwrap();
+        assert!(closed, "precondition: terminal assignee report auto-closes");
+        assert_eq!(
+            task_status(&home, "t-f1-result"),
+            Some(crate::task_events::TaskStatus::Done),
+            "precondition: task is Done"
+        );
+        assert_eq!(
+            task_result(&home, "t-f1-result").as_deref(),
+            Some(report),
+            "F1: auto-close must persist the report into `result` (was null)"
+        );
+    }
 }
