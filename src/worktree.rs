@@ -660,7 +660,16 @@ impl WipPreservation {
 ///    records the gitlink, not the submodule's internal edits), so minting one is a
 ///    false "preserved" that silently loses the nested WIP on removal. Refuse
 ///    (`UnpreservableNestedDirty`) instead. A pure gitlink MOVE (`SC..`) is NOT
-///    internal dirt and stays preservable.
+///    internal dirt and stays preservable. The same refusal also fires for an
+///    UNTRACKED embedded git repo at any depth (a `?`-row dir with a `.git`; the
+///    walk uses `--untracked-files=all` so git surfaces each foreign-repo boundary
+///    as its own row) — its internal content is equally uncapturable by a parent ref.
+///  - BOUNDARY (out of contract): content under a GITIGNORE'd path — including an
+///    ignored embedded repo — is NOT covered. `git status`/`add -A` never list or
+///    capture ignored paths, so no gitlink or recovery ref ever falsely claims it;
+///    it is universal accepted-loss on every release path (a plain ignored file is
+///    dropped identically). Preserving it would be an ignore-semantics change, not
+///    this data-safety fix. Pinned by `preserve_ignored_dir_embedded_repo_*`.
 ///  - Otherwise PRESERVE: anchor a commit whose tree = `worktree_tree` to a ref in
 ///    the SHARED object/ref store (survives the worktree-dir removal). When the
 ///    STAGED tree differs from BOTH HEAD and the working tree, it is captured as a
@@ -1139,6 +1148,16 @@ fn walk_nested_dirty(
     // P0/P1 (codex R2): reveal submodule dirt (`--ignore-submodules=none`) at BOTH
     // the super and every recursive nested call (this one line serves both via the
     // recursion), and never rewrite the live index (`--no-optional-locks`, global).
+    //
+    // r7 (P4 class-closure): `--untracked-files=all`. Without it git COLLAPSES an
+    // entirely-untracked tree into one `?? junk/` row, hiding an embedded repo at
+    // `junk/deep/repo/` from the `?`-row check below (depth ≥2 slipped — reviewer5
+    // P4). With `-uall` git enumerates every untracked path AND — crucially — never
+    // descends INTO a foreign git repo, so it emits every embedded repo as its own
+    // `? <path>/` row at ANY depth. The check below then catches each. (IGNORED
+    // content is deliberately still NOT listed — it is out of the no-silent-loss
+    // contract: `add -A` never captures it, so no gitlink/recovery-ref falsely claims
+    // it; a documented boundary, pinned by a test.)
     let entries = match crate::git_helpers::git_cmd(
         dir_canon,
         &[
@@ -1147,6 +1166,7 @@ fn walk_nested_dirty(
             "--porcelain=v2",
             "-z",
             "--ignore-submodules=none",
+            "--untracked-files=all",
         ],
     ) {
         Ok(s) => parse_porcelain_v2_z(&s),
