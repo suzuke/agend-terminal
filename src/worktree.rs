@@ -954,6 +954,8 @@ fn snapshot_worktree_tree(wt_path: &Path) -> Result<String, String> {
     // Run a git op against the TEMP index (bypass + bounded). Never touches the
     // live index (which lives at `<git_dir>/index`).
     let run = |args: &[&str], label: &str| -> Result<std::process::Output, String> {
+        // git-raw-allowed: this temp-index snapshot needs per-command
+        // GIT_INDEX_FILE while retaining the shared bounded process-group runner.
         let mut cmd = std::process::Command::new("git");
         cmd.args(args)
             .current_dir(wt_path)
@@ -1965,18 +1967,22 @@ mod tests {
 
     /// Superproject with `commit_marker_gitignore` + one committed submodule at
     /// `vendor/dep` holding `sub_file`. `create()` inits it recursively.
-    // Only used by `#[cfg(unix)]` nested tests; gate to avoid dead-code on Windows
-    // (`cargo clippy --tests -D warnings` builds all cfgs).
+    // Only used by `#[cfg(unix)]` nested tests; the fixture root is owned by one
+    // test so its cleanup cannot remove sibling repositories from another test.
     #[cfg(unix)]
     fn tmp_super_one_sub_file(name: &str, sub_file: &str) -> PathBuf {
-        let sub = tmp_repo_with_file(&format!("{name}-sub"), sub_file, "vendored-v1\n");
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-wt-super1-{}-{}-{}",
+        let root = std::env::temp_dir().join(format!(
+            "agend-wt-super1-root-{}-{}-{}",
             std::process::id(),
             name,
             id
         ));
+        std::fs::create_dir_all(&root).unwrap();
+        let sub_tmp = tmp_repo_with_file(&format!("{name}-sub"), sub_file, "vendored-v1\n");
+        let sub = root.join("sub");
+        std::fs::rename(&sub_tmp, &sub).expect("move submodule fixture under owned root");
+        let dir = root.join("super");
         std::fs::create_dir_all(&dir).unwrap();
         git_run_ok(&dir, &["init", "-b", "main"], false);
         git_run_ok(&dir, &["config", "user.email", "test@test"], false);
@@ -2028,7 +2034,6 @@ mod tests {
     /// Count inbox messages for `recipient` under `home` whose `from` matches
     /// `from_marker` (reads the JSONL file directly — fresh test home ⇒ no
     /// id-redirect, so the file is `home/inbox/<recipient>.jsonl`).
-    #[cfg(unix)]
     fn inbox_count_from(home: &Path, recipient: &str, from_marker: &str) -> usize {
         let path = home.join("inbox").join(format!("{recipient}.jsonl"));
         let body = std::fs::read_to_string(&path).unwrap_or_default();
@@ -2038,7 +2043,6 @@ mod tests {
             .count()
     }
 
-    #[cfg(unix)]
     const NESTED_FROM: &str = "system:release_unpreservable_nested_dirty";
 
     /// (1) Nested-only dirt (tracked file inside the submodule, gitlink unchanged)
@@ -2294,7 +2298,6 @@ mod tests {
 
     /// Marker directory for the per-worktree refusal notice (test-visible mirror
     /// of the production path).
-    #[cfg(unix)]
     fn refusal_marker_dir(home: &Path) -> PathBuf {
         crate::paths::runtime_dir(home).join("release_refusal_notices")
     }
@@ -2500,12 +2503,14 @@ mod tests {
         for (label, use_gitmodules) in [("repo-config", false), ("gitmodules", true)] {
             let home = tmp_home(&format!("cfg-ignore-{label}"));
             let super_repo = tmp_super_one_sub(&format!("cfg-ignore-{label}"));
-            // Configure submodule-ignore=all BEFORE leasing, from the requested
-            // source. `.gitmodules` is COMMITTED so the file itself stays clean
-            // (else it would be preservable parent dirt, defeating the fixture).
+            // Lease first so submodule initialization cannot honor ignore=all and
+            // legitimately leave the fixture unpopulated. Then configure the
+            // requested source; `.gitmodules` is committed so the worktree itself
+            // stays clean before nested dirt is introduced.
+            let info = create(&home, &super_repo, "agent1", Some("feat/cfgig")).expect("worktree");
             if use_gitmodules {
                 git_run_ok(
-                    &super_repo,
+                    &info.path,
                     &[
                         "config",
                         "-f",
@@ -2515,20 +2520,19 @@ mod tests {
                     ],
                     false,
                 );
-                git_run_ok(&super_repo, &["add", ".gitmodules"], false);
+                git_run_ok(&info.path, &["add", ".gitmodules"], false);
                 git_run_ok(
-                    &super_repo,
+                    &info.path,
                     &["commit", "-m", "gitmodules ignore=all"],
                     false,
                 );
             } else {
                 git_run_ok(
-                    &super_repo,
+                    &info.path,
                     &["config", "submodule.vendor/dep.ignore", "all"],
                     false,
                 );
             }
-            let info = create(&home, &super_repo, "agent1", Some("feat/cfgig")).expect("worktree");
             crate::binding::bind_full(
                 &home,
                 "agent1",
@@ -2670,7 +2674,6 @@ mod tests {
     /// concurrent notice may hold breaks serialization. Assert the marker is gone,
     /// the `.lock` remains, and the notice path still serializes (re-notifies once,
     /// then de-dups) afterwards — proving the lock path is intact.
-    #[cfg(unix)]
     #[test]
     fn clear_nested_refusal_marker_keeps_lock_and_serializes() {
         let home = tmp_home("clear-keeps-lock");
@@ -2728,7 +2731,6 @@ mod tests {
     /// per-worktree lock. While an in-flight notice holds the lock,
     /// `clear_nested_refusal_marker` must FAIL SAFE (leave the marker); the marker
     /// is only removed by a later cleanup that actually owns the lock.
-    #[cfg(unix)]
     #[test]
     fn clear_nested_refusal_marker_fails_safe_while_lock_held() {
         let home = tmp_home("clear-contended");
