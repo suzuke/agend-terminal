@@ -123,11 +123,23 @@ impl DeliveryKey {
         reviewer: impl Into<String>,
         kind: impl Into<String>,
     ) -> Result<Self, KeyError> {
-        // RED: validation not yet implemented.
         let repo = repo.into();
         let reviewer = reviewer.into();
         let kind = kind.into();
-        let head_sha = head_sha.into().to_lowercase();
+        let head_sha_in = head_sha.into();
+        for (name, v) in [("repo", &repo), ("reviewer", &reviewer), ("kind", &kind)] {
+            if v.is_empty() {
+                return Err(KeyError::Empty(name));
+            }
+            if v.contains('\0') {
+                return Err(KeyError::NulByte(name));
+            }
+        }
+        let head_sha = head_sha_in.to_lowercase();
+        let hex_len_ok = head_sha.len() == 40 || head_sha.len() == 64;
+        if !hex_len_ok || !head_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(KeyError::BadHeadSha(head_sha_in));
+        }
         Ok(DeliveryKey {
             repo,
             pr_number,
@@ -159,7 +171,7 @@ struct DeliveryRecord {
     head_sha: String,
     reviewer: String,
     kind: String,
-    delivered_at: String,
+    delivered_at: DateTime<Utc>,
 }
 
 impl DeliveryRecord {
@@ -171,7 +183,7 @@ impl DeliveryRecord {
             head_sha: key.head_sha.clone(),
             reviewer: key.reviewer.clone(),
             kind: key.kind.clone(),
-            delivered_at: now.to_rfc3339(),
+            delivered_at: now,
         }
     }
 
@@ -292,15 +304,7 @@ fn quarantine_corrupt_locked(path: &Path) {
 /// corrupt record is left for a lock-holding [`deliver_once`] / [`gc_stale`] to
 /// quarantine, so this read cannot race a concurrent publish.
 pub(crate) fn is_delivered(home: &Path, key: &DeliveryKey) -> bool {
-    // RED: lock-free mutating quarantine (the race).
-    match classify(home, key) {
-        Classification::Delivered => true,
-        Classification::Corrupt => {
-            quarantine_corrupt_locked(&file_for(home, key));
-            false
-        }
-        Classification::Eligible => false,
-    }
+    classify(home, key) == Classification::Delivered
 }
 
 /// Enqueue-before-record delivery under the per-key lock (which the blocking
@@ -331,15 +335,10 @@ where
     // Then the record. A failure here is AMBIGUOUS: the message is already enqueued,
     // so a retry may duplicate — classify it distinctly.
     let rec = DeliveryRecord::from_key(key, now);
-    // RED: local unsynced write (no fsync), silent empty on serialize error.
-    let bytes = serde_json::to_vec(&rec).unwrap_or_default();
-    let path = file_for(home, key);
-    let tmp = path.with_extension("json.tmp");
-    (|| -> std::io::Result<()> {
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)
-    })()
-    .map_err(|e| DeliveryError::RecordFailedAfterEnqueue(e.into()))?;
+    let bytes =
+        serde_json::to_vec(&rec).map_err(|e| DeliveryError::RecordFailedAfterEnqueue(e.into()))?;
+    crate::store::atomic_write(&file_for(home, key), &bytes)
+        .map_err(DeliveryError::RecordFailedAfterEnqueue)?;
     Ok(DeliveryOutcome::Delivered)
 }
 
@@ -361,16 +360,16 @@ pub(crate) fn gc_stale(home: &Path, now: DateTime<Utc>) {
         }
         // Same per-key lock as deliver_once (the .lock shares the .json's hash stem).
         let lock_path = path.with_extension("lock");
-        let _lock = crate::store::acquire_file_lock(&lock_path).ok(); // RED: fail-open
+        let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+            tracing::warn!(path = %path.display(), "ci_delivery_ledger: gc skipped (lock unavailable)");
+            continue; // fail-closed: never delete without the lock
+        };
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         match serde_json::from_slice::<DeliveryRecord>(&bytes) {
             Ok(rec) => {
-                if chrono::DateTime::parse_from_rfc3339(&rec.delivered_at)
-                    .map(|d| d.with_timezone(&Utc) < cutoff)
-                    .unwrap_or(false)
-                {
+                if rec.delivered_at < cutoff {
                     if let Err(e) = std::fs::remove_file(&path) {
                         tracing::warn!(path = %path.display(), error = %e, "ci_delivery_ledger: gc remove failed");
                     }
@@ -579,7 +578,7 @@ mod tests {
             head_sha: SHA1.to_string(),
             reviewer: "someone-else".to_string(),
             kind: "ci-ready-for-action".to_string(),
-            delivered_at: NOW.to_string(),
+            delivered_at: t(NOW),
         };
         std::fs::write(file_for(&home, &k), serde_json::to_vec(&wrong).unwrap()).unwrap();
         assert!(!is_delivered(&home, &k));
