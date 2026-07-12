@@ -738,6 +738,94 @@ fn preserve_submodule_pointer_move_is_preserved() {
     std::fs::remove_dir_all(&super_repo).ok();
 }
 
+/// (5b) P3b (reviewer5 r6 blocker): an UNTRACKED EMBEDDED git repo (in-worktree
+/// `git init`/clone, NOT a registered submodule — porcelain `?` row, no `S` field,
+/// so the submodule walk never saw it) WITH a commit + internal WIP must REFUSE.
+/// A superproject `add -A` records it only as a gitlink; removal destroys the
+/// embedded WIP AND its `.git` object store → the recovery ref's gitlink dangles
+/// and the "preserved" notice lies. Same no-silent-loss invariant as the headline
+/// bug. RED at d47beca2 (returned Preserved + minted a ref).
+#[cfg(unix)]
+#[test]
+fn preserve_refuses_untracked_embedded_git_repo_with_wip() {
+    let home = tmp_home("embed");
+    let repo = tmp_repo_with_file("embed", "f.txt", "base\n");
+    commit_marker_gitignore(&repo);
+    let info = create(&home, &repo, "agent1", Some("feat/embed")).expect("worktree");
+    // Untracked embedded repo inside the worktree: init + commit + internal WIP.
+    let embed = info.path.join("cloned-dep");
+    std::fs::create_dir_all(&embed).unwrap();
+    git_run_ok(&embed, &["init", "-b", "main"], false);
+    std::fs::write(embed.join("committed.txt"), b"committed\n").unwrap();
+    git_run_ok(&embed, &["add", "committed.txt"], false);
+    git_run_ok(
+        &embed,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "embed init",
+        ],
+        false,
+    );
+    let wip = embed.join("wip.txt");
+    std::fs::write(&wip, b"UNCOMMITTED embedded WIP\n").unwrap();
+
+    let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/embed", None);
+    assert_eq!(
+        pres_kind(&outcome),
+        "UnpreservableNestedDirty",
+        "an untracked embedded git repo's WIP cannot be captured by a parent ref — must refuse"
+    );
+    assert!(
+        outcome.blocked_reason().is_some(),
+        "refusal must be fail-closed (blocked_reason Some)"
+    );
+    assert!(
+        recovery_ref_names(&repo, "feat/embed").is_empty(),
+        "no recovery ref may falsely claim the embedded WIP was preserved"
+    );
+    assert_eq!(
+        std::fs::read(&wip).unwrap(),
+        b"UNCOMMITTED embedded WIP\n",
+        "the embedded WIP must survive on disk for in-place recovery"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// (5c) P3a (pin): a commit-LESS embedded repo already fail-closes — the temp-index
+/// `git add -A` errors ("does not have a commit checked out") ⇒ `Blocked`. Keep
+/// that data-preserving behavior pinned (must never fall through to Preserved).
+#[cfg(unix)]
+#[test]
+fn preserve_blocks_commitless_embedded_git_repo() {
+    let home = tmp_home("embed-empty");
+    let repo = tmp_repo_with_file("embed-empty", "f.txt", "base\n");
+    commit_marker_gitignore(&repo);
+    let info = create(&home, &repo, "agent1", Some("feat/embed0")).expect("worktree");
+    let embed = info.path.join("empty-clone");
+    std::fs::create_dir_all(&embed).unwrap();
+    git_run_ok(&embed, &["init", "-b", "main"], false); // no commit
+    std::fs::write(embed.join("wip.txt"), b"wip\n").unwrap();
+
+    let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/embed0", None);
+    assert_eq!(
+        pres_kind(&outcome),
+        "Blocked",
+        "a commit-less embedded repo fails the temp-index add -A => Blocked (fail-closed)"
+    );
+    assert!(outcome.blocked_reason().is_some());
+    assert!(recovery_ref_names(&repo, "feat/embed0").is_empty());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// (6) An UNMERGED live index makes `git write-tree` fail ⇒ `Blocked`
 /// (fail-closed), no ref. Planted deterministically via `update-index
 /// --index-info` with stage 1/2/3 entries for one path.
