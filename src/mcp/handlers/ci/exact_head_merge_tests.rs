@@ -134,10 +134,22 @@ fn force_args() -> serde_json::Value {
     json!({"pr": 4242, "repository": "suzuke/agend-terminal", "force": true, "force_reason": "emergency"})
 }
 
-const H0: &str = "h0h0h0h0h0h0h0h0h0h0h0h0h0h0h0h0h0h0h0h0";
-const H1: &str = "d1ffd1ffd1ffd1ffd1ffd1ffd1ffd1ffd1ffd1ff";
-const B0: &str = "ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e0";
-const B1: &str = "ba5eADVANCEba5eADVANCEba5eADVANCEba5eADV1";
+// All four are valid FULL 40-hex commit OIDs (`is_full_commit_sha`), distinct so
+// a head/base move is detected by EXACT identity. #merge-exact-head r1: the
+// pre-r1 fixtures padded with non-hex 'h'/'ADVANCE', which masked the full-
+// commit-OID invariant — a malformed provider identity was silently accepted as
+// valid. Real identities now exercise the invariant end-to-end.
+const H0: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+const H1: &str = "feedfacefeedfacefeedfacefeedfacefeedface";
+const B0: &str = "0badf00d0badf00d0badf00d0badf00d0badf00d";
+const B1: &str = "cafebabecafebabecafebabecafebabecafebabe";
+
+// r1 malformed-identity fixtures. Each violates `is_full_commit_sha` on exactly
+// one axis: right length / wrong alphabet, and right alphabet / wrong length. A
+// provider that yields either MUST fail closed — never a silently unpinned
+// (`--match-head-commit`) or ambiguous-base merge.
+const NON_HEX_40: &str = "gggggggggggggggggggggggggggggggggggggggg";
+const ABBREV_HEX: &str = "deadbeef";
 
 fn refused(r: &serde_json::Value) -> bool {
     r.get("error").is_some() && r["merged"].as_bool() != Some(true)
@@ -264,4 +276,57 @@ fn head_unavailable_provider_fails_closed() {
     assert!(refused(&r), "erroring provider must fail closed, got: {r}");
     assert!(recorded.lock().unwrap().is_none(), "pr_merge must NOT run");
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// r1 full-commit-OID invariant harness: a single (head, base) snapshot whose
+/// identity violates `is_full_commit_sha` MUST refuse without ever reaching
+/// `pr_merge`, under BOTH the normal and force paths (force relaxes CI/verdict/
+/// freshness POLICY only, never head/base identity acquisition). RED against
+/// ea23104f, whose `acquire_head_base` filtered only `!is_empty()`.
+fn assert_identity_refused(
+    tag: &str,
+    head: &'static str,
+    base: &'static str,
+    args: serde_json::Value,
+) {
+    let home = tmp_home(tag);
+    let recorded = Arc::new(Mutex::new(None));
+    let mut mock = MergeMock::new(recorded.clone());
+    mock.heads = vec![head];
+    mock.bases = vec![base];
+    let _g = crate::scm::set_test_scm_provider(Arc::new(mock));
+    let r = super::handle_merge_repo(&home, &args, "dev");
+    assert!(refused(&r), "{tag}: malformed identity must REFUSE, got: {r}");
+    assert!(
+        recorded.lock().unwrap().is_none(),
+        "{tag}: pr_merge must NOT run on a malformed identity"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// P0-5a: an abbreviated (valid-hex but too-short) HEAD OID fails closed — a
+/// `--match-head-commit` pin needs a FULL unambiguous SHA. Normal path.
+#[test]
+fn abbreviated_head_refuses_normal() {
+    assert_identity_refused("abbrev-head-normal", ABBREV_HEX, B0, base_args());
+}
+
+/// P0-5b: same abbreviated HEAD under force — force never relaxes identity.
+#[test]
+fn abbreviated_head_refuses_force() {
+    assert_identity_refused("abbrev-head-force", ABBREV_HEX, B0, force_args());
+}
+
+/// P0-6a: a non-hex (right length, wrong alphabet) BASE OID fails closed — a
+/// malformed base returned identically twice must NOT satisfy the exact-base
+/// recheck. Normal path.
+#[test]
+fn malformed_base_refuses_normal() {
+    assert_identity_refused("nonhex-base-normal", H0, NON_HEX_40, base_args());
+}
+
+/// P0-6b: same non-hex BASE under force.
+#[test]
+fn malformed_base_refuses_force() {
+    assert_identity_refused("nonhex-base-force", H0, NON_HEX_40, force_args());
 }
