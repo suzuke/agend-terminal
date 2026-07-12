@@ -91,6 +91,14 @@ pub struct PrState {
     /// re-emit until head_sha changes.
     #[serde(default)]
     pub ready_emitted_for_sha: Option<String>,
+    /// #2745 debounce key for the `[review-class-unresolved]` diagnostic — the
+    /// fail-closed analogue of [`Self::ready_emitted_for_sha`]. Set to the
+    /// head_sha once the "CI-green + VERIFIED but review_class is Unresolved"
+    /// re-arm diagnostic has fired, so the scanner emits it at most once per sha
+    /// (cleared on head advance). Kept SEPARATE from `ready_emitted_for_sha` so it
+    /// never interferes with the terminal-replay suppression that field drives.
+    #[serde(default)]
+    pub diagnostic_emitted_for_sha: Option<String>,
     /// #973 cross-audit Pushback C: tracks whether implementer armed
     /// `gh pr merge --auto` against the current head. Cleared on
     /// head_sha advance (force-push cancels GitHub's auto-merge).
@@ -209,20 +217,30 @@ impl ReviewClass {
         match self {
             ReviewClass::Single => 1,
             ReviewClass::Dual => 2,
-            // RED scaffolding: still counts as 1 here (the buggy pre-fix behavior) so
-            // the fail-closed tests are RED. GREEN makes `is_merge_ready` reject
-            // Unresolved outright (never satisfiable) + diagnose.
-            ReviewClass::Unresolved => 1,
+            // #2745: `Unresolved` is never satisfiable — `is_merge_ready` rejects it
+            // outright before this is consulted; `usize::MAX` is a defensive backstop
+            // so even a forgotten guard can never meet the threshold.
+            ReviewClass::Unresolved => usize::MAX,
+        }
+    }
+
+    /// Display / wire token for this class: `single` / `dual` / `unresolved`.
+    /// The `single`/`dual` tokens are also the exact watch `review_class` values
+    /// [`parse_fail_closed`] round-trips.
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            ReviewClass::Single => "single",
+            ReviewClass::Dual => "dual",
+            ReviewClass::Unresolved => "unresolved",
         }
     }
 
     /// Parse a watch/dispatch `review_class` string to the typed class, FAIL-CLOSED:
     /// only the exact lowercased tokens `single`/`dual` resolve; anything else
     /// (absent → `None`, empty, or an unknown/typo'd value) is [`Unresolved`].
-    /// (RED: this fn is not yet consulted by the poller, which still collapses to
-    /// Single — see the poller mapping test.)
-    // WIP checkpoint: allow until GREEN wires the poller to call this.
-    #[allow(dead_code)]
+    /// The single source of truth for the watch/dispatch string → `ReviewClass`
+    /// mapping — the poller (`record_ci_result` feed) and the test-only
+    /// `parse_review_class(&Value)` wrapper both route through it.
     pub fn parse_fail_closed(raw: Option<&str>) -> ReviewClass {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("single") => ReviewClass::Single,
@@ -321,6 +339,7 @@ pub fn apply(state: &mut PrState, event: Event<'_>) {
                 state.auto_armed = false;
                 state.auto_armed_for_sha = None;
                 state.ready_emitted_for_sha = None;
+                state.diagnostic_emitted_for_sha = None;
                 // Drop verdicts whose reviewed_head no longer matches.
                 // Verified gets dropped per-reviewer; Rejected/Unverified
                 // collapse to None since they were about an old commit.
@@ -467,6 +486,12 @@ pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
 /// - Draft state — `gh pr merge` rejects drafts; refuse to mark ready
 /// - Threshold per `review_class` (Single=1 / Dual=2)
 pub fn is_merge_ready(state: &PrState) -> bool {
+    // #2745 fail-closed: an `Unresolved` review_class (intent ABSENT / UNKNOWN /
+    // MISMATCHED at arm time) is NEVER merge-ready — no verdict count can satisfy
+    // it. The scanner raises an actionable diagnostic in place of pr-ready.
+    if matches!(state.review_class, ReviewClass::Unresolved) {
+        return false;
+    }
     if matches!(state.draft_state, DraftState::Draft) {
         return false;
     }
@@ -843,6 +868,7 @@ pub fn new_for_branch(
         draft_state: DraftState::Ready,
         review_class,
         ready_emitted_for_sha: None,
+        diagnostic_emitted_for_sha: None,
         auto_armed: false,
         auto_armed_for_sha: None,
         auto_armed_at: None,
@@ -1216,20 +1242,28 @@ pub fn format_ready_body(state: &PrState) -> String {
     } else {
         format!("{}@{}", state.repo, state.branch)
     };
-    let reviewers_csv = if let VerdictState::Verified { reviewers } = &state.verdict_state {
-        reviewers
-            .iter()
-            .map(|(r, _)| r.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    } else {
-        String::new()
-    };
+    let (reviewers_csv, verified_count) =
+        if let VerdictState::Verified { reviewers } = &state.verdict_state {
+            (
+                reviewers
+                    .iter()
+                    .map(|(r, _)| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                reviewers.len(),
+            )
+        } else {
+            (String::new(), 0)
+        };
+    // #2745: surface the review_class + distinct-VERIFIED tally so the merge
+    // authority can see WHY the gate opened (single vs dual, N-of-required).
+    let required = state.review_class.required_verified_count();
     format!(
         "[pr-ready-for-merge] {pr_id} (head {sha_short}): \
-         CI green ∧ VERIFIED ({reviewers_csv}). \
+         CI green ∧ VERIFIED [{class} {verified_count}/{required} distinct] ({reviewers_csv}). \
          §3.12 self-merge gate open — `gh pr merge {pr_or_branch} --squash --delete-branch` \
          (or post-#973 `--auto`).",
+        class = state.review_class.as_token(),
         pr_or_branch = if state.pr_number > 0 {
             state.pr_number.to_string()
         } else {
@@ -1284,6 +1318,7 @@ mod tests {
             draft_state: DraftState::Ready,
             review_class: class,
             ready_emitted_for_sha: None,
+            diagnostic_emitted_for_sha: None,
             auto_armed: false,
             auto_armed_for_sha: None,
             auto_armed_at: None,
@@ -1807,6 +1842,62 @@ mod tests {
             inbox_msgs.is_empty(),
             "second scan must not re-emit; got {} message(s)",
             inbox_msgs.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2745: scan_and_emit surfaces a `[review-class-unresolved]` re-arm
+    /// diagnostic (NOT a premature pr-ready) when a CI-green ∧ VERIFIED state
+    /// carries an `Unresolved` review_class — the legacy-None inventory. Debounced
+    /// once per head_sha via `diagnostic_emitted_for_sha`.
+    #[test]
+    fn review_class_unresolved_emits_rearm_diagnostic_not_ready_2745() {
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("agend-2745-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("inbox")).ok();
+        write_team_fleet(&dir, "lead-w", &["dev"]);
+
+        // CI-green + VERIFIED at head, but review_class is Unresolved (a legacy
+        // `None` watch): would-be-ready-but-for-the-unresolved-class.
+        let mut s = new_state("sha-A", ReviewClass::Unresolved);
+        s.ci_state = CiState::Green {
+            sha: "sha-A".to_string(),
+            observed_at: now(),
+        };
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
+        };
+        s.merge_state = MergeState::NotReady;
+        s.pr_author = "dev".to_string();
+        save(&dir, &s).unwrap();
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        scan_and_emit_with(&dir, &registry, &crate::daemon::pr_state::gh_poll::CliGhPoller);
+        let msgs = crate::inbox::drain(&dir, "lead-w");
+        assert_eq!(msgs.len(), 1, "expected exactly one re-arm diagnostic");
+        assert_eq!(
+            msgs[0].kind.as_deref(),
+            Some("review-class-unresolved"),
+            "must be the re-arm diagnostic, never a premature [pr-ready-for-merge]"
+        );
+        assert!(
+            msgs[0].text.contains("review_class=single|dual"),
+            "diagnostic must carry the actionable re-arm instruction: {}",
+            msgs[0].text
+        );
+
+        // Second scan: debounced per `diagnostic_emitted_for_sha` — no re-emit.
+        scan_and_emit_with(&dir, &registry, &crate::daemon::pr_state::gh_poll::CliGhPoller);
+        assert!(
+            crate::inbox::drain(&dir, "lead-w").is_empty(),
+            "second scan must not re-emit the diagnostic at the same head_sha"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

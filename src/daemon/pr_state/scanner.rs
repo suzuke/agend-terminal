@@ -3,7 +3,7 @@ use std::path::Path;
 use super::gh_poll;
 use super::{
     apply, format_ready_body, pr_state_dir, remove, resolve_author, resolve_merge_authority,
-    with_pr_state, DraftState, Event, MergeState, PrState,
+    with_pr_state, CiState, DraftState, Event, MergeState, PrState, ReviewClass, VerdictState,
 };
 
 enum ScanAction {
@@ -193,6 +193,45 @@ pub fn scan_and_emit_with(
                     "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
                 );
                 pending_ready = Some((recipient, msg, state.head_sha.clone()));
+            }
+
+            // #2745 fail-closed: a would-be-ready state whose review_class is
+            // `Unresolved` (a legacy `None` watch, or one armed before this fix)
+            // can NEVER open the merge gate. Surface an actionable re-arm
+            // diagnostic to the merge authority INSTEAD of an (absent) pr-ready,
+            // once per head_sha (debounced via `diagnostic_emitted_for_sha`, a
+            // field kept separate from `ready_emitted_for_sha` so it never touches
+            // terminal-replay suppression). Gated on CI-green ∧ VERIFIED at head —
+            // the exact point pr-ready would have fired under an explicit class — so
+            // it fires only when the unresolved class is actually blocking a merge,
+            // not on every freshly-armed watch. This is the "legacy None inventory"
+            // (decision d-…-11): each blocked watch announces itself for re-arm.
+            if matches!(state.review_class, ReviewClass::Unresolved)
+                && matches!(state.merge_state, MergeState::NotReady)
+                && matches!(&state.ci_state, CiState::Green { sha, .. } if sha == &state.head_sha)
+                && matches!(&state.verdict_state, VerdictState::Verified { .. })
+                && state.diagnostic_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
+            {
+                let recipient = resolve_merge_authority(home, state);
+                let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
+                let body = format!(
+                    "[review-class-unresolved] {}@{} (head {sha_short}): CI green ∧ VERIFIED, but \
+                     the ci-watch review_class is UNRESOLVED (absent/unknown/typo) — the merge gate \
+                     is fail-closed and will NOT open (#2745). Re-arm with an explicit threshold: \
+                     `ci action=watch repository={} branch={} review_class=single|dual`.",
+                    state.repo, state.branch, state.repo, state.branch,
+                );
+                let msg = build_event_message("review-class-unresolved", &recipient, state, body);
+                pending_emits.push((recipient, msg));
+                state.diagnostic_emitted_for_sha = Some(state.head_sha.clone());
+                dirty = true;
+                tracing::warn!(
+                    repo = %state.repo,
+                    branch = %state.branch,
+                    head = %state.head_sha,
+                    "#2745 pr_state: [review-class-unresolved] queued — legacy/absent review_class; \
+                     watch needs explicit re-arm (no merge-ready possible until then)"
+                );
             }
 
             // Terminal-state sweep.

@@ -860,24 +860,20 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
 /// Returns Some("failure") if any run failed.
 /// Returns Some("success") only if all runs succeeded.
 /// Returns None if no runs match.
-/// #972 reviewer-rejection fix: extract `review_class` from a ci-watch
-/// JSON value. `"dual"` (case-insensitive) → `ReviewClass::Dual`; any
-/// other value (including absent / null / unknown) → `ReviewClass::Single`.
-/// Source of the field: `mcp_watch_ci` MCP handler accepts a
-/// `review_class` argument and persists it into the watch file.
+/// #972 reviewer-rejection fix / #2745 fail-closed: extract `review_class` from a
+/// ci-watch JSON value. Thin `&Value` wrapper over
+/// [`crate::daemon::pr_state::ReviewClass::parse_fail_closed`] — only the exact
+/// tokens `single`/`dual` (case-insensitive) resolve; absent / null / unknown /
+/// typo / wrong-type → `Unresolved` (NEVER a silent `Single`). Test-only: the
+/// production feed (`record_ci_result` call site) calls `parse_fail_closed`
+/// directly; this wrapper pins the `&Value` → `ReviewClass` contract (see t21).
 #[cfg(test)]
 pub(crate) fn parse_review_class(
     watch: &serde_json::Value,
 ) -> crate::daemon::pr_state::ReviewClass {
-    match watch
-        .get("review_class")
-        .and_then(|v| v.as_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("dual") => crate::daemon::pr_state::ReviewClass::Dual,
-        _ => crate::daemon::pr_state::ReviewClass::Single,
-    }
+    crate::daemon::pr_state::ReviewClass::parse_fail_closed(
+        watch.get("review_class").and_then(|v| v.as_str()),
+    )
 }
 
 /// The poller's display-layer distinction over a raw CI `conclusion`
@@ -2267,15 +2263,12 @@ fn persist_watch_state(
             None => crate::daemon::pr_state::CiConclusion::Pending,
         };
         let subscriber_names = state.subscriber_names();
-        let review_class = match state
-            .review_class
-            .as_deref()
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("dual") => crate::daemon::pr_state::ReviewClass::Dual,
-            _ => crate::daemon::pr_state::ReviewClass::Single,
-        };
+        // #2745 fail-closed: absent / unknown / typo'd review_class → `Unresolved`
+        // (NEVER a silent `Single`). A watch armed before this fix, or a legacy
+        // `None`, resolves Unresolved here — `is_merge_ready` then refuses and the
+        // scanner raises a re-arm diagnostic rather than gating on a single review.
+        let review_class =
+            crate::daemon::pr_state::ReviewClass::parse_fail_closed(state.review_class.as_deref());
         crate::daemon::pr_state::record_ci_result(
             ctx.home,
             ctx.repo,
