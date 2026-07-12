@@ -11,11 +11,14 @@
 //! binding whose OWN watch it should have matched.
 //!
 //! This strips the known forge hosts (GitHub + Bitbucket; GitLab included as
-//! characterization — the public schema does not yet advertise it) and applies
-//! the SAME owner/repo parse + lowercase + `.git`/trailing-slash trim as
-//! `canonicalize_repo_slug`, so for a `github.com` URL the output is BYTE-
-//! IDENTICAL. Watch-STORAGE canonicalization is unchanged — this only affects
-//! how the current-binding identity is derived from the binding origin.
+//! characterization — the public schema does not yet advertise it) and then
+//! DELEGATES the `owner/repo` parse/lowercase/`.git`-trim to
+//! `canonicalize_repo_slug` — the SINGLE parser authority, so there is no second
+//! parser to drift from the storage form. For a `github.com` URL the output is
+//! BYTE-IDENTICAL. An unstripped input is accepted only as a clean bare slug;
+//! an unknown/look-alike transport (`://`, SCP `host:path`, `user@host`) is
+//! rejected. Watch-STORAGE canonicalization is unchanged — this only affects how
+//! the current-binding identity is derived from the binding origin.
 //!
 //! LOCKSTEP INVARIANT: this MUST produce the same canonical form that watch
 //! creation stores in `watch.repo` (see `ci::mod::resolve_repo_or_error`). If
@@ -45,28 +48,32 @@ pub(crate) fn derive_repo_slug_any_forge_pub(source_repo: &Path) -> Option<Strin
     canonicalize_repo_slug_any_forge(&url)
 }
 
-/// Host-agnostic form of [`super::canonicalize_repo_slug`]: strips the known
-/// forge hosts (in the https/http/ssh/scp remote-URL shapes) then applies the
-/// identical owner/repo parse + `.git`/slash trim + lowercase. Byte-identical to
-/// `canonicalize_repo_slug` for a `github.com` URL or a bare slug.
+/// Host-agnostic front-end to [`super::canonicalize_repo_slug`] — the SINGLE
+/// owner/repo parser authority (no second parser to drift). Strips a known forge
+/// host, then DELEGATES the `owner/repo` parse/lowercase/trim to
+/// `canonicalize_repo_slug`. An UNSTRIPPED input is accepted only as a clean bare
+/// slug; an unknown/look-alike transport (`://` scheme, SCP `host:path`,
+/// `user@host`) is rejected. Byte-identical to `canonicalize_repo_slug` for a
+/// `github.com` URL or a bare slug.
 pub(crate) fn canonicalize_repo_slug_any_forge(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    let stripped = strip_known_forge_host(s).unwrap_or(s);
-    let slug = stripped.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = slug.split('/');
-    let owner = parts.next()?;
-    let name = parts.next()?;
-    if parts.next().is_some() || owner.is_empty() || name.is_empty() {
+    // Known forge host → strip its transport prefix; the `owner/repo(.git)`
+    // remainder is parsed by the single storage canonicalizer.
+    if let Some(rest) = strip_known_forge_host(s) {
+        return super::canonicalize_repo_slug(rest);
+    }
+    // No known host: only a CLEAN bare `owner/repo` slug may pass. A valid slug
+    // never contains ':' or '@', so any scheme (`://`), SCP host (`host:path`), or
+    // user (`user@host`) is an unknown/look-alike transport we reject — without
+    // this gate, a two-part `host:owner/repo` SCP form would be accepted as a
+    // bogus slug (r2 boundary bug, codex #2746).
+    if s.contains(':') || s.contains('@') {
         return None;
     }
-    Some(format!(
-        "{}/{}",
-        owner.to_ascii_lowercase(),
-        name.to_ascii_lowercase()
-    ))
+    super::canonicalize_repo_slug(s)
 }
 
 /// Strip the leading `scheme://host/` (or `git@host:` / `ssh://git@host/`) for a
