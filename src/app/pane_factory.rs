@@ -1282,6 +1282,7 @@ mod tests {
 
     // ── #2744 r1: app-path model chokepoint (deferred + sync entries) ──
 
+    #[cfg(unix)]
     fn argv_capture_script(home: &std::path::Path, sentinel: &std::path::Path) -> String {
         let script = home.join("argv-capture.sh");
         std::fs::write(
@@ -1295,6 +1296,7 @@ mod tests {
         script.display().to_string()
     }
 
+    #[cfg(unix)]
     fn register_seat(home: &std::path::Path, name: &str) {
         // #1441: managed spawns refuse unregistered instances — give the seat
         // an authoritative fleet.yaml id.
@@ -1308,6 +1310,7 @@ mod tests {
         .expect("write fleet.yaml");
     }
 
+    #[cfg(unix)]
     fn await_sentinel(path: &std::path::Path) -> Option<String> {
         for _ in 0..100 {
             if let Ok(s) = std::fs::read_to_string(path) {
@@ -1320,6 +1323,7 @@ mod tests {
         None
     }
 
+    #[cfg(unix)]
     fn resolved_seat(
         name: &str,
         backend: crate::backend::Backend,
