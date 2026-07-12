@@ -867,12 +867,8 @@ mod tests {
     fn validate_lower_bound_is_hysteresis_pct_single_source() {
         // Exactly at the floor is out of the exclusive lower bound → Err.
         assert!(
-            validate_thresholds(
-                HYSTERESIS_PCT,
-                HYSTERESIS_PCT + 10.0,
-                HYSTERESIS_PCT + 20.0
-            )
-            .is_err(),
+            validate_thresholds(HYSTERESIS_PCT, HYSTERESIS_PCT + 10.0, HYSTERESIS_PCT + 20.0)
+                .is_err(),
             "a threshold == HYSTERESIS_PCT must be rejected (exclusive lower bound)"
         );
         // Just above the floor, ordered handoff/escalate → Ok.
@@ -924,11 +920,7 @@ mod tests {
         } else {
             std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
         }
-        std::fs::write(
-            dir.join("runtime-config.json"),
-            r#"{"schema_version": 1}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
         reload(&dir);
         std::fs::remove_dir_all(&dir).ok();
     }
