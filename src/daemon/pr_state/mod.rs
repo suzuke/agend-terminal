@@ -196,6 +196,12 @@ pub enum ReviewClass {
     Single,
     /// §3.5 — two VERIFIED required.
     Dual,
+    /// #2745: the merge-authority review class was ABSENT / UNKNOWN / MISMATCHED at
+    /// arm/parse time — i.e. never explicitly resolved to Single|Dual. FAIL-CLOSED:
+    /// never merge-ready; the emitter raises an actionable diagnostic instead of a
+    /// premature `[pr-ready-for-merge]`. Distinguished from an *explicit* Single so an
+    /// omitted intent can never silently take the least-ceremony path.
+    Unresolved,
 }
 
 impl ReviewClass {
@@ -203,6 +209,25 @@ impl ReviewClass {
         match self {
             ReviewClass::Single => 1,
             ReviewClass::Dual => 2,
+            // RED scaffolding: still counts as 1 here (the buggy pre-fix behavior) so
+            // the fail-closed tests are RED. GREEN makes `is_merge_ready` reject
+            // Unresolved outright (never satisfiable) + diagnose.
+            ReviewClass::Unresolved => 1,
+        }
+    }
+
+    /// Parse a watch/dispatch `review_class` string to the typed class, FAIL-CLOSED:
+    /// only the exact lowercased tokens `single`/`dual` resolve; anything else
+    /// (absent → `None`, empty, or an unknown/typo'd value) is [`Unresolved`].
+    /// (RED: this fn is not yet consulted by the poller, which still collapses to
+    /// Single — see the poller mapping test.)
+    // WIP checkpoint: allow until GREEN wires the poller to call this.
+    #[allow(dead_code)]
+    pub fn parse_fail_closed(raw: Option<&str>) -> ReviewClass {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("single") => ReviewClass::Single,
+            Some("dual") => ReviewClass::Dual,
+            _ => ReviewClass::Unresolved,
         }
     }
 }
