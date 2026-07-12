@@ -404,8 +404,10 @@ fn main() {
     )
     .unwrap();
     // Build products are gitignored so the build itself never reads dirty —
-    // the "exclude target loops" boundary.
-    std::fs::write(repo.join(".gitignore"), "/target-fixture\n").unwrap();
+    // the "exclude target loops" boundary. Cargo.lock: cargo writes it before
+    // the build script runs, so an untracked lockfile would dirty the very
+    // first build.
+    std::fs::write(repo.join(".gitignore"), "/target-fixture\nCargo.lock\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "--no-gpg-sign", "-m", "fixture"]);
     let head = git(&repo, &["rev-parse", "HEAD"]).to_lowercase();

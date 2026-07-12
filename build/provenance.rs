@@ -49,8 +49,9 @@ pub fn resolve_identity(
             };
         }
         warnings.push(format!(
-            "AGEND_BUILD_COMMIT is not a full 40/64-hex commit SHA (got `{raw}`); \
-             falling back to the git probe"
+            "AGEND_BUILD_COMMIT is not a full 40/64-hex commit SHA (got `{}`); \
+             falling back to the git probe",
+            sanitize_for_warning(raw)
         ));
     }
     if let Some((sha, dirty)) = probe() {
@@ -65,6 +66,22 @@ pub fn resolve_identity(
         dirty: false,
         warnings,
     }
+}
+
+/// Bound, single-line rendering of an untrusted env value for `cargo:warning`
+/// output. Control characters (esp. `\n`/`\r`) are replaced — cargo parses
+/// each build-script stdout LINE as a directive, so a raw multiline echo
+/// would let a crafted value inject e.g. a forged `cargo:rustc-env=`.
+pub fn sanitize_for_warning(raw: &str) -> String {
+    let mut s: String = raw
+        .chars()
+        .take(80)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if raw.chars().count() > 80 {
+        s.push('…');
+    }
+    s
 }
 
 /// Run git in `dir`, returning trimmed stdout on success and `None` on any
@@ -83,28 +100,41 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// Worktree-safe git probe: `git rev-parse HEAD` in `dir` (works in linked
-/// worktrees and detached HEAD) + dirtiness via `git status --porcelain -uno`
-/// (tracked files only). Any git failure — including a status failure after a
-/// successful rev-parse — returns `None` (unknown), never a false-clean
+/// worktrees and detached HEAD) + dirtiness via `git status --porcelain` —
+/// tracked modifications AND non-ignored untracked files both count (r1: the
+/// initial `-uno` hid untracked files, a false-clean); gitignored build
+/// products never count. Any git failure — including a status failure after
+/// a successful rev-parse — returns `None` (unknown), never a false-clean
 /// identity.
 pub fn git_probe(dir: &Path) -> Option<(String, bool)> {
     let sha = git_out(dir, &["rev-parse", "HEAD"])?.to_ascii_lowercase();
     if !valid_full_sha(&sha) {
         return None;
     }
-    let status = git_out(dir, &["status", "--porcelain", "--untracked-files=no"])?;
+    let status = git_out(dir, &["status", "--porcelain"])?;
     Some((sha, !status.is_empty()))
 }
 
-/// Worktree-safe `cargo:rerun-if-changed` trigger paths: the per-worktree HEAD
-/// file (`git rev-parse --git-path HEAD` — NOT `<dir>/.git/HEAD`, which does not
-/// exist in a worktree where `.git` is a pointer file), the current branch's
-/// loose ref file (absent when detached or packed), and `packed-refs` (absent
-/// until refs are packed). Only paths that exist are returned — cargo re-runs
-/// the build script on EVERY build when a registered trigger path is missing.
-/// Residual: a loose ref that later becomes packed loses its trigger until the
-/// next rebuild re-registers paths; identity staleness in that window is a
-/// dev-build cosmetic, accepted for slice α.
+/// Worktree-safe `cargo:rerun-if-changed` trigger paths:
+///
+/// - git metadata — the per-worktree HEAD file (`git rev-parse --git-path
+///   HEAD`; NOT `<dir>/.git/HEAD`, which does not exist in a worktree where
+///   `.git` is a pointer file), the current branch's loose ref file (absent
+///   when detached or packed), and `packed-refs` (absent until refs are
+///   packed);
+/// - TRACKED files (`git ls-files`, regular files only) — r1: without these,
+///   a tracked edit with no HEAD movement rebuilt the crate WITHOUT
+///   re-running the build script, baking a stale clean identity into the
+///   incremental build (false-clean). Build products stay excluded by
+///   construction: they are untracked/gitignored, and gitlink directory
+///   entries are filtered by the is_file() check — no target-loop.
+///
+/// Only paths that exist are returned — cargo re-runs the build script on
+/// EVERY build when a registered trigger path is missing. Residuals, accepted
+/// for slice α: a loose ref that later becomes packed loses its trigger until
+/// the next rebuild re-registers paths; an untracked-only change (new file,
+/// nothing tracked touched) has no trigger to fire — its dirtiness lands on
+/// the next build-script run, not instantly.
 pub fn rerun_paths(dir: &Path) -> Vec<PathBuf> {
     // `--git-path` output is relative to the invocation cwd when possible;
     // since every git call runs with `current_dir(dir)`, join relative paths
@@ -140,6 +170,18 @@ pub fn rerun_paths(dir: &Path) -> Vec<PathBuf> {
         let packed = absolutize(packed);
         if packed.exists() {
             v.push(packed);
+        }
+    }
+    // r1: tracked files, NUL-delimited (paths may contain anything but NUL).
+    // is_file() drops deleted-but-tracked entries and gitlink (submodule)
+    // directory entries — registering a directory would make cargo watch its
+    // whole tree.
+    if let Some(tracked) = git_out(dir, &["ls-files", "-z"]) {
+        for rel in tracked.split('\0').filter(|s| !s.is_empty()) {
+            let p = dir.join(rel);
+            if p.is_file() {
+                v.push(p);
+            }
         }
     }
     v
