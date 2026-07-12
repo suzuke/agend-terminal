@@ -331,7 +331,11 @@ mod tests {
         // Clear global runtime config to defaults to prevent test contamination
         let temp_dir = std::env::temp_dir().join("agend-test-clean-alert");
         std::fs::create_dir_all(&temp_dir).ok();
-        std::fs::write(temp_dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
         crate::runtime_config::reload(&temp_dir);
         std::fs::remove_dir_all(&temp_dir).ok();
 
@@ -356,7 +360,11 @@ mod tests {
         // Clean up global config back to default
         let temp_dir = std::env::temp_dir().join("agend-test-clean-alert");
         std::fs::create_dir_all(&temp_dir).ok();
-        std::fs::write(temp_dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
         crate::runtime_config::reload(&temp_dir);
         std::fs::remove_dir_all(&temp_dir).ok();
     }
