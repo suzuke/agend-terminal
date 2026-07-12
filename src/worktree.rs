@@ -654,11 +654,13 @@ impl WipPreservation {
 ///    (READ-ONLY — never `add`/`read-tree`/`reset` the live index); `worktree_tree`
 ///    = the working tree snapshotted through a TEMP index
 ///    ([`snapshot_worktree_tree`]) so the live index stays byte-identical.
-///  - Classification: a dirty `status` where BOTH `index_tree == head_tree` AND
-///    `worktree_tree == head_tree` ⟺ the only residual dirt is a submodule's
-///    INTERNAL working tree (gitlinks unchanged) — a parent recovery commit would
-///    capture nothing, so minting one is a false "preserved" that silently loses
-///    the nested WIP on removal. Refuse (`UnpreservableNestedDirty`) instead.
+///  - Classification: if the recursive nested walk finds ANY submodule with
+///    INTERNAL working-tree dirt (`m`/`u`, gitlink unchanged) — sole OR mixed with
+///    parent dirt — a parent recovery commit cannot capture it (`git add -A`
+///    records the gitlink, not the submodule's internal edits), so minting one is a
+///    false "preserved" that silently loses the nested WIP on removal. Refuse
+///    (`UnpreservableNestedDirty`) instead. A pure gitlink MOVE (`SC..`) is NOT
+///    internal dirt and stays preservable.
 ///  - Otherwise PRESERVE: anchor a commit whose tree = `worktree_tree` to a ref in
 ///    the SHARED object/ref store (survives the worktree-dir removal). When the
 ///    STAGED tree differs from BOTH HEAD and the working tree, it is captured as a
@@ -728,18 +730,30 @@ pub(crate) fn preserve_dirty_worktree(
             return WipPreservation::Blocked(e);
         }
     };
-    // Classification: dirty `status`, yet BOTH the live-index tree AND the working
-    // tree snapshot equal HEAD ⟺ the only dirt is submodule-internal (gitlinks
-    // unchanged) — UNPRESERVABLE by a parent ref. Refuse + emit a serialized,
-    // de-duped actionable notice; the caller MUST NOT remove the worktree.
-    if index_tree == head_tree && worktree_tree == head_tree {
-        let nested = enumerate_nested_dirty(wt_path);
+    // Classification (R5 data-safety, 2nd-seat blocker @ fc8481d3): ANY nested-
+    // submodule INTERNAL dirt (a submodule's own modified/untracked content, gitlink
+    // unchanged) is UNPRESERVABLE by a parent snapshot — `git add -A` records the
+    // gitlink, NEVER the submodule's internal edits — WHETHER OR NOT parent dirt
+    // co-occurs. Detect it DIRECTLY via the recursive walk (which excludes a
+    // preservable gitlink MOVE, `SC..`) and refuse fail-closed + emit a serialized,
+    // de-duped notice; the caller MUST NOT remove the worktree.
+    //
+    // The prior `index_tree == head_tree && worktree_tree == head_tree` proxy caught
+    // ONLY the sole-nested case; any co-occurring parent dirt made `worktree_tree !=
+    // HEAD`, skipped the refusal, and the preserve path below then snapshotted the
+    // gitlink only → the nested WIP was SILENTLY LOST on removal. A non-empty walk —
+    // including an explicit `[truncated:/skipped:]` can't-enumerate line — is treated
+    // as "nested dirt present" → fail-closed. (Trees are still computed above so an
+    // unmerged live index / snapshot failure keeps its `Blocked` precedence.)
+    let nested = enumerate_nested_dirty(wt_path);
+    if !nested.is_empty() {
         notify_unpreservable_nested_dirty(home, agent, branch, wt_path, &nested, sender);
         tracing::warn!(agent, branch,
-            "preserve dirty WIP: only submodule-internal dirt (unpreservable by a parent ref) — refusing removal (fail-closed)");
+            "preserve dirty WIP: nested submodule-internal dirt present (unpreservable by a parent ref — sole or mixed with parent dirt) — refusing removal (fail-closed)");
         return WipPreservation::UnpreservableNestedDirty(
-            "dirty worktree but both live-index and working-tree snapshots == HEAD \
-             (only submodule-internal dirt); refused removal to preserve nested WIP in place"
+            "worktree has uncommitted changes inside a nested submodule's working tree \
+             (gitlink unchanged); a parent recovery ref cannot capture them, so removal was \
+             refused to preserve the nested WIP in place"
                 .into(),
         );
     }
@@ -1215,10 +1229,11 @@ fn unpreservable_nested_dirty_notice(
 ) -> String {
     let wt = wt_path.display();
     format!(
-        "Agent `{agent}` could NOT release its worktree `{wt}` (branch `{branch}`): its \
-         ONLY uncommitted changes live INSIDE a nested submodule's working tree — the gitlink \
-         is unchanged, so a parent recovery ref CANNOT capture them. The release was REFUSED \
-         (fail-closed) to avoid silently losing this nested WIP.\nDirty nested content:\n\
+        "Agent `{agent}` could NOT release its worktree `{wt}` (branch `{branch}`): it has \
+         uncommitted changes INSIDE a nested submodule's working tree — the gitlink \
+         is unchanged, so a parent recovery ref CANNOT capture them (any co-occurring parent \
+         changes are NOT preserved either; the release was REFUSED whole to avoid silently \
+         losing the nested WIP).\nDirty nested content:\n\
          {nested_status}\nResolve it IN PLACE (the worktree still exists), then release again:\n\
          1) commit or stash INSIDE the affected submodule, OR\n\
          2) discard it: cd {wt} && git submodule foreach 'git checkout -- . && git clean -fdx'\n\
