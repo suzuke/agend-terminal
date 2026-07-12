@@ -1474,6 +1474,110 @@ mod tests {
         );
     }
 
+    /// #2744 T1 (§3.9 persistence replay): MCP set_model → fleet.yaml →
+    /// the real SPAWN entry (restart wire shape: params.backend carries the
+    /// resolved command) → child argv, for all six declared backends. Pins
+    /// per-backend value normalization (opencode provider prefix).
+    #[cfg(unix)]
+    #[test]
+    fn set_model_write_restart_argv_replay_all_backends_2744() {
+        let cases = [
+            ("claude", "claude-opus-4-8", "--model claude-opus-4-8"),
+            ("codex", "gpt-5.5", "--model gpt-5.5"),
+            ("kiro-cli", "claude-sonnet-4.5", "--model claude-sonnet-4.5"),
+            ("opencode", "opus", "--model anthropic/opus"),
+            ("agy", "gemini-3-pro", "--model gemini-3-pro"),
+            ("grok", "grok-4.5", "--model grok-4.5"),
+        ];
+        for (backend, model, want) in cases {
+            let tag = format!("setmodel-replay-{backend}");
+            let (ctx, home) = env_test_ctx(&tag);
+            let sentinel = home.join("sentinel.txt");
+            let script = write_argv_capture_script(&home, &sentinel);
+            std::fs::write(
+                crate::fleet::fleet_yaml_path(&home),
+                format!("instances:\n  seat:\n    backend: {backend}\n"),
+            )
+            .expect("write fleet.yaml");
+
+            let r = crate::mcp::handlers::instance_state::set_model::handle_set_model(
+                &home,
+                &json!({"instance": "seat", "model": model}),
+                &None,
+            );
+            assert_eq!(r["persisted"], true, "{backend}: must persist, got {r}");
+
+            let result = handle_spawn(
+                &json!({
+                    "name": "seat",
+                    "backend": "/bin/sh",
+                    "args": script.display().to_string(),
+                }),
+                &ctx,
+            );
+            assert_eq!(
+                result["ok"], true,
+                "{backend}: spawn must succeed: {result}"
+            );
+            let actual = await_sentinel_nonempty(&sentinel);
+            cleanup_agent(&ctx, "seat");
+            let _ = std::fs::remove_dir_all(&home);
+            assert_eq!(
+                actual.as_deref(),
+                Some(want),
+                "{backend}: persisted model must reach the spawned argv"
+            );
+        }
+    }
+
+    /// #2744 T9: an external (operator hand-)edit of fleet.yaml AFTER a
+    /// set_model write is honoured by the next SPAWN — the handler re-reads
+    /// disk at the boundary (#2038); set_model leaves no cached intent.
+    #[cfg(unix)]
+    #[test]
+    fn set_model_then_external_edit_reload_2744() {
+        let (ctx, home) = env_test_ctx("setmodel-external-edit");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  seat:\n    backend: claude\n",
+        )
+        .expect("write fleet.yaml");
+
+        let r = crate::mcp::handlers::instance_state::set_model::handle_set_model(
+            &home,
+            &json!({"instance": "seat", "model": "model-from-tool"}),
+            &None,
+        );
+        assert_eq!(r["persisted"], true, "got {r}");
+
+        // Operator hand-edit AFTER the tool write (keep the entry shape).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  seat:\n    backend: claude\n    model: model-hand-edited\n",
+        )
+        .expect("external edit");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "seat",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "seat");
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-hand-edited"),
+            "the external edit must win on the next spawn (disk re-read)"
+        );
+    }
+
     /// #2038 ingress 2 (deploy Phase 3 / args-less SPAWN shape) — SPAWN
     /// params omit `args` entirely; handle_spawn MUST fall back to the
     /// fleet entry's resolved `args` AND append its `model`. Pre-fix an

@@ -226,6 +226,65 @@ pub fn update_instance_field(
     Ok(persisted)
 }
 
+/// #2744: multi-field companion to [`update_instance_field`] — sets and
+/// REMOVES keys on one instance entry inside a SINGLE lock/write transaction
+/// (set_model's atomic mutual clearing: a concurrent resolve must never see
+/// `model` and `model_tier` both present mid-update). Same skip semantics:
+/// `Ok(false)` + warn when the file/section/entry is missing — callers MUST
+/// escalate that to a hard error, never ignore it.
+pub fn update_instance_fields(
+    home: &Path,
+    name: &str,
+    set: &[(&str, serde_yaml_ng::Value)],
+    remove: &[&str],
+) -> Result<bool> {
+    let fleet_path = fleet_yaml_path(home);
+    if !fleet_path.exists() {
+        tracing::warn!(
+            instance = name,
+            reason = "fleet_yaml_missing",
+            "update_instance_fields skipped — silent no-op detected"
+        );
+        return Ok(false);
+    }
+    let mut persisted = false;
+    let mut skip_reason: Option<&'static str> = None;
+    mutate_fleet_yaml(home, "", |doc| {
+        let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) else {
+            skip_reason = Some("instances_section_missing");
+            return Ok(false);
+        };
+        let key = serde_yaml_ng::Value::String(name.to_string());
+        let Some(inst_val) = instances.get_mut(&key) else {
+            skip_reason = Some("instance_entry_missing");
+            return Ok(false);
+        };
+        let Some(inst) = inst_val.as_mapping_mut() else {
+            skip_reason = Some("instance_entry_not_mapping");
+            return Ok(false);
+        };
+        for (field, value) in set {
+            inst.insert(
+                serde_yaml_ng::Value::String((*field).to_string()),
+                value.clone(),
+            );
+        }
+        for field in remove {
+            inst.remove(serde_yaml_ng::Value::String((*field).to_string()));
+        }
+        persisted = true;
+        Ok(true)
+    })?;
+    if !persisted {
+        tracing::warn!(
+            instance = name,
+            reason = skip_reason.unwrap_or("unknown"),
+            "update_instance_fields skipped — silent no-op detected"
+        );
+    }
+    Ok(persisted)
+}
+
 fn team_config_to_mapping(config: &TeamConfig) -> serde_yaml_ng::Mapping {
     let mut team = serde_yaml_ng::Mapping::new();
     let members_seq: Vec<serde_yaml_ng::Value> = config

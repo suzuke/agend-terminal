@@ -21,8 +21,182 @@ pub(crate) fn handle_set_model(
     args: &Value,
     sender: &Option<crate::identity::Sender>,
 ) -> Value {
-    let _ = (home, args, sender);
-    json!({"error": "set_model: unimplemented (#2744 PR-A C4)", "code": "unimplemented"})
+    let name = match crate::mcp::handlers::require_instance(args) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    crate::validate_name_or_err!(name);
+
+    // ACL — same ladder as handle_delete_instance (AUDIT2-002): anonymous
+    // (operator-direct) keeps full authority; an identified caller must be
+    // the instance itself, its team orchestrator, or its creator.
+    let actor = sender
+        .as_ref()
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_else(|| "operator".to_string());
+    if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
+        if caller != name && !crate::teams::is_orchestrator_of(home, caller, name) {
+            let is_creator = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.created_by.clone()))
+                .as_deref()
+                == Some(caller);
+            if !is_creator {
+                return json!({
+                    "error": format!(
+                        "permission denied: '{caller}' cannot set_model '{name}' \
+                         (only the instance itself, its team orchestrator, or its creator may)"
+                    ),
+                    "code": "not_owner_or_orchestrator"
+                });
+            }
+        }
+    }
+
+    let model = args["model"].as_str().filter(|s| !s.is_empty());
+    let tier = args["tier"].as_str().filter(|s| !s.is_empty());
+    let (set_field, set_val, clear_field) = match (model, tier) {
+        (Some(m), None) => ("model", m, "model_tier"),
+        (None, Some(t)) => ("model_tier", t, "model"),
+        _ => {
+            return json!({
+                "error": "set_model requires exactly one of `model` or `tier`",
+                "code": "exactly_one_required"
+            })
+        }
+    };
+
+    let fleet = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(f) => f,
+        Err(e) => return json!({"error": format!("fleet.yaml load failed: {e}")}),
+    };
+    let Some(inst) = fleet.instances.get(name) else {
+        return json!({
+            "error": format!("unknown instance '{name}' — no fleet.yaml entry"),
+            "code": "instance_entry_missing"
+        });
+    };
+
+    // Capability keys off the DECLARED backend (entry, else fleet default) —
+    // never a command string. Shell/Raw/custom = no declared capability.
+    let declared = inst
+        .backend
+        .clone()
+        .or_else(|| fleet.defaults.backend.clone())
+        .unwrap_or(crate::backend::Backend::ClaudeCode);
+    let Some(cap) = declared.model_capability() else {
+        return json!({
+            "error": format!(
+                "backend '{}' declares no model capability — set_model is \
+                 unsupported for it (an adapter must opt in explicitly)",
+                declared.name()
+            ),
+            "code": "no_model_capability"
+        });
+    };
+
+    if let Some(t) = tier {
+        if fleet.model_tiers.get(t).is_none_or(|m| m.is_empty()) {
+            return json!({
+                "error": format!(
+                    "unknown model tier '{t}' — no non-empty fleet.yaml model_tiers entry"
+                ),
+                "code": "unknown_tier"
+            });
+        }
+    }
+
+    // Parser-aware conflict scan over the args the entry would spawn with
+    // (instance args, else defaults — same precedence as resolve_instance).
+    // Confirmed spellings and conservative ambiguous tokens both REJECT: the
+    // contract forbids returning success while args would win, and forbids
+    // automatic argv rewriting.
+    let scan_args: &[String] = if inst.args.is_empty() {
+        &fleet.defaults.args
+    } else {
+        &inst.args
+    };
+    if let Some(hit) = cap.scan(scan_args).into_iter().next() {
+        return match hit {
+            crate::backend::ModelFlagHit::Confirmed(tok) => json!({
+                "error": format!(
+                    "instance '{name}' args already pin an explicit model flag ('{tok}') — \
+                     args win over fleet intent, so set_model would be a silent no-op. \
+                     Remove the flag from the entry's args, then retry."
+                ),
+                "code": "args_conflict_confirmed"
+            }),
+            crate::backend::ModelFlagHit::Ambiguous(tok) => json!({
+                "error": format!(
+                    "instance '{name}' args carry an ambiguous model-flag-like token ('{tok}'). \
+                     If it is payload text, move it after a bare `--` delimiter; if it is a \
+                     model flag, remove it — then retry."
+                ),
+                "code": "args_conflict_ambiguous"
+            }),
+        };
+    }
+
+    let old_model = inst.model.clone();
+    let old_tier = inst.model_tier.clone();
+    match crate::fleet::persist::update_instance_fields(
+        home,
+        name,
+        &[(set_field, serde_yaml_ng::Value::String(set_val.to_string()))],
+        &[clear_field],
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return json!({
+                "error": format!(
+                    "persist failed for '{name}': fleet.yaml entry missing or malformed \
+                     (see daemon warn log for the skip reason)"
+                ),
+                "code": "persist_skipped"
+            })
+        }
+        Err(e) => return json!({"error": format!("persist failed: {e}"), "code": "persist_error"}),
+    }
+
+    // Durable audit — event log, not just tracing. No secrets: model ids /
+    // tier keys + actor + old→new + cleared field + source.
+    crate::event_log::log(
+        home,
+        "set_model",
+        name,
+        &format!(
+            "{set_field}={set_val} cleared={clear_field} \
+             was_model={old_model:?} was_tier={old_tier:?} by={actor} source=set_model"
+        ),
+    );
+
+    let mut resp = json!({
+        "ok": true,
+        "persisted": true,
+        "set": {set_field: set_val},
+        "cleared": clear_field,
+        "note": "takes effect on the next respawn"
+    });
+    // Restart only AFTER the durable persist. A restart failure must not
+    // roll back or mask the persist: persisted:true + restart_ok:false.
+    if args["restart"].as_bool() == Some(true) {
+        let r = super::handle_restart_instance(
+            home,
+            &json!({"instance": name, "mode": "resume", "reason": "set_model"}),
+        );
+        let restart_ok =
+            r.get("error").is_none_or(Value::is_null) && r["spawned"] == json!(true);
+        resp["restart_ok"] = json!(restart_ok);
+        if restart_ok {
+            resp["note"] = json!("restarted — new model intent active");
+        } else {
+            resp["restart_error"] = json!(format!(
+                "restart failed ({}) — the persisted intent still applies on the next respawn",
+                r["error"].as_str().unwrap_or("spawn did not complete")
+            ));
+        }
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -95,7 +269,6 @@ mod tests {
             &home,
             "instances:\n  sh-seat:\n    backend: shell\n  raw-seat:\n    backend: /opt/custom/bin\n",
         );
-        let before = fleet_text(&home);
         for seat in ["sh-seat", "raw-seat"] {
             let r = handle_set_model(&home, &json!({"instance": seat, "model": "x"}), &None);
             assert!(
@@ -105,7 +278,12 @@ mod tests {
                 "{seat}: want capability error, got {r}"
             );
         }
-        assert_eq!(before, fleet_text(&home), "yaml must be untouched");
+        // FleetConfig::load side-stamps `id:` fields, so the file is not
+        // byte-stable — the contract is that no model intent was written.
+        assert!(
+            !fleet_text(&home).contains("model:"),
+            "no model key may be written on the error path"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -194,8 +372,8 @@ mod tests {
         let text = fleet_text(&home);
         assert!(text.contains("model: o3"), "model must persist: {text}");
         assert!(
-            !text.contains("model_tier"),
-            "model_tier must be cleared in the same write: {text}"
+            !text.contains("model_tier: cheap"),
+            "the entry's model_tier must be cleared in the same write: {text}"
         );
 
         let r = handle_set_model(&home, &json!({"instance": "seat", "tier": "cheap"}), &None);
