@@ -42,6 +42,13 @@
 //! only (no raw repo/reviewer/kind in the path), a per-key `.lock` sidecar, and a
 //! lock-free `.json`-filtered `list()` for the GC sweep.
 
+// #2741 slice 1 is the delivery FOUNDATION only: this module's API is exercised by
+// its own tests and is wired into production by slice 2 (the reviewer-obligation
+// reconciler, which calls `deliver_once` and `gc_stale`). Until that lands there is
+// deliberately no production caller — allow dead_code so the unwired foundation
+// builds clean; the allow is removed when slice 2 wires it.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -139,6 +146,23 @@ pub(crate) enum DeliveryError {
     RecordFailedAfterEnqueue(anyhow::Error),
 }
 
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeliveryError::EnqueueFailed(e) => {
+                write!(f, "enqueue failed (not sent; safe to retry): {e}")
+            }
+            DeliveryError::RecordFailedAfterEnqueue(e) => write!(
+                f,
+                "delivery record write failed after enqueue (message may be delivered; \
+                 retry may duplicate): {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
 fn dir(home: &Path) -> PathBuf {
     home.join("ci-delivery-ledger")
 }
@@ -161,40 +185,131 @@ fn lock_for(home: &Path, key: &DeliveryKey) -> PathBuf {
     dir(home).join(format!("{}.lock", key_hash(key)))
 }
 
-// ===================================================================
-// RED SCAFFOLDING (slice 1): stub bodies so the revised crash-matrix tests
-// compile and FAIL. Real bodies land in the GREEN commit. Helpers above are
-// real (pure/needed by tests); the three public fns are stubbed.
-// ===================================================================
-
-/// True iff a VALID delivered-key exists for this exact key. Missing / unreadable /
-/// corrupt / key-mismatched ⇒ false (eligible); corrupt content is quarantined.
-pub(crate) fn is_delivered(_home: &Path, _key: &DeliveryKey) -> bool {
-    false // RED stub
+/// Atomic whole-file write (write a sibling `.tmp`, then `rename` over the
+/// target) — mirrors `ci_handoff_track::atomic_write_track`. The caller holds the
+/// per-key lock, so the fixed `.tmp` name can't collide with a concurrent write.
+fn atomic_write_record(path: &Path, rec: &DeliveryRecord) -> std::io::Result<()> {
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    std::fs::write(&tmp, serde_json::to_vec(rec).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)
 }
 
-/// Enqueue-before-record delivery primitive under a per-key lock.
+/// Move a corrupt record out of the `.json` namespace (best-effort) so it is not
+/// re-parsed every check and stays available for inspection. Renaming to a
+/// non-`.json` sibling keeps it out of [`gc_stale`]'s `list()`.
+fn quarantine_corrupt(path: &Path) {
+    let dest = path.with_extension("corrupt");
+    if let Err(e) = std::fs::rename(path, &dest) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "ci_delivery_ledger: failed to quarantine corrupt record"
+        );
+    } else {
+        tracing::warn!(path = %path.display(), "ci_delivery_ledger: quarantined corrupt record");
+    }
+}
+
+/// True iff a VALID delivered-key exists for this exact key. Missing / unreadable
+/// ⇒ false (eligible; possibly transient). A parseable record whose key does NOT
+/// match ⇒ false (eligible; e.g. a hash-collision — full-key equality is the
+/// authority, not the path). A corrupt (unparseable) record ⇒ quarantined + false
+/// (never suppress forever merely because a path exists).
+pub(crate) fn is_delivered(home: &Path, key: &DeliveryKey) -> bool {
+    let path = file_for(home, key);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return false, // missing / unreadable (e.g. dir at path) → eligible
+    };
+    match serde_json::from_slice::<DeliveryRecord>(&bytes) {
+        Ok(rec) => rec.matches(key), // full-key + schema equality is the authority
+        Err(_) => {
+            quarantine_corrupt(&path);
+            false
+        }
+    }
+}
+
+/// Enqueue-before-record delivery primitive, under the per-key lock (which the
+/// blocking `acquire_file_lock` also uses to create `dir(home)`). Order:
+/// check → durable enqueue → record. A pre-enqueue setup/lock failure returns
+/// [`DeliveryError::EnqueueFailed`] (nothing was sent; safe to retry).
 pub(crate) fn deliver_once<F>(
-    _home: &Path,
-    _key: &DeliveryKey,
-    _now: DateTime<Utc>,
+    home: &Path,
+    key: &DeliveryKey,
+    now: DateTime<Utc>,
     enqueue: F,
 ) -> Result<DeliveryOutcome, DeliveryError>
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
-    // RED stub: runs enqueue, never locks/dedups/persists, never models record failure.
-    match enqueue() {
-        Ok(()) => Ok(DeliveryOutcome::Delivered),
-        Err(e) => Err(DeliveryError::EnqueueFailed(e)),
+    // Blocking per-key lock — serializes concurrent callers for this key and
+    // creates `dir(home)` (the lock file's parent). A failure here is pre-enqueue.
+    let _lock = crate::store::acquire_file_lock(&lock_for(home, key))
+        .map_err(DeliveryError::EnqueueFailed)?;
+
+    if is_delivered(home, key) {
+        return Ok(DeliveryOutcome::Suppressed);
     }
+
+    // Durable enqueue FIRST; a failure here means the message was not sent.
+    enqueue().map_err(DeliveryError::EnqueueFailed)?;
+
+    // Then record. A failure here is AMBIGUOUS: the message is already enqueued,
+    // so a retry may duplicate — do not classify it as "not sent".
+    let n = key.normalized();
+    let rec = DeliveryRecord {
+        schema_version: SCHEMA_VERSION,
+        repo: n.repo,
+        pr_number: n.pr_number,
+        head_sha: n.head_sha,
+        reviewer: n.reviewer,
+        kind: n.kind,
+        delivered_at: now.to_rfc3339(),
+    };
+    atomic_write_record(&file_for(home, key), &rec)
+        .map_err(|e| DeliveryError::RecordFailedAfterEnqueue(e.into()))?;
+    Ok(DeliveryOutcome::Delivered)
 }
 
 /// TTL reap: delete delivered-keys whose `delivered_at` is older than
-/// [`ledger_retention`]. Takes the per-key lock before deleting (no TOCTOU vs a
-/// concurrent [`deliver_once`]).
-pub(crate) fn gc_stale(_home: &Path, _now: DateTime<Utc>) {
-    // RED stub: no-op.
+/// [`ledger_retention`]. Takes the same per-key lock as [`deliver_once`] before
+/// deleting (no TOCTOU vs a concurrent delivery). Best-effort; never panics.
+pub(crate) fn gc_stale(home: &Path, now: DateTime<Utc>) {
+    let d = dir(home);
+    let entries = match std::fs::read_dir(&d) {
+        Ok(e) => e,
+        Err(_) => return, // no ledger dir yet → nothing to reap
+    };
+    let cutoff = now - ledger_retention();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue; // skip .lock / .tmp / .corrupt
+        }
+        // Take the per-key lock (same hash prefix as the .json) before mutating.
+        let lock_path = path.with_extension("lock");
+        let _lock = crate::store::acquire_file_lock(&lock_path).ok();
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(rec) = serde_json::from_slice::<DeliveryRecord>(&bytes) else {
+            continue; // corrupt → left for is_delivered to quarantine
+        };
+        let expired = chrono::DateTime::parse_from_rfc3339(&rec.delivered_at)
+            .map(|dt| dt.with_timezone(&Utc) < cutoff)
+            .unwrap_or(false);
+        if expired {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), error = %e, "ci_delivery_ledger: gc remove failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -277,20 +392,24 @@ mod tests {
 
     /// Record-write failure AFTER a successful enqueue returns the distinct
     /// ambiguous-delivery error (message may already be out; no key written).
-    /// Forced deterministically by making the ledger dir a FILE so the record
-    /// write cannot create its directory.
+    /// Forced deterministically by pre-creating the destination record path as a
+    /// DIRECTORY so the tmp→rename cannot land, while dir(home) exists so the lock
+    /// + enqueue still run.
     #[test]
     fn record_failure_after_enqueue_is_distinct_error() {
         let home = tmp_home("rfail");
-        // ledger dir path is a FILE → any record write fails, enqueue still runs.
-        std::fs::write(dir(&home), b"not a dir").unwrap();
         let k = key("h0", "codex-125550");
+        std::fs::create_dir_all(file_for(&home, &k)).unwrap();
         let calls = Cell::new(0u32);
         let out = deliver_once(&home, &k, t(NOW), || {
             calls.set(calls.get() + 1);
             Ok(())
         });
-        assert_eq!(calls.get(), 1, "enqueue must have run");
+        assert_eq!(
+            calls.get(),
+            1,
+            "enqueue must have run before the record write"
+        );
         assert!(matches!(
             out,
             Err(DeliveryError::RecordFailedAfterEnqueue(_))
