@@ -826,6 +826,164 @@ fn preserve_blocks_commitless_embedded_git_repo() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// (5d) P4 (reviewer5 r6 re-verdict): the embedded-repo class ONE LEVEL DEEPER.
+/// `git status` collapses an entirely-untracked TREE to a single `?? junk/` row, so
+/// an embedded repo at `junk/deep/repo/` never gets its own row and the r6 depth-1
+/// `<junk>/.git` check misses it → Preserved + ref minted → the same silent-loss
+/// invariant at depth ≥2. The r7 `--untracked-files=all` walk lists the deep embed
+/// as its own row (git never descends INTO a foreign repo), so it refuses. RED at
+/// 27c4063a.
+#[cfg(unix)]
+#[test]
+fn preserve_refuses_deep_untracked_embedded_git_repo() {
+    let home = tmp_home("embed-deep");
+    let repo = tmp_repo_with_file("embed-deep", "f.txt", "base\n");
+    commit_marker_gitignore(&repo);
+    let info = create(&home, &repo, "agent1", Some("feat/embed-deep")).expect("worktree");
+    // Embedded repo TWO levels down inside an otherwise-untracked tree.
+    let embed = info.path.join("junk/deep/repo");
+    std::fs::create_dir_all(&embed).unwrap();
+    git_run_ok(&embed, &["init", "-b", "main"], false);
+    std::fs::write(embed.join("committed.txt"), b"committed\n").unwrap();
+    git_run_ok(&embed, &["add", "committed.txt"], false);
+    git_run_ok(
+        &embed,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "embed init",
+        ],
+        false,
+    );
+    let wip = embed.join("wip.txt");
+    std::fs::write(&wip, b"DEEP embedded WIP\n").unwrap();
+
+    let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/embed-deep", None);
+    assert_eq!(
+        pres_kind(&outcome),
+        "UnpreservableNestedDirty",
+        "a deep untracked embedded git repo must refuse (depth >=2 still unpreservable)"
+    );
+    assert!(outcome.blocked_reason().is_some());
+    assert!(recovery_ref_names(&repo, "feat/embed-deep").is_empty());
+    assert_eq!(
+        std::fs::read(&wip).unwrap(),
+        b"DEEP embedded WIP\n",
+        "the deep embedded WIP must survive on disk"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// (5e) BOUNDARY (documented, disposition a2): an embedded repo inside a
+/// GITIGNORE'd dir is OUT of the no-silent-loss contract. `git status` (and thus the
+/// walk, even with `-uall`) never lists ignored paths, and `git add -A` never
+/// captures them — so NO gitlink is recorded and NO recovery ref falsely claims to
+/// preserve it. Ignored content is universal accepted-loss on every release path
+/// (a plain ignored file is dropped on removal identically); preserving it would be
+/// an ignore-semantics change, not this data-safety fix. This test PINS that
+/// boundary: ignored embed (sole "dirt") ⇒ Clean (no dirt visible, safe remove),
+/// and NO recovery ref is minted for it (no false-preserved claim).
+#[cfg(unix)]
+#[test]
+fn preserve_ignored_dir_embedded_repo_is_out_of_contract_no_false_ref() {
+    let home = tmp_home("embed-ignored");
+    let repo = tmp_repo_with_file("embed-ignored", "f.txt", "base\n");
+    commit_marker_gitignore(&repo);
+    let info = create(&home, &repo, "agent1", Some("feat/embed-ign")).expect("worktree");
+    // gitignore the dir, then embed a repo inside it with WIP.
+    std::fs::write(info.path.join(".gitignore"), b"/junk/\n").unwrap();
+    git_run_ok(&info.path, &["add", ".gitignore"], false);
+    git_run_ok(
+        &info.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "ignore junk",
+        ],
+        false,
+    );
+    let embed = info.path.join("junk/repo");
+    std::fs::create_dir_all(&embed).unwrap();
+    git_run_ok(&embed, &["init", "-b", "main"], false);
+    std::fs::write(embed.join("committed.txt"), b"c\n").unwrap();
+    git_run_ok(&embed, &["add", "committed.txt"], false);
+    git_run_ok(
+        &embed,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "e",
+        ],
+        false,
+    );
+    std::fs::write(embed.join("wip.txt"), b"ignored embedded WIP\n").unwrap();
+
+    let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/embed-ign", None);
+    // Ignored content is invisible to `git status` ⇒ no preservable dirt ⇒ Clean.
+    assert_eq!(
+        pres_kind(&outcome),
+        "Clean",
+        "ignored content is invisible to git status ⇒ nothing to preserve (documented boundary)"
+    );
+    // The load-bearing property: no recovery ref falsely claims the ignored embed.
+    assert!(
+        recovery_ref_names(&repo, "feat/embed-ign").is_empty(),
+        "no recovery ref may be minted for ignored content (no false-preserved claim)"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// (5f) B (symlink probe): a symlink to a git repo OUTSIDE the worktree root must
+/// fail-closed via the canonicalize+containment guard (escape ⇒ `[skipped:
+/// containment]` line ⇒ non-empty walk ⇒ refuse), never a false Preserve. Proves the
+/// embedded-repo detection can't be dodged by pointing a symlink out of the tree.
+#[cfg(unix)]
+#[test]
+fn preserve_refuses_symlink_to_out_of_root_embedded_repo() {
+    let home = tmp_home("embed-symlink");
+    let repo = tmp_repo_with_file("embed-symlink", "f.txt", "base\n");
+    commit_marker_gitignore(&repo);
+    let info = create(&home, &repo, "agent1", Some("feat/embed-sym")).expect("worktree");
+    // A real git repo OUTSIDE the worktree (under the test home, not the worktree).
+    let outside = home.join("outside-repo");
+    std::fs::create_dir_all(&outside).unwrap();
+    git_run_ok(&outside, &["init", "-b", "main"], false);
+    std::fs::write(outside.join("wip.txt"), b"outside WIP\n").unwrap();
+    // Symlink it into the worktree (untracked).
+    std::os::unix::fs::symlink(&outside, info.path.join("linked-repo")).unwrap();
+
+    let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/embed-sym", None);
+    assert_ne!(
+        pres_kind(&outcome),
+        "Preserved",
+        "a symlink to an out-of-root repo must not be falsely Preserved (fail-closed)"
+    );
+    assert!(
+        outcome.blocked_reason().is_some(),
+        "must be fail-closed (refuse / retain)"
+    );
+    assert!(recovery_ref_names(&repo, "feat/embed-sym").is_empty());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// (6) An UNMERGED live index makes `git write-tree` fail ⇒ `Blocked`
 /// (fail-closed), no ref. Planted deterministically via `update-index
 /// --index-info` with stage 1/2/3 entries for one path.
