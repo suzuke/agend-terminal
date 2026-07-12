@@ -359,10 +359,10 @@ fn rerun_paths_empty_outside_any_repo() {
 /// The exact false-clean sequence, driven through REAL cargo builds of a
 /// hermetic fixture crate whose build.rs `include!`s the SAME provenance.rs
 /// under test: clean build shows the sha; a TRACKED edit without any HEAD
-/// move must flip the baked identity to dirty on the next cached build; a
-/// revert must flip it back to clean. r0 failed the middle step (build.rs
-/// watched only git metadata, so the incremental rebuild kept the stale
-/// clean identity).
+/// move must flip the baked identity to dirty on the next cached build;
+/// committing the edit must re-stamp clean at the NEW head. r0 failed the
+/// middle step (build.rs watched only git metadata, so the incremental
+/// rebuild kept the stale clean identity).
 #[test]
 fn cached_build_refreshes_dirty_without_head_move() {
     let repo = init_repo("nested-cargo");
@@ -406,8 +406,14 @@ fn main() {
     // Build products are gitignored so the build itself never reads dirty —
     // the "exclude target loops" boundary. Cargo.lock: cargo writes it before
     // the build script runs, so an untracked lockfile would dirty the very
-    // first build.
-    std::fs::write(repo.join(".gitignore"), "/target-fixture\nCargo.lock\n").unwrap();
+    // first build. *.profraw: a coverage-instrumented outer environment can
+    // leak instrumentation into the fixture binary (CI Coverage job), whose
+    // exit then drops an untracked profile next to the sources.
+    std::fs::write(
+        repo.join(".gitignore"),
+        "/target-fixture\nCargo.lock\n*.profraw\n",
+    )
+    .unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "--no-gpg-sign", "-m", "fixture"]);
     let head = git(&repo, &["rev-parse", "HEAD"]).to_lowercase();
@@ -417,10 +423,13 @@ fn main() {
             .args(["run", "-q"])
             .current_dir(repo)
             // Hermetic vs the outer test invocation: coverage/instrumentation
-            // flags must not leak into the fixture build.
+            // flags and wrappers must not leak into the fixture build.
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("LLVM_PROFILE_FILE")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_LLVM_COV")
             .env("CARGO_TARGET_DIR", repo.join("target-fixture"))
             .output()
             .expect("nested cargo run");
@@ -432,10 +441,12 @@ fn main() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
 
+    let step1 = run_fixture(&repo);
     assert_eq!(
-        run_fixture(&repo),
+        step1,
         format!("0.1.0 (build {head})"),
-        "clean cached build must bake the exact HEAD, clean"
+        "clean cached build must bake the exact HEAD, clean; status: {:?}",
+        git(&repo, &["status", "--porcelain"])
     );
     // Tracked edit, NO HEAD movement — the r0 false-clean scenario.
     std::fs::write(
@@ -443,16 +454,27 @@ fn main() {
         "fn main() {\n    println!(\"{}\", env!(\"FIXTURE_CLI\"));\n    // edited\n}\n",
     )
     .unwrap();
+    let step2 = run_fixture(&repo);
     assert_eq!(
-        run_fixture(&repo),
+        step2,
         format!("0.1.0 (build {head} dirty)"),
-        "a tracked edit without HEAD move must flip the cached build to dirty"
+        "a tracked edit without HEAD move must flip the cached build to dirty; status: {:?}",
+        git(&repo, &["status", "--porcelain"])
     );
-    git(&repo, &["checkout", "--", "src/main.rs"]);
+    // Committing the edit returns to clean at the NEW head — the commit
+    // advances the branch ref (a git-written trigger file with a fresh
+    // mtime), so the re-stamp does not depend on worktree-file mtime
+    // granularity vs cargo's fingerprint.
+    git(&repo, &["add", "src/main.rs"]);
+    git(&repo, &["commit", "-q", "--no-gpg-sign", "-m", "c2"]);
+    let head2 = git(&repo, &["rev-parse", "HEAD"]).to_lowercase();
+    assert_ne!(head2, head, "commit must advance HEAD");
+    let step3 = run_fixture(&repo);
     assert_eq!(
-        run_fixture(&repo),
-        format!("0.1.0 (build {head})"),
-        "reverting the edit must flip the cached build back to clean"
+        step3,
+        format!("0.1.0 (build {head2})"),
+        "committing the edit must re-stamp clean at the new HEAD; status: {:?}",
+        git(&repo, &["status", "--porcelain"])
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
