@@ -2407,6 +2407,219 @@ mod tests {
         std::fs::remove_dir_all(&super_repo).ok();
     }
 
+    /// P0 (codex R2): `submodule.<name>.ignore=all` — set in EITHER `.git/config`
+    /// OR a committed `.gitmodules` — makes a PLAIN `git status` HIDE submodule
+    /// working-tree dirt. Without `--ignore-submodules=none` the safety classifier
+    /// reads the worktree as Clean and would REMOVE it, silently losing the nested
+    /// WIP. Both sources must be OVERRIDDEN: config-hidden nested dirt must still
+    /// classify `UnpreservableNestedDirty` and refuse release.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_refuses_config_ignored_submodule_dirt() {
+        for (label, use_gitmodules) in [("repo-config", false), ("gitmodules", true)] {
+            let home = tmp_home(&format!("cfg-ignore-{label}"));
+            let super_repo = tmp_super_one_sub(&format!("cfg-ignore-{label}"));
+            // Configure submodule-ignore=all BEFORE leasing, from the requested
+            // source. `.gitmodules` is COMMITTED so the file itself stays clean
+            // (else it would be preservable parent dirt, defeating the fixture).
+            if use_gitmodules {
+                git_run_ok(
+                    &super_repo,
+                    &[
+                        "config",
+                        "-f",
+                        ".gitmodules",
+                        "submodule.vendor/dep.ignore",
+                        "all",
+                    ],
+                    false,
+                );
+                git_run_ok(&super_repo, &["add", ".gitmodules"], false);
+                git_run_ok(&super_repo, &["commit", "-m", "gitmodules ignore=all"], false);
+            } else {
+                git_run_ok(
+                    &super_repo,
+                    &["config", "submodule.vendor/dep.ignore", "all"],
+                    false,
+                );
+            }
+            let info = create(&home, &super_repo, "agent1", Some("feat/cfgig")).expect("worktree");
+            crate::binding::bind_full(&home, "agent1", "", "feat/cfgig", &info.path, &super_repo, false)
+                .expect("bind");
+            let vendored = info.path.join("vendor/dep/vendored.txt");
+            assert!(vendored.is_file(), "{label}: fixture submodule file present");
+            std::fs::write(&vendored, b"DIRTY-nested-edit\n").unwrap();
+
+            // Mechanism: plain status is BLIND to the dirt; forced status reveals it.
+            let plain = git_out(&info.path, &["status", "--porcelain"]);
+            assert!(
+                plain.is_empty(),
+                "{label}: precondition — ignore=all hides dirt from PLAIN status: {plain:?}"
+            );
+            let forced = git_out(
+                &info.path,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--ignore-submodules=none",
+                ],
+            );
+            assert!(
+                forced.contains("vendor/dep"),
+                "{label}: --ignore-submodules=none must reveal the dirt: {forced:?}"
+            );
+
+            // Direct classification MUST refuse (not falsely Clean → remove).
+            let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/cfgig", None);
+            assert_eq!(
+                pres_kind(&outcome),
+                "UnpreservableNestedDirty",
+                "{label}: config-hidden submodule dirt must refuse, not read Clean"
+            );
+            assert!(
+                outcome.blocked_reason().is_some(),
+                "{label}: refusal must be fail-closed (blocked_reason Some)"
+            );
+            assert!(
+                recovery_ref_names(&super_repo, "feat/cfgig").is_empty(),
+                "{label}: no recovery ref may be minted for unpreservable nested dirt"
+            );
+
+            // Integration: release_full must refuse and RETAIN the worktree.
+            let out = crate::worktree_pool::release_full(&home, "agent1", false);
+            assert!(!out.released, "{label}: release must be refused");
+            assert!(!out.worktree_removed, "{label}: worktree must not be removed");
+            assert!(info.path.exists(), "{label}: worktree dir retained for recovery");
+
+            std::fs::remove_dir_all(&home).ok();
+            if let Some(root) = super_repo.parent() {
+                std::fs::remove_dir_all(root).ok();
+            }
+            std::fs::remove_dir_all(&super_repo).ok();
+        }
+    }
+
+    /// P1 (codex R2): a plain `git status` opportunistically REFRESHES the stat
+    /// cache and REWRITES the live index; `git write-tree` persists the cache-tree.
+    /// `preserve_dirty_worktree` must leave the LIVE index BYTE-IDENTICAL. Setup
+    /// pre-persists the cache-tree (a `write-tree` in-fixture) so the ONLY residual
+    /// mutator is the plain-status stat refresh that `--no-optional-locks` removes.
+    /// `a` is made STAT-dirty (mtime changed, content identical) to arm that refresh;
+    /// `b` carries a distinct STAGED change so preserve runs its full classify path.
+    #[cfg(unix)]
+    #[test]
+    fn preserve_leaves_live_index_bytes_identical() {
+        let home = tmp_home("index-identity");
+        let repo = tmp_repo_with_file("index-identity", "a", "va\n");
+        std::fs::write(repo.join("b"), "vb\n").unwrap();
+        git_run_ok(&repo, &["add", "b"], false);
+        git_run_ok(&repo, &["commit", "-m", "add b"], false);
+        commit_marker_gitignore(&repo);
+        let info = create(&home, &repo, "agent1", Some("feat/idx")).expect("worktree");
+
+        // Stage a distinct change to `b` (index != HEAD ⇒ full preserve path).
+        std::fs::write(info.path.join("b"), "vb2\n").unwrap();
+        git_run_ok(&info.path, &["add", "b"], false);
+        // Arm the stat-cache refresh: bump `a`'s mtime far into the past, content
+        // unchanged. A plain `status` would then refresh + rewrite the index.
+        let fa = std::fs::OpenOptions::new()
+            .write(true)
+            .open(info.path.join("a"))
+            .unwrap();
+        fa.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800))
+            .unwrap();
+        drop(fa);
+        // Pre-persist the cache-tree so `write-tree` inside preserve is a pure no-op;
+        // this isolates the status stat-refresh as the sole index mutator under test.
+        let _ = git_out(&info.path, &["write-tree"]);
+
+        let git_dir = git_out(&info.path, &["rev-parse", "--absolute-git-dir"]);
+        let index_path = Path::new(&git_dir).join("index");
+        let before = std::fs::read(&index_path).expect("read index before");
+
+        let outcome = preserve_dirty_worktree(&home, "agent1", &info.path, "feat/idx", None);
+        assert_eq!(
+            pres_kind(&outcome),
+            "Preserved",
+            "staged change is real, preservable parent WIP"
+        );
+
+        let after = std::fs::read(&index_path).expect("read index after");
+        assert_eq!(
+            before, after,
+            "preserve must NOT mutate the live index (byte-identical)"
+        );
+        // And the staged change genuinely survived (non-destructive read-only path).
+        assert_eq!(
+            git_out(&info.path, &["show", ":b"]),
+            "vb2",
+            "staged content must remain in the live index"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// P2 (codex R2): `clear_nested_refusal_marker` must remove ONLY the marker and
+    /// KEEP the `.lock` inode durable — flock is per-inode, so unlinking the lock a
+    /// concurrent notice may hold breaks serialization. Assert the marker is gone,
+    /// the `.lock` remains, and the notice path still serializes (re-notifies once,
+    /// then de-dups) afterwards — proving the lock path is intact.
+    #[cfg(unix)]
+    #[test]
+    fn clear_nested_refusal_marker_keeps_lock_and_serializes() {
+        let home = tmp_home("clear-keeps-lock");
+        let wt = tmp_repo("clear-keeps-lock-wt");
+        let dir = refusal_marker_dir(&home);
+        let has_lock = || {
+            std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("lock"))
+        };
+        let markers = || {
+            std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) != Some("lock"))
+                .count()
+        };
+
+        // Drive one refusal notice ⇒ writes marker + lock.
+        notify_unpreservable_nested_dirty(&home, "agent1", "feat/x", &wt, "status-A", None);
+        assert_eq!(markers(), 1, "notify writes exactly one refusal marker");
+        assert!(has_lock(), "notify creates the per-worktree lock file");
+
+        clear_nested_refusal_marker(&home, &wt);
+        assert_eq!(markers(), 0, "clear must remove the marker");
+        assert!(
+            has_lock(),
+            "clear must KEEP the .lock inode durable (never unlink the held lock)"
+        );
+
+        // The lock path still serializes: identical status after clear re-notifies
+        // exactly once (marker gone), then de-dups (marker re-created under lock).
+        let base = inbox_count_from(&home, "general", NESTED_FROM);
+        notify_unpreservable_nested_dirty(&home, "agent1", "feat/x", &wt, "status-A", None);
+        assert_eq!(
+            inbox_count_from(&home, "general", NESTED_FROM),
+            base + 1,
+            "after clear, the same status must notify once more"
+        );
+        notify_unpreservable_nested_dirty(&home, "agent1", "feat/x", &wt, "status-A", None);
+        assert_eq!(
+            inbox_count_from(&home, "general", NESTED_FROM),
+            base + 1,
+            "an immediate identical repeat must de-dup (lock+marker path intact)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
     /// Bug1 middle fallback: no caller but the agent belongs to a team → route to
     /// that team's ORCHESTRATOR, not the hardcoded `general`.
     #[test]
