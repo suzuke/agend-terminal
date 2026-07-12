@@ -2576,3 +2576,42 @@ fn verdict_reverse_lookup_skips_when_reporter_has_multiple_open_dispatches_t127(
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// F1 real-entry (spike t-…19288-1): a terminal correlated report driven through
+/// the REAL report handler (`track_dispatch`, the fn `handle_send` invokes) must
+/// end with the report body in the task's replayed `result`. Complements the
+/// helper-level `auto_close.rs` projection test — this covers the messaging entry.
+#[test]
+fn terminal_report_projects_result_via_track_dispatch() {
+    let home = tmp_home("f1-track-dispatch");
+    seed_review_task(&home, "t-f1e", "dev-agent"); // Created + Claimed(owner=dev-agent)
+    let report = "RESULT: shipped; PR #456 merged.";
+    let msg = crate::inbox::InboxMessage {
+        from: "dev-agent".into(),
+        text: report.into(),
+        kind: Some("report".into()),
+        correlation_id: Some("t-f1e".into()),
+        terminal: Some(true),
+        timestamp: "2026-07-12T00:00:00Z".into(),
+        ..Default::default()
+    };
+    // Real report entry (params unused on the report branch).
+    track_dispatch(&home, &json!({}), "dev-agent", "lead", &msg);
+
+    assert_eq!(
+        task_status_of(&home, "t-f1e"),
+        Some(crate::task_events::TaskStatus::Done),
+        "precondition: the real report entry auto-closed the task"
+    );
+    let result = crate::task_events::replay(&home)
+        .unwrap()
+        .tasks
+        .get(&crate::task_events::TaskId("t-f1e".into()))
+        .and_then(|r| r.result.clone());
+    assert_eq!(
+        result.as_deref(),
+        Some(report),
+        "F1(real): terminal report via track_dispatch must persist `result` (was null)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

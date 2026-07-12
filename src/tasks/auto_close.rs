@@ -552,4 +552,89 @@ mod tests {
             Some(crate::task_events::TaskStatus::Done)
         );
     }
+
+    fn task_result(home: &Path, task_id: &str) -> Option<String> {
+        crate::task_events::replay(home)
+            .unwrap()
+            .tasks
+            .get(&TaskId(task_id.into()))
+            .and_then(|r| r.result.clone())
+    }
+
+    /// F1 (spike t-…19288-1): a terminal report auto-close must project the
+    /// report body into the task's `result`. Pre-fix `apply_done` set `result`
+    /// only from `DoneSource::OperatorManual`, so `ReportAutoClose.report_summary`
+    /// was dropped and the closed task's `result` stayed null.
+    #[test]
+    fn report_auto_close_projects_report_into_result() {
+        let home = tmp_home("f1_result");
+        seed_claimed_task(&home, "t-f1-result", "dev-agent");
+        let report = "RESULT: fixed the parser; PR #123 merged; all suites green.";
+        let closed =
+            auto_close_on_report(&home, "report", "t-f1-result", "dev-agent", report, true)
+                .unwrap();
+        assert!(closed, "precondition: terminal assignee report auto-closes");
+        assert_eq!(
+            task_status(&home, "t-f1-result"),
+            Some(crate::task_events::TaskStatus::Done),
+            "precondition: task is Done"
+        );
+        assert_eq!(
+            task_result(&home, "t-f1-result").as_deref(),
+            Some(report),
+            "F1: auto-close must persist the report into `result` (was null)"
+        );
+    }
+
+    /// F1 guard: a `ReportAutoClose` must NOT overwrite an already-set `result`
+    /// (e.g. an operator-manual result). Only a null result is backfilled.
+    #[test]
+    fn report_auto_close_does_not_overwrite_explicit_result() {
+        let home = tmp_home("f1_guard");
+        let tid = TaskId("t-f1-guard".into());
+        crate::task_events::append_batch(
+            &home,
+            &InstanceName::from("test:seed"),
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "t".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Done {
+                    task_id: tid.clone(),
+                    by: InstanceName::from("op"),
+                    source: crate::task_events::DoneSource::OperatorManual {
+                        authored_at: "2026-01-01T00:00:00Z".into(),
+                        result: Some("explicit operator result".into()),
+                    },
+                },
+                // A later ReportAutoClose on the same task must be a no-op for `result`.
+                TaskEvent::Done {
+                    task_id: tid,
+                    by: InstanceName::from("dev"),
+                    source: crate::task_events::DoneSource::ReportAutoClose {
+                        report_summary: "auto summary".into(),
+                        closed_at: "2026-01-02T00:00:00Z".into(),
+                    },
+                },
+            ],
+        )
+        .expect("seed");
+        assert_eq!(
+            task_result(&home, "t-f1-guard").as_deref(),
+            Some("explicit operator result"),
+            "F1 guard: ReportAutoClose must not overwrite an explicit result"
+        );
+    }
 }

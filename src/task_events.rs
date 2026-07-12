@@ -342,6 +342,15 @@ pub enum TaskEvent {
         task_id: TaskId,
         tags: Vec<String>,
     },
+    /// Set/replace a task's free-text `result` after creation — e.g. an owner or
+    /// orchestrator backfilling the outcome on a done task. Additive variant
+    /// (mirrors `TagsSet`); the `update` MCP arm emits it. `depends_on` has NO
+    /// analogous variant by design — it is create-only/immutable.
+    ResultSet {
+        task_id: TaskId,
+        by: InstanceName,
+        result: String,
+    },
     /// Metadata KV bag update — set one key-value pair on a task.
     MetadataSet {
         task_id: TaskId,
@@ -398,6 +407,7 @@ impl TaskEvent {
             | TaskEvent::PriorityChanged { task_id, .. }
             | TaskEvent::DescriptionUpdated { task_id, .. }
             | TaskEvent::TagsSet { task_id, .. }
+            | TaskEvent::ResultSet { task_id, .. }
             | TaskEvent::MetadataSet { task_id, .. }
             | TaskEvent::BranchLinked { task_id, .. } => task_id,
         }
@@ -423,6 +433,7 @@ impl TaskEvent {
             TaskEvent::PriorityChanged { .. } => "priority_changed",
             TaskEvent::DescriptionUpdated { .. } => "description_updated",
             TaskEvent::TagsSet { .. } => "tags_set",
+            TaskEvent::ResultSet { .. } => "result_set",
             TaskEvent::MetadataSet { .. } => "metadata_set",
             TaskEvent::BranchLinked { .. } => "branch_linked",
         }
@@ -783,6 +794,12 @@ impl TaskBoardState {
                     t.updated_at = touch_at.to_string();
                 }
             }
+            TaskEvent::ResultSet { result, .. } => {
+                if let Some(t) = self.tasks.get_mut(task_id) {
+                    t.result = Some(result.clone());
+                    t.updated_at = touch_at.to_string();
+                }
+            }
             TaskEvent::BranchLinked { branch, .. } => {
                 if let Some(t) = self.tasks.get_mut(task_id) {
                     t.branch = Some(branch.clone());
@@ -886,8 +903,18 @@ impl TaskBoardState {
         if let Some(t) = self.tasks.get_mut(task_id) {
             t.status = TaskStatus::Done;
             t.updated_at = touch_at.to_string();
-            if let DoneSource::OperatorManual { result, .. } = source {
-                t.result = result.clone();
+            match source {
+                DoneSource::OperatorManual { result, .. } => t.result = result.clone(),
+                // F1: project the terminal auto-close report body into `result`
+                // when the task has no explicit result yet — never overwrite an
+                // operator-set result. Purely read-model; replay backfills
+                // historical ReportAutoClose logs. (PrMerged / AutoCloseOnPrMerge
+                // are deliberately NOT projected — out of the witnessed scope; add
+                // an arm here if a case surfaces.)
+                DoneSource::ReportAutoClose { report_summary, .. } if t.result.is_none() => {
+                    t.result = Some(report_summary.clone());
+                }
+                _ => {}
             }
         }
     }
