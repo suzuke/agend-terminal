@@ -24,8 +24,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Default alert threshold (percent). Override: `AGEND_CONTEXT_ALERT_PCT`.
-pub(crate) const DEFAULT_ALERT_PCT: f32 = 80.0;
 /// Re-arm requires dropping this far below the threshold (compact/restart),
 /// so boundary noise can't re-fire.
 const HYSTERESIS_PCT: f32 = 5.0;
@@ -33,10 +31,8 @@ const HYSTERESIS_PCT: f32 = 5.0;
 const REALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 
 fn alert_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_ALERT_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| crate::runtime_config::get().context_alert_pct)
+    let (alert, _, _) = crate::runtime_config::resolve_effective_thresholds();
+    alert
 }
 
 /// Per-agent alert latch.
@@ -329,27 +325,31 @@ mod tests {
     #[test]
     #[serial(runtime_config)]
     fn alert_threshold_precedence() {
-        // Clear global runtime config to defaults to prevent test contamination
         let temp_dir = std::env::temp_dir().join("agend-test-clean-alert");
         std::fs::create_dir_all(&temp_dir).ok();
+
+        // 1. Write non-default valid config to check loader/consumer fallback
         std::fs::write(
             temp_dir.join("runtime-config.json"),
-            r#"{"schema_version": 1}"#,
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
         )
         .unwrap();
         crate::runtime_config::reload(&temp_dir);
-        std::fs::remove_dir_all(&temp_dir).ok();
 
-        // Isolate env var to prevent pollution from/to the host process
         let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
         std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
 
-        // 1. Env var unset, runtime config default
-        assert_eq!(alert_threshold(), 80.0);
+        // Runtime config non-default value resolved
+        assert_eq!(alert_threshold(), 60.0);
 
         // 2. Env var set overrides config
         std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "55.5");
         assert_eq!(alert_threshold(), 55.5);
+
+        // 3. Invalid env var resolved combination falls back to config value
+        // alert 95.0, handoff in config is 70.0 -> invalid triplet combination (alert >= handoff), should fallback to config (60.0)
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "95.0");
+        assert_eq!(alert_threshold(), 60.0);
 
         // Restore env var
         if let Some(val) = old_env {
@@ -359,8 +359,6 @@ mod tests {
         }
 
         // Clean up global config back to default
-        let temp_dir = std::env::temp_dir().join("agend-test-clean-alert");
-        std::fs::create_dir_all(&temp_dir).ok();
         std::fs::write(
             temp_dir.join("runtime-config.json"),
             r#"{"schema_version": 1}"#,

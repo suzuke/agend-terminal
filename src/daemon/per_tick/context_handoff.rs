@@ -33,10 +33,6 @@ use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
-pub(crate) const DEFAULT_HANDOFF_PCT: f32 = 85.0;
-/// Operator-escalation threshold (percent). Override:
-/// `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT`.
-pub(crate) const DEFAULT_ESCALATE_PCT: f32 = 92.0;
 /// Re-arm requires dropping this far below the handoff threshold
 /// (compact/restart), so boundary wobble can't start a second episode.
 const HYSTERESIS_PCT: f32 = 5.0;
@@ -47,17 +43,13 @@ const HYSTERESIS_PCT: f32 = 5.0;
 pub(crate) const HANDOFF_FILENAME: &str = "SESSION-HANDOFF.md";
 
 fn handoff_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_HANDOFF_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| crate::runtime_config::get().context_handoff_pct)
+    let (_, handoff, _) = crate::runtime_config::resolve_effective_thresholds();
+    handoff
 }
 
 fn escalate_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| crate::runtime_config::get().context_handoff_escalate_pct)
+    let (_, _, escalate) = crate::runtime_config::resolve_effective_thresholds();
+    escalate
 }
 
 /// Episode phase per agent. One episode = one continuous stay above the
@@ -565,32 +557,38 @@ mod tests {
     #[test]
     #[serial(runtime_config)]
     fn handoff_threshold_precedence() {
-        // Clear global runtime config to defaults to prevent test contamination
         let temp_dir = std::env::temp_dir().join("agend-test-clean-handoff");
         std::fs::create_dir_all(&temp_dir).ok();
+
+        // 1. Write non-default valid config to check loader/consumer fallback
         std::fs::write(
             temp_dir.join("runtime-config.json"),
-            r#"{"schema_version": 1}"#,
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
         )
         .unwrap();
         crate::runtime_config::reload(&temp_dir);
-        std::fs::remove_dir_all(&temp_dir).ok();
 
-        // Isolate env vars to prevent pollution from/to the host process
         let old_handoff = std::env::var("AGEND_CONTEXT_HANDOFF_PCT").ok();
         let old_escalate = std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT").ok();
         std::env::remove_var("AGEND_CONTEXT_HANDOFF_PCT");
         std::env::remove_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT");
 
-        // 1. Env var unset, runtime config default
-        assert_eq!(handoff_threshold(), 85.0);
-        assert_eq!(escalate_threshold(), 92.0);
+        // Runtime config non-default value resolved
+        assert_eq!(handoff_threshold(), 70.0);
+        assert_eq!(escalate_threshold(), 80.0);
 
         // 2. Env var set overrides config
         std::env::set_var("AGEND_CONTEXT_HANDOFF_PCT", "65.5");
         std::env::set_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT", "75.5");
         assert_eq!(handoff_threshold(), 65.5);
         assert_eq!(escalate_threshold(), 75.5);
+
+        // 3. Invalid env var resolved combination falls back to config value
+        // handoff 90.0, escalate 85.0 -> invalid triplet combination (handoff >= escalate), should fallback to config (handoff=70.0, escalate=80.0)
+        std::env::set_var("AGEND_CONTEXT_HANDOFF_PCT", "90.0");
+        std::env::set_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT", "85.0");
+        assert_eq!(handoff_threshold(), 70.0);
+        assert_eq!(escalate_threshold(), 80.0);
 
         // Restore env vars
         if let Some(val) = old_handoff {
@@ -605,8 +603,6 @@ mod tests {
         }
 
         // Clean up global config back to default
-        let temp_dir = std::env::temp_dir().join("agend-test-clean-handoff");
-        std::fs::create_dir_all(&temp_dir).ok();
         std::fs::write(
             temp_dir.join("runtime-config.json"),
             r#"{"schema_version": 1}"#,

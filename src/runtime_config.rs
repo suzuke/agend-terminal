@@ -106,6 +106,10 @@ fn default_true() -> bool {
     true
 }
 
+pub const DEFAULT_ALERT_PCT: f32 = 80.0;
+pub const DEFAULT_HANDOFF_PCT: f32 = 85.0;
+pub const DEFAULT_ESCALATE_PCT: f32 = 92.0;
+
 fn default_dev_idle() -> i64 {
     3600
 }
@@ -116,13 +120,13 @@ fn default_fleet_ack_ttl() -> i64 {
     2700
 }
 fn default_context_alert() -> f32 {
-    crate::daemon::per_tick::context_alert::DEFAULT_ALERT_PCT
+    DEFAULT_ALERT_PCT
 }
 fn default_context_handoff() -> f32 {
-    crate::daemon::per_tick::context_handoff::DEFAULT_HANDOFF_PCT
+    DEFAULT_HANDOFF_PCT
 }
 fn default_context_handoff_escalate() -> f32 {
-    crate::daemon::per_tick::context_handoff::DEFAULT_ESCALATE_PCT
+    DEFAULT_ESCALATE_PCT
 }
 
 impl Default for RuntimeConfig {
@@ -192,8 +196,16 @@ pub fn reload(home: &Path) {
                 ),
             ),
             Ok(config) => {
-                *global().write() = config;
-                CORRUPT_WARNED.store(false, Ordering::Relaxed);
+                if let Err(msg) = validate_thresholds(
+                    config.context_alert_pct,
+                    config.context_handoff_pct,
+                    config.context_handoff_escalate_pct,
+                ) {
+                    fail_closed(is_startup, &format!("invalid context thresholds: {msg}"));
+                } else {
+                    *global().write() = config;
+                    CORRUPT_WARNED.store(false, Ordering::Relaxed);
+                }
             }
             Err(e) => fail_closed(is_startup, &format!("unparseable: {e}")),
         },
@@ -204,6 +216,78 @@ pub fn reload(home: &Path) {
         Err(_) => {
             // Vanished at runtime — keep last-known-good rather than resetting.
             fail_closed(false, "runtime-config.json disappeared");
+        }
+    }
+}
+
+/// Validate the context threshold values triplet semantically.
+pub fn validate_thresholds(alert: f32, handoff: f32, escalate: f32) -> Result<(), String> {
+    if !alert.is_finite() || !handoff.is_finite() || !escalate.is_finite() {
+        return Err("values must be finite".to_string());
+    }
+    // Hysteresis is 5.0, so values <= 5.0 are invalid.
+    if alert <= 5.0 || alert > 100.0 {
+        return Err(format!("alert_pct must be in (5.0, 100.0], got {alert}"));
+    }
+    if handoff <= 5.0 || handoff > 100.0 {
+        return Err(format!(
+            "handoff_pct must be in (5.0, 100.0], got {handoff}"
+        ));
+    }
+    if escalate <= 5.0 || escalate > 100.0 {
+        return Err(format!(
+            "escalate_pct must be in (5.0, 100.0], got {escalate}"
+        ));
+    }
+    if alert >= handoff {
+        return Err(format!(
+            "alert_pct ({alert}) must be less than handoff_pct ({handoff})"
+        ));
+    }
+    if handoff >= escalate {
+        return Err(format!(
+            "handoff_pct ({handoff}) must be less than escalate_pct ({escalate})"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve and validate the effective context threshold triplet.
+/// Checks the environment variables first, falling back to RuntimeConfig, then to defaults.
+pub fn resolve_effective_thresholds() -> (f32, f32, f32) {
+    let config = get();
+    let alert = std::env::var("AGEND_CONTEXT_ALERT_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_alert_pct);
+    let handoff = std::env::var("AGEND_CONTEXT_HANDOFF_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_handoff_pct);
+    let escalate = std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_handoff_escalate_pct);
+
+    if validate_thresholds(alert, handoff, escalate).is_ok() {
+        (alert, handoff, escalate)
+    } else {
+        tracing::warn!(
+            alert,
+            handoff,
+            escalate,
+            config_alert = config.context_alert_pct,
+            config_handoff = config.context_handoff_pct,
+            config_escalate = config.context_handoff_escalate_pct,
+            "effective context thresholds combination is invalid. falling back to runtime config values."
+        );
+        let fallback_alert = config.context_alert_pct;
+        let fallback_handoff = config.context_handoff_pct;
+        let fallback_escalate = config.context_handoff_escalate_pct;
+        if validate_thresholds(fallback_alert, fallback_handoff, fallback_escalate).is_ok() {
+            (fallback_alert, fallback_handoff, fallback_escalate)
+        } else {
+            (DEFAULT_ALERT_PCT, DEFAULT_HANDOFF_PCT, DEFAULT_ESCALATE_PCT)
         }
     }
 }
@@ -338,6 +422,11 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
         }
         _ => return Err(format!("unknown config key: {key}")),
     }
+    validate_thresholds(
+        config.context_alert_pct,
+        config.context_handoff_pct,
+        config.context_handoff_escalate_pct,
+    )?;
     let path = home.join("runtime-config.json");
     // #1990 (reviewer-2 P1): `config` comes from in-memory `get()` (the
     // keep-last-good snapshot), NOT the disk file — so a blind write here would
@@ -726,6 +815,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join("agend-test-runtime-config-ctxpct");
         std::fs::create_dir_all(&dir).ok();
+
+        // Test valid setting
         set(&dir, "context_alert_pct", "60").unwrap();
         set(&dir, "context_handoff_pct", "65.5").unwrap();
         set(&dir, "context_handoff_escalate_pct", "70.2").unwrap();
@@ -733,6 +824,25 @@ mod tests {
         assert_eq!(get_key("context_alert_pct").unwrap(), "60");
         assert_eq!(get_key("context_handoff_pct").unwrap(), "65.5");
         assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
+
+        // Test invalid setting (setting a value that breaks order or bounds must return Err)
+        assert!(set(&dir, "context_alert_pct", "80.0").is_err()); // alert 80.0 >= handoff 65.5
+        assert!(set(&dir, "context_handoff_pct", "4.0").is_err()); // handoff <= 5.0 (hysteresis)
+        assert!(set(&dir, "context_handoff_escalate_pct", "NaN").is_err()); // NaN is not finite
+
+        // Test invalid disk configuration reload keeps last known good
+        // Write invalid reload file directly
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 95.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+        // Kept last good (60.0 / 65.5 / 70.2)
+        assert_eq!(get_key("context_alert_pct").unwrap(), "60");
+        assert_eq!(get_key("context_handoff_pct").unwrap(), "65.5");
+        assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
