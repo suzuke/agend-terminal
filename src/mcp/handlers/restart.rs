@@ -32,11 +32,14 @@ pub(super) fn handle_restart_daemon(
 /// CAS-claim the gate `Serving→Probing`; hand a request to the TUI loop and BLOCK
 /// (bounded) for its verdict. On `Prepared` (probe passed — gate STILL `Probing`)
 /// register a post-flush commit-permission ack into THIS request's [`PostFlushSlot`]
-/// and return the committing JSON; `handle_session` runs that ack ONLY after it
-/// writes+flushes the reply, at which point the TUI commits `Probing→Committing` and
-/// re-execs. So the committing reply cannot be lost to a teardown that outran the
-/// writer, and a failed flush leaves the gate recoverable at `Probing`. A concurrent
-/// duplicate loses the CAS claim → idempotent "already in progress".
+/// and return the `prepared` JSON (an honest indeterminate ATTEMPT — the reply is
+/// generated pre-ack, so it must NOT claim "committing"/"re-exec'ing"); `handle_session`
+/// runs that ack ONLY after it writes+flushes the reply, and the TUI (polling
+/// non-blockingly) then commits `Probing→Committing` and re-execs. So the reply cannot
+/// be lost to a teardown that outran the writer, and a failed flush leaves the gate
+/// recoverable at `Probing`. A concurrent duplicate loses the CAS claim → a RETRYABLE
+/// "in progress" non-success (never a false ok:true, which the winner's later abort
+/// could contradict).
 #[cfg(unix)]
 fn app_restart_strategy(
     app_restart: Option<crate::api::app_restart::AppRestart>,
@@ -47,18 +50,27 @@ fn app_restart_strategy(
         return app_no_channel_fail_closed();
     };
     // The two-phase barrier NEEDS this request's slot to arm: the TUI commits + execs
-    // only after `handle_session` confirms THIS committing reply flushed. A standalone
+    // only after `handle_session` confirms THIS `prepared` reply flushed. A standalone
     // bridge call (no api mcp_tool ingress → no slot) can't guarantee that handshake,
-    // so fail closed rather than risk a lost committing reply.
+    // so fail closed rather than risk a lost `prepared` reply.
     let Some(slot) = post_flush else {
         return app_no_channel_fail_closed();
     };
     // Genuine CAS claim: only one concurrent worker enters Probing.
     if !ar.gate.try_begin_probe() {
+        // P0 (immediate-retry-before-abort): a CAS loser is NOT a success. The in-flight
+        // winner may still ABORT on a flush failure, so a definitive ok:true here would
+        // be a false success with no restart. Return a RETRYABLE non-success — the gate
+        // is the idempotence authority, so at most one restart commits regardless, and a
+        // retry either wins a fresh restart (winner aborted) or loses again (winner
+        // committing).
         return json!({
-            "ok": true,
-            "restart": "already in progress",
-            "note": "an app restart is already being processed; this request was a no-op"
+            "ok": false,
+            "restart": "in_progress",
+            "retryable": true,
+            "error": "restart_daemon: another app restart attempt is in progress and NOT yet \
+                      committed; this request did not start or confirm a restart. If the app \
+                      does not restart shortly, retry."
         });
     }
     // reply: TUI→handler verdict. flush_ack: transport→TUI commit-permission (a `()`
@@ -82,22 +94,30 @@ fn app_restart_strategy(
     // Block (bounded) for the verdict. Probe ≤5s; 7s safety net. restart_daemon's mcp
     // tool timeout is 60s (SLOW) > 7s, so this returns before the worker is abandoned.
     // The gate is NEVER Committing while we are here — the TUI commits only AFTER our
-    // committing reply flushes (post-return) — so the timeout branch can only roll
+    // `prepared` reply flushes (post-return) — so the timeout branch can only roll
     // Probing→Serving; it can never lie "fleet intact" while the app execs.
     match reply_rx.recv_timeout(std::time::Duration::from_secs(7)) {
         Ok(AppRestartVerdict::Prepared) => {
             // Arm the barrier: register the commit-permission ack into THIS request's
-            // slot. Only a successful write+flush of the committing reply runs it (→
-            // `ack_tx.send(())` → the TUI, blocked on `flush_ack`, commits
+            // slot. Only a successful write+flush of the `prepared` reply runs it (→
+            // `ack_tx.send(())` → the TUI, polling `flush_ack` non-blockingly, commits
             // Probing→Committing + re-execs). Any non-success drops the action un-run
             // → `ack_tx` drops → the TUI's `flush_ack` disconnects → it aborts.
             if slot.register(Box::new(move || {
                 let _ = ack_tx.send(());
             })) {
+                // Honest PRE-ACK wording (codex R3): the reply is generated before the
+                // transport ack, and a delivered `prepared` + the TUI's ack observation
+                // can straddle the watchdog deadline — so the reply must NOT promise
+                // completion. It is an indeterminate ATTEMPT: `prepared`, not
+                // "committing"/"re-exec'ing".
                 json!({
                     "ok": true,
-                    "restart": "committing",
-                    "note": "preflight passed; the app is re-exec'ing in place (this connection will drop)"
+                    "restart": "prepared",
+                    "note": "preflight passed; the restart is prepared but NOT yet committed. \
+                             The app will attempt an in-place re-exec after this reply is \
+                             delivered; this connection then drops on success. If the app \
+                             remains running (no restart), retry."
                 })
             } else {
                 // Slot already closed/occupied (a timed-out prior worker, or this

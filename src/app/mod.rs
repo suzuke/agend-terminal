@@ -577,7 +577,7 @@ fn poll_restart_probe(
             if status.success() {
                 // Probe passed: DO NOT commit here — leave the gate at `Probing`. The
                 // loop replies `Prepared` and CAS `Probing→Committing` only after the
-                // transport's post-flush ack, so the committing reply can't be lost to
+                // transport's post-flush ack, so the `prepared` reply can't be lost to
                 // a teardown that outran the writer.
                 ProbePoll::Prepared(p.reply, p.flush_ack)
             } else {
@@ -655,11 +655,11 @@ enum CommitPoll {
 /// the deadline, so a watchdog `Abort` may occur even after the client received
 /// `prepared` — which is why the reply is worded as an indeterminate attempt.
 fn poll_commit_pending(cp: &CommitPending, now: std::time::Instant) -> CommitPoll {
-    // RED (guard disabled): a BOUNDED-timeout decision that, on no ack, COMMITS at the
-    // deadline instead of aborting — the P0-2 defect (the commit hinges on a timer, not
-    // on the transport actually delivering `prepared`). `watchdog_aborts_at_deadline`
-    // fails RED (expects Abort, gets Commit). The GREEN commit flips the no-ack/expired
-    // branch to a watchdog Abort so the app never re-execs on an undelivered reply.
+    // try_recv FIRST: a buffered ack (the `prepared` reply flushed) always commits and
+    // the watchdog can never preempt an ack the TUI has yet to observe. Only a
+    // genuinely-empty channel is subject to the watchdog — and because the `prepared`
+    // reply is an honest indeterminate attempt, aborting the app-intact restart on a
+    // disconnect (reply not flushed) or the deadline stays contract-consistent.
     match cp.flush_ack.try_recv() {
         Ok(()) => CommitPoll::Commit,
         Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -667,7 +667,7 @@ fn poll_commit_pending(cp: &CommitPending, now: std::time::Instant) -> CommitPol
         }
         Err(crossbeam_channel::TryRecvError::Empty) => {
             if now >= cp.deadline {
-                CommitPoll::Commit
+                CommitPoll::Abort("flush_ack_watchdog")
             } else {
                 CommitPoll::Pending
             }

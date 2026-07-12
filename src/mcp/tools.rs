@@ -271,7 +271,7 @@ pub(crate) fn def_task() -> Value {
 }
 
 pub(crate) fn def_restart_daemon() -> Value {
-    json!({"name": "restart_daemon", "description": "Request a graceful daemon restart. Default (#1814): the daemon self-respawns — it spawns a successor, health-gates it, and only then exits(0) so the successor takes over; NO external supervisor required. Opt-out `AGEND_RESTART_HANDOFF=0` takes the legacy path (exit code 42 + a launchd/systemd/Task-Scheduler supervisor from `agend-terminal service install`, or `scripts/agend-wrapper.sh`, respawns it; returns ok:false if no supervisor is detected). Returns ok:false in `agend-terminal app` (combined TUI+daemon) mode — that process has no in-process restart consumer, so quit and relaunch the app, or SIGTERM + restart. Idempotent.",
+    json!({"name": "restart_daemon", "description": "Request a graceful restart. Default daemon mode (#1814): the daemon self-respawns — it spawns a successor, health-gates it, and only then exits(0) so the successor takes over; NO external supervisor required. Opt-out `AGEND_RESTART_HANDOFF=0` takes the legacy path (exit code 42 + a launchd/systemd/Task-Scheduler supervisor from `agend-terminal service install`, or `scripts/agend-wrapper.sh`, respawns it; returns ok:false if no supervisor is detected). In `agend-terminal app` (combined TUI+daemon) mode on Unix (#2453 R2): restarts IN PLACE via re-exec (same PID/shell job) after a read-only preflight — it replies `restart:\"prepared\"` (the connection then drops as the app re-execs; if it drops WITHOUT a reply, no restart occurred — retry), or `ok:false, retryable:true` when another restart is already in progress. Windows app mode stays fail-closed (no in-place exec; ConPTY handoff unverified) — quit and relaunch. Idempotent: a shared atomic gate admits at most one in-flight restart.",
         "inputSchema": {"type": "object", "properties": {}}})
 }
 
@@ -429,8 +429,7 @@ mod tests {
              `prepared` reply — got: {desc}"
         );
         assert!(
-            desc.to_lowercase().contains("windows")
-                && desc.to_lowercase().contains("fail-closed"),
+            desc.to_lowercase().contains("windows") && desc.to_lowercase().contains("fail-closed"),
             "must document Windows app mode fail-closed — got: {desc}"
         );
         assert!(

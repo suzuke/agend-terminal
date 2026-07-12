@@ -673,7 +673,7 @@ fn handle_session(
         // #2453 R2 flush barrier: a fresh per-request slot. `restart_daemon` (if this
         // request is one) registers a commit-permission ack into it; we run that ack
         // AFTER writing+flushing this response (see below), so the app tears down and
-        // re-execs only once its committing reply is on the socket.
+        // re-execs only once its `prepared` reply is on the socket.
         let post_flush = crate::api::app_restart::PostFlushSlot::new();
         let ctx = handlers::HandlerCtx {
             registry,
@@ -990,18 +990,26 @@ mod tests {
 
         // Armed slot ⇒ the id is evicted → a retry re-invokes the handler.
         let cache = request_dedup::DedupCache::default();
-        cache.dispatch(Some("armed"), fp, std::time::Duration::from_secs(5), || {
-            json!({"ok": true, "restart": "prepared"})
-        });
+        cache.dispatch(
+            Some("armed"),
+            fp,
+            std::time::Duration::from_secs(5),
+            || json!({"ok": true, "restart": "prepared"}),
+        );
         let armed = PostFlushSlot::new();
         assert!(armed.register(Box::new(|| {})));
         maybe_evict_deferred_commit(Some("armed"), &armed, &cache);
         let reran = Arc::new(AtomicBool::new(false));
         let rr = Arc::clone(&reran);
-        cache.dispatch(Some("armed"), fp, std::time::Duration::from_secs(5), move || {
-            rr.store(true, Ordering::SeqCst);
-            json!({"ok": false})
-        });
+        cache.dispatch(
+            Some("armed"),
+            fp,
+            std::time::Duration::from_secs(5),
+            move || {
+                rr.store(true, Ordering::SeqCst);
+                json!({"ok": false})
+            },
+        );
         assert!(
             reran.load(Ordering::SeqCst),
             "an armed (deferred-commit) response must be evicted so the retry re-runs"
@@ -1009,17 +1017,25 @@ mod tests {
 
         // Unarmed slot ⇒ an ordinary response stays cached (the retry does NOT re-run).
         let cache2 = request_dedup::DedupCache::default();
-        cache2.dispatch(Some("plain"), fp, std::time::Duration::from_secs(5), || {
-            json!({"ok": true, "n": 1})
-        });
+        cache2.dispatch(
+            Some("plain"),
+            fp,
+            std::time::Duration::from_secs(5),
+            || json!({"ok": true, "n": 1}),
+        );
         let unarmed = PostFlushSlot::new();
         maybe_evict_deferred_commit(Some("plain"), &unarmed, &cache2);
         let reran2 = Arc::new(AtomicBool::new(false));
         let rr2 = Arc::clone(&reran2);
-        let cached = cache2.dispatch(Some("plain"), fp, std::time::Duration::from_secs(5), move || {
-            rr2.store(true, Ordering::SeqCst);
-            json!({"ok": true, "n": 2})
-        });
+        let cached = cache2.dispatch(
+            Some("plain"),
+            fp,
+            std::time::Duration::from_secs(5),
+            move || {
+                rr2.store(true, Ordering::SeqCst);
+                json!({"ok": true, "n": 2})
+            },
+        );
         assert!(
             !reran2.load(Ordering::SeqCst),
             "an ordinary (unarmed) response must stay cached — the retry must NOT re-run"

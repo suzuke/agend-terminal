@@ -119,7 +119,10 @@ mod app_restart_strategy_tests {
             Some(slot),
         );
         t.join().expect("stub loop thread joined");
-        assert_eq!(resp["ok"], true, "a retry after abort must win a fresh restart");
+        assert_eq!(
+            resp["ok"], true,
+            "a retry after abort must win a fresh restart"
+        );
         assert_eq!(resp["restart"], "prepared");
     }
 
@@ -227,13 +230,13 @@ mod app_restart_strategy_tests {
         // permission has been delivered.
         assert!(
             !gate.is_committing(),
-            "the handler must NOT commit before the committing reply flushes"
+            "the handler must NOT commit before the `prepared` reply flushes"
         );
         assert!(
             flush_ack.try_recv().is_err(),
             "no commit-permission before the flush"
         );
-        // The transport flushes THIS committing reply → the commit-permission fires.
+        // The transport flushes THIS `prepared` reply → the commit-permission fires.
         slot.run_after_flush(true);
         assert!(
             flush_ack.recv_timeout(Duration::from_secs(1)).is_ok(),

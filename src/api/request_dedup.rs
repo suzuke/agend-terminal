@@ -458,10 +458,10 @@ impl DedupCache {
     /// idempotence authority — decide (Committing→"in progress"; Serving→fresh
     /// restart). No-op if the id is unknown.
     pub fn evict(&self, request_id: &str) {
-        // RED (guard disabled): no-op — the deferred-commit response stays cached, so
-        // a retry after a failed flush observes the stale `prepared` (the P0-1 bug).
-        // The GREEN commit removes the entry (and subtracts its bytes).
-        let _ = request_id;
+        let mut inner = self.inner.lock().expect("dedup inner mutex");
+        if let Some(entry) = inner.entries.remove(request_id) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(entry.response_bytes);
+        }
     }
 
     #[allow(dead_code)] // introspection helper (used by tests + future operator endpoints)
@@ -1271,7 +1271,10 @@ mod tests {
         assert_eq!(r1["restart"], "prepared");
 
         // handle_session's P0-1 step: an armed post-flush slot ⇒ evict this id.
-        assert!(slot.is_armed(), "the prepared response armed the post-flush slot");
+        assert!(
+            slot.is_armed(),
+            "the prepared response armed the post-flush slot"
+        );
         cache.evict("R");
         // The flush FAILED → the restart is dropped (the action is run un-successfully).
         slot.run_after_flush(false);

@@ -21,16 +21,16 @@ const COMMITTING: u8 = 2;
 /// request's bounded oneshot, in response to the preflight probe.
 ///
 /// `Prepared` (probe passed) does NOT commit — the gate STAYS `Probing`. The handler
-/// returns the committing JSON and registers a post-flush ack; the TUI transitions
-/// `Probing → Committing` and re-execs ONLY after the transport confirms that reply
-/// was flushed to the socket (see [`PostFlushSlot`]). This closes the pre-flush-commit
-/// race: a failed flush leaves the gate recoverable at `Probing`, and the committing
-/// reply can't be lost to a teardown that outran the writer. Unix-only machinery
-/// (Windows fail-closes at the handler and never reads this).
+/// returns the `prepared` JSON (an honest indeterminate attempt) and registers a
+/// post-flush ack; the TUI transitions `Probing → Committing` and re-execs ONLY after
+/// the transport confirms that reply flushed to the socket (see [`PostFlushSlot`]).
+/// This closes the pre-flush-commit race: a failed flush leaves the gate recoverable
+/// at `Probing`, and the `prepared` reply can't be lost to a teardown that outran the
+/// writer. Unix-only machinery (Windows fail-closes at the handler and never reads this).
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub enum AppRestartVerdict {
-    /// Probe passed; gate is `Probing`. The handler emits the committing reply and
+    /// Probe passed; gate is `Probing`. The handler emits the `prepared` reply and
     /// registers a [`PostFlushSlot`] ack. NOT yet committed.
     Prepared,
     /// Probe failed / errored / timed out. Fleet + TUI intact; no restart.
@@ -162,8 +162,8 @@ impl AppRestartGate {
 
     /// Atomically claim the gate `Serving → Probing`. Returns `true` iff THIS
     /// caller won the claim. Genuine CAS — at most one concurrent caller wins; a
-    /// loser (gate already `Probing`/`Committing`) gets `false` so the handler
-    /// fails closed "already in progress" WITHOUT sending a second request. Only the
+    /// loser (gate already `Probing`/`Committing`) gets `false` so the handler returns
+    /// a RETRYABLE "in progress" non-success WITHOUT sending a second request. Only the
     /// Unix restart handler (+ unit tests) call this → unused on the Windows bin build.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn try_begin_probe(&self) -> bool {

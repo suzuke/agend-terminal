@@ -872,8 +872,7 @@ fn app_mode_restart_reexecs_in_place_2453() {
     cleanup_test_home(&home);
 
     // (1) ORDERING: the `prepared` reply was received before the socket dropped.
-    let resp =
-        resp.expect("app-mode restart must return a prepared reply before the socket drops");
+    let resp = resp.expect("app-mode restart must return a prepared reply before the socket drops");
     let result_ok = resp
         .get("result")
         .and_then(|r| r.get("ok"))
