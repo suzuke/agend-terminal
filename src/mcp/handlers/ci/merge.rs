@@ -89,6 +89,32 @@ pub(crate) fn base_drift_refusal(merge_state_status: &str) -> Option<(&'static s
     }
 }
 
+/// P0 exact-head: read the PR's current `(head, base)` OIDs in one `gh pr view`.
+/// Returns `None` if either is missing or the read errors — the caller MUST fail
+/// closed (a merge that cannot identify its exact head+base is unsafe, even under
+/// `force`). `base_ref_oid` is the base BRANCH's current tip (it advances as the
+/// base moves), so comparing it gate-vs-pre-merge detects a base advance by EXACT
+/// identity — `mergeStateStatus` is derived + laggy and cannot prove base identity.
+fn acquire_head_base(repo: &str, pr: u64) -> Option<(String, String)> {
+    let s = crate::scm::make_scm_provider(repo, None)
+        .pr_view(repo, pr, &["headRefOid", "baseRefOid"])
+        .ok()?;
+    // Fail closed unless BOTH are FULL commit OIDs (40/64-hex). Non-empty is not
+    // a commit-identity invariant: an abbreviated/non-hex head would reach
+    // `--match-head-commit` ambiguously, and a malformed base returned identically
+    // across the gate+recheck reads would falsely satisfy the exact-base identity
+    // check. Reuses the canonical `is_full_commit_sha` (the same invariant that
+    // guards exact-head CI watches) so both acquire sites (gate + pre-merge
+    // recheck) and both paths (incl. force) enforce one unambiguous identity.
+    let head = s
+        .head_ref_oid
+        .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
+    let base = s
+        .base_ref_oid
+        .filter(|x| crate::daemon::ci_watch::is_full_commit_sha(x))?;
+    Some((head, base))
+}
+
 pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let pr = match args["pr"].as_u64() {
         Some(n) => n,
@@ -107,6 +133,22 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     if force && force_reason.is_empty() {
         return json!({"error": "force=true requires non-empty force_reason"});
     }
+
+    // P0 exact-head precondition: acquire the exact (head, base) OIDs this merge
+    // will pin/validate against. NON-BYPASSABLE — even a force merge must land the
+    // head+base it INTENDS; if either can't be read, fail closed (never merge a
+    // head/base we cannot identify). `force` relaxes only the CI/verdict/freshness
+    // POLICY below, never this acquisition nor the pre-merge identity recheck.
+    let (gated_head, gated_base) = match acquire_head_base(&repo, pr) {
+        Some(hb) => hb,
+        None => {
+            return json!({
+                "error": "cannot determine PR head+base commit — merge refused (fail-closed exact-head precondition)",
+                "hint": "reading the current head+base OIDs is required to pin the merge; retry when the provider (GitHub) is reachable. force does NOT bypass this.",
+                "code": "exact_head_unavailable",
+            });
+        }
+    };
 
     if !force {
         // #PR-D site 2: `gh pr checks` via ScmProvider. argv byte-identical
@@ -215,9 +257,47 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         }
     }
 
-    // #PR-Z site 3: the ONLY write — `gh pr merge` via ScmProvider. argv
-    // byte-identical (`pr merge <pr> --repo R --admin --squash
-    // --delete-branch`, pinned by scm::tests::pr_merge_args_match_existing_gh_call).
+    // P0 exact-head: one-shot immediate recheck (NO in-call retry loop). Re-read
+    // the current (head, base) and refuse if EITHER moved since the gate — the
+    // merge must land the exact head+base that passed validation. Non-bypassable
+    // (incl force). A residual ε remains between this read and the write: the HEAD
+    // side is additionally pinned at the GitHub API via `--match-head-commit`
+    // (below); the BASE side has NO GitHub pin primitive, so its ε is a documented
+    // residual — true base atomicity awaits a merge-queue (separate spike). Note:
+    // `verify_merge_landed` proves only that the PR LANDED, not that the merge was
+    // free of a semantic phantom-reversion; it is NOT a base-race backstop.
+    let (head_now, base_now) = match acquire_head_base(&repo, pr) {
+        Some(hb) => hb,
+        None => {
+            return json!({
+                "error": "cannot re-read PR head+base before merge — merge refused (fail-closed)",
+                "hint": "retry when the provider (GitHub) is reachable; no merge was attempted.",
+                "code": "exact_head_recheck_unavailable",
+            });
+        }
+    };
+    if head_now != gated_head {
+        return json!({
+            "error": "PR head moved during merge preparation — merge refused (exact-head)",
+            "gated_head": gated_head,
+            "current_head": head_now,
+            "hint": "re-run the merge; the exact-head precondition intentionally refuses a moved head. No changes were made.",
+            "code": "exact_head_moved",
+        });
+    }
+    if base_now != gated_base {
+        return json!({
+            "error": "base branch advanced during merge preparation — merge refused (exact base identity)",
+            "gated_base": gated_base,
+            "current_base": base_now,
+            "hint": "rebase onto current main and re-run: git fetch && git rebase origin/main && git push --force-with-lease. (Residual: a base advance within the recheck→merge window is uncovered — no GitHub base-pin primitive; true base atomicity awaits a merge-queue.)",
+            "code": "exact_base_moved",
+        });
+    }
+
+    // #PR-Z site 3: the ONLY write — `gh pr merge` via ScmProvider. argv now adds
+    // `--match-head-commit <gated_head>` (P0 pin) to the byte-identical
+    // `pr merge <pr> --repo R --admin --squash --delete-branch`.
     // MergeOutcome maps the original exit-status branches 1:1: Submitted =
     // exit-0 (→ verify_merge_landed post-condition, unchanged; retry loop
     // stays in that caller), Failed = non-zero (→ "gh pr merge failed" +
@@ -229,6 +309,8 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             admin: true,
             squash: true,
             delete_branch: true,
+            // P0 pin: fail the merge at the API if the head moved in the ε window.
+            expected_head_sha: Some(gated_head.clone()),
         },
     ) {
         // #1467: `gh pr merge` exit 0 is NECESSARY but not SUFFICIENT — a

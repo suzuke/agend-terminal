@@ -118,3 +118,10 @@ mod tests;
 #[path = "exact_head_watch_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_watch_tests;
+
+// P0 exact-head MERGE precondition — production handle_merge_repo race tests in a
+// sibling file (test-named ⇒ file_size_invariant-exempt; keeps merge.rs small).
+#[cfg(test)]
+#[path = "exact_head_merge_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod exact_head_merge_tests;
