@@ -385,6 +385,16 @@ fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
 /// candidate claims to be "merged" regardless of why it was really swept).
 /// `path` is `"(no worktree)"` for phase-2 orphan branches, which never had
 /// one — never an empty string standing in for a real value.
+/// V1 (d-20260712065632138568-7): best-effort durable hygiene alert — a board
+/// write failure must never abort the sweep itself.
+fn upsert_hygiene(home: &Path, key: String, title: String, evidence: serde_json::Value) {
+    if let Err(e) =
+        crate::daemon::hygiene_task::upsert_system_hygiene_task(home, &key, &title, evidence)
+    {
+        tracing::warn!(error = %e, key = %key, "hygiene task upsert failed");
+    }
+}
+
 pub fn sweep_from_registry(
     home: &Path,
     configs: &HashMap<String, Option<PathBuf>>,
@@ -440,14 +450,22 @@ pub fn sweep_from_registry(
         // failing fetch accumulates undeletable branches invisibly — surface
         // it. Pure logging, the sweep proceeds on local refs.
         let remote = crate::git_helpers::primary_remote(repo);
-        match crate::git_helpers::git_bypass(repo, &["fetch", "--prune", &remote]) {
+        // V1 (d-20260712065632138568-7): a failing fetch is a persistent-
+        // ambiguity signal (undeletable branches accumulate invisibly, #2004)
+        // — surfaced as a durable hygiene task, no longer log-only. The upsert
+        // dedups on the episode key, so a repo stuck failing every tick keeps
+        // ONE task (occurrences counts the ticks).
+        let fetch_fail = match crate::git_helpers::git_bypass(repo, &["fetch", "--prune", &remote])
+        {
             Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
                 tracing::warn!(
                     repo = %repo.display(),
                     remote = %remote,
-                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    stderr = %stderr,
                     "fetch --prune failed during worktree/branch sweep — merge/gone checks run on possibly-stale local refs"
                 );
+                Some(format!("fetch --prune failed: {stderr}"))
             }
             Err(e) => {
                 tracing::warn!(
@@ -456,8 +474,21 @@ pub fn sweep_from_registry(
                     error = %e,
                     "fetch --prune could not run during worktree/branch sweep — merge/gone checks run on possibly-stale local refs"
                 );
+                Some(format!("fetch --prune could not run: {e}"))
             }
-            Ok(_) => {}
+            Ok(_) => None,
+        };
+        if let Some(reason) = fetch_fail {
+            upsert_hygiene(
+                home,
+                format!("residue-fetch-degraded:{}", repo.display()),
+                format!("[hygiene] fetch --prune failing: {}", repo.display()),
+                serde_json::json!({
+                    "repo": repo.display().to_string(),
+                    "remote": remote,
+                    "reason": reason,
+                }),
+            );
         }
 
         // CR-2026-06-14: needed to decide whether a stale worktree's branch is
@@ -538,30 +569,51 @@ pub fn sweep_from_registry(
             // direct call: same args, push on success. `agent`/`candidate` are inert
             // on the Delete arm; the Err reason is unused here (the sweep skips, it
             // does not archive-fallthrough).
-            let removed_ok = matches!(
-                crate::daemon::janitor::dispose(
-                    home,
-                    crate::worktree::disposition::Disposition::Delete,
-                    "",
-                    None,
-                    || {
-                        if remove_worktree(
-                            repo,
-                            &entry.path,
-                            &entry.branch,
-                            branch_safe_to_delete,
-                            false,
-                        ) {
-                            Ok(())
-                        } else {
-                            Err("sweep worktree remove failed".to_string())
-                        }
-                    },
-                ),
-                crate::daemon::janitor::DispositionOutcome::Deleted(Ok(()))
+            let outcome = crate::daemon::janitor::dispose(
+                home,
+                crate::worktree::disposition::Disposition::Delete,
+                "",
+                None,
+                || {
+                    if remove_worktree(
+                        repo,
+                        &entry.path,
+                        &entry.branch,
+                        branch_safe_to_delete,
+                        false,
+                    ) {
+                        Ok(())
+                    } else {
+                        Err("sweep worktree remove failed".to_string())
+                    }
+                },
             );
-            if removed_ok {
-                removed.push((entry.branch.clone(), entry.path.clone(), reason));
+            match outcome {
+                crate::daemon::janitor::DispositionOutcome::Deleted(Ok(())) => {
+                    removed.push((entry.branch.clone(), entry.path.clone(), reason));
+                }
+                // V1 (d-20260712065632138568-7): a PROVEN-eligible candidate
+                // whose removal failed may not be silently skipped — that is
+                // the actionable residue signal (replaces the raw-count alarm).
+                crate::daemon::janitor::DispositionOutcome::Deleted(Err(fail)) => {
+                    upsert_hygiene(
+                        home,
+                        format!("residue-remove-failed:{}:{}", repo.display(), entry.branch),
+                        format!("[hygiene] worktree remove failed: {}", entry.branch),
+                        serde_json::json!({
+                            "repo": repo.display().to_string(),
+                            "branch": entry.branch,
+                            "path": entry.path,
+                            "reason": fail,
+                            "eligibility": {
+                                "merged": merged,
+                                "remote_gone": gone,
+                                "delete_branch": branch_safe_to_delete,
+                            },
+                        }),
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -2248,9 +2300,19 @@ mod tests {
         let removed = sweep_from_registry(&home, &configs, &[]);
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
 
+        // The sabotaged WORKTREE dir must survive (its removal failed). The
+        // branch itself may legitimately be reaped by phase-2 as an orphan
+        // ("(no worktree)") once git dropped the admin entry — that layered
+        // self-heal is fine; the failure signal is about the stuck DIR.
         assert!(
-            !removed.iter().any(|(b, _, _)| b == "feat/done"),
-            "sabotaged removal must not be reported as removed: {removed:?}"
+            wt.exists(),
+            "sabotage must hold: the unremovable worktree dir survives"
+        );
+        assert!(
+            !removed
+                .iter()
+                .any(|(b, p, _)| b == "feat/done" && p != "(no worktree)"),
+            "the failed worktree removal itself may not be reported: {removed:?}"
         );
         let tasks = hygiene_tasks(&home);
         let key = format!("residue-remove-failed:{}:feat/done", repo.display());
@@ -2261,7 +2323,10 @@ mod tests {
         assert_eq!(evidence["repo"], repo.display().to_string());
         assert_eq!(evidence["branch"], "feat/done");
         assert!(
-            evidence["reason"].as_str().unwrap_or("").contains("remove failed"),
+            evidence["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("remove failed"),
             "exact failure reason required: {evidence}"
         );
 
@@ -2319,7 +2384,9 @@ mod tests {
 
         let tasks = hygiene_tasks(&home);
         assert!(
-            !tasks.iter().any(|(k, _)| k.contains("review/2746-codex-r1")),
+            !tasks
+                .iter()
+                .any(|(k, _)| k.contains("review/2746-codex-r1")),
             "deliberately-kept branch must not be alerted: {tasks:?}"
         );
 

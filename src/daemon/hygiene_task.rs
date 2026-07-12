@@ -15,9 +15,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::task_events::{
-    self, InstanceName, TaskBoardState, TaskEvent, TaskId, TaskStatus,
-};
+use crate::task_events::{self, InstanceName, TaskBoardState, TaskEvent, TaskId, TaskStatus};
 
 /// Metadata key carrying the stable episode identity.
 pub const ALERT_KEY_META: &str = "system_alert_key";
@@ -83,8 +81,79 @@ pub fn upsert_system_hygiene_task(
     title: &str,
     evidence: serde_json::Value,
 ) -> anyhow::Result<HygieneUpsert> {
-    let _ = (home, key, title, evidence);
-    todo!("V1 GREEN: atomic checked-batch upsert (RED commit is stub-only)")
+    let emitter = InstanceName::from(EMITTER);
+    let meta = |task_id: &TaskId, k: &str, v: serde_json::Value| TaskEvent::MetadataSet {
+        task_id: task_id.clone(),
+        by: emitter.clone(),
+        key: k.to_string(),
+        value: v,
+    };
+    // Each attempt is individually atomic (precondition + append under the
+    // board lock against a fresh replay). A rejection means the other shape
+    // won the race; ≤2 flips converge, 3rd is a hard error.
+    for _ in 0..3 {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut existing: Option<(TaskId, u64)> = None;
+        let task_id = new_task_id();
+        let create = vec![
+            TaskEvent::Created {
+                task_id: task_id.clone(),
+                title: title.to_string(),
+                description: format!(
+                    "system hygiene alert (episode key `{key}`) — evidence in \
+                     task metadata; close when resolved (a recurrence reopens \
+                     a fresh task)."
+                ),
+                priority: "normal".to_string(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: Some(false),
+                eta_secs: None,
+                tags: vec!["system-hygiene".to_string()],
+                parent_id: None,
+            },
+            meta(&task_id, ALERT_KEY_META, key.into()),
+            meta(&task_id, EVIDENCE_META, evidence.clone()),
+            meta(&task_id, LAST_SEEN_META, now.clone().into()),
+            meta(&task_id, OCCURRENCES_META, 1u64.into()),
+        ];
+        match task_events::append_batch_checked(home, &emitter, create, |state| match find_active(
+            state, key,
+        ) {
+            Some(hit) => {
+                existing = Some(hit);
+                Err("active episode task already exists".to_string())
+            }
+            None => Ok(()),
+        })? {
+            Ok(_) => return Ok(HygieneUpsert::Created(task_id)),
+            Err(_) => {
+                let Some((tid, n)) = existing else {
+                    anyhow::bail!("hygiene upsert: rejected without an existing task");
+                };
+                let update = vec![
+                    meta(&tid, EVIDENCE_META, evidence.clone()),
+                    meta(&tid, LAST_SEEN_META, now.into()),
+                    meta(&tid, OCCURRENCES_META, (n + 1).into()),
+                ];
+                let tid_check = tid.clone();
+                match task_events::append_batch_checked(home, &emitter, update, |state| {
+                    match find_active(state, key) {
+                        Some((t, _)) if t == tid_check => Ok(()),
+                        _ => Err("episode task closed since probe".to_string()),
+                    }
+                })? {
+                    Ok(_) => return Ok(HygieneUpsert::Updated(tid)),
+                    // Closed between the two attempts — loop back to create.
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+    anyhow::bail!("hygiene upsert for `{key}`: state flipped 3 times, giving up")
 }
 
 #[cfg(test)]
@@ -148,7 +217,10 @@ mod tests {
         // One side must have created, the other updated (order free).
         let created = matches!(r1, HygieneUpsert::Created(_)) as u8
             + matches!(r2, HygieneUpsert::Created(_)) as u8;
-        assert_eq!(created, 1, "exactly one Created among racers: {r1:?} {r2:?}");
+        assert_eq!(
+            created, 1,
+            "exactly one Created among racers: {r1:?} {r2:?}"
+        );
         assert_eq!(r1.task_id(), r2.task_id(), "both refer to the same task");
     }
 
@@ -208,7 +280,10 @@ mod tests {
         assert!(matches!(b, HygieneUpsert::Created(_)), "reopen = new task");
         assert_ne!(a.task_id(), b.task_id());
         let state = board_state(home);
-        assert_eq!(state.tasks.get(a.task_id()).unwrap().status, TaskStatus::Done);
+        assert_eq!(
+            state.tasks.get(a.task_id()).unwrap().status,
+            TaskStatus::Done
+        );
         assert_ne!(
             state.tasks.get(b.task_id()).unwrap().status,
             TaskStatus::Done
