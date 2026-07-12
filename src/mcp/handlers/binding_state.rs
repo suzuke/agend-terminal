@@ -159,6 +159,14 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         // PR2 F2: diagnostic HMAC status (shim-parity; see binding::signature_valid).
         let signature_valid = crate::binding::signature_valid(home, agent);
 
+        // S2 finding-1: the agent's CURRENT binding identity is repo+branch. Derive
+        // the owner/repo slug from the binding source_repo so `current_binding` in
+        // ci_watches_detail matches BOTH repo and branch (a same-branch watch on a
+        // different repo is NOT current). Non-derivable remote ⇒ "" ⇒ nothing current.
+        let current_repo =
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(source_repo))
+                .unwrap_or_default();
+
         json!({
             "agent": agent,
             "bound": true,
@@ -174,6 +182,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "marker_present": marker_present,
             "signature_valid": signature_valid,
             "ci_watches": ci_watches,
+            "ci_watches_detail": enumerate_ci_watches_detail_for_agent(home, agent, &current_repo, branch),
             "bind_in_flight": bind_in_flight,
             "cross_branch_holders": cross_branch_holders,
             "dispatched_waiting_for": dispatched_waiting_for,
@@ -185,6 +194,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "bound": false,
             "bind_in_flight": bind_in_flight,
             "ci_watches": ci_watches,
+            "ci_watches_detail": enumerate_ci_watches_detail_for_agent(home, agent, "", ""),
             "cross_branch_holders": Vec::<String>::new(),
             "dispatched_waiting_for": dispatched_waiting_for,
             "pending_response_to": pending_response_to,
@@ -192,36 +202,13 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
     }
 }
 
-/// Return the list of CI watches that include `agent` as a subscriber,
-/// formatted as `"<repo>:<branch>"` for terse human reading. Empty
-/// list when the watches dir doesn't exist or the agent isn't on any.
-fn enumerate_ci_watches_for_agent(home: &Path, agent: &str) -> Vec<String> {
-    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(watch) = serde_json::from_str::<Value>(&content) else {
-            continue;
-        };
-        let subs = crate::daemon::ci_watch::parse_subscribers(&watch);
-        if subs.iter().any(|s| s == agent) {
-            let repo = watch["repo"].as_str().unwrap_or("?");
-            let branch = watch["branch"].as_str().unwrap_or("?");
-            out.push(format!("{repo}:{branch}"));
-        }
-    }
-    out.sort();
-    out
-}
+// S2: the ci-watch enumerators (byte-for-byte `ci_watches` strings + the additive
+// `ci_watches_detail` projection) live in a sibling module so binding_state.rs
+// stays under the MCP-handler LOC ceiling (file_size_invariant — the same reason
+// the tests are `#[path]` siblings).
+#[path = "binding_state_ci_watches.rs"]
+mod ci_watches;
+use ci_watches::{enumerate_ci_watches_detail_for_agent, enumerate_ci_watches_for_agent};
 
 /// Return list of agent names (other than `exclude_agent`) whose
 /// binding currently references `branch`. P0-1.5 enforces uniqueness
@@ -256,6 +243,12 @@ mod liveness_tests;
 #[cfg(test)]
 #[path = "binding_state_signature_tests.rs"]
 mod signature_tests;
+
+// S2 additive ci_watches_detail projection matrix (sibling file — LOC-exempt).
+#[cfg(test)]
+#[path = "binding_state_detail_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod detail_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

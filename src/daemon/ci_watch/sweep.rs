@@ -249,6 +249,72 @@ fn fan_out_health_event(
 ///
 /// Returns the number of watches removed. Best-effort: read/parse
 /// failures skip the entry rather than aborting the sweep.
+/// S2: the ordered TTL-family expiry reasons a SUBSCRIBED (non-tombstone,
+/// non-protected-migration) watch can be reaped for — the exact predicates
+/// `gc_stale_watches` uses, extracted so `binding_state`'s `ci_watches_detail`
+/// classifies lifecycle from the SAME source of truth (no drift). Order mirrors
+/// GC precedence: absolute TTL → terminal-inactivity TTL → max-age cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiryReason {
+    AbsoluteTtl,
+    TerminalInactivityTtl,
+    MaxAge,
+}
+
+impl ExpiryReason {
+    /// Stable wire string for `ci_watches_detail.expiry_reason`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ExpiryReason::AbsoluteTtl => "absolute_ttl",
+            ExpiryReason::TerminalInactivityTtl => "terminal_inactivity_ttl",
+            ExpiryReason::MaxAge => "max_age",
+        }
+    }
+}
+
+/// S2: classify whether a SUBSCRIBED watch is TTL-family reap-eligible, returning
+/// the reason (`None` = still polling). Single source of truth for BOTH
+/// `gc_stale_watches`' removal decision and `binding_state`'s lifecycle
+/// projection. `lazy_pr_open` is invoked ONLY when the max-age threshold is
+/// crossed (short-circuit &&), so ordinary active watches never trigger a
+/// per-watch pr_state read — preserving the GC's existing laziness. Callers MUST
+/// evaluate the protected-migration + tombstone branches FIRST; this covers only
+/// the TTL-family, in GC precedence order.
+pub(crate) fn classify_subscribed_watch_expiry(
+    watch: &super::watch_state::WatchState,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    lazy_pr_open: impl FnOnce() -> bool,
+) -> Option<ExpiryReason> {
+    // (1) absolute TTL.
+    if let Some(expires_at) = watch.expires_at.as_deref() {
+        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+            if now_utc > exp.with_timezone(&chrono::Utc) {
+                return Some(ExpiryReason::AbsoluteTtl);
+            }
+        }
+    }
+    // (2) inactivity TTL.
+    if let Some(last_seen) = watch.last_terminal_seen_at.as_deref() {
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
+            if now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc))
+                > chrono::Duration::hours(WATCH_TTL_HOURS)
+            {
+                return Some(ExpiryReason::TerminalInactivityTtl);
+            }
+        }
+    }
+    // (2b) #1750 A2 absolute age cap — `lazy_pr_open` runs ONLY after the age
+    // threshold is exceeded (short-circuit); an open PR is EXEMPT per PR-3.
+    if let Some(created) = watch.earliest_subscribed_at() {
+        if now_utc.signed_duration_since(created) > chrono::Duration::hours(MAX_WATCH_AGE_HOURS)
+            && !lazy_pr_open()
+        {
+            return Some(ExpiryReason::MaxAge);
+        }
+    }
+    None
+}
+
 pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
     let ci_dir = ci_watches_dir(home);
     let Ok(entries) = std::fs::read_dir(&ci_dir) else {
@@ -368,65 +434,44 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
             continue;
         }
 
-        // (1) absolute TTL.
-        if let Some(expires_at) = watch.expires_at.as_deref() {
-            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                if now_utc > exp.with_timezone(&chrono::Utc) {
-                    remove_watch(
-                        home,
-                        &path,
-                        &audit_label,
-                        repo,
-                        branch,
-                        &format!("{sweep_origin}_expired"),
-                    );
-                    tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
-                        "ci_watch removed (absolute TTL elapsed)");
-                    removed += 1;
-                    continue;
-                }
+        // (1)/(2)/(2b) TTL-family reap — via the shared `classify_subscribed_watch_expiry`
+        // so `binding_state`'s ci_watches_detail (S2) classifies from the SAME
+        // predicates (no drift). Each reason maps to the EXACT prior remove/audit/log
+        // in the same precedence. `is_branch_open` stays lazy (invoked only inside the
+        // classifier's max-age branch, after the age threshold is crossed).
+        match classify_subscribed_watch_expiry(&watch, now_utc, || {
+            crate::daemon::pr_state::is_branch_open(home, repo, branch)
+        }) {
+            Some(ExpiryReason::AbsoluteTtl) => {
+                remove_watch(
+                    home,
+                    &path,
+                    &audit_label,
+                    repo,
+                    branch,
+                    &format!("{sweep_origin}_expired"),
+                );
+                tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
+                    "ci_watch removed (absolute TTL elapsed)");
+                removed += 1;
+                continue;
             }
-        }
-
-        // (2) inactivity TTL.
-        if let Some(last_seen) = watch.last_terminal_seen_at.as_deref() {
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
-                let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
-                    remove_watch(
-                        home,
-                        &path,
-                        &audit_label,
-                        repo,
-                        branch,
-                        &format!("{sweep_origin}_inactivity_ttl"),
-                    );
-                    tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS,
-                        sweep = %sweep_origin,
-                        "ci_watch removed (inactivity TTL elapsed)");
-                    removed += 1;
-                    continue;
-                }
+            Some(ExpiryReason::TerminalInactivityTtl) => {
+                remove_watch(
+                    home,
+                    &path,
+                    &audit_label,
+                    repo,
+                    branch,
+                    &format!("{sweep_origin}_inactivity_ttl"),
+                );
+                tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS,
+                    sweep = %sweep_origin,
+                    "ci_watch removed (inactivity TTL elapsed)");
+                removed += 1;
+                continue;
             }
-        }
-
-        // (2b) #1750 A2: absolute age cap — backstop against a watch kept
-        // perpetually young by `refresh_expires_at` on every active poll (so it
-        // never trips the refreshed `expires_at` or inactivity TTL above).
-        // Anchored on the earliest `subscribed_at`, the one timestamp polling
-        // never moves. A watch older than MAX_WATCH_AGE_HOURS never reached
-        // terminal (which would have removed it) → stale by definition.
-        if let Some(created) = watch.earliest_subscribed_at() {
-            if now_utc.signed_duration_since(created) > chrono::Duration::hours(MAX_WATCH_AGE_HOURS)
-            {
-                // PR-3 (t-ci-ready-pr3-arm-not-armed): exempt watches whose PR is
-                // still OPEN. An open PR should keep notifying on CI, and the
-                // PR-3 auto-arm would otherwise re-create this watch on the next
-                // gh-poll (remove→rearm churn every MAX_WATCH_AGE_HOURS). Only
-                // merged/closed/untracked branches age out here.
-                if crate::daemon::pr_state::is_branch_open(home, repo, branch) {
-                    continue;
-                }
+            Some(ExpiryReason::MaxAge) => {
                 remove_watch(
                     home,
                     &path,
@@ -441,6 +486,7 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
                 removed += 1;
                 continue;
             }
+            None => {}
         }
     }
 
@@ -1109,6 +1155,126 @@ mod tests {
             !p.exists(),
             "a protected watch with a malformed target_head_sha must still be removed"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── S2: shared expiry classifier (source of truth for GC + binding_state) ──
+
+    fn ws(j: serde_json::Value) -> crate::daemon::ci_watch::WatchState {
+        serde_json::from_value(j).unwrap()
+    }
+
+    /// Lazy PR-open: NOT called for an active (non-over-age) watch — preserves the
+    /// GC invariant of no per-watch pr_state read on ordinary polling watches.
+    #[test]
+    fn classify_lazy_pr_open_not_called_for_active_watch() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let w = ws(serde_json::json!({
+            "repo": "o/r", "branch": "feat/x",
+            "subscribers": [{"instance": "dev", "subscribed_at": (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()}],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        }));
+        let r = classify_subscribed_watch_expiry(&w, chrono::Utc::now(), || {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert_eq!(r, None, "active watch is polling");
+        assert_eq!(calls.get(), 0, "lazy pr-open must NOT be called for an active watch");
+    }
+
+    /// Over-max-age + PR closed → MaxAge; PR-open callback invoked exactly once.
+    #[test]
+    fn classify_max_age_calls_pr_open_once_and_reaps_when_closed() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let old = (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let w = ws(serde_json::json!({
+            "repo": "o/r", "branch": "feat/x",
+            "subscribers": [{"instance": "dev", "subscribed_at": old}],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        }));
+        let r = classify_subscribed_watch_expiry(&w, chrono::Utc::now(), || {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert_eq!(r, Some(ExpiryReason::MaxAge));
+        assert_eq!(calls.get(), 1, "pr-open checked exactly once, only after the age threshold");
+    }
+
+    /// Over-max-age but PR OPEN → exempt (polling).
+    #[test]
+    fn classify_max_age_exempt_when_pr_open() {
+        let old = (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let w = ws(serde_json::json!({
+            "repo": "o/r", "branch": "feat/x",
+            "subscribers": [{"instance": "dev", "subscribed_at": old}],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        }));
+        assert_eq!(
+            classify_subscribed_watch_expiry(&w, chrono::Utc::now(), || true),
+            None,
+            "an over-age watch with an OPEN pr is exempt (polling)"
+        );
+    }
+
+    /// Absolute TTL takes precedence — pr-open is never consulted when it fires.
+    #[test]
+    fn classify_absolute_ttl_precedence_no_pr_read() {
+        let old = (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let w = ws(serde_json::json!({
+            "repo": "o/r", "branch": "feat/x",
+            "subscribers": [{"instance": "dev", "subscribed_at": old}],
+            "expires_at": (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        }));
+        assert_eq!(
+            classify_subscribed_watch_expiry(&w, chrono::Utc::now(), || {
+                panic!("pr-open must not be read when absolute TTL already fired")
+            }),
+            Some(ExpiryReason::AbsoluteTtl)
+        );
+    }
+
+    /// DRIFT GUARD: `classify_subscribed_watch_expiry` must predict `gc_stale_watches`'
+    /// actual removal for every subscribed feature-branch watch (the classifier's
+    /// domain). If the GC's TTL predicates ever drift from the classifier, this fails.
+    #[test]
+    fn classify_matches_gc_reap_decision_drift() {
+        let dir = tmp_dir("s2-drift");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let old = (now - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let future = (now + chrono::Duration::hours(24)).to_rfc3339();
+        let ancient = (now - chrono::Duration::hours(WATCH_TTL_HOURS + 10)).to_rfc3339();
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("polling", serde_json::json!({"repo":"o/r","branch":"feat/live","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":future})),
+            ("abs", serde_json::json!({"repo":"o/r","branch":"feat/abs","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":past})),
+            ("inact", serde_json::json!({"repo":"o/r","branch":"feat/inact","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":future,"last_terminal_seen_at":ancient})),
+            ("maxage", serde_json::json!({"repo":"o/r","branch":"feat/maxage","subscribers":[{"instance":"dev","subscribed_at":old}],"expires_at":future})),
+        ];
+        let mut predicted_removed = std::collections::HashMap::new();
+        for (name, j) in &cases {
+            let w = ws(j.clone());
+            let repo = w.repo.clone();
+            let branch = w.branch.clone();
+            let c = classify_subscribed_watch_expiry(&w, now, || {
+                crate::daemon::pr_state::is_branch_open(&dir, &repo, &branch)
+            });
+            predicted_removed.insert(*name, c.is_some());
+            std::fs::write(ci_dir.join(format!("{name}.json")), serde_json::to_string_pretty(j).unwrap()).unwrap();
+        }
+        gc_stale_watches(&dir, "drift_test");
+        for (name, _) in &cases {
+            let exists = ci_dir.join(format!("{name}.json")).exists();
+            assert_eq!(
+                predicted_removed[name], !exists,
+                "classify() must predict gc removal for '{name}' (predicted_removed={}, exists={exists})",
+                predicted_removed[name]
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

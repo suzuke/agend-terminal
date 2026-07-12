@@ -71,6 +71,10 @@ pub use registry::{
 };
 #[allow(unused_imports)]
 pub use sweep::{gc_stale_watches, startup_sweep};
+// `ExpiryReason` is named only inside `sweep` (+ its tests); binding_state consumes
+// the classifier's result via `.as_str()` without naming the type, so only the fn
+// is re-exported here.
+pub(crate) use sweep::classify_subscribed_watch_expiry;
 pub use watcher::check_ci_watches;
 
 pub(crate) use registry::parse_subscribers;
