@@ -25,10 +25,27 @@ fn tmp_home(tag: &str) -> std::path::PathBuf {
     h
 }
 
-/// Bind `agent` to `repo_slug`@`branch`. Creates a REAL git repo with an origin
-/// remote so `derive_repo_from_remote` resolves the slug (current_binding needs
-/// the bound repo identity, not just the branch).
+/// Bind `agent` to `repo_slug`@`branch` with a GitHub HTTPS origin (the common
+/// case). Delegates to [`write_binding_with_origin`].
 fn write_binding(home: &std::path::Path, agent: &str, repo_slug: &str, branch: &str) {
+    write_binding_with_origin(
+        home,
+        agent,
+        branch,
+        &format!("https://github.com/{repo_slug}.git"),
+    );
+}
+
+/// Bind `agent`@`branch` with `origin_url` as the source-repo origin remote.
+/// Creates a REAL git repo so `current_repo` derivation resolves (or, for a
+/// non-GitHub forge, fails to resolve) exactly as production would — the
+/// current_binding projection needs the bound repo identity, not just the branch.
+fn write_binding_with_origin(
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+    origin_url: &str,
+) {
     let src = home.join(format!("src-{agent}"));
     std::fs::create_dir_all(&src).unwrap();
     let git = |args: &[&str]| {
@@ -40,12 +57,7 @@ fn write_binding(home: &std::path::Path, agent: &str, repo_slug: &str, branch: &
             .unwrap();
     };
     git(&["init", "-b", "main"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        &format!("https://github.com/{repo_slug}.git"),
-    ]);
+    git(&["remote", "add", "origin", origin_url]);
 
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).unwrap();
@@ -437,5 +449,46 @@ fn detail_unbound_all_noncurrent() {
         "unbound ⇒ nothing current: {r}"
     );
     assert_eq!(arr[0]["lifecycle"], json!("polling"), "{r}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// r2 (codex #2746): a Bitbucket-Cloud watch is reachable via the PUBLIC `ci`
+/// schema — `repository=owner/repo` is a bare, provider-blind slug that
+/// `canonicalize_repo_slug` accepts, and `ci_provider=bitbucket_cloud` on a
+/// NON-protected branch is not rejected (only `bitbucket_server` is; the
+/// `provider_kind=="github"` gate applies to exact-head PROTECTED watches only).
+/// r1 derived `current_repo` with a GitHub-only origin canonicalizer, so a
+/// Bitbucket-origin binding resolved current_repo="" and the agent's OWN watch
+/// row projected current_binding=false. PRODUCTION-PATH RED: the real
+/// `handle_watch_ci` creates the watch (no synthetic sidecar injection).
+#[test]
+fn detail_current_binding_bitbucket_cloud_origin_production_path() {
+    let home = tmp_home("bitbucket-cur");
+    write_binding_with_origin(&home, "dev", "feat/x", "https://bitbucket.org/o/r.git");
+    // Public sequence: ci watch on a feature branch, explicit bare slug + provider.
+    let watch_resp = crate::mcp::handlers::ci::handle_watch_ci(
+        &home,
+        &json!({
+            "action": "watch",
+            "repository": "o/r",
+            "branch": "feat/x",
+            "ci_provider": "bitbucket_cloud",
+        }),
+        "dev",
+    );
+    assert!(
+        watch_resp.get("error").is_none(),
+        "a bitbucket_cloud feature-branch watch is reachable and must be accepted: {watch_resp}"
+    );
+
+    let r = handle_binding_state(&home, &json!({"instance": "dev"}), &None);
+    let d = row(&r, "feat/x");
+    assert_eq!(d["repo"], json!("o/r"), "watch stored the bare slug: {d}");
+    assert_eq!(
+        d["current_binding"],
+        json!(true),
+        "the agent's OWN Bitbucket-Cloud-origin watch must be current_binding=true; \
+         a GitHub-only current_repo derivation regressed it to false: {d}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
