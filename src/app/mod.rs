@@ -557,12 +557,7 @@ fn poll_restart_probe(
     match probe.as_mut().unwrap().child.try_wait() {
         Ok(Some(status)) => {
             let p = probe.take().unwrap();
-            // #2453 R2 RED WITNESS (temporary — restored in the next commit): the
-            // `status.success() &&` guard is dropped here so ANY probe exit —
-            // including a FAILURE — advances the gate to Committing and yields
-            // Commit. The slice-2 test below MUST fail against this (it proves a
-            // failed preflight is not silently allowed to teardown+exec).
-            if gate.to_committing() {
+            if status.success() && gate.to_committing() {
                 ProbePoll::Commit(p.reply)
             } else {
                 gate.abort_to_serving();
