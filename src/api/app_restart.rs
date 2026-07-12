@@ -65,17 +65,11 @@ impl AppRestartGate {
     /// loser (gate already `Probing`/`Committing`) gets `false` so the handler
     /// fails closed "already in progress" WITHOUT sending a second request.
     pub fn try_begin_probe(&self) -> bool {
-        // #2453 R2 RED: intentionally-buggy read-then-write (TOCTOU) so the
-        // deterministic two-worker test fails first (w1=true, w2=true). The very
-        // next commit fixes this to a genuine CAS (compare_exchange). `yield_now`
-        // widens the race window so the failure is reliable.
-        if self.0.load(Ordering::Acquire) == SERVING {
-            std::thread::yield_now();
-            self.0.store(PROBING, Ordering::Release);
-            true
-        } else {
-            false
-        }
+        // Genuine CAS: only the caller that atomically flips SERVING→PROBING wins.
+        // No read-then-write TOCTOU (decision d-20260712034222169749-5).
+        self.0
+            .compare_exchange(SERVING, PROBING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Advance `Probing → Committing` (only the claim winner, after a passing
