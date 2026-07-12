@@ -773,11 +773,9 @@ pub(super) fn run_attach(
             }
             let mut args = resolved.args.clone();
             if let Some(ref model) = resolved.model {
-                let model_val = Backend::from_command(&resolved.backend_command)
-                    .map(|b| b.format_model_arg(model))
-                    .unwrap_or_else(|| model.clone());
-                args.push("--model".to_string());
-                args.push(model_val);
+                // #2744 r1: DECLARED identity + capability gate — never
+                // from_command inference or a blind append.
+                Backend::push_model_arg(&mut args, &resolved.backend, model);
             }
             let command = resolved.backend_command.clone();
             let work_dir = working_dir
@@ -1068,11 +1066,9 @@ pub(super) fn create_pane_from_resolved(
 
     let mut args = resolved.args.clone();
     if let Some(ref model) = resolved.model {
-        let model_val = Backend::from_command(&resolved.backend_command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.clone());
-        args.push("--model".to_string());
-        args.push(model_val);
+        // #2744 r1: DECLARED identity + capability gate — never from_command
+        // inference or a blind append.
+        Backend::push_model_arg(&mut args, &resolved.backend, model);
     }
 
     let mut pane = create_pane(
@@ -1282,6 +1278,184 @@ mod tests {
 
     fn screen_of(pane: &Pane) -> String {
         String::from_utf8_lossy(&pane.vterm.dump_screen()).to_string()
+    }
+
+    // ── #2744 r1: app-path model chokepoint (deferred + sync entries) ──
+
+    fn argv_capture_script(home: &std::path::Path, sentinel: &std::path::Path) -> String {
+        let script = home.join("argv-capture.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{*:-__NO_ARGS__}}\" > '{}'\nsleep 30\n",
+                sentinel.display()
+            ),
+        )
+        .expect("write script");
+        script.display().to_string()
+    }
+
+    fn register_seat(home: &std::path::Path, name: &str) {
+        // #1441: managed spawns refuse unregistered instances — give the seat
+        // an authoritative fleet.yaml id.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n",
+                crate::types::InstanceId::new().full()
+            ),
+        )
+        .expect("write fleet.yaml");
+    }
+
+    fn await_sentinel(path: &std::path::Path) -> Option<String> {
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        None
+    }
+
+    fn resolved_seat(
+        name: &str,
+        backend: crate::backend::Backend,
+        args: Vec<String>,
+        model: Option<&str>,
+        work_dir: &std::path::Path,
+    ) -> crate::fleet::ResolvedInstance {
+        crate::fleet::ResolvedInstance {
+            name: name.into(),
+            backend,
+            // The command wire stays /bin/sh (capture harness) — the declared
+            // identity above must drive the model decision, not this string.
+            backend_command: "/bin/sh".into(),
+            args,
+            env: HashMap::new(),
+            working_directory: Some(work_dir.to_path_buf()),
+            ready_pattern: None,
+            submit_key: "\r".into(),
+            role: None,
+            cols: None,
+            rows: None,
+            topic_id: None,
+            git_branch: None,
+            model: model.map(String::from),
+            worktree: Some(false),
+            instructions: None,
+            source_repo: None,
+            repo: None,
+        }
+    }
+
+    /// #2744 r1 (deferred app path): `run_attach` — the real deferred-spawn
+    /// entry — must route model intent through the capability chokepoint:
+    /// declared opencode identity formats the value under a non-opencode
+    /// command wire (wrapper class), and a declared shell seat never
+    /// receives --model.
+    #[cfg(unix)]
+    #[test]
+    fn run_attach_routes_model_through_chokepoint_2744() {
+        let registry: &'static AgentRegistry = Box::leak(Box::default());
+        for (tag, backend, model, want) in [
+            (
+                "wrap",
+                crate::backend::Backend::OpenCode,
+                Some("opus"),
+                "--model anthropic/opus",
+            ),
+            (
+                "shell",
+                crate::backend::Backend::Shell,
+                Some("legacy"),
+                "__NO_ARGS__",
+            ),
+        ] {
+            let home = tmp_home(&format!("rf_model_{tag}"));
+            let sentinel = home.join("sentinel.txt");
+            let script = argv_capture_script(&home, &sentinel);
+            register_seat(&home, &format!("seat-{tag}"));
+            let resolved = resolved_seat(
+                &format!("seat-{tag}"),
+                backend.clone(),
+                vec![script],
+                model,
+                &home,
+            );
+            let outcome = run_attach(
+                AttachSpec::Agent {
+                    fleet_name: format!("seat-{tag}"),
+                    deduped_name: format!("seat-{tag}"),
+                    resolved,
+                    spawn_mode: crate::backend::SpawnMode::Fresh,
+                    cols: 80,
+                    rows: 24,
+                },
+                0,
+                registry,
+                &home,
+            );
+            assert!(
+                matches!(outcome, AttachOutcome::Ready { .. }),
+                "{tag}: attach must succeed"
+            );
+            let actual = await_sentinel(&sentinel);
+            crate::agent::lock_registry(registry).clear();
+            std::fs::remove_dir_all(&home).ok();
+            assert_eq!(
+                actual.as_deref(),
+                Some(want),
+                "{tag}: deferred app path must apply the capability gate"
+            );
+        }
+    }
+
+    /// #2744 r1 (sync app path): `create_pane_from_resolved` — the real
+    /// synchronous pane entry — must route model intent through the same
+    /// chokepoint (dedupe: an explicit args flag wins with no duplicate).
+    #[cfg(unix)]
+    #[test]
+    fn create_pane_from_resolved_routes_model_through_chokepoint_2744() {
+        let registry: &'static AgentRegistry = Box::leak(Box::default());
+        let home = tmp_home("sync_model");
+        let sentinel = home.join("sentinel.txt");
+        let script = argv_capture_script(&home, &sentinel);
+        register_seat(&home, "seat-sync");
+        let resolved = resolved_seat(
+            "seat-sync",
+            crate::backend::Backend::ClaudeCode,
+            vec![script, "--model".into(), "pinned".into()],
+            Some("fleet-loser"),
+            &home,
+        );
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let pane = create_pane_from_resolved(
+            "seat-sync",
+            &resolved,
+            &mut layout,
+            registry,
+            &home,
+            80,
+            24,
+            &wakeup_tx,
+            &mut name_counter,
+            crate::backend::SpawnMode::Fresh,
+        )
+        .expect("pane must spawn");
+        let actual = await_sentinel(&sentinel);
+        drop(pane);
+        crate::agent::lock_registry(registry).clear();
+        std::fs::remove_dir_all(&home).ok();
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model pinned"),
+            "sync app path must dedupe against the explicit args flag"
+        );
     }
 
     /// #render-first phase-(b) — must-resolve #4 (new behavior) + deferral proof:
