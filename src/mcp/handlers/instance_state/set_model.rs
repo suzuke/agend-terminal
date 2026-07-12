@@ -184,8 +184,7 @@ pub(crate) fn handle_set_model(
             home,
             &json!({"instance": name, "mode": "resume", "reason": "set_model"}),
         );
-        let restart_ok =
-            r.get("error").is_none_or(Value::is_null) && r["spawned"] == json!(true);
+        let restart_ok = r.get("error").is_none_or(Value::is_null) && r["spawned"] == json!(true);
         resp["restart_ok"] = json!(restart_ok);
         if restart_ok {
             resp["note"] = json!("restarted — new model intent active");
