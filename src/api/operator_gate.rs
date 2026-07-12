@@ -122,7 +122,7 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
         "repo" => AbsolutelyNever,
 
         // ── Structural lifecycle / daemon control: never-delegate ──
-        "create_instance" | "delete_instance"
+        "create_instance" | "delete_instance" | "set_model"
         | "restart_instance" | "start_instance" | "restart_daemon"
         | "release_worktree" | "move_pane"
         // direct API peers

@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（29 個工具）
+# AgEnD MCP Tools Reference — 工具參考（30 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -93,6 +93,12 @@
 - **instance**: 要重啟的 instance
 - mode (resume / fresh), reason, force
 - `fresh` 預設會在 bound worktree 有未提交變更時拒絕（#2476）；請先 commit/push 或留下 task-board handoff，或傳 `force: true`。
+
+### `set_model`
+#2744：把 instance 的 model intent 持久化到 fleet.yaml。`model`/`tier` 恰取其一；設定一方會在同一次寫入中原子清除另一方（last-write-wins intent）。預設下次 respawn 生效，`restart: true` 立即重啟。
+- **instance**：要更新的 fleet instance
+- model（宣告 backend 的具體 id/alias）、tier（`model_tiers` 符號鍵）、restart（預設 false）
+- Shell/Raw/自訂 backend 未宣告 model 能力 → 硬錯；entry `args` 內既有 model flag 屬硬衝突（不做自動改寫；payload 請移到 `--` 之後或清理 args）。持久化成功後 restart 失敗回 `persisted:true, restart_ok:false`——intent 仍於下次 respawn 生效。
 
 ### `bind_topic`
 #991：為以 `topic_binding=deferred` 建立的 instance(或 `auto` 模式但最終沒拿到 topic,例如剛好在開機後 ~6 秒 channel 初始化視窗內建立的)補建 Telegram topic。

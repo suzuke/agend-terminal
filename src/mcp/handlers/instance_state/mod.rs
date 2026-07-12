@@ -1,3 +1,5 @@
+pub(crate) mod set_model;
+
 use serde_json::{json, Value};
 use std::path::Path;
 
