@@ -226,6 +226,10 @@ fn run_scenario(home: &Path) {
             "branch": BRANCH,
             "repository": REPO_SLUG,
             "next_after_ci": "mock-reviewer",
+            // #2745 fail-closed: a merge-authority (branch) dispatch must declare an
+            // explicit review_class or it is rejected before the auto-bind — the seam
+            // this test exercises. Declaring it keeps the dispatch→bind→watch path live.
+            "review_class": "single",
         }),
     );
     assert_eq!(

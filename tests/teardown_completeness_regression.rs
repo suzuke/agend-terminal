@@ -226,6 +226,10 @@ fn run_scenario(home: &Path) {
         json!({
             "instance": VICTIM, "message": "do it", "request_kind": "task",
             "task_id": tid, "branch": BRANCH, "repository": REPO_SLUG, "next_after_ci": "lead",
+            // #2745 fail-closed: a merge-authority (branch) dispatch must declare an
+            // explicit review_class or it is rejected before the auto-bind that this
+            // teardown test needs to seed the victim's binding.
+            "review_class": "single",
         }),
     );
 

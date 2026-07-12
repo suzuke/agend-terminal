@@ -198,7 +198,7 @@ pub enum DraftState {
     Draft,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReviewClass {
     /// §3.6 — single VERIFIED triggers MergeReady.
     Single,
@@ -883,6 +883,30 @@ pub fn new_for_branch(
     }
 }
 
+/// #2745 R2 (root R1 finding): reconcile a persisted `review_class` with the
+/// current watch-resolved class on each CI observation. FAIL-CLOSED, no-weaken:
+/// - persisted `Unresolved` → adopt the watch class (operator re-arm recovery —
+///   this is what makes the diagnostic's "re-arm with review_class=…" instruction
+///   actually close the loop).
+/// - watch `Unresolved` → adopt `Unresolved` (a legacy/typo CURRENT watch →
+///   fail-closed inventory; makes the migration bite pre-existing state files that
+///   the old poller collapsed to `Single`).
+/// - persisted `Dual` + watch `Single` → keep `Dual` (a stale or accidental second
+///   watch feed must NOT silently weaken a 2-distinct-reviewer gate to 1).
+/// - otherwise adopt the watch class (`Single`→`Dual` strengthen, or unchanged).
+///
+/// Head advance does NOT reset the class (the review threshold is stable across a
+/// force-push); the next observation re-reconciles from the (unchanged) watch, so
+/// stale head-advance input cannot weaken the gate either.
+pub(crate) fn reconcile_review_class(persisted: ReviewClass, watch: ReviewClass) -> ReviewClass {
+    match (persisted, watch) {
+        (ReviewClass::Unresolved, w) => w,
+        (_, ReviewClass::Unresolved) => ReviewClass::Unresolved,
+        (ReviewClass::Dual, ReviewClass::Single) => ReviewClass::Dual,
+        (_, w) => w,
+    }
+}
+
 /// CI ingestion entry point — called from `ci_watch::poller` after
 /// the existing `[ci-ready-for-action]` emission. Loads-or-creates
 /// the pr_state file, applies the event, saves. Failures are
@@ -891,11 +915,10 @@ pub fn new_for_branch(
 ///
 /// `review_class` is sourced from the ci-watch file's `review_class`
 /// field (see [`crate::daemon::ci_watch::poller::parse_review_class`]).
-/// Applied on FIRST observation (file creation); subsequent
-/// observations preserve the existing `review_class` to avoid
-/// flapping if the watch file mutates mid-PR. Operator who needs
-/// to change review_class mid-flight should `remove` the pr_state
-/// file before re-running `ci action=watch`.
+/// #2745 R2: RECONCILED onto the existing state on EVERY observation via
+/// [`reconcile_review_class`] (fail-closed, no-weaken) — NOT create-only — so an
+/// operator re-arm actually recovers a persisted `Unresolved`, and a legacy
+/// `Single` state gets inventoried when the current watch resolves `Unresolved`.
 pub fn record_ci_result(
     home: &Path,
     repo: &str,
@@ -918,6 +941,17 @@ pub fn record_ci_result(
                 MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
             ) {
                 return;
+            }
+            // #2745 R2 (root R1 finding): reconcile the persisted class from the
+            // current watch-resolved authority (fail-closed, no-weaken) so re-arm
+            // recovery + legacy-file inventory actually close the loop — this was
+            // create-only before, stranding persisted Unresolved/legacy-Single. On a
+            // transition OUT of Unresolved, clear the diagnostic debounce so the
+            // pr-ready flow takes over at this head.
+            let was_unresolved = matches!(state.review_class, ReviewClass::Unresolved);
+            state.review_class = reconcile_review_class(state.review_class, review_class);
+            if was_unresolved && !matches!(state.review_class, ReviewClass::Unresolved) {
+                state.diagnostic_emitted_for_sha = None;
             }
             if !subscribers.is_empty() && state.subscribers.is_empty() {
                 state.subscribers = subscribers;
@@ -2177,8 +2211,9 @@ mod tests {
             "first-observation review_class must propagate from ci-watch"
         );
 
-        // Subsequent observation: existing review_class preserved (no
-        // mid-flight flapping if the watch file mutates).
+        // #2745 R2 no-weaken: a subsequent observation feeding a WEAKER class
+        // (Single) must NOT downgrade the persisted Dual — a stale or accidental
+        // second watch feed can never silently relax a 2-distinct-reviewer gate.
         record_ci_result(
             &dir,
             "owner/repo",
@@ -2192,9 +2227,198 @@ mod tests {
         assert_eq!(
             s.review_class,
             ReviewClass::Dual,
-            "subsequent observation must NOT override the initial review_class"
+            "a stale/weaker watch feed must not downgrade a persisted Dual (no-weaken)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2745 R2 (a) — root R1 finding: a persisted `Unresolved` pr-state RECOVERS
+    /// when the operator re-arms with an explicit class. The next CI observation
+    /// (production `record_ci_result`) reconciles the state to `Dual`, and merge
+    /// readiness then requires TWO distinct VERIFIED. Before R2 this loop could
+    /// never close (review_class was create-only → stranded Unresolved forever).
+    #[test]
+    fn r2a_persisted_unresolved_recovers_on_rearm_dual_2745() {
+        let dir = std::env::temp_dir().join(format!("agend-2745-r2a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A legacy/typo watch first persists an Unresolved state at sha-A.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/x",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".to_string()],
+            ReviewClass::Unresolved,
+        );
+        let s = load(&dir, "owner/repo", "feat/x").expect("created");
+        assert_eq!(s.review_class, ReviewClass::Unresolved, "starts Unresolved");
+        assert!(!is_merge_ready(&s), "Unresolved never ready");
+
+        // Operator re-arms `review_class=dual`; the next poll feeds Dual.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/x",
+            "sha-A",
+            CiConclusion::Green,
+            vec![],
+            ReviewClass::Dual,
+        );
+        let mut s = load(&dir, "owner/repo", "feat/x").expect("reloaded");
+        assert_eq!(
+            s.review_class,
+            ReviewClass::Dual,
+            "re-arm must recover the persisted class (loop closes)"
+        );
+        assert_eq!(
+            s.diagnostic_emitted_for_sha, None,
+            "diagnostic debounce cleared on leaving Unresolved"
+        );
+
+        // Readiness now enforces the 2-distinct-VERIFIED Dual threshold.
+        apply(
+            &mut s,
+            Event::VerdictObserved {
+                reviewer: "rev-1",
+                reviewed_head: "sha-A",
+                kind: VerdictKind::Verified,
+            },
+        );
+        assert!(
+            !is_merge_ready(&s),
+            "one VERIFIED is not enough for recovered Dual"
+        );
+        apply(
+            &mut s,
+            Event::VerdictObserved {
+                reviewer: "rev-2",
+                reviewed_head: "sha-A",
+                kind: VerdictKind::Verified,
+            },
+        );
+        assert!(
+            is_merge_ready(&s),
+            "two distinct VERIFIED open the recovered Dual gate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2745 R2 (b) — root R1 finding: a persisted legacy `Single` state (the
+    /// pre-#2745 poller-collapse class) is INVENTORIED when the current watch
+    /// resolves `Unresolved` (legacy None / typo). The next production
+    /// `record_ci_result` refreshes it to `Unresolved` → `is_merge_ready` closes,
+    /// so the scanner's [review-class-unresolved] diagnostic can fire. This makes
+    /// the fail-closed migration actually bite pre-existing state files.
+    #[test]
+    fn r2b_persisted_single_refreshes_to_unresolved_on_legacy_watch_2745() {
+        let dir = std::env::temp_dir().join(format!("agend-2745-r2b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-existing state: legacy Single.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/y",
+            "sha-A",
+            CiConclusion::Green,
+            vec!["dev".to_string()],
+            ReviewClass::Single,
+        );
+        assert_eq!(
+            load(&dir, "owner/repo", "feat/y").unwrap().review_class,
+            ReviewClass::Single
+        );
+
+        // The current watch has NO explicit review_class → poller resolves Unresolved.
+        record_ci_result(
+            &dir,
+            "owner/repo",
+            "feat/y",
+            "sha-A",
+            CiConclusion::Green,
+            vec![],
+            ReviewClass::Unresolved,
+        );
+        let mut s = load(&dir, "owner/repo", "feat/y").expect("reloaded");
+        assert_eq!(
+            s.review_class,
+            ReviewClass::Unresolved,
+            "a legacy Single state must be refreshed to Unresolved by an unresolved \
+             current watch (fail-closed inventory bites pre-existing files)"
+        );
+        // Even a VERIFIED cannot open the gate now.
+        apply(
+            &mut s,
+            Event::VerdictObserved {
+                reviewer: "rev-1",
+                reviewed_head: "sha-A",
+                kind: VerdictKind::Verified,
+            },
+        );
+        assert!(
+            !is_merge_ready(&s),
+            "refreshed Unresolved is never merge-ready"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2745 R2: `reconcile_review_class` transition matrix — recover from
+    /// Unresolved, adopt stricter, fail-closed to Unresolved, and NEVER silently
+    /// weaken Dual→Single (the stale-watch-can't-weaken invariant codex flagged).
+    #[test]
+    fn r2_reconcile_review_class_transition_matrix_2745() {
+        use ReviewClass::{Dual, Single, Unresolved};
+        // Recovery from Unresolved: adopt whatever the re-arm declared.
+        assert_eq!(reconcile_review_class(Unresolved, Single), Single);
+        assert_eq!(reconcile_review_class(Unresolved, Dual), Dual);
+        assert_eq!(reconcile_review_class(Unresolved, Unresolved), Unresolved);
+        // Current watch Unresolved → fail-closed regardless of persisted.
+        assert_eq!(reconcile_review_class(Single, Unresolved), Unresolved);
+        assert_eq!(reconcile_review_class(Dual, Unresolved), Unresolved);
+        // Strengthen / unchanged: adopt the watch class.
+        assert_eq!(
+            reconcile_review_class(Single, Dual),
+            Dual,
+            "single→dual strengthens"
+        );
+        assert_eq!(reconcile_review_class(Single, Single), Single);
+        assert_eq!(reconcile_review_class(Dual, Dual), Dual);
+        // NO-WEAKEN: a Single watch feed can never downgrade a persisted Dual.
+        assert_eq!(
+            reconcile_review_class(Dual, Single),
+            Dual,
+            "Dual must not be silently weakened to Single by a watch feed"
+        );
+    }
+
+    /// #2745 R2: head advance (force-push) preserves the review_class — apply()
+    /// clears verdicts + debounce keys on head advance but NOT the class, and
+    /// reconcile then keeps it, so a stale post-advance Single feed can't weaken.
+    #[test]
+    fn r2_head_advance_preserves_review_class_2745() {
+        let mut s = new_state("sha-A", ReviewClass::Dual);
+        apply(
+            &mut s,
+            Event::CiObserved {
+                head_sha: "sha-B",
+                conclusion: CiConclusion::Green,
+                observed_at: now(),
+            },
+        );
+        assert_eq!(
+            s.review_class,
+            ReviewClass::Dual,
+            "head advance must not reset the review_class"
+        );
+        assert_eq!(
+            reconcile_review_class(s.review_class, ReviewClass::Single),
+            ReviewClass::Dual,
+            "post-advance stale Single feed still cannot weaken Dual"
+        );
     }
 
     /// T20 (reviewer-rejection fix end-to-end): full pipeline for a
