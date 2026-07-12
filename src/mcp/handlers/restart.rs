@@ -480,8 +480,12 @@ mod tests {
                         .unwrap_or(0),
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
-                let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None, None);
+                let response = handle_restart_daemon(
+                    &tmp,
+                    Some(crate::api::RestartCapability::Daemon),
+                    None,
+                    None,
+                );
                 assert_eq!(
                     response["ok"], false,
                     "unsupervised invocation must return ok:false, got {response}"
@@ -538,8 +542,12 @@ mod tests {
                         .unwrap_or(0),
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
-                let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None, None);
+                let response = handle_restart_daemon(
+                    &tmp,
+                    Some(crate::api::RestartCapability::Daemon),
+                    None,
+                    None,
+                );
                 assert_eq!(
                     response["ok"], false,
                     "ambient XPC_SERVICE_NAME alone must NOT be accepted as a \
@@ -593,8 +601,12 @@ mod tests {
                         .unwrap_or(0),
                 ));
                 std::fs::create_dir_all(&tmp).expect("create tempdir");
-                let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::App), None, None);
+                let response = handle_restart_daemon(
+                    &tmp,
+                    Some(crate::api::RestartCapability::App),
+                    None,
+                    None,
+                );
                 assert_eq!(
                     response["ok"], false,
                     "app-mode (no run_core consumer) restart must fail-closed, got {response}"
@@ -651,8 +663,12 @@ mod tests {
             ],
             || {
                 let tmp = unique_tmp("daemon-cap");
-                let response =
-                    handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Daemon), None, None);
+                let response = handle_restart_daemon(
+                    &tmp,
+                    Some(crate::api::RestartCapability::Daemon),
+                    None,
+                    None,
+                );
                 assert_eq!(
                     response["ok"], false,
                     "unsupervised daemon restart fails closed on the supervisor check, got {response}"
@@ -710,8 +726,12 @@ mod tests {
     fn unsupported_capability_default_deny_cannot_reach_daemon() {
         with_env_and_reset(&[("AGEND_RESTART_HANDOFF", "1")], &[], || {
             let tmp = unique_tmp("unsupported-cap");
-            let response =
-                handle_restart_daemon(&tmp, Some(crate::api::RestartCapability::Unsupported), None, None);
+            let response = handle_restart_daemon(
+                &tmp,
+                Some(crate::api::RestartCapability::Unsupported),
+                None,
+                None,
+            );
             assert_eq!(
                 response["ok"], false,
                 "unsupported-host restart must default-deny, got {response}"

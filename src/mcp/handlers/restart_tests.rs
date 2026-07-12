@@ -44,8 +44,12 @@ mod app_restart_strategy_tests {
     #[test]
     fn app_without_flush_slot_fails_closed() {
         let (ar, rx) = make();
-        let resp =
-            handle_restart_daemon(Path::new("/tmp"), Some(RestartCapability::App), Some(ar), None);
+        let resp = handle_restart_daemon(
+            Path::new("/tmp"),
+            Some(RestartCapability::App),
+            Some(ar),
+            None,
+        );
         assert_eq!(resp["ok"], false);
         assert!(resp["error"]
             .as_str()
@@ -138,7 +142,10 @@ mod app_restart_strategy_tests {
         t.join().expect("stub loop thread joined");
         assert_eq!(resp["ok"], false);
         let err = resp["error"].as_str().expect("error is a string");
-        assert!(err.contains("aborted") && err.contains("intact"), "got {err:?}");
+        assert!(
+            err.contains("aborted") && err.contains("intact"),
+            "got {err:?}"
+        );
         assert!(
             slot.register(Box::new(|| {})),
             "an aborted probe must NOT arm the barrier — the slot stays free"
