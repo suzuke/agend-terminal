@@ -18,6 +18,8 @@ fn test_ctx(home: &std::path::Path) -> HandlerCtx<'_> {
         notifier: None,
         home,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     }
 }
 
@@ -219,6 +221,8 @@ fn test_send_to_active_registry_target_returns_pty() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     let result = handle_send(
         &json!({"from": "sender", "target": "active-agent", "text": "hi"}),
@@ -811,6 +815,8 @@ fn same_team_codex_update_absorbed() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     let result = handle_send(
         &json!({"from": "sender", "target": "codex-agent", "text": "status update", "kind": "update"}),
@@ -888,6 +894,8 @@ fn cross_team_message_not_absorbed() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     // general can send cross-team; codex update should still inject (not absorbed)
     let result = handle_send(
@@ -957,6 +965,8 @@ fn same_team_codex_update_orchestrator_not_skipped() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     let result = handle_send(
         &json!({"from": "sender", "target": "codex-agent", "text": "status update", "kind": "update"}),
@@ -1022,6 +1032,8 @@ fn same_team_codex_update_non_orchestrator_skipped() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     let result = handle_send(
         &json!({"from": "sender", "target": "codex-agent", "text": "status update", "kind": "update"}),
@@ -1088,6 +1100,8 @@ fn cross_team_codex_update_orchestrator_not_skipped() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     let result = handle_send(
         &json!({"from": "general", "target": "codex-agent", "text": "cross-team update", "kind": "update"}),
@@ -1576,6 +1590,8 @@ fn make_codex_ctx(
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     (registry, ctx, home.to_path_buf())
 }
@@ -1826,6 +1842,8 @@ fn b6_non_codex_backend_pty_path_unchanged_by_override() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     seed_drained_blocker(&home, "claude-agent", "query", "corr-b6");
 
@@ -2029,6 +2047,8 @@ fn kind_report_cross_team_codex_via_general_still_injects() {
         notifier: None,
         home: home_ref,
         capability: crate::api::RestartCapability::Unsupported,
+        app_restart: None,
+        post_flush: crate::api::app_restart::PostFlushSlot::new(),
     };
     let result = handle_send(
         &json!({

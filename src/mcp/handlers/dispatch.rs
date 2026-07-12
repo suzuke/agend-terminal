@@ -52,6 +52,16 @@ pub(crate) struct RuntimeContext {
     /// `crate::api::serve` and carried here from the API `HandlerCtx` so
     /// `dispatch_restart_daemon` routes on an injected value, not a global.
     pub capability: crate::api::RestartCapability,
+    /// #2453 Stage R2: the app owner-restart request channel + shared gate,
+    /// injected at the app API composition root. `Some` only under
+    /// `RestartCapability::App`; `None` everywhere else (daemon/verify fail-closed).
+    pub app_restart: Option<crate::api::app_restart::AppRestart>,
+    /// #2453 Stage R2 (flush barrier): a clone of the CURRENT API request's
+    /// `PostFlushSlot`, carried from the API `HandlerCtx` so the restart handler can
+    /// register a post-flush commit-permission ack that `handle_session` runs after
+    /// it flushes THIS response. `None` off the api `mcp_tool` ingress (no request to
+    /// tie a flush to → the handler cannot arm the barrier and fails closed).
+    pub post_flush: Option<crate::api::app_restart::PostFlushSlot>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -281,7 +291,12 @@ pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
 /// standalone bridge call that never traversed the api `mcp_tool` ingress) maps
 /// to `None` → default-deny in the handler.
 pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
-    restart::handle_restart_daemon(ctx.home, ctx.runtime.map(|r| r.capability))
+    restart::handle_restart_daemon(
+        ctx.home,
+        ctx.runtime.map(|r| r.capability),
+        ctx.runtime.and_then(|r| r.app_restart.clone()),
+        ctx.runtime.and_then(|r| r.post_flush.clone()),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -443,6 +458,8 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             capability: crate::api::RestartCapability::App,
+            app_restart: None,
+            post_flush: None,
         };
         let ctx = HandlerCtx {
             home: &home,

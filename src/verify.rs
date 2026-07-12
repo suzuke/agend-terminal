@@ -170,6 +170,7 @@ pub fn run(
                     externals,
                     None,
                     api::RestartCapability::Unsupported,
+                    None, // #2453 R2: verify host has no app-restart channel
                 )
             })
             .ok();

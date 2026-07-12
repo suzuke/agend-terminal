@@ -81,13 +81,17 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     // must outlive the entire app session; drop = flush + close the
     // worker thread. Bound here in `app::run`'s scope so it lives until
     // the fn returns (the entire TUI loop lifetime).
-    let _app_log_guard = crate::logging::setup_rolling_tracing(
+    // #2453 R2: stash the app log guard in the global flush slot so the
+    // owner-restart path (which re-execs, bypassing Drop) can flush it explicitly
+    // via `flush_app_log()`. The guard lives for the process lifetime either way.
+    if let Ok(guard) = crate::logging::setup_rolling_tracing(
         &home,
         "app",
         "agend_terminal=info",
         crate::logging::MigrationPolicy::Drop,
-    )
-    .ok();
+    ) {
+        crate::logging::store_app_flush_guard(guard);
+    }
 
     let fleet_path = fleet_path_override.map(PathBuf::from);
 
@@ -149,7 +153,18 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
         crossterm::event::DisableBracketedPaste,
     )
     .ok();
-    result
+
+    // #2453 R2: commit an owner-restart AFTER the terminal is restored (raw mode
+    // off, alternate screen left) and the api guard dropped — re-exec in place so
+    // the fresh app re-acquires the flock + re-enters the TUI on the SAME terminal.
+    match result {
+        Ok(RunOutcome::Normal) => Ok(()),
+        Ok(RunOutcome::RestartRequested) => {
+            crate::logging::flush_app_log();
+            commit_app_restart(fleet_path_override)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// #1726: per-tick handlers that app-standalone INTENTIONALLY does not run,
@@ -402,7 +417,265 @@ fn render_active_overlay(
     }
 }
 
-fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
+/// #2453 R2: outcome of the app TUI loop — either a normal quit or an
+/// operator-requested owner-restart that `run()` commits via in-place re-exec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunOutcome {
+    Normal,
+    RestartRequested,
+}
+
+/// #2453 R2: an in-flight app-restart preflight probe (a direct child running
+/// `--restart-probe`), owned + polled non-blocking by the TUI loop. Carries the
+/// request's `reply` (TUI→handler verdict) and `flush_ack` (the transport's
+/// post-flush commit-permission the TUI waits on before it commits + re-execs).
+struct RestartProbe {
+    child: std::process::Child,
+    reply: crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>,
+    flush_ack: crossbeam_channel::Receiver<()>,
+    deadline: std::time::Instant,
+}
+
+/// #2453 R2: spawn the read-only preflight probe as a DIRECT child (own process
+/// group, no TTY IO). It re-execs THIS binary with `--restart-probe`, which only
+/// loads the binary + parses config/fleet.yaml (read-only; it must NOT attach to
+/// the live predecessor). Clean exit (0) ⇒ the successor can boot far enough to
+/// parse its config; non-zero / crash ⇒ abort the restart with the fleet intact.
+fn spawn_restart_probe() -> std::io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("restart-probe")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // isolate: a probe kill never signals the TUI's group
+    }
+    cmd.spawn()
+}
+
+/// #2453 R2: the argv the app re-execs into on a committed restart. Preserves the
+/// `app` subcommand + the `--fleet <override>` the operator launched with.
+/// Factored out so it is unit-testable without performing the irreversible `exec`.
+/// Unix-only: the in-place re-exec (`commit_app_restart`) exists only on Unix — its
+/// sole caller — so gating this with it keeps the Windows build free of dead_code.
+#[cfg(unix)]
+fn restart_argv(fleet_override: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["app".to_string()];
+    if let Some(f) = fleet_override {
+        argv.push("--fleet".to_string());
+        argv.push(f.to_string());
+    }
+    argv
+}
+
+/// #2453 R2: commit the app owner-restart by RE-EXEC (Unix) — replaces this
+/// process image in place (same PID → same shell foreground job; a spawned
+/// successor would be reclaimed by the shell, PROVEN by the R2 PTY harness). Only
+/// returns on failure; by this point agents are stopped, the session is saved and
+/// the terminal is restored, so failure is UNRECOVERABLE — log + exit non-zero so
+/// the shell surfaces it (accepted residual risk, disclosed in the PR).
+#[cfg(unix)]
+fn commit_app_restart(fleet_override: Option<&str>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(restart_argv(fleet_override));
+    let err = cmd.exec(); // on success, never returns
+    eprintln!(
+        "agend-terminal: restart re-exec failed: {err}. Agents were stopped and the \
+         session was saved — relaunch `agend-terminal app`."
+    );
+    crate::logging::flush_app_log();
+    std::process::exit(70); // EX_SOFTWARE
+}
+
+/// #2453 R2: Windows never reaches a restart commit — the `App` strategy
+/// fail-closes at the handler, so `RunOutcome::RestartRequested` never occurs.
+#[cfg(windows)]
+fn commit_app_restart(_fleet_override: Option<&str>) -> Result<()> {
+    unreachable!("app restart commit is Unix-only; Windows fail-closes at the handler")
+}
+
+/// #2453 R2: the read-only app-restart preflight (the hidden `restart-probe`
+/// subcommand). KISS + read-only: the binary has already loaded (we are running
+/// it); confirm AGEND_HOME exists and fleet.yaml — if present — parses, WITHOUT
+/// attaching to the live daemon (it never calls `bootstrap::prepare`). Exits 0
+/// (ok) / 1 (fail). This proves the successor can boot far enough to parse its
+/// config; it does NOT prove flock / api / control-plane readiness.
+pub(crate) fn run_restart_probe() -> ! {
+    let home = crate::home_dir();
+    let code = if !home.exists() {
+        1
+    } else {
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        if !fleet_path.exists() {
+            0 // a fresh app writes one on boot — absence is fine
+        } else {
+            match std::fs::read_to_string(&fleet_path)
+                .ok()
+                .and_then(|s| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&s).ok())
+            {
+                Some(_) => 0,
+                None => 1,
+            }
+        }
+    };
+    std::process::exit(code);
+}
+
+/// #2453 R2: the decision the TUI loop reaches when it polls the in-flight restart
+/// probe on a tick. Extracted from the loop so the prepare-vs-abort branch — the one
+/// gating the IRREVERSIBLE teardown+exec — is unit-testable without driving the full
+/// TUI (mirrors `restart_argv`). A passing probe does NOT commit here; it yields
+/// `Prepared` (gate still `Probing`) and the loop replies `Prepared`, waits for the
+/// transport's post-flush ack, and ONLY THEN CAS `Probing→Committing` + breaks to
+/// teardown+exec. `Abort` rolls the gate to `Serving` and keeps serving. Ownership:
+/// on any terminal verdict the probe is `take`n out of the slot (killed+reaped on timeout).
+enum ProbePoll {
+    /// Probe still running and within its deadline — keep serving this tick.
+    Pending,
+    /// Probe passed; gate is STILL `Probing` (NOT yet committed). The loop replies
+    /// `Prepared`, then blocks on the `flush_ack` receiver for the transport's
+    /// commit-permission; on the ack it CAS `Probing→Committing`, sets
+    /// `RestartRequested`, and breaks to teardown+exec. A disconnect/timeout aborts.
+    Prepared(
+        crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>,
+        crossbeam_channel::Receiver<()>,
+    ),
+    /// Probe failed / timed out / errored — the gate was rolled back to `Serving`
+    /// and NO restart happens. The loop replies `Aborted(reason)` and keeps
+    /// serving; teardown + exec are never reached.
+    Abort(
+        crossbeam_channel::Sender<crate::api::app_restart::AppRestartVerdict>,
+        String,
+    ),
+}
+
+/// #2453 R2: poll `probe` once (non-blocking). A passing probe yields `Prepared`
+/// WITHOUT touching the gate (it stays `Probing`) — the loop commits only after the
+/// transport's post-flush ack. Every failure mode (non-zero exit, timeout, wait
+/// error) rolls the gate back to `Serving` and yields `Abort`, PROVING a failed
+/// preflight performs zero teardown.
+fn poll_restart_probe(
+    probe: &mut Option<RestartProbe>,
+    gate: &crate::api::app_restart::AppRestartGate,
+) -> ProbePoll {
+    if probe.is_none() {
+        return ProbePoll::Pending;
+    }
+    match probe
+        .as_mut()
+        .expect("probe present (checked above)")
+        .child
+        .try_wait()
+    {
+        Ok(Some(status)) => {
+            let p = probe.take().expect("probe present (checked above)");
+            if status.success() {
+                // Probe passed: DO NOT commit here — leave the gate at `Probing`. The
+                // loop replies `Prepared` and CAS `Probing→Committing` only after the
+                // transport's post-flush ack, so the `prepared` reply can't be lost to
+                // a teardown that outran the writer.
+                ProbePoll::Prepared(p.reply, p.flush_ack)
+            } else {
+                gate.abort_to_serving();
+                ProbePoll::Abort(
+                    p.reply,
+                    format!("preflight failed (exit {:?})", status.code()),
+                )
+            }
+        }
+        Ok(None) => {
+            if std::time::Instant::now()
+                >= probe
+                    .as_ref()
+                    .expect("probe present (checked above)")
+                    .deadline
+            {
+                let mut p = probe.take().expect("probe present (checked above)");
+                let _ = p.child.kill();
+                let _ = p.child.wait(); // reap — no zombie
+                gate.abort_to_serving();
+                ProbePoll::Abort(p.reply, "preflight timed out (5s)".to_string())
+            } else {
+                ProbePoll::Pending
+            }
+        }
+        Err(e) => {
+            let p = probe.take().expect("probe present (checked above)");
+            gate.abort_to_serving();
+            ProbePoll::Abort(p.reply, format!("preflight wait error: {e}"))
+        }
+    }
+}
+
+/// #2453 R2 P0-2: how long the TUI keeps a `prepared` (commit-pending) restart alive
+/// waiting for the transport's post-flush ack before a watchdog aborts it. Generous:
+/// a successful flush delivers the ack near-instantly, so only a genuinely wedged API
+/// writer reaches this. The `prepared` reply is honestly indeterminate (it never
+/// promises completion), so a watchdog abort — even after a very-late delivered
+/// `prepared` — stays contract-consistent ("if the app is still running, retry").
+const RESTART_COMMIT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #2453 R2 P0-2: the TUI's commit-pending restart state. After a passing probe the
+/// loop replies `Prepared` and parks THIS (the `flush_ack` receiver + a watchdog
+/// `deadline`) instead of BLOCKING — the loop polls it non-blockingly each tick so
+/// the UI never freezes on a wedged API writer (codex R3 correction).
+struct CommitPending {
+    flush_ack: crossbeam_channel::Receiver<()>,
+    deadline: std::time::Instant,
+}
+
+/// #2453 R2 P0-2: the decision from one non-blocking poll of the commit-pending
+/// state — extracted so the "commit ONLY on the transport's post-flush ack, else
+/// abort" rule (gating the irreversible teardown+exec) is unit-testable without the
+/// TUI. Pure: reads the ack channel + compares `now` to the deadline; the caller
+/// owns the gate CAS + teardown.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitPoll {
+    /// The post-flush ack arrived — the reply flushed. Caller CAS `Probing→Committing`
+    /// and breaks to teardown+exec.
+    Commit,
+    /// Abort (roll the gate back to `Serving`, keep serving). Either the ack channel
+    /// disconnected (the action dropped un-run: write/flush failed or the session
+    /// ended) or the watchdog `deadline` passed with no ack. The `&'static str` names
+    /// which, for an observable log.
+    Abort(&'static str),
+    /// No ack yet and still within the deadline — keep serving (UI responsive).
+    Pending,
+}
+
+/// #2453 R2 P0-2: poll the commit-pending state once (NON-BLOCKING). `try_recv` is
+/// checked FIRST, so an already-buffered ack always commits and the watchdog can
+/// never preempt an ack the TUI has yet to observe. NOTE (codex R3 truthfulness
+/// correction): a delivered `prepared` reply and this ack's visibility can straddle
+/// the deadline, so a watchdog `Abort` may occur even after the client received
+/// `prepared` — which is why the reply is worded as an indeterminate attempt.
+fn poll_commit_pending(cp: &CommitPending, now: std::time::Instant) -> CommitPoll {
+    // try_recv FIRST: a buffered ack (the `prepared` reply flushed) always commits and
+    // the watchdog can never preempt an ack the TUI has yet to observe. Only a
+    // genuinely-empty channel is subject to the watchdog — and because the `prepared`
+    // reply is an honest indeterminate attempt, aborting the app-intact restart on a
+    // disconnect (reply not flushed) or the deadline stays contract-consistent.
+    match cp.flush_ack.try_recv() {
+        Ok(()) => CommitPoll::Commit,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            CommitPoll::Abort("flush_disconnected")
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => {
+            if now >= cp.deadline {
+                CommitPoll::Abort("flush_ack_watchdog")
+            } else {
+                CommitPoll::Pending
+            }
+        }
+    }
+}
+
+fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<RunOutcome> {
     let home = crate::home_dir();
     // #2325: the app process (unlike the daemon's `run_core`, the only other
     // `runtime_config::reload` caller) never tick-reloads runtime config, so load
@@ -444,9 +717,34 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // client (Stage 3.4). `attached_mode` gates every operation that would
     // conflict with the live daemon — session persistence, fleet.yaml sync,
     // supervisor spawn, and agent kill on exit.
-    let (_api_guard, telegram_state, telegram_status, attached_run_dir) =
-        setup_app_bootstrap(&home, &fleet_path, &registry, tui_event_tx);
+    // #2453 R2: the app owner-restart gate + bounded(1) request channel. The
+    // Sender + gate are injected into the API server (owned mode); this loop owns
+    // the Receiver + gate and drives the probe → re-exec commit. In Attached mode
+    // the daemon owns restart, so the api server isn't started and the injected
+    // Sender is dropped inside `setup_app_bootstrap` — the loop treats the
+    // receiver as never-ready (see the select! arm).
+    let app_restart_gate = crate::api::app_restart::AppRestartGate::new();
+    let (app_restart_tx, app_restart_rx) =
+        crossbeam_channel::bounded::<crate::api::app_restart::AppRestartRequest>(1);
+    let app_restart_inject = crate::api::app_restart::AppRestart {
+        tx: app_restart_tx,
+        gate: app_restart_gate.clone(),
+    };
+    let (_api_guard, telegram_state, telegram_status, attached_run_dir) = setup_app_bootstrap(
+        &home,
+        &fleet_path,
+        &registry,
+        tui_event_tx,
+        Some(app_restart_inject),
+    );
     let attached_mode = attached_run_dir.is_some();
+    // #2453 R2: in Attached mode the daemon owns restart — never listen for app
+    // restart requests (the injected Sender was dropped in setup_app_bootstrap).
+    let app_restart_rx = if attached_mode {
+        crossbeam_channel::never::<crate::api::app_restart::AppRestartRequest>()
+    } else {
+        app_restart_rx
+    };
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
     // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
@@ -860,10 +1158,85 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         wakeup_tx: &wakeup_tx,
     };
 
+    // #2453 R2: app owner-restart in-flight state. At most one probe at a time
+    // (the gate CAS-serializes at the handler). `restart_outcome` is read after
+    // the loop to drive the in-place re-exec in `run()`.
+    let mut restart_outcome = RunOutcome::Normal;
+    let mut restart_probe: Option<RestartProbe> = None;
+    // #2453 R2 P0-2: the commit-pending state after a passing probe. The loop NEVER
+    // blocks on the transport ack (that would freeze the UI on a wedged API writer —
+    // codex R3): it parks the `flush_ack` receiver here and polls it each tick.
+    let mut restart_commit_pending: Option<CommitPending> = None;
+
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
             break;
+        }
+        // #2453 R2: poll the in-flight restart preflight probe (non-blocking) each
+        // loop tick so the TUI never freezes on it.
+        if restart_probe.is_some() {
+            use crate::api::app_restart::AppRestartVerdict;
+            match poll_restart_probe(&mut restart_probe, &app_restart_gate) {
+                ProbePoll::Prepared(reply, flush_ack) => {
+                    // Probe passed; the gate is still Probing. Reply PREPARED, then park
+                    // the transport ack (do NOT block): the handler returns the
+                    // `prepared` reply, handle_session writes+flushes it, and its
+                    // post-flush action sends `()` on `flush_ack`. We poll that below,
+                    // non-blockingly, and CAS Probing→Committing only on the ack — so the
+                    // UI stays responsive even if the API writer wedges. If the handler
+                    // is already gone (send fails), roll the gate back now.
+                    if reply.send(AppRestartVerdict::Prepared).is_ok() {
+                        restart_commit_pending = Some(CommitPending {
+                            flush_ack,
+                            deadline: std::time::Instant::now() + RESTART_COMMIT_WATCHDOG,
+                        });
+                    } else {
+                        app_restart_gate.abort_to_serving();
+                    }
+                }
+                ProbePoll::Abort(reply, reason) => {
+                    let _ = reply.send(AppRestartVerdict::Aborted(reason));
+                }
+                ProbePoll::Pending => {}
+            }
+        }
+        // #2453 R2 P0-2: poll the commit-pending state (NON-BLOCKING). The ack means
+        // the `prepared` reply flushed → CAS Probing→Committing + break to teardown+
+        // exec. A disconnect (reply not flushed) or the watchdog deadline aborts the
+        // restart with the app intact and an observable log; the `prepared` reply is
+        // an honest indeterminate attempt, so a watchdog abort stays truthful.
+        if restart_commit_pending.is_some() {
+            let now = std::time::Instant::now();
+            let poll = poll_commit_pending(
+                restart_commit_pending
+                    .as_ref()
+                    .expect("commit-pending present (checked above)"),
+                now,
+            );
+            match poll {
+                CommitPoll::Commit => {
+                    restart_commit_pending = None;
+                    if app_restart_gate.to_committing() {
+                        restart_outcome = RunOutcome::RestartRequested;
+                        break;
+                    }
+                    // Could not advance Probing→Committing (should not happen for the
+                    // claim owner) — fail safe: roll back, keep serving.
+                    app_restart_gate.abort_to_serving();
+                }
+                CommitPoll::Abort(reason) => {
+                    restart_commit_pending = None;
+                    app_restart_gate.abort_to_serving();
+                    tracing::warn!(
+                        target: "handoff",
+                        event = "app_restart_abort",
+                        reason,
+                        "#2453 app restart aborted before commit — app intact (retry)"
+                    );
+                }
+                CommitPoll::Pending => {}
+            }
         }
         // Auto-close the scratch shell overlay once its backing process
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
@@ -1054,6 +1427,40 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         };
 
         crossbeam_channel::select! {
+            // #2453 R2: an operator `restart_daemon` request (owned app mode only;
+            // never-ready in attached). Start the preflight probe; the poll at the
+            // loop top drives it to commit/abort. The gate CAS-serializes, so at
+            // most one probe is ever in flight.
+            recv(app_restart_rx) -> req => {
+                if let Ok(req) = req {
+                    use crate::api::app_restart::AppRestartVerdict;
+                    if restart_probe.is_some() {
+                        // Defensive: the gate should prevent this. Reject without
+                        // disturbing the in-flight probe's claim.
+                        let _ = req.reply.send(AppRestartVerdict::Aborted(
+                            "a restart preflight is already in flight".into(),
+                        ));
+                    } else {
+                        match spawn_restart_probe() {
+                            Ok(child) => {
+                                restart_probe = Some(RestartProbe {
+                                    child,
+                                    reply: req.reply,
+                                    flush_ack: req.flush_ack,
+                                    deadline: std::time::Instant::now()
+                                        + std::time::Duration::from_secs(5),
+                                });
+                            }
+                            Err(e) => {
+                                app_restart_gate.abort_to_serving();
+                                let _ = req.reply.send(AppRestartVerdict::Aborted(format!(
+                                    "could not start preflight probe: {e}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
             recv(event_rx) -> ev => {
                 dirty = true; // input may change the display → redraw next due frame
                 let ev = match ev {
@@ -1321,7 +1728,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // for Attached — see #910 for the registry-truth migration).
     app_teardown(&home, &ui.layout, &registry, attached_mode, attach_workers);
 
-    Ok(())
+    Ok(restart_outcome)
 }
 
 /// App startup bootstrap: prepare the fleet (issuing `api.cookie` BEFORE any API
@@ -1338,6 +1745,7 @@ fn setup_app_bootstrap(
     fleet_path: &Path,
     registry: &AgentRegistry,
     tui_event_tx: TuiEventSender,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) -> (
     api_server::ApiGuard,
     Option<Arc<dyn crate::channel::Channel>>,
@@ -1358,7 +1766,8 @@ fn setup_app_bootstrap(
                 } else {
                     telegram_hooks::telegram_status_from_config(&prepared.config)
                 };
-                let guard = api_server::start_api_server(prepared, registry, tui_event_tx);
+                let guard =
+                    api_server::start_api_server(prepared, registry, tui_event_tx, app_restart);
                 // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
                 // the owned app. SIGINT stays with crossterm so Ctrl+C still
                 // reaches the focused pane's PTY as 0x03.
@@ -2951,5 +3360,84 @@ mod tests {
     }
 }
 
+/// #2453 R2 slice 2 — preflight failure proves ZERO teardown. `Prepared` is the
+/// ONLY `ProbePoll` variant that can lead the TUI loop into the irreversible
+/// teardown+exec (and only after the post-flush ack); every probe failure mode must
+/// instead roll the gate back to `Serving` and yield `Abort`, leaving the app
+/// serving. This unit-checks that on the extracted `poll_restart_probe` without the TUI.
+#[cfg(all(test, unix))]
+mod probe_poll_tests {
+    use super::*;
+    use crate::api::app_restart::{AppRestartGate, AppRestartVerdict};
+    use std::time::{Duration, Instant};
+
+    /// A `RestartProbe` whose direct child exits with `code` (via `sh -c 'exit N'`)
+    /// and a far-future deadline, so polling exercises the exit-code branch (not
+    /// the timeout branch). Returns the reply receiver so the channel stays open.
+    fn exited_probe(code: i32) -> (RestartProbe, crossbeam_channel::Receiver<AppRestartVerdict>) {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .spawn()
+            .expect("spawn probe child");
+        let (reply, rx) = crossbeam_channel::unbounded::<AppRestartVerdict>();
+        // The failure path never reads flush_ack; a disconnected receiver is fine.
+        let (_ack_tx, flush_ack) = crossbeam_channel::bounded::<()>(1);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        (
+            RestartProbe {
+                child,
+                reply,
+                flush_ack,
+                deadline,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn preflight_failure_aborts_gate_to_serving_no_commit() {
+        let (probe, _rx) = exited_probe(1);
+        let gate = AppRestartGate::new();
+        assert!(gate.try_begin_probe(), "handler claimed the gate (Probing)");
+        let mut slot = Some(probe);
+        // The child exits immediately; poll until it is observed terminal.
+        let result = loop {
+            match poll_restart_probe(&mut slot, &gate) {
+                ProbePoll::Pending => std::thread::sleep(Duration::from_millis(10)),
+                other => break other,
+            }
+        };
+        let ProbePoll::Abort(_reply, reason) = result else {
+            panic!(
+                "a FAILED preflight must yield Abort (never Commit) — Commit is the ONLY \
+                 path that breaks the loop into the irreversible teardown+exec"
+            );
+        };
+        assert!(
+            reason.contains("preflight failed"),
+            "abort reason must name the preflight failure — got {reason:?}"
+        );
+        assert!(
+            gate.is_serving(),
+            "gate MUST roll back to Serving on a failed preflight (zero teardown)"
+        );
+        assert!(
+            !gate.is_committing(),
+            "a failed preflight must NEVER reach Committing (which would teardown+exec)"
+        );
+        assert!(
+            slot.is_none(),
+            "the failed probe must be consumed out of the slot"
+        );
+    }
+}
+
 #[cfg(test)]
 mod review_repro_app_tui;
+
+// #2453 R2 P0-2: commit-pending witnesses re-homed to a sibling `*tests*.rs` file
+// (exempt from the src file-size invariant); `use super::*` reaches this module's
+// private `CommitPending` / `CommitPoll` / `poll_commit_pending`.
+#[cfg(test)]
+mod commit_pending_tests;

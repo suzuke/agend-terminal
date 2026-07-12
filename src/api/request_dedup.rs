@@ -448,6 +448,22 @@ impl DedupCache {
         dropped
     }
 
+    /// #2453 R2 P0-1 guard: drop a completed entry so a subsequent retry with the
+    /// same `request_id` RE-INVOKES the handler instead of observing the cached
+    /// response. Used for DEFERRED-COMMIT responses (app restart `prepared`), whose
+    /// real commit is gated on a post-flush ack this cache never observes: a failed
+    /// flush drops the restart but would otherwise leave `{ok:true,restart:prepared}`
+    /// cached, so a retry would see false success with no restart. Evicting lets the
+    /// retry re-run and the [`crate::api::app_restart::AppRestartGate`] — the
+    /// idempotence authority — decide (Committing→"in progress"; Serving→fresh
+    /// restart). No-op if the id is unknown.
+    pub fn evict(&self, request_id: &str) {
+        let mut inner = self.inner.lock().expect("dedup inner mutex");
+        if let Some(entry) = inner.entries.remove(request_id) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(entry.response_bytes);
+        }
+    }
+
     #[allow(dead_code)] // introspection helper (used by tests + future operator endpoints)
     pub fn len(&self) -> usize {
         self.inner.lock().expect("dedup inner mutex").entries.len()
@@ -1230,6 +1246,55 @@ mod tests {
         let fp1 = operation_fingerprint("x", &json!({"items": [1, 2, 3]}));
         let fp2 = operation_fingerprint("x", &json!({"items": [3, 2, 1]}));
         assert_ne!(fp1, fp2, "array element order must affect the fingerprint");
+    }
+
+    /// #2453 R2 P0-1: a DEFERRED-COMMIT (app restart `prepared`) response must NOT
+    /// stay dedup-cached. Mirrors `handle_session`'s exact sequence at the cited
+    /// boundary (request_dedup `dispatch` + the post-flush barrier): the handler
+    /// registers a post-flush action and returns `prepared`; the armed slot ⇒
+    /// `evict` the request_id; then a FAILED flush drops the restart. A retry with
+    /// the SAME request_id MUST re-invoke the handler (so the AppRestartGate can
+    /// decide), never observe the cached `prepared`. RED with the no-op `evict`
+    /// (retry sees cached prepared, handler not re-run); GREEN once `evict` removes.
+    #[test]
+    fn deferred_commit_response_evicted_so_retry_reruns() {
+        use crate::api::app_restart::PostFlushSlot;
+        let cache = DedupCache::default();
+        let slot = PostFlushSlot::new();
+        let fp = operation_fingerprint("mcp_tool", &json!({"tool": "restart_daemon"}));
+
+        // 1st request: the handler registers a post-flush ack and returns `prepared`.
+        let r1 = cache.dispatch(Some("R"), fp, Duration::from_secs(5), || {
+            slot.register(Box::new(|| {}));
+            json!({"ok": true, "restart": "prepared"})
+        });
+        assert_eq!(r1["restart"], "prepared");
+
+        // handle_session's P0 step: a non-cacheable (armed `prepared`) response ⇒ evict.
+        assert!(
+            slot.is_non_cacheable(),
+            "the prepared response is non-cacheable (armed the post-flush slot)"
+        );
+        cache.evict("R");
+        // The flush FAILED → the restart is dropped (the action is run un-successfully).
+        slot.run_after_flush(false);
+
+        // Retry (same id, new session) MUST re-invoke the handler, not serve cached.
+        let reran = Arc::new(AtomicUsize::new(0));
+        let rr = Arc::clone(&reran);
+        let r2 = cache.dispatch(Some("R"), fp, Duration::from_secs(5), move || {
+            rr.fetch_add(1, Ordering::SeqCst);
+            json!({"ok": false, "restart": "aborted-on-retry"})
+        });
+        assert_eq!(
+            reran.load(Ordering::SeqCst),
+            1,
+            "retry must re-invoke the handler (evicted), not return the cached `prepared`"
+        );
+        assert_ne!(
+            r2["restart"], "prepared",
+            "retry must not observe the stale cached prepared"
+        );
     }
 }
 

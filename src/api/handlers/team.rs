@@ -443,6 +443,8 @@ mod tests {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         }
     }
 
@@ -533,6 +535,8 @@ mod tests_1964 {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         }
     }
 
@@ -707,6 +711,8 @@ mod tests_2525 {
             notifier: None,
             home,
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
         }
     }
 

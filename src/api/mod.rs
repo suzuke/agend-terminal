@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+pub mod app_restart;
 pub(crate) mod handlers;
 mod operator_gate;
 pub mod request_dedup;
@@ -240,6 +241,11 @@ pub enum RestartCapability {
 ///
 /// `host`: the [`RestartCapability`] of this API-server owner, injected from the
 /// composition root so `restart_daemon` dispatches to the owner's strategy.
+// #2453 R2: the 8th arg (`app_restart`) crosses the clippy threshold; the args are
+// the composition-root wiring (registry/config/notifier/host/restart channel) and
+// bundling them into a struct would only move the arity elsewhere. Matches the
+// existing allow on `handle_session`.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     home: &Path,
     registry: AgentRegistry,
@@ -248,6 +254,7 @@ pub fn serve(
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
     host: RestartCapability,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) {
     // #945 Phase 0: time the bind+port-publish step directly (not the
     // spawn of api::serve thread — that's sub-ms). Operators care about
@@ -407,6 +414,9 @@ pub fn serve(
         // #2453: `host` is a `Copy` enum; each session gets its own copy so the
         // spawned `move` closure satisfies `'static` (mirrors the cookie/token).
         let session_host = host;
+        // #2453 R2: `AppRestart` is Clone (channel Sender + Arc gate), not Copy;
+        // each session gets its own clone so the `move` closure satisfies `'static`.
+        let session_app_restart = app_restart.clone();
         if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
@@ -426,6 +436,7 @@ pub fn serve(
                     session_operator_token,
                     session_cookie,
                     session_host,
+                    session_app_restart,
                 );
             })
             .is_err()
@@ -562,6 +573,7 @@ fn handle_session(
     operator_token: crate::auth_cookie::Cookie,
     cookie: crate::auth_cookie::Cookie,
     host: RestartCapability,
+    app_restart: Option<crate::api::app_restart::AppRestart>,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -658,6 +670,11 @@ fn handle_session(
         // that don't emit the field; see `request_dedup::DedupCache::dispatch`).
         let request_id = req["request_id"].as_str();
 
+        // #2453 R2 flush barrier: a fresh per-request slot. `restart_daemon` (if this
+        // request is one) registers a commit-permission ack into it; we run that ack
+        // AFTER writing+flushing this response (see below), so the app tears down and
+        // re-execs only once its `prepared` reply is on the socket.
+        let post_flush = crate::api::app_restart::PostFlushSlot::new();
         let ctx = handlers::HandlerCtx {
             registry,
             configs,
@@ -665,6 +682,8 @@ fn handle_session(
             notifier,
             home,
             capability: host,
+            app_restart: app_restart.as_ref(),
+            post_flush: post_flush.clone(),
         };
 
         // P0a (#2342 B4): per-method CAPABILITY gate FIRST — authority is proven
@@ -746,8 +765,45 @@ fn handle_session(
             )
         };
 
-        let _ = writeln!(writer, "{}", response);
-        let _ = writer.flush();
+        // #2453 R2 P0: a NON-CACHEABLE app-restart response (the handler marked it, or it
+        // armed the post-flush slot) reflects momentary AppRestartGate state — prepared /
+        // retryable in_progress loser / aborted / timed-out. The gate, NOT this cache, is
+        // the idempotence authority, so evict its request_id: a same-id retry must re-enter
+        // the handler and be judged against CURRENT gate state, never served a stale
+        // transient (e.g. a cached in_progress after the winner aborted → the retry would
+        // never re-enter the now-Serving gate). Ordinary responses stay cached as before.
+        maybe_evict_noncacheable_restart(request_id, &post_flush, request_dedup::global());
+        // #2453 R2 flush barrier: write+flush THIS response, then run any registered
+        // post-flush action with whether BOTH succeeded. On success the restart ack
+        // fires (→ the TUI commits + re-execs); on any failure the action is dropped
+        // un-run → the TUI's `flush_ack` disconnects → it aborts (gate back to
+        // Serving). If the session loop exits before reaching here, `post_flush`
+        // drops with an un-run action → same disconnect → abort.
+        let wrote = writeln!(writer, "{}", response).is_ok();
+        let flushed = wrote && writer.flush().is_ok();
+        post_flush.run_after_flush(flushed);
+    }
+}
+
+/// #2453 R2 P0: evict the dedup entry for a NON-CACHEABLE app-restart response. Every
+/// gate-dependent response the app-restart handler produces — `prepared` (armed),
+/// retryable `in_progress` (CAS loser), `aborted`, `timed-out` — reflects momentary
+/// [`crate::api::app_restart::AppRestartGate`] state, and the gate (not this cache) is
+/// the idempotence authority. Caching any of them would let a later same-id retry observe
+/// a stale transient — e.g. a cached `in_progress` after the winner aborted would wedge
+/// retry-after-abort, never re-entering the now-`Serving` gate. Evicting makes every
+/// same-id restart_daemon call re-enter the handler → the gate judges from CURRENT state.
+/// Ordinary responses (slot neither marked nor armed) stay cached. Cross-platform (Windows
+/// fail-closes at the handler → the slot is never marked/armed there → no-op).
+fn maybe_evict_noncacheable_restart(
+    request_id: Option<&str>,
+    post_flush: &crate::api::app_restart::PostFlushSlot,
+    cache: &request_dedup::DedupCache,
+) {
+    if post_flush.is_non_cacheable() {
+        if let Some(id) = request_id.filter(|s| !s.is_empty()) {
+            cache.evict(id);
+        }
     }
 }
 
@@ -919,6 +975,80 @@ fn api_call_read_timeout() -> std::time::Duration {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #2453 R2 P0 seam: `maybe_evict_noncacheable_restart` — the handle_session
+    /// post-flush step — evicts the request_id when the post-flush slot is either
+    /// ARMED (a `prepared` response) OR MARKED non-cacheable (a transient loser /
+    /// abort / timeout), and leaves an ordinary (neither) response cached.
+    #[test]
+    fn maybe_evict_noncacheable_restart_evicts_armed_and_marked_only() {
+        use crate::api::app_restart::PostFlushSlot;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fp =
+            request_dedup::operation_fingerprint("mcp_tool", &json!({"tool": "restart_daemon"}));
+
+        // Assert a retry re-runs the handler after `slot` (set up by `arm`) is evicted.
+        fn evict_then_retry_reruns(fp: u64, id: &str, arm: impl FnOnce(&PostFlushSlot)) -> bool {
+            let cache = request_dedup::DedupCache::default();
+            cache.dispatch(
+                Some(id),
+                fp,
+                std::time::Duration::from_secs(5),
+                || json!({"ok": true, "restart": "prepared"}),
+            );
+            let slot = PostFlushSlot::new();
+            arm(&slot);
+            maybe_evict_noncacheable_restart(Some(id), &slot, &cache);
+            let reran = Arc::new(AtomicBool::new(false));
+            let rr = Arc::clone(&reran);
+            cache.dispatch(Some(id), fp, std::time::Duration::from_secs(5), move || {
+                rr.store(true, Ordering::SeqCst);
+                json!({"ok": false})
+            });
+            reran.load(Ordering::SeqCst)
+        }
+
+        // ARMED (prepared) ⇒ evicted → retry re-runs.
+        assert!(
+            evict_then_retry_reruns(fp, "armed", |s| {
+                assert!(s.register(Box::new(|| {})));
+            }),
+            "an armed (prepared) response must be evicted so the retry re-runs"
+        );
+        // MARKED non-cacheable (transient loser/abort/timeout, NOT armed) ⇒ evicted too.
+        assert!(
+            evict_then_retry_reruns(fp, "marked", |s| s.mark_non_cacheable()),
+            "a marked (transient) restart response must be evicted so the retry re-runs"
+        );
+
+        // Neither armed nor marked ⇒ an ordinary response stays cached (retry must NOT re-run).
+        let cache2 = request_dedup::DedupCache::default();
+        cache2.dispatch(
+            Some("plain"),
+            fp,
+            std::time::Duration::from_secs(5),
+            || json!({"ok": true, "n": 1}),
+        );
+        let unarmed = PostFlushSlot::new();
+        maybe_evict_noncacheable_restart(Some("plain"), &unarmed, &cache2);
+        let reran2 = Arc::new(AtomicBool::new(false));
+        let rr2 = Arc::clone(&reran2);
+        let cached = cache2.dispatch(
+            Some("plain"),
+            fp,
+            std::time::Duration::from_secs(5),
+            move || {
+                rr2.store(true, Ordering::SeqCst);
+                json!({"ok": true, "n": 2})
+            },
+        );
+        assert!(
+            !reran2.load(Ordering::SeqCst),
+            "an ordinary (unarmed) response must stay cached — the retry must NOT re-run"
+        );
+        assert_eq!(cached["n"], 1, "the retry observed the cached response");
+    }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1281,6 +1411,7 @@ mod tests {
                     e,
                     notifier,
                     crate::api::RestartCapability::Unsupported,
+                    None,
                 );
             })
             .unwrap();

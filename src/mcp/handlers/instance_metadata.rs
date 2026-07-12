@@ -408,6 +408,8 @@ mod blocked_reason_runtime_2454_tests {
             registry: Arc::new(Mutex::new(HashMap::from([(id, handle)]))),
             externals: Arc::new(Mutex::new(HashMap::new())),
             capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: None,
         };
         (rt, home)
     }
