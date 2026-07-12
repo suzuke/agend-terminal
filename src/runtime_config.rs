@@ -886,4 +886,50 @@ mod tests {
             "a threshold just above HYSTERESIS_PCT (ordered) must be accepted"
         );
     }
+
+    /// Reviewer follow-up: `set()`'s NaN rejection is tested, but the ENV path
+    /// wasn't. `"NaN".parse::<f32>()` returns `Ok(NaN)`, so a NaN env override
+    /// must NOT silently poison the effective threshold (which would disable the
+    /// watchdog) — `resolve_effective_thresholds` must fall back to the config
+    /// value because `validate_thresholds` rejects the non-finite triplet.
+    #[test]
+    #[serial(runtime_config)]
+    fn nan_env_override_falls_back_not_poisons() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-nanenv");
+        std::fs::create_dir_all(&dir).ok();
+
+        // Known-good config so the fallback value is deterministic.
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "NaN");
+
+        let (alert, _, _) = resolve_effective_thresholds();
+        assert!(
+            alert.is_finite(),
+            "a NaN env override must not poison the effective alert threshold"
+        );
+        assert_eq!(
+            alert, 60.0,
+            "NaN env value is rejected → falls back to the config value"
+        );
+
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
+        reload(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
