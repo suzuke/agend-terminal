@@ -460,13 +460,27 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
     // the daemon already runs its own supervisor against the real registry, so
     // the app must not also poll a disjoint (empty) registry.
-    if !attached_mode {
+    // #2737: the owner-service composition is now a typed two-phase seam. This
+    // owned-only block yields the `OwnerServicesStarted` witness (None when
+    // attached); the owned-only maintenance tick REQUIRES it, so a run_app that
+    // skips the seam fails to compile (structural I2, replacing the old
+    // `owner_services_called_by_both_hosts` string-scan).
+    let owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted> = if !attached_mode
+    {
         crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
-        // #2453 Stage 1a: monitoring (instance_monitor + api_activity_probe)
-        // wired via the shared owner-services helper — identical call in
-        // run_core's build_tick_infrastructure, so a service can't be wired in
-        // one host and silently dead in the other (#982/#1002/#1720/#2434).
-        crate::daemon::owner_services::start_shared_monitoring_services(&home, &registry);
+        // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
+        // api_activity_probe) via the typed phase-1 seam — identical position/args
+        // in run_core's build_tick_infrastructure, so a service can't be wired in
+        // one host and silently dead in the other (#982/#1002/#1720/#2434). The
+        // returned OwnerMonitoringStarted token is required by phase 2 below, so
+        // monitoring is compile-forced to precede the stream observers (exact
+        // order preserved: monitoring → shadow::start → stream).
+        let monitoring = crate::daemon::owner_services::start_owner_monitoring(
+            crate::daemon::owner_services::OwnerRole::Owned,
+            &home,
+            &registry,
+            &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
+        );
         // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
         // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
         // only other caller), so without this the whole Shadow Observer plane was dead in
@@ -478,13 +492,20 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // detached accept loop that exits with the process; the stale socket is cleared on
         // next bind (start_unix removes it before binding).
         crate::daemon::shadow::start(&home);
-        // #2453 Stage 1a: the three Shadow Observer stream planes (rollout +
-        // opencode + kiro) wired via the shared owner-services helper. #2434: the
-        // live fleet daemon is app mode, so these must be app-wired (not
-        // run_core-only) or each backend's observer source is dead in production.
-        // Identical call in run_core's build_tick_infrastructure. shadow::start
+        // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout
+        // + opencode + kiro) via the typed phase-2 seam. Requires the phase-1
+        // OwnerMonitoringStarted token (compile-enforced order). #2434: the live
+        // fleet daemon is app mode, so these must be app-wired (not run_core-only)
+        // or each backend's observer source is dead in production. Identical
+        // position/args in run_core's build_tick_infrastructure. shadow::start
         // (the socket-ingest plane above) stays host-local — separate fork.
-        crate::daemon::owner_services::start_shared_stream_observers(&home, &registry);
+        let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
+            crate::daemon::owner_services::OwnerRole::Owned,
+            &monitoring,
+            &home,
+            &registry,
+            &crate::daemon::owner_services::OwnerStreamStarters::real(),
+        );
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
@@ -504,7 +525,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             // no-op here once discord is also registered.
             tg.attach_registry(Arc::clone(&registry));
         }
-    }
+        // #2737: hand the final witness to the owned-only maintenance tick below.
+        Some(owner_services)
+    } else {
+        None
+    };
 
     // #2453: the five cohesive key/UI-interaction fields, owned by one type.
     // `name_counter` counts auto-dedup agent names.
@@ -1160,6 +1185,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     &app_configs,
                     &app_handlers,
                     app_tick_progress.as_deref(),
+                    // #2737: owned tick only fires when `tick_rx` is Some (owned
+                    // mode), where `owner_services` is always `Some` (the seam ran
+                    // in the owned bootstrap block above).
+                    owner_services
+                        .as_ref()
+                        .expect("owned maintenance tick requires the owner-service witness"),
                 );
                 // PR4: back to Waiting between maintenance ticks so the monitor
                 // never attributes render/idle time to the maintenance host.
@@ -1369,6 +1400,11 @@ fn app_maintenance_tick(
     configs: &crate::api::ConfigRegistry,
     handlers: &[Box<dyn crate::daemon::per_tick::PerTickHandler>],
     progress: Option<&crate::daemon::tick_stall::TickProgress>,
+    // #2737: proof the owner-service seam ran. This owned-only tick is the
+    // witness consumer that makes app's dual-host reach a COMPILE property
+    // (structural I2) — run_app cannot reach here without an OwnerServicesStarted,
+    // which only the seam can mint. Unused at runtime (it is a capability witness).
+    _owner_services: &crate::daemon::owner_services::OwnerServicesStarted,
 ) {
     let tick_ctx = crate::daemon::per_tick::TickContext {
         home,
@@ -2817,10 +2853,6 @@ mod tests {
     // no thread is spawned. Runtime-host coverage is intentionally ABSENT for
     // this pure refactor (no non-invasive host entry exists).
 
-    const OWNER_HELPERS: [&str; 2] = [
-        "start_shared_monitoring_services(",
-        "start_shared_stream_observers(",
-    ];
     const OWNER_MOVED_SPAWNS: [&str; 5] = [
         "instance_monitor::spawn_monitor_tick(",
         "api_activity_probe::spawn(",
@@ -2843,22 +2875,6 @@ mod tests {
         masked[..end].to_string()
     }
 
-    /// STATIC: BOTH production hosts (owned `run_app`, headless
-    /// `build_tick_infrastructure`) call BOTH shared helpers — deleting either
-    /// host's call turns this RED (the dual-host wiring path is required).
-    #[test]
-    fn owner_services_called_by_both_hosts() {
-        for host in ["src/app/mod.rs", "src/daemon/mod.rs"] {
-            let code = owner_wiring_prod(host);
-            for helper in OWNER_HELPERS {
-                assert!(
-                    code.contains(helper),
-                    "{host} production must call `{helper}` (dual-host shared-wiring path)"
-                );
-            }
-        }
-    }
-
     /// STATIC: the five spawn calls are absent from BOTH host bodies and present
     /// at the shared owner_services wiring site. Scope is the two run hosts + the
     /// wiring module — NOT a global-uniqueness claim.
@@ -2879,41 +2895,6 @@ mod tests {
             assert!(
                 wiring.contains(spawn),
                 "owner_services must contain `{spawn}` (the shared wiring site both hosts call)"
-            );
-        }
-    }
-
-    /// STATIC: in app mode both helper calls sit INSIDE the `if !attached_mode`
-    /// owner guard — an attached TUI must never start the shared daemon services.
-    /// Moving a call outside the guard turns this RED.
-    #[test]
-    fn owner_services_calls_inside_attached_mode_guard() {
-        let code = owner_wiring_prod("src/app/mod.rs");
-        let start = code
-            .find("if !attached_mode {")
-            .expect("app production must contain the `if !attached_mode {` owner guard");
-        let after = &code[start..];
-        let mut depth = 0i32;
-        let mut end = after.len();
-        for (idx, ch) in after.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = idx + ch.len_utf8();
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let block = &after[..end];
-        for helper in OWNER_HELPERS {
-            assert!(
-                block.contains(helper),
-                "app must call `{helper}` INSIDE the `if !attached_mode` owner guard \
-                 (attached TUI must not start shared services)"
             );
         }
     }

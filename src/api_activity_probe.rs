@@ -73,7 +73,7 @@ struct Socket {
 }
 
 /// Spawn the daemon-owned probe thread. Fire-and-forget.
-pub fn spawn(registry: AgentRegistry) {
+pub fn spawn(_permit: &crate::daemon::owner_services::OwnerServicePermit, registry: AgentRegistry) {
     // fire-and-forget: the probe loop is a read-only sampler that terminates on
     // process exit. Losing the thread on shutdown is harmless (next boot
     // re-samples); it owns no state another thread must join. (§10.5)

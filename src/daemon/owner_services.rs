@@ -1,11 +1,10 @@
-//! #2453 Stage 1a: two host-agnostic helpers that own the WIRING (not the
+//! #2453 Stage 1a: a host-agnostic TWO-PHASE seam that owns the WIRING (not the
 //! JoinHandles) of the owner-only background services started identically by
 //! BOTH run hosts — the TUI owned-mode `app::run_app` and the headless
-//! `daemon::run_core` (via `build_tick_infrastructure`). Extracting the shared
-//! spawn calls into one place closes the dual-host drift class (#982/#1002/
-//! #1720/#2434: "wired in one host, silently dead in the other"). Pure,
-//! behavior-preserving: same calls, same order, same args, same cfg — no new
-//! threads/locks/state/channels.
+//! `daemon::run_core` (via `build_tick_infrastructure`). Centralizing the spawn
+//! calls closes the dual-host drift class (#982/#1002/#1720/#2434: "wired in one
+//! host, silently dead in the other"). Behavior-preserving: same calls, same
+//! order, same args, same cfg — no new threads/locks/state/channels.
 //!
 //! Deliberately EXCLUDED (each a separate decision fork, per d-20260711201257672833-2):
 //! `shadow::start` (different ordering per host), `supervisor::spawn` (`#[cfg(unix)]`
@@ -29,68 +28,39 @@ use crate::agent::AgentRegistry;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Owner-only agent liveness/activity monitoring services. Each spawns a
-/// process-lifetime thread internally and returns `()` — this helper owns the
-/// WIRING, not a `JoinHandle`. Called identically by owned `run_app` and headless
-/// `build_tick_infrastructure`.
-pub(crate) fn start_shared_monitoring_services(home: &Path, registry: &AgentRegistry) {
-    crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(registry));
-    // #2413 Phase 1: out-of-path lsof API-activity probe (feeds
-    // AgentCore::api_activity for false-idle detection). Self-disables if `lsof`
-    // is absent.
-    crate::api_activity_probe::spawn(Arc::clone(registry));
-}
-
-/// Owner-only Shadow Observer per-backend Evidence-SOURCE planes (Stream plane).
-/// Each is a no-op under `AGEND_SHADOW_OBSERVER=0` (default-ON). The live fleet
-/// daemon is app mode, so gating these run_core-only would leave each backend's
-/// observer source dead in production (#2434). `shadow::start` (the socket-ingest
-/// plane) is deliberately NOT here — its per-host ordering differs (separate fork).
-pub(crate) fn start_shared_stream_observers(home: &Path, registry: &AgentRegistry) {
-    // #2413 Phase D: codex rollout-tail — read-only tail of
-    // ~/.codex/sessions/.../rollout-*.jsonl → Evidence → shared buffer.
-    crate::daemon::shadow::rollout::spawn(Arc::clone(registry), home.to_path_buf());
-    // #2413 opencode plane: SSE `/event` observer (per-agent embedded server).
-    crate::daemon::shadow::opencode::spawn(Arc::clone(registry), home.to_path_buf());
-    // #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/<uuid>.jsonl.
-    crate::daemon::shadow::kiro::spawn(Arc::clone(registry), home.to_path_buf());
-}
-
-// ===================================================================
-// #2737 typed two-phase owner-service seam (RED scaffolding).
-// Commit A: declarations + stub phase bodies that start NOTHING, so the
-// call-level tests below are RED. Commit B fills in the real bodies, adds the
-// permit to the five low-level spawns, wires both hosts, and deletes the old
-// string-masker guards. The `#[allow(dead_code)]` marks below are removed in
-// commit B once production wires these items.
-// ===================================================================
-
 /// Which host role is composing the owner services. Owned → start them;
 /// Attached (a TUI connected to another daemon that owns the fleet) → start none.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OwnerRole {
     Owned,
+    /// Production gates attached-exclusion via the unchanged `if !attached_mode`
+    /// wrapper in `run_app` (the seam is called with `Owned` INSIDE it, preserving
+    /// #2737's exact order), so this variant is constructed only by tests today —
+    /// it encodes the "attached starts none" contract that
+    /// `attached_two_phases_start_none` verifies behaviorally against the real seam.
+    #[cfg_attr(not(test), allow(dead_code))]
     Attached,
 }
 
 /// Capability token gating the five owner-service spawns. The single field is
 /// PRIVATE to this module, so only `owner_services` code can mint one: other
 /// modules may name `&OwnerServicePermit` in a signature but cannot construct it,
-/// which makes a host-body direct spawn fail to compile (structural I4).
-#[allow(dead_code)]
+/// which makes a host-body direct spawn fail to compile (structural I4 — the
+/// former `owner_services_spawns_absent_from_hosts…` masker guard, now a compile
+/// property).
 pub(crate) struct OwnerServicePermit(());
 
 /// Phase-1 witness — proof that the monitoring phase ran. Required as an argument
 /// by phase 2, so the compiler enforces monitoring-before-stream ordering.
 /// Ctor is private to this module.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) struct OwnerMonitoringStarted(());
 
 /// Final witness — proof that BOTH owner-service phases ran. Retained by each
-/// owner host (structural I2). Ctor is private to this module.
-#[allow(dead_code)]
+/// owner host (app: required by owned-only `app_maintenance_tick`; daemon: held
+/// in `TickKeepalive`), so a host that skips the seam fails to compile
+/// (structural I2 — the former `owner_services_called_by_both_hosts` guard).
+/// Ctor is private to this module.
 #[must_use]
 pub(crate) struct OwnerServicesStarted(());
 
@@ -110,32 +80,92 @@ pub(crate) struct OwnerStreamStarters<'a> {
     pub kiro: &'a dyn Fn(&OwnerServicePermit, &Path, &AgentRegistry),
 }
 
-/// Phase 1: owner monitoring services. `Owned` starts them via the injected
-/// starters; `Attached` starts none. Returns the `OwnerMonitoringStarted` token
-/// phase 2 requires.
-#[allow(dead_code)]
+impl OwnerMonitoringStarters<'static> {
+    /// Production starters — forward to the real thread-spawning services.
+    /// `&fn_item` promotes to `&'static dyn Fn` (fn items are zero-sized consts).
+    pub(crate) fn real() -> Self {
+        OwnerMonitoringStarters {
+            monitor_tick: &real_monitor_tick,
+            api_activity_probe: &real_api_activity_probe,
+        }
+    }
+}
+
+impl OwnerStreamStarters<'static> {
+    /// Production starters — forward to the real thread-spawning observers.
+    pub(crate) fn real() -> Self {
+        OwnerStreamStarters {
+            rollout: &real_rollout,
+            opencode: &real_opencode,
+            kiro: &real_kiro,
+        }
+    }
+}
+
+fn real_monitor_tick(permit: &OwnerServicePermit, home: &Path, registry: &AgentRegistry) {
+    crate::instance_monitor::spawn_monitor_tick(permit, home.to_path_buf(), Arc::clone(registry));
+}
+
+/// #2413 Phase 1: out-of-path lsof API-activity probe (feeds AgentCore::api_activity
+/// for false-idle detection). Self-disables if `lsof` is absent.
+fn real_api_activity_probe(permit: &OwnerServicePermit, registry: &AgentRegistry) {
+    crate::api_activity_probe::spawn(permit, Arc::clone(registry));
+}
+
+/// #2413 Phase D: codex rollout-tail — read-only tail of
+/// ~/.codex/sessions/.../rollout-*.jsonl → Evidence → shared buffer.
+fn real_rollout(permit: &OwnerServicePermit, home: &Path, registry: &AgentRegistry) {
+    crate::daemon::shadow::rollout::spawn(permit, Arc::clone(registry), home.to_path_buf());
+}
+
+/// #2413 opencode plane: SSE `/event` observer (per-agent embedded server).
+fn real_opencode(permit: &OwnerServicePermit, home: &Path, registry: &AgentRegistry) {
+    crate::daemon::shadow::opencode::spawn(permit, Arc::clone(registry), home.to_path_buf());
+}
+
+/// #2413 kiro plane: read-only tail of ~/.kiro/sessions/cli/<uuid>.jsonl.
+fn real_kiro(permit: &OwnerServicePermit, home: &Path, registry: &AgentRegistry) {
+    crate::daemon::shadow::kiro::spawn(permit, Arc::clone(registry), home.to_path_buf());
+}
+
+/// Phase 1: owner monitoring services (`instance_monitor` + `api_activity_probe`).
+/// `Owned` starts them via the injected starters; `Attached` starts none. Returns
+/// the `OwnerMonitoringStarted` token phase 2 requires. No-op / no threads under
+/// `Attached`.
 pub(crate) fn start_owner_monitoring(
-    _role: OwnerRole,
-    _home: &Path,
-    _registry: &AgentRegistry,
-    _starters: &OwnerMonitoringStarters<'_>,
+    role: OwnerRole,
+    home: &Path,
+    registry: &AgentRegistry,
+    starters: &OwnerMonitoringStarters<'_>,
 ) -> OwnerMonitoringStarted {
-    // RED stub (commit A): starts nothing → the owned call-level test is RED.
+    if role == OwnerRole::Owned {
+        let permit = OwnerServicePermit(());
+        (starters.monitor_tick)(&permit, home, registry);
+        (starters.api_activity_probe)(&permit, registry);
+    }
     OwnerMonitoringStarted(())
 }
 
-/// Phase 2: owner stream observers. Requires `&OwnerMonitoringStarted` so it
-/// cannot be called before phase 1 (compile-enforced ordering). `Owned` starts
-/// them; `Attached` starts none. Returns the final `OwnerServicesStarted` witness.
-#[allow(dead_code)]
+/// Phase 2: owner Shadow-Observer stream planes (rollout + opencode + kiro).
+/// Requires `&OwnerMonitoringStarted` so it cannot be called before phase 1
+/// (compile-enforced ordering). `Owned` starts them; `Attached` starts none.
+/// Returns the final `OwnerServicesStarted` witness. Each observer is itself a
+/// no-op under `AGEND_SHADOW_OBSERVER=0` (default-ON). `shadow::start` (the
+/// socket-ingest plane) is deliberately NOT here — its per-host ordering differs
+/// (separate fork), so it stays host-local between the two phases in `run_app`.
 pub(crate) fn start_owner_stream_observers(
-    _role: OwnerRole,
+    role: OwnerRole,
     _monitoring: &OwnerMonitoringStarted,
-    _home: &Path,
-    _registry: &AgentRegistry,
-    _starters: &OwnerStreamStarters<'_>,
+    home: &Path,
+    registry: &AgentRegistry,
+    starters: &OwnerStreamStarters<'_>,
 ) -> OwnerServicesStarted {
-    // RED stub (commit A): starts nothing → the owned call-level test is RED.
+    if role == OwnerRole::Owned {
+        let permit = OwnerServicePermit(());
+        (starters.rollout)(&permit, home, registry);
+        (starters.opencode)(&permit, home, registry);
+        (starters.kiro)(&permit, home, registry);
+    }
     OwnerServicesStarted(())
 }
 

@@ -369,7 +369,11 @@ struct Sub {
 /// Spawn the opencode SSE observer supervisor — a fire-and-forget daemon thread (mirrors
 /// `rollout::spawn`). No-op unless [`super::enabled`]. Wired into BOTH `run_core` AND
 /// `run_app` (the #2434 lesson: the live fleet daemon is app mode).
-pub fn spawn(registry: crate::agent::AgentRegistry, _home: PathBuf) {
+pub fn spawn(
+    _permit: &crate::daemon::owner_services::OwnerServicePermit,
+    registry: crate::agent::AgentRegistry,
+    _home: PathBuf,
+) {
     if !super::enabled() {
         return;
     }
