@@ -1180,7 +1180,11 @@ mod tests {
             false
         });
         assert_eq!(r, None, "active watch is polling");
-        assert_eq!(calls.get(), 0, "lazy pr-open must NOT be called for an active watch");
+        assert_eq!(
+            calls.get(),
+            0,
+            "lazy pr-open must NOT be called for an active watch"
+        );
     }
 
     /// Over-max-age + PR closed → MaxAge; PR-open callback invoked exactly once.
@@ -1188,7 +1192,8 @@ mod tests {
     fn classify_max_age_calls_pr_open_once_and_reaps_when_closed() {
         use std::cell::Cell;
         let calls = Cell::new(0u32);
-        let old = (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let old =
+            (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
         let w = ws(serde_json::json!({
             "repo": "o/r", "branch": "feat/x",
             "subscribers": [{"instance": "dev", "subscribed_at": old}],
@@ -1199,13 +1204,18 @@ mod tests {
             false
         });
         assert_eq!(r, Some(ExpiryReason::MaxAge));
-        assert_eq!(calls.get(), 1, "pr-open checked exactly once, only after the age threshold");
+        assert_eq!(
+            calls.get(),
+            1,
+            "pr-open checked exactly once, only after the age threshold"
+        );
     }
 
     /// Over-max-age but PR OPEN → exempt (polling).
     #[test]
     fn classify_max_age_exempt_when_pr_open() {
-        let old = (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let old =
+            (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
         let w = ws(serde_json::json!({
             "repo": "o/r", "branch": "feat/x",
             "subscribers": [{"instance": "dev", "subscribed_at": old}],
@@ -1221,7 +1231,8 @@ mod tests {
     /// Absolute TTL takes precedence — pr-open is never consulted when it fires.
     #[test]
     fn classify_absolute_ttl_precedence_no_pr_read() {
-        let old = (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
+        let old =
+            (chrono::Utc::now() - chrono::Duration::hours(MAX_WATCH_AGE_HOURS + 1)).to_rfc3339();
         let w = ws(serde_json::json!({
             "repo": "o/r", "branch": "feat/x",
             "subscribers": [{"instance": "dev", "subscribed_at": old}],
@@ -1250,10 +1261,22 @@ mod tests {
         let future = (now + chrono::Duration::hours(24)).to_rfc3339();
         let ancient = (now - chrono::Duration::hours(WATCH_TTL_HOURS + 10)).to_rfc3339();
         let cases: Vec<(&str, serde_json::Value)> = vec![
-            ("polling", serde_json::json!({"repo":"o/r","branch":"feat/live","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":future})),
-            ("abs", serde_json::json!({"repo":"o/r","branch":"feat/abs","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":past})),
-            ("inact", serde_json::json!({"repo":"o/r","branch":"feat/inact","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":future,"last_terminal_seen_at":ancient})),
-            ("maxage", serde_json::json!({"repo":"o/r","branch":"feat/maxage","subscribers":[{"instance":"dev","subscribed_at":old}],"expires_at":future})),
+            (
+                "polling",
+                serde_json::json!({"repo":"o/r","branch":"feat/live","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":future}),
+            ),
+            (
+                "abs",
+                serde_json::json!({"repo":"o/r","branch":"feat/abs","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":past}),
+            ),
+            (
+                "inact",
+                serde_json::json!({"repo":"o/r","branch":"feat/inact","subscribers":[{"instance":"dev","subscribed_at":recent}],"expires_at":future,"last_terminal_seen_at":ancient}),
+            ),
+            (
+                "maxage",
+                serde_json::json!({"repo":"o/r","branch":"feat/maxage","subscribers":[{"instance":"dev","subscribed_at":old}],"expires_at":future}),
+            ),
         ];
         let mut predicted_removed = std::collections::HashMap::new();
         for (name, j) in &cases {
@@ -1264,7 +1287,11 @@ mod tests {
                 crate::daemon::pr_state::is_branch_open(&dir, &repo, &branch)
             });
             predicted_removed.insert(*name, c.is_some());
-            std::fs::write(ci_dir.join(format!("{name}.json")), serde_json::to_string_pretty(j).unwrap()).unwrap();
+            std::fs::write(
+                ci_dir.join(format!("{name}.json")),
+                serde_json::to_string_pretty(j).unwrap(),
+            )
+            .unwrap();
         }
         gc_stale_watches(&dir, "drift_test");
         for (name, _) in &cases {

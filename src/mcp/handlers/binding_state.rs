@@ -163,9 +163,10 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
         // the owner/repo slug from the binding source_repo so `current_binding` in
         // ci_watches_detail matches BOTH repo and branch (a same-branch watch on a
         // different repo is NOT current). Non-derivable remote ⇒ "" ⇒ nothing current.
-        let current_repo =
-            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(source_repo))
-                .unwrap_or_default();
+        let current_repo = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
+            Path::new(source_repo),
+        )
+        .unwrap_or_default();
 
         json!({
             "agent": agent,

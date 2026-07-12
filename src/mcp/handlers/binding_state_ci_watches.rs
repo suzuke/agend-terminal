@@ -71,7 +71,8 @@ pub(super) fn enumerate_ci_watches_detail_for_agent(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(watch) = serde_json::from_str::<crate::daemon::ci_watch::WatchState>(&content) else {
+        let Ok(watch) = serde_json::from_str::<crate::daemon::ci_watch::WatchState>(&content)
+        else {
             continue;
         };
         if !watch.subscriber_names().iter().any(|s| s == agent) {
