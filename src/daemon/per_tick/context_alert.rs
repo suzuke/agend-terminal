@@ -24,9 +24,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Re-arm requires dropping this far below the threshold (compact/restart),
-/// so boundary noise can't re-fire.
-const HYSTERESIS_PCT: f32 = 5.0;
 /// Re-alert cadence while usage stays continuously above the threshold.
 const REALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 
@@ -67,7 +64,7 @@ fn decide(state: &mut AlertState, pct: f32, threshold: f32, now: Instant) -> boo
         }
         return false;
     }
-    if pct < threshold - HYSTERESIS_PCT {
+    if pct < threshold - crate::runtime_config::HYSTERESIS_PCT {
         state.armed = true;
     }
     false

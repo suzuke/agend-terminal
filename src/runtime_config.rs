@@ -110,6 +110,14 @@ pub const DEFAULT_ALERT_PCT: f32 = 80.0;
 pub const DEFAULT_HANDOFF_PCT: f32 = 85.0;
 pub const DEFAULT_ESCALATE_PCT: f32 = 92.0;
 
+/// Re-arm requires the usage to drop this far below a threshold (compact/restart)
+/// before a handler's latch re-arms — the single source of truth shared by the
+/// per-tick consumers (`context_alert`/`context_handoff`) AND by
+/// `validate_thresholds`' lower bound: a threshold <= this floor makes the
+/// re-arm condition `pct < threshold - HYSTERESIS_PCT` impossible, so such
+/// values are rejected as invalid.
+pub const HYSTERESIS_PCT: f32 = 5.0;
+
 fn default_dev_idle() -> i64 {
     3600
 }
@@ -225,18 +233,21 @@ pub fn validate_thresholds(alert: f32, handoff: f32, escalate: f32) -> Result<()
     if !alert.is_finite() || !handoff.is_finite() || !escalate.is_finite() {
         return Err("values must be finite".to_string());
     }
-    // Hysteresis is 5.0, so values <= 5.0 are invalid.
-    if alert <= 5.0 || alert > 100.0 {
-        return Err(format!("alert_pct must be in (5.0, 100.0], got {alert}"));
-    }
-    if handoff <= 5.0 || handoff > 100.0 {
+    // Values <= HYSTERESIS_PCT are invalid: the re-arm condition
+    // `pct < threshold - HYSTERESIS_PCT` would be impossible, wedging the latch.
+    if alert <= HYSTERESIS_PCT || alert > 100.0 {
         return Err(format!(
-            "handoff_pct must be in (5.0, 100.0], got {handoff}"
+            "alert_pct must be in ({HYSTERESIS_PCT}, 100.0], got {alert}"
         ));
     }
-    if escalate <= 5.0 || escalate > 100.0 {
+    if handoff <= HYSTERESIS_PCT || handoff > 100.0 {
         return Err(format!(
-            "escalate_pct must be in (5.0, 100.0], got {escalate}"
+            "handoff_pct must be in ({HYSTERESIS_PCT}, 100.0], got {handoff}"
+        ));
+    }
+    if escalate <= HYSTERESIS_PCT || escalate > 100.0 {
+        return Err(format!(
+            "escalate_pct must be in ({HYSTERESIS_PCT}, 100.0], got {escalate}"
         ));
     }
     if alert >= handoff {
@@ -844,5 +855,35 @@ mod tests {
         assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins the single-source-of-truth coupling: `validate_thresholds`' lower
+    /// bound IS `HYSTERESIS_PCT` and is exclusive. A threshold exactly at the
+    /// floor is rejected (the re-arm condition `pct < threshold - HYSTERESIS_PCT`
+    /// would be impossible); a value just above it (with valid ordered
+    /// handoff/escalate) is accepted. If someone re-tunes `HYSTERESIS_PCT`, the
+    /// validate bound moves with it — they cannot drift apart.
+    #[test]
+    fn validate_lower_bound_is_hysteresis_pct_single_source() {
+        // Exactly at the floor is out of the exclusive lower bound → Err.
+        assert!(
+            validate_thresholds(
+                HYSTERESIS_PCT,
+                HYSTERESIS_PCT + 10.0,
+                HYSTERESIS_PCT + 20.0
+            )
+            .is_err(),
+            "a threshold == HYSTERESIS_PCT must be rejected (exclusive lower bound)"
+        );
+        // Just above the floor, ordered handoff/escalate → Ok.
+        assert!(
+            validate_thresholds(
+                HYSTERESIS_PCT + 0.1,
+                HYSTERESIS_PCT + 10.0,
+                HYSTERESIS_PCT + 20.0
+            )
+            .is_ok(),
+            "a threshold just above HYSTERESIS_PCT (ordered) must be accepted"
+        );
     }
 }

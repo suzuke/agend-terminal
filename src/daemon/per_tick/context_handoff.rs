@@ -33,10 +33,6 @@ use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
-/// Re-arm requires dropping this far below the handoff threshold
-/// (compact/restart), so boundary wobble can't start a second episode.
-const HYSTERESIS_PCT: f32 = 5.0;
-
 /// The handoff file the injection asks for, relative to the agent's
 /// working directory. Matches the manual-rescue convention from the 6/10
 /// incident.
@@ -101,7 +97,7 @@ fn decide(
     escalate_pct: f32,
 ) -> Option<Action> {
     // Auto-resolve (silent): compact/restart dropped the usage — re-arm.
-    if pct < handoff_pct - HYSTERESIS_PCT {
+    if pct < handoff_pct - crate::runtime_config::HYSTERESIS_PCT {
         state.phase = Phase::Armed;
         return None;
     }
