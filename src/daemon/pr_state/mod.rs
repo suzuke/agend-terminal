@@ -1879,7 +1879,11 @@ mod tests {
 
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-        scan_and_emit_with(&dir, &registry, &crate::daemon::pr_state::gh_poll::CliGhPoller);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         let msgs = crate::inbox::drain(&dir, "lead-w");
         assert_eq!(msgs.len(), 1, "expected exactly one re-arm diagnostic");
         assert_eq!(
@@ -1894,7 +1898,11 @@ mod tests {
         );
 
         // Second scan: debounced per `diagnostic_emitted_for_sha` — no re-emit.
-        scan_and_emit_with(&dir, &registry, &crate::daemon::pr_state::gh_poll::CliGhPoller);
+        scan_and_emit_with(
+            &dir,
+            &registry,
+            &crate::daemon::pr_state::gh_poll::CliGhPoller,
+        );
         assert!(
             crate::inbox::drain(&dir, "lead-w").is_empty(),
             "second scan must not re-emit the diagnostic at the same head_sha"

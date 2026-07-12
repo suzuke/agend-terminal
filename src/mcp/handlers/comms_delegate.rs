@@ -16,8 +16,8 @@
 
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
-use crate::identity::Sender;
 use crate::daemon::pr_state::ReviewClass;
+use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -195,11 +195,9 @@ pub(crate) fn resolve_dispatch_review_class(
 ) -> Result<ReviewClass, ReviewClassRefusal> {
     match ReviewClass::parse_fail_closed(task_review_class_raw) {
         ReviewClass::Dual => Ok(ReviewClass::Dual),
-        ReviewClass::Single if second_reviewer => {
-            Err(ReviewClassRefusal::Mismatch {
-                task_class: "single",
-            })
-        }
+        ReviewClass::Single if second_reviewer => Err(ReviewClassRefusal::Mismatch {
+            task_class: "single",
+        }),
         ReviewClass::Single => Ok(ReviewClass::Single),
         ReviewClass::Unresolved => Err(ReviewClassRefusal::Unspecified),
     }
@@ -245,7 +243,8 @@ fn maybe_auto_bind_lease(
     let raw_review_class = task_review_class
         .as_deref()
         .or_else(|| args["review_class"].as_str());
-    let armed_review_class = match resolve_dispatch_review_class(raw_review_class, second_reviewer) {
+    let armed_review_class = match resolve_dispatch_review_class(raw_review_class, second_reviewer)
+    {
         Ok(class) => class.as_token(),
         Err(refusal) => {
             // #2745 fail-closed (root pre-review finding 2): REJECT the

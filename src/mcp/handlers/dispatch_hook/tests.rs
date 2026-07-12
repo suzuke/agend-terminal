@@ -999,10 +999,8 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
         ("typo", Some("duel"), false, "review_class_unspecified"),
         ("mismatch", Some("single"), true, "review_class_mismatch"),
     ] {
-        let home = std::env::temp_dir().join(format!(
-            "agend-2745-reject-{label}-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("agend-2745-reject-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).ok();
         setup_test_repo(&home, "target-agent");
