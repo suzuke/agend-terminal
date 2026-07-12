@@ -294,21 +294,31 @@ pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
         let branch = &watch.branch;
         let audit_label = watch.subscriber_names().join(",");
 
-        // (3) E4.5 protected-ref migration — applied first because a
-        // protected-ref watch is invalid regardless of TTL state.
+        // (3) E4.5 protected-ref migration — applied first because a GENERIC
+        // protected-ref watch is invalid regardless of TTL state. S1 narrows it:
+        // a VALID exact-head watch (well-formed `target_head_sha`) is a legitimate
+        // post-merge monitor and is PRESERVED (falls through to the normal TTL/
+        // age lifecycle below); a legacy generic protected watch (no target SHA)
+        // OR one with a malformed SHA is still removed here.
         if crate::agent_ops::is_protected_ref(branch) {
-            remove_watch(
-                home,
-                &path,
-                &audit_label,
-                repo,
-                branch,
-                &format!("{sweep_origin}_protected_branch_migration"),
-            );
-            tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
-                "ci_watch removed (E4.5 protected-branch migration)");
-            removed += 1;
-            continue;
+            let valid_exact_head = watch
+                .target_head_sha
+                .as_deref()
+                .is_some_and(super::is_full_commit_sha);
+            if !valid_exact_head {
+                remove_watch(
+                    home,
+                    &path,
+                    &audit_label,
+                    repo,
+                    branch,
+                    &format!("{sweep_origin}_protected_branch_migration"),
+                );
+                tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
+                    "ci_watch removed (E4.5 protected-branch migration)");
+                removed += 1;
+                continue;
+            }
         }
 
         // #1991 P6 (lead adjudication): an unwatch TOMBSTONE (auto_arm_optout,
@@ -1009,6 +1019,96 @@ mod tests {
             "after the lock is released, gc removes the expired watch"
         );
         assert_eq!(removed, 1, "exactly the one expired watch removed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── S1 exact-head protected-main watch: sweep preservation ──────────
+    //
+    // The E4.5-migration arm removes protected-ref (main/master) watches. S1
+    // narrows it: a VALID exact-head protected watch (well-formed `target_head_sha`)
+    // is PRESERVED across restart; a legacy GENERIC protected watch (no
+    // target_head_sha) or a malformed-SHA one is still removed.
+
+    fn write_raw_watch(ci_dir: &std::path::Path, name: &str, body: serde_json::Value) -> PathBuf {
+        let p = ci_dir.join(format!("{name}.json"));
+        std::fs::write(&p, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+        p
+    }
+
+    /// RED→GREEN: a valid exact-head protected `main` watch must SURVIVE the
+    /// startup sweep (today the E4.5-migration arm removes every main watch).
+    #[test]
+    fn startup_sweep_preserves_valid_exact_head_main() {
+        let dir = tmp_dir("s1-preserve-exact-head");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let p = write_raw_watch(
+            &ci_dir,
+            "exact_head_main",
+            serde_json::json!({
+                "repo": "o/r", "branch": "main",
+                "target_head_sha": "c4206950c4206950c4206950c4206950c4206950",
+                "subscribers": [{"instance": "lead"}],
+                "expires_at": future,
+            }),
+        );
+        super::startup_sweep(&dir);
+        assert!(
+            p.exists(),
+            "a valid exact-head protected main watch must survive the restart sweep"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Control/guard: a legacy GENERIC protected `main` watch (no target_head_sha)
+    /// is still removed by the E4.5 migration.
+    #[test]
+    fn startup_sweep_removes_legacy_generic_main() {
+        let dir = tmp_dir("s1-remove-legacy-generic");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let p = write_raw_watch(
+            &ci_dir,
+            "generic_main",
+            serde_json::json!({
+                "repo": "o/r", "branch": "main",
+                "subscribers": [{"instance": "dev"}],
+                "expires_at": future,
+            }),
+        );
+        super::startup_sweep(&dir);
+        assert!(
+            !p.exists(),
+            "a legacy generic protected main watch must still be removed (E4.5 migration)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Guard: a protected watch carrying a MALFORMED target_head_sha is NOT a
+    /// valid exact-head watch and must still be removed.
+    #[test]
+    fn startup_sweep_removes_exact_head_with_malformed_sha() {
+        let dir = tmp_dir("s1-remove-malformed-sha");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        let p = write_raw_watch(
+            &ci_dir,
+            "malformed_main",
+            serde_json::json!({
+                "repo": "o/r", "branch": "main",
+                "target_head_sha": "not-a-sha",
+                "subscribers": [{"instance": "lead"}],
+                "expires_at": future,
+            }),
+        );
+        super::startup_sweep(&dir);
+        assert!(
+            !p.exists(),
+            "a protected watch with a malformed target_head_sha must still be removed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

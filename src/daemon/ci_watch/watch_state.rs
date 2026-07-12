@@ -147,6 +147,18 @@ pub struct WatchState {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_class: Option<String>,
+    /// S1 exact-head protected-main watch: an IMMUTABLE full commit SHA this
+    /// watch is pinned to. When `Some`, this is a post-merge close-loop watch on
+    /// a protected ref (`main`/`master`) — the poller resolves runs for THIS SHA
+    /// only (via `poll_runs_for_sha`), never the branch's latest head, so a newer
+    /// unrelated main push can't falsely complete it. Set only by `handle_watch_ci`
+    /// under the exact-head authority gate (task_id + next_after_ci + orchestrator/
+    /// operator); dispatch auto-watch never sets it. Stored lowercase. `None` on
+    /// every ordinary (branch-tracking) watch — its absence is what distinguishes a
+    /// legitimate exact-head protected watch (kept by `gc_stale_watches`) from a
+    /// legacy generic protected watch (removed by the E4.5 migration sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_head_sha: Option<String>,
     /// #1151: when set, only these workflow names count toward the
     /// "CI passed" aggregate. Non-required checks (e.g. flaky Windows)
     /// are ignored. When absent, all checks must pass (backward compat).

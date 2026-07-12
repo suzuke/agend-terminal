@@ -345,6 +345,24 @@ pub trait CiProvider: Send + Sync {
     /// Poll workflow/pipeline runs for `repo@branch`.
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult>;
 
+    /// S1 exact-head: resolve CI runs for an EXACT immutable commit SHA (post-merge
+    /// exact-head watch on a protected ref). Unlike [`poll_runs`], which reads the
+    /// branch's recent-runs page, this resolves the target regardless of how far the
+    /// branch advanced. Default: UNSUPPORTED — returns `ApiError` so the poller keeps
+    /// the watch armed (never false-clears) on providers without a by-SHA fetch. The
+    /// handler restricts exact-head watches to GitHub, which overrides this.
+    async fn poll_runs_for_sha(
+        &self,
+        _repo: &str,
+        _head_sha: &str,
+    ) -> anyhow::Result<CiPollResult> {
+        Ok(CiPollResult::ApiError {
+            status: 501,
+            message: "poll_runs_for_sha unsupported for this provider (exact-head watch is GitHub-only this wave)".to_string(),
+            rate_limit_reset: None,
+        })
+    }
+
     /// #1705: poll ALL recent runs for `repo` in ONE query (`?per_page=100`, no
     /// branch filter); the caller groups by `head_branch` and fans out to each
     /// watched branch, collapsing N per-branch polls into one. `None` = the
@@ -479,6 +497,81 @@ impl GitHubCiProvider {
     }
 }
 
+/// S1: shared GitHub Actions `workflow_runs` response → `CiPollResult`. Extracted
+/// verbatim from `poll_runs` so `poll_runs` (branch page) and `poll_runs_for_sha`
+/// (exact-head `?head_sha=`) produce byte-identical result + rate-limit semantics
+/// from their one-line-different request URL.
+async fn parse_github_runs_response(resp: reqwest::Response) -> anyhow::Result<CiPollResult> {
+    let status = resp.status().as_u16();
+    let rate_limit_reset = resp
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    // Sprint 54 P0-2: capture remaining/limit on every response, not just
+    // rate-limited ones. The watch loop feeds these into `adaptive_interval` so
+    // we widen the next poll BEFORE hitting the cap, instead of recovering from it.
+    let parse_u64_header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    };
+    let rate_limit_remaining = parse_u64_header("x-ratelimit-remaining");
+    let rate_limit_limit = parse_u64_header("x-ratelimit-limit");
+    let body: serde_json::Value = resp.json().await?;
+
+    // Surface API errors (rate-limit, auth, server) instead of silently
+    // treating them as "no runs".
+    if !(200..300).contains(&status) {
+        let message = body["message"]
+            .as_str()
+            .unwrap_or("(no message)")
+            .to_string();
+        // Sprint 54 P0-4: hint via the unified token cache. Anything the cache
+        // treats as "no token available" (env unset AND gh not authed) gets the
+        // actionable hint. Reading the cache — not env — keeps behavior
+        // consistent with what auth_fn actually saw on the wire.
+        let hint = if status == 403
+            && crate::github_token::cached_token().is_none()
+            && message.to_lowercase().contains("rate limit")
+        {
+            " — set GITHUB_TOKEN or run `gh auth login` to raise the unauthenticated 60/hr cap"
+        } else {
+            ""
+        };
+        return Ok(CiPollResult::ApiError {
+            status,
+            message: format!("GH API {status}: {message}{hint}"),
+            rate_limit_reset,
+        });
+    }
+
+    // Parse GitHub-specific `workflow_runs` array into neutral CiRun structs.
+    let runs = body["workflow_runs"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(CiRun {
+                        id: r["id"].as_u64()?,
+                        conclusion: r["conclusion"].as_str().map(String::from),
+                        head_sha: r["head_sha"].as_str()?.to_string(),
+                        url: r["html_url"].as_str().unwrap_or("").to_string(),
+                        name: r["name"].as_str().unwrap_or("").to_string(),
+                        run_attempt: r["run_attempt"].as_u64().unwrap_or(1),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(CiPollResult::Runs {
+        runs,
+        rate_limit_remaining,
+        rate_limit_limit,
+    })
+}
+
 #[async_trait::async_trait]
 impl CiProvider for GitHubCiProvider {
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
@@ -490,76 +583,25 @@ impl CiProvider for GitHubCiProvider {
             ))
             .send()
             .await?;
-        let status = resp.status().as_u16();
-        let rate_limit_reset = resp
-            .headers()
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        // Sprint 54 P0-2: capture remaining/limit on every response,
-        // not just rate-limited ones. The watch loop feeds these into
-        // `adaptive_interval` so we widen the next poll BEFORE hitting
-        // the cap, instead of recovering from it.
-        let parse_u64_header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-        };
-        let rate_limit_remaining = parse_u64_header("x-ratelimit-remaining");
-        let rate_limit_limit = parse_u64_header("x-ratelimit-limit");
-        let body: serde_json::Value = resp.json().await?;
+        parse_github_runs_response(resp).await
+    }
 
-        // Surface API errors (rate-limit, auth, server) instead of
-        // silently treating them as "no runs".
-        if !(200..300).contains(&status) {
-            let message = body["message"]
-                .as_str()
-                .unwrap_or("(no message)")
-                .to_string();
-            // Sprint 54 P0-4: hint via the unified token cache. Anything
-            // the cache treats as "no token available" (env unset AND gh
-            // not authed) gets the actionable hint. Reading the cache —
-            // not env — keeps behavior consistent with what auth_fn
-            // actually saw on the wire.
-            let hint = if status == 403
-                && crate::github_token::cached_token().is_none()
-                && message.to_lowercase().contains("rate limit")
-            {
-                " — set GITHUB_TOKEN or run `gh auth login` to raise the unauthenticated 60/hr cap"
-            } else {
-                ""
-            };
-            return Ok(CiPollResult::ApiError {
-                status,
-                message: format!("GH API {status}: {message}{hint}"),
-                rate_limit_reset,
-            });
-        }
-
-        // Parse GitHub-specific `workflow_runs` array into neutral CiRun structs.
-        let runs = body["workflow_runs"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        Some(CiRun {
-                            id: r["id"].as_u64()?,
-                            conclusion: r["conclusion"].as_str().map(String::from),
-                            head_sha: r["head_sha"].as_str()?.to_string(),
-                            url: r["html_url"].as_str().unwrap_or("").to_string(),
-                            name: r["name"].as_str().unwrap_or("").to_string(),
-                            run_attempt: r["run_attempt"].as_u64().unwrap_or(1),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(CiPollResult::Runs {
-            runs,
-            rate_limit_remaining,
-            rate_limit_limit,
-        })
+    /// S1 exact-head: resolve runs for an EXACT immutable commit SHA via GitHub's
+    /// documented `?head_sha=` filter — independent of the branch's recent-runs
+    /// page, so a newer main push can't displace the target off the page. The
+    /// same response parser as `poll_runs`, so result/aggregate semantics match.
+    /// `head_sha` is validated + lowercased upstream (`is_full_commit_sha` /
+    /// `normalize_head_sha`).
+    async fn poll_runs_for_sha(&self, repo: &str, head_sha: &str) -> anyhow::Result<CiPollResult> {
+        let resp = self
+            .http
+            .get(&format!(
+                "repos/{repo}/actions/runs?head_sha={}&per_page={POLL_RUNS_PAGE_SIZE}",
+                percent_encode_query(head_sha)
+            ))
+            .send()
+            .await?;
+        parse_github_runs_response(resp).await
     }
 
     async fn poll_repo_runs(&self, repo: &str) -> Option<anyhow::Result<RepoPollResult>> {
