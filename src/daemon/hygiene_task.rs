@@ -373,6 +373,46 @@ mod tests {
         );
     }
 
+    /// Coverage runs the bin's unit tests as peer threads in one process. An
+    /// armed rendezvous for one board must not capture an unrelated board's
+    /// update. The timeout cleanup deliberately supplies the missing home-A
+    /// party before joining, so the RED leaves no parked thread behind.
+    #[test]
+    fn armed_home_does_not_block_other_home() {
+        let home_a = tmp_home("gate-home-a");
+        let home_b = tmp_home("gate-home-b");
+        upsert_system_hygiene_task(&home_a, "a", "a", ev("seed-a")).unwrap();
+        upsert_system_hygiene_task(&home_b, "b", "b", ev("seed-b")).unwrap();
+
+        let gate = test_sync::arm(2);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let b_home = home_b.clone();
+        let b = std::thread::spawn(move || {
+            let result = upsert_system_hygiene_task(&b_home, "b", "b", ev("update-b"));
+            let _ = done_tx.send(());
+            result
+        });
+
+        let completed_without_home_a = done_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok();
+        if !completed_without_home_a {
+            let a_home = home_a.clone();
+            let a = std::thread::spawn(move || {
+                upsert_system_hygiene_task(&a_home, "a", "a", ev("cleanup-a"))
+            });
+            a.join().unwrap().unwrap();
+        }
+        let b_result = b.join().unwrap().unwrap();
+        drop(gate);
+
+        assert!(
+            completed_without_home_a,
+            "a gate armed for home A must not capture an update for home B"
+        );
+        assert!(matches!(b_result, HygieneUpsert::Updated(_)));
+    }
+
     /// r2 (§3.20 deterministic RED): force the exact stale-probe interleaving
     /// via the production-path rendezvous — TWO writers both create-reject
     /// against the seeded task, both capture `n=1`, the armed barrier holds
