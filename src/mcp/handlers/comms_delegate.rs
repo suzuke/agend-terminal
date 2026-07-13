@@ -509,7 +509,7 @@ fn validate_review_assignment_marker(
     target: &str,
     args: &Value,
     checks: &DispatchPreChecks,
-) -> Result<(), Value> {
+) -> Result<String, Value> {
     // (a) mandatory explicit generation-bound identifiers.
     if args["task_id"].as_str().unwrap_or("").is_empty() {
         return Err(json!({
@@ -581,7 +581,115 @@ fn validate_review_assignment_marker(
             }));
         }
     }
-    Ok(())
+    // The validated, canonical `owner/repo` slug is returned so the store dispatch
+    // (A1) keys the record on the SAME lockstep form the ACL matched (I25) — no
+    // second resolve (which could redrift or re-run a git subprocess).
+    Ok(repo_slug)
+}
+
+/// t-…-17 C11 (A1→A2→A3): deliver a validated reviewer-assignment marker dispatch
+/// through the DURABLE outbox store instead of `deliver_delegate`. Called from
+/// [`handle_delegate_task`] AFTER `maybe_auto_bind_lease` (bind) has succeeded and
+/// the marker gate has resolved the canonical `repo_slug`.
+///
+/// A1 `persist` the PENDING record (mint assignment_id + delivery_nonce; store the
+/// mandatory `pr_number` — the generation identity). A2 `durable_enqueue` the
+/// reviewer's actionable inbox row (the store owns delivery — this is NOT a
+/// `deliver_delegate`/API send). A3 emit a best-effort self-IPC WAKE pointer OUTSIDE
+/// all flocks (`durable_enqueue` has already released its lock). A store failure
+/// AFTER the bind FAILS LOUD (structured error) rather than silently proceeding
+/// (I23) — the bind is already durable, so a swallowed store error would strand the
+/// assignment with no record.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_review_assignment_via_store(
+    home: &Path,
+    sender: &Sender,
+    target: &str,
+    task: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+    composed: &ComposedDelegate,
+    repo_slug: &str,
+) -> Value {
+    // All three are gate-validated: branch + task_id non-empty, pr_number nonzero.
+    let branch = args["branch"].as_str().unwrap_or_default();
+    let task_id = args["task_id"].as_str().unwrap_or_default();
+    let pr_number = checks.pr_number.unwrap_or(0);
+    // The record's `review_class` is authority METADATA (the gate/classifier read the
+    // PrState's class, never this) — resolve it from the task's DURABLE metadata (the
+    // same authority `maybe_auto_bind_lease` already validated and armed); an untagged
+    // task degrades to `Unresolved` (harmless: metadata-only).
+    let review_class = crate::tasks::load_by_id(home, task_id)
+        .and_then(|t| {
+            t.metadata
+                .get("review_class")
+                .and_then(|v| v.as_str())
+                .map(|s| ReviewClass::parse_fail_closed(Some(s)))
+        })
+        .unwrap_or(ReviewClass::Unresolved);
+    // `review_author` is OPTIONAL at dispatch (the gate only self-review-denies an
+    // Agent author); the store record carries a non-Option principal, so an absent
+    // author is stored as an empty `External` sentinel — display-only, never
+    // string-compared to the agent target (I7), and the merge gate keys on reserved
+    // PRESENCE, not authorship.
+    let review_author = checks
+        .review_author
+        .clone()
+        .unwrap_or(ReviewAuthor::External(String::new()));
+    let now = chrono::Utc::now().to_rfc3339();
+    let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending(
+        repo_slug,
+        branch,
+        target,
+        pr_number,
+        sender.as_str(),
+        task_id,
+        review_class,
+        review_author,
+        composed.msg.clone(),
+        args["thread_id"].as_str().map(String::from),
+        args["parent_id"].as_str().map(String::from),
+        &now,
+    );
+    // A1 — persist the PENDING record (no PrState/inbox row seeded — I9).
+    if let Err(e) = crate::daemon::assignment_authority::persist(home, &record) {
+        return json!({
+            "ok": false,
+            "error": format!("review_assignment store persist failed after bind: {e}"),
+            "code": "review_assignment_store_persist_failed",
+        });
+    }
+    // A2 — durable enqueue of the reviewer's actionable row (store owns delivery).
+    if let Err(e) =
+        crate::daemon::assignment_authority::durable_enqueue(home, repo_slug, branch, target, &now)
+    {
+        return json!({
+            "ok": false,
+            "error": format!("review_assignment store enqueue failed after bind: {e}"),
+            "code": "review_assignment_store_enqueue_failed",
+        });
+    }
+    // A3 — best-effort self-IPC WAKE pointer, OUTSIDE all flocks.
+    crate::inbox::notify::wake_review_assignment(home, target);
+    let result = json!({
+        "target": target,
+        "review_assignment": true,
+        "assignment_id": record.assignment_id.to_string(),
+        "pr_number": pr_number,
+    });
+    // Dispatch tracking / UX parity with the legacy path (task_id is explicit).
+    let ctx = DeliveryCtx {
+        home,
+        args,
+        sender,
+        target,
+        task,
+        msg: &composed.msg,
+        task_id: Some(task_id),
+        force_meta_json: None,
+        auto_created_task_id: None,
+    };
+    track_delegate_success(&ctx, result)
 }
 
 /// Ordered choreography for MCP `delegate_task` / unified send kind=task.
@@ -604,25 +712,33 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
 
     // t-…-17 reviewer-assignment marker gate — fail-closed, BEFORE any bind/create/
     // deliver side effect. A dispatch WITHOUT the marker skips this entirely and is
-    // byte-identical to the legacy path.
-    if checks.review_assignment {
-        if let Err(e) = validate_review_assignment_marker(home, sender, target, args, &checks) {
-            return e;
+    // byte-identical to the legacy path. On success it yields the validated canonical
+    // repo slug, which the store dispatch (A1) keys the record on.
+    let review_assignment_repo = if checks.review_assignment {
+        match validate_review_assignment_marker(home, sender, target, args, &checks) {
+            Ok(slug) => Some(slug),
+            Err(e) => return e,
         }
-    }
+    } else {
+        None
+    };
 
     if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
         return e;
     }
 
-    let (effective_task_id, auto_created_task_id) = if checks.review_assignment {
-        // Marker path: `task_id` is explicit + validated (gate step a) — BYPASS
-        // `maybe_auto_create_task` (the durable outbox store, a later slice, owns
-        // the assignment record; no board auto-create here).
-        (args["task_id"].as_str().map(String::from), None)
-    } else {
-        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required)
-    };
+    // t-…-17 C11: the marker path delivers via the DURABLE outbox store (A1→A2→A3),
+    // NOT `deliver_delegate`, and bypasses `maybe_auto_create_task` (the store owns
+    // the assignment record). Returns here; the legacy path below is untouched
+    // (byte-identical) for a non-marker dispatch.
+    if let Some(repo_slug) = review_assignment_repo {
+        return dispatch_review_assignment_via_store(
+            home, sender, target, task, args, &checks, &composed, &repo_slug,
+        );
+    }
+
+    let (effective_task_id, auto_created_task_id) =
+        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required);
     let task_id_str = effective_task_id.as_deref();
     let mut msg = composed.msg;
     if let Some(tid) = task_id_str {
@@ -1114,5 +1230,58 @@ mod review_assignment_marker_tests {
             );
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+
+    /// C11 (A1→A2): a validated marker dispatch delivers through the DURABLE outbox
+    /// store — A1 persists a generation-bound record (assignment_id + nonce +
+    /// mandatory pr_number), A2 durable-enqueues the reviewer's ACTIONABLE row (NOT a
+    /// `deliver_delegate` send). Drives the store-dispatch stage directly (the bind
+    /// stage is orthogonal and covered elsewhere).
+    #[test]
+    fn c11_marker_path_persists_record_and_enqueues_row() {
+        use super::{dispatch_review_assignment_via_store, ComposedDelegate};
+        let home = tmp_home("c11-store");
+        let sender = Sender::new("lead").unwrap();
+        let args = marker_args("owner/repo", 42); // task_id t-rev-1, branch feat/x
+        let checks = marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42));
+        let composed = ComposedDelegate {
+            msg: "[delegate_task] review the PR".to_string(),
+            force_meta_json: None,
+            second_reviewer: false,
+            plan_ack_required: 0,
+        };
+
+        let out = dispatch_review_assignment_via_store(
+            &home,
+            &sender,
+            "reviewer",
+            "review the PR",
+            &args,
+            &checks,
+            &composed,
+            "owner/repo",
+        );
+
+        // A1: a durable, generation-bound record was persisted.
+        let rec =
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .expect("A1 persisted a record");
+        assert_eq!(rec.pr_number, 42);
+        assert_eq!(rec.sender, "lead");
+        assert_eq!(rec.task_id, "t-rev-1");
+        assert_eq!(rec.review_author, ReviewAuthor::External("octocat".into()));
+        // A2: the reviewer's actionable outbox row carries the record's nonce, and the
+        // record advanced to Persisted (delivered by the store, not deliver_delegate).
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &rec.delivery_nonce),
+            "A2 durable_enqueue delivered the reviewer's actionable row"
+        );
+        assert_eq!(
+            rec.row,
+            crate::daemon::assignment_authority::RowState::Persisted
+        );
+        assert_eq!(out["review_assignment"], true, "{out}");
+        assert_eq!(out["pr_number"], 42, "{out}");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
