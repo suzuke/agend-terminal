@@ -541,6 +541,107 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// B4 (codex m-…-378) RED — the A10b reconciler (`redrive_reserved`) must SET
+    /// `authority_unknown` when the branch authority is UNREADABLE, IDENTICALLY to the
+    /// A6 drain. Pre-fix the reconciler set `reserved_assignments` ONLY and NEVER touched
+    /// the flag, so a stale-false state whose authority went unreadable was never closed
+    /// by the reconciler — only an unrelated CI event through `record_ci_result` could
+    /// SET it. Here the branch's SOLE record is corrupt (probe ⇒ `Unreadable`): redrive
+    /// MUST set the flag and KEEP the existing reservation (never drop on corruption).
+    /// RED pre-fix: the flag stays false because redrive never set it.
+    #[test]
+    fn b4_reconcile_sets_authority_unknown_on_unreadable_fail_closed() {
+        let home = tmp_home("b4-recon-set");
+        // Seed the branch's SOLE authority record, then CORRUPT it ⇒ probe reports
+        // Unreadable (a corrupt record is never conflated with absence).
+        store::persist(
+            &home,
+            &mk("o/r", "feat/x", "rev-a", 42, "2026-07-13T00:00:00Z"),
+        )
+        .unwrap();
+        let rpath = store::record_path_for_test(&home, "o/r", "feat/x", "rev-a");
+        std::fs::write(&rpath, b"{ not valid assignment json").unwrap();
+
+        // A LIVE pr_state with authority_unknown CLEAR and an EXISTING reservation the
+        // fail-closed transition must PRESERVE.
+        let mut s = pr_state::new_for_branch("o/r", "feat/x", "sha-42", ReviewClass::Dual);
+        s.pr_number = 42;
+        s.merge_state = MergeState::NotReady;
+        s.authority_unknown = false;
+        s.reserved_assignments = vec![pr_state::ReservedAssignment {
+            target: "rev-a".to_string(),
+            review_author: ReviewAuthor::External("octocat".into()),
+            assignment_id: uuid::Uuid::new_v4(),
+        }];
+        pr_state::save(&home, &s).unwrap();
+
+        // Drive the RECONCILER path directly (NOT record_ci_result).
+        store::redrive_reserved(&home, "o/r", "feat/x");
+
+        let after = pr_state::load(&home, "o/r", "feat/x").expect("pr_state present");
+        assert!(
+            after.authority_unknown,
+            "reconcile on an UNREADABLE authority must SET authority_unknown (fail closed) — pre-fix redrive never set it"
+        );
+        assert_eq!(
+            after
+                .reserved_assignments
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>(),
+            vec!["rev-a".to_string()],
+            "the existing reservation is KEPT on unreadable authority (never dropped on corruption)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// B4 (codex m-…-378) RED — the A10b reconciler must CLEAR `authority_unknown` once a
+    /// transient corruption/lock-failure is REPAIRED, WITHOUT waiting for an unrelated CI
+    /// event. Pre-fix only `record_ci_result` cleared the flag; the reconciler set
+    /// reserved but never cleared, so a repaired branch stayed STUCK merge-closed
+    /// (`is_merge_ready` gates unconditionally on the flag) until the next CI observation.
+    /// Here the record is VALID (repaired) and the seeded state carries a stale
+    /// `authority_unknown = true`: redrive MUST clear it. RED pre-fix: the flag stays true
+    /// because redrive never cleared it.
+    #[test]
+    fn b4_reconcile_clears_authority_unknown_after_repair_no_ci_event() {
+        let home = tmp_home("b4-recon-clear");
+        // A VALID (repaired) record ⇒ probe reports Active; the assignment lock is taken
+        // and the derive succeeds.
+        store::persist(
+            &home,
+            &mk("o/r", "feat/x", "rev-a", 42, "2026-07-13T00:00:00Z"),
+        )
+        .unwrap();
+
+        // A LIVE pr_state carrying a STALE authority_unknown=true (set earlier by a drain
+        // on a now-repaired corruption). No CI event fires — only the reconciler runs.
+        let mut s = pr_state::new_for_branch("o/r", "feat/x", "sha-42", ReviewClass::Dual);
+        s.pr_number = 42;
+        s.merge_state = MergeState::NotReady;
+        s.authority_unknown = true;
+        pr_state::save(&home, &s).unwrap();
+
+        // Drive the RECONCILER path directly (NOT record_ci_result).
+        store::redrive_reserved(&home, "o/r", "feat/x");
+
+        let after = pr_state::load(&home, "o/r", "feat/x").expect("pr_state present");
+        assert!(
+            !after.authority_unknown,
+            "reconcile after repair must CLEAR authority_unknown with NO CI event — pre-fix redrive never cleared it"
+        );
+        assert_eq!(
+            after
+                .reserved_assignments
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>(),
+            vec!["rev-a".to_string()],
+            "the repaired record is derived into the reserved set under the lock"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// T28 — the reconciler handler is registered at cadence `new(1)` and its `run`
     /// actually drives the reconcile when the cadence permits (a lease-due Unengaged
     /// record is repaired). Cross-checked by a source-pin on the registration.
