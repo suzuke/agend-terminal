@@ -361,18 +361,8 @@ fn init_submodules_after_create(wt_dir: &Path) {
     if !wt_dir.join(".gitmodules").is_file() {
         return;
     }
-    match crate::git_helpers::git_cmd(
-        wt_dir,
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "update",
-            "--init",
-            "--recursive",
-        ],
-    ) {
-        Ok(_) => {
+    match init_submodules_strict(wt_dir) {
+        Ok(()) => {
             tracing::info!(
                 path = %wt_dir.display(),
                 "initialized submodules after worktree create"
@@ -388,6 +378,36 @@ fn init_submodules_after_create(wt_dir: &Path) {
             );
         }
     }
+}
+
+/// #2755: recursively initialize submodules in a freshly-added worktree, returning
+/// the git error string on failure (a HARD variant of the soft-warn
+/// [`init_submodules_after_create`]). `repo action=checkout`'s SubmodulesReady
+/// phase uses this so a failed init ABORTS into rollback instead of returning a
+/// worktree with missing path-dependency content. No-op (`Ok`) when `.gitmodules`
+/// is absent.
+///
+/// `-c protocol.file.allow=always` is intentional: git's submodule clone helper
+/// ignores the superproject's stored `protocol.file.allow` (security default
+/// post-2.38), so hermetic file-path submodule fixtures — and rare local-path
+/// submodules — need the command-line override. https/ssh remotes are unaffected.
+pub(crate) fn init_submodules_strict(wt_dir: &Path) -> Result<(), String> {
+    if !wt_dir.join(".gitmodules").is_file() {
+        return Ok(());
+    }
+    crate::git_helpers::git_cmd(
+        wt_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// #888 affirmative-signal predicate: does this instance opt into a per-agent

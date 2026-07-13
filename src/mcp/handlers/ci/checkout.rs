@@ -250,6 +250,32 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             ) {
                 warnings.push(format!("marker: {e}"));
             }
+            // #2755 SubmodulesReady phase: `git worktree add` materializes the
+            // superproject (`.gitmodules` + gitlinks) but leaves submodule dirs
+            // EMPTY, so a build with path-dependency submodules (e.g.
+            // vendor/agentic-git) fails on a freshly provisioned worktree.
+            // Recursively init them; a failure ABORTS the transaction — roll the
+            // worktree back with `remove --force` (a mere prune can't remove a
+            // still-present dir) and return a structured error, never a
+            // half-provisioned tree. Runs for bind AND non-bind (a reviewer/triage
+            // inspection worktree needs its submodule content too).
+            if let Err(e) = crate::worktree::init_submodules_strict(&worktree_dir) {
+                let _ = crate::git_helpers::git_bypass(
+                    Path::new(&source_path),
+                    &["worktree", "remove", "--force", &worktree_path_str],
+                );
+                let mut err = json!({
+                    "error": format!("submodule init failed, worktree rolled back: {e}"),
+                    "code": "submodule_init_failed",
+                    "stage": "submodules_ready",
+                    "branch": branch,
+                });
+                if bind {
+                    err["fetch_attempted"] = json!(fetch_attempted);
+                    err["auto_created_branch"] = json!(auto_created_branch);
+                }
+                return err;
+            }
             if bind {
                 // #2533: optional caller-supplied task_id — attributes this self-claim
                 // to a task (§3.19.1 reviewer checkout is the common case) so `bind_full`
