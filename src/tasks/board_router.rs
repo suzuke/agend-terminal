@@ -23,7 +23,7 @@
 use crate::task_events::{board_root, project_slug, TaskId, DEFAULT_PROJECT};
 use std::path::{Path, PathBuf};
 
-use super::Task;
+use super::{Task, TaskRouteError};
 
 // ── task_index (home/task_index.jsonl) ─────────────────────────────
 
@@ -185,7 +185,9 @@ fn live_task_ids(
 )> {
     let mut live = std::collections::HashSet::new();
     let mut ambiguous_boards = std::collections::HashSet::new();
-    for project in enumerate_projects(home) {
+    // #2760 R1: enumeration failure → None → skip pruning (conservative, matches
+    // this fn's None-on-uncertainty fail-safe; never false-prune a live entry).
+    for project in enumerate_projects(home).ok()? {
         let board = board_root(home, &project);
         let state = crate::task_events::replay_at(&board).ok()?;
         if state.tasks.is_empty() {
@@ -270,6 +272,10 @@ fn index_contains(index_path: &Path, task_id: &str) -> bool {
     })
 }
 
+/// #2760: index first-match lookup. Production resolution now goes through
+/// [`route_task`]'s `index_projects_for` (which also surfaces conflicting entries);
+/// this remains only as a verification helper for the compaction tests below.
+#[cfg(test)]
 fn lookup_task_project(home: &Path, task_id: &str) -> Option<String> {
     let content = std::fs::read_to_string(index_path(home)).ok()?;
     content.lines().find_map(|line| {
@@ -363,30 +369,9 @@ pub(crate) fn resolve_target_project(home: &Path, target: &str) -> String {
     resolve_current_project(home, target)
 }
 
-/// The project a task lives in: the `task_index` entry, else a full-board scan
-/// that repairs the index on a hit, else [`DEFAULT_PROJECT`] (the `home` board)
-/// when the task is unknown — which keeps a missing/legacy task resolving to the
-/// historical board.
-pub(crate) fn resolve_task_project(home: &Path, task_id: &str) -> String {
-    if let Some(p) = lookup_task_project(home, task_id) {
-        return p;
-    }
-    let tid = TaskId(task_id.to_string());
-    for project in enumerate_projects(home) {
-        let found = crate::task_events::replay_at(&board_root(home, &project))
-            .map(|state| state.tasks.contains_key(&tid))
-            .unwrap_or(false);
-        if found {
-            // Repair the index so the next lookup is O(1). #2168 Phase-2a: use
-            // the absent-guarded variant so a concurrent repair (or a repair
-            // after a transient index loss) cannot append a duplicate entry —
-            // the existence check is atomic under the index lock.
-            let _ = record_task_project_if_absent(home, task_id, &project);
-            return project;
-        }
-    }
-    DEFAULT_PROJECT.to_string()
-}
+// #2760: the lenient `resolve_task_project` (index → scan → DEFAULT fallback) is
+// GONE — every per-id authority path now routes through [`route_task`], which
+// fails closed (NotFound / Unreadable / Ambiguous) instead of silently defaulting.
 
 /// Every project with an on-disk board: the default (fleet) project plus each
 /// `home/boards/<project_id>` subdir (the dir name IS the project id).
@@ -397,31 +382,346 @@ pub(crate) fn resolve_task_project(home: &Path, task_id: &str) -> String {
 /// unlike `list_all_boards`, which applies list-time dep derivation and would
 /// silently relabel an InProgress task's persisted status to `Blocked` before
 /// the detective ever sees it.
-pub(super) fn enumerate_projects(home: &Path) -> Vec<String> {
+///
+/// #2760 R1: FALLIBLE. A MISSING `boards/` dir is legacy/single-project →
+/// `Ok([DEFAULT])`. But a `boards/` dir that EXISTS yet cannot be fully
+/// enumerated — a `read_dir` I/O error, an unreadable directory entry, an entry
+/// whose file-type can't be stat'd, or a non-UTF-8 (thus un-sluggable) board name
+/// — makes the project-board set UNPROVABLE → `TaskRouteError::Unreadable`. This
+/// closes the fail-OPEN hole where a swallowed enumeration error would let a task
+/// living on a project board mis-resolve to `NotFound`/default. Entry errors are
+/// NEVER flattened away.
+pub(super) fn enumerate_projects(home: &Path) -> Result<Vec<String>, TaskRouteError> {
     let mut out = vec![DEFAULT_PROJECT.to_string()];
-    if let Ok(entries) = std::fs::read_dir(home.join("boards")) {
-        for e in entries.flatten() {
-            if e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    out.push(name.to_string());
-                }
+    let boards = home.join("boards");
+    let unreadable = |cause: String| TaskRouteError::Unreadable {
+        path: boards.clone(),
+        cause,
+    };
+    let entries = match std::fs::read_dir(&boards) {
+        Ok(entries) => entries,
+        // No boards/ dir → single-project/legacy → default board only.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(unreadable(format!("boards dir read_dir failed: {e}"))),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| unreadable(format!("boards dir entry unreadable: {e}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| unreadable(format!("boards dir entry file_type unreadable: {e}")))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        match entry.file_name().to_str() {
+            Some(name) => out.push(name.to_string()),
+            // A board dir whose name is not UTF-8 can't be slugged/enumerated, yet
+            // it EXISTS — it might hold the id, so uniqueness is unprovable.
+            None => {
+                return Err(unreadable(
+                    "boards dir contains a non-UTF-8 board name".to_string(),
+                ))
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // ── board handles + cross-board listing ────────────────────────────
 
-/// Board root for an existing task (via [`resolve_task_project`]).
-pub(crate) fn board_for_task(home: &Path, task_id: &str) -> PathBuf {
-    board_root(home, &resolve_task_project(home, task_id))
+// ── #2760 item 2: per-task-ID router lock ──────────────────────────
+
+/// The per-task-ID router lock file. **Board-independent** — it lives at
+/// `home/task_locks/<slug>.lock`, not under any board, because it is acquired
+/// BEFORE the strict route resolves which board holds the id. Every authority
+/// mutation on one id serialises on this lock regardless of which board the task
+/// lives on, so the route→revalidate→append transaction is atomic against a
+/// concurrent create/mutation of the same id on ANY board.
+///
+/// The id is slugged for filesystem safety; a real `t-…` task id is already
+/// slug-safe (the slug is the identity map on it), so distinct real ids never
+/// collide onto one lock file.
+fn task_id_lock_path(home: &Path, task_id: &str) -> PathBuf {
+    home.join("task_locks")
+        .join(format!("{}.lock", project_slug(task_id)))
+}
+
+/// #2760 item 2: acquire the per-task-ID router lock (the OUTER lock; the board /
+/// event-log writer lock is INNER). Held across the strict-route revalidation and
+/// the board append so no concurrent authority mutation on the same id can
+/// interleave between them. NOTHING under this lock may perform self-IPC
+/// (`api::call` / `enqueue_with_idle_hint`) — [`route_task`] only reads files (+ the
+/// `task_index` lock) and the checked append only reads `fleet.yaml` + takes the
+/// board writer lock, so the `#1629` flock-across-self-IPC guard is respected. Any
+/// cascade/cleanup/notify a caller runs MUST happen AFTER this guard drops.
+pub(super) fn acquire_task_id_lock(
+    home: &Path,
+    task_id: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
+    crate::store::acquire_file_lock(&task_id_lock_path(home, task_id))
+}
+
+// ── #2760 strict routed authority ──────────────────────────────────
+
+/// #2760 item 1: outcome of one strict `task_index` scan pass (no repair).
+/// `Fragment` = the file ended in an unterminated, unparseable torn tail — the ONE
+/// repairable case.
+enum IndexScan {
+    /// The DISTINCT project ids the index records for the target id (0, or >1 =
+    /// conflicting), first-seen order.
+    Projects(Vec<String>),
+    Fragment,
+}
+
+/// #2760 item 1: STRICT `task_index` read for the router. Unlike the advisory read
+/// it replaced (which flagged a corrupt line and pressed on), a COMPLETE
+/// (newline-terminated) malformed record is a hard [`TaskRouteError::Unreadable`]:
+/// it could be a hidden CONFLICTING entry for the target id, so tolerating it would
+/// let an `Ambiguous` route slip through as unique. ONLY a final unterminated EOF
+/// fragment is tolerable — repaired ONCE under the SAME `task_index.jsonl.lock`,
+/// then re-read (a fragment that survives one repair is hard corruption; bounded,
+/// never a repair loop). The index is still a CACHE — [`route_task`] proves
+/// uniqueness by the physical board scan — but its integrity must be provable.
+fn index_projects_strict(home: &Path, task_id: &str) -> Result<Vec<String>, TaskRouteError> {
+    match index_scan_once(home, task_id)? {
+        IndexScan::Projects(p) => Ok(p),
+        IndexScan::Fragment => {
+            repair_index_trailing_fragment(home)?;
+            match index_scan_once(home, task_id)? {
+                IndexScan::Projects(p) => Ok(p),
+                IndexScan::Fragment => Err(TaskRouteError::Unreadable {
+                    path: index_path(home),
+                    cause: "task_index trailing fragment persisted after one repair".to_string(),
+                }),
+            }
+        }
+    }
+}
+
+/// One strict scan of `task_index.jsonl` (no repair). A missing index is legacy →
+/// `Projects([])`; a hard read failure or any complete-malformed record →
+/// `Unreadable`; a trailing unparseable fragment → `Fragment`.
+fn index_scan_once(home: &Path, task_id: &str) -> Result<IndexScan, TaskRouteError> {
+    let path = index_path(home);
+    let unreadable = |cause: String| TaskRouteError::Unreadable {
+        path: path.clone(),
+        cause,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // A MISSING index is legacy/pre-index — not an error (the physical scan is
+        // the authority); an existing-but-unreadable index fails closed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IndexScan::Projects(Vec::new()))
+        }
+        Err(e) => return Err(unreadable(format!("task_index read failed: {e}"))),
+    };
+    let (complete, fragment) = crate::task_events::split_complete_and_fragment(&content);
+    let mut projects: Vec<String> = Vec::new();
+    for line in complete {
+        let entry = serde_json::from_str::<IndexEntry>(line).map_err(|e| {
+            unreadable(format!(
+                "complete-malformed task_index record (could hide a conflicting entry): {e}"
+            ))
+        })?;
+        if entry.task_id == task_id && !projects.contains(&entry.project_id) {
+            projects.push(entry.project_id);
+        }
+    }
+    if let Some(frag) = fragment {
+        match serde_json::from_str::<IndexEntry>(frag) {
+            // A whole entry missing only its newline — apply it.
+            Ok(entry) => {
+                if entry.task_id == task_id && !projects.contains(&entry.project_id) {
+                    projects.push(entry.project_id);
+                }
+            }
+            // A torn tail → repairable.
+            Err(_) => return Ok(IndexScan::Fragment),
+        }
+    }
+    Ok(IndexScan::Projects(projects))
+}
+
+/// Repair a `task_index.jsonl` torn tail: under the SAME `task_index.jsonl.lock`
+/// [`record_task_project`] holds, re-read, and — only if the file STILL ends in an
+/// unterminated, unparseable fragment — quarantine it and truncate to the last
+/// newline (fsync + durable parent). Mirrors the task_events EOF repair.
+fn repair_index_trailing_fragment(home: &Path) -> Result<(), TaskRouteError> {
+    let path = index_path(home);
+    let unreadable = |cause: String| TaskRouteError::Unreadable {
+        path: path.clone(),
+        cause,
+    };
+    let lock_path = path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| unreadable(format!("acquire task_index lock for EOF repair: {e}")))?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(unreadable(format!("re-read task_index under lock: {e}"))),
+    };
+    if content.is_empty() || content.ends_with('\n') {
+        return Ok(());
+    }
+    let cut = content.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let fragment = &content[cut..];
+    if fragment.trim().is_empty() {
+        return Ok(());
+    }
+    // A valid entry missing only its newline — keep it.
+    if serde_json::from_str::<IndexEntry>(fragment).is_ok() {
+        return Ok(());
+    }
+    quarantine_index_torn_tail(home, fragment);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|e| unreadable(format!("open task_index for truncate: {e}")))?;
+    f.set_len(cut as u64)
+        .map_err(|e| unreadable(format!("truncate task_index torn tail: {e}")))?;
+    f.sync_all()
+        .map_err(|e| unreadable(format!("fsync task_index after truncate: {e}")))?;
+    crate::store::fsync_parent_dir(&path);
+    tracing::warn!(
+        tag = "#2760-index-eof-fragment-repaired",
+        home = %home.display(),
+        bytes = fragment.len(),
+        "router repaired a task_index torn tail (truncated to last newline; quarantined)"
+    );
+    Ok(())
+}
+
+/// Quarantine a `task_index` torn tail under `task_index.recovery/<ts>/` before it
+/// is truncated out of the index.
+fn quarantine_index_torn_tail(home: &Path, fragment: &str) {
+    use std::io::Write;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let dir = home.join("task_index.recovery").join(&ts);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut rf) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("task_index.jsonl"))
+    {
+        let _ = writeln!(rf, "{fragment}");
+        let _ = rf.sync_all();
+    }
+}
+
+/// #2760 STRICT resolution: the ONE board that authoritatively holds `task_id` plus
+/// its replay-derived record, or a fail-closed [`TaskRouteError`] that NEVER means
+/// "assume the default board". The strict replacement for the lenient
+/// `resolve_task_project`/`board_for_task` pair on every per-id authority path.
+///
+/// **Uniqueness is proven by a PHYSICAL scan, not by trusting the index cache**
+/// (#2760 R1 — the old indexed short-circuit returned after checking one board and
+/// missed an unindexed duplicate left by a create whose index-write failed):
+/// - hard index read error → `Unreadable`; conflicting distinct index entries →
+///   `Ambiguous` (a cache-integrity red flag, surfaced before the scan).
+/// - a checked scan of the default board + EVERY project board (any enumeration or
+///   replay error → `Unreadable`, even after a hit — the id might ALSO live on the
+///   unreadable board): >1 physical board → `Ambiguous`; exactly one → `Ok` (index
+///   repaired, absent-guarded) UNLESS a lone index entry names a DIFFERENT board
+///   than the id physically occupies → `Unreadable`; zero physical boards →
+///   `NotFound`, UNLESS the index claims the id exists (or a corrupt line might) →
+///   `Unreadable` (indexed-but-absent is NEVER NotFound/default).
+pub(super) fn route_task(
+    home: &Path,
+    task_id: &str,
+) -> Result<(String, PathBuf, crate::task_events::TaskRecord), TaskRouteError> {
+    let tid = TaskId(task_id.to_string());
+
+    // ── index cache: hard-read + conflict signals (NOT the uniqueness authority) ──
+    // #2760 item 1: STRICT read — a hard I/O error or any complete-malformed record
+    // is `Unreadable`, not an advisory flag (a corrupt line could hide a conflicting
+    // entry for the target id). Only a final EOF fragment is repaired-and-retried.
+    let indexed_projects = index_projects_strict(home, task_id)?;
+    if indexed_projects.len() > 1 {
+        return Err(TaskRouteError::Ambiguous {
+            candidates: indexed_projects,
+            cause: "conflicting distinct task_index entries".to_string(),
+        });
+    }
+
+    // ── authoritative physical scan of default + EVERY project board ──
+    // #2760 item 1: the STRICT router-only replay proves each board's history is
+    // complete — a complete-malformed task-event record is `Unreadable` (never
+    // silently skipped, unlike the fleet-wide `replay_at`), tolerating only a final
+    // EOF fragment (repaired under the writer lock). Enumeration failure (unreadable
+    // boards/ dir) → Unreadable; a board that cannot be replayed → Unreadable even
+    // after a hit (the id might ALSO live there).
+    let mut hits: Vec<(String, PathBuf, crate::task_events::TaskRecord)> = Vec::new();
+    for project in enumerate_projects(home)? {
+        let board = board_root(home, &project);
+        let state = crate::task_events::replay_strict_at(&board).map_err(|e| {
+            TaskRouteError::Unreadable {
+                path: e.path,
+                cause: e.cause,
+            }
+        })?;
+        if let Some(record) = state.tasks.get(&tid) {
+            hits.push((project, board, record.clone()));
+        }
+    }
+    if hits.len() > 1 {
+        return Err(TaskRouteError::Ambiguous {
+            candidates: hits.into_iter().map(|(p, _, _)| p).collect(),
+            cause: "task id physically present on multiple boards".to_string(),
+        });
+    }
+    match hits.pop() {
+        Some((project, board, record)) => {
+            // Index/physical consistency: a lone index entry naming a DIFFERENT
+            // board than the id physically occupies is a hard inconsistency — fail
+            // closed rather than trust either side.
+            if let Some(indexed) = indexed_projects.first() {
+                // #2760: compare on the canonical SLUG. The physical `project` is a
+                // board dir name (already slugged); a legacy index entry may hold the
+                // RAW project id (`orgA/projA`) whose board dir is the slug
+                // (`orgA_projA`) — those are the SAME board, not an inconsistency.
+                // Slugging both sides (idempotent on an already-safe id) avoids a
+                // false Unreadable for every raw-index task on a slug-unsafe project.
+                if project_slug(indexed) != project {
+                    return Err(TaskRouteError::Unreadable {
+                        path: board,
+                        cause: format!(
+                            "task_index routes '{task_id}' to project '{indexed}' but the id \
+                             physically resides on '{project}'"
+                        ),
+                    });
+                }
+            }
+            // Repair the index (absent-guarded) so the next resolve is indexed.
+            let _ = record_task_project_if_absent(home, task_id, &project);
+            Ok((project, board, record))
+        }
+        None => {
+            // Zero physical boards hold the id. If the index CLAIMS it exists (a
+            // parseable entry), the absence is unprovable → Unreadable
+            // (indexed-but-absent is NEVER NotFound/default). A complete-malformed
+            // index line already failed closed as Unreadable in
+            // `index_projects_strict`, so only a clean, entry-free index reaches the
+            // definitive NotFound here.
+            if !indexed_projects.is_empty() {
+                Err(TaskRouteError::Unreadable {
+                    path: index_path(home),
+                    cause: format!("task_index claims '{task_id}' exists but no board holds it"),
+                })
+            } else {
+                Err(TaskRouteError::NotFound)
+            }
+        }
+    }
 }
 
 /// All tasks across every board, tagged with their project id — for the
 /// `list project=all` / `scope=fleet` aggregate view.
 pub(crate) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
+    // #2760 R1: the aggregate `list project=all` view is OUTSIDE the strict-route
+    // authority scope; on an unreadable boards/ dir it degrades to the default
+    // board rather than failing (a display path, not a per-id authority decision).
     enumerate_projects(home)
+        .unwrap_or_else(|_| vec![DEFAULT_PROJECT.to_string()])
         .into_iter()
         .map(|project| {
             let tasks = super::list_all_at(home, &board_root(home, &project));
@@ -442,7 +742,8 @@ pub(crate) fn list_all_boards(home: &Path) -> Vec<(String, Vec<Task>)> {
 /// single-project replay error is unchanged).
 pub(super) fn replay_all_boards(home: &Path) -> anyhow::Result<crate::task_events::TaskBoardState> {
     let mut merged = crate::task_events::TaskBoardState::default();
-    for project in enumerate_projects(home) {
+    // #2760 R1: enumeration failure fails closed (like the per-board replay below).
+    for project in enumerate_projects(home).map_err(|e| anyhow::anyhow!("enumerate boards: {e}"))? {
         let state = crate::task_events::replay_at(&board_root(home, &project))?;
         merged.tasks.extend(state.tasks);
     }
@@ -667,21 +968,21 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Phase-2a (integration): a `resolve_task_project` repair, then a re-resolve
-    /// after the index is lost, never accumulates duplicates — the repair routes
-    /// through the absent-guarded variant.
+    /// Phase-2a (integration), #2760: the strict `route_task` repairs the index on
+    /// a legacy-scan hit, and a re-resolve after the entry exists never accumulates
+    /// duplicates — the repair routes through the absent-guarded variant.
     #[test]
-    fn resolve_repair_is_idempotent_across_index_loss() {
+    fn route_task_repair_is_idempotent_across_index_loss() {
         let home = tmp_home("repair-idem");
         seed_live_task(&home, DEFAULT_PROJECT, "T-r");
-        assert_eq!(resolve_task_project(&home, "T-r"), DEFAULT_PROJECT);
+        assert_eq!(route_task(&home, "T-r").unwrap().0, DEFAULT_PROJECT);
         assert_eq!(
             index_lines(&home),
             1,
             "first resolve repairs the index once"
         );
         // Re-resolve with the entry already present must not append again.
-        assert_eq!(resolve_task_project(&home, "T-r"), DEFAULT_PROJECT);
+        assert_eq!(route_task(&home, "T-r").unwrap().0, DEFAULT_PROJECT);
         assert_eq!(
             index_lines(&home),
             1,

@@ -11,13 +11,12 @@ fn parse_due_at(args: &Value) -> Option<String> {
     Some(dt.with_timezone(&chrono::Utc).to_rfc3339())
 }
 
-/// Read a single task's current replay-derived record. Used by
-/// `handle`'s mutation arms to validate `(prev_status, transition)`
-/// before emitting an event.
+/// #2760: default-root record read. Production mutation arms now resolve their
+/// board via the strict `super::load_routed` (no default-board assumption), so this
+/// remains only as a convenience for the default-board handler tests.
+#[cfg(test)]
 pub(super) fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRecord> {
-    // #2117 P1: home IS the default board root (`board_root(home, DEFAULT)`), so
-    // this is byte-identical; routed callers use `read_task_record_at` with the
-    // task's resolved board.
+    // `home` IS the default board root (`board_root(home, DEFAULT)`).
     read_task_record_at(home, id)
 }
 
@@ -157,10 +156,23 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     // explicit `project` arg override). Single-project → DEFAULT → board == home
     // (byte-identical). Record the task→project mapping in the append-only index
     // so later done/update/claim/activity resolve the board in O(1).
-    let project = args["project"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| super::board_router::resolve_current_project(home, emitter.as_str()));
+    //
+    // #2760: canonicalise the project id to its filesystem-safe SLUG — the project
+    // id IS the slug (board_router doc: the board dir name equals the project id).
+    // `resolve_current_project` already returns a slug, but a raw explicit `project`
+    // arg (e.g. `orgA/projA`) is stored raw in the index while `board_root` slugs
+    // the on-disk dir (`orgA_projA`) — so the STRICT router's index-vs-physical
+    // consistency check reads them as a mismatch (Unreadable) and the parent-project
+    // comparison compares slug-vs-raw. Slugging here makes the index entry, the
+    // board dir, and every later strict route agree. Idempotent on an already-safe id.
+    let project = crate::task_events::project_slug(
+        &args["project"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| {
+                super::board_router::resolve_current_project(home, emitter.as_str())
+            }),
+    );
     // #2117 P3a: `parent_id` is subtask COMPOSITION ("A is composed of B/C/D").
     // DP4 invariant — a subtask MUST live in its parent's project. Cross-project
     // composition breaks board isolation: `cascade_cancel_children` only replays
@@ -172,7 +184,21 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     // composition — cross-board references are allowed there per the epic and are
     // NOT guarded here.)
     if let Some(parent_id) = args["parent_id"].as_str() {
-        let parent_project = super::board_router::resolve_task_project(home, parent_id);
+        // #2760: resolve the parent's board via the strict route. A route error
+        // (NotFound / Unreadable / Ambiguous) fails closed — a subtask is never
+        // created against a parent whose board cannot be uniquely proven.
+        let parent_project = match super::load_routed(home, parent_id) {
+            Ok(rt) => rt.board().project().to_string(),
+            Err(e) => {
+                return serde_json::json!({
+                    "error": format!(
+                        "cross-project parent_id rejected: parent {parent_id} could not be \
+                         routed ({e}) — a subtask must live in its parent's uniquely-resolved \
+                         project (board isolation, #2117 P3a / #2760)"
+                    )
+                });
+            }
+        };
         if parent_project != project {
             return serde_json::json!({
                 "error": format!(
@@ -184,6 +210,38 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         }
     }
     let board = crate::task_events::board_root(home, &project);
+    // #2760 item 2: create under the per-id router lock. The id routing NOWHERE
+    // (NotFound) is re-proved under the lock BEFORE the Created append + index
+    // record, so two racing creates of the same id (or a create racing a mutation)
+    // can never land a cross-board duplicate — which would make every later route
+    // Ambiguous and un-mutatable. A fresh id is timestamp+pid+seq so this virtually
+    // always holds; it fails closed if the id somehow already exists on a board or
+    // its absence cannot be proven. The lock is held across the pure board-record
+    // writes below (no dispatch side-effects, #1496 → no self-IPC under the flock).
+    let _create_lock = match super::board_router::acquire_task_id_lock(home, &id) {
+        Ok(g) => g,
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("failed to acquire per-id lock for create of '{id}': {e}")
+            })
+        }
+    };
+    match super::load_routed(home, &id) {
+        // The id is free on every board → safe to create.
+        Err(super::TaskRouteError::NotFound) => {}
+        Ok(_) => {
+            return serde_json::json!({
+                "error": format!("task id '{id}' already exists on a board"),
+                "code": "duplicate_task_id",
+            })
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("cannot prove task id '{id}' is unused: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
+    }
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
             let _ = super::board_router::record_task_project(home, &id, &project);
@@ -449,40 +507,52 @@ fn minimal_task_value(v: &mut Value) {
 /// task on the caller's current project board first, then falls back to scanning
 /// every board (the id may live elsewhere). Returns `{ "task": {...} }` or an
 /// `{ "error": ... }` when the id is absent.
-fn handle_get(home: &Path, caller: &str, args: &Value) -> Value {
+fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
     let Some(id) = id_arg(args).map(str::to_string) else {
         return serde_json::json!({"error": "missing 'id' (or 'task_id')"});
     };
-    // Primary board: explicit `project`, else the caller's current project.
-    let project = args["project"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
-    let board = crate::task_events::board_root(home, &project);
-    let mut found = super::list_all_at(home, &board)
-        .into_iter()
-        .find(|t| t.id == id);
-    let mut found_project = found.as_ref().map(|_| project);
-    // Cross-board fallback: the id may live on another project's board.
-    if found.is_none() {
-        for (p, ts) in super::board_router::list_all_boards(home) {
-            if let Some(t) = ts.into_iter().find(|t| t.id == id) {
-                found_project = Some(p);
-                found = Some(t);
-                break;
+    // #2760: an EXPLICIT `project` scopes the read to that operator-named board
+    // (deliberate disambiguation, NOT a silent default). With no `project`, the id
+    // resolves through the strict router — a duplicate across boards or an
+    // unreadable board fails closed instead of the old arbitrary first-hit scan.
+    let (task, project) = if let Some(project) = args["project"].as_str() {
+        let board = crate::task_events::board_root(home, project);
+        match super::list_all_at(home, &board)
+            .into_iter()
+            .find(|t| t.id == id)
+        {
+            Some(t) => (t, project.to_string()),
+            None => return serde_json::json!({"error": format!("task not found: {id}")}),
+        }
+    } else {
+        match super::load_routed(home, &id) {
+            // Re-read via `list_all_at` on the ROUTED board so the response keeps
+            // the dep-derived status (in-memory blocking), matching pre-#2760 `get`.
+            Ok(rt) => {
+                match super::list_all_at(home, rt.board().path())
+                    .into_iter()
+                    .find(|t| t.id == id)
+                {
+                    Some(t) => (t, rt.board().project().to_string()),
+                    None => return serde_json::json!({"error": format!("task not found: {id}")}),
+                }
+            }
+            Err(super::TaskRouteError::NotFound) => {
+                return serde_json::json!({"error": format!("task not found: {id}")})
+            }
+            Err(e) => {
+                return serde_json::json!({
+                    "error": format!("task '{id}' route unresolved: {e}"),
+                    "code": "task_route_unresolved",
+                })
             }
         }
+    };
+    let mut v = serde_json::to_value(&task).unwrap_or(Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("project".to_string(), Value::String(project));
     }
-    match found {
-        Some(t) => {
-            let mut v = serde_json::to_value(&t).unwrap_or(Value::Null);
-            if let (Some(obj), Some(p)) = (v.as_object_mut(), found_project) {
-                obj.insert("project".to_string(), Value::String(p));
-            }
-            serde_json::json!({ "task": v })
-        }
-        None => serde_json::json!({"error": format!("task not found: {id}")}),
-    }
+    serde_json::json!({ "task": v })
 }
 
 /// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task
@@ -493,12 +563,20 @@ fn handle_get(home: &Path, caller: &str, args: &Value) -> Value {
 /// SAME axis as the owner-ACL `can_mutate_record` — bypasses it on the paths that
 /// carry it. Single-project → caller project == task board project (both DEFAULT)
 /// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
-fn cross_board_denied(home: &Path, caller: &str, id: &str, force: bool) -> Option<Value> {
+// #2760: `board_project` is the caller's ALREADY-resolved authoritative board
+// (from `super::load_routed`), so the mutation routes ONCE and this gate never
+// re-resolves (nor silently defaults). `None` = allowed.
+fn cross_board_denied(
+    home: &Path,
+    caller: &str,
+    id: &str,
+    board_project: &str,
+    force: bool,
+) -> Option<Value> {
     if force {
         return None;
     }
-    let board_project = super::board_router::resolve_task_project(home, id);
-    if super::acl::can_mutate_on_board(home, caller, &board_project) {
+    if super::acl::can_mutate_on_board(home, caller, board_project) {
         return None;
     }
     Some(serde_json::json!({
@@ -523,10 +601,24 @@ fn handle_claim(
     if !instance_exists(home, &iname) {
         return serde_json::json!({"error": format!("instance '{iname}' not found in fleet.yaml")});
     }
+    // #2760: resolve the task's authoritative board ONCE via the strict route
+    // (fail-closed) and reuse it for the board-isolation gate + the append below.
+    let routed = match super::load_routed(home, &id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task '{id}' not found")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
+    };
     // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
     // project's board (claim has no `force`/owner-ACL — an open task is claimable
     // by anyone, but only within the board). Single-project → allow.
-    if let Some(deny) = cross_board_denied(home, &iname, &id, false) {
+    if let Some(deny) = cross_board_denied(home, &iname, &id, routed.board().project(), false) {
         return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
@@ -548,48 +640,61 @@ fn handle_claim(
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(iname.clone()),
     };
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, &id);
-    let result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
-        let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
-        // #2117 Q2: cross-board dep eval — a claim gate on a task whose
-        // `depends_on` points at another project's board must read that board's
-        // status, not just this one's. Pass home + the task's board.
-        super::apply_dependency_eval_in_memory(&mut tasks, home, &board);
-        let tv = tasks
-            .iter()
-            .find(|t| t.id == claim_id)
-            .ok_or_else(|| format!("task '{claim_id}' not found"))?;
-        let is_self_reclaim = tv.status == crate::task_events::TaskStatus::Claimed
-            && tv.assignee.as_deref() == Some(by.as_str());
-        if !is_self_reclaim && tv.status != crate::task_events::TaskStatus::Open {
-            return Err(format!(
-                "task '{claim_id}' status is '{}', only 'open' tasks can be claimed",
-                tv.status
-            ));
+    // #2760 items 2+3: append under the per-id router lock with write-time route
+    // revalidation — the strict route is re-proved (same board + incarnation) under
+    // the lock before the checked append, so a concurrent create/mutation of this
+    // id on any board cannot race the claim onto a stale board.
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        let result = crate::task_events::append_checked_at(board, &emitter, event, |state| {
+            let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
+            // #2117 Q2: cross-board dep eval — a claim gate on a task whose
+            // `depends_on` points at another project's board must read that board's
+            // status, not just this one's. Pass home + the task's board.
+            super::apply_dependency_eval_in_memory(&mut tasks, home, board);
+            let tv = tasks
+                .iter()
+                .find(|t| t.id == claim_id)
+                .ok_or_else(|| format!("task '{claim_id}' not found"))?;
+            let is_self_reclaim = tv.status == crate::task_events::TaskStatus::Claimed
+                && tv.assignee.as_deref() == Some(by.as_str());
+            if !is_self_reclaim && tv.status != crate::task_events::TaskStatus::Open {
+                return Err(format!(
+                    "task '{claim_id}' status is '{}', only 'open' tasks can be claimed",
+                    tv.status
+                ));
+            }
+            Ok(())
+        });
+        match result {
+            Ok(Ok(_)) => {
+                // #807 Item 1: see create arm note. claim's
+                // legacy `status` happens to match lifecycle
+                // ("claimed"), but the field is still the action
+                // event name semantically — kept as alias for
+                // shape consistency.
+                let task = read_task_record_at(board, &id).map(|r| record_to_task(&r));
+                serde_json::json!({
+                    "id": id,
+                    "event": "claimed",
+                    "task": task,
+                    "assignee": instance_name,
+                    // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                    "status": "claimed",
+                })
+            }
+            // Lost the race / precondition no longer holds — no event written.
+            Ok(Err(reason)) => serde_json::json!({"error": reason}),
+            Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
         }
-        Ok(())
     });
-    match result {
-        Ok(Ok(_)) => {
-            // #807 Item 1: see create arm note. claim's
-            // legacy `status` happens to match lifecycle
-            // ("claimed"), but the field is still the action
-            // event name semantically — kept as alias for
-            // shape consistency.
-            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-            serde_json::json!({
-                "id": id,
-                "event": "claimed",
-                "task": task,
-                "assignee": instance_name,
-                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
-                "status": "claimed",
-            })
-        }
-        // Lost the race / precondition no longer holds — no event written.
-        Ok(Err(reason)) => serde_json::json!({"error": reason}),
-        Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+    match revalidated {
+        Ok(v) => v,
+        // Route revalidation failed under the per-id lock (board/incarnation
+        // changed, or the id no longer routes uniquely) → deny, no event.
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
     }
 }
 
@@ -640,12 +745,22 @@ fn handle_done(
     };
     let result_text = args["result"].as_str().map(String::from);
     let caller = instance_name.to_string();
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, &id);
-    let record = match read_task_record_at(&board, &id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task '{id}' not found")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route
+    // (fail-closed); reuse it for the ACL gate, pre-checks, and the checked append.
+    let routed = match super::load_routed(home, &id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task '{id}' not found")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
     // #808: force flag bypasses the ACL gate for historical
     // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -659,7 +774,7 @@ fn handle_done(
         });
     }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
         return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
@@ -730,73 +845,89 @@ fn handle_done(
     // replay's `apply_done` does NOT re-guard transitions — so this precondition
     // is the authoritative gate (mirrors `handle_claim`'s `append_checked`).
     let done_id = id.clone();
-    match crate::task_events::append_checked_at(&board, &emitter, event, |state| {
-        let tv = state
-            .tasks
-            .values()
-            .map(record_to_task)
-            .find(|t| t.id == done_id)
-            .ok_or_else(|| format!("task '{done_id}' not found"))?;
-        if !tv
-            .status
-            .can_transition_to(crate::task_events::TaskStatus::Done)
-        {
-            return Err(format!(
-                "illegal transition: {} → done (task {done_id})",
-                status_to_legacy_str(tv.status)
-            ));
-        }
-        Ok(())
-    }) {
-        Ok(Ok(_)) => {
-            // #789: task-completion is a workflow boundary —
-            // clean any empty `init` commits the backend has
-            // accumulated in the agent's bound worktree since
-            // the last cleanup at `dispatch_auto_bind_lease`.
-            // Best-effort: failure is logged inside the helper
-            // but never blocks the done response (the task
-            // event already appended successfully — cleanup is
-            // a polish step, not load-bearing).
-            let owner = record
-                .owner
-                .as_ref()
-                .map(|o| o.0.clone())
-                .unwrap_or_else(|| caller.clone());
-            if let Some(binding) = crate::binding::read(home, &owner) {
-                if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from) {
-                    let _ = crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
-                }
-                // t-worktree-leak (PR-1): task-done is one of the 3 release
-                // events. Enqueue a release-invariant recompute — if the
-                // branch has no open PR and all its tasks are done, the
-                // sweeper releases the worktree (covers tasks that never
-                // produce a PR: RCA / design / spike). An open PR holds the
-                // release until it terminates. (repo="" → sweeper derives it.)
-                if let Some(branch) = binding["branch"].as_str() {
-                    crate::daemon::auto_release::enqueue_release_recompute(
-                        home,
-                        "",
-                        branch,
-                        "task_done",
-                    );
-                }
+    // #2760 items 2+3: append the →Done under the per-id router lock with write-time
+    // route revalidation. The closure does ONLY the checked append; the cascade
+    // below (worktree cleanup / release recompute / obligation cleanup — each may
+    // self-IPC or take other locks) runs AFTER the per-id flock drops (#1629). The
+    // fingerprint match guarantees `routed.board()` still names the appended board,
+    // so the post-lock read-back reads the right board.
+    let append_result = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_checked_at(board, &emitter, event, |state| {
+            let tv = state
+                .tasks
+                .values()
+                .map(record_to_task)
+                .find(|t| t.id == done_id)
+                .ok_or_else(|| format!("task '{done_id}' not found"))?;
+            if !tv
+                .status
+                .can_transition_to(crate::task_events::TaskStatus::Done)
+            {
+                return Err(format!(
+                    "illegal transition: {} → done (task {done_id})",
+                    status_to_legacy_str(tv.status)
+                ));
             }
-            // #1018/#78445-2 (d): a task reaching Done is terminal — clear BOTH
-            // obligation stores (dispatch_idle sidecar + dispatch_tracking rows) via
-            // the shared seam so no watchdog nags about the board-confirmed-done work.
-            super::task_terminal_cleanup(home, &id);
-            // #807 Item 1: see create arm note.
-            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-            serde_json::json!({
-                "id": id,
-                "event": "done",
-                "task": task,
-                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
-                "status": "done",
-            })
-        }
-        Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
-        Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+            Ok(())
+        })
+    });
+    match append_result {
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
+        Ok(inner) => match inner {
+            Ok(Ok(_)) => {
+                // #789: task-completion is a workflow boundary —
+                // clean any empty `init` commits the backend has
+                // accumulated in the agent's bound worktree since
+                // the last cleanup at `dispatch_auto_bind_lease`.
+                // Best-effort: failure is logged inside the helper
+                // but never blocks the done response (the task
+                // event already appended successfully — cleanup is
+                // a polish step, not load-bearing).
+                let owner = record
+                    .owner
+                    .as_ref()
+                    .map(|o| o.0.clone())
+                    .unwrap_or_else(|| caller.clone());
+                if let Some(binding) = crate::binding::read(home, &owner) {
+                    if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from) {
+                        let _ =
+                            crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+                    }
+                    // t-worktree-leak (PR-1): task-done is one of the 3 release
+                    // events. Enqueue a release-invariant recompute — if the
+                    // branch has no open PR and all its tasks are done, the
+                    // sweeper releases the worktree (covers tasks that never
+                    // produce a PR: RCA / design / spike). An open PR holds the
+                    // release until it terminates. (repo="" → sweeper derives it.)
+                    if let Some(branch) = binding["branch"].as_str() {
+                        crate::daemon::auto_release::enqueue_release_recompute(
+                            home,
+                            "",
+                            branch,
+                            "task_done",
+                        );
+                    }
+                }
+                // #1018/#78445-2 (d): a task reaching Done is terminal — clear BOTH
+                // obligation stores (dispatch_idle sidecar + dispatch_tracking rows) via
+                // the shared seam so no watchdog nags about the board-confirmed-done work.
+                super::task_terminal_cleanup(home, &id);
+                // #807 Item 1: see create arm note.
+                let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
+                serde_json::json!({
+                    "id": id,
+                    "event": "done",
+                    "task": task,
+                    // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                    "status": "done",
+                })
+            }
+            Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
+            Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+        },
     }
 }
 
@@ -888,12 +1019,22 @@ fn handle_update(
         None
     };
     let caller = instance_name.to_string();
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, &id);
-    let record = match read_task_record_at(&board, &id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task '{id}' not found")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route
+    // (fail-closed); reuse it for the ACL gate, pre-checks, and the checked append.
+    let routed = match super::load_routed(home, &id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task '{id}' not found")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
     // #808: force flag bypasses the ACL gate for historical
     // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -907,7 +1048,7 @@ fn handle_update(
         });
     }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
         return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
@@ -1221,11 +1362,14 @@ fn handle_update(
         // The pre-built events are kept (no in-lock rebuild); the drift check
         // guarantees their `by` is still correct at commit time.
         let stale_owner = record.owner.clone();
-        let checked = crate::task_events::append_batch_checked_at(
-            &board,
-            &emitter,
-            pending_events,
-            |state| {
+        // #2760 items 2+3: the checked batch append runs under the per-id router
+        // lock with write-time route revalidation (the closure does ONLY the
+        // append; the cascade below — obligation cleanup / child cancel / reassign,
+        // each may self-IPC or take other locks — runs AFTER the flock drops,
+        // #1629). The fingerprint match guarantees the `board` local still names the
+        // appended board, so the cascade + read-back below use it safely.
+        let checked = routed.with_revalidated_board(home, |board| {
+            crate::task_events::append_batch_checked_at(board, &emitter, pending_events, |state| {
                 update_batch_precondition(
                     state,
                     home,
@@ -1235,11 +1379,11 @@ fn handle_update(
                     target_status,
                     &stale_owner,
                 )
-            },
-        );
+            })
+        });
         match checked {
-            Ok(Ok(_)) => {}
-            Ok(Err(reason)) => {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(reason))) => {
                 // Preserve the legacy `illegal_transition` code for the #1868
                 // transition guard; the new in-lock ACL/owner-drift rejections
                 // (:231) are a distinct, retryable precondition failure.
@@ -1250,8 +1394,14 @@ fn handle_update(
                 };
                 return serde_json::json!({"error": reason, "code": code});
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return serde_json::json!({"error": format!("event log append_batch failed: {e}")});
+            }
+            Err(route_err) => {
+                return serde_json::json!({
+                    "error": format!("task '{id}' route revalidation failed: {route_err}"),
+                    "code": "task_route_unresolved",
+                });
             }
         }
         // #1018 (B): mirror the `done` arm's cleanup hook for
@@ -1482,47 +1632,143 @@ fn handle_metadata_set(
             "code": "metadata_value_too_large"
         });
     }
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, id);
-    let record = match read_task_record_at(&board, id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task not found: {id}")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route.
+    let routed = match super::load_routed(home, id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task not found: {id}")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
     // unconditional owner-ACL below).
-    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
+    {
         return deny;
     }
-    // ── t-…-74 governance-key ACL (decision d-…-22, Root ruling m-1087) ──
-    // `plan`, `plan_ack_required`, and `plan_acks` gate the #2249 pre-work
-    // alignment chokepoint — they are NOT ordinary owner-writable metadata, so
-    // each gets per-key fail-closed validation BEFORE the generic owner-ACL.
-    // GOV_AUTHOR = EXACTLY created_by (+ system), never the assignee or the
-    // orchestrator (no transitive authority — otherwise the very agent the gate
-    // constrains could self-weaken it). Every other key falls through to
-    // `can_mutate_record` (I4), byte-identical to before.
-    let is_gov_author = super::acl::is_plan_governance_author(instance_name, &record);
-    let deny_counter = |detail: &str| {
-        serde_json::json!({
-            "error": format!("plan_ack_required is protected: {detail}"),
-            "code": "plan_ack_required_protected",
-        })
-    };
-    // Set when a GOV_AUTHOR plan content-change must also reset acks (I3).
-    let mut reset_acks = false;
-    match key {
-        // I1: plan_acks is system-managed. Only `handle_ack_plan` appends it (and
-        // the reopen-reset below emits its own []-event). A direct metadata_set is
-        // rejected for EVERY identity, GOV_AUTHOR and system included.
-        "plan_acks" => {
+    // #2760 R2 (root+independent REJECT of a542517b): evaluate the plan-governance /
+    // ACL policy for the IMMEDIATE response (coded denials / idempotent no-op). It is
+    // RE-evaluated UNDER the per-id + board locks on FRESH state below, and the events
+    // are BUILT there — so a concurrent owner / status / plan / ack change cannot slip
+    // a stale-authorized write past a route-only (board+incarnation) revalidation.
+    match metadata_write_outcome(home, instance_name, &record, key, &value) {
+        MetadataWriteOutcome::Denied(e) => return e,
+        MetadataWriteOutcome::Noop => {
+            let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
             return serde_json::json!({
-                "error": "plan_acks is system-managed; record acks via action=ack_plan, never metadata_set",
-                "code": "plan_acks_immutable",
+                "id": id, "event": "metadata_set", "task": task, "noop": true
             });
         }
-        // I2: accept ONLY a GOV_AUTHOR monotonic raise (numeric, ≥ current, after
-        // the assignee has claimed). Everything else — non-author, lower,
-        // non-numeric, pre-claim — fails closed. (Typed field promotion = t-…-79.)
+        MetadataWriteOutcome::Write { .. } => {}
+    }
+    let caller = instance_name.to_string();
+    let key_owned = key.to_string();
+    let value_owned = value.clone();
+    let tid = crate::task_events::TaskId(id.to_string());
+    let meta_emitter = emitter.clone();
+    // Test seam: inject a concurrent owner/plan/ack change in the out-of-lock window
+    // to prove the under-lock re-evaluation refuses / recomputes (no-op in prod).
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
+    let append_result = routed.with_revalidated_computed(home, &emitter, move |fresh| {
+        let rec = fresh
+            .tasks
+            .get(&tid)
+            .ok_or_else(|| "task disappeared before metadata_set".to_string())?;
+        match metadata_write_outcome(home, &caller, rec, &key_owned, &value_owned) {
+            MetadataWriteOutcome::Write { reset_acks } => {
+                let mut events = vec![crate::task_events::TaskEvent::MetadataSet {
+                    task_id: tid.clone(),
+                    by: meta_emitter.clone(),
+                    key: key_owned.clone(),
+                    value: value_owned.clone(),
+                }];
+                if reset_acks {
+                    // I6: emit the plan change + an audit-visible plan_acks=[] reset
+                    // as ONE atomic batch so replay re-derives the reopened gate.
+                    events.push(crate::task_events::TaskEvent::MetadataSet {
+                        task_id: tid.clone(),
+                        by: meta_emitter.clone(),
+                        key: "plan_acks".to_string(),
+                        value: serde_json::json!([]),
+                    });
+                }
+                Ok(events)
+            }
+            // Became idempotent under the lock (a concurrent write set the same
+            // value) → no-op success.
+            MetadataWriteOutcome::Noop => Ok(Vec::new()),
+            // Authorization no longer holds on fresh state (owner/status/ack drift) →
+            // refuse; the caller retries against the new state.
+            MetadataWriteOutcome::Denied(_) => {
+                Err("metadata authorization changed under the lock — retry".to_string())
+            }
+        }
+    });
+    match append_result {
+        Ok(Ok(Ok(_))) => {
+            let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
+            serde_json::json!({"id": id, "event": "metadata_set", "task": task})
+        }
+        Ok(Ok(Err(reason))) => {
+            serde_json::json!({"error": reason, "code": "metadata_precondition_failed"})
+        }
+        Ok(Err(e)) => serde_json::json!({"error": format!("{e}")}),
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
+    }
+}
+
+/// #2760 R2: the outcome of the plan-governance / ACL policy for a `metadata_set`.
+enum MetadataWriteOutcome {
+    /// Fail-closed denial carrying the FULL coded JSON error (preserves the `code`).
+    Denied(Value),
+    /// Idempotent same-value write (`plan`) — no event.
+    Noop,
+    /// Allowed; `reset_acks` = a GOV_AUTHOR plan content-change that must also reset
+    /// `plan_acks` (I3).
+    Write { reset_acks: bool },
+}
+
+/// #2760 R2: the PURE plan-governance / ACL decision for `metadata_set`. Evaluated
+/// BOTH out-of-lock (immediate coded response) and again UNDER the per-id + board
+/// locks against FRESH state (`handle_metadata_set`), so a concurrent owner / status
+/// / plan / ack change cannot slip a stale-authorized write past a route-only
+/// revalidation. See the per-key invariants (t-…-74, decision d-…-22, PR #2761 r1).
+fn metadata_write_outcome(
+    home: &Path,
+    caller: &str,
+    record: &crate::task_events::TaskRecord,
+    key: &str,
+    value: &Value,
+) -> MetadataWriteOutcome {
+    use crate::task_events::TaskStatus;
+    // GOV_AUTHOR = EXACTLY created_by (+ system), never assignee/orchestrator (no
+    // transitive authority — else the very agent the gate constrains self-weakens it).
+    let is_gov_author = super::acl::is_plan_governance_author(caller, record);
+    let deny_counter = |detail: &str| {
+        MetadataWriteOutcome::Denied(serde_json::json!({
+            "error": format!("plan_ack_required is protected: {detail}"),
+            "code": "plan_ack_required_protected",
+        }))
+    };
+    match key {
+        // I1: plan_acks is system-managed (only `ack_plan` / the reopen-reset write
+        // it) — a direct metadata_set is rejected for EVERY identity.
+        "plan_acks" => MetadataWriteOutcome::Denied(serde_json::json!({
+            "error": "plan_acks is system-managed; record acks via action=ack_plan, never metadata_set",
+            "code": "plan_acks_immutable",
+        })),
+        // I2: accept ONLY a GOV_AUTHOR monotonic raise (numeric, ≥ current, post-claim).
         "plan_ack_required" => {
             let proposed = match value.as_u64() {
                 Some(n) => n,
@@ -1531,13 +1777,7 @@ fn handle_metadata_set(
             if !is_gov_author {
                 return deny_counter("only the task creator (created_by) may raise it");
             }
-            // "after assignee claim" — an unclaimed task (backlog/open, incl. one
-            // released back to open) is not yet under an assignee, so a raise is
-            // premature and fails closed.
-            if matches!(
-                record.status,
-                crate::task_events::TaskStatus::Backlog | crate::task_events::TaskStatus::Open
-            ) {
+            if matches!(record.status, TaskStatus::Backlog | TaskStatus::Open) {
                 return deny_counter("may only be raised after the assignee has claimed the task");
             }
             let current = record
@@ -1550,38 +1790,22 @@ fn handle_metadata_set(
                     "may only be raised, never lowered ({current} → {proposed})"
                 ));
             }
+            MetadataWriteOutcome::Write { reset_acks: false }
         }
-        // I3: idempotency FIRST (a same-content write is a no-op for anyone —
-        // no reject, no event, no ack reset), then owner-pre-ack /
-        // GOV_AUTHOR-content-change(reopens acks) / else deny.
+        // I3: idempotency FIRST (same-content = no-op), then status-frozen, then
+        // owner-pre-ack / GOV_AUTHOR-content-change(reopens acks) / else deny.
         "plan" => {
-            if record.metadata.get("plan") == Some(&value) {
-                let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
-                return serde_json::json!({
-                    "id": id, "event": "metadata_set", "task": task, "noop": true
-                });
+            if record.metadata.get("plan") == Some(value) {
+                return MetadataWriteOutcome::Noop;
             }
-            // Fail-closed status policy (PR #2761 r1): a content-CHANGING plan
-            // write is permitted ONLY in the pre-work window {Backlog, Open,
-            // Claimed} — where no work is active because the →in_progress ack gate
-            // has not yet been passed. At in_progress and every later/terminal/
-            // blocked state the plan is FROZEN for EVERY identity, creator
-            // included. Reopening the gate would require an
-            // in_progress→claimed/open transition that this handler deliberately
-            // does NOT grant (I5: no creator status authority); silently resetting
-            // plan_acks WITHOUT a transition (the r0 defect) leaves work running
-            // under an unacked replacement plan. metadata_set never mutates status
-            // — the remedy for a wrong plan mid-work is cancel + recreate.
             if !matches!(
                 record.status,
-                crate::task_events::TaskStatus::Backlog
-                    | crate::task_events::TaskStatus::Open
-                    | crate::task_events::TaskStatus::Claimed
+                TaskStatus::Backlog | TaskStatus::Open | TaskStatus::Claimed
             ) {
-                return serde_json::json!({
+                return MetadataWriteOutcome::Denied(serde_json::json!({
                     "error": "the plan is frozen once work has started (in_progress or later); cancel + recreate the task to re-plan — it cannot be hot-swapped under running work",
                     "code": "plan_frozen_work_started",
-                });
+                }));
             }
             let acks_present = record
                 .metadata
@@ -1589,60 +1813,37 @@ fn handle_metadata_set(
                 .and_then(|v| v.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
-            let is_owner = record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name);
+            let is_owner = record.owner.as_ref().map(|o| o.0.as_str()) == Some(caller);
             if is_gov_author {
-                // Creator/system content-change reopens the gate: reset acks.
-                reset_acks = acks_present;
+                MetadataWriteOutcome::Write {
+                    reset_acks: acks_present,
+                }
             } else if is_owner {
-                // The assignee may author/revise the plan ONLY before the first
-                // ack; after that it is frozen (only the creator may change it).
                 if acks_present {
-                    return serde_json::json!({
+                    MetadataWriteOutcome::Denied(serde_json::json!({
                         "error": "the plan is frozen once a reviewer has acked it; only the task creator may change it (which re-opens acks)",
                         "code": "plan_frozen_after_ack",
-                    });
+                    }))
+                } else {
+                    MetadataWriteOutcome::Write { reset_acks: false }
                 }
             } else {
-                return serde_json::json!({
+                MetadataWriteOutcome::Denied(serde_json::json!({
                     "error": "permission denied: only the assignee (pre-ack) or the task creator may set the plan",
                     "code": "plan_write_denied",
-                });
+                }))
             }
         }
         // I4: every other key keeps the unchanged owner/orchestrator ACL.
         _ => {
-            if !can_mutate_record(home, instance_name, &record) {
-                return serde_json::json!({"error": "permission denied: caller is not owner/creator"});
+            if !can_mutate_record(home, caller, record) {
+                MetadataWriteOutcome::Denied(
+                    serde_json::json!({"error": "permission denied: caller is not owner/creator"}),
+                )
+            } else {
+                MetadataWriteOutcome::Write { reset_acks: false }
             }
         }
-    }
-
-    let set_event = crate::task_events::TaskEvent::MetadataSet {
-        task_id: crate::task_events::TaskId(id.to_string()),
-        by: emitter.clone(),
-        key: key.to_string(),
-        value,
-    };
-    let append_result = if reset_acks {
-        // I6: emit the plan change + an audit-visible plan_acks=[] reset as ONE
-        // atomic batch so replay re-derives the reopened gate deterministically.
-        let reset_event = crate::task_events::TaskEvent::MetadataSet {
-            task_id: crate::task_events::TaskId(id.to_string()),
-            by: emitter.clone(),
-            key: "plan_acks".to_string(),
-            value: serde_json::json!([]),
-        };
-        crate::task_events::append_batch_at(&board, &emitter, vec![set_event, reset_event])
-            .map(|_| 0u64)
-    } else {
-        crate::task_events::append_at(&board, &emitter, set_event)
-    };
-    match append_result {
-        Ok(_) => {
-            let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
-            serde_json::json!({"id": id, "event": "metadata_set", "task": task})
-        }
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
 
@@ -1661,12 +1862,22 @@ fn handle_ack_plan(
         Some(i) => i,
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
-    let board = super::board_router::board_for_task(home, id);
-    let record = match read_task_record_at(&board, id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task not found: {id}")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route.
+    let routed = match super::load_routed(home, id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task not found: {id}")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
-    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+    let record = routed.record().clone();
+    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
+    {
         return deny;
     }
     if record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name) {
@@ -1684,7 +1895,7 @@ fn handle_ack_plan(
             "code": "plan_not_set",
         });
     }
-    let mut acks: Vec<String> = record
+    let acks: Vec<String> = record
         .metadata
         .get("plan_acks")
         .and_then(|v| v.as_array())
@@ -1700,19 +1911,79 @@ fn handle_ack_plan(
             "id": id, "event": "ack_plan", "acked": acks.len(), "already_acked": true,
         });
     }
-    acks.push(instance_name.to_string());
-    let acked_count = acks.len();
-    let event = crate::task_events::TaskEvent::MetadataSet {
-        task_id: crate::task_events::TaskId(id.to_string()),
-        by: emitter.clone(),
-        key: "plan_acks".to_string(),
-        value: serde_json::json!(acks),
-    };
-    match crate::task_events::append_at(&board, &emitter, event) {
-        Ok(_) => serde_json::json!({
-            "id": id, "event": "ack_plan", "acked": acked_count, "already_acked": false,
+    // #2760 R2 (root+independent REJECT of a542517b): the `acks` list read above is
+    // an OUT-OF-LOCK snapshot — used only for the fast idempotent already-acked
+    // response. The AUTHORITATIVE ack is built as a UNION from the FRESH under-lock
+    // `plan_acks` (`with_revalidated_computed`). A route-only revalidation
+    // (board/incarnation) cannot see CONTENT staleness, so two acks that both read
+    // the pre-lock list would last-write-wins and silently LOSE one. Building the
+    // union (and re-checking self-ack / plan-present) against the committed state no
+    // concurrent writer can change closes that lost-update TOCTOU.
+    let caller = instance_name.to_string();
+    let tid = crate::task_events::TaskId(id.to_string());
+    let ack_emitter = emitter.clone();
+    // Test seam: inject a concurrent ack in the out-of-lock window to prove the
+    // union preserves it (no-op in production).
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
+    let revalidated = routed.with_revalidated_computed(home, &emitter, move |fresh| {
+        let rec = fresh
+            .tasks
+            .get(&tid)
+            .ok_or_else(|| "task disappeared before ack".to_string())?;
+        // Re-validate the ack authorization against FRESH state.
+        if rec.owner.as_ref().map(|o| o.0.as_str()) == Some(caller.as_str()) {
+            return Err("the task's assignee cannot ack their own plan".to_string());
+        }
+        if !rec.metadata.contains_key("plan") {
+            return Err("task has no plan set".to_string());
+        }
+        let mut fresh_acks: Vec<String> = rec
+            .metadata
+            .get("plan_acks")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if fresh_acks.iter().any(|a| a == &caller) {
+            return Ok(Vec::new()); // already acked under the lock → idempotent no-op
+        }
+        fresh_acks.push(caller.clone());
+        Ok(vec![crate::task_events::TaskEvent::MetadataSet {
+            task_id: tid.clone(),
+            by: ack_emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!(fresh_acks),
+        }])
+    });
+    match revalidated {
+        Ok(Ok(Ok(seqs))) => {
+            // Empty seqs ⇒ the compute returned a no-op (already acked under lock).
+            let already = seqs.is_empty();
+            let count = read_task_record_at(routed.board().path(), id)
+                .and_then(|r| {
+                    r.metadata
+                        .get("plan_acks")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                })
+                .unwrap_or(0);
+            serde_json::json!({
+                "id": id, "event": "ack_plan", "acked": count, "already_acked": already,
+            })
+        }
+        // The compute refused under the lock (self-ack / plan removed / owner drift).
+        Ok(Ok(Err(reason))) => {
+            serde_json::json!({"error": reason, "code": "ack_precondition_failed"})
+        }
+        Ok(Err(e)) => serde_json::json!({"error": format!("{e}")}),
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
         }),
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
 
@@ -1721,20 +1992,37 @@ fn handle_metadata_get(home: &Path, args: &Value) -> Value {
         Some(i) => i,
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
-    let board = super::board_router::board_for_task(home, id);
-    match read_task_record_at(&board, id) {
-        Some(r) => {
-            serde_json::json!({"id": id, "metadata": r.metadata})
+    // #2760: strict route (read). Fail closed on Ambiguous/Unreadable.
+    match super::load_routed(home, id) {
+        Ok(rt) => serde_json::json!({"id": id, "metadata": rt.task.metadata}),
+        Err(super::TaskRouteError::NotFound) => {
+            serde_json::json!({"error": format!("task not found: {id}")})
         }
-        None => serde_json::json!({"error": format!("task not found: {id}")}),
+        Err(e) => serde_json::json!({
+            "error": format!("task '{id}' route unresolved: {e}"),
+            "code": "task_route_unresolved",
+        }),
     }
 }
 
 /// #1147: Build a chronological activity timeline for a task.
 fn activity_timeline(home: &Path, task_id: &str) -> Value {
-    // #2117 P1: read the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, task_id);
-    let envelopes = match crate::task_events::envelopes_for_task_at(&board, task_id) {
+    // #2760: read the task's events from its authoritative board (strict route).
+    // Fail closed on Ambiguous/Unreadable; unknown id → not found.
+    let routed = match super::load_routed(home, task_id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task not found: {task_id}")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{task_id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
+    };
+    let envelopes = match crate::task_events::envelopes_for_task_at(routed.board().path(), task_id)
+    {
         Ok(e) => e,
         Err(e) => return serde_json::json!({"error": format!("failed to read task events: {e}")}),
     };
@@ -1854,6 +2142,14 @@ fn cascade_cancel_children(
     // #2117 P1: a parent's children live on the parent's board — replay + cancel
     // there. `home` is kept only for the cross-instance cascade NOTIFICATION
     // (route_cascade_cancel), which is fleet-global. Single-project → board == home.
+    //
+    // #2760 scope: this is a MULTI-id secondary cascade (many children cancelled as
+    // a consequence of the parent's cancel), invoked AFTER the parent's per-id lock
+    // has dropped. Per the frozen plan's "atomic multi-id mutation sorts IDs or
+    // stays out of scope" rule it is deliberately NOT wrapped in per-child per-id
+    // locks (which would require sorted multi-lock acquisition); the children are
+    // all on this one board and the batch append rides its board writer lock. The
+    // pre-#2760 batch semantics are unchanged.
     let Ok(state) = crate::task_events::replay_at(board) else {
         return;
     };

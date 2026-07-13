@@ -18,15 +18,27 @@ pub fn auto_close_on_report(
     if kind != "report" {
         return Ok(false);
     }
+    // #2760: a cheap PRE-FILTER (not the authority). The authority for "does this
+    // correlation name a real task" is the strict `super::load_routed` below — a
+    // non-task correlation resolves `NotFound` and skips (Ok(false)). So this stays
+    // a `starts_with` pre-filter rather than the strict `TaskId::parse_canonical`
+    // gate: unlike dispatch-idle (where the raw string convention WAS the
+    // suppression authority and had to become typed), here the parser would only
+    // reject short non-canonical ids that `load_routed` already handles, at the cost
+    // of breaking every test that seeds a task under a short id — for no production
+    // change (real task ids are always canonical). See codex thread m-…-1154.
     if !correlation_id.starts_with("t-") {
         return Ok(false);
     }
-    let board = super::board_router::board_for_task(home, correlation_id);
-    let state = crate::task_events::replay_at(&board).unwrap_or_default();
-    let tid = crate::task_events::TaskId(correlation_id.to_string());
-    let Some(record) = state.tasks.get(&tid) else {
-        return Ok(false);
+    // #2760: resolve the task's authoritative board via the strict route. Fail
+    // closed — a task whose board cannot be uniquely proven (route error / unknown
+    // id) is NOT auto-closed (matches the pre-#2760 "record not found → Ok(false)").
+    let routed = match super::load_routed(home, correlation_id) {
+        Ok(rt) => rt,
+        Err(_) => return Ok(false),
     };
+    let tid = crate::task_events::TaskId(correlation_id.to_string());
+    let record = routed.record();
     use crate::task_events::TaskStatus;
     // #1942: `InReview` was added in #1265 but never added to this whitelist, so
     // a terminal report on a task the lead promoted to `in_review` was silently
@@ -67,8 +79,22 @@ pub fn auto_close_on_report(
     let emitter = crate::task_events::InstanceName::from("system:auto_close");
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
-    let closed =
-        crate::task_events::append_done_if_legal_at(&board, &emitter, correlation_id, vec![event])?;
+    // #2760 items 2+3: additionally under the per-id router lock with write-time
+    // route revalidation (the closure does ONLY the append; the cascade below —
+    // terminal cleanup + release recompute, which may self-IPC — runs AFTER the
+    // flock drops, #1629). A route change under the lock → not closed.
+    let closed = match routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_done_if_legal_at(board, &emitter, correlation_id, vec![event])
+    }) {
+        Ok(inner) => inner?,
+        Err(route_err) => {
+            tracing::warn!(
+                task_id = correlation_id, %route_err,
+                "#2760 auto-close skipped: route revalidation failed under the per-id lock"
+            );
+            return Ok(false);
+        }
+    };
     if closed {
         // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
         super::task_terminal_cleanup(home, correlation_id);

@@ -80,6 +80,35 @@ impl TaskId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// #2760 (codex ruling m-…-1154): parse `s` as a CANONICAL task id — the
+    /// TYPE-level authority for "is this string a real task id", replacing raw
+    /// `starts_with("t-")` string conventions at the suppression/authority gates
+    /// (dispatch-idle liveness, auto-close). A generated id is `t-<ts>-<pid>-<seq>`
+    /// (see `tasks::handler` create) and the legacy form is `t-<ts>-<seq>` — both
+    /// are `t-` followed by 2 or 3 NUMERIC segments. Anchored full-string (`^…$`),
+    /// so it VALIDATES the whole correlation, never a substring. Returns the typed
+    /// [`TaskId`] on success; `None` for a non-task / query / synthetic correlation
+    /// (which the gates fail-open on). This is the SAME grammar the `task_sweep`
+    /// Closes-marker extractor matches, but here as VALIDATION (not extraction) —
+    /// `task_sweep` extracts candidate tokens, then validates each through this
+    /// single parser, so the grammar has one authoritative owner.
+    pub fn parse_canonical(s: &str) -> Option<TaskId> {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"^t-[0-9]+-[0-9]+(?:-[0-9]+)?$").expect("static regex must compile")
+        });
+        re.is_match(s).then(|| TaskId(s.to_string()))
+    }
+}
+
+impl std::str::FromStr for TaskId {
+    type Err = ();
+    /// Canonical-grammar parse (see [`TaskId::parse_canonical`]). `Err(())` for a
+    /// non-canonical string — the idiomatic entry for `str::parse::<TaskId>()`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        TaskId::parse_canonical(s).ok_or(())
+    }
 }
 
 impl std::fmt::Display for TaskId {
@@ -1254,6 +1283,86 @@ where
     Ok(Ok(seqs))
 }
 
+/// #2760 R2: append events that are **COMPUTED from the FRESH on-disk replay under
+/// the append lock**. Unlike [`append_batch_checked_at`] (which GATES a fixed event
+/// set with a precondition), `compute(&state)` both re-validates authorization AND
+/// builds the events against the authoritative committed history — so a caller can
+/// re-evaluate an ACL/governance policy, or build an idempotent UNION (e.g. the
+/// `plan_acks` list), against state that no concurrent writer can change between the
+/// decision and the write. This closes the authorization/predicate TOCTOU that a
+/// route-only revalidation leaves open (a caller that read state out-of-lock, then
+/// appended a stale-derived event, could lose a concurrent update).
+///
+/// `compute` returns `Err(reason)` to REFUSE (no write; `Ok(Err(reason))`), an EMPTY
+/// vec for a computed no-op (idempotent; `Ok(Ok(vec![]))`), or the events to append.
+/// The outer `Err` is reserved for IO/replay failures. No `api::call` under the lock
+/// (#1629) — `compute` must be pure decision + event construction.
+pub(crate) fn append_batch_computed_at<F>(
+    board: &Path,
+    instance: &InstanceName,
+    compute: F,
+) -> anyhow::Result<Result<Vec<u64>, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
+{
+    let instance = instance.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
+        Ok((id, _)) => Some(id.full()),
+        Err(e) => {
+            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
+            None
+        }
+    };
+
+    let mut rejection: Option<String> = None;
+    let mut seqs: Vec<u64> = Vec::new();
+    let mut hot_lines = 0usize;
+    let mut appended = 0usize;
+    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
+        // FRESH replay under the lock — authoritative committed history.
+        let state = replay_uncached(board)?;
+        let events = match compute(&state) {
+            Ok(events) => events,
+            Err(reason) => {
+                rejection = Some(reason);
+                return Ok(Vec::new()); // empty ⇒ no write
+            }
+        };
+        if events.is_empty() {
+            return Ok(Vec::new()); // computed no-op (e.g. already-acked)
+        }
+        let count = events.len();
+        appended = count;
+        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
+        hot_lines = pre_lines;
+        let mut lines = Vec::with_capacity(count);
+        for (i, event) in events.into_iter().enumerate() {
+            let seq = start_seq + i as u64;
+            seqs.push(seq);
+            let envelope = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq,
+                timestamp: now.clone(),
+                instance: instance.clone(),
+                emitter_id: emitter_id.clone(),
+                event,
+            };
+            lines.push(serde_json::to_string(&envelope)?);
+        }
+        Ok(lines)
+    })?;
+
+    if let Some(reason) = rejection {
+        return Ok(Err(reason));
+    }
+    if appended > 0 {
+        invalidate_replay_cache();
+        maybe_compact_events(board, hot_lines + appended);
+    }
+    Ok(Ok(seqs))
+}
+
 /// Append `event` atomically iff `precondition` — evaluated under the append
 /// lock against a FRESH on-disk replay — returns `Ok`. This closes the TOCTOU
 /// where a caller validates task state, then appends after a concurrent writer
@@ -1724,6 +1833,245 @@ fn replay_uncached(board: &Path) -> anyhow::Result<TaskBoardState> {
     }
 
     Ok(state)
+}
+
+// ── #2760 item 1: router-only STRICT replay (route-local complete-record proof) ──
+//
+// `replay_uncached` (above) is the FLEET-WIDE reader: it SKIPS a non-JSON line as a
+// tolerated half-write (#1988) and serves the rest. That leniency is right for a
+// display/list read but WRONG for the per-id ROUTER authority: a skipped record
+// could be the very `Created`/`Cancelled` event that decides whether the target id
+// lives on THIS board, so a silent skip turns a real hit into a false miss (or a
+// real duplicate into a false unique). `replay_strict_at` is the router-ONLY reader
+// that fails closed instead:
+//   - ANY complete (newline-terminated) malformed record — non-JSON, a
+//     `schema_version` newer than supported, or a well-formed-but-undeserializable
+//     envelope — is a hard `StrictReplayError` (the router maps it to `Unreadable`).
+//   - ONLY a final unterminated EOF fragment on the LIVE log is tolerable: a crash
+//     mid-`append_lines_under_lock` (append-in-place, no tmp+rename) leaves exactly
+//     such a torn tail. It is repaired ONCE under the SAME writer lock (quarantine +
+//     truncate-to-last-newline + fsync), then the scan re-runs on the clean file.
+//   - Archives are written tmp+rename (atomic), so a torn tail there is real
+//     corruption, NOT a repairable fragment → `StrictReplayError`.
+// The fleet-wide `replay`/`replay_uncached`/`read_envelopes_strict` path is
+// deliberately UNCHANGED (this is additive — no fleet-wide behaviour change).
+
+/// #2760 item 1: why the router-only strict replay refused to anchor a route — the
+/// board's committed history could not be proven complete. The router maps this to
+/// [`crate::tasks::TaskRouteError::Unreadable`].
+#[derive(Debug)]
+pub(crate) struct StrictReplayError {
+    pub path: PathBuf,
+    pub cause: String,
+}
+
+/// Split raw file `content` into COMPLETE (newline-terminated, non-blank) records
+/// and an optional trailing UNTERMINATED fragment (the last record with no final
+/// `\n` — the shape a crash mid-append leaves). A file ending in `\n` has no
+/// fragment; a blank/whitespace-only tail is not a fragment.
+pub(crate) fn split_complete_and_fragment(content: &str) -> (Vec<&str>, Option<&str>) {
+    if content.is_empty() {
+        return (Vec::new(), None);
+    }
+    let terminated = content.ends_with('\n');
+    let mut lines: Vec<&str> = content.lines().collect();
+    let fragment = if terminated { None } else { lines.pop() };
+    let complete: Vec<&str> = lines.into_iter().filter(|l| !l.trim().is_empty()).collect();
+    let fragment = fragment.filter(|f| !f.trim().is_empty());
+    (complete, fragment)
+}
+
+/// Strict single-line parse: the router rejects every shape `read_envelopes_strict`
+/// either skips (non-JSON) or aborts on (future-version / undeserializable) — here
+/// they ALL become a typed cause the caller turns into `Unreadable`.
+fn parse_envelope_strict(line: &str) -> Result<TaskEventEnvelope, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("non-JSON task-event record: {e}"))?;
+    let version = value
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if version > SCHEMA_VERSION as u64 {
+        return Err(format!(
+            "schema_version {version} > supported {SCHEMA_VERSION} (forward-compat fail-closed)"
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|e| format!("undeserializable envelope at supported schema: {e}"))
+}
+
+/// Outcome of one strict scan pass (no repair). `LiveFragment` = the live log ended
+/// in an unterminated, unparseable torn tail — the ONE repairable case.
+enum StrictScan {
+    Complete(TaskBoardState),
+    LiveFragment,
+}
+
+/// One strict scan of `board` (archives then live log), no repair. Mirrors
+/// [`replay_uncached`]'s per-file sort+apply so a corruption-free board yields the
+/// SAME state as the lenient reader.
+fn replay_strict_scan(board: &Path) -> Result<StrictScan, StrictReplayError> {
+    let mut state = TaskBoardState::default();
+    let malformed = |path: &Path, cause: String| StrictReplayError {
+        path: path.to_path_buf(),
+        cause,
+    };
+
+    // Archives (atomic tmp+rename): no fragment tolerance — any torn tail or
+    // malformed record is real corruption.
+    let archive_dir = archive_dir(board);
+    if archive_dir.is_dir() {
+        let mut archives: Vec<PathBuf> = std::fs::read_dir(&archive_dir)
+            .map_err(|e| malformed(&archive_dir, format!("archive read_dir failed: {e}")))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        archives.sort();
+        for path in archives {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| malformed(&path, format!("archive read failed: {e}")))?;
+            let (complete, fragment) = split_complete_and_fragment(&content);
+            if fragment.is_some() {
+                return Err(malformed(
+                    &path,
+                    "archive has an unterminated final record (atomic writes are always \
+                     newline-terminated — this is corruption, not a repairable tail)"
+                        .to_string(),
+                ));
+            }
+            let mut envelopes = Vec::with_capacity(complete.len());
+            for line in complete {
+                envelopes.push(parse_envelope_strict(line).map_err(|c| malformed(&path, c))?);
+            }
+            sort_envelopes(&mut envelopes);
+            for env in &envelopes {
+                state.apply(env);
+            }
+        }
+    }
+
+    // Live log: a trailing unterminated, unparseable fragment is the ONE repairable
+    // case; a complete malformed record is not.
+    let log_path = log_path(board);
+    if log_path.exists() {
+        let content = std::fs::read_to_string(&log_path)
+            .map_err(|e| malformed(&log_path, format!("live log read failed: {e}")))?;
+        let (complete, fragment) = split_complete_and_fragment(&content);
+        let mut envelopes = Vec::with_capacity(complete.len());
+        for line in complete {
+            envelopes.push(parse_envelope_strict(line).map_err(|c| malformed(&log_path, c))?);
+        }
+        if let Some(frag) = fragment {
+            // A trailing record without a newline: if it PARSES it is a whole, valid
+            // event (just missing its terminator) — apply it, no repair. If it does
+            // NOT parse, it is a torn tail → signal a repair.
+            match parse_envelope_strict(frag) {
+                Ok(env) => envelopes.push(env),
+                Err(_) => return Ok(StrictScan::LiveFragment),
+            }
+        }
+        sort_envelopes(&mut envelopes);
+        for env in &envelopes {
+            state.apply(env);
+        }
+    }
+
+    Ok(StrictScan::Complete(state))
+}
+
+/// #2760 item 1: the router-only strict replay. See the module comment above.
+pub(crate) fn replay_strict_at(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
+    match replay_strict_scan(board)? {
+        StrictScan::Complete(state) => Ok(state),
+        StrictScan::LiveFragment => {
+            // Repair the torn tail under the writer lock, then re-scan ONCE. A
+            // fragment that survives one repair (e.g. a racing writer left a fresh
+            // torn tail) is hard corruption — bounded, never a repair loop.
+            repair_live_trailing_fragment(board)?;
+            match replay_strict_scan(board)? {
+                StrictScan::Complete(state) => Ok(state),
+                StrictScan::LiveFragment => Err(StrictReplayError {
+                    path: log_path(board),
+                    cause: "live-log trailing fragment persisted after one repair".to_string(),
+                }),
+            }
+        }
+    }
+}
+
+/// Repair a live-log torn tail: under the SAME `task_events.jsonl.lock` the append
+/// path holds, re-read, and — only if the file STILL ends in an unterminated,
+/// unparseable fragment — quarantine that fragment and truncate the log to the last
+/// newline (fsync + durable parent). A concurrent writer that already completed or
+/// replaced the tail short-circuits to a no-op (the re-scan then sees clean state).
+fn repair_live_trailing_fragment(board: &Path) -> Result<(), StrictReplayError> {
+    let path = log_path(board);
+    let err = |cause: String| StrictReplayError {
+        path: path.clone(),
+        cause,
+    };
+    let lock_path = path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| err(format!("acquire writer lock for EOF repair: {e}")))?;
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // Vanished under the lock (compaction/rewrite) → nothing to repair; re-scan.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(format!("re-read under lock: {e}"))),
+    };
+    // A concurrent append completed the tail (now newline-terminated) → no-op.
+    if content.is_empty() || content.ends_with('\n') {
+        return Ok(());
+    }
+    let cut = content.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let fragment = &content[cut..];
+    if fragment.trim().is_empty() {
+        return Ok(());
+    }
+    // The tail is now a valid whole record (a writer flushed it without a newline)
+    // → do NOT drop a real event; leave it for the re-scan to apply.
+    if parse_envelope_strict(fragment).is_ok() {
+        return Ok(());
+    }
+
+    // Quarantine the torn bytes (forensics — never silently destroy), then truncate.
+    quarantine_torn_tail(board, fragment);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|e| err(format!("open for truncate: {e}")))?;
+    f.set_len(cut as u64)
+        .map_err(|e| err(format!("truncate torn tail: {e}")))?;
+    f.sync_all()
+        .map_err(|e| err(format!("fsync after truncate: {e}")))?;
+    crate::store::fsync_parent_dir(&path);
+    invalidate_replay_cache();
+    tracing::warn!(
+        tag = "#2760-eof-fragment-repaired",
+        board = %board.display(),
+        bytes = fragment.len(),
+        "router repaired a live task_events torn tail (truncated to last newline; quarantined)"
+    );
+    Ok(())
+}
+
+/// Quarantine a torn tail under `task_events.recovery/<ts>/` (mirrors
+/// [`recover_half_writes_at`]) before it is truncated out of the live log.
+fn quarantine_torn_tail(board: &Path, fragment: &str) {
+    use std::io::Write;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let recovery_dir = board.join("task_events.recovery").join(&ts);
+    let _ = std::fs::create_dir_all(&recovery_dir);
+    if let Ok(mut rf) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(recovery_dir.join(format!("{LOG_NAME}.jsonl")))
+    {
+        let _ = writeln!(rf, "{fragment}");
+        let _ = rf.sync_all();
+    }
 }
 
 /// Return all task event envelopes for a given `task_id` on a board, sorted

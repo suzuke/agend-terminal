@@ -1328,8 +1328,8 @@ fn test_task_auto_unblock_when_all_deps_done() {
 
 /// Raw (unprojected) persisted status via an event-log replay of the task's board.
 fn raw_status_d63(home: &std::path::Path, id: &str) -> crate::task_events::TaskStatus {
-    let board = super::board_router::board_for_task(home, id);
-    crate::task_events::replay_at(&board)
+    let routed = super::load_routed(home, id).expect("route task to its board");
+    crate::task_events::replay_at(routed.board().path())
         .expect("replay board")
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
@@ -2124,7 +2124,9 @@ fn cross_board_dep_detective_flags_but_does_not_release_in_progress_audit2_014()
     // already shows "blocked" for ANY InProgress task with an unsatisfied dep,
     // pre-existing behavior unrelated to this detective) must be untouched:
     // no event was emitted for A.
-    let board_a = super::board_router::board_for_task(&home, &a);
+    let board_a = super::board_router::route_task(&home, &a)
+        .expect("route A's board")
+        .1;
     let persisted = crate::task_events::replay_at(&board_a)
         .expect("replay A's board")
         .tasks
@@ -2193,7 +2195,9 @@ fn cross_board_dep_detective_release_toctou_skips_when_task_advances_audit2_014(
         "must not release a task that advanced to InProgress mid-scan: {report:?}"
     );
 
-    let board_a = super::board_router::board_for_task(&home, &a);
+    let board_a = super::board_router::route_task(&home, &a)
+        .expect("route A's board")
+        .1;
     let persisted = crate::task_events::replay_at(&board_a)
         .expect("replay A's board")
         .tasks
@@ -2298,7 +2302,9 @@ fn cross_board_dep_derived_block_is_in_memory_not_persisted_2117_q2() {
 
     // But the canonical event log persisted NO Blocked transition for A: a raw
     // replay of A's own board still yields Open.
-    let board_a = super::board_router::board_for_task(&home, &a);
+    let board_a = super::board_router::route_task(&home, &a)
+        .expect("route A's board")
+        .1;
     let persisted = crate::task_events::replay_at(&board_a)
         .expect("replay A's board")
         .tasks
@@ -4297,6 +4303,74 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     assert!(
         log.contains("post-#806 sweep test fixture"),
         "event-log.jsonl must carry the audit_reason"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2760 (default-board BUG fix): a sweep `apply` over ids on DIFFERENT boards must
+/// land each `Cancelled` on ITS OWN board. Pre-#2760 `emit_cancelled_batch` wrote
+/// every Cancelled to the DEFAULT board (`append_batch_checked(home, …)`), so a
+/// project-board task's cancel landed where its own board's replay never saw it —
+/// it stayed live. GREEN routes each id to its authoritative board.
+#[test]
+fn sweep_apply_routes_each_cancel_to_its_own_board_2760() {
+    let home = tmp_home("sweep_multiboard_2760");
+    write_fleet_yaml(&home, &["alive"]);
+    // One task on the DEFAULT board, one on a PROJECT board (explicit `project`).
+    let def_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"def task","assignee":"alive"}),
+    )["id"]
+        .as_str()
+        .expect("def id")
+        .to_string();
+    let proj_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"proj task","assignee":"alive","project":"proj-sw"}),
+    )["id"]
+        .as_str()
+        .expect("proj id")
+        .to_string();
+
+    let confirm: std::collections::HashSet<String> =
+        [def_id.clone(), proj_id.clone()].into_iter().collect();
+    // Empty categories → both ids classify as validation_leftovers; the emit still
+    // cancels each id on its own routed board.
+    let cats = sweep::Categories::default();
+    let count = sweep::emit_cancelled_batch(&home, &cats, &confirm, "multi-board sweep 2760")
+        .expect("emit_cancelled_batch");
+    assert_eq!(count, 2, "both ids cancelled");
+
+    // The project task's Cancelled landed on the PROJECT board, not the default.
+    let proj_rec = crate::task_events::replay_at(&crate::task_events::board_root(&home, "proj-sw"))
+        .expect("replay proj board")
+        .tasks
+        .get(&crate::task_events::TaskId(proj_id.clone()))
+        .cloned()
+        .expect("project task must exist on its own board");
+    assert_eq!(
+        proj_rec.status,
+        crate::task_events::TaskStatus::Cancelled,
+        "project-board task cancelled on ITS board (not the default)"
+    );
+    let default_state =
+        crate::task_events::replay_at(&crate::task_events::board_root(&home, "default")).unwrap();
+    assert!(
+        !default_state
+            .tasks
+            .contains_key(&crate::task_events::TaskId(proj_id.clone())),
+        "the project task's cancel must NOT be written to the default board (#2760 BUG fix)"
+    );
+    // The default task's Cancelled landed on the default board.
+    assert_eq!(
+        default_state
+            .tasks
+            .get(&crate::task_events::TaskId(def_id.clone()))
+            .map(|r| r.status),
+        Some(crate::task_events::TaskStatus::Cancelled),
+        "default-board task cancelled on the default board"
     );
     std::fs::remove_dir_all(&home).ok();
 }

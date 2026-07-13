@@ -280,17 +280,55 @@ fn maybe_auto_bind_lease(
     let resolved_review_class = if task_id_val.is_empty() {
         resolve_dispatch_review_class(arg_review_class, second_reviewer)
     } else {
-        let task_review_class = crate::tasks::load_by_id(home, task_id_val).and_then(|t| {
-            t.metadata
-                .get("review_class")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        });
-        resolve_existing_task_review_class(
-            task_review_class.as_deref(),
-            arg_review_class,
-            second_reviewer,
-        )
+        // #2760: read the durable review_class via the STRICT router. The
+        // default-only `load_by_id` seam could not see a per-project-board task's
+        // metadata (t-…-35: a project-board `review_class=single` dispatched as
+        // `review_class_unspecified`).
+        match crate::tasks::load_routed(home, task_id_val) {
+            Ok(rt) => {
+                let task_review_class = rt
+                    .task
+                    .metadata
+                    .get("review_class")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                resolve_existing_task_review_class(
+                    task_review_class.as_deref(),
+                    arg_review_class,
+                    second_reviewer,
+                )
+            }
+            // A task that exists on NO board resolves its review_class as ABSENT —
+            // byte-identical to the removed default-only `load_by_id` seam (a task
+            // not found there yielded `None`). The existing-task resolver then
+            // rejects it as `review_class_unspecified` (unchanged #2745 contract).
+            Err(crate::tasks::TaskRouteError::NotFound) => {
+                resolve_existing_task_review_class(None, arg_review_class, second_reviewer)
+            }
+            // #2760 NEW fail-closed: the task EXISTS but its authoritative board
+            // cannot be uniquely proven (duplicate id across boards / unreadable
+            // board) — REJECT the merge-authority dispatch atomically BEFORE any
+            // bind/watch/create/send rather than guess a board.
+            Err(route_err) => {
+                tracing::error!(
+                    %target, %branch, task_id = %task_id_val, %route_err,
+                    "#2760 merge-authority dispatch REJECTED — task route ambiguous/unreadable \
+                     (no bind / watch / create / send)"
+                );
+                return Err(json!({
+                    "ok": false,
+                    "error": format!(
+                        "review_class preflight could not resolve task '{task_id_val}': {route_err}"
+                    ),
+                    "code": "review_class_route_unresolved",
+                    "remediation": "the task id must resolve to exactly one project board \
+                        (a duplicate id across boards or an unreadable board fails closed) — \
+                        resolve the ambiguity, then re-dispatch",
+                    "branch": branch,
+                    "task_id": task_id_val,
+                }));
+            }
+        }
     };
     let armed_review_class = match resolved_review_class {
         Ok(class) => class.as_token(),
@@ -560,3 +598,124 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
 
 #[cfg(test)]
 mod tests;
+
+/// #2760 Slice A — strict-RESOLUTION unit test (NOT a production dispatch-entry
+/// proof; Slice B owns the true `handle_delegate_task`/`send` production entry and
+/// its ordering/atomicity).
+///
+/// Motivating bug (t-…-35): a project-board task with `review_class=single` was
+/// dispatched as `review_class_unspecified` because the merge-authority preflight
+/// read the task's durable `review_class` via the default-only `load_by_id` seam,
+/// invisible to per-project boards.
+///
+/// This exercises the STRICT router (`crate::tasks::load_routed`) reading a
+/// project-board task's `review_class` metadata — the task created through the real
+/// `tasks::handle` create path on a non-default board — and feeds it to the pure
+/// `resolve_existing_task_review_class` classifier, proving the strict route
+/// surfaces `single` where the default-only read surfaced absent. It does NOT drive
+/// the production dispatch preflight or its bind/deliver ordering (Slice B).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod routing_red_2760 {
+    use super::{resolve_existing_task_review_class, ReviewClass};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "agend-comms-routing-red-2760-{}-{}-{tag}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// The task's durable `review_class`, read the way the merge-authority
+    /// preflight reads it — but via the STRICT router instead of the default-only
+    /// `load_by_id`.
+    fn preflight_review_class(home: &std::path::Path, task_id: &str) -> Option<String> {
+        crate::tasks::load_routed(home, task_id)
+            .ok()
+            .and_then(|rt| {
+                rt.task
+                    .metadata
+                    .get("review_class")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+    }
+
+    #[test]
+    fn load_routed_resolves_project_board_review_class_single_2760() {
+        let home = tmp_home("single");
+        // Create the task through the REAL create handler, routed to a NON-DEFAULT
+        // project board, carrying the durable `review_class=single` authority.
+        let created = crate::tasks::handle(
+            &home,
+            "orchestrator",
+            &json!({
+                "action": "create",
+                "title": "impl the feature",
+                "project": "proj-2760",
+                "review_class": "single",
+            }),
+        );
+        let task_id = created["id"]
+            .as_str()
+            .expect("create returns an id")
+            .to_string();
+
+        let class = preflight_review_class(&home, &task_id);
+        let resolved = resolve_existing_task_review_class(class.as_deref(), None, false);
+        assert_eq!(
+            resolved,
+            Ok(ReviewClass::Single),
+            "t-…-35: a project-board task with review_class=single must route strictly \
+             and the merge-authority preflight must resolve Single — pre-fix the \
+             default-only load_by_id seam returned review_class_unspecified"
+        );
+    }
+
+    /// #2760: the live t-…93 false-negative reproduction (codex 2026-07-13 16:01Z):
+    /// an EXISTING project-board task with durable `review_class=dual`, dispatched
+    /// with `review_class=dual` (+ `second_reviewer=true`), was refused as
+    /// `review_class_unspecified` because the merge-authority preflight read the
+    /// durable class via the default-only seam (invisible to the project board).
+    /// The strict router surfaces `dual`, so the preflight resolves `Dual` (a
+    /// supplied matching `dual` + second_reviewer are consistency-only, never a
+    /// mismatch). Mirrors the `single` unit for the two-reviewer authority.
+    #[test]
+    fn load_routed_resolves_project_board_review_class_dual_2760() {
+        let home = tmp_home("dual");
+        let created = crate::tasks::handle(
+            &home,
+            "orchestrator",
+            &json!({
+                "action": "create",
+                "title": "impl the feature",
+                "project": "Hack_agend-terminal",
+                "review_class": "dual",
+            }),
+        );
+        let task_id = created["id"]
+            .as_str()
+            .expect("create returns an id")
+            .to_string();
+
+        let class = preflight_review_class(&home, &task_id);
+        // The dispatch supplied review_class="dual" and second_reviewer=true — both
+        // are consistency-evidence against the durable class, not a mismatch.
+        let resolved = resolve_existing_task_review_class(class.as_deref(), Some("dual"), true);
+        assert_eq!(
+            resolved,
+            Ok(ReviewClass::Dual),
+            "t-…93: a project-board task with review_class=dual must route strictly and \
+             the merge-authority preflight must resolve Dual — pre-fix the default-only \
+             seam returned review_class_unspecified despite the durable dual authority"
+        );
+    }
+}

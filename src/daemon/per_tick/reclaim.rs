@@ -283,16 +283,27 @@ fn do_reclaim(
     // board → every owned task passes → byte-identical today.
     let mut agent_tasks: Vec<crate::task_events::TaskId> = Vec::new();
     for tid in owned {
-        let board_project = crate::tasks::resolve_task_project(home, &tid.0);
-        if crate::tasks::can_mutate_on_board(home, agent, &board_project) {
-            agent_tasks.push(tid);
-        } else {
-            tracing::warn!(
-                agent,
-                task = %tid.0,
-                board = %board_project,
-                "#2127 reclaim cross-board skip (fail-closed): agent not authorized on task's board"
-            );
+        // #2760: strict route + per-board ACL through the narrow tasks op (the raw
+        // board identity stays tasks-private). Ok(true) → authorized; Ok(false) →
+        // cross-board, skip; Err(route) → fail-closed skip (never reclaim a task
+        // whose authoritative board cannot be uniquely proven).
+        match crate::tasks::caller_can_mutate_task(home, agent, &tid.0) {
+            Ok(true) => agent_tasks.push(tid),
+            Ok(false) => {
+                tracing::warn!(
+                    agent,
+                    task = %tid.0,
+                    "#2127 reclaim cross-board skip (fail-closed): agent not authorized on task's board"
+                );
+            }
+            Err(route_err) => {
+                tracing::warn!(
+                    agent,
+                    task = %tid.0,
+                    %route_err,
+                    "#2760 reclaim skip (fail-closed): task route unresolved"
+                );
+            }
         }
     }
     if agent_tasks.is_empty() {
@@ -322,16 +333,17 @@ fn do_reclaim(
         },
     );
 
-    let emitter = crate::task_events::InstanceName::from("system:reclaim_usage_limit");
     let mins = remaining.as_secs() / 60;
     let mut reclaimed = 0usize;
     for tid in &to_reclaim {
-        let event = crate::task_events::TaskEvent::Released {
-            task_id: tid.clone(),
-            reason: format!("reclaimed: {agent} usage_limit (~{mins}m window remaining)"),
-        };
-        match crate::task_events::append(home, &emitter, event) {
-            Ok(_) => {
+        // #2760 item 2 (BUG fix): emit `Released` on the task's AUTHORITATIVE board
+        // via the narrow `tasks` op (strict route + per-id lock + revalidation). The
+        // pre-#2760 body appended to the DEFAULT board unconditionally, so a
+        // project-board task's release landed where its own board never saw it (it
+        // stayed Claimed forever). Cascade only after a real commit.
+        let reason = format!("reclaimed: {agent} usage_limit (~{mins}m window remaining)");
+        match crate::tasks::release_reclaimed_task(home, &tid.0, reason) {
+            Ok(true) => {
                 // Cascade: clear the task's dispatch-idle pending + dispatch-tracking
                 // + ci-watch handoff so no stale nag follows the released task.
                 crate::daemon::dispatch_idle::reassign_pending_for_task(home, &tid.0, None);
@@ -339,6 +351,9 @@ fn do_reclaim(
                 let _ = crate::daemon::ci_watch::reassign_next_after_ci(home, &tid.0, None);
                 reclaimed += 1;
             }
+            // Route unresolved / no longer claimable → skip (retry next pass); never
+            // a wrong-board write.
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(error = %e, task = %tid.0, "reclaim: Released append failed; will retry next pass");
             }

@@ -2383,3 +2383,53 @@ fn sort_envelopes_reverse_and_interleaved() {
         vec![("a", 1), ("a", 2), ("a", 3), ("b", 1), ("c", 1), ("c", 2)]
     );
 }
+
+/// #2760 (codex ruling m-…-1154): `TaskId::parse_canonical` is the single typed
+/// authority for "is this string a real task id" — anchored full-string, accepting
+/// `t-<ts>-<seq>` (legacy 2-segment) and `t-<ts>-<pid>-<seq>` (3-segment), all
+/// segments NUMERIC. Rejects synthetic / query / partial correlations. Pins both
+/// grammar sides + the `FromStr` alias, so the suppression/authority gates
+/// (dispatch-idle, auto-close) that key off it cannot silently drift.
+#[test]
+fn task_id_parse_canonical_accepts_canonical_rejects_non_task() {
+    // Accept: 3-segment generated + 2-segment legacy.
+    for ok in [
+        "t-20260101000000000000-1-1",
+        "t-1942-1",
+        "t-0-0-0",
+        "t-2498-70517",
+    ] {
+        assert_eq!(
+            TaskId::parse_canonical(ok).map(|t| t.0),
+            Some(ok.to_string()),
+            "'{ok}' is a canonical task id and must parse"
+        );
+        assert!(ok.parse::<TaskId>().is_ok(), "FromStr must accept '{ok}'");
+    }
+    // Reject: synthetic / query / partial / non-numeric / substring / empty.
+    for bad in [
+        "t-fires",
+        "t-cancel",
+        "t-1942-ir",
+        "corr-query-7",
+        "real-id",
+        "t-",
+        "t-1",
+        "t-1-",
+        "",
+        " t-1-1",
+        "t-1-1 ",
+        "xt-1-1",
+        "t-1-1-2-3",
+    ] {
+        assert_eq!(
+            TaskId::parse_canonical(bad),
+            None,
+            "'{bad}' is NOT a canonical task id and must be rejected (non-task → gates fail-open)"
+        );
+        assert!(
+            bad.parse::<TaskId>().is_err(),
+            "FromStr must reject '{bad}'"
+        );
+    }
+}

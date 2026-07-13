@@ -1641,18 +1641,25 @@ pub fn obligation_reason(home: &Path, msg: &InboxMessage) -> Option<String> {
         Some("task") => {
             let tid = msg.task_id.as_deref().or(msg.correlation_id.as_deref());
             match tid {
-                Some(id) => match crate::tasks::load_by_id(home, id) {
-                    Some(t)
+                // #2760: strict route. KEEP the obligation unless the board PROVES
+                // the task terminal (Done/Cancelled). Any route error
+                // (NotFound/Unreadable/Ambiguous) is uncertainty → KEEP (failure
+                // mode = noise, never hidden work), matching this fn's contract.
+                Some(id) => match crate::tasks::load_routed(home, id) {
+                    Ok(rt)
                         if matches!(
-                            t.status,
+                            rt.task.status,
                             crate::task_events::TaskStatus::Done
                                 | crate::task_events::TaskStatus::Cancelled
                         ) =>
                     {
                         None
                     }
-                    Some(t) => Some(format!("task {id} not terminal (status={})", t.status)),
-                    None => Some(format!("task {id} not on board — kept")),
+                    Ok(rt) => Some(format!(
+                        "task {id} not terminal (status={})",
+                        rt.task.status
+                    )),
+                    Err(e) => Some(format!("task {id} route unresolved ({e}) — kept")),
                 },
                 None => Some("task without id — kept".to_string()),
             }

@@ -1086,7 +1086,8 @@ fn existing_tagged_task_contradictory_send_rejects_2745() {
     );
     let tid = created["id"].as_str().expect("task id").to_string();
     assert_eq!(
-        crate::tasks::load_by_id(&home, &tid).and_then(|t| t
+        crate::tasks::load_routed(&home, &tid).ok().and_then(|rt| rt
+            .task
             .metadata
             .get("review_class")
             .and_then(|v| v.as_str())

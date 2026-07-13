@@ -481,21 +481,38 @@ fn target_in_fleet(home: &Path, agent: &str) -> bool {
 
 /// #1018 (A): is `task_id` still live on the task board? Returns
 /// `Some(true)` for live (one of `LIVE_TASK_STATUSES`); `Some(false)`
-/// for a definitively closed task (`done`, `cancelled`, etc.);
-/// `None` when the task can't be found at all (treat as live —
-/// fail-open).
+/// for a definitively closed OR definitively-absent task (the caller
+/// skips the nudge / treats it dead); `None` when the route is UNPROVABLE
+/// (treat as live — fail-open, keep nudging).
 fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
     if task_id.is_empty() {
         return None;
     }
+    // #2760 (codex ruling m-…-1154): apply task-liveness ONLY when the correlation
+    // PARSES as a canonical task id (typed `TaskId::parse_canonical`, not a raw
+    // string convention). A non-task / query correlation (a synthetic dispatch id,
+    // a message correlation) was NEVER a board task, so a strict route always
+    // returns NotFound — the old NotFound→Some(false) orphan-dead policy would
+    // WRONGLY suppress its idle nag (the app-e2e / query-dispatch regression). A
+    // non-task correlation fails OPEN → keep nudging. The `?` bails to `None`
+    // (fail-open) when the correlation is not a canonical task id.
+    crate::task_events::TaskId::parse_canonical(task_id)?;
     // #1608b/#1614: event-sourced lookup, NOT a `tasks/{id}.json` probe — that
-    // file is never written, so the old read always failed → this check was dead
-    // (always `None`) and the #1018 "skip the nudge for a closed task" branch was
-    // unreachable. `load_by_id` returns `None` on absent OR a transient replay
-    // error → fail-open (treat as live), the existing safe semantics.
-    let task = crate::tasks::load_by_id(home, task_id)?;
-    let status = task.status.to_string();
-    Some(LIVE_TASK_STATUSES.contains(&status.as_str()))
+    // file is never written, so the old read always failed → this check was dead.
+    // #2760 R1 (explicit dispatch-idle policy) — for a CANONICAL task id only:
+    //   Found                → real liveness (terminal status → Some(false) dead);
+    //   NotFound             → Some(false): a DEFINITIVELY-absent task is orphan-dead
+    //                          (the deliberate policy the frozen plan permits);
+    //   Unreadable/Ambiguous → None: the route is UNPROVABLE → fail-open → treat as
+    //                          live (keep nudging), never orphan an unprovable task.
+    match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => {
+            let status = routed.task.status.to_string();
+            Some(LIVE_TASK_STATUSES.contains(&status.as_str()))
+        }
+        Err(crate::tasks::TaskRouteError::NotFound) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// #1018 (B) eager cleanup: when a task transitions to a terminal
@@ -1554,6 +1571,11 @@ mod tests {
     // the `tests/` subdir a mod-in-inline-module `#[path]` resolves against.
     #[path = "dispatch_idle_quota_78445_tests.rs"]
     mod quota_78445_tests;
+
+    // #2760 REDs (non-task fail-open / canonical-orphan suppress) — same LOC-exempt
+    // split pattern as the quota tests above.
+    #[path = "dispatch_idle_reds_2760_tests.rs"]
+    mod reds_2760_tests;
 
     /// #1636: the `DispatchStatus` enum MUST serialize to / deserialize from the
     /// exact lowercase wire strings the prior stringly-typed field used, so

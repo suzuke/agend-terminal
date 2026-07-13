@@ -371,16 +371,6 @@ impl<'a> FsEffects<'a> {
         })
     }
 
-    fn task_matches_key(
-        record: &crate::task_events::TaskRecord,
-        key: &EpisodeKey,
-        statuses: &[crate::task_events::TaskStatus],
-    ) -> bool {
-        record.owner.as_ref().map(|owner| owner.as_str()) == Some(key.source.as_str())
-            && record.branch.as_deref() == Some(key.branch.as_str())
-            && statuses.contains(&record.status)
-    }
-
     fn current_binding_matches(&self, key: &EpisodeKey) -> bool {
         read_current_binding(self.home, self.source).is_some_and(|binding| {
             binding.get("task_id").and_then(|v| v.as_str()) == Some(key.task_id.as_str())
@@ -407,19 +397,12 @@ impl ControlEffects for FsEffects<'_> {
         if !self.current_binding_matches(key) {
             anyhow::bail!("binding generation changed before UsageLimit block");
         }
-        let board = crate::tasks::board_for_task(self.home, &key.task_id);
-        let task_id = crate::task_events::TaskId(key.task_id.clone());
+        // #2760 item 4: the strict route, per-id lock, write-time revalidation and
+        // the board append all happen INSIDE the narrow `tasks` op — the supervisor
+        // no longer touches a raw board path or a generic append. It supplies only
+        // the identity guard + the fully-built block-reason payload (which embeds
+        // the episode id, so the op's idempotency check can recognise it).
         let notification_id = key.notification_id();
-        let state = crate::task_events::replay_at(&board)?;
-        if state.tasks.get(&task_id).is_some_and(|record| {
-            record.status == crate::task_events::TaskStatus::Blocked
-                && record
-                    .block_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(&notification_id))
-        }) {
-            return Ok(());
-        }
         let episode = self.episode.as_ref().cloned();
         let reason = serde_json::json!({
             "type": "usage_limit_episode",
@@ -436,84 +419,46 @@ impl ControlEffects for FsEffects<'_> {
             }
         })
         .to_string();
-        let key_for_check = key.clone();
-        let checked = crate::task_events::append_batch_checked_at(
-            &board,
-            &crate::task_events::InstanceName("system:usage-limit".into()),
-            vec![crate::task_events::TaskEvent::Blocked {
-                task_id: task_id.clone(),
-                reason,
-            }],
-            move |fresh| {
-                let record = fresh
-                    .tasks
-                    .get(&task_id)
-                    .ok_or_else(|| "task disappeared before UsageLimit block".to_string())?;
-                Self::task_matches_key(
-                    record,
-                    &key_for_check,
-                    &[
-                        crate::task_events::TaskStatus::Claimed,
-                        crate::task_events::TaskStatus::InProgress,
-                    ],
-                )
-                .then_some(())
-                .ok_or_else(|| "task generation changed before UsageLimit block".to_string())
-            },
-        )?;
-        checked.map(|_| ()).map_err(anyhow::Error::msg)
+        let guard = crate::tasks::UsageLimitGuard {
+            task_id: key.task_id.clone(),
+            source: key.source.clone(),
+            branch: key.branch.clone(),
+            episode_id: notification_id,
+        };
+        match crate::tasks::apply_usage_limit_block(self.home, &guard, reason)? {
+            crate::tasks::ApplyOutcome::Applied | crate::tasks::ApplyOutcome::AlreadyApplied => {
+                Ok(())
+            }
+            // Route/generation changed → no event; surface as an error so the
+            // control loop retries (matches the pre-#2760 generation-change bail).
+            crate::tasks::ApplyOutcome::Stale => {
+                anyhow::bail!("task generation changed before UsageLimit block")
+            }
+        }
     }
 
     fn recover_task_atomically(&mut self, key: &EpisodeKey) -> anyhow::Result<bool> {
         if !self.current_binding_matches(key) {
             return Ok(false);
         }
-        let board = crate::tasks::board_for_task(self.home, &key.task_id);
-        let task_id = crate::task_events::TaskId(key.task_id.clone());
-        let owner = crate::task_events::InstanceName(key.source.clone());
-        let state = crate::task_events::replay_at(&board)?;
-        if state.tasks.get(&task_id).is_some_and(|record| {
-            Self::task_matches_key(record, key, &[crate::task_events::TaskStatus::InProgress])
-        }) {
-            // Crash window: the atomic Unblocked+InProgress append committed but
-            // persisting EpisodeState::Recovered did not. Treat the exact
-            // original generation as an idempotent completed recovery.
-            return Ok(true);
+        // #2760 item 4: strict route + per-id lock + revalidation + the atomic
+        // Unblocked+InProgress append all happen INSIDE the narrow `tasks` op. It
+        // folds the crash-window idempotency (already InProgress for this
+        // owner+branch → AlreadyApplied) and the commit-time generation guard. A
+        // route/generation change → Stale → not recovered this pass (no events),
+        // and the control loop re-attempts.
+        let guard = crate::tasks::UsageLimitGuard {
+            task_id: key.task_id.clone(),
+            source: key.source.clone(),
+            branch: key.branch.clone(),
+            episode_id: key.notification_id(),
+        };
+        match crate::tasks::recover_usage_limit_block(self.home, &guard)? {
+            crate::tasks::ApplyOutcome::Applied | crate::tasks::ApplyOutcome::AlreadyApplied => {
+                Ok(true)
+            }
+            crate::tasks::ApplyOutcome::Stale => Ok(false),
         }
-        let key_for_check = key.clone();
-        let notification_id = key.notification_id();
-        let checked = crate::task_events::append_batch_checked_at(
-            &board,
-            &crate::task_events::InstanceName("system:usage-limit".into()),
-            vec![
-                crate::task_events::TaskEvent::Unblocked {
-                    task_id: task_id.clone(),
-                },
-                crate::task_events::TaskEvent::InProgress {
-                    task_id: task_id.clone(),
-                    by: owner,
-                },
-            ],
-            move |fresh| {
-                let record = fresh
-                    .tasks
-                    .get(&task_id)
-                    .ok_or_else(|| "task disappeared before UsageLimit recovery".to_string())?;
-                if !Self::task_matches_key(
-                    record,
-                    &key_for_check,
-                    &[crate::task_events::TaskStatus::Blocked],
-                ) || !record
-                    .block_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(&notification_id))
-                {
-                    return Err("task generation changed before UsageLimit recovery".into());
-                }
-                Ok(())
-            },
-        )?;
-        Ok(checked.is_ok())
     }
 
     fn notify_once(
@@ -560,10 +505,13 @@ impl ControlEffects for FsEffects<'_> {
     }
 }
 
-fn correlation_from_disk(home: &Path, source: &str) -> Option<Correlation> {
+fn correlation_from_disk(home: &Path, source: &str) -> Option<(Correlation, crate::tasks::Task)> {
     let binding = read_current_binding(home, source)?;
     let task_id = binding.get("task_id")?.as_str()?.to_string();
-    let task = crate::tasks::load_by_id(home, &task_id)?;
+    // #2760: resolve via the STRICT route (any route error → None: no correlation
+    // is built on a task whose board cannot be uniquely proven). The resolved Task
+    // is RETURNED so `episode_start` reuses this SINGLE route (no double load).
+    let task = crate::tasks::load_routed(home, &task_id).ok()?.task;
     let task_status = match task.status {
         crate::task_events::TaskStatus::Claimed => "claimed",
         crate::task_events::TaskStatus::InProgress => "in_progress",
@@ -571,16 +519,17 @@ fn correlation_from_disk(home: &Path, source: &str) -> Option<Correlation> {
         _ => "other",
     }
     .to_string();
-    Some(Correlation {
+    let correlation = Correlation {
         task_id,
         source: source.to_string(),
-        owner: task.assignee.unwrap_or_default(),
+        owner: task.assignee.clone().unwrap_or_default(),
         task_status,
-        task_branch: task.branch.unwrap_or_default(),
+        task_branch: task.branch.clone().unwrap_or_default(),
         binding_task_id: binding.get("task_id")?.as_str()?.to_string(),
         binding_branch: binding.get("branch")?.as_str()?.to_string(),
         binding_issued_at: binding.get("issued_at")?.as_str()?.to_string(),
-    })
+    };
+    Some((correlation, task))
 }
 
 fn fleet_facts(
@@ -745,10 +694,12 @@ pub(crate) fn observe_supervisor_tick(
     }
 
     let _binding_guard = acquire_binding_lock(home, source)?;
-    let correlation = correlation_from_disk(home, source);
-    let task = correlation
-        .as_ref()
-        .and_then(|correlation| crate::tasks::load_by_id(home, &correlation.task_id));
+    // #2760: `correlation_from_disk` resolves the task ONCE and returns it, so the
+    // fleet-facts lookup reuses that snapshot instead of a second `load_by_id`.
+    let (correlation, task) = match correlation_from_disk(home, source) {
+        Some((correlation, task)) => (Some(correlation), Some(task)),
+        None => (None, None),
+    };
     let (source_team, source_role, candidates, recipient) =
         fleet_facts(home, registry, source, task.as_ref());
     let now = Utc::now();
@@ -1393,7 +1344,7 @@ teams:
             source_team: Some("archfix".into()),
             source_role: Some("dev".into()),
             unlock_at: Some(now() + Duration::seconds(29 * 60 + 59)),
-            correlation: super::correlation_from_disk(&home, "worker-a"),
+            correlation: super::correlation_from_disk(&home, "worker-a").map(|(c, _)| c),
             candidates: Vec::new(),
             recipient: "lead".into(),
         };
@@ -1577,7 +1528,7 @@ teams:
             source_team: Some("archfix".into()),
             source_role: Some("dev".into()),
             unlock_at: Some(now() + Duration::seconds(29 * 60 + 59)),
-            correlation: super::correlation_from_disk(&home, "worker-a"),
+            correlation: super::correlation_from_disk(&home, "worker-a").map(|(c, _)| c),
             candidates: Vec::new(),
             recipient: "lead".into(),
         };

@@ -159,9 +159,13 @@ pub(super) fn dispatch_review_assignment_via_store(
     // PrState's class, never this) — resolve it from the task's DURABLE metadata (the
     // same authority `maybe_auto_bind_lease` already validated and armed); an untagged
     // task degrades to `Unresolved` (harmless: metadata-only).
-    let review_class = crate::tasks::load_by_id(home, task_id)
-        .and_then(|t| {
-            t.metadata
+    // #2760: read via the STRICT router (project-board aware). A route error degrades
+    // to `Unresolved` — harmless here (metadata-only), matching the untagged case.
+    let review_class = crate::tasks::load_routed(home, task_id)
+        .ok()
+        .and_then(|rt| {
+            rt.task
+                .metadata
                 .get("review_class")
                 .and_then(|v| v.as_str())
                 .map(|s| ReviewClass::parse_fail_closed(Some(s)))
