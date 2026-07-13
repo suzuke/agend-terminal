@@ -168,6 +168,29 @@ mod tests {
         pr_state::save(home, &s).unwrap();
     }
 
+    /// Simulate the reviewer having READ the inbox row carrying `nonce` (set
+    /// `read_at`), making it NON-actionable. Post-B2, `repair_row` only re-nudges a
+    /// NON-actionable row — so tests that exercise the FIXED-interval repair must
+    /// first mark the current delivery read (a healthy unread row is intentionally
+    /// left alone).
+    fn mark_row_read(home: &Path, target: &str, nonce: &str, ts: &str) {
+        let path = crate::inbox::storage::inbox_path_resolved(home, target);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut out = String::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut msg: crate::inbox::InboxMessage = serde_json::from_str(line).unwrap();
+            if msg.delivery_nonce.as_deref() == Some(nonce) {
+                msg.read_at = Some(ts.to_string());
+            }
+            out.push_str(&serde_json::to_string(&msg).unwrap());
+            out.push('\n');
+        }
+        std::fs::write(&path, out).unwrap();
+    }
+
     fn reserved_targets(home: &Path, repo: &str, branch: &str) -> Vec<String> {
         pr_state::load(home, repo, branch)
             .map(|s| {
@@ -190,13 +213,18 @@ mod tests {
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
         let n0 = rec.delivery_nonce.clone();
+        // B2: repair only re-nudges a NON-actionable row. Mark the delivered row READ
+        // so the reviewer has SEEN it but not acted — the state the FIXED-interval
+        // re-nudge is for. (A still-unread row is intentionally left alone — see
+        // b2_first_tick_does_not_rotate_healthy_unread_row.)
+        mark_row_read(&home, "reviewer", &n0, "2026-07-13T00:00:00Z");
 
         // Tick 1 @ +1s (lease due at created_at): repair fires ⇒ wake + nonce rotates.
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:01Z");
         assert_eq!(
             wakes,
             vec!["reviewer".to_string()],
-            "lease-due Unengaged ⇒ wake"
+            "lease-due Unengaged (row read) ⇒ wake"
         );
         let n1 = store::get(&home, "o/r", "feat/x", "reviewer")
             .unwrap()
@@ -216,6 +244,10 @@ mod tests {
             n1,
             "throttled tick did not rotate"
         );
+
+        // The tick-1 repair enqueued a FRESH actionable row (nonce n1). Mark it read
+        // too, so the next-interval re-nudge has a NON-actionable row to act on.
+        mark_row_read(&home, "reviewer", &n1, "2026-07-13T00:00:30Z");
 
         // "Restart" = fresh core call; the lease is on-disk. @ +90s (next interval):
         // repair fires again ⇒ ≤1 repair per FIXED_INTERVAL, bound survived restart.
@@ -539,6 +571,9 @@ mod tests {
         let n0 = store::get(&home, "o/r", "feat/x", "reviewer")
             .unwrap()
             .delivery_nonce;
+        // B2: the re-nudge only rotates a NON-actionable row — mark the delivered row
+        // READ so the lease-due repair has a seen-but-unacted row to re-nudge.
+        mark_row_read(&home, "reviewer", &n0, "2020-01-01T00:00:00Z");
 
         let registry: crate::agent::AgentRegistry =
             std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));

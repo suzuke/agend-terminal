@@ -585,6 +585,21 @@ pub(crate) fn repair_row(
     if !now_ge(now, &record.next_nudge_at) {
         return Ok(false);
     }
+    // B2 (A4 = Unengaged ∧ NON-ACTIONABLE ∧ lease-due): a still-actionable (unread,
+    // un-superseded) current row is HEALTHY — the reviewer simply hasn't read it yet.
+    // Do NOT rotate/supersede a healthy delivery (that would be a spurious re-nudge
+    // and would orphan an unread row); just advance the lease under the CAS so the
+    // next check is a full interval away. ONLY a NON-actionable current row
+    // (read-and-ignored, or lost) proceeds to the append-only repair below.
+    if crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce) {
+        if let Ok(Some(mut cur)) = read_record(&path) {
+            if cur.assignment_id == record.assignment_id {
+                cur.next_nudge_at = add_interval(now);
+                atomic_write_json(&path, &cur)?;
+            }
+        }
+        return Ok(false);
+    }
     let old_nonce = record.delivery_nonce.clone();
     let new_nonce = uuid::Uuid::new_v4().to_string();
 
@@ -1484,6 +1499,9 @@ mod tests {
         persist(&home, &rec).unwrap();
         durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
         let n1 = rec.delivery_nonce.clone();
+        // B2: repair only re-nudges a NON-actionable row. Mark the delivered row READ
+        // (seen but not acted) — the state the FIXED-interval re-nudge exists for.
+        mark_row_read(&home, "reviewer", &n1, "2026-07-13T00:00:00Z");
 
         // Before next_nudge_at (== created_at) → NOT eligible.
         assert!(
@@ -1491,10 +1509,10 @@ mod tests {
             "repair before the lease is a no-op (bounded)"
         );
 
-        // At/after next_nudge_at → repairs once.
+        // At/after next_nudge_at, with the row seen (non-actionable) → repairs once.
         assert!(
             repair_row(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:01Z").unwrap(),
-            "repair fires once the lease is due"
+            "repair fires once the lease is due and the row is non-actionable"
         );
         let after = get(&home, "o/r", "feat/x", "reviewer").unwrap();
         let n2 = after.delivery_nonce.clone();
