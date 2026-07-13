@@ -217,6 +217,10 @@ pub(crate) fn record_path_for_test(home: &Path, repo: &str, branch: &str, target
 pub(crate) fn branch_lock_path_for_test(home: &Path, repo: &str, branch: &str) -> PathBuf {
     branch_lock_path(home, repo, branch)
 }
+#[cfg(test)]
+pub(crate) fn markers_path_for_test(home: &Path, repo: &str, branch: &str) -> PathBuf {
+    markers_file(home, repo, branch)
+}
 
 /// Map an arbitrary key part to a filename-safe, human-readable component. Lossy
 /// (collisions possible) — [`key_hash`] restores injectivity.

@@ -2438,6 +2438,75 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// t-…-17 B3 — the scanner must NOT `remove` the pr_state file when
+    /// `record_terminal` FAILED. The terminal marker is what A10a keys on; if the
+    /// marker was never durably written AND the pr_state (the retry source) is
+    /// deleted, the terminal is LOST — on the next scan CI recreates the file
+    /// NON-terminal, the terminal is never re-observed, and the merged PR's
+    /// assignment record RESURRECTS / re-reserves forever (re-opens B17). Fail closed:
+    /// a failed `record_terminal` must RETAIN the pr_state file as the retry source.
+    /// RED: the pr_state file is removed even though record_terminal returned Err.
+    #[test]
+    fn b3_terminal_record_failure_retains_pr_state_file() {
+        use crate::daemon::assignment_authority as store;
+        let home = std::env::temp_dir().join(format!(
+            "agend-b3-scan-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // An active reviewer-assignment record for the merged generation (55) — this
+        // also creates the branch dir so we can poison the markers path.
+        store::persist(
+            &home,
+            &store::ActiveAssignment::new_pending(
+                "o/r",
+                "b",
+                "reviewer",
+                55,
+                "lead",
+                "t-rev-1",
+                ReviewClass::Dual,
+                crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+                "review",
+                None,
+                None,
+                "2026-07-13T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        // POISON record_terminal deterministically: put a DIRECTORY where the markers
+        // file is read/written, so `record_terminal` fails closed (unreadable markers)
+        // — an unwritable markers seam, no production code change.
+        let mpath = store::markers_path_for_test(&home, "o/r", "b");
+        std::fs::create_dir_all(&mpath).unwrap();
+
+        // A pr_state ALREADY merged at generation 55 whose merge was already emitted
+        // (`ready_emitted_for_sha == head`), so the scan REPLAY-SUPPRESSES it and
+        // returns ScanAction::Remove — the arm that would delete the retry source.
+        let mut s = new_for_branch("o/r", "b", "abcdef0", ReviewClass::Single);
+        s.pr_number = 55;
+        s.merge_state = super::super::MergeState::Merged {
+            merge_commit: "abcdef0".into(),
+            merged_at: "2026-07-13T00:00:00Z".into(),
+        };
+        s.ready_emitted_for_sha = Some("abcdef0".into());
+        save(&home, &s).unwrap();
+
+        scan_and_emit_with(&home, &empty_registry(), &MockGhPoller::new(vec![]));
+
+        assert!(
+            super::super::load(&home, "o/r", "b").is_some(),
+            "record_terminal failed ⇒ the pr_state file MUST be retained as the retry \
+             source (fail closed); deleting it loses the terminal and resurrects the \
+             merged PR's assignment record"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// t-…-17 CRASH-SAFETY invariant: the durable terminal MARKER (`record_terminal`)
     /// MUST be written BEFORE the pr_state file is `remove`d. Otherwise a crash
     /// between the remove and the marker write loses BOTH — on restart CI recreates
