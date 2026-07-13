@@ -1,37 +1,23 @@
-//! #821 — isolated git subprocess invocation for test fixtures.
+//! #821 / task122 — isolated git subprocess invocation for test fixtures.
 //!
-//! Test fixtures that shell out to `git` MUST use this module instead
-//! of `std::process::Command::new("git")` directly. The helpers pin:
+//! Test fixtures that shell out to `git` MUST use this module instead of
+//! `std::process::Command::new("git")` directly. On an agent's PATH, `git`
+//! resolves to the `agend-git` SHIM, which (a) denies `git -c … <subcommand>`
+//! forms, (b) reroutes a `-C <tmp>` fixture into the agent's BOUND worktree, and
+//! (c) is inherited by CHILD git processes (`git submodule` → `git clone`). The
+//! prior `AGEND_GIT_BYPASS=1` reliance did not fully neutralize it.
 //!
-//! - `AGEND_GIT_BYPASS=1` — bypasses the `agend-git` shim's binding-
-//!   based routing. Without this, the shim sees the test process's
-//!   `AGEND_INSTANCE_NAME` (if set by `cargo test` env inheritance)
-//!   and routes git operations to the BOUND worktree's branch instead
-//!   of the test's temp dir. The #820 PR's mid-implementation
-//!   "feat-b polluted host worktree" incident traced back to a
-//!   manual bash debug session running without this env (NOT the
-//!   test fixture itself, but the trap class is real).
+//! task122 — **real-git provenance seam** (fixture-only). Resolve the REAL git
+//! binary (excluding the shim dir[s]), export a real-git-FIRST PATH to the entire
+//! spawned fixture process tree, and FAIL LOUD (panic, never SKIP) when only the
+//! shim resolves. The seam targets test-created temp repos only; it is NOT a
+//! production consumer and does NOT change shim policy or `AGEND_GIT_BYPASS`.
 //!
-//! - `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_*` —
-//!   subprocess `git commit` fails with `unable to auto-detect
-//!   email address` on CI runners that lack a global `~/.gitconfig`.
-//!   Per the #814 r1 lesson — local dev machines inherit the
-//!   developer's gitconfig and mask this trap.
+//! Author/committer env is pinned (CI runners lack a global `~/.gitconfig`), and
+//! `current_dir(repo_dir)` pins cwd so git's upward `.git` discovery can't leak
+//! into the host worktree.
 //!
-//! - `current_dir(repo_dir)` — git uses cwd for upward `.git`
-//!   discovery. Without the dir pin, git walks up from the test
-//!   process's cwd (the agend-terminal worktree) and finds the
-//!   host worktree's `.git`, leaking operations into the host.
-//!
-//! ## Pattern to AVOID (bad)
-//!
-//! ```rust,ignore
-//! std::process::Command::new("git")
-//!     .args(["checkout", "-b", "feat-b"])
-//!     .output()  // ← no cwd pin, no shim bypass, no committer env
-//! ```
-//!
-//! ## Pattern to USE (good)
+//! ## Pattern to USE
 //!
 //! ```rust,ignore
 //! use crate::common::git_isolated;
@@ -41,68 +27,192 @@
 //!
 //! ## Allowlist
 //!
-//! Pre-existing test files using raw `Command::new("git")` are
-//! grandfathered via the `tests/git_subprocess_invariant.rs` allowlist.
-//! New tests added after #821 ships MUST use this helper.
+//! Pre-existing test files using raw `Command::new("git")` are grandfathered via
+//! `tests/git_subprocess_invariant.rs`. New tests MUST use this helper.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
-/// Run git in `repo_dir` with cwd isolation + shim bypass + pinned
+/// Actionable message for a provenance failure — a fixture must run against REAL
+/// git, so we panic rather than silently proceed on the shim or SKIP.
+const PROVENANCE_HINT: &str = "a fixture must run against REAL git, but after excluding the \
+    agend-git shim dir(s) no real git resolved on PATH. Set AGEND_REAL_GIT to a real git binary \
+    or put one on PATH. This is a fail-loud provenance guard (task122) — never a SKIP.";
+
+/// Directories whose `git` is the agend-git shim (or its default install), to be
+/// EXCLUDED from real-git resolution: `$AGEND_HOME/bin` and `~/.agend-terminal/bin`.
+#[allow(dead_code)]
+pub fn shim_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(h) = std::env::var_os("AGEND_HOME") {
+        dirs.push(PathBuf::from(h).join("bin"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".agend-terminal").join("bin"));
+    }
+    dirs
+}
+
+/// True when `a` and `b` name the same directory. Prefers `canonicalize` (resolves
+/// symlink/slash form, case-folds on Windows); falls back to a lexical compare when
+/// a path doesn't exist on disk. Mirrors `agent/mod.rs::same_dir` (#1504).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => {
+            let norm = |p: &Path| {
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_end_matches('/')
+                    .to_string()
+            };
+            let (na, nb) = (norm(a), norm(b));
+            if cfg!(windows) {
+                na.eq_ignore_ascii_case(&nb)
+            } else {
+                na == nb
+            }
+        }
+    }
+}
+
+/// Resolve the REAL git binary by scanning `path`, EXCLUDING every entry in
+/// `shim_dirs`, then PROVE the candidate answers `git version`. Returns an
+/// actionable `Err` when nothing but the shim resolves — callers fail LOUD, never
+/// SKIP (task122 provenance contract). PURE w.r.t. process env (only the resolved
+/// binary is spawned for the probe), so REDs drive it with a simulated PATH + fake
+/// shim dir. `AGEND_REAL_GIT` honoring is layered on in [`cached_real`], NOT here,
+/// so the "only shim on PATH" case is deterministically testable.
+#[allow(dead_code)]
+pub fn resolve_real_git_in(path: &OsStr, shim_dirs: &[PathBuf]) -> Result<PathBuf, String> {
+    let search: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|p| !shim_dirs.iter().any(|s| same_dir(p, s)))
+        .collect();
+    // An empty search set must FAIL, not fall back to the ambient PATH (which
+    // `which_in` would do for an empty string) — else "only shim" resolves the shim.
+    if search.is_empty() {
+        return Err(format!("real-git provenance FAILED — {PROVENANCE_HINT}"));
+    }
+    let joined =
+        std::env::join_paths(&search).map_err(|e| format!("real-git PATH join failed: {e}"))?;
+    let cand = which::which_in("git", Some(&joined), ".")
+        .map_err(|_| format!("real-git provenance FAILED — {PROVENANCE_HINT}"))?;
+    if !probe_is_git(&cand) {
+        return Err(format!(
+            "real-git provenance FAILED — {} did not respond to `git version`. {PROVENANCE_HINT}",
+            cand.display()
+        ));
+    }
+    Ok(cand)
+}
+
+/// Prove a candidate binary is a working git (`git version` → `git version …`).
+fn probe_is_git(cand: &Path) -> bool {
+    Command::new(cand)
+        .arg("version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).starts_with("git version"))
+        .unwrap_or(false)
+}
+
+/// A PATH with the resolved real git's DIRECTORY first, so the whole spawned
+/// fixture process tree (incl. child `git submodule` → `git`) uses real git.
+#[allow(dead_code)]
+pub fn real_git_first_path_from(path: &OsStr, shim_dirs: &[PathBuf]) -> Result<OsString, String> {
+    let real = resolve_real_git_in(path, shim_dirs)?;
+    let dir = real
+        .parent()
+        .ok_or_else(|| format!("resolved real git has no parent dir: {}", real.display()))?;
+    let mut entries = vec![dir.to_path_buf()];
+    entries.extend(std::env::split_paths(path));
+    std::env::join_paths(entries).map_err(|e| format!("real-git PATH join failed: {e}"))
+}
+
+/// An explicitly-injected `AGEND_REAL_GIT` (existing production allowlist plumbing —
+/// agent/mod.rs), accepted only when it is a real git OUTSIDE the shim dir(s).
+fn explicit_real_git(shim_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var_os("AGEND_REAL_GIT")?);
+    let in_shim = p
+        .parent()
+        .is_some_and(|par| shim_dirs.iter().any(|s| same_dir(par, s)));
+    (p.is_file() && !in_shim && probe_is_git(&p)).then_some(p)
+}
+
+/// Process-cached (real git binary, real-git-first PATH). Resolved once: an
+/// explicit `AGEND_REAL_GIT` (if a real git outside the shim) else a shim-excluding
+/// PATH scan. Panics fail-loud on a provenance failure (never SKIP).
+fn cached_real() -> &'static (PathBuf, OsString) {
+    static CACHE: OnceLock<(PathBuf, OsString)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = shim_dirs();
+        let real = match explicit_real_git(&dirs) {
+            Some(p) => p,
+            None => {
+                resolve_real_git_in(&path, &dirs).unwrap_or_else(|e| panic!("git_isolated: {e}"))
+            }
+        };
+        let dir = real
+            .parent()
+            .unwrap_or_else(|| panic!("git_isolated: resolved real git has no parent dir"));
+        let mut entries = vec![dir.to_path_buf()];
+        entries.extend(std::env::split_paths(&path));
+        let first =
+            std::env::join_paths(entries).unwrap_or_else(|e| panic!("git_isolated: PATH join {e}"));
+        (real, first)
+    })
+}
+
+/// Base command: REAL git binary, real-git-first PATH (children inherit it), cwd
+/// pin, agent-session env scrubbed, pinned author/committer.
+fn base_cmd(repo_dir: &Path, args: &[&str]) -> Command {
+    let (real, real_path) = cached_real();
+    let mut c = Command::new(real);
+    c.args(args)
+        .current_dir(repo_dir)
+        .env_remove("AGEND_INSTANCE_NAME")
+        .env_remove("AGEND_REAL_GIT")
+        .env_remove("AGEND_GIT_BYPASS_AGENT")
+        .env_remove("AGEND_GIT_BYPASS_UNTIL")
+        .env("PATH", real_path)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example");
+    c
+}
+
+/// Run git in `repo_dir` against REAL git (shim excluded), cwd-isolated, pinned
 /// author/committer. The canonical entry for test fixtures.
 ///
 /// allow: raw-git-subprocess  // canonical helper module — exempt
 #[allow(dead_code)]
 pub fn git(repo_dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
-        .env_remove("AGEND_INSTANCE_NAME")
-        .env_remove("AGEND_REAL_GIT")
-        .env_remove("AGEND_GIT_BYPASS_AGENT")
-        .env_remove("AGEND_GIT_BYPASS_UNTIL")
-        .env("AGEND_GIT_BYPASS", "1")
-        .env("GIT_AUTHOR_NAME", "test")
-        .env("GIT_AUTHOR_EMAIL", "test@example")
-        .env("GIT_COMMITTER_NAME", "test")
-        .env("GIT_COMMITTER_EMAIL", "test@example")
+    base_cmd(repo_dir, args)
         .output()
         .expect("git subprocess spawn")
 }
 
-/// Variant accepting an explicit committer date for back-dating
-/// commits (used by stale-detection tests per #817 + #814 r1 lesson —
-/// `chrono::now() - duration` arithmetic is flaky near day boundaries,
-/// so date-sensitive tests pin both author and committer dates).
+/// Variant accepting an explicit committer date for back-dating commits (stale-
+/// detection tests per #817 — `chrono::now() - duration` is flaky near day
+/// boundaries, so date-sensitive tests pin both author and committer dates).
 ///
 /// allow: raw-git-subprocess  // canonical helper module — exempt
 #[allow(dead_code)]
 pub fn git_dated(repo_dir: &Path, args: &[&str], date_rfc3339: &str) -> Output {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
-        .env_remove("AGEND_INSTANCE_NAME")
-        .env_remove("AGEND_REAL_GIT")
-        .env_remove("AGEND_GIT_BYPASS_AGENT")
-        .env_remove("AGEND_GIT_BYPASS_UNTIL")
-        .env("AGEND_GIT_BYPASS", "1")
-        .env("GIT_AUTHOR_NAME", "test")
-        .env("GIT_AUTHOR_EMAIL", "test@example")
-        .env("GIT_COMMITTER_NAME", "test")
-        .env("GIT_COMMITTER_EMAIL", "test@example")
+    base_cmd(repo_dir, args)
         .env("GIT_AUTHOR_DATE", date_rfc3339)
         .env("GIT_COMMITTER_DATE", date_rfc3339)
         .output()
         .expect("git subprocess spawn")
 }
 
-/// Create a temp git repo with `main` branch + initial commit +
-/// pinned per-repo gitconfig. Returns the repo PathBuf. Standard
-/// entry point for fixtures that need a fresh git repo. The
-/// per-repo `user.name`/`user.email` config means CI runners
-/// without a global `~/.gitconfig` can still commit (per the #814
-/// r1 lesson — that PR's CI failed cross-platform with `unable to
-/// auto-detect email address`).
+/// Create a temp git repo with `main` branch + pinned per-repo gitconfig. Standard
+/// entry for fixtures needing a fresh git repo. The per-repo `user.name`/`.email`
+/// means CI runners without a global `~/.gitconfig` can still commit (#814 r1).
 #[allow(dead_code)]
 pub fn setup_temp_repo(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
