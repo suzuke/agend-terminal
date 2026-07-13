@@ -534,6 +534,19 @@ fn validate_review_assignment_marker(
             }))
         }
     }
+    // `review_author` is a MANDATORY audited principal on a review_assignment (codex
+    // ruling): the reviewer must be told WHOSE code they are auditing, and the
+    // self-review deny in step (d) is only meaningful when the author is known.
+    // Absent ⇒ fail closed HERE, before any repo/ACL/side-effect work — there is NO
+    // empty-principal sentinel anywhere.
+    if checks.review_author.is_none() {
+        return Err(json!({
+            "error": "review_assignment requires an explicit `review_author` — the \
+                      audited code-author principal (`{\"agent\": <name>}` for a fleet \
+                      author, or `{\"external\": <login>}` for an external one)",
+            "code": "review_assignment_missing_review_author",
+        }));
+    }
 
     // (b) fail-closed provider-neutral repo resolve (the ACL key).
     let repo_slug = dispatch_hook::resolve_review_assignment_repo(home, args, target)?;
@@ -627,15 +640,14 @@ fn dispatch_review_assignment_via_store(
                 .map(|s| ReviewClass::parse_fail_closed(Some(s)))
         })
         .unwrap_or(ReviewClass::Unresolved);
-    // `review_author` is OPTIONAL at dispatch (the gate only self-review-denies an
-    // Agent author); the store record carries a non-Option principal, so an absent
-    // author is stored as an empty `External` sentinel — display-only, never
-    // string-compared to the agent target (I7), and the merge gate keys on reserved
-    // PRESENCE, not authorship.
+    // `review_author` is MANDATORY on the marker path: the gate
+    // (`validate_review_assignment_marker`) fail-closes on an absent author BEFORE
+    // this A1 wiring runs, so it is guaranteed present here. NO sentinel principal is
+    // ever constructed — the store always records the real audited author.
     let review_author = checks
         .review_author
         .clone()
-        .unwrap_or(ReviewAuthor::External(String::new()));
+        .expect("marker gate enforces review_author present before store dispatch");
     let now = chrono::Utc::now().to_rfc3339();
     let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending(
         repo_slug,
@@ -983,7 +995,7 @@ mod review_assignment_marker_tests {
             &sender,
             "reviewer",
             &marker_args("owner/repo", 42),
-            &marker_checks(None, Some(42)),
+            &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42)),
         )
         .expect("sole-orchestrator dispatch must pass the marker gate");
         std::fs::remove_dir_all(&home).ok();
@@ -1003,7 +1015,7 @@ mod review_assignment_marker_tests {
             &sender,
             "reviewer",
             &marker_args("owner/repo", 42),
-            &marker_checks(None, Some(42)),
+            &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42)),
         )
         .expect_err("non-orchestrator must be denied");
         assert_eq!(err["code"], "review_assignment_not_authorized", "{err}");
@@ -1024,7 +1036,7 @@ mod review_assignment_marker_tests {
             &sender,
             "reviewer",
             &marker_args("other/repo", 42),
-            &marker_checks(None, Some(42)),
+            &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42)),
         )
         .expect_err("no team owning other/repo ⇒ reject");
         assert_eq!(err["code"], "review_assignment_no_team", "{err}");
@@ -1047,7 +1059,7 @@ mod review_assignment_marker_tests {
             &sender,
             "reviewer",
             &marker_args("owner/repo", 42),
-            &marker_checks(None, Some(42)),
+            &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42)),
         )
         .expect_err("two teams owning the same canonical repo ⇒ reject");
         assert_eq!(err["code"], "review_assignment_ambiguous_team", "{err}");
@@ -1111,7 +1123,7 @@ mod review_assignment_marker_tests {
         let lead = Sender::new("lead").unwrap();
         let lead2 = Sender::new("lead2").unwrap();
         let args = marker_args("owner/repo", 42);
-        let checks = marker_checks(None, Some(42));
+        let checks = marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42));
         // lead is orchestrator ⇒ allowed; lead2 is not ⇒ denied.
         validate_review_assignment_marker(&home, &lead, "reviewer", &args, &checks)
             .expect("current orchestrator allowed");
@@ -1148,7 +1160,7 @@ mod review_assignment_marker_tests {
             &sender,
             "reviewer",
             &marker_args("single", 42),
-            &marker_checks(None, Some(42)),
+            &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42)),
         )
         .expect_err("unresolvable repo must fail closed");
         assert_eq!(err["code"], "review_assignment_repo_unresolved", "{err}");
@@ -1230,6 +1242,81 @@ mod review_assignment_marker_tests {
             );
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+
+    /// codex ruling — `review_author` is a MANDATORY audited principal: a
+    /// review_assignment with a valid repo / ACL / task_id / branch / pr_number but
+    /// NO review_author is rejected by the gate BEFORE any repo/ACL work (fail closed,
+    /// no empty-principal sentinel).
+    #[test]
+    fn review_author_mandatory_gate_rejects_when_absent() {
+        let home = tmp_home("author-gate");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 42),
+            &marker_checks(None, Some(42)),
+        )
+        .expect_err("a review_assignment with no review_author must be rejected");
+        assert_eq!(
+            err["code"], "review_assignment_missing_review_author",
+            "{err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// codex ruling — real entry: a marker dispatch missing review_author is
+    /// ATOMICALLY rejected with ZERO side effects (no board task, no durable store
+    /// record, no store branch dir — no bind/create/store/inbox row).
+    #[test]
+    fn review_author_mandatory_full_entry_zero_side_effects() {
+        let home = tmp_home("author-entry");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Some(Sender::new("lead").unwrap());
+        let out = handle_delegate_task(
+            &home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the PR",
+                "review_assignment": true,
+                "task_id": "t-rev-1",
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+            }),
+            &sender,
+        );
+        assert_eq!(
+            out["code"], "review_assignment_missing_review_author",
+            "{out}"
+        );
+        let board = crate::tasks::handle(&home, "lead", &json!({"action": "list"}));
+        assert!(
+            board["tasks"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "missing review_author must NOT auto-create a task: {board}"
+        );
+        assert!(
+            crate::daemon::assignment_authority::get(&home, "owner/repo", "feat/x", "reviewer")
+                .is_none(),
+            "missing review_author must NOT persist a store record"
+        );
+        assert!(
+            crate::daemon::assignment_authority::active_branches(&home).is_empty(),
+            "missing review_author must NOT create any store branch dir"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// C11 (A1→A2): a validated marker dispatch delivers through the DURABLE outbox
