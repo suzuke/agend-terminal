@@ -1416,6 +1416,90 @@ fn checkout_reuse_different_source_fails_closed_2755() {
     std::fs::remove_dir_all(&bound).ok();
 }
 
+/// #2755 R3 (B1, decision d-…37): a reused worktree whose branch ref ADVANCED past its
+/// checked-out commit must be synced to the FINAL HEAD FIRST, then recursively inited at
+/// that HEAD, then gitlink-verified — never inited at the stale tree. Advance feat/reuse
+/// to C2 (adds a file + keeps the submodule) via `update-ref` while the worktree sits at
+/// C1; after reuse the worktree carries C2's content AND its materialized submodule.
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract.
+#[cfg(unix)]
+#[test]
+fn checkout_reuse_stale_branch_syncs_final_head_then_inits_2755() {
+    let home = tmp_home("reuse-stale");
+    let super_repo = tmp_super_with_nested_submodules("reuse-stale");
+    let instance = "agent-stale";
+    let branch = "feat/reuse";
+    git_run_ok(&super_repo, &["branch", branch, "main"], false); // C1
+
+    let mangled = mangled_for(instance, &super_repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_run_ok(
+        &super_repo,
+        &["worktree", "add", &wt.display().to_string(), branch],
+        false,
+    ); // wt at C1 (submodule vendor/mid EMPTY)
+    std::fs::write(
+        wt.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=agent-stale\n",
+    )
+    .unwrap();
+
+    // Advance the branch to C2 (a new file) WITHOUT touching the worktree — `update-ref`
+    // moves the checked-out branch at the plumbing level. wt now trails its own HEAD.
+    std::fs::write(super_repo.join("c2_only.txt"), "final-head\n").unwrap();
+    git_run_ok(&super_repo, &["add", "c2_only.txt"], false);
+    git_run_ok(&super_repo, &["commit", "-m", "C2 advance"], false); // main = C2
+    git_run_ok(
+        &super_repo,
+        &["update-ref", "refs/heads/feat/reuse", "main"],
+        false,
+    ); // feat/reuse = C2
+
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T-test",
+            "branch": branch,
+            "worktree": wt.display().to_string(),
+            "source_repo": super_repo.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let args = json!({
+        "repository_path": super_repo.display().to_string(),
+        "branch": branch,
+        "bind": true,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp.get("idempotent").and_then(|v| v.as_bool()),
+        Some(true),
+        "reuse must succeed after syncing the stale worktree to its final HEAD: {resp}"
+    );
+    assert!(
+        wt.join("c2_only.txt").is_file(),
+        "sync-first must materialize the FINAL HEAD (C2) content before init"
+    );
+    assert!(
+        wt.join("vendor/mid/nested/nested_b.txt").is_file(),
+        "recursive init must run against the final HEAD's gitlinks"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 /// Windows/open-handle: a rollback whose `git worktree remove --force` FAILS
 /// (an open handle pins the dir) RETAINS intent (armed + backoff); a later sweep,
 /// once the handle is released (remove succeeds), resolves and clears it.
