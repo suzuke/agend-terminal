@@ -55,6 +55,15 @@ pub struct GhPrMetadata {
     pub is_draft: bool,
     pub state: GhPrState,
     pub merged_at: Option<String>,
+    /// #2749: the PR head + base tip OIDs from the SAME `gh pr view --json
+    /// headRefOid,baseRefOid` response — the ATOMIC observation `apply_gh_poll`
+    /// writes into `PrState::observed_head_sha`/`observed_base_sha` together
+    /// (never composed across two reads). `#[serde(default)]` so pre-existing
+    /// `last_gh_state` snapshots load with `None`.
+    #[serde(default)]
+    pub head_ref_oid: Option<String>,
+    #[serde(default)]
+    pub base_ref_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +167,8 @@ fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
         is_draft: s.is_draft.unwrap_or(false),
         state,
         merged_at: s.merged_at,
+        head_ref_oid: None,
+        base_ref_oid: None,
     })
 }
 
@@ -760,6 +771,8 @@ pub(crate) mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         }])];
         let poller = MockGhPoller::new(responses);
         let (prs, _polled_at) = poller.poll("owner/repo").unwrap();
@@ -805,6 +818,8 @@ pub(crate) mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         };
         cache.cache.lock().unwrap().insert(
             "o/r2".into(),
@@ -900,6 +915,8 @@ pub(crate) mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         };
         let cache = GhPollCache::new();
         let poller = MockGhPoller::new(vec![Ok(vec![open])]);

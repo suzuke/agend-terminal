@@ -1473,6 +1473,8 @@ fn gh_meta_open(number: u64, branch: &str, author: &str) -> GhPrMetadata {
         is_draft: false,
         state: GhPrState::Open,
         merged_at: None,
+        head_ref_oid: None,
+        base_ref_oid: None,
     }
 }
 
@@ -1569,6 +1571,8 @@ fn stale_found_pr_does_not_drive_terminal_transition_986() {
         is_draft: false,
         state: GhPrState::Closed,
         merged_at: None,
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
     let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
     cache.seed_for_test("owner/repo", vec![closed], "2000-01-01T00:00:00+00:00");
@@ -1695,6 +1699,8 @@ fn t10_merged_observation_fires_pr_merged_event() {
         is_draft: false,
         state: GhPrState::Merged,
         merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
     let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()])]);
 
@@ -1744,6 +1750,8 @@ fn c1_merged_not_reemitted_after_delete_recreate_1842() {
         is_draft: false,
         state: GhPrState::Merged,
         merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
 
     // Scan 1: observe merged → emit [pr-merged] exactly once.
@@ -1821,6 +1829,8 @@ fn t11_closed_unmerged_observation_fires_event() {
         is_draft: false,
         state: GhPrState::Closed,
         merged_at: None,
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
 
     // #2131: first observation DEFERS — no emit, state survives with the
@@ -1888,6 +1898,8 @@ fn t_2131_closed_then_merged_emits_no_false_closed_unmerged() {
         is_draft: false,
         state,
         merged_at: merged_at.map(String::from),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
 
     // Scan 1: transient CLOSED+mergedAt=None → DEFER, no emit.
@@ -2067,6 +2079,8 @@ fn t13_idempotent_same_observation_no_double_emit() {
         is_draft: false,
         state: GhPrState::Merged,
         merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
     // Two consecutive polls return the same metadata.
     let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()]), Ok(vec![merged_meta])]);

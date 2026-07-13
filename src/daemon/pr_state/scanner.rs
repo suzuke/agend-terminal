@@ -1042,6 +1042,8 @@ mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         }
     }
 
@@ -1796,6 +1798,103 @@ mod tests {
         assert!(p.contains(&format!("id={id}")), "pre-stamped id: {p}");
         assert!(p.contains("kind=pr-needs-rebase"), "kind: {p}");
         assert!(p.contains("inbox=1"), "authoritative unread count: {p}");
+    }
+
+    // ─── #2749 3a RED: gh_poll atomic head/base observation ──────────────────
+    // These real-entry tests drive the gh_poll → apply_gh_observations path and
+    // assert the ATOMIC observed pair is written / preserved. They FAIL against
+    // this commit's parent (apply_gh_observations does not write observed_* yet);
+    // the 3a-GREEN write block + failure arm make them pass.
+
+    /// An open-PR gh observation that ALSO carries the atomic head+base OIDs, so
+    /// the real gh_poll → apply_gh_observations path writes the observed pair.
+    fn open_pr_meta_oids(
+        number: u64,
+        branch: &str,
+        head_oid: &str,
+        base_oid: &str,
+    ) -> GhPrMetadata {
+        GhPrMetadata {
+            head_ref_oid: Some(head_oid.into()),
+            base_ref_oid: Some(base_oid.into()),
+            ..open_pr_meta(number, branch)
+        }
+    }
+
+    /// #2749 3a: a live gh-poll carrying head+base OIDs writes the ATOMIC observed
+    /// pair (observed_head_sha + observed_base_sha + observed_at TOGETHER, clearing
+    /// observed_error). Real gh_poll → apply_gh_observations path (not injection).
+    #[test]
+    fn gh_poll_writes_atomic_observed_head_and_base() {
+        let home = tmp_home(line!());
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        let mut s = new_for_branch("owner/repo", "feat/x", "curhead", ReviewClass::Single);
+        s.pr_number = 55;
+        s.pr_author = "dev".into();
+        assert!(s.observed_head_sha.is_none(), "precondition: unobserved");
+        save(&home, &s).unwrap();
+
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+                55, "feat/x", "HEADOID1", "BASEOID1",
+            )])]),
+        );
+
+        let r = load(&home, "owner/repo", "feat/x").expect("state persists");
+        assert_eq!(r.observed_head_sha.as_deref(), Some("HEADOID1"));
+        assert_eq!(r.observed_base_sha.as_deref(), Some("BASEOID1"));
+        assert!(
+            r.observed_at.is_some(),
+            "observed_at stamped from the same poll"
+        );
+        assert!(
+            !r.observed_error,
+            "a good observation clears observed_error"
+        );
+    }
+
+    /// #2749 3a: a gh-poll TRANSPORT FAILURE flags observed_error and does NOT
+    /// advance observed_at nor clobber the last-good observed pair — the gate then
+    /// fails closed while the prior observation is preserved (CORRECTION 3 / GO-proof).
+    #[test]
+    fn gh_poll_failure_flags_observed_error_without_clobbering() {
+        let home = tmp_home(line!());
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        let mut s = new_for_branch("owner/repo", "feat/x", "curhead", ReviewClass::Single);
+        s.pr_number = 55;
+        s.pr_author = "dev".into();
+        // A prior GOOD observation on disk.
+        s.observed_head_sha = Some("GOODHEAD".into());
+        s.observed_base_sha = Some("GOODBASE".into());
+        s.observed_at = Some("2026-07-12T00:00:00+00:00".into());
+        s.observed_error = false;
+        save(&home, &s).unwrap();
+
+        scan_and_emit_with(
+            &home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Err(anyhow::anyhow!("gh transport failed"))]),
+        );
+
+        let r = load(&home, "owner/repo", "feat/x").expect("state persists");
+        assert!(r.observed_error, "transport failure ⇒ observed_error");
+        assert_eq!(
+            r.observed_head_sha.as_deref(),
+            Some("GOODHEAD"),
+            "last-good head preserved (not clobbered)"
+        );
+        assert_eq!(
+            r.observed_base_sha.as_deref(),
+            Some("GOODBASE"),
+            "last-good base preserved (not clobbered)"
+        );
+        assert_eq!(
+            r.observed_at.as_deref(),
+            Some("2026-07-12T00:00:00+00:00"),
+            "observed_at NOT advanced on failure"
+        );
     }
 }
 
