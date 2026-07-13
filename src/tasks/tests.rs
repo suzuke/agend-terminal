@@ -1328,8 +1328,8 @@ fn test_task_auto_unblock_when_all_deps_done() {
 
 /// Raw (unprojected) persisted status via an event-log replay of the task's board.
 fn raw_status_d63(home: &std::path::Path, id: &str) -> crate::task_events::TaskStatus {
-    let board = super::board_router::board_for_task(home, id);
-    crate::task_events::replay_at(&board)
+    let routed = super::load_routed(home, id).expect("route task to its board");
+    crate::task_events::replay_at(routed.board().path())
         .expect("replay board")
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
