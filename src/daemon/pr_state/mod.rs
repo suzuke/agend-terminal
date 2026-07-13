@@ -1147,6 +1147,20 @@ pub fn record_ci_result(
     subscribers: Vec<String>,
     review_class: ReviewClass,
 ) {
+    // t-…-17 A6 (I11/I15/I16): hold the reviewer-assignment branch lock as the OUTER
+    // lock of the drain below (the pr_state flock `with_pr_state_or_create` takes is
+    // the INNER lock — the mandated assignment-OUTER / pr_state-INNER order), so the
+    // `reserved_assignments` derivation is consistent with a concurrent
+    // revoke/transfer/tombstone. Acquired ONLY when the branch actually has active
+    // assignments (so an assignment-free branch never creates an empty store dir);
+    // best-effort — a lock failure logs nothing and the drain still runs lock-free
+    // (the per-tick reconciler re-derives, so convergence is preserved). Held for the
+    // whole `with_pr_state_or_create` scope via the binding's lifetime.
+    let _assignment_lock = if crate::daemon::assignment_authority::has_active(home, repo, branch) {
+        crate::daemon::assignment_authority::lock_branch_for_drain(home, repo, branch)
+    } else {
+        None
+    };
     if let Err(e) = with_pr_state_or_create(
         home,
         repo,
@@ -1183,6 +1197,22 @@ pub fn record_ci_result(
                     observed_at: chrono::Utc::now().to_rfc3339(),
                 },
             );
+            // t-…-17 A6 (I13/I16): DRAIN — after the head is applied (above) and
+            // BEFORE the buffered-verdict replay (below), REPLACE the whole
+            // `reserved_assignments` vec with the full-typed derivation from the
+            // authority store: every active record whose stored pr_number equals THIS
+            // state's pr_number and whose evidence is NOT SatisfiedExactHead. This is
+            // DECLARATIVE + convergent (a re-run yields the same set) and reads the
+            // store lock-free under the OUTER assignment lock held above. Reserved
+            // entries are NEVER counted toward `required_verified_count` / pushed into
+            // `VerdictState::Verified` — they only hold `is_merge_ready` closed
+            // (I17). A freshly-created state still carries pr_number 0 (gh-poll fills
+            // it later), matching no record (persist rejects pr_number 0), so the
+            // reconciler backstops the reservation until the generation is known.
+            state.reserved_assignments =
+                crate::daemon::assignment_authority::derive_reserved_for_prstate(
+                    home, repo, branch, state,
+                );
             // #2059 #2(c): the state's head_sha is now established at `head_sha`.
             // Drain + replay any verdicts that were buffered for this SHA before
             // the state existed (the #2058 verdict-before-CI ordering gap). They

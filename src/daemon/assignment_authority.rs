@@ -31,15 +31,12 @@
 //! APPEND-ONLY: it mints a NEW nonce, enqueues a fresh row, and SUPERSEDES the
 //! stale row by the OLD nonce — it NEVER resets `read_at` in place (I12).
 
-// t-…-17 C8 lands the store + its unit tests as one slice; the dispatch/tick/ack
-// call sites that CONSUME this surface are separate later slices (plan C9–C13).
-// Until those land, the whole module is reachable only from its own `#[cfg(test)]`
-// tests, so the non-test bin build sees every item as dead. This module-level
-// allow keeps the standalone slice green under CI's `-D warnings`; DROP it once
-// the wiring slices reference the store.
+// t-…-17: DROPPED in the slice-4 cleanup commit once the store is wired LIVE. Kept
+// on the intermediate C10/C11/C12 commits so each builds clean while the call sites
+// land incrementally.
 #![allow(dead_code)]
 
-use crate::daemon::pr_state::ReviewClass;
+use crate::daemon::pr_state::{MergeState, PrState, ReservedAssignment, ReviewClass};
 use crate::mcp::handlers::comms_gates::ReviewAuthor;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -389,6 +386,11 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 }
 
 /// The record for one `(repo,branch,target)`, if any.
+// t-…-17: a public single-record accessor. Production reconcile/drain/dispatch read
+// the whole branch via `list_active`; this point-lookup is exercised by the store
+// unit tests and reserved for a future single-assignment query — no production caller
+// yet (slice-4 wires list/persist/enqueue/repair/terminal/revoke, not point-get).
+#[allow(dead_code)]
 pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option<ActiveAssignment> {
     read_record(&record_file(home, repo, branch, target))
 }
@@ -538,9 +540,35 @@ fn revoke_under_lock(
     Ok(removed)
 }
 
+/// TEARDOWN hygiene — REVOKE every active reviewer assignment whose TARGET is the
+/// deleted instance `name`, across all branches. LOAD-BEARING once the store is live:
+/// a deleted reviewer that still held an active record would keep the per-tick
+/// reconciler deriving a `reserved_assignments` entry for a GHOST, holding
+/// [`crate::daemon::pr_state::is_merge_ready`] CLOSED forever — the same
+/// per-instance-residual class the ci_watch / pr_state subscriber cleanups close at
+/// teardown. Best-effort; returns the number revoked. `now` is clock-injected. Each
+/// [`revoke`] takes the branch lock top-level (never nested — the `list_active` read
+/// is lock-free), so there is no re-lock deadlock.
+pub(crate) fn revoke_all_for_target(home: &Path, name: &str, now: &str) -> usize {
+    let mut revoked = 0;
+    for (repo, branch) in active_branches(home) {
+        for record in list_active(home, &repo, &branch) {
+            if record.target == name && revoke(home, &repo, &branch, name, now).unwrap_or(false) {
+                revoked += 1;
+            }
+        }
+    }
+    revoked
+}
+
 /// A9 — transfer old→new atomically under ONE branch lock: {revoke old} + {persist
 /// a fresh record for new with a NEW `assignment_id` + nonce, SAME `pr_number`,
 /// authority carried over}. Other targets untouched.
+// t-…-17: reviewer REASSIGNMENT primitive (A9). Slice-4 wires dispatch (A1), terminal
+// (A7), reconcile (A2/A3/A4/A10) and the teardown REVOKE (A8) — but an operator
+// reviewer-REASSIGNMENT command (the sole caller of A9) is a distinct future feature,
+// so this has no production caller in this slice. Tested by `t33_transfer_atomic_*`.
+#[allow(dead_code)]
 pub(crate) fn transfer(
     home: &Path,
     repo: &str,
@@ -608,6 +636,139 @@ pub(crate) fn record_terminal(
         }
     }
     Ok(tombstoned)
+}
+
+// ─────────────────────────── C10/C12: live-wiring helpers ───────────────────────────
+
+/// Map a `PrState`'s terminal `merge_state` to its [`TerminalKind`], or `None` when
+/// the PR is not (yet) terminal. Used by the scanner's terminal wire (A7) to record
+/// the retained marker at the moment a generation goes terminal.
+pub(crate) fn terminal_kind_of(state: &PrState) -> Option<TerminalKind> {
+    match state.merge_state {
+        MergeState::Merged { .. } => Some(TerminalKind::Merged),
+        MergeState::ClosedUnmerged { .. } => Some(TerminalKind::Closed),
+        MergeState::NotReady | MergeState::MergeReady => None,
+    }
+}
+
+/// A10a store-half — TERMINAL RESTART-REPAIR. CAS-tombstone every active record of
+/// `(repo,branch)` whose stored `pr_number` is already in the RETAINED
+/// [`TerminalMarkers`] set (the A7 crash-gap / old-generation-replay backstop —
+/// I18/I19). Takes the branch lock internally; NEVER re-locks (call it top-level,
+/// never while already holding the branch lock). Returns the number tombstoned.
+pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) -> usize {
+    let Ok(_lock) = lock_branch(home, repo, branch) else {
+        return 0;
+    };
+    let markers = terminal_markers(home, repo, branch);
+    if markers.markers.is_empty() {
+        return 0;
+    }
+    let mut tombstoned = 0;
+    for record in list_active(home, repo, branch) {
+        if markers.contains(record.pr_number) {
+            let path = record_file(home, repo, branch, &record.target);
+            if remove_if_assignment_matches(&path, record.assignment_id) {
+                tombstoned += 1;
+            }
+        }
+    }
+    tombstoned
+}
+
+/// A6/A10b — DERIVE the RESERVED set for `prstate` from the active assignment
+/// records of its `(repo,branch)`: every active record whose stored `pr_number`
+/// equals `prstate.pr_number` AND whose evidence is NOT `SatisfiedExactHead`
+/// (plan §1/I16). FULL-TYPED (`target`/`review_author`/`assignment_id`), generation-
+/// matched, Satisfied-excluded. Reads records LOCK-FREE ([`list_active`]), so it is
+/// safe to call while the caller already holds the branch lock (the A6 drain does).
+pub(crate) fn derive_reserved_for_prstate(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    prstate: &PrState,
+) -> Vec<ReservedAssignment> {
+    list_active(home, repo, branch)
+        .into_iter()
+        .filter(|r| r.pr_number == prstate.pr_number)
+        .filter(|r| classify_assignment(r, Some(prstate)) != AssignmentEvidence::SatisfiedExactHead)
+        .map(|r| ReservedAssignment {
+            target: r.target,
+            review_author: r.review_author,
+            assignment_id: r.assignment_id,
+        })
+        .collect()
+}
+
+/// A10b — re-derive `reserved_assignments` on the LIVE `PrState` for `(repo,branch)`
+/// (declarative, convergent). Lock order is the mandated assignment-lock OUTER →
+/// pr_state-flock INNER (I11/I15): the branch lock is acquired FIRST, then
+/// [`crate::daemon::pr_state::with_pr_state`] takes the pr_state flock. A missing
+/// pr_state file is a no-op. Best-effort (a lock/save failure is swallowed — the
+/// next tick re-derives).
+pub(crate) fn redrive_reserved(home: &Path, repo: &str, branch: &str) {
+    let Ok(_lock) = lock_branch(home, repo, branch) else {
+        return;
+    };
+    let _ = crate::daemon::pr_state::with_pr_state(home, repo, branch, |ps| {
+        ps.reserved_assignments = derive_reserved_for_prstate(home, repo, branch, ps);
+    });
+}
+
+/// Acquire the per-`(repo,branch)` assignment lock as the OUTER lock of the A6 drain
+/// in `record_ci_result` (which then takes the pr_state flock INNER). Returns the
+/// guard so the caller holds it across `with_pr_state_or_create`; `None` on failure
+/// (the drain proceeds best-effort — the reconciler re-derives). NEVER call while
+/// already holding this branch's lock (same-process re-lock deadlocks on `flock`).
+pub(crate) fn lock_branch_for_drain(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+) -> Option<crate::store::FileFlockGuard> {
+    lock_branch(home, repo, branch).ok()
+}
+
+/// True iff `(repo,branch)` has at least one active record. Lock-free (mirrors
+/// [`list_active`]). Lets the A6 drain skip acquiring the branch lock — and creating
+/// an empty branch dir — for a branch with no reviewer assignments.
+pub(crate) fn has_active(home: &Path, repo: &str, branch: &str) -> bool {
+    !list_active(home, repo, branch).is_empty()
+}
+
+/// Enumerate every `(repo,branch)` with at least one active record — the reconciler's
+/// bounded work set. Derived from the self-describing record files (the branch-dir
+/// NAME is lossy/hashed and cannot be reversed); a markers-only dir (all records
+/// tombstoned) yields nothing, which is correct (it needs no reconciler action).
+/// Lock-free.
+pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for branch_entry in std::fs::read_dir(base_dir(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let dir = branch_entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+                continue;
+            }
+            if let Some(r) = read_record(&path) {
+                if seen.insert((r.repo.clone(), r.branch.clone())) {
+                    out.push((r.repo, r.branch));
+                }
+                break; // one record identifies the branch
+            }
+        }
+    }
+    out
 }
 
 // ─────────────────────────── C7: 4-state evidence classifier ───────────────────────────

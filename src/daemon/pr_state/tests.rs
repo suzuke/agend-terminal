@@ -2778,3 +2778,124 @@ fn t36_reserved_assignments_serde_legacy_byte_identical() {
     );
     assert_eq!(s, back, "byte-identical round-trip");
 }
+
+// ── t-…-17 C10 / A6: the record_ci_result reserved-derivation DRAIN (T30) ──
+// Real entry (record_ci_result). The pr_state's pr_number is pre-set (gh-poll fills
+// it in production; here we set it directly) so the pr_number-matched drain fires.
+
+fn t30_home(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "agend-t30-{}-{}-{}",
+        tag,
+        std::process::id(),
+        C.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn t30_persist_asgn(home: &std::path::Path, repo: &str, branch: &str, target: &str, pr: u64) {
+    let rec = crate::daemon::assignment_authority::ActiveAssignment::new_pending(
+        repo,
+        branch,
+        target,
+        pr,
+        "lead",
+        "t-rev-1",
+        ReviewClass::Dual,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-07-13T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(home, &rec).unwrap();
+}
+
+/// T30 (ordering + gate): the drain sets `reserved_assignments` AFTER the head apply
+/// but BEFORE the buffered-verdict replay — so a reviewer whose buffered VERIFIED is
+/// replayed in the SAME call is STILL reserved (reserved excludes Satisfied only at
+/// derive time), and that reserved entry holds an otherwise-ready Single PR CLOSED.
+#[test]
+fn t30_drain_reserved_before_verdict_replay_holds_merge_closed() {
+    let home = t30_home("order");
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42);
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    save(&home, &ps).unwrap();
+    // A verdict that WOULD satisfy `reviewer` is buffered BEFORE the CI observation.
+    verdict_buffer::buffer(&home, "sha-A", "reviewer", "verified", None);
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(
+        s.reserved_assignments
+            .iter()
+            .map(|r| r.target.clone())
+            .collect::<Vec<_>>(),
+        vec!["reviewer".to_string()],
+        "reserved is derived BEFORE the buffered verdict replay (ordering)"
+    );
+    assert!(
+        matches!(s.verdict_state, VerdictState::Verified { .. }),
+        "the buffered VERIFIED WAS replayed in this same call"
+    );
+    assert!(
+        !is_merge_ready(&s),
+        "a reserved required reviewer holds the (else-ready Single) PR CLOSED (I17)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T30 (excludes Satisfied + foreign generation): the drain reserves ONLY active
+/// records whose pr_number matches the state's generation AND whose evidence is not
+/// SatisfiedExactHead.
+#[test]
+fn t30_drain_excludes_satisfied_and_foreign_generation() {
+    let home = t30_home("excl");
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42); // matching gen, unengaged
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "satisfied", 42); // matching gen, VERIFIED@head
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "other-gen", 99); // FOREIGN generation
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.verdict_state = VerdictState::Verified {
+        reviewers: vec![("satisfied".into(), "sha-A".into())],
+    };
+    save(&home, &ps).unwrap();
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let mut got: Vec<String> = load(&home, "owner/repo", "feat/x")
+        .unwrap()
+        .reserved_assignments
+        .iter()
+        .map(|r| r.target.clone())
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["reviewer".to_string()],
+        "reserved excludes the Satisfied target AND the foreign-generation record"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

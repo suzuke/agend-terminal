@@ -572,6 +572,41 @@ pub fn scan_and_emit_with(
                 record_terminal_emitted(home, k);
             }
         }
+        // t-…-17 A7 (I18/I19): a terminal PR generation durably records its
+        // pr_number in the reviewer-assignment authority's RETAINED marker set and
+        // CAS-tombstones ONLY records whose stored pr_number matches — NEVER a
+        // different generation (no force-bind by branch, no unbound window). Done
+        // POST-FLOCK (the pr_state flock is released here): `record_terminal` takes
+        // ONLY the assignment lock, so it is assignment-lock-with-no-pr_state-flock —
+        // it can NEVER nest under the pr_state flock, preserving the global
+        // assignment-OUTER / pr_state-INNER order (record_ci_result's A6 drain is the
+        // only assignment→pr_state path; nothing goes pr_state→assignment). Fires on
+        // every scan tick the snapshot is terminal (idempotent: the marker is not
+        // duplicated and the tombstone is a no-op once done), so it lands reliably
+        // before the eventual file removal; the reconciler's A10a restart-repair
+        // backstops the rare crash between the marker write and the tombstone.
+        if let Some(kind) = crate::daemon::assignment_authority::terminal_kind_of(&snapshot) {
+            if snapshot.pr_number != 0 {
+                match crate::daemon::assignment_authority::record_terminal(
+                    home,
+                    &repo,
+                    &branch,
+                    snapshot.pr_number,
+                    kind,
+                ) {
+                    Ok(n) if n > 0 => tracing::info!(
+                        repo = %repo, branch = %branch, pr = snapshot.pr_number,
+                        tombstoned = n,
+                        "t-…-17 A7: terminal marker recorded + reviewer-assignment records tombstoned"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        repo = %repo, branch = %branch, pr = snapshot.pr_number, error = %e,
+                        "t-…-17 A7: record_terminal failed (reconciler A10a will retry)"
+                    ),
+                }
+            }
+        }
         // #1888 phase-2: a PR reaching a terminal state (merged / closed)
         // resolves any pending ci-handoff track for it — the review obligation
         // is gone, the re-nudge stops. Post-flock (file delete, no locks) and
@@ -2331,6 +2366,70 @@ mod tests {
                 .freshness_error,
             "gate stays fail-closed while errored"
         );
+    }
+    /// T21 (B18) — the scanner's A7 terminal wire: a MERGED pr_state records the
+    /// generation's RETAINED marker and CAS-tombstones ONLY that generation's
+    /// reviewer-assignment record (real entry `scan_and_emit_with`, marker write is
+    /// POST-flock / assignment-lock-only — no lock inversion). Then RESTART: the
+    /// pr_state file is gone (terminal cleanup) and a replayed record for the same
+    /// terminal generation STAYS removed on reconcile (A10a, marker retained — I19).
+    #[test]
+    fn t21_scanner_terminal_marker_tombstone_survives_restart() {
+        use crate::daemon::assignment_authority as store;
+        let home =
+            std::env::temp_dir().join(format!("agend-t21-scan-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mk = || {
+            store::ActiveAssignment::new_pending(
+                "o/r",
+                "b",
+                "reviewer",
+                55,
+                "lead",
+                "t-rev-1",
+                ReviewClass::Dual,
+                crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+                "review",
+                None,
+                None,
+                "2026-07-13T00:00:00Z",
+            )
+        };
+        store::persist(&home, &mk()).unwrap();
+
+        // A pr_state ALREADY merged at generation 55. apply_gh_poll SKIPS terminal
+        // states, so the main scan loop reads this snapshot and fires the A7 marker.
+        let mut s = new_for_branch("o/r", "b", "abcdef0", ReviewClass::Single);
+        s.pr_number = 55;
+        s.merge_state = super::super::MergeState::Merged {
+            merge_commit: "abcdef0".into(),
+            merged_at: "2026-07-13T00:00:00Z".into(),
+        };
+        save(&home, &s).unwrap();
+
+        scan_and_emit_with(&home, &empty_registry(), &MockGhPoller::new(vec![]));
+
+        assert!(
+            store::terminal_markers(&home, "o/r", "b").contains(55),
+            "scanner recorded the terminal marker for the merged generation"
+        );
+        assert!(
+            store::get(&home, "o/r", "b", "reviewer").is_none(),
+            "scanner tombstoned the matching-generation reviewer-assignment record"
+        );
+
+        // RESTART: pr_state gone; a replayed record for the terminal generation must
+        // STAY removed on the next reconcile (marker retained forever — I19).
+        let _ = super::super::remove(&home, "o/r", "b");
+        store::persist(&home, &mk()).unwrap();
+        crate::daemon::per_tick::assignment_reconcile::reconcile_all(&home, "2026-07-13T01:00:00Z");
+        assert!(
+            store::get(&home, "o/r", "b", "reviewer").is_none(),
+            "replayed terminal-generation record stays removed after restart (A10a)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 
