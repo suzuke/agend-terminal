@@ -197,3 +197,132 @@ fn sha_gate_bare_pr_number_still_rejected_actionable_78445_3() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─────────────────── t-…-17 C9: authenticated correlated ACK ───────────────────
+
+use crate::daemon::assignment_authority as authority;
+
+/// Seed one ACTIVE reviewer assignment for `target` on `branch` with `task_id`.
+fn seed_assignment(home: &std::path::Path, branch: &str, target: &str, pr: u64, task_id: &str) {
+    let rec = authority::ActiveAssignment::new_pending(
+        "o/r",
+        branch,
+        target,
+        pr,
+        "lead",
+        task_id,
+        crate::daemon::pr_state::ReviewClass::Dual,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "Please review PR",
+        None,
+        None,
+        "2026-07-13T00:00:00Z",
+    );
+    authority::persist(home, &rec).unwrap();
+}
+
+fn seed_home(tag: &str, reporter: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "agend-c9-{}-{}-{}",
+        tag,
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!("instances:\n  lead:\n    backend: claude\n  {reporter}:\n    backend: claude\n"),
+    )
+    .unwrap();
+    home
+}
+
+/// C9 (T14): an authenticated correlated report from the assignment TARGET drives
+/// the ACK end-to-end through `handle_report_result` — `acked_at` is set, so the
+/// record classifies EngagedPending (a prstate with no verdict). A report from a
+/// DIFFERENT sender does NOT ack the target's record.
+#[test]
+fn c9_authenticated_correlated_report_acks_target_t14() {
+    let reporter = "reviewer-c9a";
+    let home = seed_home("t14", reporter);
+    seed_assignment(&home, "feat/x", reporter, 42, "t-x");
+
+    // Report FROM the target, correlated to the assignment's task_id.
+    let sender = crate::identity::Sender::new(reporter);
+    super::handle_report_result(
+        &home,
+        &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
+        &sender,
+    );
+
+    let rec = authority::get(&home, "o/r", "feat/x", reporter).expect("assignment present");
+    assert!(
+        rec.acked_at.is_some(),
+        "an authenticated correlated report from the target sets acked_at"
+    );
+    let ps = crate::daemon::pr_state::new_for_branch(
+        "o/r",
+        "feat/x",
+        "sha-1",
+        crate::daemon::pr_state::ReviewClass::Dual,
+    );
+    assert_eq!(
+        authority::classify_assignment(&rec, Some(&ps)),
+        authority::AssignmentEvidence::EngagedPending,
+        "an acked record with no current-head verdict ⇒ EngagedPending"
+    );
+    std::fs::remove_dir_all(&home).ok();
+
+    // A report from a DIFFERENT sender does NOT ack the target's record.
+    let other = "not-the-reviewer-c9a";
+    let home = seed_home("t14-neg", other);
+    seed_assignment(&home, "feat/x", "reviewer-c9a", 42, "t-x");
+    let sender = crate::identity::Sender::new(other);
+    super::handle_report_result(
+        &home,
+        &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
+        &sender,
+    );
+    assert!(
+        authority::get(&home, "o/r", "feat/x", "reviewer-c9a")
+            .unwrap()
+            .acked_at
+            .is_none(),
+        "a report from a non-target sender must NOT ack the target's assignment"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// C9 (T15 fail-closed): TWO active assignments with the SAME (target,task_id) on
+/// DIFFERENT branches ⇒ an authenticated correlated report acks NEITHER.
+#[test]
+fn c9_ack_ambiguity_fails_closed_end_to_end_t15() {
+    let reporter = "reviewer-c9b";
+    let home = seed_home("t15", reporter);
+    seed_assignment(&home, "feat/a", reporter, 42, "t-x");
+    seed_assignment(&home, "feat/b", reporter, 43, "t-x");
+
+    let sender = crate::identity::Sender::new(reporter);
+    super::handle_report_result(
+        &home,
+        &json!({"instance": "lead", "summary": "done", "correlation_id": "t-x"}),
+        &sender,
+    );
+
+    assert!(
+        authority::get(&home, "o/r", "feat/a", reporter)
+            .unwrap()
+            .acked_at
+            .is_none(),
+        "ambiguous (target,task_id) ⇒ branch a NOT acked (fail closed)"
+    );
+    assert!(
+        authority::get(&home, "o/r", "feat/b", reporter)
+            .unwrap()
+            .acked_at
+            .is_none(),
+        "ambiguous (target,task_id) ⇒ branch b NOT acked (fail closed)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

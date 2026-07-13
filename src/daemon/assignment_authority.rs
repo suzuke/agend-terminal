@@ -610,6 +610,62 @@ pub(crate) fn record_terminal(
     Ok(tombstoned)
 }
 
+// ─────────────────────────── C7: 4-state evidence classifier ───────────────────────────
+
+/// The FROZEN 4-state evidence classification for one active assignment (plan §1).
+/// DERIVED, never stored. `SatisfiedExactHead` ⇒ NOT reserved / no nudge; the other
+/// three ⇒ reserved; only `Unengaged` is eligible for nudge/repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignmentEvidence {
+    /// `record.target` is VERIFIED at the CURRENT head.
+    SatisfiedExactHead,
+    /// `record.target` REJECTED / UNVERIFIED at the CURRENT head.
+    EngagedUnsatisfied,
+    /// Authenticated correlated ACK received, but no current-head verdict yet.
+    EngagedPending,
+    /// None of the above (incl. no `PrState`/head yet, and not acked).
+    Unengaged,
+}
+
+/// C7 — classify one assignment's evidence (plan §1, EXACT). PURE: reads ONLY the
+/// record's `target`/`acked_at` and the passed-in `PrState`'s current-head
+/// `VerdictState` (the `prstate` is the one for `record.pr_number`; its `head_sha`
+/// is the current head). NEVER reads `read_at`/`delivering_at`/report text. A
+/// DIFFERENT reviewer's verdict NEVER satisfies/engages THIS record.
+pub(crate) fn classify_assignment(
+    _record: &ActiveAssignment,
+    _prstate: Option<&crate::daemon::pr_state::PrState>,
+) -> AssignmentEvidence {
+    // STUB (RED): the real §1 derivation lands in the GREEN commit.
+    AssignmentEvidence::Unengaged
+}
+
+// ─────────────────────────── C9: authenticated correlated ACK ───────────────────────────
+
+/// The outcome of an authenticated correlated ACK ([`ack`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckOutcome {
+    /// EXACTLY ONE active assignment matched `(target,task_id)` — its `acked_at` is
+    /// now set (or was already set: re-ack is an idempotent no-op success).
+    Acked,
+    /// >1 active assignment matched — FAIL CLOSED, NOTHING set (I20).
+    Ambiguous,
+    /// No active assignment matched — no-op.
+    NoMatch,
+}
+
+/// A5 / C9 — authenticated correlated ACK. Resolves the ACTIVE assignment(s) whose
+/// `target == sender_target` AND `task_id == task_id` STORE-WIDE, then:
+///   - EXACTLY ONE ⇒ set `acked_at`/`acked_by` under THAT record's per-branch
+///     assignment-lock, CAS on `assignment_id`; re-ack is an idempotent success;
+///   - >1 ⇒ FAIL CLOSED: set NOTHING, return [`AckOutcome::Ambiguous`] (I20);
+///   - 0 ⇒ [`AckOutcome::NoMatch`] (no-op).
+/// Takes ONLY the assignment-lock — NEVER the inbox or pr_state lock (no inversion).
+pub(crate) fn ack(_home: &Path, _sender_target: &str, _task_id: &str, _now: &str) -> AckOutcome {
+    // STUB (RED): the real resolve+CAS lands in the GREEN commit.
+    AckOutcome::NoMatch
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1066,6 +1122,233 @@ mod tests {
                 .delivery_nonce,
             n2,
             "no rotation on the throttled second repair"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─────────────────── C7: 4-state evidence classifier ───────────────────
+
+    use crate::daemon::pr_state::{PrState, VerdictState};
+
+    /// A fresh `PrState` at `head` carrying `verdict` (the production constructor,
+    /// so the shape never drifts from the real default).
+    fn prstate_with(head: &str, verdict: VerdictState) -> PrState {
+        let mut ps =
+            crate::daemon::pr_state::new_for_branch("o/r", "feat/x", head, ReviewClass::Dual);
+        ps.verdict_state = verdict;
+        ps
+    }
+
+    /// C7 (T24/T25): the FROZEN 4-state classifier (plan §1). Target VERIFIED@head ⇒
+    /// Satisfied; a DIFFERENT reviewer's verdict NEVER satisfies/engages this record;
+    /// a head-advanced (stale) verdict ⇒ NOT Satisfied; acked-no-verdict ⇒
+    /// EngagedPending; nothing ⇒ Unengaged; target REJECTED/UNVERIFIED@head ⇒
+    /// EngagedUnsatisfied.
+    #[test]
+    fn c7_classify_four_state_evidence() {
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+
+        // target VERIFIED @ current head ⇒ Satisfied.
+        let ps = prstate_with(
+            "sha-1",
+            VerdictState::Verified {
+                reviewers: vec![("reviewer".into(), "sha-1".into())],
+            },
+        );
+        assert_eq!(
+            classify_assignment(&rec, Some(&ps)),
+            AssignmentEvidence::SatisfiedExactHead,
+            "target VERIFIED@head ⇒ Satisfied"
+        );
+
+        // A DIFFERENT reviewer VERIFIED @ head does NOT satisfy this record.
+        let ps = prstate_with(
+            "sha-1",
+            VerdictState::Verified {
+                reviewers: vec![("other".into(), "sha-1".into())],
+            },
+        );
+        assert_eq!(
+            classify_assignment(&rec, Some(&ps)),
+            AssignmentEvidence::Unengaged,
+            "a different reviewer's VERIFIED never satisfies/engages this record"
+        );
+
+        // Head advanced AFTER the target's VERIFIED (stale) ⇒ NOT Satisfied.
+        let ps = prstate_with(
+            "sha-2",
+            VerdictState::Verified {
+                reviewers: vec![("reviewer".into(), "sha-1".into())],
+            },
+        );
+        assert_eq!(
+            classify_assignment(&rec, Some(&ps)),
+            AssignmentEvidence::Unengaged,
+            "a stale (head-advanced) verdict does NOT satisfy"
+        );
+
+        // target REJECTED @ head ⇒ EngagedUnsatisfied.
+        let ps = prstate_with(
+            "sha-1",
+            VerdictState::Rejected {
+                reviewer: "reviewer".into(),
+                reviewed_head: "sha-1".into(),
+                reason: None,
+            },
+        );
+        assert_eq!(
+            classify_assignment(&rec, Some(&ps)),
+            AssignmentEvidence::EngagedUnsatisfied,
+            "target REJECTED@head ⇒ EngagedUnsatisfied"
+        );
+
+        // target UNVERIFIED @ head ⇒ EngagedUnsatisfied.
+        let ps = prstate_with(
+            "sha-1",
+            VerdictState::Unverified {
+                reviewer: "reviewer".into(),
+                reviewed_head: "sha-1".into(),
+            },
+        );
+        assert_eq!(
+            classify_assignment(&rec, Some(&ps)),
+            AssignmentEvidence::EngagedUnsatisfied,
+            "target UNVERIFIED@head ⇒ EngagedUnsatisfied"
+        );
+
+        // A DIFFERENT reviewer REJECTED @ head does NOT engage this record.
+        let ps = prstate_with(
+            "sha-1",
+            VerdictState::Rejected {
+                reviewer: "other".into(),
+                reviewed_head: "sha-1".into(),
+                reason: None,
+            },
+        );
+        assert_eq!(
+            classify_assignment(&rec, Some(&ps)),
+            AssignmentEvidence::Unengaged,
+            "a different reviewer's REJECTED never engages this record"
+        );
+
+        // acked, no current-head verdict ⇒ EngagedPending.
+        let mut acked = rec.clone();
+        acked.acked_at = Some("2026-07-13T00:00:05Z".into());
+        assert_eq!(
+            classify_assignment(&acked, Some(&prstate_with("sha-1", VerdictState::None))),
+            AssignmentEvidence::EngagedPending,
+            "acked + no verdict ⇒ EngagedPending"
+        );
+
+        // nothing (no PrState, not acked) ⇒ Unengaged.
+        assert_eq!(
+            classify_assignment(&rec, None),
+            AssignmentEvidence::Unengaged,
+            "no PrState + not acked ⇒ Unengaged"
+        );
+    }
+
+    // ─────────────────── C9: authenticated correlated ACK ───────────────────
+
+    /// C9 (T23): exactly-one match ⇒ `acked_at`/`acked_by` set as a SINGLE atomic
+    /// write that PERSISTS across a re-read; a re-ack is an idempotent no-op success
+    /// (never overwrites the original timestamp); a non-matching (target,task_id) is
+    /// a no-op.
+    #[test]
+    fn c9_ack_exactly_one_idempotent_atomic() {
+        let home = tmp_home("c9-ack");
+        // mk_record ⇒ target "reviewer", task_id "t-orig-1".
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        assert_eq!(
+            ack(&home, "reviewer", "t-orig-1", "2026-07-13T00:00:05Z"),
+            AckOutcome::Acked,
+            "exactly one (target,task_id) match ⇒ Acked"
+        );
+        let got = get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(got.acked_at.as_deref(), Some("2026-07-13T00:00:05Z"));
+        assert_eq!(got.acked_by.as_deref(), Some("reviewer"));
+        // Persists across re-read; classify now sees EngagedPending (no verdict).
+        assert_eq!(
+            classify_assignment(&got, Some(&prstate_with("sha-1", VerdictState::None))),
+            AssignmentEvidence::EngagedPending,
+            "acked record classifies EngagedPending"
+        );
+
+        // Re-ack is an idempotent success — the original timestamp is NOT overwritten.
+        assert_eq!(
+            ack(&home, "reviewer", "t-orig-1", "2026-07-13T01:00:00Z"),
+            AckOutcome::Acked,
+            "re-ack is an idempotent success"
+        );
+        assert_eq!(
+            get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .acked_at
+                .as_deref(),
+            Some("2026-07-13T00:00:05Z"),
+            "re-ack must NOT overwrite the original acked_at"
+        );
+
+        // Non-matching sender or task_id ⇒ no-op.
+        assert_eq!(
+            ack(&home, "someone-else", "t-orig-1", "2026-07-13T02:00:00Z"),
+            AckOutcome::NoMatch,
+            "a non-target sender never acks"
+        );
+        assert_eq!(
+            ack(&home, "reviewer", "t-nope", "2026-07-13T02:00:00Z"),
+            AckOutcome::NoMatch,
+            "a non-matching task_id never acks"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C9 (T15 fail-closed): TWO active assignments with the SAME (target,task_id)
+    /// on DIFFERENT branches ⇒ ack is AMBIGUOUS and sets NEITHER. Once the ambiguity
+    /// is resolved (one revoked) the remaining single match acks.
+    #[test]
+    fn c9_ack_ambiguity_fails_closed() {
+        let home = tmp_home("c9-ambig");
+        let a = mk_record("o/r", "feat/a", "reviewer", 42, "2026-07-13T00:00:00Z");
+        let b = mk_record("o/r", "feat/b", "reviewer", 43, "2026-07-13T00:00:00Z");
+        persist(&home, &a).unwrap();
+        persist(&home, &b).unwrap();
+
+        assert_eq!(
+            ack(&home, "reviewer", "t-orig-1", "2026-07-13T00:00:05Z"),
+            AckOutcome::Ambiguous,
+            ">1 (target,task_id) match ⇒ FAIL CLOSED"
+        );
+        assert!(
+            get(&home, "o/r", "feat/a", "reviewer")
+                .unwrap()
+                .acked_at
+                .is_none(),
+            "ambiguous ack sets NOTHING on branch a"
+        );
+        assert!(
+            get(&home, "o/r", "feat/b", "reviewer")
+                .unwrap()
+                .acked_at
+                .is_none(),
+            "ambiguous ack sets NOTHING on branch b"
+        );
+
+        // Resolve the ambiguity: revoke one ⇒ the remaining single match acks.
+        revoke(&home, "o/r", "feat/b", "reviewer", "2026-07-13T00:00:06Z").unwrap();
+        assert_eq!(
+            ack(&home, "reviewer", "t-orig-1", "2026-07-13T00:00:07Z"),
+            AckOutcome::Acked,
+            "once unambiguous, the single match acks"
+        );
+        assert_eq!(
+            get(&home, "o/r", "feat/a", "reviewer")
+                .unwrap()
+                .acked_at
+                .as_deref(),
+            Some("2026-07-13T00:00:07Z"),
         );
         std::fs::remove_dir_all(&home).ok();
     }

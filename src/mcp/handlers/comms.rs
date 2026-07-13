@@ -316,6 +316,20 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             task_id,
         }));
     }
+    // t-…-17 C9: authenticated correlated ACK into the reviewer-assignment
+    // authority. STRICTLY ADDITIVE + best-effort — it never touches `result`
+    // (an ordinary report is byte-identical to before). The sender is already
+    // authenticated (the `err_needs_identity` guard above) and `correlation_id`
+    // is the task_id; the store op resolves the ACTIVE assignment by
+    // `(target == sender, task_id)`, so a non-target sender or a non-matching
+    // task_id is a cheap no-op (the scan short-circuits on an empty store). It
+    // takes ONLY its own per-branch assignment-lock — NEVER the inbox or
+    // pr_state lock — and is sequenced OUTSIDE the inbox-settle above, so there
+    // is no lock inversion.
+    if let Some(task_id) = args["correlation_id"].as_str().filter(|s| !s.is_empty()) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = crate::daemon::assignment_authority::ack(home, sender.as_str(), task_id, &now);
+    }
     result
 }
 

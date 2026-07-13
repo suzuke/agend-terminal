@@ -76,6 +76,7 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         observed_base_sha: None,
         observed_at: None,
         observed_error: false,
+        reserved_assignments: Vec::new(),
         created_at: now(),
         updated_at: now(),
     }
@@ -2712,4 +2713,68 @@ fn resolve_merge_authority_no_team_no_author_last_ditch_fixup_lead_2059() {
         "no team and no author → last-ditch fixup-lead default"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ─────────────────── t-…-17 C13: reserved_assignments gate ───────────────────
+
+/// T31: a RESERVED-but-unverified required reviewer holds `is_merge_ready` CLOSED,
+/// yet reserved entries are NEVER counted toward `required_verified_count`. With
+/// zero reserved + the threshold met ⇒ ready; add one reserved ⇒ NOT ready; a
+/// reserved entry never substitutes for a real VERIFIED.
+#[test]
+fn t31_reserved_assignment_holds_merge_ready_closed() {
+    let mut s = new_state("sha-A", ReviewClass::Dual);
+    s.ci_state = CiState::Green {
+        sha: "sha-A".into(),
+        observed_at: now(),
+    };
+    s.verdict_state = VerdictState::Verified {
+        reviewers: vec![("r1".into(), "sha-A".into()), ("r2".into(), "sha-A".into())],
+    };
+    // Baseline: Dual threshold met at head, zero reserved ⇒ merge-ready.
+    assert!(
+        is_merge_ready(&s),
+        "2 VERIFIED@head + 0 reserved ⇒ merge-ready"
+    );
+
+    // Add one reserved-but-unverified required reviewer ⇒ gate holds it CLOSED.
+    s.reserved_assignments = vec![ReservedAssignment {
+        target: "r3".into(),
+        review_author: crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        assignment_id: uuid::Uuid::new_v4(),
+    }];
+    assert!(
+        !is_merge_ready(&s),
+        "a reserved-but-unverified required reviewer holds merge-ready closed"
+    );
+
+    // A reserved entry NEVER counts toward the verified threshold: 1 real VERIFIED
+    // + 1 reserved must NOT become "2" and go ready.
+    s.verdict_state = VerdictState::Verified {
+        reviewers: vec![("r1".into(), "sha-A".into())],
+    };
+    assert!(
+        !is_merge_ready(&s),
+        "reserved never increments required_verified_count"
+    );
+}
+
+/// T36: additive serde — an empty `reserved_assignments` is SKIPPED on serialize
+/// (legacy state files are byte-identical) and legacy JSON WITHOUT the field
+/// deserializes back to an empty vec.
+#[test]
+fn t36_reserved_assignments_serde_legacy_byte_identical() {
+    let s = new_state("sha-A", ReviewClass::Single);
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(
+        !json.contains("reserved_assignments"),
+        "an empty reserved_assignments is skip_serializing_if ⇒ absent from the wire"
+    );
+    // Legacy JSON (no field) round-trips to an empty vec, equal to the original.
+    let back: PrState = serde_json::from_str(&json).unwrap();
+    assert!(
+        back.reserved_assignments.is_empty(),
+        "a legacy doc without the field deserializes to empty"
+    );
+    assert_eq!(s, back, "byte-identical round-trip");
 }

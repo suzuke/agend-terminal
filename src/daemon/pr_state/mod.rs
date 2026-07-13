@@ -185,8 +185,32 @@ pub struct PrState {
     pub observed_at: Option<String>,
     #[serde(default)]
     pub observed_error: bool,
+    /// t-…-17 C13: required reviewers whose assignment is RESERVED-but-unverified,
+    /// DERIVED by the per-tick reconciler (a LATER slice) from the assignment
+    /// authority (`assignment_authority.rs`). While ANY entry is present
+    /// [`is_merge_ready`] returns false — a required reviewer is reserved but not
+    /// yet Verified — yet reserved entries are NEVER counted toward
+    /// `required_verified_count` and NEVER pushed into `VerdictState::Verified`
+    /// (plan §3(l)/I17). Additive serde (`default` + `skip_serializing_if`) ⇒
+    /// legacy state files are byte-identical. Population is a LATER slice; this
+    /// slice adds only the field + the gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reserved_assignments: Vec<ReservedAssignment>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// t-…-17 C13: one RESERVED-but-unverified required reviewer on a `PrState`. Carries
+/// the full-typed authority (`target`, `review_author`, `assignment_id`) so the
+/// gate/diagnostic can name the holder. `review_author` reuses the SINGLE shared
+/// [`crate::mcp::handlers::comms_gates::ReviewAuthor`] principal (no shadow copy).
+/// `pub(crate)` (not `pub`) because that principal is itself `pub(crate)` — a `pub`
+/// wrapper would leak a more-private type (rustc `private_interfaces`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReservedAssignment {
+    pub target: String,
+    pub review_author: crate::mcp::handlers::comms_gates::ReviewAuthor,
+    pub assignment_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1053,6 +1077,7 @@ pub fn new_for_branch(
         observed_base_sha: None,
         observed_at: None,
         observed_error: false,
+        reserved_assignments: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     }
