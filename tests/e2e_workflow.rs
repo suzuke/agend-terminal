@@ -46,10 +46,12 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    String::from_utf8_lossy(&git_isolated::git(dir, args).stdout)
-        .trim()
-        .to_string()
+/// The ONE sanctioned `git_managed_fixture` consumer call-site (d-68 allowlist): real git
+/// against the daemon-created mock-dev MANAGED worktree (`.agend-managed`), which the
+/// default `git()` fence rejects. Ownership-gated by `<home>/.agend-fixture-owned` (written
+/// before daemon start). Both worktree ops (branch check + the empty commit) route here.
+fn git_managed(home: &Path, dir: &Path, args: &[&str]) -> std::process::Output {
+    git_isolated::git_managed_fixture(home, dir, args)
 }
 
 /// Hermetic source repo (a clone of a local bare origin) with one commit on
@@ -172,6 +174,10 @@ fn e2e_dispatch_review_workflow_seam_invariants_1900() {
         "hermetic: the e2e home must be under the tmp dir, got {}",
         home.display()
     );
+    // (d-68) Ownership sentinel for git_managed_fixture, written atomically into the
+    // fresh unique home BEFORE the daemon starts — so the ONLY process permitted to drive
+    // real git against the daemon-created managed mock-dev worktree is THIS test process.
+    git_isolated::write_fixture_owned_sentinel(&home);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_scenario(&home)));
 
@@ -276,7 +282,13 @@ fn run_scenario(home: &Path) {
         .as_str()
         .expect("worktree path in binding")
         .to_string();
-    let head = git_stdout(Path::new(&wt), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    // MANAGED worktree → the ownership-gated escape hatch (default git() would reject the
+    // `.agend-managed` marker); this is the d-68 sanctioned consumer.
+    let head = String::from_utf8_lossy(
+        &git_managed(home, Path::new(&wt), &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+    )
+    .trim()
+    .to_string();
     assert_eq!(
         head, BRANCH,
         "#1833 directive-survival: the bound worktree HEAD must be branch B, not '{head}'"
@@ -302,10 +314,16 @@ fn run_scenario(home: &Path) {
         "#931/#1877 chain-armed: the auto-armed ci-watch must carry next_after_ci=mock-reviewer: {watch}"
     );
 
-    // ── mock-dev commits in the bound worktree + reports to lead ──
-    git(
+    // ── mock-dev commits in the bound (MANAGED) worktree + reports to lead ──
+    let commit = git_managed(
+        home,
         Path::new(&wt),
         &["commit", "--allow-empty", "-m", "e2e work"],
+    );
+    assert!(
+        commit.status.success(),
+        "mock-dev commit in the managed worktree failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
     );
     let report = mcp_tool(
         &h,

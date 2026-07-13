@@ -46,6 +46,12 @@ const PROVENANCE_HINT: &str = "a fixture must run against REAL git, but after ex
 /// test); it is the SAME authoritative signal `worktree_pool::is_daemon_managed` uses.
 const MANAGED_MARKER: &str = ".agend-managed";
 
+/// Ownership sentinel for [`git_managed_fixture`] (d-68). Placed by the sanctioned e2e
+/// at `<home>/.agend-fixture-owned` BEFORE the daemon starts; it contains THIS test
+/// process's PID. The managed-fixture escape hatch runs real git against a daemon
+/// managed worktree ONLY when this proves the current process owns the home.
+pub const FIXTURE_OWNED_SENTINEL: &str = ".agend-fixture-owned";
+
 /// Directories whose `git` is the agend-git shim (or its default install), to be
 /// EXCLUDED from real-git resolution: `$AGEND_HOME/bin` and `~/.agend-terminal/bin`.
 #[allow(dead_code)]
@@ -228,10 +234,11 @@ fn assert_temp_repo(repo_dir: &Path) {
     }
 }
 
-/// Base command: REAL git binary, real-git-first PATH (children inherit it), cwd
-/// pin, agent-session env scrubbed, pinned author/committer.
-fn base_cmd(repo_dir: &Path, args: &[&str]) -> Command {
-    assert_temp_repo(repo_dir);
+/// Build the REAL-git command (real-git-first PATH children inherit, cwd pin, agent-
+/// session env scrubbed, pinned author/committer). NO fence — the shared spawn primitive
+/// behind the two FENCED public entries: `base_cmd` (→ `git`/`git_dated`, temp-repo fence)
+/// and [`git_managed_fixture`] (ownership fence). Private; never call it directly.
+fn real_git_cmd(repo_dir: &Path, args: &[&str]) -> Command {
     let (real, real_path) = cached_real();
     let mut c = Command::new(real);
     c.args(args)
@@ -246,6 +253,110 @@ fn base_cmd(repo_dir: &Path, args: &[&str]) -> Command {
         .env("GIT_COMMITTER_NAME", "test")
         .env("GIT_COMMITTER_EMAIL", "test@example");
     c
+}
+
+/// Base command for the default fixture entries: temp-repo fenced (rejects any
+/// `.agend-managed` ancestor), then the shared real-git command.
+fn base_cmd(repo_dir: &Path, args: &[&str]) -> Command {
+    assert_temp_repo(repo_dir);
+    real_git_cmd(repo_dir, args)
+}
+
+/// Fail-CLOSED ownership fence for [`git_managed_fixture`] (d-68). Proves the CURRENT
+/// process owns a hermetic temp home before letting real git touch a managed worktree:
+/// (N4) `home` canonicalizes UNDER the system temp dir; (N3) `repo_dir` canonicalizes
+/// under that EXACT `home`; (N1/N2) `<home>/.agend-fixture-owned` is readable and holds
+/// THIS process's PID — reject absent / unreadable / malformed / stale-or-foreign PID.
+fn assert_owned_managed_fixture(home: &Path, repo_dir: &Path) {
+    let tmp = std::env::temp_dir();
+    let canon_tmp = tmp.canonicalize().unwrap_or(tmp);
+    let canon_home = home.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "git_managed_fixture: home {} cannot be canonicalized ({e}) — refusing",
+            home.display()
+        )
+    });
+    let canon_repo = repo_dir.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "git_managed_fixture: repo {} cannot be canonicalized ({e}) — refusing",
+            repo_dir.display()
+        )
+    });
+    // (N4) home under the system temp dir
+    assert!(
+        canon_home.starts_with(&canon_tmp),
+        "git_managed_fixture: home {} is NOT under the system temp dir ({}) — refusing",
+        canon_home.display(),
+        canon_tmp.display(),
+    );
+    // (N3) repo under that EXACT home (no cross-home reuse of a sentinel)
+    assert!(
+        canon_repo.starts_with(&canon_home),
+        "git_managed_fixture: repo {} is NOT under the owned home {} — refusing (cross-home)",
+        canon_repo.display(),
+        canon_home.display(),
+    );
+    // (N1) sentinel present + readable
+    let sentinel = canon_home.join(FIXTURE_OWNED_SENTINEL);
+    let raw = std::fs::read_to_string(&sentinel).unwrap_or_else(|e| {
+        panic!(
+            "git_managed_fixture: ownership sentinel {} absent/unreadable ({e}) — refusing",
+            sentinel.display()
+        )
+    });
+    // malformed → refuse
+    let owner: u32 = raw.trim().parse().unwrap_or_else(|_| {
+        panic!(
+            "git_managed_fixture: ownership sentinel {} is malformed ({raw:?}) — refusing",
+            sentinel.display()
+        )
+    });
+    // (N2) stale/foreign PID → refuse
+    let me = std::process::id();
+    assert!(
+        owner == me,
+        "git_managed_fixture: ownership sentinel {} PID {owner} != current process {me} \
+         (stale/foreign) — refusing",
+        sentinel.display(),
+    );
+}
+
+/// Sanctioned ESCAPE HATCH (d-68) for the ONE hermetic e2e workflow test: run real git
+/// against a daemon-created MANAGED worktree — which the default [`git`] fence rejects —
+/// gated by explicit process ownership of the hermetic temp `home`.
+///
+/// This is a NON-ADVERSARIAL FOOTGUN GUARD, NOT same-UID containment: a same-UID
+/// adversary can forge `<home>/.agend-fixture-owned`. Its job is to stop a fixture from
+/// ACCIDENTALLY driving real git against the wrong (or a live/foreign) managed worktree,
+/// while still letting the sanctioned e2e drive its OWN hermetic mock-dev worktree.
+///
+/// Source-allowlisted to `tests/e2e_workflow.rs` (enforced by the allowlist invariant in
+/// `tests/fixture_real_git_provenance.rs`). Fail-closed via [`assert_owned_managed_fixture`].
+///
+/// allow: raw-git-subprocess  // canonical helper module — exempt
+#[allow(dead_code)]
+pub fn git_managed_fixture(home: &Path, repo_dir: &Path, args: &[&str]) -> Output {
+    assert_owned_managed_fixture(home, repo_dir);
+    real_git_cmd(repo_dir, args)
+        .output()
+        .expect("git subprocess spawn")
+}
+
+/// Write the [`git_managed_fixture`] ownership sentinel into `home` for THIS process
+/// (the single source of the exact PID format the guard verifies). The sanctioned e2e
+/// calls this once, atomically, BEFORE the daemon starts.
+#[allow(dead_code)]
+pub fn write_fixture_owned_sentinel(home: &Path) {
+    std::fs::write(
+        home.join(FIXTURE_OWNED_SENTINEL),
+        std::process::id().to_string(),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "git_isolated: write fixture-owned sentinel in {}: {e}",
+            home.display()
+        )
+    });
 }
 
 /// Run git in `repo_dir` against REAL git (shim excluded), cwd-isolated, pinned
