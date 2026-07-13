@@ -20,6 +20,9 @@ mod source_resolve;
 // the re-exports below preserve EVERY `ci::handle_*` path used by dispatch.rs and
 // every `super::*` path used by the child `tests` module (zero caller/test edits).
 mod checkout;
+// #2755 R3: response-mapping + marker-durability helpers extracted from checkout.rs
+// to keep that handler under the LOC ceiling (same relief pattern as source_resolve).
+mod checkout_helpers;
 // #2755: pub(crate) so the daemon per-tick + boot-repair recovery can reach the
 // shared `recover_pending_sweep_prod` (checkout provisioning is in `ci`, the
 // recovery driver is in `daemon`/`bootstrap`).

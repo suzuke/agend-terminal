@@ -615,7 +615,7 @@ fn txn_rollback_failed_pending_flags_nondurable_intent() {
 /// `failed_code` preserved). Pure mapping, cross-platform.
 #[test]
 fn rollback_response_pending_never_claims_rolled_back() {
-    let removed = super::checkout::rollback_response(
+    let removed = super::checkout_helpers::rollback_response(
         RollbackOutcome::Removed,
         "submodule init failed",
         "submodule_init_failed",
@@ -626,7 +626,7 @@ fn rollback_response_pending_never_claims_rolled_back() {
     assert!(removed["error"].as_str().unwrap().contains("rolled back"));
     assert!(removed.get("rollback_pending").is_none());
 
-    let pending = super::checkout::rollback_response(
+    let pending = super::checkout_helpers::rollback_response(
         RollbackOutcome::RollbackPending {
             intent_durable: false,
         },
@@ -666,15 +666,15 @@ fn marker_sync_contents_observes_failure_via_seam() {
     let home = tmp_home("marker-sync");
     let f = home.join(".agend-managed");
     std::fs::write(&f, "agent=x\n").unwrap();
-    super::checkout::set_fail_marker_sync(true);
-    let armed = super::checkout::sync_marker_contents(&f);
-    super::checkout::set_fail_marker_sync(false);
+    super::checkout_helpers::set_fail_marker_sync(true);
+    let armed = super::checkout_helpers::sync_marker_contents(&f);
+    super::checkout_helpers::set_fail_marker_sync(false);
     assert!(
         armed.is_err(),
         "armed seam ⇒ marker fsync observed as failure"
     );
     assert!(
-        super::checkout::sync_marker_contents(&f).is_ok(),
+        super::checkout_helpers::sync_marker_contents(&f).is_ok(),
         "disarmed ⇒ real marker contents fsync succeeds"
     );
     std::fs::remove_dir_all(&home).ok();
@@ -1108,11 +1108,11 @@ fn checkout_marker_fsync_failure_rolls_back_2755() {
     let repo = tmp_repo_with_file("markerfail", "readme.txt", "x\n");
     let instance = "agent-mf";
     let mangled = mangled_for(instance, &repo);
-    super::checkout::set_fail_marker_sync(true);
+    super::checkout_helpers::set_fail_marker_sync(true);
     let args =
         json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
     let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
-    super::checkout::set_fail_marker_sync(false);
+    super::checkout_helpers::set_fail_marker_sync(false);
     assert_eq!(
         resp["stage"].as_str(),
         Some("marker_durable"),

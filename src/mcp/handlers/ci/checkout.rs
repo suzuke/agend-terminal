@@ -2,6 +2,9 @@ use crate::agent_ops::validate_branch;
 use crate::git_helpers::git_bypass;
 use serde_json::{json, Value};
 use std::path::Path;
+// #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
+// keep this handler under the LOC ceiling (call sites below are unchanged).
+use super::checkout_helpers::{rollback_response, sync_marker_contents};
 
 /// #2755 structured redaction: replace absolute filesystem paths (and Windows
 /// drive paths) in an error string RETURNED over the wire with `<path>`. The
@@ -30,77 +33,6 @@ pub(crate) fn checkout_source(args: &Value) -> Option<&str> {
     args.get("repository_path")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-}
-
-/// #2755 R3 (root + independent review): map a post-`git worktree add`
-/// [`RollbackOutcome`](super::checkout_txn::RollbackOutcome) to the checkout error
-/// response, reporting the ACTUAL cleanup state. `Removed` → the historical
-/// "worktree rolled back" text. `RollbackPending` → a STRUCTURED pending state
-/// (`code: "rollback_pending"`, `rollback_pending: true`) that NEVER claims the
-/// worktree was rolled back — the remove failed (Windows open-handle / transient
-/// FS) and the worktree survives for the recovery sweep. `intent_durable=false`
-/// (the retained-intent journal save ALSO failed) is surfaced for intervention.
-/// The original failure `code`/`stage` are preserved (`failed_code`/`stage`) so
-/// machine consumers keep the root cause. Pure — unit-tested cross-platform.
-pub(super) fn rollback_response(
-    outcome: super::checkout_txn::RollbackOutcome,
-    reason: &str,
-    code: &str,
-    stage: &str,
-    branch: &str,
-) -> Value {
-    use super::checkout_txn::RollbackOutcome;
-    match outcome {
-        RollbackOutcome::Removed => json!({
-            "error": format!("{reason}, worktree rolled back"),
-            "code": code,
-            "stage": stage,
-            "branch": branch,
-        }),
-        RollbackOutcome::RollbackPending { intent_durable } => json!({
-            "error": format!(
-                "{reason}; worktree REMOVE FAILED — rollback pending, recovery sweep will retry{}",
-                if intent_durable {
-                    ""
-                } else {
-                    " (retained-intent journal save ALSO failed — operator intervention needed)"
-                }
-            ),
-            "code": "rollback_pending",
-            "rollback_pending": true,
-            "intent_durable": intent_durable,
-            "failed_code": code,
-            "stage": stage,
-            "branch": branch,
-        }),
-    }
-}
-
-/// #2755 R3 (independent P1.4): fsync the `.agend-managed` marker file's CONTENTS
-/// durable — `std::fs::write` + a parent-dir fsync makes the DIRENT durable but not
-/// the bytes, so a crash/power loss could leave a durable journal phase (or Committed
-/// success) with an empty/torn marker. Open + `sync_all()` and OBSERVE the result; a
-/// failure aborts the transaction fail-closed. A `cfg(test)` thread-local seam forces
-/// the sync error so the crash/durability rollback path is testable cross-platform.
-pub(super) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    if FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
-        return Err(std::io::Error::other(
-            "test seam: forced marker sync_all failure",
-        ));
-    }
-    std::fs::File::open(path)?.sync_all()
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_MARKER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Test-only: arm/disarm the [`sync_marker_contents`] failure seam (current thread).
-#[cfg(test)]
-pub(super) fn set_fail_marker_sync(fail: bool) {
-    FAIL_MARKER_SYNC.with(|c| c.set(fail));
 }
 
 pub(crate) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
