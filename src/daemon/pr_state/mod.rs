@@ -1254,74 +1254,26 @@ pub fn record_ci_result(
             // (I17). A freshly-created state still carries pr_number 0 (gh-poll fills
             // it later), matching no record (persist rejects pr_number 0), so the
             // reconciler backstops the reservation until the generation is known.
-            // t-…-17 B4 (codex m-…-322): set/clear the fail-closed `authority_unknown`
-            // gate flag from the probe + derive outcome. SET on corrupt/unreadable/
-            // required-lock-failure; CLEARED only on a successful locked-or-absent
-            // derive. This is the explicit "authority unreadable ⇒ close" state that
-            // closes the sole-corrupt-record fail-open (`is_merge_ready` gates on it).
-            use crate::daemon::assignment_authority::BranchAuthority;
-            let derive = |state: &mut PrState| {
-                crate::daemon::assignment_authority::derive_reserved_for_prstate(
-                    home, repo, branch, state,
-                )
-            };
-            match authority {
-                // Genuine absence — an empty reserved set is correct; derive lock-free
-                // (nothing to race). On Ok, adopt it and CLEAR the flag (authority is
-                // readable). A dir that flipped to unreadable between probe and derive
-                // KEEPS the existing set and fails closed.
-                BranchAuthority::Absent => match derive(state) {
-                    Ok(v) => {
-                        state.reserved_assignments = v;
-                        state.authority_unknown = false;
-                    }
-                    Err(e) => {
-                        state.authority_unknown = true;
-                        tracing::error!(
-                            repo = %repo, branch = %branch, error = %e,
-                            "t-…-17 B4: reserved derivation failed on an absent-probed branch (raced to unreadable) — keeping existing reserved set + authority_unknown SET (fail closed)"
-                        );
-                    }
+            // t-…-17 B4 (codex m-…-322 / m-…-378): set/clear the fail-closed
+            // `authority_unknown` gate flag from the probe + derive outcome, via the
+            // SHARED `apply_authority_transition` helper — the SAME transition the A10b
+            // reconciler's `redrive_reserved` applies (codex m-…-378 closed the divergence
+            // where the two paths differed). SET on corrupt/unreadable/required-lock-
+            // failure; CLEARED only on a successful locked-or-absent derive. This is the
+            // explicit "authority unreadable ⇒ close" state that closes the sole-corrupt-
+            // record fail-open (`is_merge_ready` gates on it).
+            crate::daemon::assignment_authority::apply_authority_transition(
+                state,
+                repo,
+                branch,
+                authority,
+                lock_acquired,
+                |state| {
+                    crate::daemon::assignment_authority::derive_reserved_for_prstate(
+                        home, repo, branch, state,
+                    )
                 },
-                // Active + lock held — derive under the OUTER lock (consistent w.r.t. a
-                // concurrent revoke/transfer). Ok ⇒ adopt + CLEAR; Err (a co-resident
-                // corrupt record) ⇒ keep existing set + SET (never drop on corruption).
-                BranchAuthority::Active if lock_acquired => match derive(state) {
-                    Ok(v) => {
-                        state.reserved_assignments = v;
-                        state.authority_unknown = false;
-                    }
-                    Err(e) => {
-                        state.authority_unknown = true;
-                        tracing::error!(
-                            repo = %repo, branch = %branch, error = %e,
-                            "t-…-17 B4: reserved derivation skipped — corrupt authority record; keeping existing reserved set + authority_unknown SET (fail closed, gate stays closed)"
-                        );
-                    }
-                },
-                // Active but the required lock could NOT be acquired — a lock-free
-                // derive could read a torn set that CLEARS the gate. Keep the existing
-                // set + SET (fail closed); the per-tick reconciler re-derives under the
-                // lock later.
-                BranchAuthority::Active => {
-                    state.authority_unknown = true;
-                    tracing::warn!(
-                        repo = %repo, branch = %branch,
-                        "t-…-17 B4(d): reserved derivation skipped fail-closed — assignment lock not acquired while active assignments exist; keeping existing reserved set + authority_unknown SET (reconciler re-derives under the lock)"
-                    );
-                }
-                // The authority is UNREADABLE (a corrupt/unreadable record or an
-                // unreadable branch dir) — do NOT derive (can't read reliably). Keep the
-                // existing set + SET (fail closed). THIS is the sole-corrupt-record path
-                // the lossy `has_active` used to mis-read as assignment-free.
-                BranchAuthority::Unreadable => {
-                    state.authority_unknown = true;
-                    tracing::error!(
-                        repo = %repo, branch = %branch,
-                        "t-…-17 B4: reserved derivation skipped — branch authority UNREADABLE (corrupt/unreadable record or dir); keeping existing reserved set + authority_unknown SET (fail closed, gate stays closed)"
-                    );
-                }
-            }
+            );
             // #2059 #2(c): the state's head_sha is now established at `head_sha`.
             // Drain + replay any verdicts that were buffered for this SHA before
             // the state existed (the #2058 verdict-before-CI ordering gap). They
