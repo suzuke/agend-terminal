@@ -790,6 +790,28 @@ fn build_event_message(
         .with_reviewed_head(state.head_sha.clone())
 }
 
+/// #2749 wake policy for the durable `[pr-needs-rebase]` delivery. A best-effort
+/// PTY pointer wake fires ONLY when the row is guaranteed to be durably persisted
+/// already: `Delivered` (enqueued + recorded) OR `RecordFailedAfterEnqueue`
+/// (enqueued, only the dedup-record write failed — the row EXISTS so the recipient
+/// must still be woken; the missing record just means a later tick may re-deliver,
+/// which the at-least-once ledger tolerates). NO wake on `Suppressed` (a prior tick
+/// already delivered + woke this exact key) or `EnqueueFailed` (no row persisted —
+/// nothing to point at). A wake failure never invalidates the durable delivery.
+#[allow(dead_code)] // wired by the #2749 2b-GREEN post-flock drain
+fn wake_after_ledger(
+    res: &Result<
+        crate::daemon::ci_delivery_ledger::DeliveryOutcome,
+        crate::daemon::ci_delivery_ledger::DeliveryError,
+    >,
+) -> bool {
+    use crate::daemon::ci_delivery_ledger::{DeliveryError, DeliveryOutcome};
+    matches!(
+        res,
+        Ok(DeliveryOutcome::Delivered) | Err(DeliveryError::RecordFailedAfterEnqueue(_))
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1310,6 +1332,308 @@ mod tests {
             FreshnessGate::Suppress,
             "negative ttl must never admit Fresh"
         );
+    }
+
+    // ─── #2749 2b RED: behind → durable pr-needs-rebase + PTY wake ───────────
+    // These production-entry tests drive `scan_and_emit_with` and assert the
+    // durable [pr-needs-rebase] row AND its canonical [AGEND-MSG-PENDING] wake.
+    // They FAIL against this commit's parent (no Behind arm yet); the 2b-GREEN
+    // Behind arm + post-flock ledger drain + wake makes them pass.
+
+    // DeliveryKey::new requires a full 40/64-hex head — the durable ledger keys
+    // pr-needs-rebase on (repo, PR, head, recipient), so the behind tests use
+    // realistic full SHAs.
+    const BEHIND_HEAD: &str = "abcdef0123456789abcdef0123456789abcdef01";
+    const BEHIND_BASE: &str = "1234567890abcdef1234567890abcdef12345678";
+
+    /// Write a fleet.yaml so `resolve_merge_authority` returns `orch` (the team
+    /// orchestrator = merge authority) for a PR authored by team member `member`.
+    fn write_team_fleet(home: &std::path::Path, orch: &str, member: &str) {
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        let y = format!(
+            "instances:\n  {member}:\n    backend: claude\n  {orch}:\n    backend: claude\n\
+             teams:\n  squad:\n    orchestrator: {orch}\n    members:\n      - {member}\n"
+        );
+        std::fs::write(crate::fleet::fleet_yaml_path(home), y).expect("write fleet.yaml");
+    }
+
+    fn needs_rebase_msgs(home: &std::path::Path, who: &str) -> Vec<crate::inbox::InboxMessage> {
+        crate::inbox::drain(home, who)
+            .into_iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-needs-rebase"))
+            .collect()
+    }
+
+    fn tmp_home(ln: u32) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("agend-2749-2b-{}-{}", std::process::id(), ln));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    fn behind_state(home: &std::path::Path, pr: u64, behind_by: u64) {
+        let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, pr);
+        s.pr_author = "dev".into();
+        stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, behind_by);
+        save(home, &s).unwrap();
+    }
+
+    fn behind_poller(pr: u64) -> MockGhPoller {
+        MockGhPoller::new(vec![Ok(vec![open_pr_meta(pr, "feat/x")])])
+    }
+
+    /// RED#1: behind ⇒ suppress pr-ready + exactly ONE durable [pr-needs-rebase]
+    /// to each deduped {merge authority (lead), PR owner (dev)}.
+    #[test]
+    fn behind_pr_suppresses_ready_and_notifies_authority_and_owner() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        behind_state(&home, 77, 2);
+
+        scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+        let reloaded = load(&home, "owner/repo", "feat/x").expect("state persists");
+        assert_eq!(
+            reloaded.ready_emitted_for_sha, None,
+            "#2749 behind ⇒ [pr-ready-for-merge] must be suppressed"
+        );
+        for who in ["lead", "dev"] {
+            let nr = needs_rebase_msgs(&home, who);
+            assert_eq!(nr.len(), 1, "#2749 behind ⇒ one [pr-needs-rebase] to {who}");
+            assert!(
+                nr[0].text.contains("owner/repo#77"),
+                "PR ref: {}",
+                nr[0].text
+            );
+            assert!(
+                nr[0].text.to_lowercase().contains("behind"),
+                "states behind: {}",
+                nr[0].text
+            );
+        }
+    }
+
+    /// RED#2: the notice body carries the full payload + reviewed_head.
+    #[test]
+    fn behind_needs_rebase_body_carries_full_payload() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        behind_state(&home, 77, 3);
+
+        scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+        let nr = needs_rebase_msgs(&home, "dev");
+        assert_eq!(nr.len(), 1, "one notice to the owner");
+        let body = &nr[0].text;
+        assert!(body.contains("owner/repo#77"), "PR ref: {body}");
+        assert!(body.contains(&BEHIND_HEAD[..8]), "head short sha: {body}");
+        assert!(body.contains(&BEHIND_BASE[..8]), "main short sha: {body}");
+        assert!(body.contains("by 3 commit"), "behind-by count: {body}");
+        assert!(body.contains("Re-stamp checklist"), "checklist: {body}");
+        assert_eq!(
+            nr[0].reviewed_head.as_deref(),
+            Some(BEHIND_HEAD),
+            "reviewed_head pins the behind head"
+        );
+    }
+
+    /// RED#3: the #2745 ledger dedups the ROW per (repo, PR, head, recipient) —
+    /// N ticks at the same head deliver exactly ONE notice per recipient.
+    #[test]
+    fn behind_needs_rebase_delivered_once_across_ticks() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        behind_state(&home, 77, 2);
+
+        for _ in 0..3 {
+            scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+        }
+        for who in ["lead", "dev"] {
+            assert_eq!(
+                needs_rebase_msgs(&home, who).len(),
+                1,
+                "#2749 ledger dedup: one notice to {who} across 3 ticks"
+            );
+        }
+    }
+
+    /// RED#4: recipients deduped BEFORE the ledger keys — owner == merge authority
+    /// (no team) ⇒ a single notice.
+    #[test]
+    fn behind_needs_rebase_dedups_recipient_when_owner_is_authority() {
+        let home = tmp_home(line!());
+        std::fs::create_dir_all(home.join("inbox")).ok(); // no fleet.yaml ⇒ no team
+        let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+        s.pr_author = "solo".into();
+        stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 1);
+        save(&home, &s).unwrap();
+
+        scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+        assert_eq!(
+            needs_rebase_msgs(&home, "solo").len(),
+            1,
+            "#2749 owner == authority ⇒ a single deduped notice"
+        );
+    }
+
+    /// RED#5 (WAKE): a Delivered row emits exactly ONE canonical
+    /// [AGEND-MSG-PENDING] pointer wake per deduped recipient (kind=pr-needs-rebase).
+    #[test]
+    fn behind_delivered_emits_one_canonical_wake_per_recipient() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        behind_state(&home, 77, 2);
+
+        let (_, wakes) = crate::inbox::with_captured_pointer_wakes(|| {
+            scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+        });
+        let nr_wakes: Vec<_> = wakes
+            .iter()
+            .filter(|w| w.contains("kind=pr-needs-rebase"))
+            .collect();
+        assert_eq!(
+            nr_wakes.len(),
+            2,
+            "#2749 wake: one canonical pointer per deduped recipient (lead+dev); got {wakes:?}"
+        );
+        for w in &nr_wakes {
+            assert!(w.contains("[AGEND-MSG-PENDING]"), "canonical pointer: {w}");
+            assert!(
+                w.contains("inbox="),
+                "carries authoritative unread count: {w}"
+            );
+        }
+    }
+
+    /// RED#6 (WAKE dedup): a second tick at the SAME head enqueues NO new row and
+    /// emits NO new wake (the ledger suppresses the already-delivered key).
+    #[test]
+    fn behind_same_head_next_tick_no_new_row_no_new_wake() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        behind_state(&home, 77, 2);
+
+        // Tick 1: delivered + woken.
+        let (_, w1) = crate::inbox::with_captured_pointer_wakes(|| {
+            scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+        });
+        let rows1: usize = ["lead", "dev"]
+            .iter()
+            .map(|w| needs_rebase_msgs(&home, w).len())
+            .sum();
+        assert_eq!(rows1, 2, "tick 1 delivers one row per recipient");
+        assert_eq!(
+            w1.iter()
+                .filter(|w| w.contains("kind=pr-needs-rebase"))
+                .count(),
+            2,
+            "tick 1 wakes each recipient once"
+        );
+
+        // Tick 2 (same head): ledger Suppressed ⇒ no new row, no new wake.
+        let (_, w2) = crate::inbox::with_captured_pointer_wakes(|| {
+            scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+        });
+        let rows2: usize = ["lead", "dev"]
+            .iter()
+            .map(|w| needs_rebase_msgs(&home, w).len())
+            .sum();
+        assert_eq!(rows2, 0, "#2749 same head ⇒ no NEW row on tick 2");
+        assert_eq!(
+            w2.iter()
+                .filter(|w| w.contains("kind=pr-needs-rebase"))
+                .count(),
+            0,
+            "#2749 same head ⇒ no NEW wake on tick 2 (Suppressed)"
+        );
+    }
+
+    /// RED#7 (WAKE failure): a dropped wake (delivery queue full) must NOT
+    /// invalidate the durable delivery — the row stays persisted and the ledger
+    /// stays recorded (a later tick still Suppresses).
+    #[test]
+    fn behind_wake_failure_leaves_row_and_ledger_durable() {
+        let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
+        crate::daemon::delivery_worker::test_support::set_force_full(true);
+
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        behind_state(&home, 77, 2);
+
+        // Wake goes to the REAL inject path (no capture) → queue full → wake Errs.
+        scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+        crate::daemon::delivery_worker::test_support::set_force_full(false);
+
+        // The durable row is still there despite the dropped wake.
+        for who in ["lead", "dev"] {
+            assert_eq!(
+                needs_rebase_msgs(&home, who).len(),
+                1,
+                "#2749 wake drop must NOT invalidate the durable row for {who}"
+            );
+        }
+    }
+
+    /// #2749 wake decision matrix (the ambiguous-record case + the no-wake cases):
+    /// wake ONLY on Delivered | RecordFailedAfterEnqueue (row durably persisted);
+    /// never on Suppressed (already delivered) or EnqueueFailed (no row).
+    #[test]
+    fn wake_after_ledger_decision_matrix() {
+        use crate::daemon::ci_delivery_ledger::{DeliveryError, DeliveryOutcome};
+        assert!(
+            super::wake_after_ledger(&Ok(DeliveryOutcome::Delivered)),
+            "Delivered ⇒ wake"
+        );
+        assert!(
+            super::wake_after_ledger(&Err(DeliveryError::RecordFailedAfterEnqueue(
+                anyhow::anyhow!("record write failed")
+            ))),
+            "RecordFailedAfterEnqueue ⇒ wake (row durably enqueued)"
+        );
+        assert!(
+            !super::wake_after_ledger(&Ok(DeliveryOutcome::Suppressed)),
+            "Suppressed ⇒ NO wake (a prior tick already delivered + woke)"
+        );
+        assert!(
+            !super::wake_after_ledger(&Err(DeliveryError::EnqueueFailed(anyhow::anyhow!(
+                "enqueue failed"
+            )))),
+            "EnqueueFailed ⇒ NO wake (no row persisted)"
+        );
+    }
+
+    /// #2749: the narrow wake helper builds the CANONICAL [AGEND-MSG-PENDING]
+    /// pointer (id/kind/from/inbox count) for an already-persisted row.
+    #[test]
+    fn wake_persisted_pointer_builds_canonical_inbox_pointer() {
+        let home = tmp_home(line!());
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        // Pre-stamp the id (as the durable ledger path does), persist the row so
+        // the authoritative unread count is non-zero, then wake THAT id.
+        let mut msg =
+            crate::inbox::InboxMessage::new_system("system:pr-state", "pr-needs-rebase", "b");
+        let id = crate::inbox::stamp_message_id(&mut msg);
+        assert!(!id.is_empty(), "stamp_message_id assigns an id");
+        crate::inbox::enqueue(&home, "rcpt", msg).unwrap();
+
+        let (res, wakes) = crate::inbox::with_captured_pointer_wakes(|| {
+            crate::inbox::wake_persisted_pointer(
+                &home,
+                "rcpt",
+                &id,
+                "pr-needs-rebase",
+                "system:pr-state",
+            )
+        });
+        res.expect("wake ok under capture");
+        assert_eq!(wakes.len(), 1, "one pointer captured");
+        let p = &wakes[0];
+        assert!(p.contains("[AGEND-MSG-PENDING]"), "canonical prefix: {p}");
+        assert!(p.contains(&format!("id={id}")), "pre-stamped id: {p}");
+        assert!(p.contains("kind=pr-needs-rebase"), "kind: {p}");
+        assert!(p.contains("inbox=1"), "authoritative unread count: {p}");
     }
 }
 
