@@ -482,6 +482,33 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
     }
     let _lock = lock_branch(home, &record.repo, &record.branch)?;
     let path = record_file(home, &record.repo, &record.branch, &record.target);
+    // B1 — atomic revoke-and-replace under the one branch lock: if a record ALREADY
+    // exists at this key with a DIFFERENT assignment_id, RETIRE its outbox row BEFORE
+    // overwriting it, so the old actionable delivery_nonce is not orphaned. A corrupt
+    // existing record FAILS CLOSED (bail) — never blindly overwrite/lose it (B4). A
+    // same-id re-persist is idempotent (no self-supersede).
+    if let Some(old) = read_record(&path)? {
+        if old.assignment_id != record.assignment_id {
+            let successor = format!("superseded-{}", record.assignment_id);
+            let outcome = crate::inbox::storage::supersede_by_nonce(
+                home,
+                &record.target,
+                &old.delivery_nonce,
+                &successor,
+            );
+            // Mirror the A8 revoke path: a row the reviewer had already READ is not
+            // retracted by the supersede alone — surface a durable revocation notice
+            // for the retired assignment (I21). Clock-injected via the new record's
+            // `created_at` (persist takes no separate `now`).
+            if outcome.was_read {
+                crate::inbox::storage::enqueue(
+                    home,
+                    &record.target,
+                    build_revocation_notice(&old, &record.created_at),
+                )?;
+            }
+        }
+    }
     atomic_write_json(&path, record)?;
     Ok(())
 }
