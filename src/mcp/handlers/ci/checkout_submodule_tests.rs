@@ -1281,6 +1281,13 @@ fn checkout_idempotent_bound_reuse_inits_empty_submodules_2755() {
         &["worktree", "add", &wt.display().to_string(), branch],
         false,
     );
+    // A daemon-managed worktree carries the `.agend-managed` marker; the R3 reuse
+    // provenance gate requires it (+ within the daemon worktree area + matching source).
+    std::fs::write(
+        wt.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=agent-reuse\nbranch=feat/reuse\n",
+    )
+    .unwrap();
     let nested_b = wt.join("vendor/mid/nested/nested_b.txt");
     assert!(
         !nested_b.exists(),
@@ -1327,6 +1334,86 @@ fn checkout_idempotent_bound_reuse_inits_empty_submodules_2755() {
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
+}
+
+/// #2755 R3 (B4, indep P0.1 + codex m-…736): a `bind:true` reuse whose binding points
+/// at a worktree of a DIFFERENT repository than the requested source MUST fail closed —
+/// the bound tree is never mutated (sync/reset/init) or returned as success. The
+/// provenance gate requires bound `source_repo` canonical == requested source_canonical.
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract.
+#[cfg(unix)]
+#[test]
+fn checkout_reuse_different_source_fails_closed_2755() {
+    let home = tmp_home("reuse-diff");
+    let requested = tmp_repo_with_file("reuse-req", "readme.txt", "requested\n");
+    let bound = tmp_repo_with_file("reuse-bound", "readme.txt", "bound\n");
+    let instance = "agent-diff";
+    let branch = "feat/diff";
+    // Both repos carry the (non-protected) branch so ensure_branch_exists is a no-op and
+    // the flow reaches the reuse block rather than failing earlier.
+    git_run_ok(&requested, &["branch", branch, "main"], false);
+    git_run_ok(&bound, &["branch", branch, "main"], false);
+
+    // A REAL daemon-managed worktree OF THE OTHER (bound) repo, with a sentinel file.
+    let wt = home.join("worktrees").join("agent-diff-bound");
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_run_ok(
+        &bound,
+        &["worktree", "add", &wt.display().to_string(), branch],
+        false,
+    );
+    std::fs::write(
+        wt.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=agent-diff\n",
+    )
+    .unwrap();
+    let sentinel = wt.join("sentinel.txt");
+    std::fs::write(&sentinel, "UNTOUCHED").unwrap();
+
+    // Binding maps instance → (branch, wt-of-bound-repo, source=bound).
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T-test",
+            "branch": branch,
+            "worktree": wt.display().to_string(),
+            "source_repo": bound.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Checkout requests the OTHER (requested) source on the same branch ⇒ provenance fail.
+    let args = json!({
+        "repository_path": requested.display().to_string(),
+        "branch": branch,
+        "bind": true,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("reuse_provenance"),
+        "reuse of a worktree with a DIFFERENT source must fail closed: {resp}"
+    );
+    assert!(
+        resp.get("idempotent").is_none(),
+        "must NOT return idempotent success: {resp}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "UNTOUCHED",
+        "the bound worktree must NOT be mutated (no sync/reset/clean/init)"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&requested).ok();
+    std::fs::remove_dir_all(&bound).ok();
 }
 
 /// Windows/open-handle: a rollback whose `git worktree remove --force` FAILS
