@@ -502,91 +502,57 @@ pub fn ensure_not_protected_json(branch: &str) -> Result<(), serde_json::Value> 
 /// is missing the 5 Kiro paths: `.kiro/agents/{agend.json,agend-prompt.md,
 /// default.json}`, `.kiro/prompts/agend.md`, `.kiro/settings.json`.
 pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
-    let workspaces = crate::paths::workspace_dir(home);
-
-    // If under $AGEND_HOME/workspace/, remove the whole directory.
-    // CR-2026-06-14 (security): a purely LEXICAL `starts_with` lets a symlink
-    // under workspace/ whose real target is ELSEWHERE take this whole-dir
-    // `remove_dir_all` and follow the symlink out of the workspace, destroying
-    // real user data. Require the path to ALSO resolve canonically inside the
-    // canonicalized workspace root (canonicalize BOTH so a symlinked
-    // $AGEND_HOME — e.g. macOS /tmp→/private/tmp — still matches).
-    let under_workspace = working_dir.starts_with(&workspaces)
-        && match (
-            dunce::canonicalize(working_dir),
-            dunce::canonicalize(&workspaces),
-        ) {
-            (Ok(wd), Ok(ws)) => wd.starts_with(&ws),
-            _ => false,
-        };
-    if under_workspace {
-        // #2234 Phase 0: under cure-(B) the workspace dir IS a daemon-managed
-        // canonical worktree (its `.git` is a gitlink FILE). A bare
-        // remove_dir_all would destroy uncommitted/unpushed work AND orphan the
-        // worktree registration in the canonical repo. Route a worktree through
-        // `git worktree remove --force` (work-at-risk backed up first). A
-        // standalone clone / plain dir (the pre-(B) state) returns false here →
-        // the byte-identical remove_dir_all below still runs.
-        if crate::worktree_pool::teardown_workspace_worktree(home, name, working_dir) {
-            // handled (gitlink worktree): removal + registry cleanup done.
-        } else if let Err(e) = std::fs::remove_dir_all(working_dir) {
-            tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
-        } else {
-            tracing::info!(dir = %working_dir.display(), "removed workspace");
-        }
+    // #2764: legacy entry — callers that hold no pre-removal fleet snapshot
+    // load a fresh one. `full_delete_instance` MUST instead use
+    // `cleanup_working_dir_proven` with the snapshot captured BEFORE it removes
+    // the victim from fleet.yaml, so survivor authority reflects the true
+    // pre-delete roster.
+    //
+    // Distinguish MISSING (no roster exists → empty survivor set → nothing can
+    // share → safe to proceed) from UNREADABLE/CORRUPT (a roster may exist but
+    // we cannot read it → ambiguous → fail closed). `FleetConfig::load` returns
+    // `Err` for both, so gate on the file's existence.
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let snapshot = if fleet_path.exists() {
+        crate::fleet::FleetConfig::load(&fleet_path).ok()
     } else {
-        // User-provided working directory: only remove agend-generated files
-        let agend_files = [
-            // Claude
-            ".claude/settings.local.json",
-            "mcp-config.json",
-            "claude-settings.json",
-            "statusline.sh",
-            "statusline.json",
-            ".claude/rules/agend.md",
-            // Gemini
-            ".gemini/settings.json",
-            // OpenCode
-            "opencode.json",
-            "instructions/agend.md",
-            // Codex
-            ".codex/config.toml",
-            "AGENTS.md",
-            // Kiro
-            ".kiro/settings/mcp.json",
-            ".kiro/settings/agend-mcp-wrapper.sh",
-            ".kiro/steering/agend.md",
-            ".kiro/agents/agend.json",
-            ".kiro/agents/agend-prompt.md",
-            ".kiro/agents/default.json",
-            ".kiro/prompts/agend.md",
-            ".kiro/settings.json",
-        ];
-        for file in &agend_files {
-            let path = working_dir.join(file);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
+        Some(crate::fleet::FleetConfig::default())
+    };
+    cleanup_working_dir_proven(home, snapshot.as_ref(), &[name], name, working_dir);
+}
+
+/// #2764: proof-carrying working-dir cleanup. Routes the destructive decision
+/// through [`workspace_cleanup::plan_cleanup`] using the caller-supplied
+/// IMMUTABLE `snapshot` (the fleet roster as it was BEFORE the victim's entry
+/// was removed). Shared/ambiguous authority is a complete path-local no-op —
+/// no scrub, no worktree teardown, no `remove_dir_all`. The always-run metadata
+/// cleanup tail is unchanged (it never touches the workspace tree).
+pub fn cleanup_working_dir_proven(
+    home: &Path,
+    snapshot: Option<&crate::fleet::FleetConfig>,
+    cohort: &[&str],
+    name: &str,
+    working_dir: &Path,
+) {
+    use crate::agent_ops::workspace_cleanup::{self, CleanupPlan};
+    match workspace_cleanup::plan_cleanup(snapshot, home, cohort, name, working_dir) {
+        CleanupPlan::RemoveOwned(proof) => {
+            if let Err(e) = workspace_cleanup::execute_remove_owned(home, name, &proof) {
+                tracing::debug!(dir = %proof.canonical().display(), error = %e, "cleanup: remove workspace");
+            } else {
+                tracing::info!(dir = %proof.canonical().display(), "removed workspace");
             }
         }
-
-        // Clean up worktree if exists
-        let wt_dir = working_dir.join(".worktrees").join(name);
-        if wt_dir.exists() {
-            // W1.2: LOCAL best-effort worktree-remove via the bypass+bounded
-            // helper (was a raw UNBOUNDED `.output()` whose result was already
-            // discarded). git_ok adds the LOCAL_GIT_TIMEOUT bound so a stuck
-            // remove can't hang teardown; the bypass env is a no-op in the
-            // daemon's shim-free PATH. Result stays discarded → same effect.
-            let _ = crate::git_helpers::git_ok(
-                working_dir,
-                &[
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &wt_dir.display().to_string(),
-                ],
-            );
-            tracing::info!(dir = %wt_dir.display(), "removed worktree");
+        CleanupPlan::ScrubExclusive(proof) => {
+            workspace_cleanup::execute_scrub_exclusive(home, name, &proof);
+        }
+        CleanupPlan::PreserveShared { reason } => {
+            tracing::warn!(agent = name, dir = %working_dir.display(), %reason,
+                "#2764 cleanup: shared workspace — complete path-local no-op");
+        }
+        CleanupPlan::PreserveAmbiguous { reason } => {
+            tracing::warn!(agent = name, dir = %working_dir.display(), %reason,
+                "#2764 cleanup: ambiguous ownership — failing closed, complete path-local no-op");
         }
     }
 
@@ -1521,7 +1487,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+pub mod workspace_cleanup;
+
 mod review_repro_agent_binding;
 #[cfg(test)]
 mod review_repro_xcut_security;

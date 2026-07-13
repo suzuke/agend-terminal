@@ -14,7 +14,6 @@
 //!   future callers (e.g. `handle_spawn` rejection-message enrichment)
 //!   that want to surface the divergent-store list to the operator.
 
-use crate::agent_ops::cleanup_working_dir;
 use crate::channel::telegram;
 use serde_json::json;
 use std::path::Path;
@@ -135,15 +134,21 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // #1907: default to `workspace/<name>` when the fleet entry has no explicit
     // `working_directory`. Otherwise the daemon-created default workspace dir
     // (per-backend skills/config under `$AGEND_HOME/workspace/<name>`) LEAKS on
-    // delete — `cleanup_working_dir` only ran when the resolver returned a path,
-    // but it returns `None` for the (common) entries that never set
-    // `working_directory:` explicitly. `cleanup_working_dir` only `remove_dir_all`s
-    // paths UNDER `$AGEND_HOME/workspace/`, so a user-provided dir is never nuked —
-    // the default fed here is always under workspace/, the path it's safe to remove.
+    // delete — cleanup only ran when the resolver returned a path, but it
+    // returns `None` for the (common) entries that never set
+    // `working_directory:` explicitly.
     let wd = working_dir
         .clone()
         .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
-    cleanup_working_dir(home, name, &wd);
+    // #2764: route the destructive cleanup through the proof-carrying planner
+    // using the IMMUTABLE pre-removal `fleet` snapshot captured above (BEFORE
+    // `remove_instance_from_yaml`), NOT a fresh post-removal reload — so
+    // survivor ownership authority reflects the true pre-delete roster. A
+    // victim `working_directory` that aliases a surviving instance's dir (the
+    // 2026-07-13 incident) now resolves to a complete path-local no-op instead
+    // of recursively removing the survivor's tree. `cohort = [name]` excludes
+    // only the victim from the survivor set.
+    crate::agent_ops::cleanup_working_dir_proven(home, fleet.as_ref(), &[name], name, &wd);
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,
     // so cleanup_working_dir's best-effort lookup may miss the id path.
     // #1682: construct the id path via agent_ops (fleet.yaml is gone, so the

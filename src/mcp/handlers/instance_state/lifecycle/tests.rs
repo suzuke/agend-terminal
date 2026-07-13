@@ -632,3 +632,156 @@ fn full_delete_clears_binding_and_succeeds_1879() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2764: proof-carrying workspace ownership (real full_delete entry) ──────
+//
+// These drive the REAL `full_delete_instance`, exercising the
+// removal-before-cleanup ordering: the victim's fleet entry is removed, then
+// cleanup runs against the PRE-removal snapshot. A victim whose
+// `working_directory` aliases (or nests inside) a SURVIVING instance's dir must
+// leave that dir byte-identical.
+
+/// Seed three canary files whose survival proves no whole-tree removal / scrub.
+fn seed_canaries(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join(".codex")).unwrap();
+    std::fs::write(dir.join("arbitrary.txt"), b"USER DATA").unwrap();
+    std::fs::write(dir.join("AGENTS.md"), b"# agents").unwrap();
+    std::fs::write(dir.join(".codex/config.toml"), b"key = 1").unwrap();
+}
+
+fn canaries_intact(dir: &std::path::Path) -> bool {
+    std::fs::read(dir.join("arbitrary.txt")).ok().as_deref() == Some(b"USER DATA")
+        && std::fs::read(dir.join("AGENTS.md")).ok().as_deref() == Some(b"# agents")
+        && std::fs::read(dir.join(".codex/config.toml"))
+            .ok()
+            .as_deref()
+            == Some(b"key = 1")
+}
+
+/// R1 (incident): victim.working_directory points AT a live sibling's default
+/// workspace dir. Deleting the victim must be a complete no-op on that dir.
+#[test]
+fn full_delete_victim_aliasing_sibling_default_preserves_sibling() {
+    let home = tmp_home("alias_sibling_default");
+    let sibling_dir = crate::paths::workspace_dir(&home).join("sibling");
+    seed_canaries(&sibling_dir);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  sibling:\n    backend: claude\n",
+            sibling_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        canaries_intact(&sibling_dir),
+        "victim delete recursively removed/scrubbed the live sibling's dir {sibling_dir:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// R2: victim + survivor share an EXTERNAL directory. Delete must not scrub the
+/// survivor's `.codex/config.toml` / `AGENTS.md`.
+#[test]
+fn full_delete_shared_external_dir_preserves_survivor_config() {
+    let home = tmp_home("shared_external");
+    let shared = tmp_home("shared_external_target");
+    seed_canaries(&shared);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {sh}\n  survivor:\n    backend: claude\n    working_directory: {sh}\n",
+            sh = shared.display()
+        ),
+    )
+    .unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        canaries_intact(&shared),
+        "victim delete scrubbed a survivor-shared external dir {shared:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(shared).ok();
+}
+
+/// R3 (plain leaf symlink): victim.working_directory is a symlink whose target
+/// is a live sibling's dir. Canonicalization must resolve the alias → no-op.
+#[test]
+#[cfg(unix)]
+fn full_delete_symlink_alias_preserves_target() {
+    let home = tmp_home("symlink_alias");
+    let sibling_dir = crate::paths::workspace_dir(&home).join("sibling");
+    seed_canaries(&sibling_dir);
+    let link = crate::paths::workspace_dir(&home).join("victim-link");
+    std::os::unix::fs::symlink(&sibling_dir, &link).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  sibling:\n    backend: claude\n",
+            link.display()
+        ),
+    )
+    .unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        canaries_intact(&sibling_dir),
+        "victim delete followed a symlink and removed the live sibling's real dir {sibling_dir:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// R4 (regression pin): victim's dir is its EXACT canonical default under this
+/// home, no survivor overlaps → the whole tree is still removed. The
+/// `working_directory` is set explicitly to the exact default so the resolved
+/// target is under the test `home` (the None-default path resolves via the
+/// global `home_dir()`, which a unit test can't relocate without a process-wide
+/// env mutation); the planner path exercised — `candidate == owned_default` —
+/// is byte-identical either way.
+#[test]
+fn full_delete_exact_owned_default_still_removed() {
+    let home = tmp_home("owned_default_removed");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  other:\n    backend: claude\n",
+            vdir.display()
+        ),
+    )
+    .unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        !vdir.exists(),
+        "victim's exact owned default dir must still be removed, but survived: {vdir:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// R6 (fail-closed): fleet.yaml is unreadable at cleanup time → the victim's
+/// default dir must be PRESERVED (cannot prove non-sharing). Also pins that
+/// authority derives from a snapshot, not a post-removal reload.
+#[test]
+fn full_delete_unreadable_fleet_fails_closed() {
+    let home = tmp_home("unreadable_fleet");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    // fleet.yaml is a DIRECTORY → FleetConfig::load errors → snapshot None.
+    std::fs::create_dir_all(crate::fleet::fleet_yaml_path(&home)).unwrap();
+
+    let _ = super::full_delete_instance(&home, "victim");
+    assert!(
+        canaries_intact(&vdir),
+        "unreadable fleet must fail closed (preserve), but the dir was mutated: {vdir:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}

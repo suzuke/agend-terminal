@@ -470,8 +470,27 @@ mod workspace;
 pub use workspace::{
     checkout_workspace_branch, detach_workspace_to_holding, prepare_workspace_worktree,
     reconcile_workspace_to_worktree, release_stale_branch_holders, reverse_reconcile,
-    teardown_workspace_worktree, workspace_as_worktree_enabled,
+    workspace_as_worktree_enabled,
 };
+// #2764: the RAW workspace-worktree teardown is now crate-internal — the only
+// authorized destructive caller is `teardown_workspace_worktree_proven` below,
+// which demands a `RemoveOwnedProof` minted by the ownership planner.
+pub(crate) use workspace::teardown_workspace_worktree;
+
+/// #2764: proof-gated wrapper over [`teardown_workspace_worktree`]. A caller
+/// cannot tear down a workspace worktree without a [`RemoveOwnedProof`], which
+/// only `agent_ops::workspace_cleanup::plan_cleanup` can construct. Operates on
+/// the proof's revalidated canonical path.
+pub fn teardown_workspace_worktree_proven(
+    home: &Path,
+    agent: &str,
+    proof: &crate::agent_ops::workspace_cleanup::RemoveOwnedProof,
+) -> bool {
+    // Canonical path — git registers worktrees by realpath, so a canonical
+    // target matches the registration (an `/var` original could miss a
+    // `/private/var` realpath registration on macOS, orphaning it).
+    teardown_workspace_worktree(home, agent, proof.canonical())
+}
 #[cfg(test)]
 pub(crate) use workspace::{
     release_one_stale_holder, workspace_as_worktree_from_env, workspace_worktree_test_seam,
