@@ -44,12 +44,17 @@ fi
 # rather than asserted as byte-exact — and without pinning a toolchain here.
 echo "fmt-owned: $(rustfmt --version 2>/dev/null) [edition 2021, owned *.rs, vendor/** excluded]" >&2
 
-# Resolve the SUPERPROJECT root so enumeration + rustfmt run against the owned
-# tree regardless of CWD — including when invoked from within a submodule (then
-# --show-superproject-working-tree names the parent superproject; otherwise we
-# are already at the top level).
-root="$(git rev-parse --show-superproject-working-tree 2>/dev/null || true)"
-[ -n "$root" ] || root="$(git rev-parse --show-toplevel)"
+# Resolve the OUTERMOST superproject working tree so enumeration + rustfmt always
+# run against the top-level owned tree, regardless of CWD. `--show-superproject-
+# working-tree` climbs only ONE level, so from a deeply nested submodule a single
+# call names the IMMEDIATE superproject (and would then format vendored sources
+# under it); loop until it reports no superproject to reach the top.
+root="$(git rev-parse --show-toplevel)"
+while true; do
+    super="$(git -C "$root" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+    [ -n "$super" ] || break
+    root="$super"
+done
 cd "$root"
 
 # NUL-safe: enumerate tracked owned *.rs (vendor/** excluded). A -z stream keeps
