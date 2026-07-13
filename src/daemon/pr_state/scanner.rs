@@ -2,8 +2,9 @@ use std::path::Path;
 
 use super::gh_poll;
 use super::{
-    apply, format_ready_body, pr_state_dir, remove, resolve_author, resolve_merge_authority,
-    with_pr_state, CiState, DraftState, Event, MergeState, PrState, ReviewClass, VerdictState,
+    apply, format_ready_body, freshness_gate, pr_state_dir, remove, resolve_author,
+    resolve_merge_authority, with_pr_state, CiState, DraftState, Event, FreshnessGate, MergeState,
+    PrState, ReviewClass, VerdictState, FRESHNESS_TTL_SECS,
 };
 
 enum ScanAction {
@@ -163,36 +164,79 @@ pub fn scan_and_emit_with(
             if matches!(state.merge_state, MergeState::MergeReady)
                 && state.ready_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
             {
-                // #2059-#3: ready-for-MERGE routes to the MERGE AUTHORITY (the
-                // team orchestrator via durable fleet.yaml teams), NOT the
-                // binding-resolved author — the implementer releases the
-                // worktree post-push, so the binding-first `resolve_notify_
-                // recipient` falls through to the author by merge-ready time
-                // (the PR #2058 mis-route). `[review-verdict]` keeps the
-                // author-facing resolver; only this terminal signal changes
-                // audience.
-                let recipient = resolve_merge_authority(home, state);
-                let body = format_ready_body(state);
-                let msg = build_event_message("pr-ready-for-merge", &recipient, state, body);
-                // #1629: defer the enqueue (see top of fn). Set the dedup flag
-                // optimistically under the flock. The pr-ready arm has NO
-                // persistent ledger backstop (unlike the Merged/ClosedUnmerged
-                // arms), so the deferred `pending_ready` drain below RESETS this
-                // flag if the post-flock enqueue fails — otherwise a failed
-                // enqueue would leave the flag set and the signal would be lost
-                // until head_sha next changes. The flock-free emit (the reset is a
-                // separate post-flock `with_pr_state`) preserves the #1617
-                // lock-while-blocking guarantee.
-                state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                dirty = true;
-                tracing::info!(
-                    repo = %state.repo,
-                    branch = %state.branch,
-                    head = %state.head_sha,
-                    recipient = %recipient,
-                    "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
-                );
-                pending_ready = Some((recipient, msg, state.head_sha.clone()));
+                // #2749 A5 (Fable): a legacy/torn state can carry a stale
+                // `merge_state == MergeReady` while `review_class` is Unresolved
+                // (files persisted before #2745, or a future off-tick populator
+                // stamping a legacy Unresolved watch fresh). `is_merge_ready`
+                // already refuses Unresolved, but a PERSISTED MergeReady reaches
+                // this arm WITHOUT re-running that reducer — so refuse HERE, before
+                // ANY freshness delivery (pr-ready now, or the pr-needs-rebase
+                // Behind arm in the next increment). Fail closed: emit nothing. The
+                // #2745 [review-class-unresolved] diagnostic below is NotReady-gated,
+                // so it does not fire for a MergeReady state either.
+                if matches!(state.review_class, ReviewClass::Unresolved) {
+                    tracing::debug!(
+                        repo = %state.repo,
+                        branch = %state.branch,
+                        head = %state.head_sha,
+                        "#2749 A5 pr_state: freshness delivery suppressed — review_class Unresolved on a MergeReady state"
+                    );
+                } else {
+                    // #2749 (decision d-20260712092257798199-17): read-only freshness
+                    // gate. A MergeReady PR may announce [pr-ready-for-merge] ONLY when
+                    // deterministic latest-main ancestry is PROVEN fresh at the current
+                    // head. The gate is PURE — it reads the freshness cache tuple
+                    // stamped by the OFF-TICK populator, doing ZERO provider.compare on
+                    // this tick. Unknown / torn observation / stale-past-TTL / error ⇒
+                    // fail CLOSED (suppress; #2747's exact-head merge remains the hard
+                    // backstop). Behind ⇒ suppress here too; the durable
+                    // [pr-needs-rebase] notice is wired in the next increment.
+                    match freshness_gate(state, chrono::Utc::now(), FRESHNESS_TTL_SECS) {
+                        FreshnessGate::Fresh => {
+                            // #2059-#3: ready-for-MERGE routes to the MERGE AUTHORITY
+                            // (the team orchestrator via durable fleet.yaml teams), NOT
+                            // the binding-resolved author — the implementer releases the
+                            // worktree post-push, so the binding-first `resolve_notify_
+                            // recipient` falls through to the author by merge-ready time
+                            // (the PR #2058 mis-route). `[review-verdict]` keeps the
+                            // author-facing resolver; only this terminal signal changes
+                            // audience.
+                            let recipient = resolve_merge_authority(home, state);
+                            let body = format_ready_body(state);
+                            let msg =
+                                build_event_message("pr-ready-for-merge", &recipient, state, body);
+                            // #1629: defer the enqueue (see top of fn). Set the dedup
+                            // flag optimistically under the flock. The pr-ready arm has
+                            // NO persistent ledger backstop (unlike the Merged/
+                            // ClosedUnmerged arms), so the deferred `pending_ready` drain
+                            // below RESETS this flag if the post-flock enqueue fails —
+                            // otherwise a failed enqueue would leave the flag set and the
+                            // signal would be lost until head_sha next changes. The
+                            // flock-free emit (the reset is a separate post-flock
+                            // `with_pr_state`) preserves the #1617 lock-while-blocking
+                            // guarantee.
+                            state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                            dirty = true;
+                            tracing::info!(
+                                repo = %state.repo,
+                                branch = %state.branch,
+                                head = %state.head_sha,
+                                recipient = %recipient,
+                                "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
+                            );
+                            pending_ready = Some((recipient, msg, state.head_sha.clone()));
+                        }
+                        gate => {
+                            tracing::debug!(
+                                repo = %state.repo,
+                                branch = %state.branch,
+                                head = %state.head_sha,
+                                ?gate,
+                                "#2749 pr_state: [pr-ready-for-merge] suppressed — latest-main ancestry not proven fresh"
+                            );
+                        }
+                    }
+                }
             }
 
             // #2745 fail-closed: a would-be-ready state whose review_class is
@@ -752,12 +796,47 @@ mod tests {
     use super::super::gh_poll::tests::MockGhPoller;
     use super::super::gh_poll::{GhPrMetadata, GhPrState};
     use super::super::{
-        load, new_for_branch, save, CiState, MergeState, ReviewClass, VerdictState,
+        freshness_gate, load, new_for_branch, save, CiState, FreshnessGate, MergeState,
+        ReviewClass, VerdictState,
     };
     use super::scan_and_emit_with;
 
     fn empty_registry() -> crate::agent::AgentRegistry {
         std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// #2749 test helper: an otherwise fully MergeReady PR (CI green + VERIFIED
+    /// at `head`, not draft) with an EMPTY freshness cache. Callers stamp /
+    /// mutate the freshness+observed fields to exercise each gate branch.
+    fn merge_ready_state(repo: &str, branch: &str, head: &str, pr: u64) -> super::super::PrState {
+        let mut s = new_for_branch(repo, branch, head, ReviewClass::Single);
+        s.pr_number = pr;
+        s.ci_state = CiState::Green {
+            sha: head.into(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("r".into(), head.into())],
+        };
+        s.merge_state = MergeState::MergeReady;
+        s
+    }
+
+    /// Stamp a VALID freshness tuple onto `s`: three heads agree at `head`,
+    /// checked base == observed base == `base`, no error, both timestamps == now,
+    /// the given `behind_by` — so `freshness_gate` returns `Fresh` (behind_by==0)
+    /// or `Behind` (behind_by>0).
+    fn stamp_fresh_tuple(s: &mut super::super::PrState, head: &str, base: &str, behind_by: u64) {
+        let now = chrono::Utc::now().to_rfc3339();
+        s.observed_head_sha = Some(head.into());
+        s.observed_base_sha = Some(base.into());
+        s.observed_at = Some(now.clone());
+        s.observed_error = false;
+        s.freshness_checked_head_sha = Some(head.into());
+        s.freshness_checked_base_sha = Some(base.into());
+        s.freshness_checked_at = Some(now);
+        s.freshness_behind_by = Some(behind_by);
+        s.freshness_error = false;
     }
 
     fn open_pr_meta(number: u64, branch: &str) -> GhPrMetadata {
@@ -1021,6 +1100,138 @@ mod tests {
              the backstop)"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2749 no-regression guard (RED #6): a MergeReady PR whose freshness tuple
+    /// is VALID and FRESH (three heads agree, checked base == observed base, no
+    /// error, within TTL, behind_by == 0) must STILL emit [pr-ready-for-merge] —
+    /// deterministic ancestry proven fresh WINS. This pins the gate so a GREEN
+    /// implementation cannot degenerate into "never emit" (which would satisfy
+    /// the fail-closed RED alone). Ancestry-fresh ⇒ ready fires unchanged.
+    #[test]
+    fn merge_ready_with_fresh_tuple_still_emits_pr_ready() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-2749-fresh-emits-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let head = "abcdef0";
+        let mut s = merge_ready_state("o/r", "b", head, 78);
+        stamp_fresh_tuple(&mut s, head, "beef0001", 0);
+        save(&home, &s).unwrap();
+
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(78, "b")])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        let reloaded = load(&home, "o/r", "b").expect("state persists");
+        assert_eq!(
+            reloaded.ready_emitted_for_sha,
+            Some(head.to_string()),
+            "#2749 no-regression: a MergeReady PR with a valid FRESH tuple \
+             (behind_by=0) must STILL emit [pr-ready-for-merge]"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2749 A5 (Fable pinning test): a PERSISTED MergeReady state whose
+    /// `review_class` is Unresolved must emit NOTHING from the freshness arm —
+    /// even with a VALID FRESH tuple that would otherwise open pr-ready. Guards
+    /// against a future off-tick populator reviving a legacy stale MergeReady
+    /// whose class was never resolved (the reducer's `is_merge_ready` refuses
+    /// Unresolved, but a persisted MergeReady bypasses that path). Fail closed.
+    #[test]
+    fn merge_ready_unresolved_class_suppresses_freshness_delivery() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-2749-a5-unresolved-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let head = "abcdef0";
+        let mut s = merge_ready_state("o/r", "b", head, 79);
+        // Legacy/torn: persisted MergeReady, but the class was never resolved.
+        s.review_class = ReviewClass::Unresolved;
+        stamp_fresh_tuple(&mut s, head, "beef0001", 0);
+        save(&home, &s).unwrap();
+
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(79, "b")])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        let reloaded = load(&home, "o/r", "b").expect("state persists");
+        assert_eq!(
+            reloaded.ready_emitted_for_sha, None,
+            "#2749 A5: a MergeReady state with review_class Unresolved must NOT \
+             emit pr-ready even with a fresh tuple (fail closed before delivery)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2749 the pure read-only three-way classifier. Fresh only when the whole
+    /// tuple agrees and is within TTL at behind_by==0; behind_by>0 ⇒ Behind;
+    /// every unknown/torn/stale/error input ⇒ Suppress (fail closed). Exercised
+    /// directly (populator-independent) so the gate logic is pinned without the
+    /// end-to-end scanner harness.
+    #[test]
+    fn freshness_gate_classifies() {
+        let now = chrono::Utc::now();
+        let head = "aaaaaaa";
+        let base = "bbbbbbb";
+        let valid = |behind: u64| {
+            let mut s = new_for_branch("o/r", "b", head, ReviewClass::Single);
+            stamp_fresh_tuple(&mut s, head, base, behind);
+            s
+        };
+
+        // Fresh: agreeing tuple, within TTL, behind_by == 0.
+        assert_eq!(freshness_gate(&valid(0), now, 600), FreshnessGate::Fresh);
+        // Behind: agreeing tuple, behind_by > 0.
+        assert_eq!(
+            freshness_gate(&valid(3), now, 600),
+            FreshnessGate::Behind { behind_by: 3 }
+        );
+        // Unknown: no tuple at all (fresh state) ⇒ Suppress.
+        assert_eq!(
+            freshness_gate(
+                &new_for_branch("o/r", "b", head, ReviewClass::Single),
+                now,
+                600
+            ),
+            FreshnessGate::Suppress
+        );
+        // Checked head != current head ⇒ Suppress.
+        let mut s = valid(0);
+        s.freshness_checked_head_sha = Some("ccccccc".into());
+        assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
+        // Observed head != current head (torn) ⇒ Suppress.
+        let mut s = valid(0);
+        s.observed_head_sha = Some("ccccccc".into());
+        assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
+        // Checked base != observed base (the #2749 main-advance case) ⇒ Suppress.
+        let mut s = valid(0);
+        s.observed_base_sha = Some("ddddddd".into());
+        assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
+        // Compare error ⇒ Suppress.
+        let mut s = valid(0);
+        s.freshness_error = true;
+        assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
+        // Observation error ⇒ Suppress.
+        let mut s = valid(0);
+        s.observed_error = true;
+        assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
+        // Stale past TTL (evaluate well beyond the 600s bound) ⇒ Suppress.
+        assert_eq!(
+            freshness_gate(&valid(0), now + chrono::Duration::seconds(900), 600),
+            FreshnessGate::Suppress
+        );
+        // behind_by unknown but tuple otherwise valid ⇒ Suppress (never guess 0).
+        let mut s = valid(0);
+        s.freshness_behind_by = None;
+        assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
     }
 }
 

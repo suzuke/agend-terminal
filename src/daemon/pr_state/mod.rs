@@ -558,6 +558,103 @@ pub fn is_merge_ready(state: &PrState) -> bool {
         .all(|(_, reviewed)| sha_prefix_match(&state.head_sha, reviewed))
 }
 
+/// #2749 read-only freshness gate outcome (decision d-20260712092257798199-17).
+/// Derived PURELY from the PrState freshness cache tuple (`freshness_checked_*`)
+/// plus the atomic observed pair (`observed_*`). Computing this NEVER runs a
+/// `provider.compare` — that ancestry work is the OFF-TICK populator's job, so
+/// the per-tick scanner path stays free of a compare storm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshnessGate {
+    /// Ancestry PROVEN fresh at the current head (behind_by == 0): the PR may
+    /// announce `[pr-ready-for-merge]`.
+    Fresh,
+    /// Ancestry PROVEN stale — a valid, agreeing tuple with behind_by > 0:
+    /// suppress pr-ready and durably emit `[pr-needs-rebase]`.
+    Behind { behind_by: u64 },
+    /// Ancestry UNPROVEN — unknown (pre-populator), torn observation (the three
+    /// heads disagree or the checked/observed bases disagree), stale past TTL, or
+    /// a compare/observe error. FAIL CLOSED: suppress pr-ready and emit NOTHING
+    /// (never mislabel as pr-needs-rebase). #2747's exact-head merge gate is the
+    /// hard backstop; the off-tick populator refreshes the tuple next cycle.
+    Suppress,
+}
+
+/// #2749 freshness cache TTL — the ε staleness bound. A checked tuple or an
+/// observation older than this (relative to the gate's `now`) is treated as
+/// stale and the gate fails closed. Sized generously above the off-tick
+/// populator cadence so a single skipped refresh cycle does not needlessly
+/// suppress a genuinely-fresh pr-ready. Documented ε = populator cadence +
+/// FRESHNESS_TTL_SECS.
+pub const FRESHNESS_TTL_SECS: i64 = 600;
+
+/// #2749 the read-only three-way freshness gate (CORRECTION 3 / codex R2). A
+/// MergeReady PR may announce pr-ready ONLY when deterministic latest-main
+/// ancestry is PROVEN fresh at the current head. Requires ALL of:
+/// - three heads agree: `head_sha == observed_head_sha == freshness_checked_head_sha`
+///   (ci_head == the atomically-observed head == the head the compare used);
+/// - the CHECKED base equals the INDEPENDENTLY-observed base
+///   (`freshness_checked_base_sha == observed_base_sha`). A main advance bumps
+///   `observed_base_sha` (via gh_poll) while the checked base still lags ⇒
+///   mismatch ⇒ Suppress until the populator rechecks. This is what makes a
+///   stale-but-self-consistent tuple fail closed — the core #2749 fix; a
+///   tuple-only check (no independent base) cannot detect the main advance.
+/// - neither the observation nor the compare errored;
+/// - both the observation (`observed_at`) and the compare
+///   (`freshness_checked_at`) are within `ttl_secs` of `now`.
+///
+/// Then `behind_by == 0 ⇒ Fresh`, `> 0 ⇒ Behind`. Any missing / mismatched /
+/// stale / errored input ⇒ Suppress.
+pub fn freshness_gate(
+    state: &PrState,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_secs: i64,
+) -> FreshnessGate {
+    // Three heads must agree.
+    let (Some(checked_head), Some(observed_head)) = (
+        state.freshness_checked_head_sha.as_deref(),
+        state.observed_head_sha.as_deref(),
+    ) else {
+        return FreshnessGate::Suppress;
+    };
+    if checked_head != state.head_sha || observed_head != state.head_sha {
+        return FreshnessGate::Suppress;
+    }
+    // The checked base must equal the independently-observed base.
+    let (Some(checked_base), Some(observed_base)) = (
+        state.freshness_checked_base_sha.as_deref(),
+        state.observed_base_sha.as_deref(),
+    ) else {
+        return FreshnessGate::Suppress;
+    };
+    if checked_base != observed_base {
+        return FreshnessGate::Suppress;
+    }
+    // Neither signal errored.
+    if state.observed_error || state.freshness_error {
+        return FreshnessGate::Suppress;
+    }
+    // Both the observation and the compare must be within TTL.
+    let within_ttl = |ts: Option<&str>| -> bool {
+        let Some(ts) = ts else { return false };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            return false;
+        };
+        now.signed_duration_since(parsed.with_timezone(&chrono::Utc))
+            .num_seconds()
+            <= ttl_secs
+    };
+    if !within_ttl(state.observed_at.as_deref())
+        || !within_ttl(state.freshness_checked_at.as_deref())
+    {
+        return FreshnessGate::Suppress;
+    }
+    match state.freshness_behind_by {
+        Some(0) => FreshnessGate::Fresh,
+        Some(n) => FreshnessGate::Behind { behind_by: n },
+        None => FreshnessGate::Suppress,
+    }
+}
+
 // ─── storage ───────────────────────────────────────────────────────────
 
 /// Canonical path to the PR-state directory.

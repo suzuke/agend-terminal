@@ -23,6 +23,27 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// #2749: stamp a VALID, FRESH deterministic-ancestry tuple on `s` — three
+/// heads agree at the current `head_sha`, checked base == observed base, no
+/// error, both timestamps `now`, behind_by == 0 — so the read-only freshness
+/// gate returns `Fresh` and `[pr-ready-for-merge]` may emit. This is the state a
+/// genuinely up-to-date PR has once the off-tick populator has run; tests about
+/// routing / dedup / threshold (NOT ancestry) call it to satisfy the new gate
+/// precondition without exercising the populator.
+fn stamp_fresh_ancestry(s: &mut PrState) {
+    let head = s.head_sha.clone();
+    let ts = now();
+    s.observed_head_sha = Some(head.clone());
+    s.observed_base_sha = Some("main-base".to_string());
+    s.observed_at = Some(ts.clone());
+    s.observed_error = false;
+    s.freshness_checked_head_sha = Some(head);
+    s.freshness_checked_base_sha = Some("main-base".to_string());
+    s.freshness_checked_at = Some(ts);
+    s.freshness_behind_by = Some(0);
+    s.freshness_error = false;
+}
+
 fn new_state(head: &str, class: ReviewClass) -> PrState {
     PrState {
         repo: "owner/repo".to_string(),
@@ -528,6 +549,9 @@ fn t18_scan_and_emit_fires_once_per_sha() {
     };
     s.merge_state = MergeState::MergeReady;
     s.pr_author = "dev".to_string();
+    // #2749: this test pins once-per-sha dedup, not ancestry — stamp a fresh
+    // tuple so the read-only freshness gate admits the emission.
+    stamp_fresh_ancestry(&mut s);
     save(&dir, &s).unwrap();
 
     let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -1265,6 +1289,9 @@ fn t20_dual_review_does_not_merge_until_two_verdicts_e2e() {
         },
     );
     assert_eq!(s.merge_state, MergeState::MergeReady);
+    // #2749: dual-review gate test — stamp a fresh ancestry tuple so the
+    // read-only freshness gate admits the emission once both verdicts land.
+    stamp_fresh_ancestry(&mut s);
     save(&dir, &s).unwrap();
 
     // Scanner now fires [pr-ready-for-merge].
@@ -1959,6 +1986,9 @@ fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
         reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
     };
     s.merge_state = MergeState::MergeReady;
+    // #2749: this test pins author promotion + merge-authority routing, not
+    // ancestry — stamp a fresh tuple so the freshness gate admits emission.
+    stamp_fresh_ancestry(&mut s);
     // subscribers[0] is "dev" from fixture — but we want gh-poll
     // to win via tier 2 name match. Set up a fleet.yaml with a
     // "suzuke" instance that matches the gh author.login.
@@ -2337,6 +2367,13 @@ fn pr_ready_for_merge_routes_to_merge_authority_2059() {
         Some("headsha"),
         VerdictKind::Verified,
     );
+    // #2749: this test pins merge-authority ROUTING, not ancestry — stamp a
+    // fresh tuple on the now-MergeReady state so the freshness gate admits it.
+    {
+        let mut s = load(&home, "owner/repo", "feat/x").expect("merge-ready state present");
+        stamp_fresh_ancestry(&mut s);
+        save(&home, &s).unwrap();
+    }
     let poller = MockGhPoller::new(vec![Ok(vec![])]);
     scan_and_emit_with(&home, &empty_registry(), &poller);
     // #2059-#3: merge-ready routes to the MERGE AUTHORITY (orchestrator),
