@@ -4307,6 +4307,75 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2760 (default-board BUG fix): a sweep `apply` over ids on DIFFERENT boards must
+/// land each `Cancelled` on ITS OWN board. Pre-#2760 `emit_cancelled_batch` wrote
+/// every Cancelled to the DEFAULT board (`append_batch_checked(home, …)`), so a
+/// project-board task's cancel landed where its own board's replay never saw it —
+/// it stayed live. GREEN routes each id to its authoritative board.
+#[test]
+fn sweep_apply_routes_each_cancel_to_its_own_board_2760() {
+    let home = tmp_home("sweep_multiboard_2760");
+    write_fleet_yaml(&home, &["alive"]);
+    // One task on the DEFAULT board, one on a PROJECT board (explicit `project`).
+    let def_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"def task","assignee":"alive"}),
+    )["id"]
+        .as_str()
+        .expect("def id")
+        .to_string();
+    let proj_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action":"create","title":"proj task","assignee":"alive","project":"proj-sw"}),
+    )["id"]
+        .as_str()
+        .expect("proj id")
+        .to_string();
+
+    let confirm: std::collections::HashSet<String> =
+        [def_id.clone(), proj_id.clone()].into_iter().collect();
+    // Empty categories → both ids classify as validation_leftovers; the emit still
+    // cancels each id on its own routed board.
+    let cats = sweep::Categories::default();
+    let count = sweep::emit_cancelled_batch(&home, &cats, &confirm, "multi-board sweep 2760")
+        .expect("emit_cancelled_batch");
+    assert_eq!(count, 2, "both ids cancelled");
+
+    // The project task's Cancelled landed on the PROJECT board, not the default.
+    let proj_rec =
+        crate::task_events::replay_at(&crate::task_events::board_root(&home, "proj-sw"))
+            .expect("replay proj board")
+            .tasks
+            .get(&crate::task_events::TaskId(proj_id.clone()))
+            .cloned()
+            .expect("project task must exist on its own board");
+    assert_eq!(
+        proj_rec.status,
+        crate::task_events::TaskStatus::Cancelled,
+        "project-board task cancelled on ITS board (not the default)"
+    );
+    let default_state =
+        crate::task_events::replay_at(&crate::task_events::board_root(&home, "default")).unwrap();
+    assert!(
+        !default_state
+            .tasks
+            .contains_key(&crate::task_events::TaskId(proj_id.clone())),
+        "the project task's cancel must NOT be written to the default board (#2760 BUG fix)"
+    );
+    // The default task's Cancelled landed on the default board.
+    assert_eq!(
+        default_state
+            .tasks
+            .get(&crate::task_events::TaskId(def_id.clone()))
+            .map(|r| r.status),
+        Some(crate::task_events::TaskStatus::Cancelled),
+        "default-board task cancelled on the default board"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ── CR-2026-06-14 row232 — sweep apply must not clobber a concurrently-Done
 //    task (the dry-run → apply window is a TOCTOU; the in-lock guard fails
 //    closed). ──

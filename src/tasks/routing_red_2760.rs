@@ -348,3 +348,200 @@ fn route_task_index_physical_board_mismatch_is_unreadable_2760() {
         ),
     }
 }
+
+// ── #2760 items 2+3+4: per-id lock + write-time revalidation + narrow ops ──
+//
+// These pin the SLICE-A authority-mutation contract: every per-id mutation resolves
+// its board strictly, re-validates the route under the per-id lock, and writes ONLY
+// to that board (never the default board). The narrow external ops (usage-limit,
+// reclaim) carry no board path — they take a task-bound guard and return an outcome.
+
+/// Seed a Created+Claimed task OWNED by `owner` with `branch`, on `project`'s board,
+/// and record its index entry — the starting state for a reclaim / usage-limit
+/// mutation (status `Claimed`, owner set, branch set).
+fn seed_owned_claimed(home: &Path, project: &str, id: &str, owner: &str, branch: &str) {
+    let board = board_root(home, project);
+    append_batch_at(
+        &board,
+        &InstanceName::from("test:seed"),
+        vec![
+            TaskEvent::Created {
+                task_id: TaskId(id.to_string()),
+                title: "t".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: Some(InstanceName::from(owner)),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some(branch.to_string()),
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+            TaskEvent::Claimed {
+                task_id: TaskId(id.to_string()),
+                by: InstanceName::from(owner),
+            },
+        ],
+    )
+    .expect("seed owned+claimed task");
+    super::board_router::record_task_project(home, id, project).expect("record index");
+}
+
+fn record_on_board(home: &Path, project: &str, id: &str) -> crate::task_events::TaskRecord {
+    crate::task_events::replay_at(&board_root(home, project))
+        .expect("replay board")
+        .tasks
+        .get(&TaskId(id.to_string()))
+        .cloned()
+        .unwrap_or_else(|| panic!("task '{id}' must exist on board '{project}'"))
+}
+
+fn default_has_task(home: &Path, id: &str) -> bool {
+    crate::task_events::replay_at(&board_root(home, crate::task_events::DEFAULT_PROJECT))
+        .map(|s| s.tasks.contains_key(&TaskId(id.to_string())))
+        .unwrap_or(false)
+}
+
+/// RED (reclaim default-board BUG fix): a reclaimed PROJECT-board task's `Released`
+/// event must land on ITS board — the pre-#2760 body appended to the DEFAULT board
+/// unconditionally, so the task's own board never saw the release and it stayed
+/// Claimed forever.
+#[test]
+fn release_reclaimed_task_writes_to_project_board_not_default_2760() {
+    let home = tmp_home("reclaim-proj");
+    seed_owned_claimed(&home, "proj-rc", "t-2760-rc", "dev", "feat/rc");
+
+    let released =
+        super::release_reclaimed_task(&home, "t-2760-rc", "reclaimed: test".into()).expect("ok");
+    assert!(released, "a claimed project-board task must be released");
+
+    let rec = record_on_board(&home, "proj-rc", "t-2760-rc");
+    assert_eq!(
+        rec.status,
+        crate::task_events::TaskStatus::Open,
+        "Released → Open on the PROJECT board"
+    );
+    assert!(rec.owner.is_none(), "Released clears the owner");
+    assert!(
+        !default_has_task(&home, "t-2760-rc"),
+        "reclaim Released must NOT write to the default board (#2760 BUG fix)"
+    );
+}
+
+/// RED (item 4 narrow op): a usage-limit block lands `Blocked` on the task's PROJECT
+/// board and is idempotent (a re-block for the same episode → `AlreadyApplied`, no
+/// second event); never a default-board write.
+#[test]
+fn apply_usage_limit_block_targets_project_board_and_is_idempotent_2760() {
+    let home = tmp_home("ul-block-proj");
+    seed_owned_claimed(&home, "proj-ul", "t-2760-ul", "dev", "feat/ul");
+    let guard = super::UsageLimitGuard {
+        task_id: "t-2760-ul".into(),
+        source: "dev".into(),
+        branch: "feat/ul".into(),
+        episode_id: "ep-123".into(),
+    };
+    // The reason payload embeds the episode id (as the production caller builds it),
+    // so the idempotency pre-check can recognise a prior block for this episode.
+    let reason = r#"{"episode_id":"ep-123"}"#.to_string();
+
+    assert_eq!(
+        super::apply_usage_limit_block(&home, &guard, reason.clone()).expect("block ok"),
+        super::ApplyOutcome::Applied
+    );
+    let rec = record_on_board(&home, "proj-ul", "t-2760-ul");
+    assert_eq!(rec.status, crate::task_events::TaskStatus::Blocked);
+    assert!(rec
+        .block_reason
+        .as_deref()
+        .is_some_and(|r| r.contains("ep-123")));
+    assert!(!default_has_task(&home, "t-2760-ul"), "no default-board write");
+
+    // Re-block for the SAME episode → idempotent no-op.
+    assert_eq!(
+        super::apply_usage_limit_block(&home, &guard, reason).expect("re-block ok"),
+        super::ApplyOutcome::AlreadyApplied
+    );
+}
+
+/// RED (item 4 narrow op): usage-limit recovery unblocks → InProgress on the PROJECT
+/// board.
+#[test]
+fn recover_usage_limit_block_targets_project_board_2760() {
+    let home = tmp_home("ul-recover-proj");
+    seed_owned_claimed(&home, "proj-ur", "t-2760-ur", "dev", "feat/ur");
+    let guard = super::UsageLimitGuard {
+        task_id: "t-2760-ur".into(),
+        source: "dev".into(),
+        branch: "feat/ur".into(),
+        episode_id: "ep-9".into(),
+    };
+    assert_eq!(
+        super::apply_usage_limit_block(&home, &guard, r#"{"episode_id":"ep-9"}"#.into())
+            .expect("block"),
+        super::ApplyOutcome::Applied
+    );
+    assert_eq!(
+        super::recover_usage_limit_block(&home, &guard).expect("recover"),
+        super::ApplyOutcome::Applied
+    );
+    let rec = record_on_board(&home, "proj-ur", "t-2760-ur");
+    assert_eq!(
+        rec.status,
+        crate::task_events::TaskStatus::InProgress,
+        "recovery → Unblocked+InProgress on the project board"
+    );
+}
+
+/// RED (item 4 guard): a usage-limit block whose guard branch no longer matches the
+/// task is `Stale` — NO event is written (deny-on-mismatch, no side effect).
+#[test]
+fn apply_usage_limit_block_stale_on_branch_mismatch_2760() {
+    let home = tmp_home("ul-stale");
+    seed_owned_claimed(&home, "proj-st", "t-2760-st", "dev", "feat/real");
+    let guard = super::UsageLimitGuard {
+        task_id: "t-2760-st".into(),
+        source: "dev".into(),
+        branch: "feat/WRONG".into(),
+        episode_id: "ep".into(),
+    };
+    assert_eq!(
+        super::apply_usage_limit_block(&home, &guard, r#"{"episode_id":"ep"}"#.into()).expect("ok"),
+        super::ApplyOutcome::Stale,
+        "a guard/branch mismatch → Stale"
+    );
+    assert_eq!(
+        record_on_board(&home, "proj-st", "t-2760-st").status,
+        crate::task_events::TaskStatus::Claimed,
+        "no Blocked event written on a guard mismatch"
+    );
+}
+
+/// RED (core item 2+3): `with_revalidated_board` re-resolves the strict route UNDER
+/// the per-id lock and REFUSES the write — without running the closure — when the
+/// route is no longer unique (a concurrent duplicate-create raced the mutation in).
+/// This is the write-time revalidation that a stale pre-lock route cannot give.
+#[test]
+fn with_revalidated_board_refuses_when_route_became_ambiguous_2760() {
+    let home = tmp_home("reval-ambig");
+    seed_task_on_board(&home, "proj-rv", "t-2760-rv");
+    super::board_router::record_task_project(&home, "t-2760-rv", "proj-rv").expect("index");
+    let routed = load_routed(&home, "t-2760-rv").expect("resolve");
+
+    // A concurrent create lands the SAME id on another board → route now Ambiguous.
+    seed_task_on_board(&home, "proj-other", "t-2760-rv");
+
+    let ran = std::cell::Cell::new(false);
+    let result = routed.with_revalidated_board(&home, |_board| ran.set(true));
+    assert!(
+        result.is_err(),
+        "revalidation must refuse when the route is no longer unique"
+    );
+    assert!(
+        !ran.get(),
+        "the write closure must NOT run when revalidation fails (zero side effect)"
+    );
+}
