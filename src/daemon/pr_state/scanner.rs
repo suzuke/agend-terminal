@@ -576,7 +576,7 @@ pub fn scan_and_emit_with(
         let terminal_recorded = match crate::daemon::assignment_authority::terminal_kind_of(
             &snapshot,
         ) {
-            None => true, // no terminal to record ⇒ nothing to lose
+            None => true,                               // no terminal to record ⇒ nothing to lose
             Some(_) if snapshot.pr_number == 0 => true, // unbound generation: no marker keyed
             Some(kind) => match crate::daemon::assignment_authority::record_terminal(
                 home,
@@ -2470,11 +2470,8 @@ mod tests {
     #[test]
     fn b3_terminal_record_failure_retains_pr_state_file() {
         use crate::daemon::assignment_authority as store;
-        let home = std::env::temp_dir().join(format!(
-            "agend-b3-scan-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("agend-b3-scan-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
 

@@ -435,7 +435,11 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 /// from [`read_record`] propagates instead of silently dropping the record. The
 /// SOLE reader for the merge-gate-affecting reserved derivation (B4) — a corrupt
 /// record must NEVER be read as "no reservation".
-fn list_active_checked(home: &Path, repo: &str, branch: &str) -> anyhow::Result<Vec<ActiveAssignment>> {
+fn list_active_checked(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+) -> anyhow::Result<Vec<ActiveAssignment>> {
     let dir = branch_dir(home, repo, branch);
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -470,7 +474,9 @@ pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option
 /// The retained terminal-marker set for `(repo,branch)`. Inspection-only accessor:
 /// a corrupt/absent file yields an empty set. Production terminal paths
 /// ([`record_terminal`] / [`tombstone_terminal_matches`]) read markers through the
-/// corruption-aware [`read_markers`] instead so they can fail closed on corruption.
+/// corruption-aware [`read_markers`] instead so they can fail closed on corruption —
+/// so this convenience accessor is now only referenced by tests (`#[cfg(test)]`).
+#[cfg(test)]
 pub(crate) fn terminal_markers(home: &Path, repo: &str, branch: &str) -> TerminalMarkers {
     read_markers(&markers_file(home, repo, branch)).unwrap_or_default()
 }
@@ -1799,7 +1805,10 @@ mod tests {
 
         // A NEW dispatch at the SAME (repo,branch,target) with a DIFFERENT id.
         let r2 = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:01:00Z");
-        assert_ne!(r1.assignment_id, r2.assignment_id, "R2 is a distinct record");
+        assert_ne!(
+            r1.assignment_id, r2.assignment_id,
+            "R2 is a distinct record"
+        );
         persist(&home, &r2).unwrap();
 
         // R1's orphaned actionable row MUST be retired (superseded ⇒ not actionable).
@@ -1809,7 +1818,9 @@ mod tests {
         );
         // R2 is the stored record.
         assert_eq!(
-            get(&home, "o/r", "feat/x", "reviewer").unwrap().assignment_id,
+            get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .assignment_id,
             r2.assignment_id,
             "R2 is the stored authority record"
         );
