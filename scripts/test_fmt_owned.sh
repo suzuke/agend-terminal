@@ -43,12 +43,12 @@ commit_all() { git_h -C "$1" add -A; git_h -C "$1" commit -q -m "$2"; }
 
 # ── Build super → vendor/dep → nested/inner (2-level recursive submodule) ──────
 inner="$work/inner"; mk_repo "$inner"
-printf 'fn inner() {}\n' > "$inner/inner.rs"
+printf 'fn   inner( ){  }\n' > "$inner/inner.rs"   # vendored + MALFORMED — must stay untouched
 commit_all "$inner" inner
 
 dep="$work/dep"; mk_repo "$dep"
 git_h -C "$dep" submodule add -q "$inner" nested >/dev/null 2>&1
-printf 'fn dep() {}\n' > "$dep/dep.rs"
+printf 'fn   dep( ){  }\n' > "$dep/dep.rs"         # vendored + MALFORMED — must stay untouched
 commit_all "$dep" dep
 
 super="$work/super"; mk_repo "$super"
@@ -146,6 +146,24 @@ done
 [ "$callers_ok" -eq 1 ] \
     && ok "all production fmt callers invoke scripts/fmt-owned.sh" \
     || bad "a production fmt caller does not invoke the shared surface"
+
+# ── 9. invoked from a deeply NESTED submodule CWD → resolves to the OUTERMOST
+#       superproject. `--show-superproject-working-tree` climbs ONE level, so from
+#       vendor/dep/nested (the doubly-nested inner) a single call picks the IMMEDIATE
+#       superproject (vendor/dep) and would format vendored dep.rs, dirtying the
+#       top-level `vendor/dep` gitlink. The formatter must climb to the top.
+rm -f "$super/src/broken.rs"                        # drop section 7's unparseable file
+printf 'fn   from_nested( ){  }\n' > "$super/src/from_nested.rs"
+git_h -C "$super" add -A >/dev/null 2>&1
+dep_nested_before="$(sha "$dep/dep.rs")"
+( cd "$super/vendor/dep/nested" && "$fmt_owned" ) >/dev/null 2>&1 || true
+if rustfmt --edition 2021 --check "$super/src/from_nested.rs" >/dev/null 2>&1 \
+    && [ "$dep_nested_before" = "$(sha "$dep/dep.rs")" ] \
+    && ! git_h -C "$super" status --porcelain | grep -q 'vendor/'; then
+    ok "nested-submodule CWD resolves to outermost superproject (owned formatted, vendored dep.rs untouched)"
+else
+    bad "nested CWD picked the immediate superproject — formatted vendored dep.rs / dirtied top-level vendor/"
+fi
 
 echo
 echo "summary: $pass passed, $fail failed"
