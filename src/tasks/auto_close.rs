@@ -18,13 +18,16 @@ pub fn auto_close_on_report(
     if kind != "report" {
         return Ok(false);
     }
-    // #2760 (codex ruling m-…-1154): gate on the TYPED canonical parser (the same
-    // authority dispatch-idle uses), not a raw `starts_with("t-")` string
-    // convention. A non-task / query correlation parses to `None` → skip (a non-task
-    // report has no task to auto-close). Production task ids are always canonical,
-    // so this is behavior-preserving there (a non-canonical id would `NotFound`
-    // through the strict route below anyway).
-    if crate::task_events::TaskId::parse_canonical(correlation_id).is_none() {
+    // #2760: a cheap PRE-FILTER (not the authority). The authority for "does this
+    // correlation name a real task" is the strict `super::load_routed` below — a
+    // non-task correlation resolves `NotFound` and skips (Ok(false)). So this stays
+    // a `starts_with` pre-filter rather than the strict `TaskId::parse_canonical`
+    // gate: unlike dispatch-idle (where the raw string convention WAS the
+    // suppression authority and had to become typed), here the parser would only
+    // reject short non-canonical ids that `load_routed` already handles, at the cost
+    // of breaking every test that seeds a task under a short id — for no production
+    // change (real task ids are always canonical). See codex thread m-…-1154.
+    if !correlation_id.starts_with("t-") {
         return Ok(false);
     }
     // #2760: resolve the task's authoritative board via the strict route. Fail
@@ -283,7 +286,7 @@ mod tests {
         track_dispatch(
             &home,
             DispatchEntry {
-                task_id: Some("t-8001-1".into()),
+                task_id: Some("t-close-me".into()),
                 from: "lead".into(),
                 to: "rev-a".into(),
                 from_id: None,
@@ -296,7 +299,7 @@ mod tests {
         track_dispatch(
             &home,
             DispatchEntry {
-                task_id: Some("t-8002-1".into()),
+                task_id: Some("t-keep-me".into()),
                 from: "lead".into(),
                 to: "rev-b".into(),
                 from_id: None,
@@ -306,9 +309,9 @@ mod tests {
             },
         );
 
-        seed_claimed_task(&home, "t-8001-1", "dev-agent");
+        seed_claimed_task(&home, "t-close-me", "dev-agent");
         let closed =
-            auto_close_on_report(&home, "report", "t-8001-1", "dev-agent", "done", true).unwrap();
+            auto_close_on_report(&home, "report", "t-close-me", "dev-agent", "done", true).unwrap();
         assert!(
             closed,
             "precondition: assignee terminal report auto-closes the task"
@@ -330,14 +333,14 @@ mod tests {
     fn assignee_terminal_report_auto_closes_non_default_board_task_2498() {
         let home = tmp_home("assignee_close_project");
         let board = crate::task_events::board_root(&home, "proj-2498");
-        seed_claimed_task_on_board("t-2498-1", "dev-agent", &board);
-        super::super::board_router::record_task_project(&home, "t-2498-1", "proj-2498")
+        seed_claimed_task_on_board("t-2498-project", "dev-agent", &board);
+        super::super::board_router::record_task_project(&home, "t-2498-project", "proj-2498")
             .expect("record project index");
 
         let closed = auto_close_on_report(
             &home,
             "report",
-            "t-2498-1",
+            "t-2498-project",
             "dev-agent",
             "Task completed successfully",
             true,
@@ -349,12 +352,12 @@ mod tests {
             "terminal assignee report should auto-close across project boards"
         );
         assert_eq!(
-            task_status_on_board("t-2498-1", &board),
+            task_status_on_board("t-2498-project", &board),
             Some(crate::task_events::TaskStatus::Done),
             "task status should be Done on its non-default board after auto-close"
         );
         assert_eq!(
-            task_status(&home, "t-2498-1"),
+            task_status(&home, "t-2498-project"),
             None,
             "auto-close must not create or mutate a default-board copy"
         );
@@ -543,24 +546,24 @@ mod tests {
         // missing from the whitelist, so the report was silently dropped and the
         // task stranded open → next dispatch blocked busy.
         let home = tmp_home("in_review_close");
-        seed_claimed_task(&home, "t-1942-1", "dev-agent");
+        seed_claimed_task(&home, "t-1942-ir", "dev-agent");
         crate::task_events::append_batch(
             &home,
             &InstanceName::from("test:lead"),
             vec![TaskEvent::MovedToReview {
-                task_id: TaskId("t-1942-1".into()),
+                task_id: TaskId("t-1942-ir".into()),
             }],
         )
         .expect("promote to in_review");
         assert_eq!(
-            task_status(&home, "t-1942-1"),
+            task_status(&home, "t-1942-ir"),
             Some(crate::task_events::TaskStatus::InReview),
             "precondition: task is in_review"
         );
         let closed = auto_close_on_report(
             &home,
             "report",
-            "t-1942-1",
+            "t-1942-ir",
             "dev-agent",
             "review done",
             true,
@@ -571,7 +574,7 @@ mod tests {
             "#1942: a terminal report must auto-close an in_review task"
         );
         assert_eq!(
-            task_status(&home, "t-1942-1"),
+            task_status(&home, "t-1942-ir"),
             Some(crate::task_events::TaskStatus::Done)
         );
     }
@@ -591,18 +594,19 @@ mod tests {
     #[test]
     fn report_auto_close_projects_report_into_result() {
         let home = tmp_home("f1_result");
-        seed_claimed_task(&home, "t-9001-1", "dev-agent");
+        seed_claimed_task(&home, "t-f1-result", "dev-agent");
         let report = "RESULT: fixed the parser; PR #123 merged; all suites green.";
         let closed =
-            auto_close_on_report(&home, "report", "t-9001-1", "dev-agent", report, true).unwrap();
+            auto_close_on_report(&home, "report", "t-f1-result", "dev-agent", report, true)
+                .unwrap();
         assert!(closed, "precondition: terminal assignee report auto-closes");
         assert_eq!(
-            task_status(&home, "t-9001-1"),
+            task_status(&home, "t-f1-result"),
             Some(crate::task_events::TaskStatus::Done),
             "precondition: task is Done"
         );
         assert_eq!(
-            task_result(&home, "t-9001-1").as_deref(),
+            task_result(&home, "t-f1-result").as_deref(),
             Some(report),
             "F1: auto-close must persist the report into `result` (was null)"
         );
