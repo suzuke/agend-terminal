@@ -1320,6 +1320,435 @@ fn test_task_auto_unblock_when_all_deps_done() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── d-63: explicit/raw Blocked passes through; ONLY raw Open is view-derived ──
+// Split-brain bug: `evaluate_with_resolver` auto-unblocked a raw Blocked task once
+// its deps were Done, so get/list projected Open while the update response + raw
+// replay stayed Blocked. Surgical rule: raw status != Open passes through unchanged;
+// only raw Open derives dependency Blocked. These exercise the REAL task handlers.
+
+/// Raw (unprojected) persisted status via an event-log replay of the task's board.
+fn raw_status_d63(home: &std::path::Path, id: &str) -> crate::task_events::TaskStatus {
+    let board = super::board_router::board_for_task(home, id);
+    crate::task_events::replay_at(&board)
+        .expect("replay board")
+        .tasks
+        .get(&crate::task_events::TaskId(id.to_string()))
+        .expect("task present on its board")
+        .status
+}
+
+/// Projected status via the `get` handler.
+fn status_via_get_d63(home: &std::path::Path, caller: &str, id: &str) -> String {
+    handle(
+        home,
+        caller,
+        &serde_json::json!({"action": "get", "id": id}),
+    )["task"]["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// (1) explicit operator Blocked with all deps Done AGREES Blocked across the update
+/// response, get, list, AND the raw replay — no split-brain.
+#[test]
+fn d63_explicit_blocked_with_done_deps_agrees_all_surfaces() {
+    let home = tmp_home("d63-explicit");
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "done", "id": dep, "result": "ok"}),
+    );
+    let child = handle(&home, "u", &serde_json::json!({"action": "create", "title": "child", "assignee": "u", "depends_on": [dep]}))["id"].as_str().unwrap().to_string();
+    let upd = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "update", "id": child, "status": "blocked"}),
+    );
+    assert_eq!(
+        upd["task"]["status"], "blocked",
+        "update response reports raw Blocked"
+    );
+    assert_eq!(
+        status_via_get_d63(&home, "u", &child),
+        "blocked",
+        "get must agree Blocked (not projected Open)"
+    );
+    assert_eq!(
+        status_via_list(&home, "u", "child"),
+        "blocked",
+        "list must agree Blocked (not projected Open)"
+    );
+    assert_eq!(
+        raw_status_d63(&home, &child),
+        crate::task_events::TaskStatus::Blocked,
+        "raw replay is Blocked"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (2) raw Open with an UNMET dep is a VIEW Blocked while the raw replay stays Open.
+#[test]
+fn d63_raw_open_unmet_dep_view_blocked_raw_open() {
+    let home = tmp_home("d63-open-unmet");
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let child = handle(&home, "u", &serde_json::json!({"action": "create", "title": "child", "assignee": "u", "depends_on": [dep]}))["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        status_via_list(&home, "u", "child"),
+        "blocked",
+        "unmet dep → view Blocked"
+    );
+    assert_eq!(
+        status_via_get_d63(&home, "u", &child),
+        "blocked",
+        "get view Blocked"
+    );
+    assert_eq!(
+        raw_status_d63(&home, &child),
+        crate::task_events::TaskStatus::Open,
+        "raw replay stays Open (view-only block)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (3) completing the dep returns a raw-Open task's VIEW to Open.
+#[test]
+fn d63_completing_dep_returns_raw_open_view_to_open() {
+    let home = tmp_home("d63-complete");
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let child = handle(&home, "u", &serde_json::json!({"action": "create", "title": "child", "assignee": "u", "depends_on": [dep]}))["id"].as_str().unwrap().to_string();
+    assert_eq!(status_via_list(&home, "u", "child"), "blocked");
+    handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "done", "id": dep, "result": "ok"}),
+    );
+    assert_eq!(
+        status_via_list(&home, "u", "child"),
+        "open",
+        "dep Done → raw-Open child view returns to Open"
+    );
+    assert_eq!(
+        raw_status_d63(&home, &child),
+        crate::task_events::TaskStatus::Open
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (4) a usage-limit Blocked (system-seeded, not an operator update) SURVIVES dep
+/// satisfaction — the exact auto-unblock bug (dep Done must not reopen it).
+#[test]
+fn d63_usage_limit_blocked_survives_satisfied_deps() {
+    let home = tmp_home("d63-usage-limit");
+    let inst = crate::task_events::InstanceName::from("u");
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let child = handle(&home, "u", &serde_json::json!({"action": "create", "title": "child", "assignee": "u", "depends_on": [dep]}))["id"].as_str().unwrap().to_string();
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Blocked {
+            task_id: crate::task_events::TaskId(child.clone()),
+            reason: "usage limit reached".into(),
+        },
+    )
+    .unwrap();
+    handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "done", "id": dep, "result": "ok"}),
+    );
+    assert_eq!(
+        status_via_list(&home, "u", "child"),
+        "blocked",
+        "usage-limit Blocked must survive Done deps"
+    );
+    assert_eq!(status_via_get_d63(&home, "u", &child), "blocked");
+    assert_eq!(
+        raw_status_d63(&home, &child),
+        crate::task_events::TaskStatus::Blocked
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (5) explicit Blocked → explicit `status=open` STILL succeeds — the fix removes the
+/// AUTO unblock, not the operator's ability to unblock.
+#[test]
+fn d63_explicit_blocked_to_open_transition_succeeds() {
+    let home = tmp_home("d63-unblock");
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "done", "id": dep, "result": "ok"}),
+    );
+    let child = handle(&home, "u", &serde_json::json!({"action": "create", "title": "child", "assignee": "u", "depends_on": [dep]}))["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "update", "id": child, "status": "blocked"}),
+    );
+    let r = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "update", "id": child, "status": "open"}),
+    );
+    assert_eq!(r["event"], "updated", "Blocked → open must succeed: {r:?}");
+    assert_eq!(
+        raw_status_d63(&home, &child),
+        crate::task_events::TaskStatus::Open,
+        "explicit unblock persists Open"
+    );
+    assert_eq!(status_via_list(&home, "u", "child"), "open");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (6) a legacy-migration Blocked (seeded via events, as a tasks.json migration
+/// produces) SURVIVES Done deps.
+#[test]
+fn d63_legacy_migration_blocked_survives_satisfied_deps() {
+    let home = tmp_home("d63-legacy");
+    let inst = crate::task_events::InstanceName::from("u");
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "done", "id": dep, "result": "ok"}),
+    );
+    let child = crate::task_events::TaskId("t-d63-legacy-child".into());
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Created {
+            task_id: child.clone(),
+            title: "legacy-child".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            branch: None,
+            depends_on: vec![crate::task_events::TaskId(dep.clone())],
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+        },
+    )
+    .unwrap();
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Blocked {
+            task_id: child.clone(),
+            reason: "legacy migration".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        status_via_list(&home, "u", "legacy-child"),
+        "blocked",
+        "legacy-migration Blocked must survive Done deps"
+    );
+    assert_eq!(
+        raw_status_d63(&home, &child.0),
+        crate::task_events::TaskStatus::Blocked
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// List including non-actionable statuses (default `list` trims to
+/// open/claimed/in_progress/blocked, so Backlog/InReview/Verified need this).
+fn status_via_list_full_d63(home: &std::path::Path, caller: &str, title: &str) -> String {
+    handle(
+        home,
+        caller,
+        &serde_json::json!({"action": "list", "include_history": true}),
+    )["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["title"] == title)
+        .unwrap_or_else(|| panic!("task '{title}' not in list"))["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// (7) NON-Open raw statuses with an UNMET dep pass through AS-IS in get/list — only
+/// raw Open is view-derived, so InProgress / Backlog / InReview / Verified are NEVER
+/// projected to Blocked. Seeded via events because the claim gate blocks the normal
+/// claim→in_progress path while a dep is unmet (Fable task123 required addition).
+#[test]
+fn d63_non_open_statuses_with_unmet_dep_pass_through() {
+    let home = tmp_home("d63-nonopen");
+    let inst = crate::task_events::InstanceName::from("u");
+    // A shared UNMET (Open) dependency.
+    let dep = handle(
+        &home,
+        "u",
+        &serde_json::json!({"action": "create", "title": "dep", "assignee": "u"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dep_id = crate::task_events::TaskId(dep.clone());
+    let tid = |s: &str| crate::task_events::TaskId(s.into());
+    let seed = |id: &str, title: &str, extra: Vec<crate::task_events::TaskEvent>| {
+        crate::task_events::append(
+            &home,
+            &inst,
+            crate::task_events::TaskEvent::Created {
+                task_id: tid(id),
+                title: title.into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                branch: None,
+                depends_on: vec![dep_id.clone()],
+                routed_to: None,
+                bind: None,
+                eta_secs: None,
+                tags: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        for ev in extra {
+            crate::task_events::append(&home, &inst, ev).unwrap();
+        }
+    };
+    seed(
+        "t-d63-inprog",
+        "inprog",
+        vec![
+            crate::task_events::TaskEvent::Claimed {
+                task_id: tid("t-d63-inprog"),
+                by: inst.clone(),
+            },
+            crate::task_events::TaskEvent::InProgress {
+                task_id: tid("t-d63-inprog"),
+                by: inst.clone(),
+            },
+        ],
+    );
+    seed(
+        "t-d63-backlog",
+        "backlog",
+        vec![crate::task_events::TaskEvent::MovedToBacklog {
+            task_id: tid("t-d63-backlog"),
+        }],
+    );
+    seed(
+        "t-d63-inreview",
+        "inreview",
+        vec![crate::task_events::TaskEvent::MovedToReview {
+            task_id: tid("t-d63-inreview"),
+        }],
+    );
+    seed(
+        "t-d63-verified",
+        "verified",
+        vec![crate::task_events::TaskEvent::Verified {
+            task_id: tid("t-d63-verified"),
+            by_reviewer: inst.clone(),
+            verdict: "VERIFIED".into(),
+        }],
+    );
+    for (title, id, want, want_status) in [
+        (
+            "inprog",
+            "t-d63-inprog",
+            "in_progress",
+            crate::task_events::TaskStatus::InProgress,
+        ),
+        (
+            "backlog",
+            "t-d63-backlog",
+            "backlog",
+            crate::task_events::TaskStatus::Backlog,
+        ),
+        (
+            "inreview",
+            "t-d63-inreview",
+            "in_review",
+            crate::task_events::TaskStatus::InReview,
+        ),
+        (
+            "verified",
+            "t-d63-verified",
+            "verified",
+            crate::task_events::TaskStatus::Verified,
+        ),
+    ] {
+        assert_eq!(
+            raw_status_d63(&home, id),
+            want_status,
+            "{title}: raw status seeded"
+        );
+        assert_eq!(
+            status_via_get_d63(&home, "u", id),
+            want,
+            "{title}: get must pass through (never Blocked)"
+        );
+        assert_eq!(
+            status_via_list_full_d63(&home, "u", title),
+            want,
+            "{title}: list must pass through (never Blocked)"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// (8) cross-board raw-Open dependency projection is preserved by the d-63 rule (raw
+// Open still derives Blocked/Open across boards). Covered by the existing tests
+// `cross_board_dep_done_unblocks_dependent_2117_q2` and
+// `cross_board_dep_derived_block_is_in_memory_not_persisted_2117_q2` below, which
+// continue to pass unchanged (the fix only stops projecting NON-Open statuses).
+
 // ── #2117 Q2: cross-board depends_on resolution (multi-project) ──
 
 /// Multi-project fleet: teamA(devA)@orgA/projA, teamB(devB)@orgB/projB. A task
