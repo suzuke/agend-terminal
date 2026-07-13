@@ -137,7 +137,9 @@ pub(super) fn pane_from_menu_item(
             };
             // Resolve from fleet to get defaults merged
             let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
+            let pane_result = if let Some(resolved) =
+                fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))
+            {
                 pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
@@ -169,7 +171,14 @@ pub(super) fn pane_from_menu_item(
                     name_counter,
                     pane_factory::SpawnIdentity::Managed,
                 )
+            };
+            // #2764 R9: hold-through-success-or-rollback — a pane failure
+            // undoes the fleet/topic mutations while the admission guard is
+            // still held, so a failed TUI create leaves ZERO residue.
+            if pane_result.is_err() {
+                tui_spawn::rollback_created_instance(home, &inst_name);
             }
+            pane_result
         }
         MenuItemKind::Fugu => {
             // Provision (idempotent) the Fugu Codex profile (`fugu.config.toml`)
@@ -186,7 +195,10 @@ pub(super) fn pane_from_menu_item(
             if crate::provider_detect::default_codex_home().as_ref() != Some(&codex_home) {
                 env.insert("CODEX_HOME".to_string(), codex_home.display().to_string());
             }
-            if let Err(e) = tui_spawn::add_instance_with_topic(
+            // #2764 R9: Fugu owns the admission like the Backend arm — a
+            // refusal ABORTS (no pane), and a pane failure rolls the
+            // fleet/topic mutations back while the guard is still held.
+            let _create_admission = match tui_spawn::add_instance_with_topic(
                 home,
                 &inst_name,
                 &crate::fleet::InstanceYamlEntry {
@@ -196,10 +208,16 @@ pub(super) fn pane_from_menu_item(
                     ..Default::default()
                 },
             ) {
-                tracing::warn!(error = %e, "failed to write fleet.yaml for fugu");
-            }
+                Ok((_, adm)) => adm,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fugu spawn aborted — instance not created");
+                    return Err(anyhow::anyhow!("fugu spawn aborted: {e}"));
+                }
+            };
             let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
+            let pane_result = if let Some(resolved) =
+                fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))
+            {
                 pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
@@ -213,8 +231,14 @@ pub(super) fn pane_from_menu_item(
                     crate::backend::SpawnMode::Fresh,
                 )
             } else {
-                anyhow::bail!("failed to resolve fugu instance after creation")
+                Err(anyhow::anyhow!(
+                    "failed to resolve fugu instance after creation"
+                ))
+            };
+            if pane_result.is_err() {
+                tui_spawn::rollback_created_instance(home, &inst_name);
             }
+            pane_result
         }
         MenuItemKind::FleetInstance(inst_name) => {
             let fleet = crate::fleet::FleetConfig::load(fleet_path)?;

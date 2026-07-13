@@ -399,7 +399,7 @@ fn spawn_instances(
         // spawn_one — without the token the spawn is refused as an
         // independent concurrent create.
         if let Some(adm) = admissions.get(inst_name) {
-            params["create_admission_token"] = serde_json::json!(adm.token());
+            params["create_admission_token"] = serde_json::json!(adm.token().to_string());
         }
         if let Some(ref model) = entry.model {
             params["model"] = serde_json::json!(model);

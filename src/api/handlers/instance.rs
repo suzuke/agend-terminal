@@ -139,10 +139,13 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             )});
         }
     }
-    // Check external registry (after the generation gate). External agents
-    // have no daemon-managed child to stop — deregistration IS the terminal
-    // disposition, reported explicitly.
-    {
+    // #2764 R9: a PINNED managed delete STRUCTURALLY excludes external /
+    // name-only removal — when a same-name external coexists with the pinned
+    // managed generation, removing the external and answering stopped:true
+    // would hand the caller destructive authority over A without stopping A.
+    // Only an unpinned delete may deregister an external; that deregistration
+    // IS its terminal disposition (no daemon-managed child exists to stop).
+    if expected_id.is_none() {
         let mut ext = agent::lock_external(ctx.externals);
         if ext.remove(name).is_some() {
             crate::event_log::log(ctx.home, "delete", name, "external agent deleted");
@@ -362,7 +365,9 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
 
     // #2764 R8: the create transaction's admission token (forwarded by the
     // MCP create / deploy caller) re-enters that transaction in spawn_one.
-    let create_token = params["create_admission_token"].as_u64();
+    let create_token = params["create_admission_token"]
+        .as_str()
+        .and_then(|t| t.parse::<u128>().ok());
     match crate::agent_ops::spawn_one(
         ctx.home,
         ctx.registry,
@@ -1062,6 +1067,43 @@ mod tests {
     }
 
     /// §3.5.10: spawn_one (team-spawn path) also clears stale metadata.
+    /// #2764 R9 S2: a PINNED managed delete STRUCTURALLY excludes the
+    /// external/name-only arm — with a same-name external coexisting, the
+    /// pinned delete stops managed A and leaves the external registered
+    /// (removing it and answering stopped:true would hand out destructive
+    /// authority over A without stopping A).
+    #[test]
+    fn pinned_delete_never_removes_same_name_external_2764_r9() {
+        let (ctx, home) = test_ctx_with_agent("dualname");
+        let id = crate::fleet::resolve_uuid(ctx.home, "dualname").expect("seeded id");
+        // A same-name EXTERNAL agent coexists.
+        agent::lock_external(ctx.externals).insert(
+            "dualname".to_string(),
+            agent::ExternalAgentHandle {
+                backend_command: "claude".to_string(),
+                pid: 4242,
+            },
+        );
+
+        let resp = handle_delete(&json!({"name": "dualname", "expected_id": id.full()}), &ctx);
+
+        assert_eq!(resp["ok"].as_bool(), Some(true), "got {resp}");
+        assert_eq!(
+            resp["stopped"].as_bool(),
+            Some(true),
+            "managed A must be stopped for real: {resp}"
+        );
+        assert!(
+            agent::lock_external(ctx.externals).contains_key("dualname"),
+            "the same-name external must NOT be removed by a pinned managed delete"
+        );
+        assert!(
+            !agent::lock_registry(ctx.registry).contains_key(&id),
+            "managed A's registry handle must actually be stopped/removed"
+        );
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
     /// #2764 R8 S2: a malformed expected_id fails CLOSED — never degrades a
     /// pinned delete to name-only authority.
     #[test]

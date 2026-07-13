@@ -185,7 +185,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             }
         }
     }
-    let member_token = |name: &str| -> Option<u64> {
+    let member_token = |name: &str| -> Option<u128> {
         planned
             .iter()
             .position(|(n, _, _)| n == name)

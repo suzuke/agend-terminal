@@ -44,7 +44,7 @@ use std::sync::OnceLock;
 /// RPC → spawn_one); an INDEPENDENT concurrent same-name create is refused,
 /// never refcounted in. Deleting holds refcount for re-entrant deletes.
 enum Hold {
-    Creating { count: u32, token: u64 },
+    Creating { count: u32, token: u128 },
     Deleting(u32),
 }
 
@@ -65,10 +65,11 @@ pub fn is_deleting(home: &Path, name: &str) -> bool {
     )
 }
 
-fn mint_token() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+/// #2764 R9: tokens are RANDOM 128-bit values (uuid v4), not sequential — a
+/// re-entry token crosses the SPAWN RPC boundary, so a guessable counter would
+/// let an unrelated caller forge its way into another create transaction.
+fn mint_token() -> u128 {
+    uuid::Uuid::new_v4().as_u128()
 }
 
 /// Mark `name` under `home` as deleting for the lifetime of the returned guard.
@@ -116,7 +117,7 @@ pub fn admit_create(home: &Path, name: &str) -> Result<CreateAdmission, String> 
 pub fn admit_or_reenter_create(
     home: &Path,
     name: &str,
-    token: Option<u64>,
+    token: Option<u128>,
 ) -> Result<CreateAdmission, String> {
     let k = key(home, name);
     let mut reg = registry().lock();
@@ -177,14 +178,14 @@ impl Drop for DeletingGuard {
 /// alive; a same-name delete refuses to start.
 pub struct CreateAdmission {
     key: (PathBuf, String),
-    token: u64,
+    token: u128,
 }
 
 impl CreateAdmission {
     /// #2764 R8: the transaction token — forward it through the spawn chain
     /// (SPAWN RPC params) so nested stages re-enter THIS create instead of
     /// being refused as an independent concurrent one.
-    pub fn token(&self) -> u64 {
+    pub fn token(&self) -> u128 {
         self.token
     }
 }
@@ -326,7 +327,7 @@ mod tests {
         let nested =
             admit_or_reenter_create(&home, "victim", Some(tok)).expect("matching token re-enters");
         assert!(
-            admit_or_reenter_create(&home, "victim", Some(tok + 999)).is_err(),
+            admit_or_reenter_create(&home, "victim", Some(tok ^ 1)).is_err(),
             "mismatched token must be refused"
         );
         drop(top);

@@ -106,6 +106,10 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
                 .to_string()
         });
 
+    // #2764 R9: record what THIS call materializes so the failure rollback can
+    // undo it — a pre-existing operator dir must never be removed.
+    let mut created_worktree: Option<std::path::PathBuf> = None;
+    let work_dir_preexisted = std::path::Path::new(&work_dir).exists();
     if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
         if !validate_branch(branch) {
             return json!({"error": format!("invalid branch name '{branch}'")});
@@ -124,9 +128,11 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         // `$AGEND_HOME/worktrees/<agent>/<branch>/` resolves correctly.
         if let Some(info) = crate::worktree::create(home, &wd, name, Some(branch)) {
             work_dir = info.path.display().to_string();
+            created_worktree = Some(info.path.clone());
         }
     }
 
+    let work_dir_created_here = !std::path::Path::new(&work_dir).exists();
     std::fs::create_dir_all(&work_dir).ok();
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
@@ -219,7 +225,7 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         // #2764 R8: nested spawn stages re-enter THIS create transaction —
         // without the token the daemon-side spawn_one would refuse the spawn
         // as an independent concurrent create.
-        "create_admission_token": _create_admission.token(),
+        "create_admission_token": _create_admission.token().to_string(),
     });
     if let Some(env) = env_value.as_ref() {
         spawn_params["env"] = env.clone();
@@ -281,12 +287,57 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         }
         Ok(resp) => {
             rollback_fleet_entry_on_failure(home, name, "SPAWN failed");
+            rollback_created_paths(
+                &work_dir,
+                work_dir_preexisted || !work_dir_created_here,
+                created_worktree.as_deref(),
+            );
             json!({"error": resp["error"].as_str().unwrap_or("spawn failed")})
         }
         Err(e) => {
             rollback_fleet_entry_on_failure(home, name, "API unavailable");
+            rollback_created_paths(
+                &work_dir,
+                work_dir_preexisted || !work_dir_created_here,
+                created_worktree.as_deref(),
+            );
             json!({"error": format!("API unavailable: {e}")})
         }
+    }
+}
+
+/// #2764 R9: undo the filesystem paths THIS create materialized before the
+/// spawn failed — the created worktree (git-removed so no orphan registration
+/// survives) and the created working dir. `work_dir_keep` = the dir either
+/// pre-existed or was not created by this call → never touched.
+fn rollback_created_paths(work_dir: &str, work_dir_keep: bool, worktree: Option<&Path>) {
+    if let Some(wt) = worktree {
+        let wt_str = wt.display().to_string();
+        let removed = crate::git_helpers::git_bypass(wt, &["rev-parse", "--git-common-dir"])
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let common = if Path::new(&raw).is_absolute() {
+                    std::path::PathBuf::from(&raw)
+                } else {
+                    wt.join(&raw)
+                };
+                common.parent().map(|repo| {
+                    crate::git_worktree::remove_force(repo, &wt_str)
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !removed {
+            let _ = std::fs::remove_dir_all(wt);
+        }
+        tracing::warn!(worktree = %wt.display(), "create rollback: removed worktree created by the failed create");
+    }
+    if !work_dir_keep {
+        let _ = std::fs::remove_dir_all(work_dir);
+        tracing::warn!(dir = %work_dir, "create rollback: removed working dir created by the failed create");
     }
 }
 

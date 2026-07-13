@@ -466,3 +466,71 @@ fn create_instance_name_plus_team_count_conflict_errors_2037() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// #2764 R9 RED: a SPAWN failure rolls back EVERYTHING this create
+/// materialized — the fleet entry AND the working dir it created (a
+/// pre-existing operator dir must never be touched; here the dir did not
+/// exist, so the rollback removes it).
+#[test]
+fn create_rollback_removes_created_workdir_and_fleet_entry_2764_r9() {
+    let home = tmp_home("r9-rollback");
+    let wd = home.join("fresh-workdir");
+    assert!(!wd.exists(), "precondition: the workdir does not exist yet");
+    let fail_spawn =
+        |_h: &std::path::Path, _req: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": false, "error": "boom"}))
+        };
+    let resp = spawn_single_instance_impl(
+        &home,
+        "",
+        &serde_json::json!({
+            "name": "rolled",
+            "backend": "claude",
+            "working_directory": wd.display().to_string(),
+        }),
+        &fail_spawn,
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "failed spawn must surface an error: {resp}"
+    );
+    assert!(
+        !wd.exists(),
+        "the workdir created by this call must be rolled back"
+    );
+    let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        !yaml.contains("rolled"),
+        "the fleet entry must be rolled back, got:\n{yaml}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2764 R9: a PRE-EXISTING operator working dir survives the rollback — only
+/// paths materialized by the failed create are undone.
+#[test]
+fn create_rollback_keeps_preexisting_workdir_2764_r9() {
+    let home = tmp_home("r9-rollback-keep");
+    let wd = home.join("operator-dir");
+    std::fs::create_dir_all(&wd).expect("mk operator dir");
+    std::fs::write(wd.join("precious.txt"), "keep me").expect("write");
+    let fail_spawn =
+        |_h: &std::path::Path, _req: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"ok": false, "error": "boom"}))
+        };
+    let _ = spawn_single_instance_impl(
+        &home,
+        "",
+        &serde_json::json!({
+            "name": "kept",
+            "backend": "claude",
+            "working_directory": wd.display().to_string(),
+        }),
+        &fail_spawn,
+    );
+    assert!(
+        wd.join("precious.txt").exists(),
+        "a pre-existing operator dir must NEVER be removed by the rollback"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

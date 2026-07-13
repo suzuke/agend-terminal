@@ -158,8 +158,32 @@ pub fn delete_transaction_expecting(
             wait_for_child_exit(&child_arc)
         }
     } else {
-        // No registry entry; nothing to wait on.
-        true
+        // #2764 R9: NO live registry handle. Registry absence alone is NOT
+        // terminal proof (a lost handle leaves a live child) — consult the
+        // durable child ledger + an OS liveness probe:
+        //   no ledger entry            → durable negative (never spawned /
+        //                                already proven exited) → terminal;
+        //   ledger + pid provably gone → terminal; ledger cleared;
+        //   ledger + pid alive/unknown → UNKNOWN → report false, release
+        //                                nothing (never kill an unverified
+        //                                recorded pid — pid reuse).
+        match instance_id.and_then(|id| crate::agent::child_ledger::lookup(home, &id)) {
+            None => true,
+            Some(pid) if !crate::agent::child_ledger::pid_alive(pid) => {
+                if let Some(id) = instance_id {
+                    crate::agent::child_ledger::clear(home, &id);
+                }
+                true
+            }
+            Some(pid) => {
+                tracing::warn!(
+                    agent = %name,
+                    pid,
+                    "delete: no registry handle but the recorded child pid is still alive                      (or unverifiable) — stop disposition UNKNOWN, authority retained"
+                );
+                false
+            }
+        }
     };
 
     // #2764 R8 (codex blocker 2 at d54a3ab4): a wait TIMEOUT is an UNKNOWN
@@ -182,6 +206,11 @@ pub fn delete_transaction_expecting(
             "delete_transaction: child did not exit within timeout — registry/config/port retained for retry"
         );
         return false;
+    }
+
+    // #2764 R9: terminal exit proven — clear the durable child ledger.
+    if let Some(id) = instance_id {
+        crate::agent::child_ledger::clear(home, &id);
     }
 
     // Step 4: registry remove (after child exit confirmed or timeout).
@@ -556,9 +585,10 @@ mod tests {
     /// #2764 R8 (codex correction 3): a PINNED stop addresses the registry by
     /// the EXACT expected id — an A→B same-name replacement between the
     /// caller's validation and the stop lookup must leave B's child, config
-    /// and port untouched. A itself is terminally absent (not registered), so
-    /// the stop verdict is true, and the fresh generation check skips ALL
-    /// name-keyed cleanup because the name now belongs to B.
+    /// and port untouched. A's terminal absence is PROVEN (R9): no registry
+    /// handle AND no durable child-ledger entry = durable negative (never
+    /// spawned), so the verdict is true, and the fresh generation check skips
+    /// ALL name-keyed cleanup because the name now belongs to B.
     #[test]
     fn pinned_stop_never_retargets_replacement_generation_2764_r8() {
         let home = tmp_home("pinned-no-retarget");
@@ -592,6 +622,65 @@ mod tests {
         assert!(
             port.exists(),
             "the replacement B's port (name-keyed) must be untouched"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2764 R9: NO registry handle + a durable child-ledger entry whose pid
+    /// is still ALIVE (this test's own pid) → the stop disposition is UNKNOWN:
+    /// report false, retain the ledger, release nothing name-keyed. Registry
+    /// absence alone must never convert into terminal-absence authority.
+    #[test]
+    fn pinned_stop_lost_child_alive_is_unknown_2764_r9() {
+        let home = tmp_home("lost-child-alive");
+        let reg = empty_registry();
+        let id = crate::types::InstanceId::new();
+        crate::agent::child_ledger::record(&home, &id, std::process::id());
+        let rdir = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&rdir).expect("mk run dir");
+        let port = crate::ipc::port_path(&rdir, "lost");
+        std::fs::write(&port, "1").expect("seed port");
+
+        let verdict = delete_transaction_expecting(&home, "lost", &reg, None, false, Some(id));
+
+        assert!(
+            !verdict,
+            "an alive recorded child without a handle is UNKNOWN"
+        );
+        assert_eq!(
+            crate::agent::child_ledger::lookup(&home, &id),
+            Some(std::process::id()),
+            "the ledger must be RETAINED on UNKNOWN"
+        );
+        assert!(
+            port.exists(),
+            "nothing name-keyed may be released on UNKNOWN"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2764 R9: NO registry handle + a ledger entry whose pid is provably
+    /// GONE (freshly-reaped child) → terminal absence proven via the OS probe;
+    /// the ledger is cleared and the stop reports true.
+    #[test]
+    fn pinned_stop_lost_child_dead_is_terminal_2764_r9() {
+        let home = tmp_home("lost-child-dead");
+        let reg = empty_registry();
+        let id = crate::types::InstanceId::new();
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        crate::agent::child_ledger::record(&home, &id, pid);
+
+        let verdict = delete_transaction_expecting(&home, "gone", &reg, None, false, Some(id));
+
+        assert!(verdict, "a provably-dead recorded child is terminal");
+        assert_eq!(
+            crate::agent::child_ledger::lookup(&home, &id),
+            None,
+            "the ledger must be cleared once terminal absence is proven"
         );
         std::fs::remove_dir_all(&home).ok();
     }

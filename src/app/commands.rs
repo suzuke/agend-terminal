@@ -438,7 +438,11 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     return true;
                 }
                 Err(e) => {
-                    tracing::error!(name = %inst_name, backend = *backend_name, error = %e, "spawn failed")
+                    tracing::error!(name = %inst_name, backend = *backend_name, error = %e, "spawn failed");
+                    // #2764 R9: hold-through-success-or-rollback — undo the
+                    // fleet/topic mutations while the admission guard is still
+                    // held, so a failed palette spawn leaves ZERO residue.
+                    super::tui_spawn::rollback_created_instance(ctx.home, &inst_name);
                 }
             }
         }

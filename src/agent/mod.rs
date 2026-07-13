@@ -23,6 +23,7 @@ use dismiss::{
     try_prepared_dismiss_dialog, PreparedDismissPattern,
 };
 
+pub mod child_ledger;
 pub mod deleting;
 
 #[cfg(unix)]
@@ -1302,6 +1303,16 @@ pub fn spawn_agent(
     // lookup. Extracted to `resolve_spawn_instance_id` so the managed/unmanaged
     // identity policy is unit-testable without a live PTY spawn.
     let instance_id = resolve_spawn_instance_id(config.home, name)?;
+
+    // #2764 R9: durable child-lifecycle ledger for MANAGED agents — written
+    // before the handle becomes discoverable, cleared only on proven terminal
+    // exit. A later pinned stop consults it so a lost registry handle can
+    // never be vacuously converted into "terminally absent".
+    if let Some(home_path) = config.home {
+        if let Some(pid) = child_arc.lock().process_id() {
+            crate::agent::child_ledger::record(home_path, &instance_id, pid);
+        }
+    }
 
     // Register in registry
     {

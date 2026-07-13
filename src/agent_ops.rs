@@ -540,7 +540,7 @@ pub fn spawn_one(
     work_dir: &Path,
     size: (u16, u16),
     env: Option<&std::collections::HashMap<String, String>>,
-    create_token: Option<u64>,
+    create_token: Option<u128>,
 ) -> anyhow::Result<crate::backend::SpawnMode> {
     // #2764 R7/R8 (codex P0-1): admission BEFORE the first side effect — the
     // dir creation + skills install below run long before spawn_agent's

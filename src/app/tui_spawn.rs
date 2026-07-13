@@ -76,6 +76,34 @@ pub(crate) fn add_instance_with_topic(
     Ok((outcome, create_admission))
 }
 
+/// #2764 R9: undo a TUI create's fleet/topic mutations after a pane-create
+/// failure (called while the caller still HOLDS the create admission, so no
+/// delete can interleave). Mirrors `full_delete_instance`'s topic discipline:
+/// unregister our own mapping unconditionally; a Telegram-side delete failure
+/// leaves a genuine orphan for the sweep paths, never a landmine for the next
+/// same-name instance.
+pub(crate) fn rollback_created_instance(home: &Path, name: &str) {
+    if let Some(tid) = crate::channel::telegram::lookup_topic_for_instance(home, name) {
+        match crate::channel::telegram::delete_topic(home, tid) {
+            crate::channel::telegram::DeleteTopicOutcome::Deleted => {}
+            other => {
+                crate::channel::telegram::unregister_topic(home, tid);
+                tracing::warn!(instance = name, topic_id = tid, outcome = ?other,
+                    "TUI create rollback: topic delete incomplete — registry unregistered anyway");
+            }
+        }
+    }
+    if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
+        tracing::error!(instance = name, error = %e,
+            "TUI create rollback: fleet.yaml entry removal FAILED — residue left");
+    } else {
+        tracing::warn!(
+            instance = name,
+            "TUI create rollback: removed fleet entry after pane-create failure"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -390,6 +418,40 @@ mod tests {
         );
         reset_active_channel_for_test();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #2764 R9 RED: a pane-create failure rolls back the fleet/topic
+    /// mutations (helper used by menu Backend/Fugu + palette while the
+    /// admission guard is still held) — a failed TUI create leaves zero
+    /// fleet/topic residue.
+    #[test]
+    fn rollback_created_instance_removes_fleet_and_topic_2764_r9() {
+        let home = tmp_home("r9-tui-rollback");
+        let (_outcome, _adm) = add_instance_with_topic(
+            &home,
+            "halfway",
+            &crate::fleet::InstanceYamlEntry {
+                backend: Some("claude".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("create registers");
+        crate::channel::telegram::register_topic(&home, 4242, "halfway").expect("seed topic");
+
+        rollback_created_instance(&home, "halfway");
+
+        let yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+        assert!(
+            !yaml.contains("halfway"),
+            "fleet entry must be rolled back, got:\n{yaml}"
+        );
+        assert_eq!(
+            crate::channel::telegram::lookup_topic_for_instance(&home, "halfway"),
+            None,
+            "topic mapping must be rolled back"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #2764 R8 RED: the TUI create entry racing a same-name delete is
