@@ -206,6 +206,18 @@ fn branch_lock_path(home: &Path, repo: &str, branch: &str) -> PathBuf {
     branch_dir(home, repo, branch).join("assignment.lock")
 }
 
+/// Test-only path accessors: cross-module regression tests (scanner / pr_state)
+/// need the internal on-disk layout to inject a corrupt record, a corrupt markers
+/// file, or an un-acquirable branch lock. `#[cfg(test)]` — zero production surface.
+#[cfg(test)]
+pub(crate) fn record_path_for_test(home: &Path, repo: &str, branch: &str, target: &str) -> PathBuf {
+    record_file(home, repo, branch, target)
+}
+#[cfg(test)]
+pub(crate) fn branch_lock_path_for_test(home: &Path, repo: &str, branch: &str) -> PathBuf {
+    branch_lock_path(home, repo, branch)
+}
+
 /// Map an arbitrary key part to a filename-safe, human-readable component. Lossy
 /// (collisions possible) — [`key_hash`] restores injectivity.
 fn sanitize_component(s: &str) -> String {
@@ -1604,6 +1616,34 @@ mod tests {
                 .acked_at
                 .as_deref(),
             Some("2026-07-13T00:00:07Z"),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// B4(b) — a CORRUPT markers file must NOT be silently read as an EMPTY
+    /// (zero-terminals) set. `record_terminal` reads the RETAINED marker set to
+    /// append to; if a corrupt file read as default-empty, the subsequent write
+    /// would OVERWRITE the retained set with just the new marker, LOSING every
+    /// prior terminal generation (old-generation replays would then no longer die
+    /// — B20). Fail closed: `record_terminal` must surface the corruption (Err) and
+    /// NOT overwrite. Pre-fix: `read_markers` `.unwrap_or_default()` empties on
+    /// corrupt, so `record_terminal` returns `Ok` and clobbers the retained set.
+    #[test]
+    fn b4_corrupt_markers_fails_closed_not_silent_empty() {
+        let home = tmp_home("b4-markers");
+        // Retain two terminal generations first.
+        record_terminal(&home, "o/r", "feat/x", 100, TerminalKind::Merged).unwrap();
+        record_terminal(&home, "o/r", "feat/x", 101, TerminalKind::Closed).unwrap();
+        // Corrupt the markers file on disk.
+        let mpath = markers_file(&home, "o/r", "feat/x");
+        std::fs::write(&mpath, b"{ this is not valid markers json").unwrap();
+
+        // A subsequent record_terminal must FAIL CLOSED (not silently treat the
+        // corrupt file as zero terminals and overwrite the retained set).
+        let res = record_terminal(&home, "o/r", "feat/x", 102, TerminalKind::Merged);
+        assert!(
+            res.is_err(),
+            "record_terminal must fail closed on a corrupt markers file, not overwrite the retained set"
         );
         std::fs::remove_dir_all(&home).ok();
     }

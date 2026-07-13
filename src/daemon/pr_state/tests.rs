@@ -2899,3 +2899,61 @@ fn t30_drain_excludes_satisfied_and_foreign_generation() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// B4(d) — when a branch HAS active assignments but the reviewer-assignment lock
+/// CANNOT be acquired during the `record_ci_result` A6 drain, the reserved set must
+/// NOT be re-derived LOCK-FREE. A lock-free derivation can race a concurrent
+/// revoke/transfer and produce a torn reserved set that CLEARS the merge gate.
+/// Fail closed: keep the existing (gate-closing) `reserved_assignments`; the per-tick
+/// reconciler re-derives under the lock later. Pre-fix the drain overwrites
+/// `reserved_assignments` unconditionally, dropping the pre-existing reservation.
+#[test]
+fn b4_drain_preserves_reserved_when_assignment_lock_unavailable() {
+    let home = t30_home("b4-lock");
+    // An active assignment for THIS generation ⇒ has_active == true.
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42);
+    // A pre-existing reserved entry (a DIFFERENT target the lock-free re-derive would
+    // DROP — the fail-open the drain must not cause).
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.reserved_assignments = vec![ReservedAssignment {
+        target: "ghost".into(),
+        review_author: crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        assignment_id: uuid::Uuid::new_v4(),
+    }];
+    save(&home, &ps).unwrap();
+
+    // POISON the branch assignment lock so acquisition returns None while has_active
+    // is true: put a DIRECTORY where the lock file is opened, so the open-for-write
+    // fails (EISDIR) deterministically — no wall clock, no thread race.
+    let lock_path = crate::daemon::assignment_authority::branch_lock_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/x",
+    );
+    let _ = std::fs::remove_file(&lock_path);
+    std::fs::create_dir_all(&lock_path).unwrap();
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(
+        s.reserved_assignments
+            .iter()
+            .map(|r| r.target.clone())
+            .collect::<Vec<_>>(),
+        vec!["ghost".to_string()],
+        "has_active && lock unavailable ⇒ the drain must PRESERVE the existing reserved set (fail closed), not re-derive it lock-free"
+    );
+    // Cleanup: the poisoned lock dir would block remove_dir_all's file unlink? it's a
+    // dir, remove_dir_all handles it.
+    let _ = std::fs::remove_dir_all(&home);
+}

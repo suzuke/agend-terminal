@@ -414,6 +414,56 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// B4(a) — a CORRUPT authority record must NOT silently DROP its reservation
+    /// from the derived `reserved_assignments` set (which would OPEN the reserved
+    /// merge gate). The reserved derivation reads records; pre-fix a corrupt record
+    /// is indistinguishable from ABSENT (skipped), so the reconciler's A10b re-derive
+    /// clears the reservation → `is_merge_ready` opens on a corrupt authority record.
+    /// Fail closed: corruption ⇒ KEEP the existing reservation (do not overwrite).
+    #[test]
+    fn b4_corrupt_record_keeps_reservation_fail_closed() {
+        let home = tmp_home("b4-corrupt-rec");
+        // TWO active records on the SAME branch/generation. `rev-a` stays healthy so
+        // the branch remains in the reconciler's work set (active_branches); `rev-b`
+        // is the one we corrupt — its reservation must NOT be dropped.
+        store::persist(
+            &home,
+            &mk("o/r", "feat/x", "rev-a", 42, "2026-07-13T00:00:00Z"),
+        )
+        .unwrap();
+        store::persist(
+            &home,
+            &mk("o/r", "feat/x", "rev-b", 42, "2026-07-13T00:00:00Z"),
+        )
+        .unwrap();
+        open_prstate(&home, "o/r", "feat/x", 42, "sha-42");
+
+        // First reconcile derives reservations for both healthy records.
+        reconcile_all_collect(&home, "2026-07-13T00:05:00Z");
+        let mut both = reserved_targets(&home, "o/r", "feat/x");
+        both.sort();
+        assert_eq!(
+            both,
+            vec!["rev-a".to_string(), "rev-b".to_string()],
+            "both healthy records reserve"
+        );
+
+        // Now CORRUPT rev-b's record file and reconcile again. Its reservation MUST
+        // survive (fail closed) — never dropped because the record is unreadable.
+        let rpath = store::record_path_for_test(&home, "o/r", "feat/x", "rev-b");
+        std::fs::write(&rpath, b"{ not valid assignment json").unwrap();
+
+        reconcile_all_collect(&home, "2026-07-13T00:10:00Z");
+        let mut after = reserved_targets(&home, "o/r", "feat/x");
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["rev-a".to_string(), "rev-b".to_string()],
+            "a corrupt authority record must NOT drop its reservation (gate stays closed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// T28 — the reconciler handler is registered at cadence `new(1)` and its `run`
     /// actually drives the reconcile when the cadence permits (a lease-due Unengaged
     /// record is repaired). Cross-checked by a source-pin on the registration.
