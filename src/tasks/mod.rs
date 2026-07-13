@@ -15,9 +15,12 @@ mod tests;
 
 // #2760 RED (frozen-plan d-…-7): strict-routing contract for `load_routed`.
 // Proven-failing against the checkpoint stub; the GREEN strict-resolution body
-// turns them green.
+// turns them green. `#[path]` (mirroring the `tests` submodule above) marks this a
+// cfg(test) module file so the task-events anti-bypass invariant recognizes it as
+// test-only — the Unreadable RED deliberately makes a board's event log a directory.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "routing_red_2760.rs"]
 mod routing_red_2760;
 
 use serde::{Deserialize, Serialize};
@@ -743,7 +746,13 @@ pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileRep
     let mut report = CrossBoardReconcileReport::default();
     let emitter = InstanceName::from("system:cross_board_dep_detective");
 
-    for project in board_router::enumerate_projects(home) {
+    // #2760 R1: an unenumerable boards/ dir → skip this reconcile pass entirely
+    // (conservative: never release a claim we cannot fully survey).
+    let projects = match board_router::enumerate_projects(home) {
+        Ok(p) => p,
+        Err(_) => return report,
+    };
+    for project in projects {
         let board = crate::task_events::board_root(home, &project);
         // RAW persisted state (`replay_at`, no in-memory dep derivation) — the
         // derived view (`list_all_at`/`list_all_boards`) would relabel an

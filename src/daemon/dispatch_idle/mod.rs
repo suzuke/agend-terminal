@@ -481,25 +481,29 @@ fn target_in_fleet(home: &Path, agent: &str) -> bool {
 
 /// #1018 (A): is `task_id` still live on the task board? Returns
 /// `Some(true)` for live (one of `LIVE_TASK_STATUSES`); `Some(false)`
-/// for a definitively closed task (`done`, `cancelled`, etc.);
-/// `None` when the task can't be found at all (treat as live —
-/// fail-open).
+/// for a definitively closed OR definitively-absent task (the caller
+/// skips the nudge / treats it dead); `None` when the route is UNPROVABLE
+/// (treat as live — fail-open, keep nudging).
 fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
     if task_id.is_empty() {
         return None;
     }
     // #1608b/#1614: event-sourced lookup, NOT a `tasks/{id}.json` probe — that
-    // file is never written, so the old read always failed → this check was dead
-    // (always `None`) and the #1018 "skip the nudge for a closed task" branch was
-    // unreachable.
-    // #2760: resolve via the STRICT router. Found → real liveness; ANY route error
-    // (NotFound / Unreadable / Ambiguous) → `None` → treated as live (fail-open),
-    // preserving the pre-#2760 "can't prove it closed ⇒ keep nudging" semantics.
-    // (Per frozen-plan pt5, treating a definitive NotFound as orphan-dead would be
-    // a deliberate policy change; the watchdog stays conservative and does not.)
-    let routed = crate::tasks::load_routed(home, task_id).ok()?;
-    let status = routed.task.status.to_string();
-    Some(LIVE_TASK_STATUSES.contains(&status.as_str()))
+    // file is never written, so the old read always failed → this check was dead.
+    // #2760 R1 (explicit dispatch-idle policy):
+    //   Found                → real liveness (terminal status → Some(false) dead);
+    //   NotFound             → Some(false): a DEFINITIVELY-absent task is orphan-dead
+    //                          (the deliberate policy the frozen plan permits);
+    //   Unreadable/Ambiguous → None: the route is UNPROVABLE → fail-open → treat as
+    //                          live (keep nudging), never orphan an unprovable task.
+    match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => {
+            let status = routed.task.status.to_string();
+            Some(LIVE_TASK_STATUSES.contains(&status.as_str()))
+        }
+        Err(crate::tasks::TaskRouteError::NotFound) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// #1018 (B) eager cleanup: when a task transitions to a terminal
