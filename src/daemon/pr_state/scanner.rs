@@ -2125,6 +2125,137 @@ mod tests {
             "#2749 3b: freshness_error ⇒ pr-ready suppressed"
         );
     }
+
+    // ─── #2749 correction (codex): retry-lease backoff + stale-error discard ──
+    // A persistent compare failure must back off to ONE compare per 60s lease
+    // (not one per 15s worker cycle), and a stale errored tuple must be discarded
+    // when the observation advances. These FAIL vs this commit's parent (the
+    // populator recomputes every cycle on error and never clears the stale error).
+
+    fn set_retry_after(home: &std::path::Path, deadline: Option<String>) {
+        let _ = super::super::with_pr_state(home, "owner/repo", "feat/x", |s| {
+            s.freshness_retry_after = deadline;
+        });
+    }
+
+    /// RED (backoff): a persistently-FAILING compare stamps a 60s retry lease and
+    /// is NOT re-attempted within it (one compare, no 15s storm); it re-attempts
+    /// once the lease deadline passes.
+    #[test]
+    fn off_tick_persistent_failure_backs_off_then_retries_after_lease() {
+        let mock = crate::scm::MockScmProvider::with_compare_err("forge 500");
+        let _scm = crate::scm::set_test_scm_provider(mock.clone());
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = full_head(5);
+        ready_state(&home, 88, &head);
+        scan_observe(&home, 88, &head, BEHIND_BASE);
+
+        run_off_tick(&home, 88, &head, BEHIND_BASE); // compare #1 → Err, lease set
+        assert_eq!(mock.compare_calls(), 1, "first cycle compares once");
+        let s = load(&home, "owner/repo", "feat/x").unwrap();
+        assert!(
+            s.freshness_error && s.freshness_retry_after.is_some(),
+            "error + lease stamped"
+        );
+
+        run_off_tick(&home, 88, &head, BEHIND_BASE); // within lease → SKIP (no compare)
+        assert_eq!(
+            mock.compare_calls(),
+            1,
+            "#2749 correction: within the 60s lease the failing tuple must NOT re-compare (no 15s storm)"
+        );
+
+        // Age the lease past its deadline → re-attempt.
+        set_retry_after(
+            &home,
+            Some((chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339()),
+        );
+        run_off_tick(&home, 88, &head, BEHIND_BASE);
+        assert_eq!(
+            mock.compare_calls(),
+            2,
+            "#2749 correction: after the lease deadline the tuple re-attempts"
+        );
+    }
+
+    /// RED (stale-error discard): a failed compare (error + lease) whose observation
+    /// then ADVANCES must have the stale error + lease CLEARED, so the NEW tuple is
+    /// re-attempted immediately rather than staying errored.
+    #[test]
+    fn off_tick_observation_change_discards_stale_error_and_lease() {
+        let mock = crate::scm::MockScmProvider::with_compare_err("forge 500");
+        let _scm = crate::scm::set_test_scm_provider(mock.clone());
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = full_head(6);
+        let base1 = full_head(12);
+        let base2 = full_head(24);
+        ready_state(&home, 88, &head);
+        scan_observe(&home, 88, &head, &base1);
+        run_off_tick(&home, 88, &head, &base1); // Err → error + lease for base1
+        let s = load(&home, "owner/repo", "feat/x").unwrap();
+        assert!(s.freshness_error && s.freshness_retry_after.is_some());
+
+        // Observation advances to base2 ⇒ the base1 error/lease is stale.
+        scan_observe(&home, 88, &head, &base2);
+        let s = load(&home, "owner/repo", "feat/x").unwrap();
+        assert!(
+            !s.freshness_error,
+            "#2749 correction: an observed tuple change must DISCARD the stale freshness_error"
+        );
+        assert!(
+            s.freshness_retry_after.is_none(),
+            "#2749 correction: the stale retry lease must be discarded on tuple change"
+        );
+    }
+
+    /// The retry lease persists across restart (serde) and a MALFORMED / absurd
+    /// deadline fails-closed by re-attempting (self-heal to a valid lease) rather
+    /// than sticking the PR errored; the gate stays fail-closed on freshness_error.
+    #[test]
+    fn off_tick_retry_lease_persists_and_malformed_self_heals() {
+        // Restart persistence: a stamped retry lease survives save→load.
+        let home = tmp_home(line!());
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        let mut s = merge_ready_state("owner/repo", "feat/x", &full_head(7), 88);
+        s.freshness_retry_after = Some("2026-07-13T00:00:00+00:00".into());
+        save(&home, &s).unwrap();
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .freshness_retry_after
+                .as_deref(),
+            Some("2026-07-13T00:00:00+00:00"),
+            "retry lease persists across restart"
+        );
+
+        // Malformed lease + freshness_error ⇒ the populator re-attempts (self-heal),
+        // and the gate keeps suppressing (fail-closed) while errored.
+        let mock = crate::scm::MockScmProvider::with_compare_err("forge 500");
+        let _scm = crate::scm::set_test_scm_provider(mock.clone());
+        let home2 = tmp_home(line!());
+        write_team_fleet(&home2, "lead", "dev");
+        let head = full_head(8);
+        let mut s = merge_ready_state("owner/repo", "feat/x", &head, 88);
+        s.pr_author = "dev".into();
+        save(&home2, &s).unwrap();
+        scan_observe(&home2, 88, &head, BEHIND_BASE);
+        run_off_tick(&home2, 88, &head, BEHIND_BASE); // Err → error + valid lease
+        let before = mock.compare_calls();
+        set_retry_after(&home2, Some("not-a-timestamp".into())); // corrupt the lease
+        run_off_tick(&home2, 88, &head, BEHIND_BASE); // malformed ⇒ re-attempt (self-heal)
+        assert!(
+            mock.compare_calls() > before,
+            "#2749 correction: a malformed retry lease fails-closed by re-attempting (no stuck PR)"
+        );
+        assert!(
+            load(&home2, "owner/repo", "feat/x")
+                .unwrap()
+                .freshness_error,
+            "gate stays fail-closed while errored"
+        );
+    }
 }
 
 #[cfg(test)]

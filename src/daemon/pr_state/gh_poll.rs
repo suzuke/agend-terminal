@@ -603,6 +603,7 @@ pub(crate) mod tests {
             freshness_checked_at: None,
             freshness_behind_by: None,
             freshness_error: false,
+            freshness_retry_after: None,
             observed_head_sha: None,
             observed_base_sha: None,
             observed_at: None,

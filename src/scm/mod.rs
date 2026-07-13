@@ -677,6 +677,9 @@ impl ScmProvider for TestScmHandle {
 pub(crate) struct MockScmProvider {
     pr_list: Option<MockPrList>,
     compare: Option<Result<CompareResult, String>>,
+    /// #2749 correction: counts `compare` invocations so a test can assert the
+    /// off-tick populator's retry-lease BACKOFF (one compare per lease, not per cycle).
+    compare_calls: std::sync::atomic::AtomicUsize,
 }
 
 /// Configured `pr_list` behavior for [`MockScmProvider`].
@@ -694,18 +697,18 @@ impl MockScmProvider {
     pub(crate) fn with_pr_list(behavior: MockPrList) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             pr_list: Some(behavior),
-            compare: None,
+            ..Default::default()
         })
     }
 
     /// #2749 3b: a canned `compare` result — `behind_by` commits behind the base.
     pub(crate) fn with_compare(behind_by: u64) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            pr_list: None,
             compare: Some(Ok(CompareResult {
                 behind_by,
                 files: vec![],
             })),
+            ..Default::default()
         })
     }
 
@@ -713,9 +716,15 @@ impl MockScmProvider {
     /// off-tick populator must stamp `freshness_error` without clobbering.
     pub(crate) fn with_compare_err(msg: &str) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            pr_list: None,
             compare: Some(Err(msg.to_string())),
+            ..Default::default()
         })
+    }
+
+    /// #2749 correction: how many times `compare` has been invoked (backoff assert).
+    pub(crate) fn compare_calls(&self) -> usize {
+        self.compare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -747,6 +756,8 @@ impl ScmProvider for MockScmProvider {
         unimplemented!("MockScmProvider::issue_view not configured")
     }
     fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<CompareResult> {
+        self.compare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match &self.compare {
             Some(Ok(r)) => Ok(r.clone()),
             Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),

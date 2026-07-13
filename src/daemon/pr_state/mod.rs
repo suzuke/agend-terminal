@@ -155,6 +155,13 @@ pub struct PrState {
     pub freshness_behind_by: Option<u64>,
     #[serde(default)]
     pub freshness_error: bool,
+    /// #2749 correction (codex): a persisted 60s retry lease (RFC3339 deadline)
+    /// for a FAILED ancestry compare on the exact observed tuple — bounds a
+    /// persistently-failing forge to ONE compare per lease (not one per 15s worker
+    /// cycle). Cleared on a successful compare, or when the observed (head/base)
+    /// tuple changes (the errored tuple is then stale). `#[serde(default)]`.
+    #[serde(default)]
+    pub freshness_retry_after: Option<String>,
     /// #2749 CORRECTION 3 (codex R2): the ATOMIC observed (head, base) pair,
     /// written together in ONE `apply_gh_poll` from a single
     /// `gh pr view --json headRefOid,baseRefOid` response — never composed
@@ -1038,6 +1045,7 @@ pub fn new_for_branch(
         freshness_checked_at: None,
         freshness_behind_by: None,
         freshness_error: false,
+        freshness_retry_after: None,
         // #2749: fresh state has an empty (unknown) observation — gh_poll
         // stamps observed_head_sha + observed_base_sha atomically on a later
         // pass; until then the read-only gate fails closed.

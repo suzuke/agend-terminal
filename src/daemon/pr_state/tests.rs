@@ -71,6 +71,7 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         freshness_checked_at: None,
         freshness_behind_by: None,
         freshness_error: false,
+        freshness_retry_after: None,
         observed_head_sha: None,
         observed_base_sha: None,
         observed_at: None,
@@ -116,6 +117,7 @@ fn pre_2749_state_json_loads_with_defaulted_freshness_and_oid_fields() {
         "freshness_checked_at",
         "freshness_behind_by",
         "freshness_error",
+        "freshness_retry_after",
     ] {
         obj.remove(k);
     }
@@ -140,6 +142,10 @@ fn pre_2749_state_json_loads_with_defaulted_freshness_and_oid_fields() {
         "freshness_behind_by ⇒ None"
     );
     assert!(!loaded.freshness_error);
+    assert!(
+        loaded.freshness_retry_after.is_none(),
+        "freshness_retry_after ⇒ None"
+    );
     let gh = loaded.last_gh_state.expect("last_gh_state survives");
     assert!(
         gh.head_ref_oid.is_none(),
