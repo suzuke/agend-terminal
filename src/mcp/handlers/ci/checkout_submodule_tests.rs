@@ -986,6 +986,146 @@ fn checkout_restart_replays_stale_worktree_2755() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// #2755 item 1 (codex R2): the PRODUCTION recovery entry
+/// `checkout_txn::recover_pending_sweep_prod` — the ONE callable run from
+/// boot-repair AND the per-tick handler — invoked DIRECTLY (not via another
+/// checkout) removes a crashed attempt's REAL stale worktree under the real
+/// path-lock via a real `git worktree remove --force`, then clears its journal.
+/// The restart-replay test above drives recovery THROUGH a second checkout; this
+/// pins the boot / per-tick standalone path codex flagged as untested.
+#[cfg(unix)]
+#[test]
+fn recover_pending_sweep_prod_removes_stale_worktree_directly_2755() {
+    let home = tmp_home("prod-sweep");
+    let repo = tmp_repo_with_file("prod-sweep", "readme.txt", "x\n");
+    let instance = "agent-ps";
+    let mangled = mangled_for(instance, &repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    // A crashed attempt: a REAL registered worktree + a non-Committed journal.
+    git_run_ok(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &wt.display().to_string(),
+            "main",
+        ],
+        false,
+    );
+    assert!(
+        wt.join("readme.txt").is_file(),
+        "fixture: stale worktree materialized"
+    );
+    let mut j = Journal::prepared(
+        "crashed-nonce",
+        wt.display().to_string(),
+        repo.display().to_string(),
+        "main",
+        false,
+        fixed_now().to_rfc3339(),
+    );
+    j.advance(Phase::WorktreeAdded);
+    j.save(&home, &mangled).unwrap();
+
+    // DIRECT production entry — no second checkout drives this.
+    let resolved = super::checkout_txn::recover_pending_sweep_prod(&home);
+    assert_eq!(
+        resolved, 1,
+        "prod sweep resolves exactly the one crashed worktree"
+    );
+    assert!(
+        !wt.exists(),
+        "stale worktree removed by the real `git worktree remove --force`"
+    );
+    assert!(
+        Journal::load(&home, &mangled).is_none(),
+        "journal cleared after successful recovery"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #2755 item 2 (codex R2): a `bind:true` idempotent reuse (THIS agent already
+/// bound to this branch, worktree still on disk) must recursively INIT submodules
+/// on the reused worktree before returning it. A worktree provisioned before this
+/// fix — or partially inited — can have EMPTY submodule dirs; reuse must self-heal
+/// rather than hand back a broken tree. RED before the reuse-path
+/// `init_submodules_strict` (the short-circuit returned the stale worktree as-is).
+///
+/// Feasible without daemon signing: `binding::read` is an unsigned read (no HMAC
+/// verify) and the reuse short-circuit returns BEFORE `bind_full`, so a hand-seeded
+/// `binding.json` drives the path. The branch is non-protected (E4.5 rejects `main`
+/// under `bind:true`).
+#[cfg(unix)]
+#[test]
+fn checkout_idempotent_bound_reuse_inits_empty_submodules_2755() {
+    let home = tmp_home("reuse-submod");
+    let super_repo = tmp_super_with_nested_submodules("reuse-submod");
+    let instance = "agent-reuse";
+    let branch = "feat/reuse"; // non-protected (main is E4.5-protected for bind)
+    git_run_ok(&super_repo, &["branch", branch, "main"], false);
+
+    // A pre-existing bound worktree whose submodules are EMPTY: `git worktree add`
+    // does NOT recurse submodules, so vendor/mid/ starts uninitialized.
+    let mangled = mangled_for(instance, &super_repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_run_ok(
+        &super_repo,
+        &["worktree", "add", &wt.display().to_string(), branch],
+        false,
+    );
+    let nested_b = wt.join("vendor/mid/nested/nested_b.txt");
+    assert!(
+        !nested_b.exists(),
+        "fixture: reused worktree must start with EMPTY submodules"
+    );
+
+    // Seed THIS agent's binding pointing at the existing worktree (unsigned; the
+    // reuse short-circuit reads branch+worktree and returns before bind_full).
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T-test",
+            "branch": branch,
+            "worktree": wt.display().to_string(),
+            "source_repo": super_repo.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let args = json!({
+        "repository_path": super_repo.display().to_string(),
+        "branch": branch,
+        "bind": true,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp.get("idempotent").and_then(|v| v.as_bool()),
+        Some(true),
+        "must take the idempotent bound-reuse path: {resp}"
+    );
+    assert!(
+        nested_b.is_file(),
+        "#2755: idempotent reuse must recursively init submodules so {} exists",
+        nested_b.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 /// Windows/open-handle: a rollback whose `git worktree remove --force` FAILS
 /// (an open handle pins the dir) RETAINS intent (armed + backoff); a later sweep,
 /// once the handle is released (remove succeeds), resolves and clears it.
