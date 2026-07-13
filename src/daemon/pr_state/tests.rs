@@ -379,6 +379,109 @@ fn typed_buffer_lock_failure_retries_without_losing_receipt_2760() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// task66/root-review RED: selecting a typed buffered receipt is not a commit.
+/// If the subsequent atomic PR-state save fails, the durable candidate must
+/// remain parked so a later observation can revalidate and apply it exactly
+/// once. This exercises the post-selection failure window that the assignment-
+/// lock test above does not reach.
+#[test]
+fn typed_buffer_save_failure_after_selection_remains_retryable_2760() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-prstate-buffer-save-2760-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let head = "e".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/buffer-save",
+        "reviewer",
+        reviewer_id,
+        44,
+        &head,
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-buffer-save-review",
+        ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-07-14T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+    let receipt = crate::review_receipt::ReviewReceiptSummary {
+        receipt_id: "review-receipt:m-buffer-save".into(),
+        source_id: "m-buffer-save".into(),
+        evidence_digest: "a".repeat(64),
+        assignment_id: assignment.assignment_id,
+        reviewer_instance_id: reviewer_id,
+        reviewer_name: "reviewer".into(),
+        repo: "owner/repo".into(),
+        pr_number: 44,
+        branch: "fix/buffer-save".into(),
+        task_id: "t-buffer-save-review".into(),
+        reviewed_head: head.clone(),
+        review_class: ReviewClass::Single,
+        slot: crate::review_receipt::ReviewSlot::Primary,
+        verdict: crate::review_receipt::ReviewVerdict::Verified,
+    };
+    assert!(super::verdict_buffer::buffer_validated(&home, &receipt));
+    let mut state =
+        super::new_for_branch("owner/repo", "fix/buffer-save", &head, ReviewClass::Single);
+    state.pr_number = 44;
+    super::save(&home, &state).unwrap();
+    let state_path =
+        super::pr_state_dir(&home).join(super::pr_state_filename("owner/repo", "fix/buffer-save"));
+    crate::store::fail_next_atomic_write_for_test(&state_path);
+
+    super::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/buffer-save",
+        &head,
+        super::CiConclusion::Green,
+        vec!["lead".into()],
+        ReviewClass::Single,
+    );
+    let after_failed_save = super::load(&home, "owner/repo", "fix/buffer-save").unwrap();
+    assert!(after_failed_save.validated_review_receipts.is_empty());
+    assert!(
+        super::verdict_buffer::has_validated_subject_hint(
+            &home,
+            "owner/repo",
+            "fix/buffer-save",
+            &head,
+        ),
+        "failed PR-state persistence must leave the selected receipt durable"
+    );
+
+    super::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/buffer-save",
+        &head,
+        super::CiConclusion::Green,
+        vec!["lead".into()],
+        ReviewClass::Single,
+    );
+    let replayed = super::load(&home, "owner/repo", "fix/buffer-save").unwrap();
+    assert_eq!(replayed.validated_review_receipts, vec![receipt]);
+    assert!(super::is_merge_ready(&replayed));
+    assert!(
+        !super::verdict_buffer::has_validated_subject_hint(
+            &home,
+            "owner/repo",
+            "fix/buffer-save",
+            &head,
+        ),
+        "successful persistence commits the exact buffered candidate"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2749 (Fable mandatory evidence): a PrState JSON written BEFORE #2749 added the
 /// freshness/observed fields — and a nested last_gh_state GhPrMetadata written
 /// before the atomic-OID fields — MUST load with every new field defaulted, never

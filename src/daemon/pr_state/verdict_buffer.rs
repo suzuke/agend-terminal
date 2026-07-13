@@ -24,6 +24,20 @@ struct BufferedValidatedReceipt {
     buffered_at: String,
 }
 
+/// Non-destructive candidate captured while the assignment lock is held. The
+/// full durable row is retained so commit can refuse to unlink a path whose
+/// contents changed after selection (ABA guard).
+pub(crate) struct ValidatedBufferSelection {
+    path: PathBuf,
+    buffered: BufferedValidatedReceipt,
+}
+
+impl ValidatedBufferSelection {
+    pub(crate) fn receipt(&self) -> &crate::review_receipt::ReviewReceiptSummary {
+        &self.buffered.receipt
+    }
+}
+
 fn validated_buffer_dir(home: &Path) -> PathBuf {
     super::pr_state_dir(home).join("validated-verdict-buffer")
 }
@@ -99,15 +113,16 @@ pub(crate) fn buffer_validated(
     true
 }
 
-/// Drain only receipts whose full subject exactly equals the newly observed PR.
-/// No SHA-prefix or cross-PR scan is permitted.
-pub(crate) fn drain_validated_for_subject(
+/// Select, without deleting, only receipts whose full subject exactly equals
+/// the newly observed PR. The caller holds the assignment lock across this
+/// selection, PR-state persistence, and [`commit_validated_selections`].
+pub(crate) fn select_validated_for_subject(
     home: &Path,
     repo: &str,
     branch: &str,
     pr_number: u64,
     head: &str,
-) -> Vec<crate::review_receipt::ReviewReceiptSummary> {
+) -> Vec<ValidatedBufferSelection> {
     let dir = validated_buffer_dir(home);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -124,17 +139,82 @@ pub(crate) fn drain_validated_for_subject(
         else {
             continue;
         };
-        let receipt = buffered.receipt;
-        if receipt.repo == repo
-            && receipt.branch == branch
-            && receipt.pr_number == pr_number
-            && receipt.reviewed_head == head
+        if buffered.receipt.repo == repo
+            && buffered.receipt.branch == branch
+            && buffered.receipt.pr_number == pr_number
+            && buffered.receipt.reviewed_head == head
         {
-            let _ = std::fs::remove_file(&path);
-            out.push(receipt);
+            out.push(ValidatedBufferSelection { path, buffered });
         }
     }
     out
+}
+
+/// Commit candidates only after the PR-state save succeeds. Re-read and compare
+/// the entire durable row before unlinking: a failed save leaves every candidate
+/// retryable, while same-path content replacement cannot be mistaken for the
+/// selection that was actually persisted.
+pub(crate) fn commit_validated_selections(selections: &[ValidatedBufferSelection]) {
+    for selection in selections {
+        let current = match std::fs::read(&selection.path) {
+            Ok(bytes) => match serde_json::from_slice::<BufferedValidatedReceipt>(&bytes) {
+                Ok(current) => current,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %selection.path.display(),
+                        error = %e,
+                        "task66 verdict_buffer: selected row changed or became unreadable; retaining"
+                    );
+                    continue;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    path = %selection.path.display(),
+                    error = %e,
+                    "task66 verdict_buffer: cannot re-read selected row; retaining"
+                );
+                continue;
+            }
+        };
+        if current != selection.buffered {
+            tracing::warn!(
+                path = %selection.path.display(),
+                receipt_id = %selection.buffered.receipt.receipt_id,
+                "task66 verdict_buffer: selected path content changed; refusing ABA unlink"
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&selection.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %selection.path.display(),
+                    error = %e,
+                    "task66 verdict_buffer: commit unlink failed; row remains retryable"
+                );
+            }
+        }
+    }
+}
+
+/// Compatibility helper for tests that assert the typed buffer is empty. The
+/// production replay path uses explicit select → durable save → commit.
+#[cfg(test)]
+pub(crate) fn drain_validated_for_subject(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    head: &str,
+) -> Vec<crate::review_receipt::ReviewReceiptSummary> {
+    let selections = select_validated_for_subject(home, repo, branch, pr_number, head);
+    let receipts = selections
+        .iter()
+        .map(|selection| selection.receipt().clone())
+        .collect();
+    commit_validated_selections(&selections);
+    receipts
 }
 
 /// An owned snapshot of a verdict, parked until its pr-state appears. `kind` is
@@ -396,5 +476,45 @@ mod tests {
             v.verdict_kind(),
             super::super::VerdictKind::Unverified
         ));
+    }
+
+    #[test]
+    fn typed_commit_refuses_changed_same_path_candidate_2760() {
+        let home = tmp_home("typed-aba");
+        let receipt = crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:m-aba".into(),
+            source_id: "m-aba".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "reviewer".into(),
+            repo: "owner/repo".into(),
+            pr_number: 7,
+            branch: "fix/aba".into(),
+            task_id: "t-aba".into(),
+            reviewed_head: "f".repeat(40),
+            review_class: super::super::ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        };
+        assert!(buffer_validated(&home, &receipt));
+        let selections =
+            select_validated_for_subject(&home, "owner/repo", "fix/aba", 7, &"f".repeat(40));
+        assert_eq!(selections.len(), 1);
+
+        let mut replacement = selections[0].buffered.clone();
+        replacement.receipt.source_id = "m-replacement".into();
+        std::fs::write(
+            &selections[0].path,
+            serde_json::to_vec_pretty(&replacement).unwrap(),
+        )
+        .unwrap();
+        commit_validated_selections(&selections);
+
+        let still_parked =
+            select_validated_for_subject(&home, "owner/repo", "fix/aba", 7, &"f".repeat(40));
+        assert_eq!(still_parked.len(), 1);
+        assert_eq!(still_parked[0].receipt().source_id, "m-replacement");
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -1251,24 +1251,24 @@ pub fn record_ci_result(
     review_class: ReviewClass,
 ) {
     // t-…-17 A6 (I11/I15/I16): hold the reviewer-assignment branch lock as the OUTER
-    // lock of the drain below (the pr_state flock `with_pr_state_or_create` takes is
+    // lock of the replay below (the pr_state flock `with_pr_state_or_create` takes is
     // the INNER lock — the mandated assignment-OUTER / pr_state-INNER order), so the
     // `reserved_assignments` derivation is consistent with a concurrent
     // revoke/transfer/tombstone. Acquired when the branch is ACTIVE, or when a
-    // typed-buffer hint requires a safe destructive revalidation. Ordinary
+    // typed-buffer hint requires safe select/persist/commit revalidation. Ordinary
     // assignment-free branches still create no empty store dir. If acquisition
-    // fails the drain FAILS CLOSED; the reconciler retries later.
+    // fails the replay FAILS CLOSED; the reconciler retries later.
     // t-…-17 B4 (codex m-…-322): probe the branch authority with the TRI-STATE probe,
     // NOT the lossy `has_active`. `has_active` DROPS a corrupt record's `Err`, so a
-    // branch whose SOLE record is corrupt looks assignment-free — the drain then
+    // branch whose SOLE record is corrupt looks assignment-free — replay then
     // derives an EMPTY reserved set on a fresh state and OPENs the merge gate. The
-    // probe reports `Unreadable` for that case so the drain fails closed (below).
+    // probe reports `Unreadable` for that case so replay fails closed (below).
     let initial_authority =
         crate::daemon::assignment_authority::probe_branch_authority(home, repo, branch);
     let typed_buffer_hint =
         verdict_buffer::has_validated_subject_hint(home, repo, branch, head_sha);
     // A typed buffered receipt requires the lock even when the first probe says
-    // Absent: acquire before the destructive drain, then re-probe under lock.
+    // Absent: acquire before selection, then re-probe under lock.
     // This consumes revoked receipts safely without creating lock sidecars for
     // ordinary assignment-free branches.
     let _assignment_lock = if matches!(
@@ -1280,7 +1280,7 @@ pub fn record_ci_result(
     } else {
         None
     };
-    // Whether the OUTER assignment lock is actually held — captured (Copy) so the drain
+    // Whether the OUTER assignment lock is actually held — captured (Copy) so the replay
     // closure need not borrow the guard. A lock-free derivation on an `Active` branch
     // could read a torn reserved set that CLEARS the gate, so it is refused fail-closed.
     let lock_acquired = _assignment_lock.is_some();
@@ -1289,7 +1289,8 @@ pub fn record_ci_result(
     } else {
         initial_authority
     };
-    if let Err(e) = with_pr_state_or_create(
+    let mut selected_receipts = Vec::new();
+    let save_result = with_pr_state_or_create(
         home,
         repo,
         branch,
@@ -1358,9 +1359,9 @@ pub fn record_ci_result(
                 },
             );
             // A typed receipt may have preceded creation of this exact PR state.
-            // Drain only while the assignment lock is held: the buffer read is
-            // destructive, so a transient lock failure must leave the receipt for
-            // retry, and revoke/transfer must not cross revalidation→mutation.
+            // Select only while the assignment lock is held, persist the PR state,
+            // then exact-content commit below. A failed lock or save leaves the row
+            // retryable, and revoke/transfer cannot cross revalidation→mutation.
             // The legacy name+SHA namespace is never read here.
             if lock_acquired
                 && !matches!(
@@ -1368,16 +1369,18 @@ pub fn record_ci_result(
                     crate::daemon::assignment_authority::BranchAuthority::Unreadable
                 )
             {
-                for receipt in verdict_buffer::drain_validated_for_subject(
+                let selections = verdict_buffer::select_validated_for_subject(
                     home,
                     repo,
                     branch,
                     state.pr_number,
                     head_sha,
-                ) {
-                    if !crate::review_receipt::assignment_still_authorizes(home, &receipt)
+                );
+                for selection in &selections {
+                    let receipt = selection.receipt();
+                    if !crate::review_receipt::assignment_still_authorizes(home, receipt)
                         || !receipt.matches_state(state)
-                        || receipt_seen(state, &receipt)
+                        || receipt_seen(state, receipt)
                     {
                         continue;
                     }
@@ -1389,18 +1392,25 @@ pub fn record_ci_result(
                         receipt_id = %receipt.receipt_id,
                         "task66 verdict_buffer: replaying validated receipt onto exact subject"
                     );
-                    apply_receipt_to_state(state, receipt);
+                    apply_receipt_to_state(state, receipt.clone());
                 }
+                selected_receipts = selections;
             }
         },
-    ) {
-        tracing::warn!(
-            repo = %repo,
-            branch = %branch,
-            error = %e,
-            "#972 pr_state: record_ci_result save failed"
-        );
+    );
+    match save_result {
+        Ok(()) => verdict_buffer::commit_validated_selections(&selected_receipts),
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo,
+                branch = %branch,
+                error = %e,
+                "#972 pr_state: record_ci_result save failed"
+            );
+        }
     }
+    // Keep assignment-OUTER held through the post-save exact-content commit.
+    drop(_assignment_lock);
 }
 
 fn receipt_seen(state: &PrState, receipt: &crate::review_receipt::ReviewReceiptSummary) -> bool {

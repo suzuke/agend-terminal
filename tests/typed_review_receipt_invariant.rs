@@ -10,7 +10,9 @@ fn root() -> PathBuf {
 }
 
 fn read_source_file(path: impl AsRef<Path>) -> String {
-    std::fs::read_to_string(root().join(path)).expect("source file")
+    std::fs::read_to_string(root().join(path))
+        .expect("source file")
+        .replace("\r\n", "\n")
 }
 
 #[test]
