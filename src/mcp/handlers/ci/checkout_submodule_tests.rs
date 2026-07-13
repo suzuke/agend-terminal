@@ -397,7 +397,7 @@ fn txn_recover_committed_clears_without_remove() {
     let wt = home.join("wt");
     save_journal_at(&home, "m", &wt, Phase::Committed, true);
     let removed = std::cell::Cell::new(false);
-    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
         removed.set(true);
         true
     });
@@ -413,7 +413,7 @@ fn txn_recover_inflight_remove_ok_clears() {
     let home = tmp_home("rec-ok");
     let wt = home.join("wt");
     save_journal_at(&home, "m", &wt, Phase::WorktreeAdded, true);
-    let r = recover_stale(&home, "m", &wt, fixed_now(), || true);
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || true);
     assert!(r.is_ok());
     assert!(Journal::load(&home, "m").is_none(), "removed ⇒ cleared");
     std::fs::remove_dir_all(&home).ok();
@@ -425,7 +425,7 @@ fn txn_recover_inflight_remove_fail_retains_intent() {
     let home = tmp_home("rec-fail");
     let wt = home.join("wt");
     save_journal_at(&home, "m", &wt, Phase::SubmodulesReady, true);
-    let r = recover_stale(&home, "m", &wt, fixed_now(), || false);
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || false);
     assert!(r.is_err(), "remove failed ⇒ Err");
     let retained = Journal::load(&home, "m").expect("journal retained");
     assert!(retained.rollback_pending && retained.next_attempt_at.is_some());
@@ -440,7 +440,7 @@ fn txn_recover_no_worktree_clears_without_remove() {
     let wt = home.join("wt"); // NOT created
     save_journal_at(&home, "m", &wt, Phase::WorktreeAdded, false);
     let removed = std::cell::Cell::new(false);
-    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
         removed.set(true);
         true
     });
@@ -458,7 +458,7 @@ fn txn_recover_prepared_with_real_worktree_removes() {
     let wt = home.join("wt");
     save_journal_at(&home, "m", &wt, Phase::Prepared, true);
     let removed = std::cell::Cell::new(false);
-    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
         removed.set(true);
         true
     });
@@ -471,8 +471,10 @@ fn txn_recover_prepared_with_real_worktree_removes() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A CORRUPT (torn) journal + a real worktree → the worktree is removed and the
-/// torn record cleared (treated as a crashed attempt).
+/// A CORRUPT (torn) journal + a real worktree that REMOVES cleanly: the worktree is
+/// removed, and the torn record is QUARANTINED (retained as forensic evidence — #2755
+/// R3), never silently cleared. `Journal::load` is None only because journal.json was
+/// renamed aside to journal.json.corrupt.
 #[test]
 fn txn_recover_corrupt_removes_worktree() {
     let home = tmp_home("rec-corrupt");
@@ -480,13 +482,57 @@ fn txn_recover_corrupt_removes_worktree() {
     std::fs::create_dir_all(&wt).unwrap();
     write_corrupt_journal(&home, "m");
     let removed = std::cell::Cell::new(false);
-    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
         removed.set(true);
         true
     });
     assert!(r.is_ok());
     assert!(removed.get(), "corrupt + real worktree ⇒ removed");
-    assert!(Journal::load(&home, "m").is_none());
+    assert!(
+        super::checkout_txn::journal_path(&home, "m")
+            .with_file_name("journal.json.corrupt")
+            .exists(),
+        "torn record quarantined (evidence retained), not silently cleared"
+    );
+    assert!(
+        Journal::load(&home, "m").is_none(),
+        "no live journal.json remains"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R3 (indep P0.2): a CORRUPT record + a real worktree whose remove FAILS must
+/// NOT drop recovery authority. recover_stale quarantines the torn record AND arms a
+/// SYNTHESIZED durable replacement (carrying the caller-known source) so the sweep can
+/// later drive `git worktree remove` — never orphan a worktree with no recovery record.
+#[test]
+fn txn_recover_corrupt_remove_fail_arms_replacement() {
+    let home = tmp_home("rec-corrupt-fail");
+    let wt = home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    write_corrupt_journal(&home, "m");
+    let r = recover_stale(&home, "m", &wt, "/src-xyz", fixed_now(), || false);
+    assert!(r.is_err(), "corrupt + remove fail ⇒ Err (caller aborts)");
+    assert!(
+        super::checkout_txn::journal_path(&home, "m")
+            .with_file_name("journal.json.corrupt")
+            .exists(),
+        "torn record quarantined (evidence retained)"
+    );
+    let replacement = Journal::load(&home, "m").expect("synthesized replacement armed");
+    assert!(
+        replacement.rollback_pending && replacement.next_attempt_at.is_some(),
+        "replacement armed for the recovery sweep"
+    );
+    assert_eq!(
+        replacement.source_repo, "/src-xyz",
+        "replacement carries the caller source so the sweep can git-remove"
+    );
+    assert_eq!(
+        replacement.worktree_path,
+        wt.to_string_lossy(),
+        "replacement targets this worktree path"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -855,14 +901,26 @@ fn txn_sweep_recovers_unarmed_crash() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A corrupt journal is cleared by the sweep (any orphan worktree ⇒ worktree GC).
+/// #2755 R3: the sweep QUARANTINES a corrupt journal (rename → journal.json.corrupt)
+/// instead of CLEARING it — a torn record still carries recovery AUTHORITY (a managed
+/// worktree may remain) and is the only source/path/nonce evidence. n stays 0 (nothing
+/// auto-resolved); the sweep surfaces intervention rather than destroying the evidence.
 #[test]
-fn txn_sweep_corrupt_cleared() {
+fn txn_sweep_corrupt_quarantined_not_cleared() {
     let home = tmp_home("sweep-corrupt");
     write_corrupt_journal(&home, "m");
     let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
-    assert_eq!(n, 0);
-    assert!(Journal::load(&home, "m").is_none(), "corrupt cleared");
+    assert_eq!(n, 0, "corrupt is not an auto-resolved removal");
+    assert!(
+        super::checkout_txn::journal_path(&home, "m")
+            .with_file_name("journal.json.corrupt")
+            .exists(),
+        "corrupt journal quarantined (evidence retained), NOT cleared"
+    );
+    assert!(
+        Journal::load(&home, "m").is_none(),
+        "no live journal.json remains (renamed aside)"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 

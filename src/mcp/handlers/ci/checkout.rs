@@ -289,16 +289,21 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path (removes a
     // stale worktree so a fresh add — or the reuse check below — sees clean state).
-    if let Err(e) =
-        super::checkout_txn::recover_stale(home, &mangled, &worktree_dir, txn_now, || {
+    if let Err(e) = super::checkout_txn::recover_stale(
+        home,
+        &mangled,
+        &worktree_dir,
+        &source_canonical.display().to_string(),
+        txn_now,
+        || {
             crate::git_helpers::git_bypass(
                 Path::new(&source_path),
                 &["worktree", "remove", "--force", &worktree_path_str],
             )
             .map(|o| o.status.success())
             .unwrap_or(false)
-        })
-    {
+        },
+    ) {
         return json!({"error": redact_paths(&e), "code": "stale_txn_rollback", "branch": branch});
     }
     if bind {
