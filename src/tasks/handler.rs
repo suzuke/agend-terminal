@@ -853,19 +853,27 @@ fn handle_done(
     // so the post-lock read-back reads the right board.
     let append_result = routed.with_revalidated_board(home, |board| {
         crate::task_events::append_checked_at(board, &emitter, event, |state| {
-            let tv = state
+            let rec = state
                 .tasks
-                .values()
-                .map(record_to_task)
-                .find(|t| t.id == done_id)
+                .get(&crate::task_events::TaskId(done_id.clone()))
                 .ok_or_else(|| format!("task '{done_id}' not found"))?;
-            if !tv
+            // #2760 R2 (root in-lock-authorization point): re-check the owner-ACL
+            // against FRESH state (force bypasses, mirroring the out-of-lock gate) so
+            // a concurrent ownership change cannot slip a stale-authorized done past
+            // the route-only revalidation.
+            if !force && !can_mutate_record(home, &caller, rec) {
+                return Err(format!(
+                    "task '{done_id}' ownership changed since authorization; caller \
+                     '{caller}' no longer authorized (retry)"
+                ));
+            }
+            if !rec
                 .status
                 .can_transition_to(crate::task_events::TaskStatus::Done)
             {
                 return Err(format!(
                     "illegal transition: {} → done (task {done_id})",
-                    status_to_legacy_str(tv.status)
+                    status_to_legacy_str(rec.status)
                 ));
             }
             Ok(())
