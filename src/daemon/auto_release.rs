@@ -755,8 +755,7 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
             .ok()
             .and_then(|f| f.resolve_instance(&assignee))
             .and_then(|r| r.role);
-        if reviewer_binding_release_bypass(intent, Some(&task), &assignee, sender_role.as_deref())
-        {
+        if reviewer_binding_release_bypass(intent, Some(&task), &assignee, sender_role.as_deref()) {
             tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, role = ?sender_role, "auto_release: reviewer-binding bypass — reviewer verdict + review task terminal, releasing if clean (#2010 2a)");
             true
         } else {
