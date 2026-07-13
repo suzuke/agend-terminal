@@ -79,6 +79,22 @@ pub fn record_exited(home: &Path, id: &InstanceId) {
     }
 }
 
+/// #2764 R11: erase the ledger record for one EXACT generation. ONLY sound
+/// past a proven stop disposition + a Clean `full_delete` destructive commit —
+/// there the WHOLE generation is erased, so dropping its terminal record
+/// cannot create a fail-open (`Absent` stays a durable negative via the
+/// Running-before-exposure invariant). Never call this on an ambiguous or
+/// failed delete: the record is the retry's lifecycle evidence.
+pub fn purge(home: &Path, id: &InstanceId) {
+    let _ = std::fs::remove_file(path(home, id));
+}
+
+/// Whether ANY ledger record (running/exited/corrupt) exists for `id` — the
+/// residual-audit mirror of [`purge`] (file-level, state-agnostic).
+pub fn record_exists(home: &Path, id: &InstanceId) -> bool {
+    path(home, id).exists()
+}
+
 /// Typed lookup — see [`LedgerState`].
 pub fn lookup(home: &Path, id: &InstanceId) -> LedgerState {
     let p = path(home, id);

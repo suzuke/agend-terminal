@@ -362,6 +362,20 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
             let _ = std::fs::remove_file(inbox_id.with_extension("jsonl.lock"));
         }
     }
+    // #2764 R11: purge the child-lifecycle ledger record for the EXACT deleted
+    // generation (`runtime/child-pids/<uuid>.json`). Sound ONLY here — past the
+    // proven stop disposition AND the Clean destructive commit above — where
+    // the whole generation is erased: `Absent` stays a durable negative
+    // (Running-before-exposure invariant) and `Exited` remains the terminal
+    // proof for every NON-full-delete stop. An ambiguous/failed delete returns
+    // before this tail, retaining the record as the retry's evidence. Keyed by
+    // the captured generation id, so a newer same-name generation's record
+    // (different uuid) is never touched.
+    if let Some(ref id) = instance_id {
+        if let Some(id) = crate::types::InstanceId::parse(id) {
+            crate::agent::child_ledger::purge(home, &id);
+        }
+    }
     crate::teams::remove_member_from_all(home, name);
 
     // #808: orphan tasks whose owner is the deleted instance so the
@@ -643,6 +657,16 @@ pub(crate) fn name_residual_anywhere(
     }
     if crate::daemon::pr_state::has_subscriber(home, name) {
         sources.push("pr-state");
+    }
+    // #2764 R11: the child-lifecycle ledger record (`runtime/child-pids/
+    // <uuid>.json`) — mirrors the exact-generation `child_ledger::purge` in the
+    // teardown tail. Uuid-keyed, so like the metadata/inbox checks above it
+    // needs the captured id (fleet.yaml is already gone at audit time).
+    if id
+        .and_then(crate::types::InstanceId::parse)
+        .is_some_and(|id| crate::agent::child_ledger::record_exists(home, &id))
+    {
+        sources.push("child-ledger");
     }
     // #1907: the daemon-created default workspace dir (`workspace/<name>`). Only a
     // residual when the entry had no explicit `working_directory` AND the cleanup

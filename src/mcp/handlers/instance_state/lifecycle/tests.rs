@@ -220,6 +220,54 @@ fn full_delete_instance_removes_uuid_inbox_1902() {
 }
 
 #[test]
+fn name_residual_anywhere_detects_child_ledger_residual_2764() {
+    // #2764 R11: the child-lifecycle ledger record (`runtime/child-pids/
+    // <uuid>.json`) survived full_delete — the audit must flag it via the
+    // captured id (uuid-keyed; fleet.yaml is gone at audit time).
+    let home = tmp_home("ledger_audit");
+    let id = crate::types::InstanceId::new();
+    crate::agent::child_ledger::record_running(&home, &id, 4242).expect("seed record");
+    let sources = name_residual_anywhere(&home, "zombie", Some(&id.full()));
+    assert!(
+        sources.contains(&"child-ledger"),
+        "child-ledger residual must be detected, got {sources:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn full_delete_instance_purges_child_ledger_record_2764() {
+    // #2764 R11 (the CI 1907 RED): R10 made terminal an EXPLICIT Exited record,
+    // so a full delete that erases the whole generation must also purge the
+    // uuid-keyed ledger file — file absence after full_delete is sound (the
+    // generation no longer exists), and nothing else removes it.
+    let home = tmp_home("ledger_delete");
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  doomed:\n    backend: claude\n    id: {}\n",
+            id.full()
+        ),
+    )
+    .unwrap();
+    crate::agent::child_ledger::record_running(&home, &id, 4242).expect("seed running");
+    crate::agent::child_ledger::record_exited(&home, &id);
+    assert!(
+        crate::agent::child_ledger::record_exists(&home, &id),
+        "pre: ledger record must exist"
+    );
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
+    let result = super::full_delete_instance(&home, "doomed");
+    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        !crate::agent::child_ledger::record_exists(&home, &id),
+        "child ledger record leaked — full_delete_instance must purge the exact generation's record"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn name_residual_anywhere_detects_usage_limit_notify_residual_1906() {
     // #1906 Leak 2: the usage-limit notify-dedup store was a teardown audit
     // blind spot — the audit must now flag a leftover name entry.
