@@ -458,7 +458,10 @@ fn apply_usage_limit_block_targets_project_board_and_is_idempotent_2760() {
         .block_reason
         .as_deref()
         .is_some_and(|r| r.contains("ep-123")));
-    assert!(!default_has_task(&home, "t-2760-ul"), "no default-board write");
+    assert!(
+        !default_has_task(&home, "t-2760-ul"),
+        "no default-board write"
+    );
 
     // Re-block for the SAME episode → idempotent no-op.
     assert_eq!(

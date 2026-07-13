@@ -169,7 +169,9 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         &args["project"]
             .as_str()
             .map(String::from)
-            .unwrap_or_else(|| super::board_router::resolve_current_project(home, emitter.as_str())),
+            .unwrap_or_else(|| {
+                super::board_router::resolve_current_project(home, emitter.as_str())
+            }),
     );
     // #2117 P3a: `parent_id` is subtask COMPOSITION ("A is composed of B/C/D").
     // DP4 invariant — a subtask MUST live in its parent's project. Cross-project
@@ -875,55 +877,56 @@ fn handle_done(
             "code": "task_route_unresolved",
         }),
         Ok(inner) => match inner {
-        Ok(Ok(_)) => {
-            // #789: task-completion is a workflow boundary —
-            // clean any empty `init` commits the backend has
-            // accumulated in the agent's bound worktree since
-            // the last cleanup at `dispatch_auto_bind_lease`.
-            // Best-effort: failure is logged inside the helper
-            // but never blocks the done response (the task
-            // event already appended successfully — cleanup is
-            // a polish step, not load-bearing).
-            let owner = record
-                .owner
-                .as_ref()
-                .map(|o| o.0.clone())
-                .unwrap_or_else(|| caller.clone());
-            if let Some(binding) = crate::binding::read(home, &owner) {
-                if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from) {
-                    let _ = crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+            Ok(Ok(_)) => {
+                // #789: task-completion is a workflow boundary —
+                // clean any empty `init` commits the backend has
+                // accumulated in the agent's bound worktree since
+                // the last cleanup at `dispatch_auto_bind_lease`.
+                // Best-effort: failure is logged inside the helper
+                // but never blocks the done response (the task
+                // event already appended successfully — cleanup is
+                // a polish step, not load-bearing).
+                let owner = record
+                    .owner
+                    .as_ref()
+                    .map(|o| o.0.clone())
+                    .unwrap_or_else(|| caller.clone());
+                if let Some(binding) = crate::binding::read(home, &owner) {
+                    if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from) {
+                        let _ =
+                            crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+                    }
+                    // t-worktree-leak (PR-1): task-done is one of the 3 release
+                    // events. Enqueue a release-invariant recompute — if the
+                    // branch has no open PR and all its tasks are done, the
+                    // sweeper releases the worktree (covers tasks that never
+                    // produce a PR: RCA / design / spike). An open PR holds the
+                    // release until it terminates. (repo="" → sweeper derives it.)
+                    if let Some(branch) = binding["branch"].as_str() {
+                        crate::daemon::auto_release::enqueue_release_recompute(
+                            home,
+                            "",
+                            branch,
+                            "task_done",
+                        );
+                    }
                 }
-                // t-worktree-leak (PR-1): task-done is one of the 3 release
-                // events. Enqueue a release-invariant recompute — if the
-                // branch has no open PR and all its tasks are done, the
-                // sweeper releases the worktree (covers tasks that never
-                // produce a PR: RCA / design / spike). An open PR holds the
-                // release until it terminates. (repo="" → sweeper derives it.)
-                if let Some(branch) = binding["branch"].as_str() {
-                    crate::daemon::auto_release::enqueue_release_recompute(
-                        home,
-                        "",
-                        branch,
-                        "task_done",
-                    );
-                }
+                // #1018/#78445-2 (d): a task reaching Done is terminal — clear BOTH
+                // obligation stores (dispatch_idle sidecar + dispatch_tracking rows) via
+                // the shared seam so no watchdog nags about the board-confirmed-done work.
+                super::task_terminal_cleanup(home, &id);
+                // #807 Item 1: see create arm note.
+                let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
+                serde_json::json!({
+                    "id": id,
+                    "event": "done",
+                    "task": task,
+                    // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                    "status": "done",
+                })
             }
-            // #1018/#78445-2 (d): a task reaching Done is terminal — clear BOTH
-            // obligation stores (dispatch_idle sidecar + dispatch_tracking rows) via
-            // the shared seam so no watchdog nags about the board-confirmed-done work.
-            super::task_terminal_cleanup(home, &id);
-            // #807 Item 1: see create arm note.
-            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-            serde_json::json!({
-                "id": id,
-                "event": "done",
-                "task": task,
-                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
-                "status": "done",
-            })
-        }
-        Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
-        Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+            Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
+            Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
         },
     }
 }
@@ -1888,8 +1891,9 @@ fn handle_ack_plan(
     };
     // #2760 items 2+3: append the ack under the per-id router lock with write-time
     // route revalidation.
-    let revalidated = routed
-        .with_revalidated_board(home, |board| crate::task_events::append_at(board, &emitter, event));
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_at(board, &emitter, event)
+    });
     match revalidated {
         Ok(Ok(_)) => serde_json::json!({
             "id": id, "event": "ack_plan", "acked": acked_count, "already_acked": false,

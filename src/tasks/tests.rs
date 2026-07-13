@@ -4344,13 +4344,12 @@ fn sweep_apply_routes_each_cancel_to_its_own_board_2760() {
     assert_eq!(count, 2, "both ids cancelled");
 
     // The project task's Cancelled landed on the PROJECT board, not the default.
-    let proj_rec =
-        crate::task_events::replay_at(&crate::task_events::board_root(&home, "proj-sw"))
-            .expect("replay proj board")
-            .tasks
-            .get(&crate::task_events::TaskId(proj_id.clone()))
-            .cloned()
-            .expect("project task must exist on its own board");
+    let proj_rec = crate::task_events::replay_at(&crate::task_events::board_root(&home, "proj-sw"))
+        .expect("replay proj board")
+        .tasks
+        .get(&crate::task_events::TaskId(proj_id.clone()))
+        .cloned()
+        .expect("project task must exist on its own board");
     assert_eq!(
         proj_rec.status,
         crate::task_events::TaskStatus::Cancelled,

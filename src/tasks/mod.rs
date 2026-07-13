@@ -522,7 +522,10 @@ impl RoutedTask {
         let _id_lock = board_router::acquire_task_id_lock(home, &self.task.id).map_err(|e| {
             TaskRouteError::Unreadable {
                 path: home.to_path_buf(),
-                cause: format!("acquire per-task-id router lock for '{}': {e}", self.task.id),
+                cause: format!(
+                    "acquire per-task-id router lock for '{}': {e}",
+                    self.task.id
+                ),
             }
         })?;
         // Re-resolve the strict route UNDER the lock — the authoritative
@@ -774,11 +777,7 @@ pub fn recover_usage_limit_block(
 /// project-board task's release was written where its own board's replay never saw
 /// it (the task stayed Claimed forever). The commit-time guard only releases a task
 /// still `Claimed`/`InProgress`. Returns `Ok(true)` iff the `Released` committed.
-pub fn release_reclaimed_task(
-    home: &Path,
-    task_id: &str,
-    reason: String,
-) -> anyhow::Result<bool> {
+pub fn release_reclaimed_task(home: &Path, task_id: &str, reason: String) -> anyhow::Result<bool> {
     let routed = match load_routed(home, task_id) {
         Ok(rt) => rt,
         Err(e) => {
@@ -809,7 +808,9 @@ pub fn release_reclaimed_task(
                         | crate::task_events::TaskStatus::InProgress
                 )
                 .then_some(())
-                .ok_or_else(|| "task no longer claimed/in-progress before reclaim release".to_string())
+                .ok_or_else(|| {
+                    "task no longer claimed/in-progress before reclaim release".to_string()
+                })
             },
         )
     });
