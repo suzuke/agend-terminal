@@ -751,7 +751,9 @@ fn build_event_message(
 mod tests {
     use super::super::gh_poll::tests::MockGhPoller;
     use super::super::gh_poll::{GhPrMetadata, GhPrState};
-    use super::super::{new_for_branch, save, ReviewClass, VerdictState};
+    use super::super::{
+        load, new_for_branch, save, CiState, MergeState, ReviewClass, VerdictState,
+    };
     use super::scan_and_emit_with;
 
     fn empty_registry() -> crate::agent::AgentRegistry {
@@ -959,6 +961,66 @@ mod tests {
             prod[block_end..].contains(&emit_needle),
             "enqueue_with_idle_hint must run AFTER the PR-state flock is dropped (deferred drain)"
         );
+    }
+
+    /// #2749 RED (fail-closed anchor, first small increment): an otherwise
+    /// fully MergeReady PR (CI green at head, VERIFIED at head, not draft) whose
+    /// deterministic-ancestry freshness tuple is UNKNOWN — `freshness_checked_*`
+    /// all `None`, the first-observation / pre-populator state — must NOT emit
+    /// `[pr-ready-for-merge]`. Ancestry is unproven, so the read-only gate fails
+    /// CLOSED: it suppresses ready and emits NOTHING (never mislabels as
+    /// pr-needs-rebase), leaving #2747's exact-head merge gate as the hard
+    /// backstop while the off-tick populator stamps the tuple on a later cycle.
+    ///
+    /// Against the CURRENT gate-less scanner — which emits pr-ready whenever
+    /// `merge_state == MergeReady` — this FAILS (ready_emitted_for_sha becomes
+    /// `Some(head)`), which is the intended RED. The GREEN three-way gate makes
+    /// it pass. Emission is asserted via the persisted `ready_emitted_for_sha`
+    /// dedup flag (set under the flock exactly when pr-ready is queued, and only
+    /// reset on a post-flock enqueue FAILURE — which does not happen against a
+    /// real temp home).
+    #[test]
+    fn merge_ready_without_freshness_tuple_suppresses_pr_ready() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-2749-fail-closed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let head = "abcdef0";
+        let mut s = new_for_branch("o/r", "b", head, ReviewClass::Single);
+        s.pr_number = 77;
+        // Drive is_merge_ready → MergeReady: CI green at head + VERIFIED at head.
+        s.ci_state = CiState::Green {
+            sha: head.into(),
+            observed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        s.verdict_state = VerdictState::Verified {
+            reviewers: vec![("r".into(), head.into())],
+        };
+        s.merge_state = MergeState::MergeReady;
+        // Freshness tuple left UNKNOWN (all None) — the fail-closed case.
+        assert!(
+            s.freshness_checked_head_sha.is_none()
+                && s.freshness_checked_base_sha.is_none()
+                && s.freshness_behind_by.is_none(),
+            "precondition: freshness tuple is unknown"
+        );
+        save(&home, &s).unwrap();
+
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(77, "b")])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+
+        let reloaded = load(&home, "o/r", "b").expect("state persists");
+        assert_eq!(
+            reloaded.ready_emitted_for_sha, None,
+            "#2749 fail-closed: a MergeReady PR with NO freshness tuple must NOT \
+             emit [pr-ready-for-merge] (ancestry unproven ⇒ suppress; #2747 is \
+             the backstop)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
 

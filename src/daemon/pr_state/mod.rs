@@ -133,6 +133,50 @@ pub struct PrState {
     /// files written before this field existed.
     #[serde(default)]
     pub closed_unmerged_pending: bool,
+    /// #2749 (task t-…-9, decision d-20260712092257798199-17): deterministic
+    /// latest-main ancestry freshness cache, stamped by the OFF-TICK ci-watch
+    /// background poller (never on the scanner tick). The scanner reads this
+    /// tuple READ-ONLY and trusts it ONLY when `freshness_checked_head_sha ==
+    /// head_sha` AND `freshness_checked_base_sha == <current base>` AND it is
+    /// within TTL AND `!freshness_error`. A head OR base move invalidates it
+    /// (head-only keying was rejected: a base advance with the head unchanged is
+    /// exactly the #2749 stale case). Unknown/stale/error ⇒ pr-ready is
+    /// suppressed FAIL-CLOSED (never mislabeled pr-needs-rebase); #2747's
+    /// exact-head merge gate remains the hard backstop. `#[serde(default)]` so
+    /// pre-existing state files load with an empty (unknown) cache.
+    #[serde(default)]
+    pub freshness_checked_head_sha: Option<String>,
+    #[serde(default)]
+    pub freshness_checked_base_sha: Option<String>,
+    #[serde(default)]
+    pub freshness_checked_at: Option<String>,
+    #[serde(default)]
+    pub freshness_behind_by: Option<u64>,
+    #[serde(default)]
+    pub freshness_error: bool,
+    /// #2749 CORRECTION 3 (codex R2): the ATOMIC observed (head, base) pair,
+    /// written together in ONE `apply_gh_poll` from a single
+    /// `gh pr view --json headRefOid,baseRefOid` response — never composed
+    /// across two independent reads (that torn snapshot was the R2 defect).
+    /// This is the INDEPENDENT base authority the read-only gate compares the
+    /// populator's CHECKED tuple against: a main advance bumps
+    /// `observed_base_sha` while `freshness_checked_base_sha` still holds the
+    /// old base ⇒ mismatch ⇒ suppress-ready until the off-tick populator
+    /// rechecks. The FINAL gate requires three heads to agree
+    /// (`head_sha == observed_head_sha == freshness_checked_head_sha`) AND
+    /// `observed_base_sha == freshness_checked_base_sha`. On gh_poll failure
+    /// `observed_error` is set and `observed_at` is NOT advanced (the last-good
+    /// pair is preserved, not clobbered) so the gate closes immediately.
+    /// `#[serde(default)]` so pre-existing state files load with an empty
+    /// (unknown) observation.
+    #[serde(default)]
+    pub observed_head_sha: Option<String>,
+    #[serde(default)]
+    pub observed_base_sha: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub observed_error: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -878,6 +922,20 @@ pub fn new_for_branch(
         gh_poll_failures: 0,
         last_gh_state: None,
         closed_unmerged_pending: false,
+        // #2749: fresh state has an empty (unknown) freshness cache — the
+        // off-tick ci-watch poller stamps it on a later background cycle.
+        freshness_checked_head_sha: None,
+        freshness_checked_base_sha: None,
+        freshness_checked_at: None,
+        freshness_behind_by: None,
+        freshness_error: false,
+        // #2749: fresh state has an empty (unknown) observation — gh_poll
+        // stamps observed_head_sha + observed_base_sha atomically on a later
+        // pass; until then the read-only gate fails closed.
+        observed_head_sha: None,
+        observed_base_sha: None,
+        observed_at: None,
+        observed_error: false,
         created_at: now.clone(),
         updated_at: now,
     }
