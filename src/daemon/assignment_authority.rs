@@ -633,10 +633,46 @@ pub(crate) enum AssignmentEvidence {
 /// is the current head). NEVER reads `read_at`/`delivering_at`/report text. A
 /// DIFFERENT reviewer's verdict NEVER satisfies/engages THIS record.
 pub(crate) fn classify_assignment(
-    _record: &ActiveAssignment,
-    _prstate: Option<&crate::daemon::pr_state::PrState>,
+    record: &ActiveAssignment,
+    prstate: Option<&crate::daemon::pr_state::PrState>,
 ) -> AssignmentEvidence {
-    // STUB (RED): the real §1 derivation lands in the GREEN commit.
+    use crate::daemon::pr_state::VerdictState;
+    // A verdict counts ONLY when it names THIS record's target AND was rendered at
+    // the CURRENT head (`prstate.head_sha`). `record_verdict` already drops stale
+    // Verified entries on head-advance, but the head match is asserted defensively
+    // here so a stale entry can never satisfy/engage (plan §1).
+    if let Some(ps) = prstate {
+        match &ps.verdict_state {
+            VerdictState::Verified { reviewers } => {
+                if reviewers
+                    .iter()
+                    .any(|(name, head)| name == &record.target && head == &ps.head_sha)
+                {
+                    return AssignmentEvidence::SatisfiedExactHead;
+                }
+            }
+            VerdictState::Rejected {
+                reviewer,
+                reviewed_head,
+                ..
+            }
+            | VerdictState::Unverified {
+                reviewer,
+                reviewed_head,
+            } => {
+                if reviewer == &record.target && reviewed_head == &ps.head_sha {
+                    return AssignmentEvidence::EngagedUnsatisfied;
+                }
+            }
+            VerdictState::None | VerdictState::Pending => {}
+        }
+    }
+    // No current-head verdict for the target. An authenticated correlated ACK means
+    // the reviewer engaged but hasn't rendered a verdict yet ⇒ EngagedPending
+    // (TRUE stop — no nudge). Otherwise ⇒ Unengaged (the only nudge-eligible state).
+    if record.acked_at.is_some() {
+        return AssignmentEvidence::EngagedPending;
+    }
     AssignmentEvidence::Unengaged
 }
 
@@ -660,10 +696,73 @@ pub(crate) enum AckOutcome {
 ///     assignment-lock, CAS on `assignment_id`; re-ack is an idempotent success;
 ///   - >1 ⇒ FAIL CLOSED: set NOTHING, return [`AckOutcome::Ambiguous`] (I20);
 ///   - 0 ⇒ [`AckOutcome::NoMatch`] (no-op).
+///
 /// Takes ONLY the assignment-lock — NEVER the inbox or pr_state lock (no inversion).
-pub(crate) fn ack(_home: &Path, _sender_target: &str, _task_id: &str, _now: &str) -> AckOutcome {
-    // STUB (RED): the real resolve+CAS lands in the GREEN commit.
-    AckOutcome::NoMatch
+pub(crate) fn ack(home: &Path, sender_target: &str, task_id: &str, now: &str) -> AckOutcome {
+    let mut matches = list_active_by_target_task(home, sender_target, task_id);
+    // >1 ⇒ FAIL CLOSED: touch NOTHING (no lock taken) — I20.
+    if matches.len() > 1 {
+        return AckOutcome::Ambiguous;
+    }
+    let Some(rec) = matches.pop() else {
+        return AckOutcome::NoMatch;
+    };
+    // Set acked under THAT record's per-branch assignment-lock ONLY. Re-read + CAS
+    // on `assignment_id` so a concurrent revoke/transfer between the lock-free scan
+    // and here can never resurrect a stale record (ABA — B9/I14).
+    let Ok(_lock) = lock_branch(home, &rec.repo, &rec.branch) else {
+        return AckOutcome::NoMatch;
+    };
+    let path = record_file(home, &rec.repo, &rec.branch, &rec.target);
+    let Some(mut cur) = read_record(&path) else {
+        return AckOutcome::NoMatch;
+    };
+    if cur.assignment_id != rec.assignment_id {
+        return AckOutcome::NoMatch;
+    }
+    // Idempotent: an already-acked record is a no-op SUCCESS (never overwrites the
+    // original timestamp) — a single atomic write only on the first ack.
+    if cur.acked_at.is_none() {
+        cur.acked_at = Some(now.to_string());
+        cur.acked_by = Some(sender_target.to_string());
+        if atomic_write_json(&path, &cur).is_err() {
+            return AckOutcome::NoMatch;
+        }
+    }
+    AckOutcome::Acked
+}
+
+/// Store-wide scan for [`ack`]: every ACTIVE record across ALL `(repo,branch)` whose
+/// `target`/`task_id` match. Lock-free — atomic whole-record writes make torn reads
+/// impossible. Cheap on the common path: an empty store means the base dir does not
+/// exist, so `read_dir` yields nothing and no record files are opened.
+fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<ActiveAssignment> {
+    let mut out = Vec::new();
+    for branch_entry in std::fs::read_dir(base_dir(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let dir = branch_entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+                continue;
+            }
+            if let Some(r) = read_record(&path) {
+                if r.target == target && r.task_id == task_id {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -562,6 +562,13 @@ pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
 /// - Draft state — `gh pr merge` rejects drafts; refuse to mark ready
 /// - Threshold per `review_class` (Single=1 / Dual=2)
 pub fn is_merge_ready(state: &PrState) -> bool {
+    // t-…-17 C13: a required reviewer whose assignment is RESERVED-but-unverified
+    // holds the PR closed. Reserved entries are DERIVED (excl. Satisfied) by the
+    // reconciler and are NEVER counted toward `required_verified_count` / pushed
+    // into `VerdictState::Verified` — they only gate here (plan §3(l)/I17).
+    if !state.reserved_assignments.is_empty() {
+        return false;
+    }
     // #2745 fail-closed: an `Unresolved` review_class (intent ABSENT / UNKNOWN /
     // MISMATCHED at arm time) is NEVER merge-ready — no verdict count can satisfy
     // it. The scanner raises an actionable diagnostic in place of pr-ready.
