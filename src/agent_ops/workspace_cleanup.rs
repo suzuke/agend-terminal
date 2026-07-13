@@ -180,124 +180,171 @@ fn parse_deploy_marker(body: &str) -> Option<(String, String, String)> {
     Some((deployment?, instance?, nonce?))
 }
 
-/// Extra git-teardown context for a deployment custom-subdir removal. The
-/// executor runs `git worktree remove` / `branch -D` / `worktree prune` (to
-/// clear a branch-mode worktree registration) BEFORE `remove_dir_all`, all
-/// AFTER revalidation and gated by the opaque proof.
+/// DISTINCT opaque authorization to whole-tree-remove a deployment CUSTOM-dir
+/// subdir. Separate from [`RemoveOwnedProof`] BY TYPE so a workspace proof can
+/// never drive the deployment executor (and vice-versa), and it BINDS the full
+/// destructive context — expected deployment identity, canonical target,
+/// canonical custom root, and branch/worktree context — into the proof itself
+/// (not a separable side-channel). Constructible only by
+/// [`plan_custom_dir_cleanup`]; the executor re-verifies EVERY bound authority
+/// fact immediately before mutation.
 #[derive(Debug, Clone)]
-pub struct DeployRemoveCtx {
-    /// The deploy directory (source repo in branch mode) git commands run from.
-    pub custom_root: PathBuf,
-    /// True when `custom_root` is a git repo (branch-mode deploy).
-    pub is_repo: bool,
-    /// The per-instance worktree branch (`{deploy}/{suffix}`), if branch mode.
-    pub branch: Option<String>,
+pub struct CustomRemoveOwnedProof {
+    /// Candidate subdir path as passed (revalidated at execute).
+    original: PathBuf,
+    /// Canonical target captured at plan time.
+    canonical: PathBuf,
+    /// The deployment identity + generation nonce the marker must match.
+    expected: DeployProvenance,
+    /// Deploy directory git commands run from (source repo in branch mode).
+    custom_root: PathBuf,
+    is_repo: bool,
+    /// Per-instance worktree branch (`{deploy}/{suffix}`), if branch mode.
+    branch: Option<String>,
+    /// Home + cohort so the executor can re-load a FRESH fleet snapshot and
+    /// re-run the survivor-overlap check (TOCTOU: a survivor inserted post-plan).
+    home: PathBuf,
+    cohort: Vec<String>,
+}
+
+/// Load the survivor snapshot for a deployment custom-dir check: MISSING fleet
+/// → empty roster (nothing can share) proceeds; CORRUPT → None → fail closed.
+fn load_survivor_snapshot(home: &Path) -> Option<FleetConfig> {
+    let p = crate::fleet::fleet_yaml_path(home);
+    if p.exists() {
+        FleetConfig::load(&p).ok()
+    } else {
+        Some(FleetConfig::default())
+    }
+}
+
+/// Verify a subdir's marker still binds the expected deployment identity +
+/// generation nonce. Used at BOTH plan and execute — the execute-time call is
+/// the TOCTOU guard against a marker removed/replaced between plan and mutation.
+fn verify_marker(dir: &Path, expected: &DeployProvenance) -> Result<(), String> {
+    if expected.nonce.is_empty() {
+        return Err(format!(
+            "deployment '{}' has no persisted provenance nonce (legacy/unproven)",
+            expected.deployment
+        ));
+    }
+    let marker = dir.join(DEPLOY_CREATED_MARKER);
+    let body = std::fs::read_to_string(&marker)
+        .map_err(|_| format!("no creation-provenance marker at {}", marker.display()))?;
+    match parse_deploy_marker(&body) {
+        Some((d, i, n))
+            if d == expected.deployment && i == expected.instance && n == expected.nonce =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "creation marker at {} does not match deployment '{}' instance '{}' generation",
+            marker.display(),
+            expected.deployment,
+            expected.instance
+        )),
+    }
 }
 
 /// Plan the destructive cleanup of a deployment CUSTOM-directory subdir
-/// (`candidate = custom_root/<instance>`), minting a `RemoveOwned` proof ONLY
+/// (`candidate = custom_root/<instance>`). Mints a `CustomRemoveOwnedProof` ONLY
 /// after the full check chain: dotdot reject → canonical capture → symmetric
-/// survivor-overlap (via the same fleet snapshot as full-delete) → durable
+/// survivor-overlap (same fleet snapshot semantics as full-delete) → durable
 /// creation provenance (marker present AND its deployment+instance+nonce match
-/// the live Deployment record `expected`). Any failure fails closed to a
-/// `Preserve*` no-op. Legacy/unproven (no nonce on the record, missing/mismatched
-/// marker) → `PreserveAmbiguous`.
+/// the live Deployment record `expected`). `Err(reason)` = preserve (fail closed):
+/// legacy/unproven (no nonce), missing/mismatched marker, ambiguity, or a
+/// surviving overlap. The git context is BOUND into the returned proof.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_custom_dir_cleanup(
     snapshot: Option<&FleetConfig>,
     home: &Path,
     cohort: &[&str],
     candidate: &Path,
     expected: &DeployProvenance,
-) -> CleanupPlan {
+    custom_root: &Path,
+    is_repo: bool,
+    branch: Option<&str>,
+) -> Result<CustomRemoveOwnedProof, String> {
     if has_dotdot(candidate) {
-        return CleanupPlan::PreserveAmbiguous {
-            reason: format!("candidate path contains '..': {}", candidate.display()),
-        };
+        return Err(format!(
+            "candidate path contains '..': {}",
+            candidate.display()
+        ));
     }
-    let candidate_canonical = match dunce::canonicalize(candidate) {
-        Ok(c) => c,
-        Err(e) => {
-            return CleanupPlan::PreserveAmbiguous {
-                reason: format!(
-                    "candidate {} does not canonicalize ({e})",
-                    candidate.display()
-                ),
-            };
-        }
-    };
-    let Some(snapshot) = snapshot else {
-        return CleanupPlan::PreserveAmbiguous {
-            reason: "fleet snapshot unavailable — cannot prove exclusive ownership".to_string(),
-        };
-    };
+    let candidate_canonical = dunce::canonicalize(candidate).map_err(|e| {
+        format!(
+            "candidate {} does not canonicalize ({e})",
+            candidate.display()
+        )
+    })?;
+    let snapshot = snapshot
+        .ok_or_else(|| "fleet snapshot unavailable — cannot prove ownership".to_string())?;
     if let Some(preserve) =
         survivor_conflict(snapshot, home, cohort, candidate, &candidate_canonical)
     {
-        return preserve;
+        return Err(match preserve {
+            CleanupPlan::PreserveShared { reason } | CleanupPlan::PreserveAmbiguous { reason } => {
+                reason
+            }
+            _ => "survivor conflict".to_string(),
+        });
     }
-    // Durable creation provenance: the marker must exist AND its identity + nonce
-    // must match the live Deployment record. An empty expected nonce (legacy
-    // record without persisted provenance) can never match → fail closed.
-    if expected.nonce.is_empty() {
-        return CleanupPlan::PreserveAmbiguous {
-            reason: format!(
-                "deployment '{}' has no persisted provenance nonce (legacy/unproven) — preserving",
-                expected.deployment
-            ),
-        };
-    }
-    let marker = candidate.join(DEPLOY_CREATED_MARKER);
-    let body = match std::fs::read_to_string(&marker) {
-        Ok(b) => b,
-        Err(_) => {
-            return CleanupPlan::PreserveAmbiguous {
-                reason: format!(
-                    "no creation-provenance marker at {} — preserving (unproven)",
-                    marker.display()
-                ),
-            };
-        }
-    };
-    match parse_deploy_marker(&body) {
-        Some((d, i, n))
-            if d == expected.deployment && i == expected.instance && n == expected.nonce => {}
-        _ => {
-            return CleanupPlan::PreserveAmbiguous {
-                reason: format!(
-                    "creation marker at {} does not match deployment '{}' instance '{}' generation — preserving",
-                    marker.display(),
-                    expected.deployment,
-                    expected.instance
-                ),
-            };
-        }
-    }
-    CleanupPlan::RemoveOwned(RemoveOwnedProof {
+    // Durable creation provenance: marker present AND identity+nonce match.
+    verify_marker(&candidate_canonical, expected)?;
+    Ok(CustomRemoveOwnedProof {
         original: candidate.to_path_buf(),
         canonical: candidate_canonical,
+        expected: expected.clone(),
+        custom_root: custom_root.to_path_buf(),
+        is_repo,
+        branch: branch.map(str::to_string),
+        home: home.to_path_buf(),
+        cohort: cohort.iter().map(|s| s.to_string()).collect(),
     })
 }
 
-/// Execute a proven deployment custom-subdir removal. Revalidates the proof
-/// (original still canonicalizes to the captured target) IMMEDIATELY before any
-/// mutation, then clears a branch-mode worktree registration and removes the
-/// tree. All destruction is gated by the opaque `RemoveOwnedProof`.
-pub fn execute_remove_owned_custom(
-    proof: &RemoveOwnedProof,
-    ctx: &DeployRemoveCtx,
-) -> Result<(), String> {
+/// Execute a proven deployment custom-subdir removal. Re-verifies EVERY mutable
+/// authorization fact bound in the proof IMMEDIATELY before the first mutation —
+/// path identity (revalidate), marker identity+nonce (marker removed/replaced),
+/// and survivor overlap against a FRESH fleet snapshot (survivor inserted
+/// post-plan) — then clears a branch-mode worktree registration and removes the
+/// tree. Any re-verification failure aborts with `Err` and mutates nothing.
+pub fn execute_custom_remove(proof: &CustomRemoveOwnedProof) -> Result<(), String> {
+    // (1) path identity.
     revalidate(&proof.original, &proof.canonical)?;
-    if ctx.is_repo {
-        // git registers worktrees by realpath → use the canonical path.
+    // (2) marker identity + nonce (TOCTOU: marker removed/replaced since plan).
+    verify_marker(&proof.canonical, &proof.expected)
+        .map_err(|e| format!("re-verify at execute failed: {e}"))?;
+    // (3) survivor overlap on a FRESH snapshot (TOCTOU: survivor inserted since plan).
+    let snapshot = load_survivor_snapshot(&proof.home)
+        .ok_or_else(|| "fleet snapshot unavailable at execute — refusing removal".to_string())?;
+    let cohort: Vec<&str> = proof.cohort.iter().map(String::as_str).collect();
+    if let Some(conflict) = survivor_conflict(
+        &snapshot,
+        &proof.home,
+        &cohort,
+        &proof.original,
+        &proof.canonical,
+    ) {
+        let reason = match conflict {
+            CleanupPlan::PreserveShared { reason } | CleanupPlan::PreserveAmbiguous { reason } => {
+                reason
+            }
+            _ => "survivor conflict".to_string(),
+        };
+        return Err(format!("re-verify at execute failed: {reason}"));
+    }
+    // Authorized → destroy. git registers worktrees by realpath → canonical.
+    if proof.is_repo {
         let subdir_str = proof.canonical.display().to_string();
         let _ = crate::git_helpers::git_bypass(
-            &ctx.custom_root,
+            &proof.custom_root,
             &["worktree", "remove", "--force", &subdir_str],
         );
-        if let Some(branch) = ctx.branch.as_deref() {
-            let _ = crate::git_helpers::git_bypass(&ctx.custom_root, &["branch", "-D", branch]);
+        if let Some(branch) = proof.branch.as_deref() {
+            let _ = crate::git_helpers::git_bypass(&proof.custom_root, &["branch", "-D", branch]);
         }
-        let _ = crate::git_helpers::git_bypass(&ctx.custom_root, &["worktree", "prune"]);
+        let _ = crate::git_helpers::git_bypass(&proof.custom_root, &["worktree", "prune"]);
     }
     if proof.canonical.exists() {
         std::fs::remove_dir_all(&proof.canonical)
@@ -776,6 +823,121 @@ mod tests {
             matches!(plan, CleanupPlan::PreserveShared { .. }),
             "leaf symlink to a live sibling must PreserveShared, got {plan:?}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2764 R4: custom-dir proof binding + TOCTOU re-verification ─────────
+
+    /// Set up an empty-fleet home with a marked custom deployment subdir.
+    /// Returns (home, custom_root, subdir, expected).
+    fn setup_custom(tag: &str) -> (PathBuf, PathBuf, PathBuf, DeployProvenance) {
+        let home = tmp_home(tag);
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let custom_root = home.join("custom");
+        let subdir = custom_root.join("dep-a");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("USER.txt"), b"precious").unwrap();
+        let expected = DeployProvenance {
+            deployment: "dep".to_string(),
+            instance: "dep-a".to_string(),
+            nonce: "NONCE-1".to_string(),
+        };
+        std::fs::write(
+            subdir.join(DEPLOY_CREATED_MARKER),
+            deploy_marker_body(&expected),
+        )
+        .unwrap();
+        (home, custom_root, subdir, expected)
+    }
+
+    fn plan_ok(
+        home: &Path,
+        custom_root: &Path,
+        subdir: &Path,
+        expected: &DeployProvenance,
+    ) -> CustomRemoveOwnedProof {
+        let snap = FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
+        plan_custom_dir_cleanup(
+            snap.as_ref(),
+            home,
+            &["dep-a"],
+            subdir,
+            expected,
+            custom_root,
+            false,
+            None,
+        )
+        .expect("plan must mint a proof for a valid marked subdir")
+    }
+
+    /// Happy path: a valid proof executes and removes the subdir.
+    #[test]
+    fn custom_execute_removes_when_still_valid() {
+        let (home, custom_root, subdir, expected) = setup_custom("r4-ok");
+        let proof = plan_ok(&home, &custom_root, &subdir, &expected);
+        execute_custom_remove(&proof).expect("removal must succeed when still valid");
+        assert!(!subdir.exists(), "subdir must be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// TOCTOU: the marker is REMOVED between plan and execute → the executor
+    /// re-verify aborts, mutating nothing.
+    #[test]
+    fn custom_execute_aborts_when_marker_removed_after_plan() {
+        let (home, custom_root, subdir, expected) = setup_custom("r4-mrm");
+        let proof = plan_ok(&home, &custom_root, &subdir, &expected);
+        std::fs::remove_file(subdir.join(DEPLOY_CREATED_MARKER)).unwrap();
+        assert!(
+            execute_custom_remove(&proof).is_err(),
+            "execute must abort when the marker was removed after plan"
+        );
+        assert!(subdir.join("USER.txt").exists(), "nothing may be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// TOCTOU: the marker is REPLACED with a mismatched nonce between plan and
+    /// execute → the executor re-verify aborts.
+    #[test]
+    fn custom_execute_aborts_when_marker_replaced_after_plan() {
+        let (home, custom_root, subdir, expected) = setup_custom("r4-mrp");
+        let proof = plan_ok(&home, &custom_root, &subdir, &expected);
+        let stale = DeployProvenance {
+            nonce: "STALE".to_string(),
+            ..expected.clone()
+        };
+        std::fs::write(
+            subdir.join(DEPLOY_CREATED_MARKER),
+            deploy_marker_body(&stale),
+        )
+        .unwrap();
+        assert!(
+            execute_custom_remove(&proof).is_err(),
+            "execute must abort when the marker nonce changed after plan"
+        );
+        assert!(subdir.join("USER.txt").exists(), "nothing may be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// TOCTOU: a NEW overlapping survivor instance is inserted into fleet.yaml
+    /// between plan and execute → the executor re-check on a FRESH snapshot
+    /// aborts.
+    #[test]
+    fn custom_execute_aborts_when_survivor_inserted_after_plan() {
+        let (home, custom_root, subdir, expected) = setup_custom("r4-surv");
+        let proof = plan_ok(&home, &custom_root, &subdir, &expected);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+                subdir.display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            execute_custom_remove(&proof).is_err(),
+            "execute must abort when a survivor now overlaps the target"
+        );
+        assert!(subdir.join("USER.txt").exists(), "nothing may be removed");
         std::fs::remove_dir_all(&home).ok();
     }
 }

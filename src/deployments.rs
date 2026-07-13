@@ -777,41 +777,32 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) -> DeployCleanu
                 nonce: nonce.clone(),
             };
             use crate::agent_ops::workspace_cleanup::{
-                execute_remove_owned_custom, plan_custom_dir_cleanup, CleanupPlan, DeployRemoveCtx,
+                execute_custom_remove, plan_custom_dir_cleanup,
             };
+            let branch = dir_is_repo.then(|| format!("{}/{}", deployment.name, suffix));
             match plan_custom_dir_cleanup(
                 snapshot.as_ref(),
                 home,
                 &cohort,
                 &custom_subdir,
                 &expected,
+                custom_root,
+                dir_is_repo,
+                branch.as_deref(),
             ) {
-                CleanupPlan::RemoveOwned(proof) => {
-                    let ctx = DeployRemoveCtx {
-                        custom_root: custom_root.to_path_buf(),
-                        is_repo: dir_is_repo,
-                        branch: dir_is_repo.then(|| format!("{}/{}", deployment.name, suffix)),
-                    };
-                    if let Err(e) = execute_remove_owned_custom(&proof, &ctx) {
-                        preserve(home, inst, &custom_subdir, &format!("removal error: {e}"));
+                Ok(proof) => {
+                    // The distinct `CustomRemoveOwnedProof` binds the deployment
+                    // identity + git context; `execute_custom_remove` re-verifies
+                    // every mutable authority fact immediately before mutation.
+                    if let Err(e) = execute_custom_remove(&proof) {
+                        preserve(home, inst, &custom_subdir, &format!("removal aborted: {e}"));
                     } else {
                         tracing::info!(inst = %inst, path = %custom_subdir.display(),
                             "deployment cleanup: removed custom subdir (proof-gated)");
                     }
                 }
-                CleanupPlan::PreserveShared { reason }
-                | CleanupPlan::PreserveAmbiguous { reason } => {
+                Err(reason) => {
                     preserve(home, inst, &custom_subdir, &reason);
-                }
-                // A custom deployment subdir is never a workspace user-dir scrub
-                // target — the planner only returns RemoveOwned/Preserve* here.
-                CleanupPlan::ScrubExclusive(_) => {
-                    preserve(
-                        home,
-                        inst,
-                        &custom_subdir,
-                        "unexpected scrub plan for a custom deployment subdir",
-                    );
                 }
             }
         }
