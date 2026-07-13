@@ -394,13 +394,31 @@ pub(crate) fn new_nonce() -> String {
     )
 }
 
+/// The observable outcome of a post-`git worktree add` rollback, so a caller reports
+/// the ACTUAL cleanup state and never claims the worktree was removed while it is
+/// still present awaiting the recovery sweep (#2755 R3 — root + independent review).
+#[must_use = "the checkout response must reflect Removed vs RollbackPending — never claim rolled back while cleanup is pending"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollbackOutcome {
+    /// Worktree removed and the journal cleared — cleanup complete.
+    Removed,
+    /// Worktree remove FAILED (Windows open-handle / transient FS); the retained-
+    /// intent journal is armed for the recovery sweep to retry. `intent_durable` is
+    /// whether that armed journal was durably persisted — `false` means the save
+    /// ALSO failed, a worse state the response must surface for intervention.
+    RollbackPending { intent_durable: bool },
+}
+
 /// Roll back a provisioning attempt that failed AFTER `git worktree add`: arm the
 /// journal with retained-intent + backoff (durably), release any partial lease
 /// (`unbind`, a no-op when no binding was written), then attempt the worktree
-/// `remove` (returns true on success). The journal is CLEARED only when the
-/// worktree is actually gone; otherwise it survives with `rollback_pending` +
-/// `next_attempt_at` so recovery retries (up to the INTERVENTION ceiling), never
-/// orphaning a recoverable worktree. `remove`/`unbind` are injected for tests.
+/// `remove`. Returns [`RollbackOutcome`]: `Removed` (journal cleared) ONLY when the
+/// worktree is actually gone; otherwise `RollbackPending` — the journal survives with
+/// `rollback_pending` + `next_attempt_at` so recovery retries (up to the INTERVENTION
+/// ceiling), never orphaning a recoverable worktree, and the caller MUST report
+/// pending, not "rolled back". The armed-intent SAVE result is surfaced as
+/// `intent_durable` (a save failure is a durability regression the response flags).
+/// `remove`/`unbind` are injected for tests.
 pub(crate) fn rollback_failed(
     home: &Path,
     mangled: &str,
@@ -408,12 +426,15 @@ pub(crate) fn rollback_failed(
     now: chrono::DateTime<chrono::Utc>,
     remove: impl Fn() -> bool,
     unbind: impl Fn(),
-) {
+) -> RollbackOutcome {
     journal.arm_rollback(now);
-    let _ = journal.save(home, mangled);
+    let intent_durable = journal.save(home, mangled).is_ok();
     unbind();
     if remove() {
         Journal::clear(home, mangled);
+        RollbackOutcome::Removed
+    } else {
+        RollbackOutcome::RollbackPending { intent_durable }
     }
 }
 

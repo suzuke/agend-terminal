@@ -32,6 +32,50 @@ pub(crate) fn checkout_source(args: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// #2755 R3 (root + independent review): map a post-`git worktree add`
+/// [`RollbackOutcome`](super::checkout_txn::RollbackOutcome) to the checkout error
+/// response, reporting the ACTUAL cleanup state. `Removed` → the historical
+/// "worktree rolled back" text. `RollbackPending` → a STRUCTURED pending state
+/// (`code: "rollback_pending"`, `rollback_pending: true`) that NEVER claims the
+/// worktree was rolled back — the remove failed (Windows open-handle / transient
+/// FS) and the worktree survives for the recovery sweep. `intent_durable=false`
+/// (the retained-intent journal save ALSO failed) is surfaced for intervention.
+/// The original failure `code`/`stage` are preserved (`failed_code`/`stage`) so
+/// machine consumers keep the root cause. Pure — unit-tested cross-platform.
+pub(super) fn rollback_response(
+    outcome: super::checkout_txn::RollbackOutcome,
+    reason: &str,
+    code: &str,
+    stage: &str,
+    branch: &str,
+) -> Value {
+    use super::checkout_txn::RollbackOutcome;
+    match outcome {
+        RollbackOutcome::Removed => json!({
+            "error": format!("{reason}, worktree rolled back"),
+            "code": code,
+            "stage": stage,
+            "branch": branch,
+        }),
+        RollbackOutcome::RollbackPending { intent_durable } => json!({
+            "error": format!(
+                "{reason}; worktree REMOVE FAILED — rollback pending, recovery sweep will retry{}",
+                if intent_durable {
+                    ""
+                } else {
+                    " (retained-intent journal save ALSO failed — operator intervention needed)"
+                }
+            ),
+            "code": "rollback_pending",
+            "rollback_pending": true,
+            "intent_durable": intent_durable,
+            "failed_code": code,
+            "stage": stage,
+            "branch": branch,
+        }),
+    }
+}
+
 pub(crate) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let result = handle_checkout_repo_inner(home, args, instance_name);
     log_checkout_outcome(home, args, instance_name, &result);
@@ -347,7 +391,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // state (a crash would then orphan it).
             journal.advance(super::checkout_txn::Phase::WorktreeAdded);
             if journal.save(home, &mangled).is_err() {
-                super::checkout_txn::rollback_failed(
+                let outcome = super::checkout_txn::rollback_failed(
                     home,
                     &mangled,
                     &mut journal,
@@ -355,12 +399,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     remove_worktree,
                     || {},
                 );
-                return json!({
-                    "error": "could not persist WorktreeAdded journal, worktree rolled back",
-                    "code": "journal_write",
-                    "stage": "worktree_added",
-                    "branch": branch,
-                });
+                return rollback_response(
+                    outcome,
+                    "could not persist WorktreeAdded journal",
+                    "journal_write",
+                    "worktree_added",
+                    branch,
+                );
             }
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
@@ -377,7 +422,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             )
             .is_err()
             {
-                super::checkout_txn::rollback_failed(
+                let outcome = super::checkout_txn::rollback_failed(
                     home,
                     &mangled,
                     &mut journal,
@@ -385,17 +430,18 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     remove_worktree,
                     || {},
                 );
-                return json!({
-                    "error": "marker write failed, worktree rolled back",
-                    "code": "marker_failed",
-                    "stage": "marker_durable",
-                    "branch": branch,
-                });
+                return rollback_response(
+                    outcome,
+                    "marker write failed",
+                    "marker_failed",
+                    "marker_durable",
+                    branch,
+                );
             }
             crate::store::fsync_parent_dir(&marker_path); // best-effort durability
             journal.advance(super::checkout_txn::Phase::MarkerDurable);
             if journal.save(home, &mangled).is_err() {
-                super::checkout_txn::rollback_failed(
+                let outcome = super::checkout_txn::rollback_failed(
                     home,
                     &mangled,
                     &mut journal,
@@ -403,12 +449,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     remove_worktree,
                     || {},
                 );
-                return json!({
-                    "error": "could not persist MarkerDurable journal, worktree rolled back",
-                    "code": "journal_write",
-                    "stage": "marker_durable",
-                    "branch": branch,
-                });
+                return rollback_response(
+                    outcome,
+                    "could not persist MarkerDurable journal",
+                    "journal_write",
+                    "marker_durable",
+                    branch,
+                );
             }
             // #2755 SubmodulesReady phase: `git worktree add` materializes the
             // superproject (`.gitmodules` + gitlinks) but leaves submodule dirs
@@ -420,7 +467,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // never a half-provisioned tree. Runs for bind AND non-bind (a
             // reviewer/triage inspection worktree needs its submodule content too).
             if let Err(e) = crate::worktree::init_submodules_strict(&worktree_dir) {
-                super::checkout_txn::rollback_failed(
+                let outcome = super::checkout_txn::rollback_failed(
                     home,
                     &mangled,
                     &mut journal,
@@ -428,15 +475,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     remove_worktree,
                     || {},
                 );
-                let mut err = json!({
-                    "error": format!(
-                        "submodule init failed, worktree rolled back: {}",
-                        redact_paths(&e)
-                    ),
-                    "code": "submodule_init_failed",
-                    "stage": "submodules_ready",
-                    "branch": branch,
-                });
+                let mut err = rollback_response(
+                    outcome,
+                    &format!("submodule init failed: {}", redact_paths(&e)),
+                    "submodule_init_failed",
+                    "submodules_ready",
+                    branch,
+                );
                 if bind {
                     err["fetch_attempted"] = json!(fetch_attempted);
                     err["auto_created_branch"] = json!(auto_created_branch);
@@ -445,7 +490,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             journal.advance(super::checkout_txn::Phase::SubmodulesReady);
             if journal.save(home, &mangled).is_err() {
-                super::checkout_txn::rollback_failed(
+                let outcome = super::checkout_txn::rollback_failed(
                     home,
                     &mangled,
                     &mut journal,
@@ -453,12 +498,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     remove_worktree,
                     || {},
                 );
-                return json!({
-                    "error": "could not persist SubmodulesReady journal, worktree rolled back",
-                    "code": "journal_write",
-                    "stage": "submodules_ready",
-                    "branch": branch,
-                });
+                return rollback_response(
+                    outcome,
+                    "could not persist SubmodulesReady journal",
+                    "journal_write",
+                    "submodules_ready",
+                    branch,
+                );
             }
             if bind {
                 // #2533: optional caller-supplied task_id — attributes this self-claim
@@ -486,7 +532,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     );
                     // #1899 + #2755: retained-intent rollback (arm journal + bounded
                     // `remove --force`; bind_full failed ⇒ no binding to unbind).
-                    super::checkout_txn::rollback_failed(
+                    let outcome = super::checkout_txn::rollback_failed(
                         home,
                         &mangled,
                         &mut journal,
@@ -494,14 +540,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         remove_worktree,
                         || {},
                     );
-                    return json!({
-                        "error": format!(
-                            "bind_full failed, worktree rolled back: {}",
-                            redact_paths(&e.to_string())
-                        ),
-                        "code": "bind_rollback",
-                        "branch": branch,
-                    });
+                    return rollback_response(
+                        outcome,
+                        &format!("bind_full failed: {}", redact_paths(&e.to_string())),
+                        "bind_rollback",
+                        "bind_full",
+                        branch,
+                    );
                 }
                 // #2158 GR1 (operator-approved): a self-claimed `repo action=checkout
                 // bind=true` no longer SILENTLY arms a ci_watch — neither here (this
@@ -524,7 +569,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // provision.
             journal.advance(super::checkout_txn::Phase::Committed);
             if journal.save(home, &mangled).is_err() {
-                super::checkout_txn::rollback_failed(
+                let outcome = super::checkout_txn::rollback_failed(
                     home,
                     &mangled,
                     &mut journal,
@@ -536,11 +581,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         }
                     },
                 );
-                return json!({
-                    "error": "commit journal write failed, worktree rolled back",
-                    "code": "commit_failed",
-                    "branch": branch,
-                });
+                return rollback_response(
+                    outcome,
+                    "commit journal write failed",
+                    "commit_failed",
+                    "committed",
+                    branch,
+                );
             }
             // Committed durable ⇒ transaction resolved; drop the journal tombstone.
             super::checkout_txn::Journal::clear(home, &mangled);

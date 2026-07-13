@@ -353,7 +353,7 @@ fn txn_nonce_distinguishes_attempts() {
 
 // ─── recover_stale / rollback_failed (injected remove/unbind — no live git) ──
 
-use super::checkout_txn::{recover_stale, rollback_failed};
+use super::checkout_txn::{recover_stale, rollback_failed, RollbackOutcome};
 
 /// Save a journal at `phase` whose `worktree_path` is `wt`, optionally creating a
 /// real `wt` dir on disk (recovery now decides remove-vs-clear by on-disk
@@ -498,7 +498,7 @@ fn txn_rollback_failed_remove_ok_unbinds_and_clears() {
     j.advance(Phase::SubmodulesReady);
     j.save(&home, "m").unwrap();
     let unbound = std::cell::Cell::new(false);
-    rollback_failed(
+    let outcome = rollback_failed(
         &home,
         "m",
         &mut j,
@@ -506,6 +506,7 @@ fn txn_rollback_failed_remove_ok_unbinds_and_clears() {
         || true,
         || unbound.set(true),
     );
+    assert_eq!(outcome, RollbackOutcome::Removed, "remove ok ⇒ Removed");
     assert!(unbound.get(), "unbind runs");
     assert!(Journal::load(&home, "m").is_none(), "removed ⇒ cleared");
     std::fs::remove_dir_all(&home).ok();
@@ -518,13 +519,96 @@ fn txn_rollback_failed_remove_fail_retains() {
     let mut j = sample_journal();
     j.advance(Phase::SubmodulesReady);
     j.save(&home, "m").unwrap();
-    rollback_failed(&home, "m", &mut j, fixed_now(), || false, || {});
+    // #2755 R3: a failed remove (Windows open-handle / transient FS) ⇒ RollbackPending,
+    // NEVER Removed — the caller must not claim "rolled back". intent_durable=true here
+    // (the armed journal saved cleanly). Cross-platform (injected remove) — this is the
+    // genuine Windows/open-handle rollback-pending row.
+    let outcome = rollback_failed(&home, "m", &mut j, fixed_now(), || false, || {});
+    assert_eq!(
+        outcome,
+        RollbackOutcome::RollbackPending {
+            intent_durable: true
+        },
+        "remove fail ⇒ RollbackPending with durably-saved intent"
+    );
     let retained = Journal::load(&home, "m").expect("retained");
     assert!(
         retained.rollback_pending && retained.next_attempt_at.is_some(),
         "armed retained intent survives a failed remove"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R3: when the worktree remove AND the retained-intent journal SAVE both fail,
+/// RollbackPending surfaces `intent_durable: false` — a worse durability state the
+/// response flags for intervention (indep P1.3: the save result must be observed).
+/// Seam: journal.json pre-created as a DIR so `store::atomic_write` can't rename over
+/// it. Cross-platform.
+#[test]
+fn txn_rollback_failed_pending_flags_nondurable_intent() {
+    let home = tmp_home("rb-nondurable");
+    let mut j = sample_journal();
+    j.advance(Phase::SubmodulesReady);
+    // Make the armed-intent save fail: its journal.json path is a directory.
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, "m")).unwrap();
+    let outcome = rollback_failed(&home, "m", &mut j, fixed_now(), || false, || {});
+    assert_eq!(
+        outcome,
+        RollbackOutcome::RollbackPending {
+            intent_durable: false
+        },
+        "remove fail + save fail ⇒ pending with non-durable intent"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R3 (public response): the checkout error response reports the ACTUAL cleanup
+/// state. `Removed` keeps the historical "worktree rolled back" text + original code.
+/// `RollbackPending` NEVER claims rolled back — a structured pending state (code
+/// `rollback_pending`, `rollback_pending:true`, `intent_durable`, original
+/// `failed_code` preserved). Pure mapping, cross-platform.
+#[test]
+fn rollback_response_pending_never_claims_rolled_back() {
+    let removed = super::checkout::rollback_response(
+        RollbackOutcome::Removed,
+        "submodule init failed",
+        "submodule_init_failed",
+        "submodules_ready",
+        "feat/x",
+    );
+    assert_eq!(removed["code"], "submodule_init_failed");
+    assert!(removed["error"].as_str().unwrap().contains("rolled back"));
+    assert!(removed.get("rollback_pending").is_none());
+
+    let pending = super::checkout::rollback_response(
+        RollbackOutcome::RollbackPending {
+            intent_durable: false,
+        },
+        "submodule init failed",
+        "submodule_init_failed",
+        "submodules_ready",
+        "feat/x",
+    );
+    assert_eq!(
+        pending["code"], "rollback_pending",
+        "pending ⇒ distinct code"
+    );
+    assert_eq!(pending["rollback_pending"], true);
+    assert_eq!(
+        pending["failed_code"], "submodule_init_failed",
+        "root-cause code preserved"
+    );
+    assert_eq!(pending["intent_durable"], false);
+    let err = pending["error"].as_str().unwrap();
+    assert!(
+        !err.contains("worktree rolled back"),
+        "must NOT claim rolled back: {err}"
+    );
+    assert!(err.contains("rollback pending"), "surfaces pending: {err}");
+    assert!(
+        err.contains("intervention"),
+        "non-durable intent flagged: {err}"
+    );
 }
 
 // ─── recover_pending_sweep (shared boot+periodic — injected try_lock/remove) ───
@@ -1147,7 +1231,13 @@ fn txn_open_handle_remove_failure_retained_then_recovered() {
     j.advance(Phase::SubmodulesReady);
     j.save(&home, mangled).unwrap();
     // Handle held open ⇒ remove fails ⇒ intent retained (not cleared).
-    rollback_failed(&home, mangled, &mut j, fixed_now(), || false, || {});
+    assert!(
+        matches!(
+            rollback_failed(&home, mangled, &mut j, fixed_now(), || false, || {}),
+            RollbackOutcome::RollbackPending { .. }
+        ),
+        "open handle ⇒ remove fails ⇒ RollbackPending"
+    );
     let stuck = Journal::load(&home, mangled).expect("retained while handle open");
     assert!(stuck.rollback_pending && stuck.next_attempt_at.is_some());
     // Make it due; handle released ⇒ the sweep removes + clears.
