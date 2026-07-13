@@ -618,3 +618,163 @@ fn txn_normalize_target_aliases_share_identity() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── frozen-scope remaining: redaction + real-entry recovery (deterministic) ──
+
+use super::checkout::redact_paths;
+
+/// Structured redaction strips absolute paths / git stderr from returned errors
+/// while keeping the actionable non-path text; "and/or" and plain words are not
+/// mangled (the ≥2-segment + boundary rule).
+#[test]
+fn redact_paths_strips_absolute_paths_only() {
+    let s = "fatal: could not clone /Users/alice/.agend/worktrees/x into /private/tmp/y";
+    let r = redact_paths(s);
+    assert!(!r.contains("/Users/alice"), "unix home redacted: {r}");
+    assert!(!r.contains("/private/tmp"), "temp path redacted: {r}");
+    assert!(
+        r.contains("<path>") && r.contains("could not clone"),
+        "placeholder + non-path text kept: {r}"
+    );
+    assert!(
+        !redact_paths(r"at C:\Users\bob\wt\x").contains(r"C:\Users"),
+        "windows drive path redacted"
+    );
+    assert_eq!(
+        redact_paths("retry and/or wait"),
+        "retry and/or wait",
+        "relative token untouched"
+    );
+    assert_eq!(
+        redact_paths("git worktree add failed"),
+        "git worktree add failed",
+        "no false positive on plain words"
+    );
+}
+
+/// The `(instance, source)` → worktree-dir mangling `handle_checkout_repo` uses.
+fn mangled_for(instance: &str, source: &Path) -> String {
+    format!(
+        "{}-{}",
+        instance,
+        source
+            .display()
+            .to_string()
+            .replace(['/', '\\', ':'], "_")
+            .replace('~', "")
+    )
+}
+
+/// Committed-write-FAILURE seam: force the durable Committed journal write to fail
+/// (its path pre-created as a DIRECTORY so `store::atomic_write`'s rename fails) →
+/// the real checkout ABORTS into rollback (worktree removed) and returns the
+/// structured `commit_failed`, never success.
+#[test]
+fn checkout_commit_write_failure_rolls_back_2755() {
+    let home = tmp_home("commitfail");
+    let repo = tmp_repo_with_file("commitfail", "readme.txt", "x\n");
+    let instance = "agent-cf";
+    let mangled = mangled_for(instance, &repo);
+    let jpath = home
+        .join("checkout_txn")
+        .join(&mangled)
+        .join("journal.json");
+    std::fs::create_dir_all(&jpath).unwrap(); // seam: journal.json is a DIR
+
+    let args =
+        json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("commit_failed"),
+        "Committed-write failure ⇒ commit_failed: {resp}"
+    );
+    assert!(
+        !home.join("worktrees").join(&mangled).exists(),
+        "worktree rolled back on Committed-write failure"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Restart-replay: a crashed prior attempt left a REAL stale worktree + a
+/// non-Committed journal at this path; a fresh real checkout REPLAYS it (removes
+/// the stale worktree under the path-lock) then provisions cleanly.
+#[test]
+fn checkout_restart_replays_stale_worktree_2755() {
+    let home = tmp_home("replay");
+    let repo = tmp_repo_with_file("replay", "readme.txt", "x\n");
+    let instance = "agent-rp";
+    let mangled = mangled_for(instance, &repo);
+    let wt = home.join("worktrees").join(&mangled);
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    // Crashed attempt: a REAL stale worktree at the target path + its
+    // non-Committed journal (WorktreeAdded ⇒ recover_stale must remove it).
+    git_run_ok(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &wt.display().to_string(),
+            "main",
+        ],
+        false,
+    );
+    let mut j = Journal::prepared(
+        "stale-nonce",
+        wt.display().to_string(),
+        repo.display().to_string(),
+        "main",
+        false,
+        fixed_now().to_rfc3339(),
+    );
+    j.advance(Phase::WorktreeAdded);
+    j.save(&home, &mangled).unwrap();
+
+    let args =
+        json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert!(
+        resp.get("error").is_none(),
+        "checkout succeeds after replaying the stale attempt: {resp}"
+    );
+    assert!(
+        wt.join("readme.txt").is_file(),
+        "freshly provisioned worktree materialized"
+    );
+    assert!(
+        Journal::load(&home, &mangled).is_none(),
+        "journal cleared on Committed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Windows/open-handle: a rollback whose `git worktree remove --force` FAILS
+/// (an open handle pins the dir) RETAINS intent (armed + backoff); a later sweep,
+/// once the handle is released (remove succeeds), resolves and clears it.
+/// Deterministic via injected remove — a real held OS handle is platform-specific.
+#[test]
+fn txn_open_handle_remove_failure_retained_then_recovered() {
+    let home = tmp_home("openhandle");
+    let mangled = "agent-oh";
+    let mut j = sample_journal();
+    j.advance(Phase::SubmodulesReady);
+    j.save(&home, mangled).unwrap();
+    // Handle held open ⇒ remove fails ⇒ intent retained (not cleared).
+    rollback_failed(&home, mangled, &mut j, fixed_now(), || false, || {});
+    let stuck = Journal::load(&home, mangled).expect("retained while handle open");
+    assert!(stuck.rollback_pending && stuck.next_attempt_at.is_some());
+    // Make it due; handle released ⇒ the sweep removes + clears.
+    let mut s = Journal::load(&home, mangled).unwrap();
+    s.next_attempt_at = Some((fixed_now() - chrono::Duration::seconds(1)).to_rfc3339());
+    s.save(&home, mangled).unwrap();
+    let resolved = recover_pending_sweep(&home, fixed_now(), |_| true, |_| {});
+    assert_eq!(resolved, 1, "handle released ⇒ recovered");
+    assert!(
+        Journal::load(&home, mangled).is_none(),
+        "cleared after successful remove"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

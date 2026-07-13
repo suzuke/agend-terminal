@@ -3,6 +3,26 @@ use crate::git_helpers::git_bypass;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// #2755 structured redaction: replace absolute filesystem paths (and Windows
+/// drive paths) in an error string RETURNED over the wire with `<path>`. The
+/// structured `code`/`stage`/`branch` stay actionable for the caller, but raw
+/// paths / git stderr — which leak the local layout, usernames, or submodule
+/// URLs — are stripped. The FULL, un-redacted detail is still recorded in the
+/// daemon event-log (`log_checkout_outcome`), so operators keep debuggability.
+pub(super) fn redact_paths(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // A Windows drive path (`C:\…`), OR a POSIX path of ≥2 segments starting
+        // at a non-word boundary — the `≥2` + boundary avoid mangling "and/or"
+        // and a URL's "//host". Rust's regex has no lookbehind, so the leading
+        // boundary char is captured (`b`) and restored in the replacement.
+        regex::Regex::new(r"(?P<b>^|[^\w])(?P<p>[A-Za-z]:\\[\w.\\@~%+-]+|(?:/[\w.@~%+-]+){2,})")
+            .expect("valid redaction regex")
+    });
+    re.replace_all(s, "${b}<path>").into_owned()
+}
+
 /// #1447: resolve the checkout source repo from `repository_path` — the
 /// cross-tool standard name used by bind_self / team update. Returns `None`
 /// when absent or empty.
@@ -244,7 +264,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         Ok(g) => g,
         Err(e) => {
             return json!({
-                "error": format!("could not acquire provisioning lock for '{branch}': {e}"),
+                "error": format!(
+                    "could not acquire provisioning lock for '{branch}': {}",
+                    redact_paths(&e.to_string())
+                ),
                 "code": "path_lock",
                 "branch": branch,
             })
@@ -335,7 +358,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     || {}, // no binding written before SubmodulesReady
                 );
                 let mut err = json!({
-                    "error": format!("submodule init failed, worktree rolled back: {e}"),
+                    "error": format!(
+                        "submodule init failed, worktree rolled back: {}",
+                        redact_paths(&e)
+                    ),
                     "code": "submodule_init_failed",
                     "stage": "submodules_ready",
                     "branch": branch,
@@ -390,7 +416,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         || {},
                     );
                     return json!({
-                        "error": format!("bind_full failed, worktree rolled back: {e}"),
+                        "error": format!(
+                            "bind_full failed, worktree rolled back: {}",
+                            redact_paths(&e.to_string())
+                        ),
                         "code": "bind_rollback",
                         "branch": branch,
                     });
@@ -453,11 +482,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // back; drop the journal.
             super::checkout_txn::Journal::clear(home, &mangled);
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            let redacted = redact_paths(stderr.trim());
             let mut err = json!({
-                "error": format!("git worktree add failed: {}", stderr.trim()),
+                "error": format!("git worktree add failed: {redacted}"),
                 "code": "worktree_add_failed",
                 "stage": "worktree_add",
-                "raw": stderr,
+                "raw": redacted,
             });
             if bind {
                 err["fetch_attempted"] = json!(fetch_attempted);
@@ -467,11 +497,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         }
         Err(e) => {
             super::checkout_txn::Journal::clear(home, &mangled);
+            let spawn_err = redact_paths(&e.to_string());
             let mut err = json!({
-                "error": format!("git worktree add spawn failed: {e}"),
+                "error": format!("git worktree add spawn failed: {spawn_err}"),
                 "code": "worktree_add_failed",
                 "stage": "worktree_add",
-                "raw": e.to_string(),
+                "raw": spawn_err,
             });
             if bind {
                 err["fetch_attempted"] = json!(fetch_attempted);
