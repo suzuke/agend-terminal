@@ -23,7 +23,7 @@ use std::path::Path;
 /// intermediate dirs a slash-containing branch nests (`worktrees/<name>/feat/x/`),
 /// while preserving a refused unmanaged worktree (its real files keep its dir
 /// non-empty, so it's left for the residual audit to surface).
-fn remove_empty_dir_tree(dir: &Path) {
+pub(crate) fn remove_empty_dir_tree(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {

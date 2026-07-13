@@ -158,28 +158,37 @@ pub fn delete_transaction_expecting(
             wait_for_child_exit(&child_arc)
         }
     } else {
-        // #2764 R9: NO live registry handle. Registry absence alone is NOT
-        // terminal proof (a lost handle leaves a live child) — consult the
-        // durable child ledger + an OS liveness probe:
-        //   no ledger entry            → durable negative (never spawned /
-        //                                already proven exited) → terminal;
-        //   ledger + pid provably gone → terminal; ledger cleared;
-        //   ledger + pid alive/unknown → UNKNOWN → report false, release
-        //                                nothing (never kill an unverified
-        //                                recorded pid — pid reuse).
-        match instance_id.and_then(|id| crate::agent::child_ledger::lookup(home, &id)) {
+        // #2764 R9/R10: NO live registry handle. Registry absence alone is NOT
+        // terminal proof — consult the TYPED durable child ledger + an OS
+        // liveness probe:
+        //   Absent          → durable negative (Running-before-exposure
+        //                     invariant: the generation was never exposed);
+        //   Exited          → explicit terminal record;
+        //   Running + gone  → terminal proven by the OS probe; record Exited;
+        //   Running + alive → UNKNOWN → report false, release nothing (never
+        //                     kill an unverified recorded pid — pid reuse);
+        //   Corrupt         → UNKNOWN, fail closed.
+        use crate::agent::child_ledger::{self, LedgerState};
+        match instance_id.map(|id| (id, child_ledger::lookup(home, &id))) {
             None => true,
-            Some(pid) if !crate::agent::child_ledger::os_pid_alive(pid) => {
-                if let Some(id) = instance_id {
-                    crate::agent::child_ledger::clear(home, &id);
-                }
+            Some((_, LedgerState::Absent)) | Some((_, LedgerState::Exited)) => true,
+            Some((id, LedgerState::Running { pid })) if !child_ledger::os_pid_alive(pid) => {
+                child_ledger::record_exited(home, &id);
                 true
             }
-            Some(pid) => {
+            Some((_, LedgerState::Running { pid })) => {
                 tracing::warn!(
                     agent = %name,
                     pid,
-                    "delete: no registry handle but the recorded child pid is still alive                      (or unverifiable) — stop disposition UNKNOWN, authority retained"
+                    "delete: no registry handle but the recorded child pid is still alive (or unverifiable) — stop disposition UNKNOWN, authority retained"
+                );
+                false
+            }
+            Some((id, LedgerState::Corrupt)) => {
+                tracing::warn!(
+                    agent = %name,
+                    id = %id.full(),
+                    "delete: child ledger record unreadable/malformed — stop disposition UNKNOWN, authority retained (fail closed)"
                 );
                 false
             }
@@ -208,9 +217,9 @@ pub fn delete_transaction_expecting(
         return false;
     }
 
-    // #2764 R9: terminal exit proven — clear the durable child ledger.
+    // #2764 R9/R10: terminal exit proven — record the explicit Exited state.
     if let Some(id) = instance_id {
-        crate::agent::child_ledger::clear(home, &id);
+        crate::agent::child_ledger::record_exited(home, &id);
     }
 
     // Step 4: registry remove (after child exit confirmed or timeout).
@@ -626,6 +635,63 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #2764 R10 RED: a BLOCKED ledger write (dir path squatted by a file)
+    /// must ABORT the spawn before any registry exposure — best-effort
+    /// recording would make a later `Absent` lookup fail-open.
+    #[test]
+    #[cfg(unix)]
+    fn spawn_bails_without_lifecycle_evidence_2764_r10() {
+        let home = tmp_home("spawn-bail-ledger");
+        std::fs::create_dir_all(home.join("runtime")).expect("mk runtime");
+        std::fs::write(home.join("runtime").join("child-pids"), "squatter").expect("squat");
+        let reg = empty_registry();
+        let cfg = crate::agent::SpawnConfig {
+            name: "unevidenced",
+            backend_command: "cat",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: None,
+            shutdown: None,
+        };
+        let result = crate::agent::spawn_agent(&cfg, &reg);
+        assert!(
+            result.is_err(),
+            "a failed lifecycle-evidence write must abort the spawn, got {result:?}"
+        );
+        assert!(
+            reg.lock().is_empty(),
+            "no registry exposure without lifecycle evidence"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2764 R10 RED: a CORRUPT/legacy ledger record is UNKNOWN — the pinned
+    /// stop fails closed instead of treating it as terminal.
+    #[test]
+    fn pinned_stop_corrupt_ledger_is_unknown_2764_r10() {
+        let home = tmp_home("corrupt-ledger");
+        let reg = empty_registry();
+        let id = crate::types::InstanceId::new();
+        let dir = home.join("runtime").join("child-pids");
+        std::fs::create_dir_all(&dir).expect("mk ledger dir");
+        std::fs::write(dir.join(format!("{}.json", id.full())), r#"{"pid": 77}"#)
+            .expect("write legacy record");
+
+        let verdict = delete_transaction_expecting(&home, "murky", &reg, None, false, Some(id));
+
+        assert!(
+            !verdict,
+            "a corrupt/legacy ledger record must be UNKNOWN (fail closed), not terminal"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// #2764 R9: NO registry handle + a durable child-ledger entry whose pid
     /// is still ALIVE (this test's own pid) → the stop disposition is UNKNOWN:
     /// report false, retain the ledger, release nothing name-keyed. Registry
@@ -636,7 +702,8 @@ mod tests {
         let home = tmp_home("lost-child-alive");
         let reg = empty_registry();
         let id = crate::types::InstanceId::new();
-        crate::agent::child_ledger::record(&home, &id, std::process::id());
+        crate::agent::child_ledger::record_running(&home, &id, std::process::id())
+            .expect("record running");
         let rdir = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&rdir).expect("mk run dir");
         let port = crate::ipc::port_path(&rdir, "lost");
@@ -650,8 +717,10 @@ mod tests {
         );
         assert_eq!(
             crate::agent::child_ledger::lookup(&home, &id),
-            Some(std::process::id()),
-            "the ledger must be RETAINED on UNKNOWN"
+            crate::agent::child_ledger::LedgerState::Running {
+                pid: std::process::id()
+            },
+            "the Running record must be RETAINED on UNKNOWN"
         );
         assert!(
             port.exists(),
@@ -674,15 +743,15 @@ mod tests {
             .expect("spawn true");
         let pid = child.id();
         child.wait().expect("reap");
-        crate::agent::child_ledger::record(&home, &id, pid);
+        crate::agent::child_ledger::record_running(&home, &id, pid).expect("record running");
 
         let verdict = delete_transaction_expecting(&home, "gone", &reg, None, false, Some(id));
 
         assert!(verdict, "a provably-dead recorded child is terminal");
         assert_eq!(
             crate::agent::child_ledger::lookup(&home, &id),
-            None,
-            "the ledger must be cleared once terminal absence is proven"
+            crate::agent::child_ledger::LedgerState::Exited,
+            "the explicit Exited record must be written once terminal absence is proven"
         );
         std::fs::remove_dir_all(&home).ok();
     }

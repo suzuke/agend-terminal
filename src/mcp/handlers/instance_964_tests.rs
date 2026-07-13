@@ -130,11 +130,12 @@ fn t2_spawn_failure_rolls_back_fleet_yaml_entry() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// T2b (rollback on API-unavailable): same contract as T2, but the
-/// spawn_fn returns `Err` (API-unavailable path) instead of an
-/// `Ok(json!{"ok": false})` response.
+/// T2b — #2764 R10 (4c) REWRITE of the old blind-rollback contract: a
+/// transport Err does NOT prove the spawn failed. When the disambiguation
+/// LIST is ALSO unreachable the outcome is UNKNOWN → all state (fleet entry,
+/// created paths) is RETAINED for recovery, loudly — never erased.
 #[test]
-fn t2b_api_unavailable_rolls_back_fleet_yaml_entry() {
+fn t2b_transport_loss_unknown_retains_state_2764_r10() {
     let home = tmp_home("t2b");
 
     let spawn_fn =
@@ -151,19 +152,96 @@ fn t2b_api_unavailable_rolls_back_fleet_yaml_entry() {
         result["error"]
             .as_str()
             .unwrap_or("")
-            .contains("API unavailable"),
-        "Err path must surface as 'API unavailable'; got {result}"
+            .contains("state retained for recovery"),
+        "UNKNOWN outcome must be loud about retention; got {result}"
     );
 
     let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
         .expect("reload fleet.yaml");
     assert!(
-        !cfg.instance_names().iter().any(|n| n == "t2b-instance"),
-        "#964 rollback on API-unavailable: fleet.yaml must NOT \
-         contain t2b-instance; got instances={:?}",
+        cfg.instance_names().iter().any(|n| n == "t2b-instance"),
+        "#2764 R10: an UNKNOWN spawn outcome must RETAIN the fleet entry \
+         (erasing a possibly-live generation is the incident class); got {:?}",
         cfg.instance_names()
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #2764 R10 (4c) RED: transport lost on SPAWN but the daemon's LIST shows
+/// the instance REGISTERED → the spawn took; NO rollback, honest response.
+#[test]
+fn transport_loss_registered_instance_no_rollback_2764_r10() {
+    let home = tmp_home("t2c-live");
+    let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+        match req["method"].as_str() {
+            Some(m) if m == crate::api::method::LIST => Ok(json!({
+                "ok": true,
+                "result": {"agents": [{"name": "t2c-instance"}]}
+            })),
+            _ => Err(anyhow::anyhow!("ipc dropped mid-spawn")),
+        }
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({"name": "t2c-instance", "backend": "claude"}),
+        &spawn_fn,
+    );
+
+    assert_eq!(
+        result["spawned"].as_bool(),
+        Some(true),
+        "a registered instance after transport loss is a LIVE spawn: {result}"
+    );
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    assert!(
+        cfg.instance_names().iter().any(|n| n == "t2c-instance"),
+        "no rollback may run for a live generation; got {:?}",
+        cfg.instance_names()
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #2764 R10 (4c) RED: transport lost on SPAWN and LIST proves the instance
+/// is NOT registered → the spawn provably did not take → full rollback
+/// (fleet entry gone).
+#[test]
+fn transport_loss_unregistered_rolls_back_2764_r10() {
+    let home = tmp_home("t2d-dead");
+    let spawn_fn = |_h: &Path, req: &Value| -> anyhow::Result<Value> {
+        match req["method"].as_str() {
+            Some(m) if m == crate::api::method::LIST => Ok(json!({
+                "ok": true,
+                "result": {"agents": []}
+            })),
+            _ => Err(anyhow::anyhow!("ipc dropped before spawn")),
+        }
+    };
+
+    let result = spawn_single_instance_impl(
+        &home,
+        "test-spawner",
+        &json!({"name": "t2d-instance", "backend": "claude"}),
+        &spawn_fn,
+    );
+
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("API unavailable"),
+        "provably-dead spawn surfaces the API error: {result}"
+    );
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("reload fleet.yaml");
+    assert!(
+        !cfg.instance_names().iter().any(|n| n == "t2d-instance"),
+        "a provably-not-registered spawn must roll back the fleet entry; got {:?}",
+        cfg.instance_names()
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -533,4 +611,71 @@ fn create_rollback_keeps_preexisting_workdir_2764_r9() {
         "a pre-existing operator dir must NEVER be removed by the rollback"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2764 R10 (4a) RED: a create with `branch` materializes a git WORKTREE;
+/// on spawn failure the rollback must remove BOTH the filesystem dir AND the
+/// git worktree registration (a bare dir removal leaves a prunable
+/// registration = residue).
+#[test]
+fn create_rollback_removes_worktree_fs_and_git_metadata_2764_r10() {
+    let home = tmp_home("r10-wt-rollback");
+    // A real repo as the operator working dir.
+    let repo = home.join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo");
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+        vec!["commit", "--allow-empty", "-m", "seed"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let fail_spawn = |_h: &Path, _req: &Value| -> anyhow::Result<Value> {
+        Ok(json!({"ok": false, "error": "boom"}))
+    };
+
+    let resp = spawn_single_instance_impl(
+        &home,
+        "",
+        &json!({
+            "name": "wt-rolled",
+            "backend": "claude",
+            "working_directory": repo.display().to_string(),
+            "branch": "feat/rollback-red",
+        }),
+        &fail_spawn,
+    );
+    assert!(resp.get("error").is_some(), "spawn must fail: {resp}");
+
+    // Filesystem residue: no worktree dir anywhere under the canonical layout.
+    let wt_root = crate::worktree_pool::daemon_managed_worktree_root(&home);
+    let fs_residue = wt_root.join("wt-rolled").exists();
+    // Git metadata residue: repo lists only its own primary worktree.
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git worktree list");
+    let listing = String::from_utf8_lossy(&out.stdout).to_string();
+    let registrations = listing
+        .lines()
+        .filter(|l| l.starts_with("worktree "))
+        .count();
+    assert!(
+        !fs_residue && registrations == 1 && !listing.contains("prunable"),
+        "worktree rollback must leave zero fs + git residue; fs_residue={fs_residue} listing:\n{listing}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }

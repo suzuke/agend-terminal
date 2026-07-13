@@ -1304,13 +1304,23 @@ pub fn spawn_agent(
     // identity policy is unit-testable without a live PTY spawn.
     let instance_id = resolve_spawn_instance_id(config.home, name)?;
 
-    // #2764 R9: durable child-lifecycle ledger for MANAGED agents — written
-    // before the handle becomes discoverable, cleared only on proven terminal
-    // exit. A later pinned stop consults it so a lost registry handle can
-    // never be vacuously converted into "terminally absent".
+    // #2764 R9/R10: durable child-lifecycle ledger for MANAGED agents —
+    // written ATOMICALLY before the handle becomes discoverable, rewritten to
+    // the explicit Exited state only on proven terminal exit. FAIL-CLOSED: a
+    // missing pid or a failed ledger write ABORTS the spawn (child killed,
+    // never exposed) — that invariant is what makes a later `Absent` lookup a
+    // provable durable negative instead of a fail-open inference.
     if let Some(home_path) = config.home {
-        if let Some(pid) = child_arc.lock().process_id() {
-            crate::agent::child_ledger::record(home_path, &instance_id, pid);
+        let pid = child_arc.lock().process_id();
+        let recorded = match pid {
+            Some(pid) => crate::agent::child_ledger::record_running(home_path, &instance_id, pid),
+            None => Err("spawned child exposes no pid".to_string()),
+        };
+        if let Err(e) = recorded {
+            let _ = child_arc.lock().kill();
+            anyhow::bail!(
+                "#2764 R10: refusing to expose '{name}' without lifecycle evidence — {e}"
+            );
         }
     }
 
@@ -2217,6 +2227,20 @@ fn handle_pty_close(
         "process exit wait complete"
     );
     sweep_child_tree(id, registry);
+
+    // #2764 R10: exit OBSERVED → record the explicit terminal ledger state so
+    // a later pinned stop has durable lifecycle evidence (a stale Running
+    // entry after a normal exit was an independent-review blocker). A None
+    // exit (wait timeout) records nothing — unproven stays unproven.
+    // ORDERING: any respawn (crash / clean-exit shell fallback) is triggered
+    // BELOW by this same handler, so its record_running always lands AFTER
+    // this Exited record — the same-id ledger can't regress a live
+    // replacement generation to Exited on this path.
+    if exit_code.is_some() {
+        if let Some(home) = home {
+            crate::agent::child_ledger::record_exited(home, id);
+        }
+    }
 
     if deleted.load(std::sync::atomic::Ordering::SeqCst) {
         tracing::info!(agent = name, "agent deleted, skipping shell fallback");

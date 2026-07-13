@@ -288,6 +288,8 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         Ok(resp) => {
             rollback_fleet_entry_on_failure(home, name, "SPAWN failed");
             rollback_created_paths(
+                home,
+                name,
                 &work_dir,
                 work_dir_preexisted || !work_dir_created_here,
                 created_worktree.as_deref(),
@@ -295,13 +297,66 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
             json!({"error": resp["error"].as_str().unwrap_or("spawn failed")})
         }
         Err(e) => {
-            rollback_fleet_entry_on_failure(home, name, "API unavailable");
-            rollback_created_paths(
-                &work_dir,
-                work_dir_preexisted || !work_dir_created_here,
-                created_worktree.as_deref(),
-            );
-            json!({"error": format!("API unavailable: {e}")})
+            // #2764 R10 (4c): a transport error does NOT prove the spawn did
+            // not happen daemon-side (the SPAWN may have completed before the
+            // connection dropped). Disambiguate BEFORE any rollback: ask the
+            // daemon whether the name is now registered.
+            //   registered      → the instance is LIVE: rolling back would
+            //                     erase a live generation's fleet entry —
+            //                     retain everything, answer honestly;
+            //   not registered  → the spawn provably did not take → roll back
+            //                     as before;
+            //   query also down → UNKNOWN: retain ALL state + a LOUD recovery
+            //                     note (residue is recoverable; erasing a live
+            //                     generation is not).
+            match spawn_fn(
+                home,
+                &json!({"method": crate::api::method::LIST, "params": {}}),
+            ) {
+                Ok(list) if list["ok"].as_bool() == Some(true) => {
+                    let registered = list["result"]["agents"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|x| x["name"].as_str() == Some(name)));
+                    if registered {
+                        tracing::warn!(
+                            %name,
+                            error = %e,
+                            "create: SPAWN transport lost but the instance IS registered — no rollback"
+                        );
+                        json!({
+                            "name": name,
+                            "spawned": true,
+                            "note": format!("SPAWN transport lost after the spawn took ({e}); instance is live — no rollback")
+                        })
+                    } else {
+                        rollback_fleet_entry_on_failure(home, name, "API unavailable");
+                        rollback_created_paths(
+                            home,
+                            name,
+                            &work_dir,
+                            work_dir_preexisted || !work_dir_created_here,
+                            created_worktree.as_deref(),
+                        );
+                        json!({"error": format!("API unavailable: {e}")})
+                    }
+                }
+                _ => {
+                    tracing::error!(
+                        %name,
+                        error = %e,
+                        "create: SPAWN transport lost and the daemon is unreachable — state                          RETAINED for recovery (fleet entry + created paths kept; a live                          generation must never be erased on an UNKNOWN outcome)"
+                    );
+                    crate::event_log::log(
+                        home,
+                        "create_recovery",
+                        name,
+                        "SPAWN transport lost, daemon unreachable — fleet entry and created                          paths retained; operator: verify and delete or restart",
+                    );
+                    json!({"error": format!(
+                        "API unavailable ({e}); spawn outcome UNKNOWN — state retained for recovery (see event log)"
+                    )})
+                }
+            }
         }
     }
 }
@@ -310,34 +365,90 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
 /// spawn failed — the created worktree (git-removed so no orphan registration
 /// survives) and the created working dir. `work_dir_keep` = the dir either
 /// pre-existed or was not created by this call → never touched.
-fn rollback_created_paths(work_dir: &str, work_dir_keep: bool, worktree: Option<&Path>) {
+fn rollback_created_paths(
+    home: &Path,
+    name: &str,
+    work_dir: &str,
+    work_dir_keep: bool,
+    worktree: Option<&Path>,
+) {
     if let Some(wt) = worktree {
         let wt_str = wt.display().to_string();
-        let removed = crate::git_helpers::git_bypass(wt, &["rev-parse", "--git-common-dir"])
+        // Resolve the owning repo FIRST (from the worktree's gitlink) — needed
+        // both for the git removal and for the post-fallback prune/verify.
+        let owning_repo = crate::git_helpers::git_bypass(wt, &["rev-parse", "--git-common-dir"])
             .ok()
             .filter(|o| o.status.success())
             .and_then(|o| {
                 let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if raw.is_empty() {
+                    return None;
+                }
                 let common = if Path::new(&raw).is_absolute() {
                     std::path::PathBuf::from(&raw)
                 } else {
                     wt.join(&raw)
                 };
-                common.parent().map(|repo| {
-                    crate::git_worktree::remove_force(repo, &wt_str)
-                        .map(|o| o.status.success())
-                        .unwrap_or(false)
-                })
+                let common = dunce::canonicalize(&common).unwrap_or(common);
+                common.parent().map(|p| p.to_path_buf())
+            });
+        let removed = owning_repo
+            .as_deref()
+            .map(|repo| {
+                crate::git_worktree::remove_force(repo, &wt_str)
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
             })
             .unwrap_or(false);
         if !removed {
+            // #2764 R10 (4a): the raw remove_dir_all fallback deletes the DIR
+            // but leaves the git registration — prune it and VERIFY zero
+            // residue; a survivor is loud/fail-closed (event-logged error),
+            // never silently declared clean.
             let _ = std::fs::remove_dir_all(wt);
+            if let Some(repo) = owning_repo.as_deref() {
+                let _ = crate::git_helpers::git_bypass(repo, &["worktree", "prune"]);
+            }
         }
-        tracing::warn!(worktree = %wt.display(), "create rollback: removed worktree created by the failed create");
+        // A slash-containing branch nests intermediate dirs under
+        // `worktrees/<name>/…` (#1907 class) — sweep the now-empty tree so the
+        // fs check below sees the true residue state.
+        super::lifecycle::remove_empty_dir_tree(
+            &crate::worktree_pool::daemon_managed_worktree_root(home).join(name),
+        );
+        let dir_residue = wt.exists();
+        let registration_residue = owning_repo
+            .as_deref()
+            .and_then(|repo| {
+                crate::git_helpers::git_bypass(repo, &["worktree", "list", "--porcelain"])
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| {
+                        let canon = dunce::canonicalize(wt).unwrap_or_else(|_| wt.to_path_buf());
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .filter_map(|l| l.strip_prefix("worktree "))
+                            .any(|p| Path::new(p) == wt || Path::new(p) == canon.as_path())
+                    })
+            })
+            .unwrap_or(false);
+        if dir_residue || registration_residue {
+            tracing::error!(worktree = %wt.display(), dir_residue, registration_residue,
+                "create rollback FAILED to fully remove the created worktree — residue left (fail-closed: NOT reported clean)");
+        } else {
+            tracing::warn!(worktree = %wt.display(),
+                "create rollback: removed worktree created by the failed create (fs + git registration verified)");
+        }
     }
     if !work_dir_keep {
-        let _ = std::fs::remove_dir_all(work_dir);
-        tracing::warn!(dir = %work_dir, "create rollback: removed working dir created by the failed create");
+        if let Err(e) = std::fs::remove_dir_all(work_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(dir = %work_dir, error = %e,
+                    "create rollback FAILED to remove the created working dir — residue left");
+            }
+        } else {
+            tracing::warn!(dir = %work_dir, "create rollback: removed working dir created by the failed create");
+        }
     }
 }
 
