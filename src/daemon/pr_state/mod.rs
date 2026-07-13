@@ -196,6 +196,21 @@ pub struct PrState {
     /// slice adds only the field + the gate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) reserved_assignments: Vec<ReservedAssignment>,
+    /// t-…-17 B4 (codex m-…-322): FAIL-CLOSED merge-gate flag. SET by the
+    /// [`record_ci_result`] A6 drain whenever the branch's assignment authority
+    /// could NOT be read reliably — a corrupt/unreadable record, an
+    /// exists-but-unreadable branch dir, or a required assignment-lock acquisition
+    /// failure — so the reserved derivation could not be trusted. While set,
+    /// [`is_merge_ready`] returns false unconditionally. This closes the
+    /// sole-corrupt-record fail-open: a branch whose ONLY record is corrupt looks
+    /// assignment-free to the lossy [`crate::daemon::assignment_authority::has_active`],
+    /// so the drain would otherwise derive an EMPTY reserved set on a fresh state and
+    /// OPEN the gate. CLEARED only by a successful locked-or-genuinely-absent derive.
+    /// Additive serde (`default` + skip-when-false) ⇒ legacy state files load
+    /// byte-identical; an old file without the field defaults `false` and is
+    /// re-derived on the next CI observation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) authority_unknown: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1085,6 +1100,7 @@ pub fn new_for_branch(
         observed_at: None,
         observed_error: false,
         reserved_assignments: Vec::new(),
+        authority_unknown: false,
         created_at: now.clone(),
         updated_at: now,
     }

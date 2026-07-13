@@ -77,6 +77,7 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         observed_at: None,
         observed_error: false,
         reserved_assignments: Vec::new(),
+        authority_unknown: false,
         created_at: now(),
         updated_at: now(),
     }
@@ -2955,5 +2956,78 @@ fn b4_drain_preserves_reserved_when_assignment_lock_unavailable() {
     );
     // Cleanup: the poisoned lock dir would block remove_dir_all's file unlink? it's a
     // dir, remove_dir_all handles it.
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// t-…-17 B4 (codex m-…-322) — the SOLE-corrupt-record merge-gate fail-open. A branch
+/// whose ONLY assignment record is CORRUPT, with NO pre-existing reservation, must NOT
+/// be able to OPEN the merge gate. The lossy `has_active`/`list_active` DROP a corrupt
+/// record's `Err`, so the branch looks assignment-free: the drain then derives on a
+/// fresh state with an EMPTY reserved set and `is_merge_ready` OPENs even though the
+/// authority is UNREADABLE. Fail closed: the tri-state probe reports `Unreadable`, the
+/// drain SETs `authority_unknown`, and `is_merge_ready` returns false. This complements
+/// the reconcile-path RED (assignment_reconcile.rs
+/// `b4_corrupt_record_keeps_reservation_fail_closed`, which covers a prior reservation +
+/// a co-resident healthy record); THIS covers the uncovered first-projection /
+/// single-corrupt case with an empty reserved set.
+#[test]
+fn b4_sole_corrupt_record_holds_merge_gate_closed_fail_closed() {
+    let home = t30_home("b4-sole-corrupt");
+    // The SOLE assignment record for (repo,branch) is CORRUPT — write garbage at the
+    // real on-disk record path (create the branch dir first). No healthy record, so the
+    // lossy `has_active`/`list_active` see an assignment-free branch.
+    let rpath = crate::daemon::assignment_authority::record_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "reviewer",
+    );
+    std::fs::create_dir_all(rpath.parent().unwrap()).unwrap();
+    std::fs::write(&rpath, b"{ not valid assignment json").unwrap();
+
+    // A FRESH PrState with EVERY OTHER merge condition satisfied: CI is set Green at
+    // head by `record_ci_result` below; the reviewer is Verified at head; not Draft;
+    // review_class resolved (Single). reserved_assignments is empty (no prior
+    // reservation) — the exact state the fail-open OPENs the gate on.
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.verdict_state = VerdictState::Verified {
+        reviewers: vec![("reviewer".to_string(), "sha-A".to_string())],
+    };
+    assert!(ps.reserved_assignments.is_empty(), "no prior reservation");
+    assert!(!ps.authority_unknown, "authority_unknown starts clear");
+    save(&home, &ps).unwrap();
+
+    // Real entry: the A6 drain runs against the sole corrupt record.
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    // Sanity: every OTHER condition is met, so ONLY the authority-unknown gate keeps
+    // the PR closed — proving this is the sole-corrupt fail-open, not some other gate.
+    assert!(
+        matches!(s.ci_state, CiState::Green { ref sha, .. } if sha == "sha-A"),
+        "CI is green at head"
+    );
+    assert!(
+        matches!(s.verdict_state, VerdictState::Verified { .. }),
+        "reviewer is Verified at head"
+    );
+    assert!(s.reserved_assignments.is_empty(), "reserved stays empty");
+    assert!(
+        s.authority_unknown,
+        "a SOLE corrupt record ⇒ authority UNREADABLE ⇒ authority_unknown SET (fail closed)"
+    );
+    assert!(
+        !is_merge_ready(&s),
+        "a branch whose sole assignment record is corrupt must NOT be merge-ready (gate stays CLOSED)"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

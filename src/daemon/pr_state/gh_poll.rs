@@ -609,6 +609,7 @@ pub(crate) mod tests {
             observed_at: None,
             observed_error: false,
             reserved_assignments: Vec::new(),
+            authority_unknown: false,
             created_at: now.clone(),
             updated_at: now,
         }
