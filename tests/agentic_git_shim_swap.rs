@@ -24,7 +24,7 @@
 //! `agentic-git-core` from this same submodule, P1b), so `include_str!` on it
 //! adds no new fragility.
 
-const VENDORED_SHIM: &str = include_str!("../vendor/agentic-git/crates/agentic-git/src/main.rs");
+const VENDORED_SHIM: &str = include_str!("../vendor/agentic-git/crates/agentic-git/src/lib.rs");
 
 /// Every git guard agend-terminal relies on must be present in the vendored
 /// successor shim (design §5 DUAL parity core). A missing one = a silent guard

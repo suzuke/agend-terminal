@@ -76,8 +76,7 @@ jobs:
         # task83 (d-46): the owned-source rustfmt boundary now lives in ONE place —
         # scripts/fmt-owned.sh — so CI, GitLab CI and preflight can't drift apart. It
         # enumerates `git ls-files -z -- '*.rs' ':!:vendor/**'` (NUL-safe; excludes
-        # the vendored agentic-git submodule that `cargo fmt` would otherwise walk and
-        # reformat) and runs `rustfmt --edition 2021 --check`.
+        # the vendored agentic-git submodule) and runs `rustfmt --edition 2021 --check`.
         run: scripts/fmt-owned.sh --check
 
       # task83: exercise the owned-fmt boundary contract itself (hermetic recursive-
@@ -89,27 +88,22 @@ jobs:
         shell: bash
         run: scripts/test_fmt_owned.sh
 
-      # #2524 P3: the agentic-git `[[bin]]` compiles vendored submodule source.
-      # `cargo clippy --all-targets` would lint it under agend-terminal's strict
-      # `-D warnings` + `unwrap_used=deny`, but that is UPSTREAM code gated by
-      # agentic-git's OWN CI — and `--all-targets` IGNORES the target's
-      # `test = false`, dragging in its unix-only inline tests (which also fail to
-      # compile on Windows). So run the strict gate on OUR OWN targets only:
-      # `--tests` DOES honor `test=false`, so it excludes the vendored bin's
-      # unittest; enumerate our bins (NOT agentic-git) so `--bins`/`--all-targets`
-      # never pull the vendored binary either. Add a new agend-terminal bin here.
-      # This keeps full default+tray coverage of everything we own.
+      # First-party agentic-git wrapper regression: real cargo fmt must leave the
+      # parent and every recursive submodule byte-clean on the ephemeral checkout.
+      - name: Real cargo fmt recursive-clean proof
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          cargo fmt
+          test -z "$(git diff --name-only)"
+          dirty="$(git submodule foreach --recursive 'git status --porcelain' | grep -v '^Entering' || true)"
+          test -z "$dirty"
+
+      # The first-party wrapper delegates to upstream's library entrypoint; lint
+      # the binary strictly alongside the other agend-terminal targets.
       - name: Clippy (our targets, strict)
         timeout-minutes: 15
-        run: cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --tests --examples --features tray -- -D warnings
-      # The vendored agentic-git bin: lint as ADVISORY only (`--cap-lints=warn` →
-      # nothing gates), never imposing agend-terminal's `-D` bar on upstream code.
-      # We do NOT edit the submodule source to add `#[allow]` (that forks the
-      # vendored crate). Real Windows-compile coverage comes from the Build step.
-      - name: Clippy (vendored agentic-git bin, advisory)
-        timeout-minutes: 15
-        continue-on-error: true
-        run: cargo clippy --bin agentic-git --features tray -- --cap-lints=warn
+        run: cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
 
       - name: Build
         timeout-minutes: 20
