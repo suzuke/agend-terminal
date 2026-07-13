@@ -2223,3 +2223,101 @@ fn plan_revise_refused_when_ack_lands_concurrently_2760_r2() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// RED (finding 2 — metadata_set stale authorization, OWNER dimension / STALE-FORMER-OWNER):
+/// a THIRD PARTY (`lead`, the creator) creates the task; the OLD OWNER (`worker`) claims it
+/// and is authorized to set a generic (non-`plan`) metadata key OUT of lock. In the old
+/// owner's out-of-lock window the OLD OWNER RELEASES the task (`update`→open clears the
+/// assignee) and a NEW OWNER (`worker2`) CLAIMS it — a real release→claim ownership drift,
+/// expressed entirely through the production `update`/`claim` handlers (each takes+releases
+/// its own per-id lock BEFORE the instrumented metadata_set locks, so no deadlock). The
+/// under-lock re-evaluation of the owner ACL against the FRESH record (`can_mutate_record`,
+/// owner = worker2) must REFUSE the former owner's write and leave the metadata (hence the
+/// event log) unchanged. Pre-R2 (a542517b) checked the ACL ONLY on the pre-lock record
+/// (`worker` still owner → authorized) and appended the write unchecked — a stale-authorized
+/// former owner silently overwrites a key the new owner now controls.
+#[test]
+fn metadata_set_refused_when_owner_drifts_via_release_claim_under_lock_2760_r2() {
+    let home = tmp_home("r2-stale-former-owner");
+    // Third party (`lead`, creator) creates; OLD OWNER (`worker`) claims → creator ≠ owner.
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "generic-metadata task",
+            "assignee": "worker",
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    // Baseline: the old owner sets a generic key while still the owner (authorized).
+    let base = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "note", "metadata_value": "baseline"
+        }),
+    );
+    assert!(
+        base.get("error").is_none(),
+        "baseline set must succeed: {base}"
+    );
+    // In the old owner's out-of-lock window: the OLD OWNER releases (update→open clears the
+    // assignee) and the NEW OWNER claims — ownership drifts before the write commits.
+    let home_h = home.clone();
+    let id_h = id.clone();
+    crate::tasks::set_before_mutation_commit_hook_for_test(move || {
+        let rel = handle(
+            &home_h,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id_h, "status": "open"}),
+        );
+        assert_eq!(
+            rel["status"], "updated",
+            "old owner's release must succeed: {rel}"
+        );
+        let claim = handle(
+            &home_h,
+            "worker2",
+            &serde_json::json!({"action": "claim", "id": id_h}),
+        );
+        assert_eq!(
+            claim["event"], "claimed",
+            "new owner's claim must succeed: {claim}"
+        );
+    });
+    // The OLD OWNER's racing generic-key write: authorized out-of-lock, but the under-lock
+    // owner-ACL re-check against the FRESH record (owner = worker2) must REFUSE it.
+    let resp = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "note", "metadata_value": "hijacked"
+        }),
+    );
+    assert_eq!(
+        resp.get("code").and_then(|v| v.as_str()),
+        Some("metadata_precondition_failed"),
+        "the former owner's write must be refused once ownership drifts under the lock: {resp}"
+    );
+    // Metadata unchanged (the hijack never landed) and ownership did drift to the new owner.
+    let rec = read_task_record(&home, &id).expect("record");
+    assert_eq!(
+        rec.metadata.get("note").and_then(|v| v.as_str()),
+        Some("baseline"),
+        "the note stays 'baseline' — the former owner's write is refused under the lock"
+    );
+    assert_eq!(
+        rec.owner.as_ref().map(|o| o.0.as_str()),
+        Some("worker2"),
+        "ownership drifted to the new owner in the out-of-lock window"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
