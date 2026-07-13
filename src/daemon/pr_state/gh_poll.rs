@@ -302,6 +302,9 @@ pub(crate) fn worker_poll_and_act(
             }
             super::remote_gc::gc_remote_orphans(repo, &prs);
             super::auto_arm::auto_arm_unwatched_open_prs(home, repo, &prs);
+            // #2749 3b: off-tick producer for the read-only freshness gate — stamp
+            // the deterministic latest-main ancestry tuple the scanner consumes.
+            super::freshness_populator::stamp_freshness_off_tick(home, repo, &prs);
         }
         Err(e) => tracing::warn!(
             repo = %repo, error = %e,

@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod auto_arm;
+mod freshness_populator;
 pub mod gh_poll;
 pub mod ready_gate;
 mod remote_gc;
