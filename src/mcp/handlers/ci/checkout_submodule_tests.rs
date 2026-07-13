@@ -8,6 +8,10 @@
 //! (that module's helpers are private); a two-level super→A→B nest pins that
 //! the fix inits submodules RECURSIVELY, not just one level.
 
+// `#[cfg(unix)]`: `json!` is used only by the real-checkout tests below, which are
+// Unix-only (absolute-source contract — see the first such test). Windows would
+// otherwise warn `unused_imports` under strict clippy.
+#[cfg(unix)]
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,6 +21,10 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Run git with `AGEND_GIT_BYPASS` (skip the shim); panic on non-zero. When
 /// `allow_file`, set `protocol.file.allow=always` so local-path submodule
 /// fixtures clone (git's submodule helper ignores repo-stored config).
+///
+/// `#[cfg(unix)]`: consumed only by the Unix-only real-checkout fixtures/tests
+/// below; gating avoids a `dead_code` warning on Windows under strict clippy.
+#[cfg(unix)]
 fn git_run_ok(dir: &Path, args: &[&str], allow_file: bool) {
     let mut cmd = std::process::Command::new("git");
     cmd.env("AGEND_GIT_BYPASS", "1").current_dir(dir);
@@ -35,6 +43,7 @@ fn git_run_ok(dir: &Path, args: &[&str], allow_file: bool) {
 }
 
 /// A committed local repo with one file at `rel` (the innermost submodule).
+#[cfg(unix)] // Unix-only real-checkout fixture (see `git_run_ok`).
 fn tmp_repo_with_file(name: &str, rel: &str, body: &str) -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -60,6 +69,7 @@ fn tmp_repo_with_file(name: &str, rel: &str, body: &str) -> PathBuf {
 
 /// Hermetic superproject with two submodule levels:
 ///   super → `vendor/mid` (A) → `nested` (B, holds `nested_b.txt`).
+#[cfg(unix)] // Unix-only real-checkout fixture (see `git_run_ok`).
 fn tmp_super_with_nested_submodules(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "agend-co-nest-root-{}-{}-{}",
@@ -126,6 +136,13 @@ fn tmp_home(name: &str) -> PathBuf {
 /// must leave the submodule CONTENT materialized in the provisioned worktree.
 /// Pre-fix the handler runs `git worktree add` and skips `--init --recursive`,
 /// so the level-B file is missing and the assert fails.
+///
+/// `#[cfg(unix)]`: drives the real entry with an ABSOLUTE temp `repository_path`.
+/// The #2158 source guard's absolute arm is `/`-prefixed (Unix-only by design —
+/// a `C:\`-rooted Windows path routes to the agent-name arm and fails closed with
+/// `ambiguous_source_path`). Same Unix-only contract as
+/// `source_resolve.rs::absolute_existing_path_still_resolves_2158`.
+#[cfg(unix)]
 #[test]
 fn checkout_initializes_nested_submodules_2755() {
     let home = tmp_home("co-submod");
@@ -831,6 +848,7 @@ fn redact_paths_strips_absolute_paths_only() {
 }
 
 /// The `(instance, source)` → worktree-dir mangling `handle_checkout_repo` uses.
+#[cfg(unix)] // Used only by the Unix-only real-checkout tests below.
 fn mangled_for(instance: &str, source: &Path) -> String {
     format!(
         "{}-{}",
@@ -846,6 +864,10 @@ fn mangled_for(instance: &str, source: &Path) -> String {
 /// BLOCKER 1 — a checked PREPARED-save failure is fatal-but-CLEAN: no worktree is
 /// created (no side effect yet), so nothing to roll back. (journal.json
 /// pre-created as a DIR ⇒ the first `store::atomic_write` rename fails.)
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract
+/// (see `checkout_initializes_nested_submodules_2755`).
+#[cfg(unix)]
 #[test]
 fn checkout_prepared_write_failure_fails_clean_2755() {
     let home = tmp_home("prepfail");
@@ -878,6 +900,10 @@ fn checkout_prepared_write_failure_fails_clean_2755() {
 /// BLOCKER 1 — a COMMITTED-write failure (all earlier phase saves succeed) ABORTS
 /// into rollback: the worktree is removed and the structured `commit_failed`
 /// returned, never success. Uses the checkout_txn `set_fail_committed_save` seam.
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract
+/// (see `checkout_initializes_nested_submodules_2755`).
+#[cfg(unix)]
 #[test]
 fn checkout_commit_write_failure_rolls_back_2755() {
     let home = tmp_home("commitfail");
@@ -905,6 +931,10 @@ fn checkout_commit_write_failure_rolls_back_2755() {
 /// Restart-replay: a crashed prior attempt left a REAL stale worktree + a
 /// non-Committed journal at this path; a fresh real checkout REPLAYS it (removes
 /// the stale worktree under the path-lock) then provisions cleanly.
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract
+/// (see `checkout_initializes_nested_submodules_2755`).
+#[cfg(unix)]
 #[test]
 fn checkout_restart_replays_stale_worktree_2755() {
     let home = tmp_home("replay");

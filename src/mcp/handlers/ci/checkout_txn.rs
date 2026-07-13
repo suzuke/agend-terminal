@@ -36,13 +36,18 @@ use std::path::{Path, PathBuf};
 // Test seam: when set on the current thread, `Journal::save` fails ONLY the
 // `Committed` write, so a real-entry test can exercise the Committed-write-failure
 // abort (earlier phase saves still succeed).
-#[cfg(test)]
+// `all(test, unix)`: this seam is exercised only by the Unix-only
+// `checkout_commit_write_failure_rolls_back_2755` real-entry test (the #2158
+// source guard's absolute arm is `/`-prefixed — see checkout_submodule_tests.rs).
+// Gating the whole seam (thread_local + setter + `save` check) to `unix` keeps it
+// physically absent on Windows tests, so there is no dead-code to suppress.
+#[cfg(all(test, unix))]
 thread_local! {
     static FAIL_COMMITTED_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Test-only: arm/disarm the [`FAIL_COMMITTED_SAVE`] seam for the current thread.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_fail_committed_save(fail: bool) {
     FAIL_COMMITTED_SAVE.with(|c| c.set(fail));
 }
@@ -182,7 +187,7 @@ impl Journal {
 
     /// Durably persist (temp+fsync+rename+dir-fsync via [`store::atomic_write`]).
     pub(crate) fn save(&self, home: &Path, mangled: &str) -> anyhow::Result<()> {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if self.phase == Phase::Committed && FAIL_COMMITTED_SAVE.with(|c| c.get()) {
             return Err(anyhow::anyhow!(
                 "test seam: forced Committed journal save failure"
