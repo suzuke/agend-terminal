@@ -1572,6 +1572,11 @@ mod tests {
     #[path = "dispatch_idle_quota_78445_tests.rs"]
     mod quota_78445_tests;
 
+    // #2760 REDs (non-task fail-open / canonical-orphan suppress) — same LOC-exempt
+    // split pattern as the quota tests above.
+    #[path = "dispatch_idle_reds_2760_tests.rs"]
+    mod reds_2760_tests;
+
     /// #1636: the `DispatchStatus` enum MUST serialize to / deserialize from the
     /// exact lowercase wire strings the prior stringly-typed field used, so
     /// existing on-disk sidecars + IPC payloads stay byte-compatible.
@@ -2242,78 +2247,6 @@ mod tests {
         assert_eq!(p.expected_kind, "task");
         assert_eq!(p.threshold_secs, 600);
         assert_eq!(p.status, DispatchStatus::Pending);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2760 (codex ruling m-…-1154) RED: a NON-canonical correlation (a query /
-    /// synthetic dispatch id that was NEVER a board task) must FAIL-OPEN and still
-    /// fire the idle nag. Pre-fix `task_still_live` treated ANY non-empty NotFound
-    /// correlation as orphan-dead (Some(false)) and swept it silent — the app-e2e /
-    /// query-dispatch over-suppression regression. The typed `TaskId::parse_canonical`
-    /// gate now applies liveness only to real task ids.
-    #[test]
-    fn non_canonical_correlation_fails_open_and_fires_2760() {
-        let home = tmp_home("noncanon-fires");
-        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        // "corr-query-7" is not `t-<digits>-<digits>[-<digits>]` → not a task id.
-        let id = write_pending_at(
-            &home,
-            "alpha",
-            "beta",
-            Some("corr-query-7"),
-            "task",
-            600,
-            issued,
-        );
-        scan_and_emit(&home);
-        let inbox = crate::inbox::drain(&home, "alpha");
-        assert!(
-            inbox
-                .iter()
-                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
-            "a non-canonical (non-task) correlation must fail-open and fire the idle nag: {inbox:?}"
-        );
-        assert_eq!(
-            list_pending(&home)
-                .iter()
-                .find(|p| p.dispatch_id == id)
-                .map(|p| p.status),
-            Some(DispatchStatus::Exceeded),
-            "non-task sidecar flips pending→exceeded (fired), never swept as orphan-dead"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2760 (codex ruling) RED: the flip side — a CANONICAL task id present on NO
-    /// board is a definitively orphaned dispatch → orphan-dead → the sidecar is
-    /// swept silently, no nag. Pins that the parser gate STILL enforces the frozen
-    /// NotFound=orphan-dead policy for real task ids.
-    #[test]
-    fn canonical_absent_task_is_orphan_dead_and_swept_2760() {
-        let home = tmp_home("canon-orphan");
-        let issued = chrono::Utc::now() - chrono::Duration::seconds(700);
-        // A well-formed canonical id that no board holds → strict route NotFound.
-        let did = write_pending_at(
-            &home,
-            "alpha",
-            "beta",
-            Some("t-20260101000000000000-1-1"),
-            "task",
-            600,
-            issued,
-        );
-        scan_and_emit(&home);
-        let inbox = crate::inbox::drain(&home, "alpha");
-        assert!(
-            !inbox
-                .iter()
-                .any(|m| m.kind.as_deref() == Some("dispatch_idle_threshold_exceeded")),
-            "a canonical task id absent from every board is orphan-dead — no idle nag: {inbox:?}"
-        );
-        assert!(
-            list_pending(&home).iter().all(|d| d.dispatch_id != did),
-            "the orphan-dead sidecar must be swept"
-        );
         std::fs::remove_dir_all(&home).ok();
     }
 
