@@ -676,6 +676,7 @@ impl ScmProvider for TestScmHandle {
 #[derive(Default)]
 pub(crate) struct MockScmProvider {
     pr_list: Option<MockPrList>,
+    compare: Option<Result<CompareResult, String>>,
 }
 
 /// Configured `pr_list` behavior for [`MockScmProvider`].
@@ -693,6 +694,27 @@ impl MockScmProvider {
     pub(crate) fn with_pr_list(behavior: MockPrList) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             pr_list: Some(behavior),
+            compare: None,
+        })
+    }
+
+    /// #2749 3b: a canned `compare` result — `behind_by` commits behind the base.
+    pub(crate) fn with_compare(behind_by: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pr_list: None,
+            compare: Some(Ok(CompareResult {
+                behind_by,
+                files: vec![],
+            })),
+        })
+    }
+
+    /// #2749 3b: a `compare` that FAILS (a transient remote-forge error) — the
+    /// off-tick populator must stamp `freshness_error` without clobbering.
+    pub(crate) fn with_compare_err(msg: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pr_list: None,
+            compare: Some(Err(msg.to_string())),
         })
     }
 }
@@ -725,7 +747,11 @@ impl ScmProvider for MockScmProvider {
         unimplemented!("MockScmProvider::issue_view not configured")
     }
     fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<CompareResult> {
-        unimplemented!("MockScmProvider::compare not configured")
+        match &self.compare {
+            Some(Ok(r)) => Ok(r.clone()),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            None => unimplemented!("MockScmProvider::compare not configured"),
+        }
     }
 }
 

@@ -1916,6 +1916,215 @@ mod tests {
             "observed_at NOT advanced on failure"
         );
     }
+
+    // ─── #2749 3b RED: off-tick freshness populator → scanner (real-entry) ────
+    // Drive the ACTUAL off-tick worker (worker_poll_and_act) — which observes via
+    // gh-poll and, once 3b-GREEN wires it, runs the deterministic REMOTE ancestry
+    // compare (ScmProvider::compare) and stamps freshness_checked_* — then run the
+    // scanner and assert the end-to-end gate outcome. NO helper-stamped tuples.
+    // These FAIL vs this commit's parent (the worker does not populate freshness
+    // yet); 3b-GREEN wires the populator so they pass.
+
+    fn full_head(n: u8) -> String {
+        format!("{:0>40}", format!("{n}beef"))
+    }
+
+    /// Run the REAL off-tick worker once (poll + observe-consumers + — in GREEN —
+    /// the ancestry compare + freshness stamp).
+    fn run_off_tick(home: &std::path::Path, pr: u64, head: &str, base: &str) {
+        let cache = super::super::gh_poll::GhPollCache::new();
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(pr, "feat/x", head, base)])]);
+        super::super::gh_poll::worker_poll_and_act(home, &cache, "owner/repo", &poller);
+    }
+
+    /// Scan once with an OID-carrying open-PR poll (writes observed_head/base, 3a).
+    /// Clears `last_gh_poll_at` first so the production per-file poll cadence
+    /// (`should_poll`) does not skip the re-observation — the test needs each
+    /// observation to actually land (in production a main-advance is observed on
+    /// the next cadence-allowed poll; this just removes that latency for the test).
+    fn scan_observe(home: &std::path::Path, pr: u64, head: &str, base: &str) {
+        let _ = super::super::with_pr_state(home, "owner/repo", "feat/x", |s| {
+            s.last_gh_poll_at = None;
+        });
+        scan_and_emit_with(
+            home,
+            &empty_registry(),
+            &MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(pr, "feat/x", head, base)])]),
+        );
+    }
+
+    fn ready_state(home: &std::path::Path, pr: u64, head: &str) {
+        let mut s = merge_ready_state("owner/repo", "feat/x", head, pr);
+        s.pr_author = "dev".into();
+        save(home, &s).unwrap();
+    }
+
+    /// RED 3b-1 (Fresh): observe → off-tick compare behind_by=0 → scan ⇒ pr-ready.
+    #[test]
+    fn off_tick_fresh_ancestry_opens_pr_ready() {
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_compare(0));
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = full_head(1);
+        ready_state(&home, 88, &head);
+
+        // Pre-populate: a plain scan observes but the gate has no freshness tuple.
+        scan_observe(&home, 88, &head, BEHIND_BASE);
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .ready_emitted_for_sha,
+            None,
+            "pre-populate: no freshness tuple ⇒ pr-ready suppressed"
+        );
+
+        run_off_tick(&home, 88, &head, BEHIND_BASE); // REAL worker: compare + stamp
+        scan_observe(&home, 88, &head, BEHIND_BASE); // now Fresh ⇒ emit
+
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .ready_emitted_for_sha
+                .as_deref(),
+            Some(head.as_str()),
+            "#2749 3b: fresh ancestry (behind_by=0) ⇒ pr-ready emits"
+        );
+    }
+
+    /// RED 3b-2 (Behind): off-tick compare behind_by=2 ⇒ suppress pr-ready + emit
+    /// pr-needs-rebase + a canonical wake per recipient.
+    #[test]
+    fn off_tick_behind_ancestry_emits_needs_rebase_and_wake() {
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_compare(2));
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = BEHIND_HEAD; // full hex for the ledger DeliveryKey
+        ready_state(&home, 88, head);
+
+        scan_observe(&home, 88, head, BEHIND_BASE);
+        run_off_tick(&home, 88, head, BEHIND_BASE);
+        let (_, wakes) = crate::inbox::with_captured_pointer_wakes(|| {
+            scan_observe(&home, 88, head, BEHIND_BASE);
+        });
+
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .ready_emitted_for_sha,
+            None,
+            "#2749 3b: behind ⇒ pr-ready suppressed"
+        );
+        for who in ["lead", "dev"] {
+            assert_eq!(
+                needs_rebase_msgs(&home, who).len(),
+                1,
+                "#2749 3b: one [pr-needs-rebase] to {who}"
+            );
+        }
+        assert_eq!(
+            wakes
+                .iter()
+                .filter(|w| w.contains("kind=pr-needs-rebase"))
+                .count(),
+            2,
+            "#2749 3b: behind ⇒ a canonical wake per recipient"
+        );
+    }
+
+    /// RED 3b-3 (main-advance): after a Fresh compare, a NEW observation whose base
+    /// moved (checked_base != observed_base) ⇒ Suppress until the populator recomputes.
+    #[test]
+    fn off_tick_main_advance_suppresses_until_recompute() {
+        let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_compare(0));
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = full_head(3);
+        let base1 = full_head(10);
+        let base2 = full_head(20);
+        ready_state(&home, 88, &head);
+
+        // Fresh against base1.
+        scan_observe(&home, 88, &head, &base1);
+        run_off_tick(&home, 88, &head, &base1);
+        // Main advances: a new observation carries base2 ⇒ observed_base=base2, but
+        // freshness_checked_base is still base1 ⇒ gate Suppress.
+        scan_observe(&home, 88, &head, &base2);
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .ready_emitted_for_sha,
+            None,
+            "#2749 3b: base advanced (checked_base != observed_base) ⇒ suppressed"
+        );
+
+        // Re-populate against base2 ⇒ converges to Fresh ⇒ emit.
+        run_off_tick(&home, 88, &head, &base2);
+        scan_observe(&home, 88, &head, &base2);
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .ready_emitted_for_sha
+                .as_deref(),
+            Some(head.as_str()),
+            "#2749 3b: re-compute against the new base ⇒ pr-ready re-converges"
+        );
+    }
+
+    /// RED 3b-4 (compare error): a failed ancestry re-compare (base changed) stamps
+    /// freshness_error WITHOUT clobbering the last-good checked tuple ⇒ Suppress.
+    #[test]
+    fn off_tick_compare_error_suppresses_without_clobber() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = full_head(4);
+        let base1 = full_head(11);
+        let base2 = full_head(22);
+        ready_state(&home, 88, &head);
+
+        // A GOOD compare against base1 stamps a Fresh tuple.
+        {
+            let _scm =
+                crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_compare(0));
+            scan_observe(&home, 88, &head, &base1);
+            run_off_tick(&home, 88, &head, &base1);
+        }
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .freshness_checked_base_sha
+                .as_deref(),
+            Some(base1.as_str()),
+            "precondition: good compare stamped checked_base=base1"
+        );
+
+        // Base advances (tuple changed ⇒ re-compute needed) but the compare FAILS.
+        {
+            let _scm = crate::scm::set_test_scm_provider(
+                crate::scm::MockScmProvider::with_compare_err("forge 500"),
+            );
+            scan_observe(&home, 88, &head, &base2); // observed_base=base2
+            run_off_tick(&home, 88, &head, &base2); // compare(base2) → Err
+        }
+        let after_err = load(&home, "owner/repo", "feat/x").unwrap();
+        assert!(
+            after_err.freshness_error,
+            "#2749 3b: compare failure ⇒ freshness_error"
+        );
+        assert_eq!(
+            after_err.freshness_checked_base_sha.as_deref(),
+            Some(base1.as_str()),
+            "#2749 3b: last-good checked tuple preserved (NOT clobbered) on failure"
+        );
+
+        scan_observe(&home, 88, &head, &base2);
+        assert_eq!(
+            load(&home, "owner/repo", "feat/x")
+                .unwrap()
+                .ready_emitted_for_sha,
+            None,
+            "#2749 3b: freshness_error ⇒ pr-ready suppressed"
+        );
+    }
 }
 
 #[cfg(test)]
