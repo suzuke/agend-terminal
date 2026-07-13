@@ -741,14 +741,11 @@ struct DeployCleanupOutcome {
 fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) -> DeployCleanupOutcome {
     let custom_root = std::path::Path::new(&deployment.directory);
     let dir_is_repo = crate::worktree::is_git_repo(custom_root);
-    // Live fleet snapshot for the survivor-overlap check. MISSING → empty roster
-    // (nothing can share) proceeds; CORRUPT → None → the planner fails closed.
-    let fleet_path = crate::fleet::fleet_yaml_path(home);
-    let snapshot = if fleet_path.exists() {
-        crate::fleet::FleetConfig::load(&fleet_path).ok()
-    } else {
-        Some(crate::fleet::FleetConfig::default())
-    };
+    // Live fleet snapshot for the survivor-overlap check. Destructive custom-dir
+    // removal is the higher-risk path, so ANY fleet-read ambiguity fails closed:
+    // BOTH a missing AND a corrupt/unreadable fleet.yaml yield `None` → the
+    // planner preserves.
+    let snapshot = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     // The deployment's own instances are the deletion cohort (excluded from the
     // survivor set); everyone else in the snapshot is a potential survivor.
     let cohort: Vec<&str> = deployment.instances.iter().map(String::as_str).collect();

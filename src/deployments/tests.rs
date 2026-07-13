@@ -1371,6 +1371,9 @@ fn teardown_removes_branch_mode_worktree_and_orphan_branch_med4() {
     }
 
     let home = tmp_home("med4-worktree");
+    // #2764 R5: custom-dir cleanup fails closed on an unreadable fleet — provide
+    // an empty-but-present roster (no survivors) to authorize the removal.
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
     // Branch-mode: the deploy directory IS the source repo.
     let repo = home.join("srcrepo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -1499,6 +1502,7 @@ fn cleanup_deployment_dirs_rmdir_parent_when_only_member_subdirs() {
     // parent must be GONE because both subdirs are removed and
     // nothing else lives there.
     let home = tmp_home("p15_rmdir_clean");
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
     let custom_root =
         std::env::temp_dir().join(format!("agend-p15-{}-clean-custom", std::process::id()));
     std::fs::create_dir_all(&custom_root).unwrap();
@@ -1564,6 +1568,7 @@ fn cleanup_deployment_dirs_rmdir_is_idempotent() {
     // noise (`NotFound` is mapped to a silent no-op in
     // `rmdir_if_empty`).
     let home = tmp_home("p15_rmdir_idem");
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
     let custom_root =
         std::env::temp_dir().join(format!("agend-p15-{}-idem-custom", std::process::id()));
     std::fs::create_dir_all(&custom_root).unwrap();
@@ -2272,6 +2277,44 @@ fn cleanup_pending_ledger_is_idempotent() {
     assert_eq!(
         count, 1,
         "pending ledger must dedupe repeated reconcile passes, got {count} entries:\n{body}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+/// #2764 R5 (blocker 1): a correctly-marked custom deployment whose fleet.yaml
+/// is ABSENT must PRESERVE the subdir at teardown (fleet-read ambiguity fails
+/// closed) rather than proceed on an assumed-empty roster.
+#[test]
+fn teardown_preserves_when_fleet_absent() {
+    let home = tmp_home("r5_absent_fleet");
+    let custom_root =
+        std::env::temp_dir().join(format!("agend-r5af-{}-custom", std::process::id()));
+    std::fs::create_dir_all(&custom_root).ok();
+    let inst = "af-a".to_string();
+    let inst_dir = custom_root.join(&inst);
+    std::fs::create_dir_all(&inst_dir).unwrap();
+    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
+    seed_deploy_marker(&inst_dir, "af", &inst, "test-nonce-af");
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "af".to_string(),
+        template: "tpl".to_string(),
+        instances: vec![inst.clone()],
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some("test-nonce-af".to_string()),
+    });
+    save(&home, &mut store).unwrap();
+    // NO fleet.yaml written — the roster is unreadable.
+    assert!(!crate::fleet::fleet_yaml_path(&home).exists());
+
+    let _ = teardown(&home, &serde_json::json!({"name": "af"}));
+
+    assert!(
+        inst_dir.join("USER_DATA.txt").exists(),
+        "an absent fleet must fail closed — the marked subdir must be preserved"
     );
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&custom_root).ok();

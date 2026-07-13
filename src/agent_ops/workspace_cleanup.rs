@@ -196,8 +196,13 @@ pub struct CustomRemoveOwnedProof {
     canonical: PathBuf,
     /// The deployment identity + generation nonce the marker must match.
     expected: DeployProvenance,
-    /// Deploy directory git commands run from (source repo in branch mode).
-    custom_root: PathBuf,
+    /// Deploy directory as passed (revalidated at execute to catch a
+    /// root retarget/alias between plan and mutation).
+    custom_root_original: PathBuf,
+    /// Canonical deploy directory — git commands run from THIS (never the raw
+    /// path). `canonical == custom_root_canonical.join(expected.instance)` is
+    /// proven at plan (exact immediate child) and re-verified at execute.
+    custom_root_canonical: PathBuf,
     is_repo: bool,
     /// Per-instance worktree branch (`{deploy}/{suffix}`), if branch mode.
     branch: Option<String>,
@@ -207,15 +212,12 @@ pub struct CustomRemoveOwnedProof {
     cohort: Vec<String>,
 }
 
-/// Load the survivor snapshot for a deployment custom-dir check: MISSING fleet
-/// → empty roster (nothing can share) proceeds; CORRUPT → None → fail closed.
+/// Load the survivor snapshot for a deployment custom-dir check. Destructive
+/// custom-dir removal is the HIGHER-risk path, so any fleet-read ambiguity
+/// fails closed: BOTH a missing AND a corrupt/unreadable fleet.yaml yield `None`
+/// (→ the caller preserves). Only a readable roster authorizes proceeding.
 fn load_survivor_snapshot(home: &Path) -> Option<FleetConfig> {
-    let p = crate::fleet::fleet_yaml_path(home);
-    if p.exists() {
-        FleetConfig::load(&p).ok()
-    } else {
-        Some(FleetConfig::default())
-    }
+    FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()
 }
 
 /// Verify a subdir's marker still binds the expected deployment identity +
@@ -271,12 +273,36 @@ pub fn plan_custom_dir_cleanup(
             candidate.display()
         ));
     }
+    if has_dotdot(custom_root) {
+        return Err(format!(
+            "custom root contains '..': {}",
+            custom_root.display()
+        ));
+    }
     let candidate_canonical = dunce::canonicalize(candidate).map_err(|e| {
         format!(
             "candidate {} does not canonicalize ({e})",
             candidate.display()
         )
     })?;
+    let custom_root_canonical = dunce::canonicalize(custom_root).map_err(|e| {
+        format!(
+            "custom root {} does not canonicalize ({e})",
+            custom_root.display()
+        )
+    })?;
+    // Exact-child proof: the candidate must be the EXACT immediate child
+    // `canonical(custom_root)/<expected.instance>` — the RAW instance name joined
+    // to the canonical root, never a canonicalized leaf (a symlinked subdir whose
+    // target lands elsewhere, or a retargeted root, fails this).
+    let expected_child = custom_root_canonical.join(&expected.instance);
+    if candidate_canonical != expected_child {
+        return Err(format!(
+            "candidate {} is not the exact canonical child {} of the custom root",
+            candidate_canonical.display(),
+            expected_child.display()
+        ));
+    }
     let snapshot = snapshot
         .ok_or_else(|| "fleet snapshot unavailable — cannot prove ownership".to_string())?;
     if let Some(preserve) =
@@ -295,7 +321,8 @@ pub fn plan_custom_dir_cleanup(
         original: candidate.to_path_buf(),
         canonical: candidate_canonical,
         expected: expected.clone(),
-        custom_root: custom_root.to_path_buf(),
+        custom_root_original: custom_root.to_path_buf(),
+        custom_root_canonical,
         is_repo,
         branch: branch.map(str::to_string),
         home: home.to_path_buf(),
@@ -310,14 +337,56 @@ pub fn plan_custom_dir_cleanup(
 /// post-plan) — then clears a branch-mode worktree registration and removes the
 /// tree. Any re-verification failure aborts with `Err` and mutates nothing.
 pub fn execute_custom_remove(proof: &CustomRemoveOwnedProof) -> Result<(), String> {
+    let fail = |e: String| Err(format!("re-verify at execute failed: {e}"));
     // (1) path identity.
     revalidate(&proof.original, &proof.canonical)?;
-    // (2) marker identity + nonce (TOCTOU: marker removed/replaced since plan).
+    // (2) custom-root identity + exact-child relation (TOCTOU: root retarget /
+    // alias, or the subdir no longer the exact canonical child of the root).
+    match dunce::canonicalize(&proof.custom_root_original) {
+        Ok(now) if now == proof.custom_root_canonical => {}
+        Ok(now) => {
+            return fail(format!(
+                "custom root {} now resolves to {} (was {})",
+                proof.custom_root_original.display(),
+                now.display(),
+                proof.custom_root_canonical.display()
+            ))
+        }
+        Err(e) => {
+            return fail(format!(
+                "custom root {} no longer canonicalizes ({e})",
+                proof.custom_root_original.display()
+            ))
+        }
+    }
+    if proof.canonical != proof.custom_root_canonical.join(&proof.expected.instance) {
+        return fail(
+            "candidate is no longer the exact canonical child of the custom root".to_string(),
+        );
+    }
+    // (3) repo-mode identity (TOCTOU: the deploy dir became/ceased to be a repo).
+    if crate::worktree::is_git_repo(&proof.custom_root_canonical) != proof.is_repo {
+        return fail("custom-root git repo-mode changed since plan".to_string());
+    }
+    // (4) marker identity + nonce (TOCTOU: marker removed/replaced since plan).
     verify_marker(&proof.canonical, &proof.expected)
         .map_err(|e| format!("re-verify at execute failed: {e}"))?;
-    // (3) survivor overlap on a FRESH snapshot (TOCTOU: survivor inserted since plan).
-    let snapshot = load_survivor_snapshot(&proof.home)
-        .ok_or_else(|| "fleet snapshot unavailable at execute — refusing removal".to_string())?;
+    // (5) survivor overlap on a FRESH snapshot; missing/corrupt fleet fails closed.
+    let snapshot = load_survivor_snapshot(&proof.home).ok_or_else(|| {
+        "fleet snapshot unavailable/unreadable at execute — refusing removal".to_string()
+    })?;
+    // ABA guard: any name in the deletion cohort REAPPEARING in the fresh roster
+    // is a NEW live instance (same-name recreation since plan) — fail closed
+    // rather than silently excluding it from the survivor set.
+    if let Some(reborn) = proof
+        .cohort
+        .iter()
+        .find(|c| snapshot.instances.contains_key(c.as_str()))
+    {
+        return fail(format!(
+            "cohort member '{reborn}' reappeared in the fleet since plan (same-name recreation)"
+        ));
+    }
     let cohort: Vec<&str> = proof.cohort.iter().map(String::as_str).collect();
     if let Some(conflict) = survivor_conflict(
         &snapshot,
@@ -332,19 +401,24 @@ pub fn execute_custom_remove(proof: &CustomRemoveOwnedProof) -> Result<(), Strin
             }
             _ => "survivor conflict".to_string(),
         };
-        return Err(format!("re-verify at execute failed: {reason}"));
+        return fail(reason);
     }
-    // Authorized → destroy. git registers worktrees by realpath → canonical.
+    // Authorized → destroy. git commands run from the CANONICAL root; git
+    // registers worktrees by realpath so the subdir target is canonical too.
     if proof.is_repo {
         let subdir_str = proof.canonical.display().to_string();
         let _ = crate::git_helpers::git_bypass(
-            &proof.custom_root,
+            &proof.custom_root_canonical,
             &["worktree", "remove", "--force", &subdir_str],
         );
         if let Some(branch) = proof.branch.as_deref() {
-            let _ = crate::git_helpers::git_bypass(&proof.custom_root, &["branch", "-D", branch]);
+            let _ = crate::git_helpers::git_bypass(
+                &proof.custom_root_canonical,
+                &["branch", "-D", branch],
+            );
         }
-        let _ = crate::git_helpers::git_bypass(&proof.custom_root, &["worktree", "prune"]);
+        let _ =
+            crate::git_helpers::git_bypass(&proof.custom_root_canonical, &["worktree", "prune"]);
     }
     if proof.canonical.exists() {
         std::fs::remove_dir_all(&proof.canonical)
@@ -938,6 +1012,151 @@ mod tests {
             "execute must abort when a survivor now overlaps the target"
         );
         assert!(subdir.join("USER.txt").exists(), "nothing may be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 (blocker 1): absent fleet.yaml fails closed — a marked subdir with a
+    /// matching record is PRESERVED at plan when the roster can't be read.
+    #[test]
+    fn custom_plan_preserves_when_fleet_absent() {
+        let (home, custom_root, subdir, expected) = setup_custom("r5-plan-nofleet");
+        std::fs::remove_file(crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let snap = FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).ok();
+        let r = plan_custom_dir_cleanup(
+            snap.as_ref(),
+            &home,
+            &["dep-a"],
+            &subdir,
+            &expected,
+            &custom_root,
+            false,
+            None,
+        );
+        assert!(r.is_err(), "absent fleet must fail closed at plan");
+        assert!(subdir.join("USER.txt").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 (blocker 1): fleet.yaml removed between plan and execute → execute
+    /// re-check fails closed.
+    #[test]
+    fn custom_execute_aborts_when_fleet_absent() {
+        let (home, custom_root, subdir, expected) = setup_custom("r5-exec-nofleet");
+        let proof = plan_ok(&home, &custom_root, &subdir, &expected);
+        std::fs::remove_file(crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert!(
+            execute_custom_remove(&proof).is_err(),
+            "absent fleet at execute must fail closed"
+        );
+        assert!(subdir.join("USER.txt").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 (blocker 2): a cohort member is RE-CREATED (same name) in the fleet
+    /// between plan and execute → the ABA guard fails closed.
+    #[test]
+    fn custom_execute_aborts_when_cohort_member_reappears() {
+        let (home, custom_root, subdir, expected) = setup_custom("r5-aba");
+        let proof = plan_ok(&home, &custom_root, &subdir, &expected);
+        // `dep-a` (the cohort member) reappears as a live instance since plan.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dep-a:\n    backend: claude\n",
+        )
+        .unwrap();
+        assert!(
+            execute_custom_remove(&proof).is_err(),
+            "a same-name cohort recreation must fail closed"
+        );
+        assert!(subdir.join("USER.txt").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 (blocker 3): the candidate subdir is a symlink whose target is OUTSIDE
+    /// the exact canonical child of the custom root → plan fails closed.
+    #[test]
+    #[cfg(unix)]
+    fn custom_plan_preserves_when_candidate_not_exact_child() {
+        let (home, custom_root, subdir, expected) = setup_custom("r5-child");
+        let elsewhere = home.join("elsewhere-dep-a");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("USER.txt"), b"precious").unwrap();
+        std::fs::write(
+            elsewhere.join(DEPLOY_CREATED_MARKER),
+            deploy_marker_body(&expected),
+        )
+        .unwrap();
+        // Replace the real subdir with a symlink pointing outside the root.
+        std::fs::remove_dir_all(&subdir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &subdir).unwrap();
+        let snap = FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).ok();
+        let r = plan_custom_dir_cleanup(
+            snap.as_ref(),
+            &home,
+            &["dep-a"],
+            &subdir,
+            &expected,
+            &custom_root,
+            false,
+            None,
+        );
+        assert!(
+            r.is_err(),
+            "a subdir resolving outside the exact canonical child must fail closed"
+        );
+        assert!(elsewhere.join("USER.txt").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 (blocker 3): the custom root is retargeted (symlink repointed) between
+    /// plan and execute → execute fails closed, mutating nothing at the old root.
+    #[test]
+    #[cfg(unix)]
+    fn custom_execute_aborts_when_root_retargeted() {
+        let home = tmp_home("r5-rootre");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let real_a = home.join("root-a");
+        let dep_dir = real_a.join("dep-a");
+        std::fs::create_dir_all(&dep_dir).unwrap();
+        std::fs::write(dep_dir.join("USER.txt"), b"precious").unwrap();
+        let expected = DeployProvenance {
+            deployment: "dep".to_string(),
+            instance: "dep-a".to_string(),
+            nonce: "N".to_string(),
+        };
+        std::fs::write(
+            dep_dir.join(DEPLOY_CREATED_MARKER),
+            deploy_marker_body(&expected),
+        )
+        .unwrap();
+        let root_link = home.join("root-link");
+        std::os::unix::fs::symlink(&real_a, &root_link).unwrap();
+        let subdir = root_link.join("dep-a");
+        let snap = FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).ok();
+        let proof = plan_custom_dir_cleanup(
+            snap.as_ref(),
+            &home,
+            &["dep-a"],
+            &subdir,
+            &expected,
+            &root_link,
+            false,
+            None,
+        )
+        .expect("plan ok through the symlinked root");
+        // Retarget the root symlink to a different (empty) dir.
+        let real_b = home.join("root-b");
+        std::fs::create_dir_all(&real_b).unwrap();
+        std::fs::remove_file(&root_link).unwrap();
+        std::os::unix::fs::symlink(&real_b, &root_link).unwrap();
+        assert!(
+            execute_custom_remove(&proof).is_err(),
+            "root retarget must fail closed"
+        );
+        assert!(
+            dep_dir.join("USER.txt").exists(),
+            "the old root's data must be untouched"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
