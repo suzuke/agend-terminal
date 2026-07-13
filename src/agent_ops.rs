@@ -1489,6 +1489,7 @@ mod tests {
 
 pub mod workspace_cleanup;
 
+#[cfg(test)]
 mod review_repro_agent_binding;
 #[cfg(test)]
 mod review_repro_xcut_security;
