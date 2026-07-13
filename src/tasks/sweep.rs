@@ -389,7 +389,6 @@ pub(super) fn emit_cancelled_batch(
 ) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskId};
     let emitter = InstanceName::from("system:task_sweep");
-    let mut events: Vec<TaskEvent> = Vec::new();
     let lookup_category = |id: &str| -> &'static str {
         if categories.shipped.iter().any(|c| c.id == id) {
             return "shipped";
@@ -405,68 +404,107 @@ pub(super) fn emit_cancelled_batch(
         }
         "validation_leftovers"
     };
-    // Collect (id, category) so the `task_sweep_apply` audit lines are written
-    // only AFTER the cancel actually commits — the in-lock guard below can
-    // reject the batch, and an audit line for a cancel that never happened
-    // would mislead.
-    let mut audit: Vec<(String, &'static str)> = Vec::new();
+    // #2760: route each confirmed id to its AUTHORITATIVE board and group by board.
+    // The pre-#2760 body wrote every `Cancelled` to the DEFAULT board via
+    // `append_batch_checked(home, …)`, so a project-board task's cancel landed on a
+    // board whose own replay never saw it — the task stayed live (the same class of
+    // bug as the reclaim default-board write). An id that cannot be uniquely routed
+    // is SKIPPED (fail-closed; never cancelled on a guessed board) and logged.
+    // Board-key order is deterministic (`BTreeMap`) so the per-board passes are
+    // stable. Single-project → every id routes to the DEFAULT board → one group →
+    // byte-identical to the pre-#2760 single-batch behaviour.
+    let mut by_board: std::collections::BTreeMap<std::path::PathBuf, Vec<(String, &'static str)>> =
+        std::collections::BTreeMap::new();
     for id in confirm_ids {
-        let category = lookup_category(id);
-        events.push(TaskEvent::Cancelled {
-            task_id: TaskId(id.clone()),
-            by: emitter.clone(),
-            reason: format!("sweep:{category}: {audit_reason}"),
-        });
-        audit.push((id.clone(), category));
-    }
-    let count = events.len();
-    if count == 0 {
-        return Ok(0);
-    }
-    // CR-2026-06-14 (row232): re-validate UNDER the append lock against FRESH
-    // committed state. The dry-run that produced `confirm_ids` is out-of-lock, so
-    // a task can race to a terminal state (Done/Cancelled) before apply. A bare
-    // `append_batch` would clobber that terminal status (replay does not re-guard
-    // transitions). Fail closed: if ANY confirmed task is no longer cancellable,
-    // reject the whole batch — the operator re-runs the sweep, whose dry-run
-    // re-scans and drops the now-terminal task. The closure only inspects the
-    // replayed state — no `api::call` under the lock (#1629).
-    let checked = crate::task_events::append_batch_checked(home, &emitter, events, |state| {
-        for id in confirm_ids {
-            if let Some(rec) = state.tasks.get(&TaskId(id.clone())) {
-                if !rec
-                    .status
-                    .can_transition_to(crate::task_events::TaskStatus::Cancelled)
-                {
-                    return Err(format!(
-                        "task '{id}' is no longer cancellable (now {}); sweep aborted to avoid \
-                         clobbering a terminal task — re-run the sweep",
-                        super::status_to_legacy_str(rec.status)
-                    ));
-                }
-            }
-        }
-        Ok(())
-    });
-    match checked {
-        Ok(Ok(_)) => {
-            // #78445-2 (d): each batch-cancelled task is terminal — clear BOTH
-            // obligation stores (this path previously cleared NEITHER). task_id-scoped
-            // → a co-dispatcher's other task rows survive.
-            for id in confirm_ids {
-                super::task_terminal_cleanup(home, id);
-            }
-            for (id, category) in &audit {
-                crate::event_log::log(
-                    home,
-                    "task_sweep_apply",
-                    "system:task_sweep",
-                    &format!("task={id} category={category} reason={audit_reason}"),
+        match crate::tasks::load_routed(home, id) {
+            Ok(routed) => by_board
+                .entry(routed.board().path().to_path_buf())
+                .or_default()
+                .push((id.clone(), lookup_category(id))),
+            Err(e) => {
+                tracing::warn!(
+                    task = %id, route_err = %e,
+                    "#2760 sweep: skip cancel — task route unresolved (never a default-board write)"
                 );
             }
-            Ok(count)
         }
-        Ok(Err(reason)) => Err(reason),
-        Err(e) => Err(e.to_string()),
     }
+
+    let mut total = 0usize;
+    for (board, items) in &by_board {
+        // #2760 item 2: acquire this board's per-id router locks in SORTED id order
+        // (deadlock-free — ids on distinct boards never overlap, so no cross-board
+        // lock cycle) and hold them across the checked batch append.
+        let mut sorted = items.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut id_locks = Vec::with_capacity(sorted.len());
+        for (id, _) in &sorted {
+            match super::board_router::acquire_task_id_lock(home, id) {
+                Ok(g) => id_locks.push(g),
+                Err(e) => return Err(format!("acquire per-id lock for sweep of '{id}': {e}")),
+            }
+        }
+        let events: Vec<TaskEvent> = sorted
+            .iter()
+            .map(|(id, category)| TaskEvent::Cancelled {
+                task_id: TaskId(id.clone()),
+                by: emitter.clone(),
+                reason: format!("sweep:{category}: {audit_reason}"),
+            })
+            .collect();
+        let ids_on_board: Vec<TaskId> = sorted.iter().map(|(id, _)| TaskId(id.clone())).collect();
+        // CR-2026-06-14 (row232): re-validate UNDER the append lock against FRESH
+        // committed state. The dry-run that produced `confirm_ids` is out-of-lock,
+        // so a task can race to a terminal state (Done/Cancelled) before apply. A
+        // bare `append_batch` would clobber that terminal status (replay does not
+        // re-guard transitions). Fail closed: if ANY confirmed task on THIS board is
+        // no longer cancellable, reject this board's batch — the operator re-runs
+        // the sweep, whose dry-run re-scans and drops the now-terminal task.
+        // Per-board (not global) atomicity: independent boards never block each
+        // other; single-project → one board → identical to the prior all-or-nothing.
+        // The closure only inspects the replayed state — no `api::call` under the
+        // lock (#1629).
+        let checked =
+            crate::task_events::append_batch_checked_at(board, &emitter, events, |state| {
+                for tid in &ids_on_board {
+                    if let Some(rec) = state.tasks.get(tid) {
+                        if !rec
+                            .status
+                            .can_transition_to(crate::task_events::TaskStatus::Cancelled)
+                        {
+                            return Err(format!(
+                                "task '{}' is no longer cancellable (now {}); sweep aborted to \
+                                 avoid clobbering a terminal task — re-run the sweep",
+                                tid.0,
+                                super::status_to_legacy_str(rec.status)
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            });
+        match checked {
+            Ok(Ok(_)) => {
+                // Release the per-id flocks BEFORE the cleanup/audit below (those may
+                // self-IPC / take other locks — never under a held flock, #1629).
+                drop(id_locks);
+                // #78445-2 (d): each batch-cancelled task is terminal — clear BOTH
+                // obligation stores (this path previously cleared NEITHER).
+                // task_id-scoped → a co-dispatcher's other task rows survive.
+                for (id, category) in &sorted {
+                    super::task_terminal_cleanup(home, id);
+                    crate::event_log::log(
+                        home,
+                        "task_sweep_apply",
+                        "system:task_sweep",
+                        &format!("task={id} category={category} reason={audit_reason}"),
+                    );
+                }
+                total += sorted.len();
+            }
+            Ok(Err(reason)) => return Err(reason),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(total)
 }

@@ -70,12 +70,22 @@ pub fn auto_close_on_report(
     let emitter = crate::task_events::InstanceName::from("system:auto_close");
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
-    let closed = crate::task_events::append_done_if_legal_at(
-        routed.board().path(),
-        &emitter,
-        correlation_id,
-        vec![event],
-    )?;
+    // #2760 items 2+3: additionally under the per-id router lock with write-time
+    // route revalidation (the closure does ONLY the append; the cascade below —
+    // terminal cleanup + release recompute, which may self-IPC — runs AFTER the
+    // flock drops, #1629). A route change under the lock → not closed.
+    let closed = match routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_done_if_legal_at(board, &emitter, correlation_id, vec![event])
+    }) {
+        Ok(inner) => inner?,
+        Err(route_err) => {
+            tracing::warn!(
+                task_id = correlation_id, %route_err,
+                "#2760 auto-close skipped: route revalidation failed under the per-id lock"
+            );
+            return Ok(false);
+        }
+    };
     if closed {
         // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
         super::task_terminal_cleanup(home, correlation_id);

@@ -371,16 +371,6 @@ impl<'a> FsEffects<'a> {
         })
     }
 
-    fn task_matches_key(
-        record: &crate::task_events::TaskRecord,
-        key: &EpisodeKey,
-        statuses: &[crate::task_events::TaskStatus],
-    ) -> bool {
-        record.owner.as_ref().map(|owner| owner.as_str()) == Some(key.source.as_str())
-            && record.branch.as_deref() == Some(key.branch.as_str())
-            && statuses.contains(&record.status)
-    }
-
     fn current_binding_matches(&self, key: &EpisodeKey) -> bool {
         read_current_binding(self.home, self.source).is_some_and(|binding| {
             binding.get("task_id").and_then(|v| v.as_str()) == Some(key.task_id.as_str())
@@ -407,22 +397,12 @@ impl ControlEffects for FsEffects<'_> {
         if !self.current_binding_matches(key) {
             anyhow::bail!("binding generation changed before UsageLimit block");
         }
-        // #2760: resolve the task's authoritative board via the STRICT route
-        // (fail-closed) ONCE and reuse the snapshot; the raw board path stays
-        // tasks-private (the checked append rides `routed.append_batch_checked`).
-        let routed = crate::tasks::load_routed(self.home, &key.task_id)
-            .map_err(|e| anyhow::anyhow!("UsageLimit block: task route unresolved: {e}"))?;
-        let task_id = crate::task_events::TaskId(key.task_id.clone());
+        // #2760 item 4: the strict route, per-id lock, write-time revalidation and
+        // the board append all happen INSIDE the narrow `tasks` op — the supervisor
+        // no longer touches a raw board path or a generic append. It supplies only
+        // the identity guard + the fully-built block-reason payload (which embeds
+        // the episode id, so the op's idempotency check can recognise it).
         let notification_id = key.notification_id();
-        if routed.record().status == crate::task_events::TaskStatus::Blocked
-            && routed
-                .record()
-                .block_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains(&notification_id))
-        {
-            return Ok(());
-        }
         let episode = self.episode.as_ref().cloned();
         let reason = serde_json::json!({
             "type": "usage_limit_episode",
@@ -439,86 +419,46 @@ impl ControlEffects for FsEffects<'_> {
             }
         })
         .to_string();
-        let key_for_check = key.clone();
-        let checked = routed.append_batch_checked(
-            &crate::task_events::InstanceName("system:usage-limit".into()),
-            vec![crate::task_events::TaskEvent::Blocked {
-                task_id: task_id.clone(),
-                reason,
-            }],
-            move |fresh| {
-                let record = fresh
-                    .tasks
-                    .get(&task_id)
-                    .ok_or_else(|| "task disappeared before UsageLimit block".to_string())?;
-                Self::task_matches_key(
-                    record,
-                    &key_for_check,
-                    &[
-                        crate::task_events::TaskStatus::Claimed,
-                        crate::task_events::TaskStatus::InProgress,
-                    ],
-                )
-                .then_some(())
-                .ok_or_else(|| "task generation changed before UsageLimit block".to_string())
-            },
-        )?;
-        checked.map(|_| ()).map_err(anyhow::Error::msg)
+        let guard = crate::tasks::UsageLimitGuard {
+            task_id: key.task_id.clone(),
+            source: key.source.clone(),
+            branch: key.branch.clone(),
+            episode_id: notification_id,
+        };
+        match crate::tasks::apply_usage_limit_block(self.home, &guard, reason)? {
+            crate::tasks::ApplyOutcome::Applied | crate::tasks::ApplyOutcome::AlreadyApplied => {
+                Ok(())
+            }
+            // Route/generation changed → no event; surface as an error so the
+            // control loop retries (matches the pre-#2760 generation-change bail).
+            crate::tasks::ApplyOutcome::Stale => {
+                anyhow::bail!("task generation changed before UsageLimit block")
+            }
+        }
     }
 
     fn recover_task_atomically(&mut self, key: &EpisodeKey) -> anyhow::Result<bool> {
         if !self.current_binding_matches(key) {
             return Ok(false);
         }
-        // #2760: strict route (fail-closed), resolved ONCE and reused for both the
-        // idempotency pre-check and the checked append. Board path stays private.
-        let routed = crate::tasks::load_routed(self.home, &key.task_id)
-            .map_err(|e| anyhow::anyhow!("UsageLimit recovery: task route unresolved: {e}"))?;
-        let task_id = crate::task_events::TaskId(key.task_id.clone());
-        let owner = crate::task_events::InstanceName(key.source.clone());
-        if Self::task_matches_key(
-            routed.record(),
-            key,
-            &[crate::task_events::TaskStatus::InProgress],
-        ) {
-            // Crash window: the atomic Unblocked+InProgress append committed but
-            // persisting EpisodeState::Recovered did not. Treat the exact
-            // original generation as an idempotent completed recovery.
-            return Ok(true);
+        // #2760 item 4: strict route + per-id lock + revalidation + the atomic
+        // Unblocked+InProgress append all happen INSIDE the narrow `tasks` op. It
+        // folds the crash-window idempotency (already InProgress for this
+        // owner+branch → AlreadyApplied) and the commit-time generation guard. A
+        // route/generation change → Stale → not recovered this pass (no events),
+        // and the control loop re-attempts.
+        let guard = crate::tasks::UsageLimitGuard {
+            task_id: key.task_id.clone(),
+            source: key.source.clone(),
+            branch: key.branch.clone(),
+            episode_id: key.notification_id(),
+        };
+        match crate::tasks::recover_usage_limit_block(self.home, &guard)? {
+            crate::tasks::ApplyOutcome::Applied | crate::tasks::ApplyOutcome::AlreadyApplied => {
+                Ok(true)
+            }
+            crate::tasks::ApplyOutcome::Stale => Ok(false),
         }
-        let key_for_check = key.clone();
-        let notification_id = key.notification_id();
-        let checked = routed.append_batch_checked(
-            &crate::task_events::InstanceName("system:usage-limit".into()),
-            vec![
-                crate::task_events::TaskEvent::Unblocked {
-                    task_id: task_id.clone(),
-                },
-                crate::task_events::TaskEvent::InProgress {
-                    task_id: task_id.clone(),
-                    by: owner,
-                },
-            ],
-            move |fresh| {
-                let record = fresh
-                    .tasks
-                    .get(&task_id)
-                    .ok_or_else(|| "task disappeared before UsageLimit recovery".to_string())?;
-                if !Self::task_matches_key(
-                    record,
-                    &key_for_check,
-                    &[crate::task_events::TaskStatus::Blocked],
-                ) || !record
-                    .block_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(&notification_id))
-                {
-                    return Err("task generation changed before UsageLimit recovery".into());
-                }
-                Ok(())
-            },
-        )?;
-        Ok(checked.is_ok())
     }
 
     fn notify_once(

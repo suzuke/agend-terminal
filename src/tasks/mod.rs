@@ -439,6 +439,35 @@ impl BoardRoot {
     }
 }
 
+/// #2760 item 3: an opaque board identity for write-time route revalidation. Two
+/// routes are the "same board" iff their `BoardKey`s are equal. It wraps the
+/// project id (the board membership axis) but is `tasks`-private and compared only
+/// by value — an external module can never mint one to spoof a route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardKey(String);
+
+/// #2760 item 3: a fingerprint of a resolved strict route — the board PLUS the
+/// task's incarnation (`created_at`). A mutation captures the fingerprint at route
+/// time and [`RoutedTask::with_revalidated_board`] re-resolves the route under the
+/// per-id lock and asserts it STILL fingerprints identically before appending. The
+/// `created_at` component defends against id reuse (a task deleted and a NEW task
+/// created with the same id would carry a different `created_at`, so a stale
+/// mutation cannot be replayed against the fresh incarnation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteFingerprint {
+    board: BoardKey,
+    created_at: String,
+}
+
+impl RouteFingerprint {
+    fn of(project: &str, record: &crate::task_events::TaskRecord) -> Self {
+        Self {
+            board: BoardKey(project.to_string()),
+            created_at: record.created_at.clone(),
+        }
+    }
+}
+
 /// #2760: a task resolved through the strict router — the public [`Task`] view
 /// PLUS the opaque board it authoritatively lives on. External consumers read
 /// `.task`; the board identity is `tasks`-private, so no caller outside this
@@ -451,6 +480,10 @@ pub struct RoutedTask {
     /// an idempotency pre-check on the SAME single route (no re-load).
     record: crate::task_events::TaskRecord,
     board: BoardRoot,
+    /// #2760 item 3: the route fingerprint captured at resolve time —
+    /// [`RoutedTask::with_revalidated_board`] re-resolves under the per-id lock and
+    /// refuses the write unless the fresh route fingerprints identically.
+    fingerprint: RouteFingerprint,
 }
 
 impl RoutedTask {
@@ -467,20 +500,46 @@ impl RoutedTask {
         &self.record
     }
 
-    /// #2760: append `events` to THIS task's authoritative board under a checked
-    /// precondition, reusing the SINGLE route already resolved (no re-load). The
-    /// board identity stays `tasks`-private — a write-owner (usage-limit) supplies
-    /// the domain events + precondition; `tasks` owns WHERE they land.
-    pub(crate) fn append_batch_checked<F>(
+    /// #2760 items 2+3: run `write` under the per-task-ID router lock (OUTER),
+    /// after RE-RESOLVING the strict route inside the lock and asserting it still
+    /// fingerprints identically to this route (same board + incarnation). `write`
+    /// receives the REVALIDATED board root and performs the actual append (which
+    /// takes the board writer lock, INNER). The per-id lock guarantees no
+    /// concurrent authority mutation on this id interleaves between the
+    /// revalidation and the append; the fingerprint guarantees the board / task
+    /// incarnation the caller decided against has not changed under it.
+    ///
+    /// A route error or fingerprint mismatch → `Err(TaskRouteError)` and `write`
+    /// NEVER runs (no side effect) — every mutation consumer maps that to its
+    /// fail-closed policy (deny, no task events). Any cascade/cleanup/notify the
+    /// caller performs MUST run AFTER this returns (the per-id flock is dropped by
+    /// then), never inside `write` — self-IPC under the flock is refused (#1629).
+    pub(in crate::tasks) fn with_revalidated_board<T>(
         &self,
-        emitter: &crate::task_events::InstanceName,
-        events: Vec<crate::task_events::TaskEvent>,
-        check: F,
-    ) -> anyhow::Result<Result<Vec<u64>, String>>
-    where
-        F: FnOnce(&crate::task_events::TaskBoardState) -> Result<(), String>,
-    {
-        crate::task_events::append_batch_checked_at(self.board.path(), emitter, events, check)
+        home: &Path,
+        write: impl FnOnce(&Path) -> T,
+    ) -> Result<T, TaskRouteError> {
+        let _id_lock = board_router::acquire_task_id_lock(home, &self.task.id).map_err(|e| {
+            TaskRouteError::Unreadable {
+                path: home.to_path_buf(),
+                cause: format!("acquire per-task-id router lock for '{}': {e}", self.task.id),
+            }
+        })?;
+        // Re-resolve the strict route UNDER the lock — the authoritative
+        // revalidation. Any route failure (NotFound / Unreadable / Ambiguous) fails
+        // the mutation closed.
+        let (project, board, record) = board_router::route_task(home, &self.task.id)?;
+        if RouteFingerprint::of(&project, &record) != self.fingerprint {
+            return Err(TaskRouteError::Unreadable {
+                path: board,
+                cause: format!(
+                    "route revalidation mismatch for '{}': board/incarnation changed under the \
+                     per-id lock since it was resolved",
+                    self.task.id
+                ),
+            });
+        }
+        Ok(write(&board))
     }
 }
 
@@ -501,6 +560,269 @@ pub(crate) fn caller_can_mutate_task(
         caller,
         routed.board().project(),
     ))
+}
+
+// ── #2760 item 4: narrow task-bound authority ops for EXTERNAL modules ──────
+//
+// External modules (the daemon supervisor's usage-limit control, the per-tick
+// reclaim handler) must NEVER obtain a raw board `Path` or a generic board
+// append. They call these narrow, task-bound operations instead: the strict
+// route, the per-id lock, the write-time revalidation, and the board append all
+// happen INSIDE the `tasks` module — the caller supplies only domain intent
+// (which task, what identity guard, what reason) and learns an outcome.
+
+/// #2760 item 4: the identity a usage-limit block/recover is authorised against —
+/// the task id plus the owner (`source`), the linked `branch`, and the
+/// `episode_id` (the caller's `notification_id`). The board-side revalidation
+/// asserts the routed task still carries this owner+branch (and, for recovery,
+/// this episode) before mutating; a generation change → [`ApplyOutcome::Stale`].
+/// (Binding-generation freshness is the CALLER's concern — it holds the binding
+/// lock and checks it before calling — so it is deliberately NOT in this guard.)
+#[derive(Debug, Clone)]
+pub struct UsageLimitGuard {
+    pub task_id: String,
+    pub source: String,
+    pub branch: String,
+    pub episode_id: String,
+}
+
+/// #2760 item 4: the outcome of a narrow usage-limit op. `Applied` = the event(s)
+/// committed; `AlreadyApplied` = the desired state already holds (idempotent
+/// no-op); `Stale` = the routed task no longer matches the guard (owner/branch/
+/// status/episode changed, or the route no longer resolves uniquely) → nothing
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    AlreadyApplied,
+    Stale,
+}
+
+/// True iff the routed record still bears the guard's owner + branch and one of
+/// `statuses`. The board-state counterpart of the supervisor's old
+/// `task_matches_key`, now owned by `tasks` (the board authority).
+fn task_matches_guard(
+    record: &crate::task_events::TaskRecord,
+    guard: &UsageLimitGuard,
+    statuses: &[crate::task_events::TaskStatus],
+) -> bool {
+    record.owner.as_ref().map(|o| o.as_str()) == Some(guard.source.as_str())
+        && record.branch.as_deref() == Some(guard.branch.as_str())
+        && statuses.contains(&record.status)
+}
+
+/// #2760 item 4: block a task for a usage-limit episode on ITS authoritative board
+/// (never the default board). Strict-resolves the route, short-circuits
+/// idempotently if the task is already `Blocked` for this episode, then appends a
+/// `Blocked` event under the per-id lock with write-time revalidation and a
+/// commit-time guard (still `Claimed`/`InProgress`, still this owner+branch).
+///
+/// `reason` is the fully-formed block-reason payload the caller built (it embeds
+/// the `episode_id`, so the idempotency check can recognise it). A route error /
+/// revalidation mismatch / commit-guard failure → `Stale` (no event); only a real
+/// board IO/replay failure returns `Err`.
+pub fn apply_usage_limit_block(
+    home: &Path,
+    guard: &UsageLimitGuard,
+    reason: String,
+) -> anyhow::Result<ApplyOutcome> {
+    let routed = match load_routed(home, &guard.task_id) {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!(task = %guard.task_id, route_err = %e,
+                "#2760 usage-limit block: task route unresolved → Stale (no default-board write)");
+            return Ok(ApplyOutcome::Stale);
+        }
+    };
+    // Idempotent: already blocked for THIS episode (its id is embedded in the
+    // committed block_reason) → nothing to do.
+    if routed.record().status == crate::task_events::TaskStatus::Blocked
+        && routed
+            .record()
+            .block_reason
+            .as_deref()
+            .is_some_and(|r| r.contains(&guard.episode_id))
+    {
+        return Ok(ApplyOutcome::AlreadyApplied);
+    }
+    let tid = crate::task_events::TaskId(guard.task_id.clone());
+    let emitter = crate::task_events::InstanceName("system:usage-limit".into());
+    let guard_for_check = guard.clone();
+    let check_tid = tid.clone();
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_batch_checked_at(
+            board,
+            &emitter,
+            vec![crate::task_events::TaskEvent::Blocked {
+                task_id: tid.clone(),
+                reason,
+            }],
+            move |fresh| {
+                let record = fresh
+                    .tasks
+                    .get(&check_tid)
+                    .ok_or_else(|| "task disappeared before usage-limit block".to_string())?;
+                task_matches_guard(
+                    record,
+                    &guard_for_check,
+                    &[
+                        crate::task_events::TaskStatus::Claimed,
+                        crate::task_events::TaskStatus::InProgress,
+                    ],
+                )
+                .then_some(())
+                .ok_or_else(|| "task generation changed before usage-limit block".to_string())
+            },
+        )
+    });
+    match revalidated {
+        Ok(Ok(Ok(_))) => Ok(ApplyOutcome::Applied),
+        // Commit-guard rejected (generation changed) → Stale, no event.
+        Ok(Ok(Err(_))) => Ok(ApplyOutcome::Stale),
+        // Real board IO / replay failure.
+        Ok(Err(e)) => Err(e),
+        // Route revalidation refused under the per-id lock → Stale.
+        Err(route_err) => {
+            tracing::warn!(task = %guard.task_id, %route_err,
+                "#2760 usage-limit block: route revalidation failed → Stale");
+            Ok(ApplyOutcome::Stale)
+        }
+    }
+}
+
+/// #2760 item 4: recover (unblock → back to InProgress) a usage-limit-blocked task
+/// on its authoritative board. Idempotent if the task is already `InProgress` for
+/// this owner+branch (the crash window where the Unblocked+InProgress append
+/// committed but the episode-state persist did not). Otherwise appends
+/// `[Unblocked, InProgress]` under the per-id lock with revalidation and a
+/// commit-time guard (still `Blocked` for THIS episode, still this owner+branch).
+pub fn recover_usage_limit_block(
+    home: &Path,
+    guard: &UsageLimitGuard,
+) -> anyhow::Result<ApplyOutcome> {
+    let routed = match load_routed(home, &guard.task_id) {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!(task = %guard.task_id, route_err = %e,
+                "#2760 usage-limit recovery: task route unresolved → Stale");
+            return Ok(ApplyOutcome::Stale);
+        }
+    };
+    // Crash-window idempotency: the atomic Unblocked+InProgress already committed
+    // but persisting the recovered episode state did not.
+    if task_matches_guard(
+        routed.record(),
+        guard,
+        &[crate::task_events::TaskStatus::InProgress],
+    ) {
+        return Ok(ApplyOutcome::AlreadyApplied);
+    }
+    let tid = crate::task_events::TaskId(guard.task_id.clone());
+    let owner = crate::task_events::InstanceName(guard.source.clone());
+    let emitter = crate::task_events::InstanceName("system:usage-limit".into());
+    let guard_for_check = guard.clone();
+    let check_tid = tid.clone();
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_batch_checked_at(
+            board,
+            &emitter,
+            vec![
+                crate::task_events::TaskEvent::Unblocked {
+                    task_id: tid.clone(),
+                },
+                crate::task_events::TaskEvent::InProgress {
+                    task_id: tid.clone(),
+                    by: owner,
+                },
+            ],
+            move |fresh| {
+                let record = fresh
+                    .tasks
+                    .get(&check_tid)
+                    .ok_or_else(|| "task disappeared before usage-limit recovery".to_string())?;
+                if task_matches_guard(
+                    record,
+                    &guard_for_check,
+                    &[crate::task_events::TaskStatus::Blocked],
+                ) && record
+                    .block_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains(&guard_for_check.episode_id))
+                {
+                    Ok(())
+                } else {
+                    Err("task generation changed before usage-limit recovery".to_string())
+                }
+            },
+        )
+    });
+    match revalidated {
+        Ok(Ok(Ok(_))) => Ok(ApplyOutcome::Applied),
+        Ok(Ok(Err(_))) => Ok(ApplyOutcome::Stale),
+        Ok(Err(e)) => Err(e),
+        Err(route_err) => {
+            tracing::warn!(task = %guard.task_id, %route_err,
+                "#2760 usage-limit recovery: route revalidation failed → Stale");
+            Ok(ApplyOutcome::Stale)
+        }
+    }
+}
+
+/// #2760 item 2 (reclaim BUG fix): emit a `Released` event for a reclaimed task on
+/// ITS authoritative board, under the per-id lock with revalidation. The pre-#2760
+/// reclaim handler appended `Released` to the DEFAULT board unconditionally, so a
+/// project-board task's release was written where its own board's replay never saw
+/// it (the task stayed Claimed forever). The commit-time guard only releases a task
+/// still `Claimed`/`InProgress`. Returns `Ok(true)` iff the `Released` committed.
+pub fn release_reclaimed_task(
+    home: &Path,
+    task_id: &str,
+    reason: String,
+) -> anyhow::Result<bool> {
+    let routed = match load_routed(home, task_id) {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!(task = task_id, route_err = %e,
+                "#2760 reclaim release: task route unresolved → skip (no default-board write)");
+            return Ok(false);
+        }
+    };
+    let tid = crate::task_events::TaskId(task_id.to_string());
+    let emitter = crate::task_events::InstanceName::from("system:reclaim_usage_limit");
+    let check_tid = tid.clone();
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_checked_at(
+            board,
+            &emitter,
+            crate::task_events::TaskEvent::Released {
+                task_id: tid.clone(),
+                reason,
+            },
+            move |fresh| {
+                let record = fresh
+                    .tasks
+                    .get(&check_tid)
+                    .ok_or_else(|| "task disappeared before reclaim release".to_string())?;
+                matches!(
+                    record.status,
+                    crate::task_events::TaskStatus::Claimed
+                        | crate::task_events::TaskStatus::InProgress
+                )
+                .then_some(())
+                .ok_or_else(|| "task no longer claimed/in-progress before reclaim release".to_string())
+            },
+        )
+    });
+    match revalidated {
+        Ok(Ok(Ok(_))) => Ok(true),
+        Ok(Ok(Err(_))) => Ok(false),
+        Ok(Err(e)) => Err(e),
+        Err(route_err) => {
+            tracing::warn!(task = task_id, %route_err,
+                "#2760 reclaim release: route revalidation failed → skip");
+            Ok(false)
+        }
+    }
 }
 
 /// #2760: why a strict route failed. There is deliberately NO variant that means
@@ -559,10 +881,12 @@ impl std::error::Error for TaskRouteError {}
 /// board": consumers map it to their own fail-closed policy.
 pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, TaskRouteError> {
     let (project, board, record) = board_router::route_task(home, task_id)?;
+    let fingerprint = RouteFingerprint::of(&project, &record);
     Ok(RoutedTask {
         task: record_to_task(&record),
         record,
         board: BoardRoot::new(project, board),
+        fingerprint,
     })
 }
 
@@ -625,27 +949,34 @@ pub fn link_branch_to_task(home: &Path, task_id: &str, branch: &str) -> anyhow::
     let emitter = crate::task_events::InstanceName::from("system:branch-link");
     let branch_owned = branch.to_string();
     let closure_tid = tid.clone();
-    let checked = routed.append_batch_checked(
-        &emitter,
-        vec![crate::task_events::TaskEvent::BranchLinked {
-            task_id: tid,
-            by: emitter.clone(),
-            branch: branch_owned.clone(),
-        }],
-        move |fresh| match fresh.tasks.get(&closure_tid) {
-            None => Err(format!(
-                "task '{}' disappeared before branch-link",
-                closure_tid.0
-            )),
-            // A concurrent link raced the same branch in → idempotent no-op.
-            Some(record) if record.branch.as_deref() == Some(branch_owned.as_str()) => {
-                Err("branch already linked".to_string())
-            }
-            Some(_) => Ok(()),
-        },
-    )?;
-    match checked {
-        Ok(_) => {
+    // #2760 items 2+3: append under the per-id router lock with write-time route
+    // revalidation. A route change under the lock (board/incarnation) fails closed
+    // → no branch-link, no side effect (never a wrong-board write).
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_batch_checked_at(
+            board,
+            &emitter,
+            vec![crate::task_events::TaskEvent::BranchLinked {
+                task_id: tid,
+                by: emitter.clone(),
+                branch: branch_owned.clone(),
+            }],
+            move |fresh| match fresh.tasks.get(&closure_tid) {
+                None => Err(format!(
+                    "task '{}' disappeared before branch-link",
+                    closure_tid.0
+                )),
+                // A concurrent link raced the same branch in → idempotent no-op.
+                Some(record) if record.branch.as_deref() == Some(branch_owned.as_str()) => {
+                    Err("branch already linked".to_string())
+                }
+                Some(_) => Ok(()),
+            },
+        )
+    });
+    match revalidated {
+        // Committed the BranchLinked event.
+        Ok(Ok(Ok(_))) => {
             tracing::info!(
                 task_id,
                 branch,
@@ -654,7 +985,18 @@ pub fn link_branch_to_task(home: &Path, task_id: &str, branch: &str) -> anyhow::
             Ok(true)
         }
         // Precondition failed at commit (raced re-link / task gone) → no-op.
-        Err(_) => Ok(false),
+        Ok(Ok(Err(_))) => Ok(false),
+        // Board IO / replay error inside the checked append.
+        Ok(Err(e)) => Err(e),
+        // Route revalidation refused under the lock (board/incarnation changed, or
+        // the id no longer routes uniquely) → no write.
+        Err(route_err) => {
+            tracing::warn!(
+                task_id, branch, %route_err,
+                "#2760 branch-link skipped: route revalidation failed under the per-id lock"
+            );
+            Ok(false)
+        }
     }
 }
 

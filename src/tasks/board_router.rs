@@ -428,6 +428,38 @@ pub(super) fn enumerate_projects(home: &Path) -> Result<Vec<String>, TaskRouteEr
 
 // ── board handles + cross-board listing ────────────────────────────
 
+// ── #2760 item 2: per-task-ID router lock ──────────────────────────
+
+/// The per-task-ID router lock file. **Board-independent** — it lives at
+/// `home/task_locks/<slug>.lock`, not under any board, because it is acquired
+/// BEFORE the strict route resolves which board holds the id. Every authority
+/// mutation on one id serialises on this lock regardless of which board the task
+/// lives on, so the route→revalidate→append transaction is atomic against a
+/// concurrent create/mutation of the same id on ANY board.
+///
+/// The id is slugged for filesystem safety; a real `t-…` task id is already
+/// slug-safe (the slug is the identity map on it), so distinct real ids never
+/// collide onto one lock file.
+fn task_id_lock_path(home: &Path, task_id: &str) -> PathBuf {
+    home.join("task_locks")
+        .join(format!("{}.lock", project_slug(task_id)))
+}
+
+/// #2760 item 2: acquire the per-task-ID router lock (the OUTER lock; the board /
+/// event-log writer lock is INNER). Held across the strict-route revalidation and
+/// the board append so no concurrent authority mutation on the same id can
+/// interleave between them. NOTHING under this lock may perform self-IPC
+/// (`api::call` / `enqueue_with_idle_hint`) — [`route_task`] only reads files (+ the
+/// `task_index` lock) and the checked append only reads `fleet.yaml` + takes the
+/// board writer lock, so the `#1629` flock-across-self-IPC guard is respected. Any
+/// cascade/cleanup/notify a caller runs MUST happen AFTER this guard drops.
+pub(super) fn acquire_task_id_lock(
+    home: &Path,
+    task_id: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
+    crate::store::acquire_file_lock(&task_id_lock_path(home, task_id))
+}
+
 // ── #2760 strict routed authority ──────────────────────────────────
 
 /// #2760 item 1: outcome of one strict `task_index` scan pass (no repair).

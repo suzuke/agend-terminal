@@ -197,6 +197,38 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         }
     }
     let board = crate::task_events::board_root(home, &project);
+    // #2760 item 2: create under the per-id router lock. The id routing NOWHERE
+    // (NotFound) is re-proved under the lock BEFORE the Created append + index
+    // record, so two racing creates of the same id (or a create racing a mutation)
+    // can never land a cross-board duplicate — which would make every later route
+    // Ambiguous and un-mutatable. A fresh id is timestamp+pid+seq so this virtually
+    // always holds; it fails closed if the id somehow already exists on a board or
+    // its absence cannot be proven. The lock is held across the pure board-record
+    // writes below (no dispatch side-effects, #1496 → no self-IPC under the flock).
+    let _create_lock = match super::board_router::acquire_task_id_lock(home, &id) {
+        Ok(g) => g,
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("failed to acquire per-id lock for create of '{id}': {e}")
+            })
+        }
+    };
+    match super::load_routed(home, &id) {
+        // The id is free on every board → safe to create.
+        Err(super::TaskRouteError::NotFound) => {}
+        Ok(_) => {
+            return serde_json::json!({
+                "error": format!("task id '{id}' already exists on a board"),
+                "code": "duplicate_task_id",
+            })
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("cannot prove task id '{id}' is unused: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
+    }
     match crate::task_events::append_at(&board, &emitter, event) {
         Ok(_) => {
             let _ = super::board_router::record_task_project(home, &id, &project);
@@ -595,48 +627,61 @@ fn handle_claim(
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(iname.clone()),
     };
-    // #2760: the board resolved once above (strict route).
-    let board = routed.board().path().to_path_buf();
-    let result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
-        let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
-        // #2117 Q2: cross-board dep eval — a claim gate on a task whose
-        // `depends_on` points at another project's board must read that board's
-        // status, not just this one's. Pass home + the task's board.
-        super::apply_dependency_eval_in_memory(&mut tasks, home, &board);
-        let tv = tasks
-            .iter()
-            .find(|t| t.id == claim_id)
-            .ok_or_else(|| format!("task '{claim_id}' not found"))?;
-        let is_self_reclaim = tv.status == crate::task_events::TaskStatus::Claimed
-            && tv.assignee.as_deref() == Some(by.as_str());
-        if !is_self_reclaim && tv.status != crate::task_events::TaskStatus::Open {
-            return Err(format!(
-                "task '{claim_id}' status is '{}', only 'open' tasks can be claimed",
-                tv.status
-            ));
+    // #2760 items 2+3: append under the per-id router lock with write-time route
+    // revalidation — the strict route is re-proved (same board + incarnation) under
+    // the lock before the checked append, so a concurrent create/mutation of this
+    // id on any board cannot race the claim onto a stale board.
+    let revalidated = routed.with_revalidated_board(home, |board| {
+        let result = crate::task_events::append_checked_at(board, &emitter, event, |state| {
+            let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
+            // #2117 Q2: cross-board dep eval — a claim gate on a task whose
+            // `depends_on` points at another project's board must read that board's
+            // status, not just this one's. Pass home + the task's board.
+            super::apply_dependency_eval_in_memory(&mut tasks, home, board);
+            let tv = tasks
+                .iter()
+                .find(|t| t.id == claim_id)
+                .ok_or_else(|| format!("task '{claim_id}' not found"))?;
+            let is_self_reclaim = tv.status == crate::task_events::TaskStatus::Claimed
+                && tv.assignee.as_deref() == Some(by.as_str());
+            if !is_self_reclaim && tv.status != crate::task_events::TaskStatus::Open {
+                return Err(format!(
+                    "task '{claim_id}' status is '{}', only 'open' tasks can be claimed",
+                    tv.status
+                ));
+            }
+            Ok(())
+        });
+        match result {
+            Ok(Ok(_)) => {
+                // #807 Item 1: see create arm note. claim's
+                // legacy `status` happens to match lifecycle
+                // ("claimed"), but the field is still the action
+                // event name semantically — kept as alias for
+                // shape consistency.
+                let task = read_task_record_at(board, &id).map(|r| record_to_task(&r));
+                serde_json::json!({
+                    "id": id,
+                    "event": "claimed",
+                    "task": task,
+                    "assignee": instance_name,
+                    // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                    "status": "claimed",
+                })
+            }
+            // Lost the race / precondition no longer holds — no event written.
+            Ok(Err(reason)) => serde_json::json!({"error": reason}),
+            Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
         }
-        Ok(())
     });
-    match result {
-        Ok(Ok(_)) => {
-            // #807 Item 1: see create arm note. claim's
-            // legacy `status` happens to match lifecycle
-            // ("claimed"), but the field is still the action
-            // event name semantically — kept as alias for
-            // shape consistency.
-            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-            serde_json::json!({
-                "id": id,
-                "event": "claimed",
-                "task": task,
-                "assignee": instance_name,
-                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
-                "status": "claimed",
-            })
-        }
-        // Lost the race / precondition no longer holds — no event written.
-        Ok(Err(reason)) => serde_json::json!({"error": reason}),
-        Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+    match revalidated {
+        Ok(v) => v,
+        // Route revalidation failed under the per-id lock (board/incarnation
+        // changed, or the id no longer routes uniquely) → deny, no event.
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
     }
 }
 
@@ -787,24 +832,38 @@ fn handle_done(
     // replay's `apply_done` does NOT re-guard transitions — so this precondition
     // is the authoritative gate (mirrors `handle_claim`'s `append_checked`).
     let done_id = id.clone();
-    match crate::task_events::append_checked_at(&board, &emitter, event, |state| {
-        let tv = state
-            .tasks
-            .values()
-            .map(record_to_task)
-            .find(|t| t.id == done_id)
-            .ok_or_else(|| format!("task '{done_id}' not found"))?;
-        if !tv
-            .status
-            .can_transition_to(crate::task_events::TaskStatus::Done)
-        {
-            return Err(format!(
-                "illegal transition: {} → done (task {done_id})",
-                status_to_legacy_str(tv.status)
-            ));
-        }
-        Ok(())
-    }) {
+    // #2760 items 2+3: append the →Done under the per-id router lock with write-time
+    // route revalidation. The closure does ONLY the checked append; the cascade
+    // below (worktree cleanup / release recompute / obligation cleanup — each may
+    // self-IPC or take other locks) runs AFTER the per-id flock drops (#1629). The
+    // fingerprint match guarantees `routed.board()` still names the appended board,
+    // so the post-lock read-back reads the right board.
+    let append_result = routed.with_revalidated_board(home, |board| {
+        crate::task_events::append_checked_at(board, &emitter, event, |state| {
+            let tv = state
+                .tasks
+                .values()
+                .map(record_to_task)
+                .find(|t| t.id == done_id)
+                .ok_or_else(|| format!("task '{done_id}' not found"))?;
+            if !tv
+                .status
+                .can_transition_to(crate::task_events::TaskStatus::Done)
+            {
+                return Err(format!(
+                    "illegal transition: {} → done (task {done_id})",
+                    status_to_legacy_str(tv.status)
+                ));
+            }
+            Ok(())
+        })
+    });
+    match append_result {
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
+        Ok(inner) => match inner {
         Ok(Ok(_)) => {
             // #789: task-completion is a workflow boundary —
             // clean any empty `init` commits the backend has
@@ -854,6 +913,7 @@ fn handle_done(
         }
         Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
         Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+        },
     }
 }
 
@@ -1288,11 +1348,14 @@ fn handle_update(
         // The pre-built events are kept (no in-lock rebuild); the drift check
         // guarantees their `by` is still correct at commit time.
         let stale_owner = record.owner.clone();
-        let checked = crate::task_events::append_batch_checked_at(
-            &board,
-            &emitter,
-            pending_events,
-            |state| {
+        // #2760 items 2+3: the checked batch append runs under the per-id router
+        // lock with write-time route revalidation (the closure does ONLY the
+        // append; the cascade below — obligation cleanup / child cancel / reassign,
+        // each may self-IPC or take other locks — runs AFTER the flock drops,
+        // #1629). The fingerprint match guarantees the `board` local still names the
+        // appended board, so the cascade + read-back below use it safely.
+        let checked = routed.with_revalidated_board(home, |board| {
+            crate::task_events::append_batch_checked_at(board, &emitter, pending_events, |state| {
                 update_batch_precondition(
                     state,
                     home,
@@ -1302,11 +1365,11 @@ fn handle_update(
                     target_status,
                     &stale_owner,
                 )
-            },
-        );
+            })
+        });
         match checked {
-            Ok(Ok(_)) => {}
-            Ok(Err(reason)) => {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(reason))) => {
                 // Preserve the legacy `illegal_transition` code for the #1868
                 // transition guard; the new in-lock ACL/owner-drift rejections
                 // (:231) are a distinct, retryable precondition failure.
@@ -1317,8 +1380,14 @@ fn handle_update(
                 };
                 return serde_json::json!({"error": reason, "code": code});
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return serde_json::json!({"error": format!("event log append_batch failed: {e}")});
+            }
+            Err(route_err) => {
+                return serde_json::json!({
+                    "error": format!("task '{id}' route revalidation failed: {route_err}"),
+                    "code": "task_route_unresolved",
+                });
             }
         }
         // #1018 (B): mirror the `done` arm's cleanup hook for
@@ -1700,26 +1769,37 @@ fn handle_metadata_set(
         key: key.to_string(),
         value,
     };
-    let append_result = if reset_acks {
-        // I6: emit the plan change + an audit-visible plan_acks=[] reset as ONE
-        // atomic batch so replay re-derives the reopened gate deterministically.
-        let reset_event = crate::task_events::TaskEvent::MetadataSet {
-            task_id: crate::task_events::TaskId(id.to_string()),
-            by: emitter.clone(),
-            key: "plan_acks".to_string(),
-            value: serde_json::json!([]),
-        };
-        crate::task_events::append_batch_at(&board, &emitter, vec![set_event, reset_event])
-            .map(|_| 0u64)
-    } else {
-        crate::task_events::append_at(&board, &emitter, set_event)
-    };
+    // #2760 items 2+3: the metadata append (previously an UNCHECKED default-board
+    // write via the pre-#2760 seam, now board-resolved) runs under the per-id
+    // router lock with write-time route revalidation — no self-IPC cascade, so the
+    // whole append can sit inside the closure. Read-back uses the `board` local
+    // (unchanged since the fingerprint matched).
+    let append_result = routed.with_revalidated_board(home, |board| {
+        if reset_acks {
+            // I6: emit the plan change + an audit-visible plan_acks=[] reset as ONE
+            // atomic batch so replay re-derives the reopened gate deterministically.
+            let reset_event = crate::task_events::TaskEvent::MetadataSet {
+                task_id: crate::task_events::TaskId(id.to_string()),
+                by: emitter.clone(),
+                key: "plan_acks".to_string(),
+                value: serde_json::json!([]),
+            };
+            crate::task_events::append_batch_at(board, &emitter, vec![set_event, reset_event])
+                .map(|_| 0u64)
+        } else {
+            crate::task_events::append_at(board, &emitter, set_event)
+        }
+    });
     match append_result {
-        Ok(_) => {
+        Ok(Ok(_)) => {
             let task = read_task_record_at(&board, id).map(|r| record_to_task(&r));
             serde_json::json!({"id": id, "event": "metadata_set", "task": task})
         }
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
+        Ok(Err(e)) => serde_json::json!({"error": format!("{e}")}),
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
     }
 }
 
@@ -1751,7 +1831,6 @@ fn handle_ack_plan(
             })
         }
     };
-    let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
     if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
     {
@@ -1796,11 +1875,19 @@ fn handle_ack_plan(
         key: "plan_acks".to_string(),
         value: serde_json::json!(acks),
     };
-    match crate::task_events::append_at(&board, &emitter, event) {
-        Ok(_) => serde_json::json!({
+    // #2760 items 2+3: append the ack under the per-id router lock with write-time
+    // route revalidation.
+    let revalidated = routed
+        .with_revalidated_board(home, |board| crate::task_events::append_at(board, &emitter, event));
+    match revalidated {
+        Ok(Ok(_)) => serde_json::json!({
             "id": id, "event": "ack_plan", "acked": acked_count, "already_acked": false,
         }),
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
+        Ok(Err(e)) => serde_json::json!({"error": format!("{e}")}),
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
     }
 }
 
@@ -1959,6 +2046,14 @@ fn cascade_cancel_children(
     // #2117 P1: a parent's children live on the parent's board — replay + cancel
     // there. `home` is kept only for the cross-instance cascade NOTIFICATION
     // (route_cascade_cancel), which is fleet-global. Single-project → board == home.
+    //
+    // #2760 scope: this is a MULTI-id secondary cascade (many children cancelled as
+    // a consequence of the parent's cancel), invoked AFTER the parent's per-id lock
+    // has dropped. Per the frozen plan's "atomic multi-id mutation sorts IDs or
+    // stays out of scope" rule it is deliberately NOT wrapped in per-child per-id
+    // locks (which would require sorted multi-lock acquisition); the children are
+    // all on this one board and the batch append rides its board writer lock. The
+    // pre-#2760 batch semantics are unchanged.
     let Ok(state) = crate::task_events::replay_at(board) else {
         return;
     };
