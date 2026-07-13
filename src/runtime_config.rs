@@ -237,17 +237,17 @@ pub fn validate_thresholds(alert: f32, handoff: f32, escalate: f32) -> Result<()
     // `pct < threshold - HYSTERESIS_PCT` would be impossible, wedging the latch.
     if alert <= HYSTERESIS_PCT || alert > 100.0 {
         return Err(format!(
-            "alert_pct must be in ({HYSTERESIS_PCT}, 100.0], got {alert}"
+            "alert_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {alert}"
         ));
     }
     if handoff <= HYSTERESIS_PCT || handoff > 100.0 {
         return Err(format!(
-            "handoff_pct must be in ({HYSTERESIS_PCT}, 100.0], got {handoff}"
+            "handoff_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {handoff}"
         ));
     }
     if escalate <= HYSTERESIS_PCT || escalate > 100.0 {
         return Err(format!(
-            "escalate_pct must be in ({HYSTERESIS_PCT}, 100.0], got {escalate}"
+            "escalate_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {escalate}"
         ));
     }
     if alert >= handoff {
