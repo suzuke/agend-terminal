@@ -856,6 +856,8 @@ mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         });
         save(&dir, &st).unwrap();
 
@@ -934,6 +936,8 @@ mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         });
         save(&dir, &st).unwrap();
 
@@ -966,6 +970,8 @@ mod tests {
             is_draft: false,
             state,
             merged_at: merged.then(|| "2026-06-05T00:00:00Z".to_string()),
+            head_ref_oid: None,
+            base_ref_oid: None,
         };
         let write_old_watch = |branch: &str| {
             let w = serde_json::json!({

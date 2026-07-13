@@ -618,6 +618,74 @@ pub(crate) fn build_pending_pointer(
     )
 }
 
+/// #2749: pre-stamp an [`InboxMessage`]'s id (idempotent — `storage::enqueue`
+/// leaves an existing id untouched) and return it. A durable ledger delivery
+/// (`ci_delivery_ledger::deliver_once`, whose closure does the enqueue) can then
+/// WAKE this exact persisted row afterward via [`wake_persisted_pointer`] without
+/// re-reading the inbox to recover the id.
+pub fn stamp_message_id(msg: &mut InboxMessage) -> String {
+    storage::ensure_msg_id(msg);
+    msg.id.clone().unwrap_or_default()
+}
+
+/// #2749: emit ONLY the canonical `[AGEND-MSG-PENDING]` pointer wake for an inbox
+/// row that is ALREADY durably persisted — it does NOT enqueue. Use it after a
+/// durable ledger path (e.g. `ci_delivery_ledger::deliver_once`) has appended the
+/// row, so the wake does not DUPLICATE it (which `enqueue_with_idle_hint` would).
+/// `id`/`kind`/`from` are the persisted row's fields (pre-stamp the id with
+/// [`stamp_message_id`]); the unread count is read authoritatively from storage.
+/// Best-effort: a dropped wake returns `Err` for the caller to LOG and MUST NOT
+/// invalidate the durable delivery — the recipient still has the row and sees it
+/// on its next drain.
+pub fn wake_persisted_pointer(
+    home: &Path,
+    target: &str,
+    id: &str,
+    kind: &str,
+    from: &str,
+) -> anyhow::Result<()> {
+    let (unread, _) = storage::unread_count(home, target);
+    let from_short = from.strip_prefix("from:").unwrap_or(from);
+    let pointer = build_pending_pointer(id, kind, from_short, unread, &operator_now_field());
+    #[cfg(test)]
+    if wake_capture_push(&pointer) {
+        return Ok(());
+    }
+    inject_with_submit(home, target, &pointer)
+        .map_err(|e| anyhow::anyhow!("pointer wake dropped: {e}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAKE_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #2749 test seam: run `f` with pointer-wake capture ENABLED — every
+/// [`wake_persisted_pointer`] call on this thread records its pointer string and
+/// skips the real PTY inject (which needs a live daemon loopback). Returns
+/// `(f's result, captured pointers)` so a real-entry scanner test can prove the
+/// canonical wake fired exactly once per delivered row.
+#[cfg(test)]
+pub(crate) fn with_captured_pointer_wakes<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    WAKE_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let captured = WAKE_CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default());
+    (out, captured)
+}
+
+#[cfg(test)]
+fn wake_capture_push(pointer: &str) -> bool {
+    WAKE_CAPTURE.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.push(pointer.to_string());
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Test-seam variant of [`enqueue_with_idle_hint`]. Accepts a closure
 /// that receives the formatted hint string so unit tests can verify
 /// the wire format without standing up the API loopback.

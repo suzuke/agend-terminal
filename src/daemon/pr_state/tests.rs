@@ -23,6 +23,27 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// #2749: stamp a VALID, FRESH deterministic-ancestry tuple on `s` — three
+/// heads agree at the current `head_sha`, checked base == observed base, no
+/// error, both timestamps `now`, behind_by == 0 — so the read-only freshness
+/// gate returns `Fresh` and `[pr-ready-for-merge]` may emit. This is the state a
+/// genuinely up-to-date PR has once the off-tick populator has run; tests about
+/// routing / dedup / threshold (NOT ancestry) call it to satisfy the new gate
+/// precondition without exercising the populator.
+fn stamp_fresh_ancestry(s: &mut PrState) {
+    let head = s.head_sha.clone();
+    let ts = now();
+    s.observed_head_sha = Some(head.clone());
+    s.observed_base_sha = Some("main-base".to_string());
+    s.observed_at = Some(ts.clone());
+    s.observed_error = false;
+    s.freshness_checked_head_sha = Some(head);
+    s.freshness_checked_base_sha = Some("main-base".to_string());
+    s.freshness_checked_at = Some(ts);
+    s.freshness_behind_by = Some(0);
+    s.freshness_error = false;
+}
+
 fn new_state(head: &str, class: ReviewClass) -> PrState {
     PrState {
         repo: "owner/repo".to_string(),
@@ -45,9 +66,92 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         gh_poll_failures: 0,
         last_gh_state: None,
         closed_unmerged_pending: false,
+        freshness_checked_head_sha: None,
+        freshness_checked_base_sha: None,
+        freshness_checked_at: None,
+        freshness_behind_by: None,
+        freshness_error: false,
+        freshness_retry_after: None,
+        observed_head_sha: None,
+        observed_base_sha: None,
+        observed_at: None,
+        observed_error: false,
         created_at: now(),
         updated_at: now(),
     }
+}
+
+/// #2749 (Fable mandatory evidence): a PrState JSON written BEFORE #2749 added the
+/// freshness/observed fields — and a nested last_gh_state GhPrMetadata written
+/// before the atomic-OID fields — MUST load with every new field defaulted, never
+/// a `missing field` deserialize error. `#[serde(default)]` on each new field is
+/// what keeps pre-existing on-disk state files loadable across the upgrade.
+#[test]
+fn pre_2749_state_json_loads_with_defaulted_freshness_and_oid_fields() {
+    // Populate a state (incl. a last_gh_state), serialize, then STRIP the
+    // #2749-added keys to simulate a file written before they existed.
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.observed_head_sha = Some("h".into());
+    s.observed_error = true;
+    s.freshness_behind_by = Some(3);
+    s.last_gh_state = Some(GhPrMetadata {
+        number: 1,
+        author_login: "dev".into(),
+        head_ref: "feat/test".into(),
+        is_cross_repository: false,
+        is_draft: false,
+        state: GhPrState::Open,
+        merged_at: None,
+        head_ref_oid: Some("oid".into()),
+        base_ref_oid: Some("oid2".into()),
+    });
+    let mut v = serde_json::to_value(&s).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    for k in [
+        "observed_head_sha",
+        "observed_base_sha",
+        "observed_at",
+        "observed_error",
+        "freshness_checked_head_sha",
+        "freshness_checked_base_sha",
+        "freshness_checked_at",
+        "freshness_behind_by",
+        "freshness_error",
+        "freshness_retry_after",
+    ] {
+        obj.remove(k);
+    }
+    if let Some(gh) = obj.get_mut("last_gh_state").and_then(|g| g.as_object_mut()) {
+        gh.remove("head_ref_oid");
+        gh.remove("base_ref_oid");
+    }
+
+    let loaded: PrState = serde_json::from_value(v).expect("pre-#2749 json must load, not error");
+    assert!(
+        loaded.observed_head_sha.is_none(),
+        "observed_head_sha ⇒ None"
+    );
+    assert!(loaded.observed_base_sha.is_none());
+    assert!(loaded.observed_at.is_none());
+    assert!(!loaded.observed_error, "observed_error ⇒ false");
+    assert!(loaded.freshness_checked_head_sha.is_none());
+    assert!(loaded.freshness_checked_base_sha.is_none());
+    assert!(loaded.freshness_checked_at.is_none());
+    assert!(
+        loaded.freshness_behind_by.is_none(),
+        "freshness_behind_by ⇒ None"
+    );
+    assert!(!loaded.freshness_error);
+    assert!(
+        loaded.freshness_retry_after.is_none(),
+        "freshness_retry_after ⇒ None"
+    );
+    let gh = loaded.last_gh_state.expect("last_gh_state survives");
+    assert!(
+        gh.head_ref_oid.is_none(),
+        "GhPrMetadata head_ref_oid ⇒ None"
+    );
+    assert!(gh.base_ref_oid.is_none());
 }
 
 /// T1: CI green at head_sha + Verified at same head_sha → MergeReady.
@@ -519,16 +623,23 @@ fn t18_scan_and_emit_fires_once_per_sha() {
     };
     s.merge_state = MergeState::MergeReady;
     s.pr_author = "dev".to_string();
+    // #2749: this test pins once-per-sha dedup, not ancestry — stamp a fresh
+    // tuple so the read-only freshness gate admits the emission.
+    stamp_fresh_ancestry(&mut s);
     save(&dir, &s).unwrap();
 
     let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // #2749 3a: a SUCCESSFUL gh poll (open PR, no OIDs) so apply_gh_observations
+    // leaves the stamped observed_* intact. CliGhPoller errors in tests, and the
+    // #2749 failure arm now sets observed_error — which would close the freshness
+    // gate. One response per scan (both open).
+    let poller = MockGhPoller::new(vec![
+        Ok(vec![gh_meta_open(100, "feat/test", "dev")]),
+        Ok(vec![gh_meta_open(100, "feat/test", "dev")]),
+    ]);
 
     // First scan: emit.
-    scan_and_emit_with(
-        &dir,
-        &registry,
-        &crate::daemon::pr_state::gh_poll::CliGhPoller,
-    );
+    scan_and_emit_with(&dir, &registry, &poller);
     let inbox_msgs = crate::inbox::drain(&dir, "lead-w");
     assert_eq!(inbox_msgs.len(), 1, "expected one [pr-ready-for-merge]");
     assert_eq!(inbox_msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
@@ -551,11 +662,7 @@ fn t18_scan_and_emit_fires_once_per_sha() {
     assert_eq!(inbox_msgs[0].reviewed_head.as_deref(), Some("sha-A"));
 
     // Second scan: must NOT re-emit (debounce per ready_emitted_for_sha).
-    scan_and_emit_with(
-        &dir,
-        &registry,
-        &crate::daemon::pr_state::gh_poll::CliGhPoller,
-    );
+    scan_and_emit_with(&dir, &registry, &poller);
     let inbox_msgs = crate::inbox::drain(&dir, "lead-w");
     assert!(
         inbox_msgs.is_empty(),
@@ -1256,6 +1363,9 @@ fn t20_dual_review_does_not_merge_until_two_verdicts_e2e() {
         },
     );
     assert_eq!(s.merge_state, MergeState::MergeReady);
+    // #2749: dual-review gate test — stamp a fresh ancestry tuple so the
+    // read-only freshness gate admits the emission once both verdicts land.
+    stamp_fresh_ancestry(&mut s);
     save(&dir, &s).unwrap();
 
     // Scanner now fires [pr-ready-for-merge].
@@ -1437,6 +1547,8 @@ fn gh_meta_open(number: u64, branch: &str, author: &str) -> GhPrMetadata {
         is_draft: false,
         state: GhPrState::Open,
         merged_at: None,
+        head_ref_oid: None,
+        base_ref_oid: None,
     }
 }
 
@@ -1533,6 +1645,8 @@ fn stale_found_pr_does_not_drive_terminal_transition_986() {
         is_draft: false,
         state: GhPrState::Closed,
         merged_at: None,
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
     let cache = crate::daemon::pr_state::gh_poll::GhPollCache::new();
     cache.seed_for_test("owner/repo", vec![closed], "2000-01-01T00:00:00+00:00");
@@ -1659,6 +1773,8 @@ fn t10_merged_observation_fires_pr_merged_event() {
         is_draft: false,
         state: GhPrState::Merged,
         merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
     let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()])]);
 
@@ -1708,6 +1824,8 @@ fn c1_merged_not_reemitted_after_delete_recreate_1842() {
         is_draft: false,
         state: GhPrState::Merged,
         merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
 
     // Scan 1: observe merged → emit [pr-merged] exactly once.
@@ -1785,6 +1903,8 @@ fn t11_closed_unmerged_observation_fires_event() {
         is_draft: false,
         state: GhPrState::Closed,
         merged_at: None,
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
 
     // #2131: first observation DEFERS — no emit, state survives with the
@@ -1852,6 +1972,8 @@ fn t_2131_closed_then_merged_emits_no_false_closed_unmerged() {
         is_draft: false,
         state,
         merged_at: merged_at.map(String::from),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
 
     // Scan 1: transient CLOSED+mergedAt=None → DEFER, no emit.
@@ -1950,6 +2072,9 @@ fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
         reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
     };
     s.merge_state = MergeState::MergeReady;
+    // #2749: this test pins author promotion + merge-authority routing, not
+    // ancestry — stamp a fresh tuple so the freshness gate admits emission.
+    stamp_fresh_ancestry(&mut s);
     // subscribers[0] is "dev" from fixture — but we want gh-poll
     // to win via tier 2 name match. Set up a fleet.yaml with a
     // "suzuke" instance that matches the gh author.login.
@@ -2028,6 +2153,8 @@ fn t13_idempotent_same_observation_no_double_emit() {
         is_draft: false,
         state: GhPrState::Merged,
         merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
     };
     // Two consecutive polls return the same metadata.
     let poller = MockGhPoller::new(vec![Ok(vec![merged_meta.clone()]), Ok(vec![merged_meta])]);
@@ -2328,6 +2455,13 @@ fn pr_ready_for_merge_routes_to_merge_authority_2059() {
         Some("headsha"),
         VerdictKind::Verified,
     );
+    // #2749: this test pins merge-authority ROUTING, not ancestry — stamp a
+    // fresh tuple on the now-MergeReady state so the freshness gate admits it.
+    {
+        let mut s = load(&home, "owner/repo", "feat/x").expect("merge-ready state present");
+        stamp_fresh_ancestry(&mut s);
+        save(&home, &s).unwrap();
+    }
     let poller = MockGhPoller::new(vec![Ok(vec![])]);
     scan_and_emit_with(&home, &empty_registry(), &poller);
     // #2059-#3: merge-ready routes to the MERGE AUTHORITY (orchestrator),

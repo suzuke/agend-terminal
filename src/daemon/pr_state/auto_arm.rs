@@ -141,6 +141,8 @@ mod tests {
             is_draft: draft,
             state,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         }
     }
 

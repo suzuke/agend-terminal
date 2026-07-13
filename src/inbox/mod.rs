@@ -43,7 +43,7 @@ pub(crate) use storage::inbox_path_resolved;
 pub use notify::{
     compose_aware_inject, deliver, enqueue_with_idle_hint, format_event_header,
     inject_notification_with_submit, notify_agent, notify_agent_with_attachments, notify_system,
-    AGENT_MSG_PREFIX, SYSTEM_MSG_PREFIX,
+    stamp_message_id, wake_persisted_pointer, AGENT_MSG_PREFIX, SYSTEM_MSG_PREFIX,
 };
 // Notification & PTY injection (pub(crate))
 pub(crate) use notify::build_excerpt;
@@ -53,6 +53,7 @@ pub(crate) use notify::build_excerpt;
 pub(crate) use notify::{
     attachment_body_placeholder, enqueue_with_idle_hint_with_emitter,
     should_suppress_911_reinject_with_ledger, summarize_attachments_for_header,
+    with_captured_pointer_wakes,
 };
 #[cfg(test)]
 pub use notify::{

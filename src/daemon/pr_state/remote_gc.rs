@@ -243,6 +243,8 @@ mod tests {
             is_draft: false,
             state,
             merged_at: merged_at.map(String::from),
+            head_ref_oid: None,
+            base_ref_oid: None,
         }
     }
 

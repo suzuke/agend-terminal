@@ -8,7 +8,7 @@
 //! ## Architecture
 //!
 //! - [`GhPoller`] trait — production [`CliGhPoller`] shells out to
-//!   `gh pr list --json author,number,headRefName,isCrossRepository,isDraft,state,mergedAt
+//!   `gh pr list --json author,number,headRefName,isCrossRepository,isDraft,state,mergedAt,headRefOid,baseRefOid
 //!   --state all`; tests inject [`MockGhPoller`] with canned responses
 //!   (§3.20 SOP 1 — no subprocess invocation in unit tests).
 //! - Single batched call per repo per scanner tick (NOT per-PR
@@ -55,6 +55,15 @@ pub struct GhPrMetadata {
     pub is_draft: bool,
     pub state: GhPrState,
     pub merged_at: Option<String>,
+    /// #2749: the PR head + base tip OIDs from the SAME `gh pr view --json
+    /// headRefOid,baseRefOid` response — the ATOMIC observation `apply_gh_poll`
+    /// writes into `PrState::observed_head_sha`/`observed_base_sha` together
+    /// (never composed across two reads). `#[serde(default)]` so pre-existing
+    /// `last_gh_state` snapshots load with `None`.
+    #[serde(default)]
+    pub head_ref_oid: Option<String>,
+    #[serde(default)]
+    pub base_ref_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +115,9 @@ impl GhPoller for CliGhPoller {
                 "isDraft",
                 "state",
                 "mergedAt",
+                // #2749: atomic head+base tip OIDs in the SAME response.
+                "headRefOid",
+                "baseRefOid",
             ],
             None, // #PR-D: uses --repo (no cwd), byte-identical to before
         );
@@ -158,6 +170,10 @@ fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
         is_draft: s.is_draft.unwrap_or(false),
         state,
         merged_at: s.merged_at,
+        // #2749: carry the atomic head/base OIDs through (may be None if the
+        // provider did not surface them — the gate then fails closed).
+        head_ref_oid: s.head_ref_oid,
+        base_ref_oid: s.base_ref_oid,
     })
 }
 
@@ -286,6 +302,9 @@ pub(crate) fn worker_poll_and_act(
             }
             super::remote_gc::gc_remote_orphans(repo, &prs);
             super::auto_arm::auto_arm_unwatched_open_prs(home, repo, &prs);
+            // #2749 3b: off-tick producer for the read-only freshness gate — stamp
+            // the deterministic latest-main ancestry tuple the scanner consumes.
+            super::freshness_populator::stamp_freshness_off_tick(home, repo, &prs);
         }
         Err(e) => tracing::warn!(
             repo = %repo, error = %e,
@@ -579,6 +598,16 @@ pub(crate) mod tests {
             gh_poll_failures: 0,
             last_gh_state: None,
             closed_unmerged_pending: false,
+            freshness_checked_head_sha: None,
+            freshness_checked_base_sha: None,
+            freshness_checked_at: None,
+            freshness_behind_by: None,
+            freshness_error: false,
+            freshness_retry_after: None,
+            observed_head_sha: None,
+            observed_base_sha: None,
+            observed_at: None,
+            observed_error: false,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -751,6 +780,8 @@ pub(crate) mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         }])];
         let poller = MockGhPoller::new(responses);
         let (prs, _polled_at) = poller.poll("owner/repo").unwrap();
@@ -796,6 +827,8 @@ pub(crate) mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         };
         cache.cache.lock().unwrap().insert(
             "o/r2".into(),
@@ -891,6 +924,8 @@ pub(crate) mod tests {
             is_draft: false,
             state: GhPrState::Open,
             merged_at: None,
+            head_ref_oid: None,
+            base_ref_oid: None,
         };
         let cache = GhPollCache::new();
         let poller = MockGhPoller::new(vec![Ok(vec![open])]);
