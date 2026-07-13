@@ -30,6 +30,10 @@ pub(super) struct SendEnvelope {
     pub(super) expect_reply_within_secs: Option<i64>,
     pub(super) terminal: Option<bool>,
     pub(super) no_report_expected: Option<bool>,
+    // reviewer-assignment outbox (t-…-17): opaque delivery generation nonce, minted
+    // at dispatch (A1) and rotated on row-repair (A4). Daemon-read by value (null =
+    // absent), so it joins the uniform directive set. ≠ assignment_id.
+    pub(super) delivery_nonce: Option<String>,
     // task-only extras (delegate_task) — emitted only when Some, so send/report
     // params keep their current shape (no null task keys → no presence-check risk)
     pub(super) task_id: Option<String>,
@@ -74,6 +78,7 @@ impl SendEnvelope {
             expect_reply_within_secs,
             terminal,
             no_report_expected,
+            delivery_nonce,
             task_id,
             force_meta,
             provenance,
@@ -94,6 +99,7 @@ impl SendEnvelope {
             "expect_reply_within_secs": expect_reply_within_secs,
             "terminal": terminal,
             "no_report_expected": no_report_expected,
+            "delivery_nonce": delivery_nonce,
         });
         // task-only extras: insert only when present (keeps send/report params
         // identical to their pre-refactor shape — no null task keys).
@@ -134,6 +140,7 @@ impl SendEnvelope {
             expect_reply_within_secs: _,
             terminal,
             no_report_expected: _,
+            delivery_nonce,
             task_id,
             force_meta,
             provenance: _,
@@ -151,6 +158,7 @@ impl SendEnvelope {
             reporting_cadence: reporting_cadence.clone(),
             worktree_binding_required: *worktree_binding_required,
             terminal: *terminal,
+            delivery_nonce: delivery_nonce.clone(),
             task_id: task_id.clone(),
             force_meta: force_meta
                 .as_ref()
@@ -184,6 +192,7 @@ mod tests {
             expect_reply_within_secs: Some(600),
             terminal: Some(true),
             no_report_expected: Some(true),
+            delivery_nonce: Some("n-deadbeef".to_string()),
             task_id: Some("t-99".to_string()),
             force_meta: None,
             provenance: Some(json!({"from": "dev-1", "task": "do x"})),
@@ -211,6 +220,8 @@ mod tests {
         assert_eq!(p["expect_reply_within_secs"], 600);
         assert_eq!(p["terminal"], true);
         assert_eq!(p["no_report_expected"], true);
+        // t-…-17 nonce drift-guard (params): a new directive must appear here.
+        assert_eq!(p["delivery_nonce"], "n-deadbeef");
         // task-extras present when Some
         assert_eq!(p["task_id"], "t-99");
         assert_eq!(p["provenance"]["task"], "do x");
@@ -236,6 +247,10 @@ mod tests {
         assert_eq!(m.reporting_cadence.as_deref(), Some("per-pr"));
         assert_eq!(m.worktree_binding_required, Some(true));
         assert_eq!(m.terminal, Some(true));
+        // t-…-17 nonce drift-guard (fallback): the nonce must survive the API-down
+        // fallback projection too — the outbox record's generation identity can't be
+        // silently dropped when the daemon is down.
+        assert_eq!(m.delivery_nonce.as_deref(), Some("n-deadbeef"));
         assert_eq!(m.delivery_mode.as_deref(), Some("inbox_fallback"));
     }
 

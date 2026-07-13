@@ -76,6 +76,8 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         observed_base_sha: None,
         observed_at: None,
         observed_error: false,
+        reserved_assignments: Vec::new(),
+        authority_unknown: false,
         created_at: now(),
         updated_at: now(),
     }
@@ -2224,6 +2226,54 @@ fn t15_malformed_pr_state_file_emits_observability_trace() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// t-…-17 B4 (codex m-…-425) — a MALFORMED/unreadable PrState file must NOT be able
+/// to OPEN the merge gate through the PRODUCTION emit path. The reconciler workset now
+/// enumerates live PrState identities from file CONTENT (`list_state_identities`); a
+/// malformed file is SURFACED + skipped there. But the authoritative fail-closed
+/// guarantee lives on the merge-ready EMIT path: `scan_and_emit_with` can never
+/// deserialize a garbage file into a MergeReady `PrState`, so it emits NO
+/// `[pr-ready-for-merge]` and stamps NO `ready_emitted_for_sha` (the file stays garbage;
+/// `load` returns None ⇒ nothing is merge-ready). This is the REAL-PATH proof — not just
+/// a comment — that an unreadable PrState keeps the gate CLOSED.
+#[test]
+#[tracing_test::traced_test]
+fn b4_malformed_pr_state_cannot_open_merge_gate_fail_closed() {
+    let home = tmp_home_for_1002("b4-malformed-gate");
+    let dir = pr_state_dir(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    // A team so that IF anything were (wrongly) emitted it WOULD route to the merge
+    // authority and be drainable — making the "no emit" assertion meaningful.
+    write_team_fleet(&home, "lead-w", &["dev"]);
+
+    // A MALFORMED PrState at the canonical (repo,branch) path — the shape a torn write
+    // or schema-skew leaves on disk. It must NEVER become merge-ready.
+    let bad_path = dir.join(pr_state_filename("owner/repo", "feat/test"));
+    std::fs::write(&bad_path, b"{ this is not valid pr_state json").unwrap();
+
+    let poller = MockGhPoller::new(vec![]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    // Production load path: a malformed file is NOT loadable ⇒ there is no gatable state.
+    assert!(
+        load(&home, "owner/repo", "feat/test").is_none(),
+        "a malformed PrState must not load into a gatable state (fail closed)"
+    );
+    // Production emit path: NO [pr-ready-for-merge] reached the merge-authority target.
+    assert!(
+        crate::inbox::drain(&home, "lead-w").is_empty(),
+        "a malformed PrState must NOT emit [pr-ready-for-merge] — the merge gate stays CLOSED"
+    );
+    // The scanner skipped the malformed file WITHOUT mutating it (no ready_emitted_for_sha
+    // could be stamped onto an unparseable file).
+    assert_eq!(
+        std::fs::read_to_string(&bad_path).unwrap(),
+        "{ this is not valid pr_state json",
+        "the scanner left the malformed file untouched"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// #1002 Phase 1 observability pin: record_verdict's gate A
 /// (reviewed_head is None) MUST emit a tracing::debug! identifying
 /// the silent skip with the gate marker. Pre-fix, the early-return
@@ -2712,4 +2762,421 @@ fn resolve_merge_authority_no_team_no_author_last_ditch_fixup_lead_2059() {
         "no team and no author → last-ditch fixup-lead default"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ─────────────────── t-…-17 C13: reserved_assignments gate ───────────────────
+
+/// T31: a RESERVED-but-unverified required reviewer holds `is_merge_ready` CLOSED,
+/// yet reserved entries are NEVER counted toward `required_verified_count`. With
+/// zero reserved + the threshold met ⇒ ready; add one reserved ⇒ NOT ready; a
+/// reserved entry never substitutes for a real VERIFIED.
+#[test]
+fn t31_reserved_assignment_holds_merge_ready_closed() {
+    let mut s = new_state("sha-A", ReviewClass::Dual);
+    s.ci_state = CiState::Green {
+        sha: "sha-A".into(),
+        observed_at: now(),
+    };
+    s.verdict_state = VerdictState::Verified {
+        reviewers: vec![("r1".into(), "sha-A".into()), ("r2".into(), "sha-A".into())],
+    };
+    // Baseline: Dual threshold met at head, zero reserved ⇒ merge-ready.
+    assert!(
+        is_merge_ready(&s),
+        "2 VERIFIED@head + 0 reserved ⇒ merge-ready"
+    );
+
+    // Add one reserved-but-unverified required reviewer ⇒ gate holds it CLOSED.
+    s.reserved_assignments = vec![ReservedAssignment {
+        target: "r3".into(),
+        review_author: crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        assignment_id: uuid::Uuid::new_v4(),
+    }];
+    assert!(
+        !is_merge_ready(&s),
+        "a reserved-but-unverified required reviewer holds merge-ready closed"
+    );
+
+    // A reserved entry NEVER counts toward the verified threshold: 1 real VERIFIED
+    // + 1 reserved must NOT become "2" and go ready.
+    s.verdict_state = VerdictState::Verified {
+        reviewers: vec![("r1".into(), "sha-A".into())],
+    };
+    assert!(
+        !is_merge_ready(&s),
+        "reserved never increments required_verified_count"
+    );
+}
+
+/// T36: additive serde — an empty `reserved_assignments` is SKIPPED on serialize
+/// (legacy state files are byte-identical) and legacy JSON WITHOUT the field
+/// deserializes back to an empty vec.
+#[test]
+fn t36_reserved_assignments_serde_legacy_byte_identical() {
+    let s = new_state("sha-A", ReviewClass::Single);
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(
+        !json.contains("reserved_assignments"),
+        "an empty reserved_assignments is skip_serializing_if ⇒ absent from the wire"
+    );
+    // Legacy JSON (no field) round-trips to an empty vec, equal to the original.
+    let back: PrState = serde_json::from_str(&json).unwrap();
+    assert!(
+        back.reserved_assignments.is_empty(),
+        "a legacy doc without the field deserializes to empty"
+    );
+    assert_eq!(s, back, "byte-identical round-trip");
+}
+
+// ── t-…-17 C10 / A6: the record_ci_result reserved-derivation DRAIN (T30) ──
+// Real entry (record_ci_result). The pr_state's pr_number is pre-set (gh-poll fills
+// it in production; here we set it directly) so the pr_number-matched drain fires.
+
+fn t30_home(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "agend-t30-{}-{}-{}",
+        tag,
+        std::process::id(),
+        C.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn t30_persist_asgn(home: &std::path::Path, repo: &str, branch: &str, target: &str, pr: u64) {
+    let rec = crate::daemon::assignment_authority::ActiveAssignment::new_pending(
+        repo,
+        branch,
+        target,
+        pr,
+        "lead",
+        "t-rev-1",
+        ReviewClass::Dual,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-07-13T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(home, &rec).unwrap();
+}
+
+/// T30 (ordering + gate): the drain sets `reserved_assignments` AFTER the head apply
+/// but BEFORE the buffered-verdict replay — so a reviewer whose buffered VERIFIED is
+/// replayed in the SAME call is STILL reserved (reserved excludes Satisfied only at
+/// derive time), and that reserved entry holds an otherwise-ready Single PR CLOSED.
+#[test]
+fn t30_drain_reserved_before_verdict_replay_holds_merge_closed() {
+    let home = t30_home("order");
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42);
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    save(&home, &ps).unwrap();
+    // A verdict that WOULD satisfy `reviewer` is buffered BEFORE the CI observation.
+    verdict_buffer::buffer(&home, "sha-A", "reviewer", "verified", None);
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(
+        s.reserved_assignments
+            .iter()
+            .map(|r| r.target.clone())
+            .collect::<Vec<_>>(),
+        vec!["reviewer".to_string()],
+        "reserved is derived BEFORE the buffered verdict replay (ordering)"
+    );
+    assert!(
+        matches!(s.verdict_state, VerdictState::Verified { .. }),
+        "the buffered VERIFIED WAS replayed in this same call"
+    );
+    assert!(
+        !is_merge_ready(&s),
+        "a reserved required reviewer holds the (else-ready Single) PR CLOSED (I17)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// T30 (excludes Satisfied + foreign generation): the drain reserves ONLY active
+/// records whose pr_number matches the state's generation AND whose evidence is not
+/// SatisfiedExactHead.
+#[test]
+fn t30_drain_excludes_satisfied_and_foreign_generation() {
+    let home = t30_home("excl");
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42); // matching gen, unengaged
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "satisfied", 42); // matching gen, VERIFIED@head
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "other-gen", 99); // FOREIGN generation
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.verdict_state = VerdictState::Verified {
+        reviewers: vec![("satisfied".into(), "sha-A".into())],
+    };
+    save(&home, &ps).unwrap();
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let mut got: Vec<String> = load(&home, "owner/repo", "feat/x")
+        .unwrap()
+        .reserved_assignments
+        .iter()
+        .map(|r| r.target.clone())
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["reviewer".to_string()],
+        "reserved excludes the Satisfied target AND the foreign-generation record"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// B4(d) — when a branch HAS active assignments but the reviewer-assignment lock
+/// CANNOT be acquired during the `record_ci_result` A6 drain, the reserved set must
+/// NOT be re-derived LOCK-FREE. A lock-free derivation can race a concurrent
+/// revoke/transfer and produce a torn reserved set that CLEARS the merge gate.
+/// Fail closed: keep the existing (gate-closing) `reserved_assignments`; the per-tick
+/// reconciler re-derives under the lock later. Pre-fix the drain overwrites
+/// `reserved_assignments` unconditionally, dropping the pre-existing reservation.
+#[test]
+fn b4_drain_preserves_reserved_when_assignment_lock_unavailable() {
+    let home = t30_home("b4-lock");
+    // An active assignment for THIS generation ⇒ has_active == true.
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42);
+    // A pre-existing reserved entry (a DIFFERENT target the lock-free re-derive would
+    // DROP — the fail-open the drain must not cause).
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.reserved_assignments = vec![ReservedAssignment {
+        target: "ghost".into(),
+        review_author: crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        assignment_id: uuid::Uuid::new_v4(),
+    }];
+    save(&home, &ps).unwrap();
+
+    // POISON the branch assignment lock so acquisition returns None while has_active
+    // is true: put a DIRECTORY where the lock file is opened, so the open-for-write
+    // fails (EISDIR) deterministically — no wall clock, no thread race.
+    let lock_path = crate::daemon::assignment_authority::branch_lock_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/x",
+    );
+    let _ = std::fs::remove_file(&lock_path);
+    std::fs::create_dir_all(&lock_path).unwrap();
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(
+        s.reserved_assignments
+            .iter()
+            .map(|r| r.target.clone())
+            .collect::<Vec<_>>(),
+        vec!["ghost".to_string()],
+        "has_active && lock unavailable ⇒ the drain must PRESERVE the existing reserved set (fail closed), not re-derive it lock-free"
+    );
+    // Cleanup: the poisoned lock dir would block remove_dir_all's file unlink? it's a
+    // dir, remove_dir_all handles it.
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// t-…-17 B4 (codex m-…-322) — the SOLE-corrupt-record merge-gate fail-open. A branch
+/// whose ONLY assignment record is CORRUPT, with NO pre-existing reservation, must NOT
+/// be able to OPEN the merge gate. The lossy `has_active`/`list_active` DROP a corrupt
+/// record's `Err`, so the branch looks assignment-free: the drain then derives on a
+/// fresh state with an EMPTY reserved set and `is_merge_ready` OPENs even though the
+/// authority is UNREADABLE. Fail closed: the tri-state probe reports `Unreadable`, the
+/// drain SETs `authority_unknown`, and `is_merge_ready` returns false. This complements
+/// the reconcile-path RED (assignment_reconcile.rs
+/// `b4_corrupt_record_keeps_reservation_fail_closed`, which covers a prior reservation +
+/// a co-resident healthy record); THIS covers the uncovered first-projection /
+/// single-corrupt case with an empty reserved set.
+#[test]
+fn b4_sole_corrupt_record_holds_merge_gate_closed_fail_closed() {
+    let home = t30_home("b4-sole-corrupt");
+    // The SOLE assignment record for (repo,branch) is CORRUPT — write garbage at the
+    // real on-disk record path (create the branch dir first). No healthy record, so the
+    // lossy `has_active`/`list_active` see an assignment-free branch.
+    let rpath = crate::daemon::assignment_authority::record_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "reviewer",
+    );
+    std::fs::create_dir_all(rpath.parent().unwrap()).unwrap();
+    std::fs::write(&rpath, b"{ not valid assignment json").unwrap();
+
+    // A FRESH PrState with EVERY OTHER merge condition satisfied: CI is set Green at
+    // head by `record_ci_result` below; the reviewer is Verified at head; not Draft;
+    // review_class resolved (Single). reserved_assignments is empty (no prior
+    // reservation) — the exact state the fail-open OPENs the gate on.
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.verdict_state = VerdictState::Verified {
+        reviewers: vec![("reviewer".to_string(), "sha-A".to_string())],
+    };
+    assert!(ps.reserved_assignments.is_empty(), "no prior reservation");
+    assert!(!ps.authority_unknown, "authority_unknown starts clear");
+    save(&home, &ps).unwrap();
+
+    // Real entry: the A6 drain runs against the sole corrupt record.
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    // Sanity: every OTHER condition is met, so ONLY the authority-unknown gate keeps
+    // the PR closed — proving this is the sole-corrupt fail-open, not some other gate.
+    assert!(
+        matches!(s.ci_state, CiState::Green { ref sha, .. } if sha == "sha-A"),
+        "CI is green at head"
+    );
+    assert!(
+        matches!(s.verdict_state, VerdictState::Verified { .. }),
+        "reviewer is Verified at head"
+    );
+    assert!(s.reserved_assignments.is_empty(), "reserved stays empty");
+    assert!(
+        s.authority_unknown,
+        "a SOLE corrupt record ⇒ authority UNREADABLE ⇒ authority_unknown SET (fail closed)"
+    );
+    assert!(
+        !is_merge_ready(&s),
+        "a branch whose sole assignment record is corrupt must NOT be merge-ready (gate stays CLOSED)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// t-…-17 B4 (codex m-…-479) RED (c) — the REDUCER-side cached-`merge_state`
+/// recompute. `record_ci_result` applies `Event::CiObserved` (which derives
+/// `merge_state`) BEFORE the A6 authority drain sets `reserved_assignments`, so
+/// pre-fix the CACHED `merge_state` stays `MergeReady` even though the just-added
+/// reservation makes `is_merge_ready` false — a stale `MergeReady` the scanner would
+/// emit `[pr-ready-for-merge]` on, bypassing the fail-closed gate. The shared
+/// `apply_authority_transition` now recomputes nonterminal `merge_state` as its FINAL
+/// step, so a same-head CI observation whose drain adds a reservation persists
+/// `merge_state == NotReady`. Repair-convergence: once the reservation is revoked, a
+/// subsequent `record_ci_result` re-derives back to `MergeReady` (bidirectional — the
+/// recompute is not a one-way latch).
+#[test]
+fn b4_record_ci_result_recomputes_cached_merge_state_after_reservation_drain() {
+    let home = t30_home("b4-479-reducer");
+    // An active assignment for a SEPARATE, still-unverified reviewer on THIS generation
+    // ⇒ the A6 drain reserves it (it is NOT the verified reviewer below, so `classify`
+    // does not mark it SatisfiedExactHead and exclude it).
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42);
+    // A state otherwise fully ready at sha-A: a DIFFERENT reviewer VERIFIED at head
+    // satisfies the Single threshold, not draft; CI is set Green at head by
+    // record_ci_result below. reserved starts empty, so the pre-drain CiObserved
+    // derivation computes MergeReady (the stale value the drain must recompute away).
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.verdict_state = VerdictState::Verified {
+        reviewers: vec![("verifier".into(), "sha-A".into())],
+    };
+    save(&home, &ps).unwrap();
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(
+        s.reserved_assignments
+            .iter()
+            .map(|r| r.target.clone())
+            .collect::<Vec<_>>(),
+        vec!["reviewer".to_string()],
+        "the A6 drain reserved the active record"
+    );
+    assert!(
+        !is_merge_ready(&s),
+        "a reserved required reviewer ⇒ is_merge_ready false"
+    );
+    // THE RED: pre-fix, merge_state stayed the stale MergeReady derived BEFORE the
+    // drain; the recompute must persist NotReady.
+    assert_eq!(
+        s.merge_state,
+        MergeState::NotReady,
+        "codex m-…-479: apply_authority_transition must recompute the cached merge_state to \
+         NotReady after the drain adds a reservation (pre-fix it stayed a stale MergeReady)"
+    );
+
+    // Repair-convergence: revoke the reservation (remove the sole active record), then a
+    // subsequent same-head CI observation must re-derive merge_state back to MergeReady —
+    // proving the recompute is bidirectional (not a one-way latch that only closes).
+    let rpath = crate::daemon::assignment_authority::record_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "reviewer",
+    );
+    std::fs::remove_file(&rpath).unwrap();
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+    let s2 = load(&home, "owner/repo", "feat/x").unwrap();
+    assert!(
+        s2.reserved_assignments.is_empty(),
+        "reservation revoked ⇒ reserved empty"
+    );
+    assert!(
+        !s2.authority_unknown,
+        "record removed ⇒ authority Absent ⇒ authority_unknown CLEARED"
+    );
+    assert!(
+        is_merge_ready(&s2),
+        "the otherwise-ready state is merge-ready again once the reservation is gone"
+    );
+    assert_eq!(
+        s2.merge_state,
+        MergeState::MergeReady,
+        "repair-convergence: the recompute restores MergeReady when readiness returns (bidirectional)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }

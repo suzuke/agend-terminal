@@ -48,6 +48,24 @@ pub(crate) fn derive_repo_slug_any_forge_pub(source_repo: &Path) -> Option<Strin
     canonicalize_repo_slug_any_forge(&url)
 }
 
+/// t-…-17: canonical provider-neutral `owner/repo` for a resolved `source_repo`,
+/// the SINGLE lockstep normalizer shared by the reviewer-assignment repo resolve
+/// (`resolve_review_assignment_repo`, the DISPATCH side) and the team-authority ACL
+/// (`teams::resolve_team_by_source_repo`, the TEAM side) — so both sides derive the
+/// SAME canonical form for the same repo (else the ACL silently mis-matches).
+///
+/// An operator may store `source_repo` as a bare `owner/repo` slug or a forge URL
+/// (canonicalized directly), OR as a local checkout path (canonicalized from its
+/// `origin` remote). `None` when neither resolves — the caller then fail-closes.
+pub(crate) fn canonical_repo_slug_for_source(src: &Path) -> Option<String> {
+    if let Some(s) = src.to_str() {
+        if let Some(slug) = canonicalize_repo_slug_any_forge(s) {
+            return Some(slug);
+        }
+    }
+    derive_repo_slug_any_forge_pub(src)
+}
+
 /// Host-agnostic front-end to [`super::canonicalize_repo_slug`] — the SINGLE
 /// owner/repo parser authority (no second parser to drift). Strips a known forge
 /// host, then DELEGATES the `owner/repo` parse/lowercase/trim to

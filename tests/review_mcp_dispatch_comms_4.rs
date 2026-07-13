@@ -11,7 +11,7 @@
 //!
 //! ## W2.2 phase-split (#2710)
 //! `handle_delegate_task` was split out of `src/mcp/handlers/comms.rs` into
-//! named phase stages in `src/mcp/handlers/comms_delegate.rs`. The invariant is
+//! named phase stages in `src/mcp/handlers/comms_delegate/mod.rs`. The invariant is
 //! unchanged but now spans two functions: the unconditional `*sender == target`
 //! reject lives in `resolve_delegate` (an early `return Err(...)`), and the lease
 //! lives in `maybe_auto_bind_lease` (which calls
@@ -33,9 +33,10 @@ use std::path::PathBuf;
 use syn::visit::{self, Visit};
 
 fn parse_comms_delegate() -> syn::File {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers/comms_delegate.rs");
-    let src = std::fs::read_to_string(&p).expect("read src/mcp/handlers/comms_delegate.rs");
-    syn::parse_file(&src).expect("parse src/mcp/handlers/comms_delegate.rs")
+    let p =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers/comms_delegate/mod.rs");
+    let src = std::fs::read_to_string(&p).expect("read src/mcp/handlers/comms_delegate/mod.rs");
+    syn::parse_file(&src).expect("parse src/mcp/handlers/comms_delegate/mod.rs")
 }
 
 fn find_fn<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemFn {

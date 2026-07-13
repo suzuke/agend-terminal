@@ -539,6 +539,29 @@ pub(crate) fn renudge_actionable_unread(
     }
 }
 
+/// t-…-17 A3: best-effort self-IPC WAKE pointer nudging `target` to drain a
+/// reviewer-assignment inbox row that the durable outbox store already enqueued
+/// (A1/A2 or an A4 repair). A pure PTY wake — OFFLOADED to the delivery worker via
+/// [`inject_with_submit`], so the caller thread never blocks — and NEVER a new inbox
+/// row (the durable row is the store's, keyed by its `delivery_nonce`). MUST be
+/// called OUTSIDE every daemon lock (dispatch A3 / reconciler A3 both collect the
+/// target set under no lock and fire here after releasing); best-effort — a full
+/// queue / absent worker is swallowed.
+pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
+    let (inbox_count, _) = storage::unread_count(home, target);
+    let now_field = operator_now_field();
+    let pointer = build_pending_pointer(
+        "review-assignment",
+        "review-assignment",
+        "system:review",
+        inbox_count,
+        &now_field,
+    );
+    if let Err(e) = inject_with_submit(home, target, &pointer) {
+        tracing::debug!(%target, error = %e, "wake_review_assignment: best-effort inject failed");
+    }
+}
+
 /// #26795: renudge-specific pointer — same shape as [`build_pending_pointer`]
 /// but labels the count honestly as `pending_handoffs`, not `inbox`. The
 /// renudge pointer's count is the target's pending `ci_handoff_track`

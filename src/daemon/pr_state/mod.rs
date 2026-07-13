@@ -185,8 +185,48 @@ pub struct PrState {
     pub observed_at: Option<String>,
     #[serde(default)]
     pub observed_error: bool,
+    /// t-…-17 C13: required reviewers whose assignment is RESERVED-but-unverified,
+    /// DERIVED by the per-tick reconciler (a LATER slice) from the assignment
+    /// authority (`assignment_authority.rs`). While ANY entry is present
+    /// [`is_merge_ready`] returns false — a required reviewer is reserved but not
+    /// yet Verified — yet reserved entries are NEVER counted toward
+    /// `required_verified_count` and NEVER pushed into `VerdictState::Verified`
+    /// (plan §3(l)/I17). Additive serde (`default` + `skip_serializing_if`) ⇒
+    /// legacy state files are byte-identical. Population is a LATER slice; this
+    /// slice adds only the field + the gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reserved_assignments: Vec<ReservedAssignment>,
+    /// t-…-17 B4 (codex m-…-322): FAIL-CLOSED merge-gate flag. SET by the
+    /// [`record_ci_result`] A6 drain whenever the branch's assignment authority
+    /// could NOT be read reliably — a corrupt/unreadable record, an
+    /// exists-but-unreadable branch dir, or a required assignment-lock acquisition
+    /// failure — so the reserved derivation could not be trusted. While set,
+    /// [`is_merge_ready`] returns false unconditionally. This closes the
+    /// sole-corrupt-record fail-open: a branch whose ONLY record is corrupt looks
+    /// assignment-free to a lossy record read, so without the tri-state
+    /// [`crate::daemon::assignment_authority::probe_branch_authority`] the A6 drain
+    /// would derive an EMPTY reserved set on a fresh state and OPEN the gate. CLEARED
+    /// only by a successful locked-or-genuinely-absent derive.
+    /// Additive serde (`default` + skip-when-false) ⇒ legacy state files load
+    /// byte-identical; an old file without the field defaults `false` and is
+    /// re-derived on the next CI observation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) authority_unknown: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// t-…-17 C13: one RESERVED-but-unverified required reviewer on a `PrState`. Carries
+/// the full-typed authority (`target`, `review_author`, `assignment_id`) so the
+/// gate/diagnostic can name the holder. `review_author` reuses the SINGLE shared
+/// [`crate::mcp::handlers::comms_gates::ReviewAuthor`] principal (no shadow copy).
+/// `pub(crate)` (not `pub`) because that principal is itself `pub(crate)` — a `pub`
+/// wrapper would leak a more-private type (rustc `private_interfaces`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReservedAssignment {
+    pub target: String,
+    pub review_author: crate::mcp::handlers::comms_gates::ReviewAuthor,
+    pub assignment_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -538,6 +578,23 @@ pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
 /// - Draft state — `gh pr merge` rejects drafts; refuse to mark ready
 /// - Threshold per `review_class` (Single=1 / Dual=2)
 pub fn is_merge_ready(state: &PrState) -> bool {
+    // t-…-17 B4 (codex m-…-322): the assignment authority was UNREADABLE at the last
+    // A6 drain (a corrupt/unreadable record, an exists-but-unreadable branch dir, or a
+    // required assignment-lock failure), so the reserved derivation could NOT be
+    // trusted. FAIL CLOSED. This is the explicit "authority unreadable ⇒ close" state
+    // that closes the sole-corrupt-record fail-open: a branch whose only record is
+    // corrupt looks assignment-free to the lossy `has_active`, so the drain would
+    // otherwise derive an EMPTY reserved set on a fresh state and OPEN this gate.
+    if state.authority_unknown {
+        return false;
+    }
+    // t-…-17 C13: a required reviewer whose assignment is RESERVED-but-unverified
+    // holds the PR closed. Reserved entries are DERIVED (excl. Satisfied) by the
+    // reconciler and are NEVER counted toward `required_verified_count` / pushed
+    // into `VerdictState::Verified` — they only gate here (plan §3(l)/I17).
+    if !state.reserved_assignments.is_empty() {
+        return false;
+    }
     // #2745 fail-closed: an `Unresolved` review_class (intent ABSENT / UNKNOWN /
     // MISMATCHED at arm time) is NEVER merge-ready — no verdict count can satisfy
     // it. The scanner raises an actionable diagnostic in place of pr-ready.
@@ -694,6 +751,67 @@ pub(crate) fn is_pr_state_file(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with('.'));
     !is_dotfile && path.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
+/// t-…-17 B4 (codex m-…-416): enumerate every LIVE `PrState`'s `{repo, branch}`
+/// identity, read from the DESERIALIZED file CONTENT — NEVER from the lossy/hashed
+/// filename. The per-tick reconciler UNIONs this with
+/// [`crate::daemon::assignment_authority::active_branches`], which discovers a branch
+/// only via its FIRST PARSEABLE authority record: a branch whose authority records are
+/// ALL corrupt is invisible to `active_branches`, so it would VANISH from the workset
+/// and `redrive_reserved` would never run — leaving `authority_unknown` stale-false and
+/// the merge gate OPEN. Rediscovering it here via its readable PrState routes it back
+/// through `redrive_reserved` (→ probe `Unreadable` → SET the fail-closed flag).
+///
+/// Mirrors the scanner's file filtering ([`scanner::scan_and_emit_with`]): only
+/// `*.json`, and the `.emitted-terminal.json` ledger / `.lock` sidecars are skipped
+/// via [`is_pr_state_file`]. A malformed/unreadable PrState is SURFACED
+/// (`tracing::warn!` with the path) — observable, NEVER silently dropped. It is
+/// inherently fail-closed: an unreadable PrState cannot be deserialized, so it can
+/// never be declared merge-ready and cannot contribute an identity here either. Lock-free.
+pub(crate) fn list_state_identities(home: &Path) -> Vec<(String, String)> {
+    let dir = pr_state_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "t-…-17 B4: list_state_identities read_dir failed — reconciler PrState-identity source empty this tick"
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_pr_state_file(&path) {
+            continue; // #2059: skip .emitted-terminal.json ledger + .lock sidecars
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "t-…-17 B4: list_state_identities read failed — malformed/unreadable PrState SURFACED, not discovered this tick (fail-closed: an unreadable PrState is never merge-ready)"
+                );
+                continue;
+            }
+        };
+        match serde_json::from_str::<PrState>(&content) {
+            Ok(state) => out.push((state.repo, state.branch)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "t-…-17 B4: list_state_identities parse failed — malformed PrState SURFACED, not discovered this tick (fail-closed: an unreadable PrState is never merge-ready)"
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Canonical filename for a (repo, branch) PR state file. Keyed by
@@ -1053,6 +1171,8 @@ pub fn new_for_branch(
         observed_base_sha: None,
         observed_at: None,
         observed_error: false,
+        reserved_assignments: Vec::new(),
+        authority_unknown: false,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -1115,6 +1235,38 @@ pub fn record_ci_result(
     subscribers: Vec<String>,
     review_class: ReviewClass,
 ) {
+    // t-…-17 A6 (I11/I15/I16): hold the reviewer-assignment branch lock as the OUTER
+    // lock of the drain below (the pr_state flock `with_pr_state_or_create` takes is
+    // the INNER lock — the mandated assignment-OUTER / pr_state-INNER order), so the
+    // `reserved_assignments` derivation is consistent with a concurrent
+    // revoke/transfer/tombstone. Acquired ONLY when the branch is ACTIVE (so an
+    // assignment-free branch never creates an empty store dir); if the lock cannot be
+    // acquired the drain FAILS CLOSED (below) rather than deriving lock-free — the
+    // per-tick reconciler re-derives under the lock later. Held for the whole
+    // `with_pr_state_or_create` scope via the binding's lifetime.
+    // t-…-17 B4 (codex m-…-322): probe the branch authority with the TRI-STATE probe,
+    // NOT the lossy `has_active`. `has_active` DROPS a corrupt record's `Err`, so a
+    // branch whose SOLE record is corrupt looks assignment-free — the drain then
+    // derives an EMPTY reserved set on a fresh state and OPENs the merge gate. The
+    // probe reports `Unreadable` for that case so the drain fails closed (below).
+    let authority = crate::daemon::assignment_authority::probe_branch_authority(home, repo, branch);
+    // Acquire the OUTER assignment lock ONLY when the branch is ACTIVE (has ≥1 valid
+    // record). `Absent` needs none (empty reserved is correct); `Unreadable` is not
+    // derived at all. Best-effort — an `Active` branch whose lock cannot be acquired is
+    // handled fail-closed in the drain below. Held for the whole
+    // `with_pr_state_or_create` scope via the binding's lifetime.
+    let _assignment_lock = if matches!(
+        authority,
+        crate::daemon::assignment_authority::BranchAuthority::Active
+    ) {
+        crate::daemon::assignment_authority::lock_branch_for_drain(home, repo, branch)
+    } else {
+        None
+    };
+    // Whether the OUTER assignment lock is actually held — captured (Copy) so the drain
+    // closure need not borrow the guard. A lock-free derivation on an `Active` branch
+    // could read a torn reserved set that CLEARS the gate, so it is refused fail-closed.
+    let lock_acquired = _assignment_lock.is_some();
     if let Err(e) = with_pr_state_or_create(
         home,
         repo,
@@ -1149,6 +1301,38 @@ pub fn record_ci_result(
                     head_sha,
                     conclusion,
                     observed_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+            // t-…-17 A6 (I13/I16): DRAIN — after the head is applied (above) and
+            // BEFORE the buffered-verdict replay (below), REPLACE the whole
+            // `reserved_assignments` vec with the full-typed derivation from the
+            // authority store: every active record whose stored pr_number equals THIS
+            // state's pr_number and whose evidence is NOT SatisfiedExactHead. This is
+            // DECLARATIVE + convergent (a re-run yields the same set) and reads the
+            // store lock-free under the OUTER assignment lock held above. Reserved
+            // entries are NEVER counted toward `required_verified_count` / pushed into
+            // `VerdictState::Verified` — they only hold `is_merge_ready` closed
+            // (I17). A freshly-created state still carries pr_number 0 (gh-poll fills
+            // it later), matching no record (persist rejects pr_number 0), so the
+            // reconciler backstops the reservation until the generation is known.
+            // t-…-17 B4 (codex m-…-322 / m-…-378): set/clear the fail-closed
+            // `authority_unknown` gate flag from the probe + derive outcome, via the
+            // SHARED `apply_authority_transition` helper — the SAME transition the A10b
+            // reconciler's `redrive_reserved` applies (codex m-…-378 closed the divergence
+            // where the two paths differed). SET on corrupt/unreadable/required-lock-
+            // failure; CLEARED only on a successful locked-or-absent derive. This is the
+            // explicit "authority unreadable ⇒ close" state that closes the sole-corrupt-
+            // record fail-open (`is_merge_ready` gates on it).
+            crate::daemon::assignment_authority::apply_authority_transition(
+                state,
+                repo,
+                branch,
+                authority,
+                lock_acquired,
+                |state| {
+                    crate::daemon::assignment_authority::derive_reserved_for_prstate(
+                        home, repo, branch, state,
+                    )
                 },
             );
             // #2059 #2(c): the state's head_sha is now established at `head_sha`.

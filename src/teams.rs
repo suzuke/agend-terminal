@@ -614,6 +614,49 @@ pub fn resolve_team_orchestrator(home: &Path, name: &str) -> Result<Option<Strin
     }
 }
 
+/// t-…-17 C5: why a reviewer-assignment repo could NOT be resolved to a single
+/// authoritative team. Both variants are operator-repair rejects (fail-closed): the
+/// dispatch's `source_repo` must map to EXACTLY ONE team so the sole-orchestrator
+/// ACL has an unambiguous authority.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TeamAuthorityError {
+    /// No team's `source_repo` canonicalizes to the dispatch repo slug.
+    NoMatch,
+    /// `n` (≥2) teams share the same canonical `source_repo` — ambiguous authority.
+    Ambiguous(usize),
+}
+
+/// t-…-17 C5: resolve the team that OWNS `repo_slug` for the reviewer-assignment
+/// authority ACL. Each team's `source_repo` is canonicalized through the SAME
+/// provider-neutral normalizer the dispatch side uses
+/// ([`crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source`]) — the
+/// lockstep invariant, so a repo that resolves on the dispatch side matches its
+/// team here. Requires EXACTLY ONE match: 0 or ≥2 ⇒ `Err` (operator repair). The
+/// caller then enforces the sole-current-orchestrator authority on the returned
+/// team (there is NO operator-allow branch). Fresh (`load_fleet`) read = live fleet.
+pub fn resolve_team_by_source_repo(
+    home: &Path,
+    repo_slug: &str,
+) -> Result<Team, TeamAuthorityError> {
+    let mut matches: Vec<Team> = list_all(home)
+        .into_iter()
+        .filter(|t| {
+            t.source_repo
+                .as_ref()
+                .and_then(|p| {
+                    crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(p)
+                })
+                .as_deref()
+                == Some(repo_slug)
+        })
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(TeamAuthorityError::NoMatch),
+        n => Err(TeamAuthorityError::Ambiguous(n)),
+    }
+}
+
 /// Check if `caller` is the orchestrator of any team that `member` belongs to.
 pub fn is_orchestrator_of(home: &Path, caller: &str, member: &str) -> bool {
     let fleet = load_fleet(home);

@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) mod assignment_reconcile;
 pub(crate) mod backend_exit_detection;
 pub(crate) mod canonical_heartbeat;
 pub(crate) mod check_schedules;
@@ -76,6 +77,7 @@ pub(crate) mod watchdog;
 pub(crate) mod workspace_boundary_sweep;
 pub(crate) mod worktree_registry_sweep;
 
+pub(crate) use assignment_reconcile::AssignmentReconcileHandler;
 pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
@@ -413,6 +415,15 @@ pub(crate) fn build_default_handlers(
         Box::new(CheckSchedulesHandler::new()),
         Box::new(CiWatchPollHandler::new()),
         Box::new(PrStateScanHandler::new()),
+        // t-…-17 C12: reconcile the durable reviewer-assignment authority every tick
+        // (~10s). Registered right AFTER PrStateScanHandler so, within a tick, it
+        // sees the terminal markers the scanner's A7 wire just wrote (the marker
+        // write is idempotent + persistent, so ordering is an optimization, not a
+        // correctness dependency — the reconciler's A10a restart-repair converges
+        // regardless). Bounded work: one pass over the (few) active assignment
+        // branches; a store with no reviewer assignments does a single empty
+        // read_dir. Runs in app mode too (the live daemon is app-mode).
+        Box::new(AssignmentReconcileHandler::new(1)),
         Box::new(InboxMaintenanceHandler::new(60)),
         // #2604: offline-target unread-obligation escalation. Same 60-tick
         // cadence as the inbox sweep it races — an offline/nonexistent target's

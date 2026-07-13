@@ -2,6 +2,7 @@
 //! schedule checking, health monitoring, Telegram notifications.
 
 pub(crate) mod anti_stall;
+pub(crate) mod assignment_authority;
 pub(crate) mod auto_release;
 pub(crate) mod boot_sweep;
 pub(crate) mod cadence_gate;

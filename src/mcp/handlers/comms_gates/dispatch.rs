@@ -15,6 +15,64 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// t-…-17 reviewer-assignment: the STRICT-typed principal that authored the code
+/// under review. `Agent` is a fleet instance in the SAME namespace as the reviewer
+/// target (so an `Agent(name) == target` marker is same-namespace self-review and
+/// is rejected); `External` is a forge login — a distinct principal type that is
+/// NEVER string-compared to the agent target (an agent reviewing external-authored
+/// code is legitimate). Parsed once, fail-closed, via [`parse_review_author`].
+// t-…-17 C8: `Serialize`/`Deserialize` are additive here so the durable
+// `ActiveAssignment` record (assignment_authority.rs) can persist the authenticated
+// author verbatim. The enum stays the single source of truth (no shadow copy); the
+// derive is a no-behavior-change addition to slice-1's typed principal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ReviewAuthor {
+    Agent(String),
+    External(String),
+}
+
+/// t-…-17: STRICT parse of `args["review_author"]`. It must be an object with
+/// EXACTLY ONE of the keys `{"agent", "external"}` whose value is a NONEMPTY
+/// string. Absent / JSON-null ⇒ `Ok(None)` (review_author is optional). Both keys,
+/// neither key, any extra key, a non-object, or an empty/non-string value ⇒
+/// `Err(reject Value)` — fail-closed, never a lenient default. Only invoked on the
+/// `review_assignment == true` path so a stray `review_author` on an ordinary
+/// dispatch is byte-identically ignored.
+pub(crate) fn parse_review_author(v: &Value) -> Result<Option<ReviewAuthor>, Value> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let invalid = || {
+        json!({
+            "error": "review_author must be an object with EXACTLY ONE of \
+                      {\"agent\": <name>} or {\"external\": <login>} and a non-empty string value",
+            "code": "review_author_invalid",
+        })
+    };
+    let obj = v.as_object().ok_or_else(invalid)?;
+    // len==1 rejects both-keys (2), any extra key (>=2), and neither (0) in one shot.
+    if obj.len() != 1 {
+        return Err(invalid());
+    }
+    let build =
+        |key: &str, ctor: fn(String) -> ReviewAuthor| -> Result<Option<ReviewAuthor>, Value> {
+            let s = obj
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(invalid)?;
+            Ok(Some(ctor(s.to_string())))
+        };
+    if obj.contains_key("agent") {
+        build("agent", ReviewAuthor::Agent)
+    } else if obj.contains_key("external") {
+        build("external", ReviewAuthor::External)
+    } else {
+        // single key, but neither agent nor external.
+        Err(invalid())
+    }
+}
+
 /// Scalars derived during the pre-check pass that the downstream pipeline
 /// (message build, `force_meta`, lease auto-bind) reuses — returned here so
 /// they are derived exactly once.
@@ -29,6 +87,17 @@ pub(crate) struct DispatchPreChecks {
     /// off. Ignored when `task_id` already references an existing task (its
     /// plan_ack_required, if any, was fixed at that task's own create time).
     pub plan_ack_required: u64,
+    /// t-…-17: true when this dispatch carries the durable reviewer-assignment
+    /// marker (`args["review_assignment"] == true`). Gates the fail-closed marker
+    /// validation in `handle_delegate_task`; false ⇒ byte-identical legacy path.
+    pub review_assignment: bool,
+    /// t-…-17: the strict-typed code author (see [`ReviewAuthor`]). Parsed (and
+    /// fail-closed-validated) ONLY when `review_assignment` is true; `None`
+    /// otherwise or when the marker omits it.
+    pub review_author: Option<ReviewAuthor>,
+    /// t-…-17 (B18): the PR generation identity. Additive/raw here; the
+    /// mandatory-nonzero enforcement is the marker gate's step (a).
+    pub pr_number: Option<u64>,
 }
 
 /// Run the delegate-task pre-send gates in their exact short-circuit order.
@@ -154,15 +223,30 @@ pub(crate) fn run_dispatch_pre_checks(
         );
     }
 
+    // t-…-17 reviewer-assignment marker parse (additive; enforcement lives in the
+    // marker gate). `review_author` is strict-parsed ONLY on the marker path so a
+    // stray key on an ordinary dispatch stays byte-identical.
+    let review_assignment = args["review_assignment"].as_bool().unwrap_or(false);
+    let review_author = if review_assignment {
+        parse_review_author(&args["review_author"])?
+    } else {
+        None
+    };
+    let pr_number = args["pr_number"].as_u64();
+
     Ok(DispatchPreChecks {
         force,
         force_reason: force_reason.map(String::from),
         second_reviewer,
         plan_ack_required,
+        review_assignment,
+        review_author,
+        pr_number,
     })
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -340,6 +424,85 @@ mod tests {
             err.get("error").is_none(),
             "must be the busy payload, not the second_reviewer error: {err}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── t-…-17 (T8): review_author STRICT typed parse ──
+
+    /// A well-formed single-key `review_author` parses to the matching typed
+    /// variant; a JSON-null / absent value is `None` (review_author is optional).
+    #[test]
+    fn review_author_wellformed_parses_typed() {
+        assert_eq!(
+            parse_review_author(&json!({"agent": "dev-1"})).unwrap(),
+            Some(ReviewAuthor::Agent("dev-1".to_string()))
+        );
+        assert_eq!(
+            parse_review_author(&json!({"external": "octocat"})).unwrap(),
+            Some(ReviewAuthor::External("octocat".to_string()))
+        );
+        // typed distinction: Agent(x) != External(x).
+        assert_ne!(
+            parse_review_author(&json!({"agent": "x"})).unwrap(),
+            parse_review_author(&json!({"external": "x"})).unwrap()
+        );
+        // absent / null ⇒ None.
+        assert_eq!(parse_review_author(&Value::Null).unwrap(), None);
+        assert_eq!(parse_review_author(&json!(null)).unwrap(), None);
+    }
+
+    /// Fail-closed: both keys, neither key, an extra key, a non-object, or an
+    /// empty/non-string value ⇒ a structured reject (never a lenient default).
+    #[test]
+    fn review_author_strict_rejects_malformed() {
+        for bad in [
+            json!({"agent": "a", "external": "b"}), // both
+            json!({}),                              // neither
+            json!({"agent": "a", "extra": 1}),      // extra key
+            json!({"reviewer": "a"}),               // single wrong key
+            json!({"agent": ""}),                   // empty value
+            json!({"agent": 7}),                    // non-string value
+            json!("dev-1"),                         // non-object
+            json!(["dev-1"]),                       // non-object
+        ] {
+            let err = parse_review_author(&bad).expect_err(&format!("must reject {bad}"));
+            assert_eq!(err["code"], "review_author_invalid", "for {bad}: {err}");
+        }
+    }
+
+    /// The strict parse only runs on the marker path: an ordinary dispatch carrying
+    /// a malformed `review_author` is byte-identically ignored (no new rejection),
+    /// while the SAME malformed marker dispatch fails closed.
+    #[test]
+    fn review_author_strict_only_on_marker_path() {
+        let home = gate_home("marker-parse-scope");
+        // review_assignment absent ⇒ malformed review_author ignored, gates pass.
+        let ok = run(
+            &home,
+            &json!({"instance": "target", "review_author": {"agent": "a", "external": "b"}}),
+        )
+        .expect("non-marker dispatch must ignore review_author");
+        assert!(!ok.review_assignment);
+        assert!(ok.review_author.is_none());
+        // review_assignment=true ⇒ the same malformed review_author fails closed.
+        let err = run(
+            &home,
+            &json!({"instance": "target", "review_assignment": true, "review_author": {"agent": "a", "external": "b"}}),
+        )
+        .expect_err("marker dispatch must strict-parse review_author");
+        assert_eq!(err["code"], "review_author_invalid", "{err}");
+        // review_assignment=true + well-formed marker fields parse through.
+        let out = run(
+            &home,
+            &json!({"instance": "target", "review_assignment": true, "review_author": {"external": "octocat"}, "pr_number": 42}),
+        )
+        .expect("well-formed marker must pass pre-checks");
+        assert!(out.review_assignment);
+        assert_eq!(
+            out.review_author,
+            Some(ReviewAuthor::External("octocat".to_string()))
+        );
+        assert_eq!(out.pr_number, Some(42));
         std::fs::remove_dir_all(&home).ok();
     }
 }

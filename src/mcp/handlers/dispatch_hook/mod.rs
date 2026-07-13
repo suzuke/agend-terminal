@@ -15,6 +15,9 @@ mod live_binding;
 mod provider_neutral_slug;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
+// t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
+// repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
+pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across
@@ -1022,6 +1025,44 @@ fn derive_repo_from_remote(source_repo: &std::path::Path) -> Option<String> {
     }
     let url = String::from_utf8(output.stdout).ok()?;
     parse_github_owner_repo(&url)
+}
+
+/// t-…-17 C4 (fail-closed repo resolve): the canonical provider-neutral
+/// `owner/repo` for a reviewer-assignment dispatch. Resolution order:
+/// 1. an explicit `args["repository"]` (bare slug or forge URL) →
+///    [`provider_neutral_slug::canonicalize_repo_slug_any_forge`];
+/// 2. otherwise the reviewer target's resolved `source_repo` (fleet/team tiers) →
+///    [`canonical_repo_slug_for_source`] (bare slug / URL / git `origin`).
+///
+/// Provider-neutral by construction (GitHub + Bitbucket + GitLab) — NOT the
+/// GitHub-only `derive_repo_from_remote`. Unresolvable ⇒ `Err(structured reject)`
+/// with NO default: a marker dispatch whose repo can't be pinned must fail closed
+/// (the repo is the ACL key in C5). `resolved_target` is the already-resolved
+/// reviewer instance name (deviation note: the plan sketched a `resolved`
+/// instance handle; the target NAME is what the gate holds, and it drives the same
+/// `resolve_source_repo` tiering the bind path uses).
+pub(crate) fn resolve_review_assignment_repo(
+    home: &Path,
+    args: &serde_json::Value,
+    resolved_target: &str,
+) -> Result<String, serde_json::Value> {
+    let unresolved = || {
+        serde_json::json!({
+            "error": "review_assignment rejected: could not resolve a canonical \
+                      owner/repo for the dispatch — set an explicit `repository=owner/repo` \
+                      or a team/instance `source_repo` (fail-closed, no default)",
+            "code": "review_assignment_repo_unresolved",
+        })
+    };
+    if let Some(repo) = args["repository"].as_str().filter(|s| !s.is_empty()) {
+        return provider_neutral_slug::canonicalize_repo_slug_any_forge(repo)
+            .ok_or_else(unresolved);
+    }
+    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|f| f.resolve_instance(resolved_target));
+    let (source_repo, _tier) = resolve_source_repo(home, resolved_target, None, resolved.as_ref());
+    canonical_repo_slug_for_source(&source_repo).ok_or_else(unresolved)
 }
 
 #[cfg(test)]

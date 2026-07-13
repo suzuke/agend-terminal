@@ -1626,6 +1626,7 @@ fn seed_drained_blocker(home: &std::path::Path, target: &str, kind: &str, corr: 
         worktree_binding_required: None,
         pr_number: None,
         terminal: None,
+        delivery_nonce: None,
     };
     crate::inbox::enqueue(home, target, msg).expect("seed blocker");
 }
@@ -1723,6 +1724,7 @@ fn b3_codex_report_keeps_absorption_when_blocker_undrained() {
         worktree_binding_required: None,
         pr_number: None,
         terminal: None,
+        delivery_nonce: None,
     };
     msg.read_at = None;
     crate::inbox::enqueue(&home_path, "codex-agent", msg).expect("seed");
