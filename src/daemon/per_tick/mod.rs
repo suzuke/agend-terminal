@@ -45,6 +45,7 @@ pub(crate) mod assignment_reconcile;
 pub(crate) mod backend_exit_detection;
 pub(crate) mod canonical_heartbeat;
 pub(crate) mod check_schedules;
+pub(crate) mod checkout_txn_recover;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
@@ -484,6 +485,9 @@ pub(crate) fn build_default_handlers(
         // already-dead workers. Runs in app mode too (not allowlisted out); the
         // live daemon is app-mode. Idle cost: one read of a usually-tiny JSON sidecar.
         Box::new(EphemeralReapHandler::new(6)),
+        // #2755: retry stuck checkout-transaction rollbacks (backoff-governed;
+        // shares the boot-repair callable — no dedicated worker).
+        Box::new(checkout_txn_recover::CheckoutTxnRecoverHandler::new(60)),
         // #2549 W5: ContextAlertHandler (operator-directed: every 6 ticks
         // ~1min, ≥80% orchestrator alert) and ContextHandoffHandler (#2007
         // context-full safety net: every 6 ticks, 85% one-shot

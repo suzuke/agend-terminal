@@ -454,3 +454,167 @@ fn txn_rollback_failed_remove_fail_retains() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── recover_pending_sweep (shared boot+periodic callable — injected closures) ─
+
+use super::checkout_txn::recover_pending_sweep;
+
+fn save_pending_journal(
+    home: &std::path::Path,
+    mangled: &str,
+    attempts: u32,
+    deadline: chrono::DateTime<chrono::Utc>,
+) {
+    let mut j = sample_journal();
+    j.advance(Phase::SubmodulesReady);
+    j.rollback_pending = true;
+    j.attempts = attempts;
+    j.next_attempt_at = Some(deadline.to_rfc3339());
+    j.save(home, mangled).unwrap();
+}
+
+/// No transaction area ⇒ sweep resolves nothing.
+#[test]
+fn txn_sweep_empty_area_is_zero() {
+    let home = tmp_home("sweep-empty");
+    let n = recover_pending_sweep(&home, fixed_now(), |_| true, |_| {});
+    assert_eq!(n, 0);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A DUE pending rollback whose worktree removes is resolved + cleared.
+#[test]
+fn txn_sweep_due_remove_ok_clears() {
+    let home = tmp_home("sweep-ok");
+    save_pending_journal(&home, "m", 1, fixed_now() - chrono::Duration::seconds(1));
+    let n = recover_pending_sweep(&home, fixed_now(), |_| true, |_| {});
+    assert_eq!(n, 1);
+    assert!(Journal::load(&home, "m").is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A NOT-yet-due pending rollback is left untouched (backoff respected).
+#[test]
+fn txn_sweep_not_due_is_skipped() {
+    let home = tmp_home("sweep-notdue");
+    save_pending_journal(&home, "m", 1, fixed_now() + chrono::Duration::seconds(60));
+    let removed = std::cell::Cell::new(false);
+    let n = recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| {
+            removed.set(true);
+            true
+        },
+        |_| {},
+    );
+    assert_eq!(n, 0);
+    assert!(!removed.get(), "not-due journal is not touched");
+    assert!(Journal::load(&home, "m").is_some(), "journal retained");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A due rollback whose remove FAILS is re-armed (attempts bump) and not cleared.
+#[test]
+fn txn_sweep_remove_fail_rearms() {
+    let home = tmp_home("sweep-fail");
+    save_pending_journal(&home, "m", 0, fixed_now() - chrono::Duration::seconds(1));
+    let n = recover_pending_sweep(&home, fixed_now(), |_| false, |_| {});
+    assert_eq!(n, 0);
+    let j = Journal::load(&home, "m").expect("retained");
+    assert!(
+        j.rollback_pending && j.attempts >= 1,
+        "re-armed for a later retry"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The INTERVENTION audit fires ONCE when a stuck journal crosses the ceiling and
+/// is NOT re-emitted on subsequent sweeps of the same still-stuck journal.
+#[test]
+fn txn_sweep_intervention_audit_deduped() {
+    let home = tmp_home("sweep-audit");
+    // attempts=9 ⇒ next arm's backoff hits the ceiling ⇒ flips into intervention.
+    save_pending_journal(&home, "m", 9, fixed_now() - chrono::Duration::seconds(1));
+    let count = std::cell::Cell::new(0);
+    recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| false,
+        |_| count.set(count.get() + 1),
+    );
+    assert_eq!(count.get(), 1, "audit once on ENTERING intervention");
+
+    // Make it due again; still stuck + already in intervention ⇒ no re-audit.
+    let mut j = Journal::load(&home, "m").unwrap();
+    assert!(j.intervention, "now in intervention");
+    j.next_attempt_at = Some((fixed_now() - chrono::Duration::seconds(1)).to_rfc3339());
+    j.save(&home, "m").unwrap();
+    recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| false,
+        |_| count.set(count.get() + 1),
+    );
+    assert_eq!(
+        count.get(),
+        1,
+        "deduped — no re-audit while already in intervention"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The typed path-lock guard carries the normalized TARGET-PATH identity and
+/// revalidates against a path (the forward API Slice A will require on bind_full).
+#[test]
+fn txn_path_lock_guard_carries_identity() {
+    let home = tmp_home("pathlock");
+    let wt = home.join("worktrees").join("agent-src");
+    std::fs::create_dir_all(&wt).unwrap();
+    let g = super::checkout_txn::acquire_path_lock(&home, &wt, "agent-src").expect("acquire");
+    assert_eq!(g.mangled(), "agent-src", "mangled metadata preserved");
+    assert_eq!(g.target(), super::checkout_txn::normalize_target(&wt));
+    assert!(g.guards(&wt), "revalidates its own target path");
+    assert!(
+        !g.guards(&home.join("worktrees").join("other")),
+        "rejects a different target path"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Alias spellings (`.`-containing, symlink) of the SAME real worktree normalize
+/// to the SAME lock identity, so checkout/bind/release/GC mutually exclude on that
+/// path however it is spelled; distinct paths key distinctly. (Under the old
+/// (instance,source) mangled key these aliases would key DIFFERENTLY — the RED.)
+#[test]
+fn txn_normalize_target_aliases_share_identity() {
+    use super::checkout_txn::normalize_target;
+    let home = tmp_home("alias");
+    let real = home.join("worktrees").join("realwt");
+    std::fs::create_dir_all(&real).unwrap();
+
+    let via_dot = home.join("worktrees").join(".").join("realwt");
+    assert_eq!(
+        normalize_target(&real),
+        normalize_target(&via_dot),
+        "`.`-alias normalizes to the same identity"
+    );
+    #[cfg(unix)]
+    {
+        let link = home.join("worktrees").join("linkwt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            normalize_target(&real),
+            normalize_target(&link),
+            "symlink normalizes to its canonical target ⇒ same lock identity"
+        );
+    }
+    let other = home.join("worktrees").join("otherwt");
+    std::fs::create_dir_all(&other).unwrap();
+    assert_ne!(
+        normalize_target(&real),
+        normalize_target(&other),
+        "distinct paths keep distinct identities"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

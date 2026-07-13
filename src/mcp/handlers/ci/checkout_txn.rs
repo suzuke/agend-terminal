@@ -12,10 +12,12 @@
 //! - **Committed is the durable linearization point**: the caller returns
 //!   success ONLY after a `Committed` journal is durably written
 //!   ([`store::atomic_write`]); a write failure aborts into rollback.
-//! - The journal + its provisioning lock live OUTSIDE the worktree, in a
-//!   daemon-owned area keyed by the SAME mangled `<instance>-<source>` path the
-//!   worktree uses — so a `remove --force` of the worktree can never delete the
-//!   recovery record, and a stable key lets a restart find pending work.
+//! - The journal (keyed by the `<instance>-<source>` mangled name) and its
+//!   provisioning lock (keyed by the NORMALIZED target PATH, so any consumer —
+//!   checkout/bind/release/GC — derives the same domain from the path alone) live
+//!   OUTSIDE the worktree in a daemon-owned area — so a `remove --force` of the
+//!   worktree can never delete the recovery record, and a stable key lets a
+//!   restart find pending work.
 //! - **CAS-by-nonce**: each provisioning attempt stamps a unique `nonce`; a
 //!   replayer compares it to distinguish "my in-flight attempt" from a stale
 //!   record left by a previous process.
@@ -153,6 +155,23 @@ impl Journal {
         self.attempts = self.attempts.saturating_add(1);
     }
 
+    /// Is a pending rollback due to retry at `now`? A deadline that is absent or
+    /// unparseable is treated as due (fail-forward — never strand a recoverable
+    /// worktree behind a corrupt timestamp).
+    pub(crate) fn rollback_due(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if !self.rollback_pending {
+            return false;
+        }
+        match self
+            .next_attempt_at
+            .as_deref()
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        {
+            Some(d) => now >= d.with_timezone(&chrono::Utc),
+            None => true,
+        }
+    }
+
     /// Durably persist (temp+fsync+rename+dir-fsync via [`store::atomic_write`]).
     pub(crate) fn save(&self, home: &Path, mangled: &str) -> anyhow::Result<()> {
         crate::store::save_atomic(&journal_path(home, mangled), self)
@@ -182,22 +201,113 @@ pub(crate) fn journal_path(home: &Path, mangled: &str) -> PathBuf {
     txn_root(home).join(mangled).join("journal.json")
 }
 
-/// Provisioning lock file for `mangled` — the INNER per-worktree-path flock
-/// (branch-lease is the OUTER lock). Kept outside the mangled subdir so it is
-/// not swept with the journal.
-pub(crate) fn lock_path(home: &Path, mangled: &str) -> PathBuf {
-    txn_root(home).join(format!("{mangled}.lock"))
+/// Normalize an absolute worktree TARGET path into the stable identity used as
+/// the CROSS-CONSUMER lock domain (checkout / bind / release / GC all key off the
+/// same real path, regardless of naming scheme). Canonicalize when the path
+/// EXISTS (release/GC — resolves symlinks / `.` / `..`); otherwise (checkout,
+/// pre-creation) canonicalize the PARENT and re-append the basename, so the same
+/// real path yields the same identity whether or not the worktree is
+/// materialized yet.
+pub(crate) fn normalize_target(target: &Path) -> String {
+    if let Ok(c) = target.canonicalize() {
+        return c.to_string_lossy().into_owned();
+    }
+    match (target.parent(), target.file_name()) {
+        (Some(parent), Some(name)) => {
+            let base = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
+            base.join(name).to_string_lossy().into_owned()
+        }
+        _ => target.to_string_lossy().into_owned(),
+    }
 }
 
-/// Acquire the INNER per-worktree-path provisioning flock (blocking). Held across
-/// the whole provision so two attempts on the SAME mangled path serialize.
-/// Released before the OUTER branch-lease (inner-first) by dropping this guard
-/// first at the call site.
+/// A filesystem-safe, bounded lock-file NAME for a normalized target path —
+/// STABLE (same across processes of one binary, so any consumer derives the same
+/// lock file from the path alone) and collision-RESISTANT (a hash, not a
+/// bijection — the AUTHORITATIVE path identity is the guard's `normalize_target`
+/// string, revalidated on use; the hash only names the lock file). A hash reseed
+/// across a binary upgrade merely orphans idle lock files; the DURABLE journal is
+/// keyed separately by the human-readable `mangled`.
+fn path_lock_key(normalized: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, normalized.as_bytes());
+    format!("wtpath-{:016x}", std::hash::Hasher::finish(&h))
+}
+
+/// The CANONICAL per-worktree-path lock file, keyed by the NORMALIZED target
+/// PATH (not the naming scheme). Kept outside the journal subdir so it is not
+/// swept with the journal. The single shared lock file for any op that mutates
+/// the worktree at this path — checkout today; a follow-up repo-release reuses it
+/// to serialize delete against checkout on the SAME path. Do not fork a private
+/// per-op lock file.
+pub(crate) fn lock_path(home: &Path, normalized_target: &str) -> PathBuf {
+    txn_root(home).join(format!("{}.lock", path_lock_key(normalized_target)))
+}
+
+/// A held per-worktree-path provisioning lock PLUS the NORMALIZED target-path
+/// identity it guards — a TYPED proof, not a bare flock, so a holder can
+/// REVALIDATE that the lock it holds matches the exact path it is about to
+/// mutate. The flock releases when this guard drops (RAII), so simply holding it
+/// serializes the path. `mangled` is retained as `(instance, source)` metadata
+/// (the journal key), but the lock DOMAIN is the normalized path (`target`).
+///
+/// #2755's checkout only HOLDS this guard. The identity/revalidate accessors are
+/// the forward API that Slice A (t-20260713082228621780-70517-26) will require on
+/// `bind_full` (pass the proof, assert identity before writing the binding);
+/// `allow(dead_code)` stands until that consumer lands.
+#[allow(dead_code)] // fields/accessors consumed by Slice A (t-…70517-26)
+pub(crate) struct PathLockGuard {
+    target: String,
+    mangled: String,
+    _flock: crate::store::FileFlockGuard,
+}
+
+#[allow(dead_code)] // accessors consumed by Slice A (t-…70517-26); #2755 holds only
+impl PathLockGuard {
+    /// The normalized absolute target-path lock domain this guard holds.
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// The `(instance, source)` mangled journal key (metadata; NOT the lock domain).
+    pub(crate) fn mangled(&self) -> &str {
+        &self.mangled
+    }
+
+    /// Re-resolve / revalidate: does this held lock guard the worktree at
+    /// `target_path`? A holder normalizes the path it is about to mutate and
+    /// asserts identity before mutating.
+    pub(crate) fn guards(&self, target_path: &Path) -> bool {
+        normalize_target(target_path) == self.target
+    }
+}
+
+/// Acquire the canonical per-worktree-path provisioning lock (blocking), keyed by
+/// the NORMALIZED `worktree_dir` PATH — crate-reusable across worktree-mutating
+/// ops on the same real path (checkout now; repo-release next — do NOT duplicate
+/// this API privately). `mangled` is carried as the journal metadata key.
+///
+/// Fleet lock order (acquire outer→inner, release inner→outer):
+/// branch-lease flock (`binding::acquire_branch_lease_lock`, OUTER, bind-only) →
+/// THIS per-path flock (serializes one worktree PATH for bind AND non-bind; the
+/// SOLE lock when `bind:false`) → binding-write lock (`.binding.json.lock`,
+/// inside `bind_full`, INNER). Held across the whole provision; the caller
+/// declares this guard AFTER the branch-lease guard so it drops (releases) first
+/// — inner-first.
 pub(crate) fn acquire_path_lock(
     home: &Path,
+    worktree_dir: &Path,
     mangled: &str,
-) -> anyhow::Result<crate::store::FileFlockGuard> {
-    crate::store::acquire_file_lock(&lock_path(home, mangled))
+) -> anyhow::Result<PathLockGuard> {
+    let target = normalize_target(worktree_dir);
+    let flock = crate::store::acquire_file_lock(&lock_path(home, &target))?;
+    Ok(PathLockGuard {
+        target,
+        mangled: mangled.to_string(),
+        _flock: flock,
+    })
 }
 
 /// Exponential rollback backoff for retry `attempts` (0-based): 2^attempts
@@ -285,4 +395,82 @@ pub(crate) fn recover_stale(
             if j.intervention { ", INTERVENTION" } else { "" }
         ))
     }
+}
+
+/// Drive every DUE pending rollback across all checkout-transaction journals.
+///
+/// The ONE shared callable for BOTH boot-repair and a periodic tick (there is no
+/// dedicated worker — the caller decides cadence). For each journal that is
+/// `rollback_pending` and past its `next_attempt_at`, re-attempt the worktree
+/// `remove`: clear on success; otherwise re-arm (exponential backoff) and, the
+/// FIRST time a journal crosses into the INTERVENTION ceiling, emit a deduped
+/// operator-visible `audit` (subsequent sweeps of the same stuck journal do NOT
+/// re-emit). `remove`/`audit` are injected so the sweep is unit-testable without
+/// live git. Returns the count of journals resolved (worktree removed) this pass.
+pub(crate) fn recover_pending_sweep(
+    home: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    remove: impl Fn(&Journal) -> bool,
+    mut audit: impl FnMut(&Journal),
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(txn_root(home)) else {
+        return 0; // no transaction area yet ⇒ nothing pending
+    };
+    let mut resolved = 0;
+    for entry in entries.flatten() {
+        // Journal lives at <root>/<mangled>/journal.json; the sibling
+        // <mangled>.lock files load as None and are skipped.
+        let Some(mangled) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(mut j) = Journal::load(home, &mangled) else {
+            continue;
+        };
+        if !j.rollback_pending || !j.rollback_due(now) {
+            continue;
+        }
+        if remove(&j) {
+            Journal::clear(home, &mangled);
+            resolved += 1;
+        } else {
+            let was_intervention = j.intervention;
+            j.arm_rollback(now);
+            if j.intervention && !was_intervention {
+                audit(&j); // deduped: only on ENTERING intervention
+            }
+            let _ = j.save(home, &mangled);
+        }
+    }
+    resolved
+}
+
+/// Production entry to [`recover_pending_sweep`] — the ONE shared callable invoked
+/// from BOTH boot-repair (`bootstrap::boot_hygiene_sweeps`) and the per-tick
+/// recovery handler (no dedicated worker). Supplies the real `git worktree remove
+/// --force` (run in each journal's recorded source repo) and the operator-visible
+/// INTERVENTION audit (`event_log`). Returns the count resolved this pass.
+pub(crate) fn recover_pending_sweep_prod(home: &Path) -> usize {
+    recover_pending_sweep(
+        home,
+        chrono::Utc::now(),
+        |j| {
+            crate::git_helpers::git_bypass(
+                Path::new(&j.source_repo),
+                &["worktree", "remove", "--force", &j.worktree_path],
+            )
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        },
+        |j| {
+            crate::event_log::log(
+                home,
+                "checkout_txn_intervention",
+                "checkout_txn",
+                &format!(
+                    "stuck checkout-worktree rollback entered INTERVENTION after {} attempts: {}",
+                    j.attempts, j.worktree_path
+                ),
+            );
+        },
+    )
 }

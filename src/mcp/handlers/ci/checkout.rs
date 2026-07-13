@@ -240,7 +240,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string();
-    let _path_lock = match super::checkout_txn::acquire_path_lock(home, &mangled) {
+    let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
         Ok(g) => g,
         Err(e) => {
             return json!({
@@ -250,6 +250,16 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             })
         }
     };
+    // #2755: revalidate the held lock still maps to the EXACT target path we are
+    // about to mutate, BEFORE any side effect (fail-closed; the pattern Slice A
+    // extends to bind_full). The authority is the guard's normalized path.
+    if !path_lock.guards(&worktree_dir) {
+        return json!({
+            "error": "provisioning lock identity does not match the target worktree path",
+            "code": "path_lock_identity",
+            "branch": branch,
+        });
+    }
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path so the fresh
     // `git worktree add` below cannot collide with a stale worktree.

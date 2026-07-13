@@ -20,7 +20,10 @@ mod source_resolve;
 // the re-exports below preserve EVERY `ci::handle_*` path used by dispatch.rs and
 // every `super::*` path used by the child `tests` module (zero caller/test edits).
 mod checkout;
-mod checkout_txn;
+// #2755: pub(crate) so the daemon per-tick + boot-repair recovery can reach the
+// shared `recover_pending_sweep_prod` (checkout provisioning is in `ci`, the
+// recovery driver is in `daemon`/`bootstrap`).
+pub(crate) mod checkout_txn;
 mod cleanup;
 mod merge;
 mod release;
