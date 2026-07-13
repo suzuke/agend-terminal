@@ -344,7 +344,8 @@ pub fn git_managed_fixture(home: &Path, repo_dir: &Path, args: &[&str]) -> Outpu
 
 /// Write the [`git_managed_fixture`] ownership sentinel into `home` for THIS process
 /// (the single source of the exact PID format the guard verifies). The sanctioned e2e
-/// calls this once, atomically, BEFORE the daemon starts.
+/// calls this once, BEFORE the daemon starts — a synchronous write that completes before
+/// any reader exists (no atomic rename needed; malformed contents fail closed in the guard).
 #[allow(dead_code)]
 pub fn write_fixture_owned_sentinel(home: &Path) {
     std::fs::write(

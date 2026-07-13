@@ -174,9 +174,10 @@ fn e2e_dispatch_review_workflow_seam_invariants_1900() {
         "hermetic: the e2e home must be under the tmp dir, got {}",
         home.display()
     );
-    // (d-68) Ownership sentinel for git_managed_fixture, written atomically into the
-    // fresh unique home BEFORE the daemon starts — so the ONLY process permitted to drive
-    // real git against the daemon-created managed mock-dev worktree is THIS test process.
+    // (d-68) Ownership sentinel for git_managed_fixture, written into the fresh unique home
+    // BEFORE the daemon starts — a synchronous write completed before any reader exists — so
+    // the ONLY process permitted to drive real git against the daemon-created managed mock-dev
+    // worktree is THIS test process.
     git_isolated::write_fixture_owned_sentinel(&home);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_scenario(&home)));
