@@ -4,16 +4,18 @@
 //!
 //! ## Bug 1 — daemon-side startup ordering race
 //!
-//! Before #879v4, `daemon::run_core` spawned all queued agents BEFORE starting
-//! the `api::serve` thread (src/daemon/mod.rs:452-483). With N agents and the
-//! default 500 ms spawn stagger, `api.port` could be missing for ~N×500 ms +
-//! tens of ms while the agents' MCP bridges were already trying to connect.
+//! Before #879v4, `daemon::run_core` spawned all queued agents BEFORE publishing
+//! `api.port`. With N agents each agent's MCP bridge could race against a missing
+//! `api.port` file. The C1 reorder makes `daemon::run_core` publish `api.port`
+//! (via `init_daemon_services`) BEFORE `spawn_fleet_agents`.
 //!
-//! The RED test asserts `api.port` is published within a budget that's strictly
-//! smaller than the agent-spawn loop's wall time. On main (HEAD = fe528c1, the
-//! revert of #903) the test fails because the loop completes before
-//! `api::serve` binds; after the C1 reorder it passes because the API server
-//! starts before any agent is spawned.
+//! The test measures this CAUSALLY, not by wall time: each agent runs a helper
+//! that records — at its first start — whether `AGEND_HOME/run/*/api.port` already
+//! exists, then stays alive. We assert every agent observed it (`1`). Under the
+//! legacy agents-first ordering the first agents observe no `api.port` (`0` → RED);
+//! under C1 every agent observes it (`1` → GREEN). Because the evidence is ORDER,
+//! not elapsed time, a slow CI runner cannot flip the result — the fragile 1500 ms
+//! wall-clock budget it replaces false-RED'd on a 1.607 s macOS run (#29281799014).
 //!
 //! ## Bug 2 — bridge silent-degrade on tools/list error
 //!
@@ -66,29 +68,67 @@ fn agend_binary() -> PathBuf {
     path
 }
 
-/// Scan `$AGEND_HOME/run/*` for the first run-dir containing `api.port`.
-/// Mirrors `agend-mcp-bridge::find_run_dir` so the assertion uses the same
-/// discovery contract as a real bridge would.
+/// True while any member of process group `pgid` is alive (`kill(-pgid, 0)` → 0); false
+/// once none remain (`-1`/ESRCH).
 #[cfg(unix)]
-fn find_api_port(home: &std::path::Path) -> Option<PathBuf> {
-    let run_base = home.join("run");
-    let entries = std::fs::read_dir(&run_base).ok()?;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() && p.join("api.port").exists() {
-            return Some(p.join("api.port"));
-        }
-    }
-    None
+fn group_alive(pgid: i32) -> bool {
+    unsafe { libc::kill(-pgid, 0) == 0 }
 }
 
-/// Bug 1 contract: `api.port` MUST be published before the agent spawn loop
-/// completes. With N=3 agents and a 1000 ms stagger, the legacy ordering
-/// (agents-first) takes ~2 s before `api::serve` even starts; the budget here
-/// is 1500 ms so the test fails on main and passes after C1.
+/// Poll until process group `pgid` is fully reaped (`kill(-pgid, 0)` → ESRCH), bounded.
+#[cfg(unix)]
+fn poll_group_reaped(pgid: i32, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    while Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !group_alive(pgid)
+}
+
+/// SIGTERM → (bounded) SIGKILL a process group, then confirm it is reaped (ESRCH). An
+/// already-dead group counts as reaped — the daemon's graceful shutdown may already have
+/// reaped this PTY agent's session.
+#[cfg(unix)]
+fn reap_group(pgid: i32) -> bool {
+    if !group_alive(pgid) {
+        return true;
+    }
+    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    if poll_group_reaped(pgid, Duration::from_secs(3)) {
+        return true;
+    }
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    poll_group_reaped(pgid, Duration::from_secs(5))
+}
+
+/// Bug 1 contract (CAUSAL, not wall-clock): the daemon MUST publish `api.port` before it
+/// spawns any agent — i.e. before EVERY agent's FIRST start. Each agent runs a helper that
+/// records whether `AGEND_HOME/run/*/api.port` already exists, then stays alive (`exec
+/// sleep`) so it is never respawned. Each agent writes its OWN marker (keyed by
+/// `AGEND_INSTANCE_NAME`) exactly once — a temp+rename, so the poller only ever reads a
+/// COMPLETE marker. We poll for all 3 markers with a GENEROUS liveness bound (not a
+/// correctness deadline) and assert every marker is `1`.
+///
+/// Under the legacy agents-first ordering the first agents observe NO api.port (`0` → RED);
+/// under C1 (`init_daemon_services` publishes api.port before `spawn_fleet_agents`,
+/// src/daemon/mod.rs run_core) every agent observes it (`1` → GREEN). The evidence is
+/// ORDER, not elapsed time, so a slow CI runner cannot flip it — replacing the fragile
+/// 1500 ms budget that false-RED'd on a 1.607 s macOS run (#29281799014).
+///
+/// Teardown must reap TWO kinds of group: portable-pty 0.9.0 (src/unix.rs:257) runs
+/// `setsid()` on every spawned agent, so each PTY helper is its OWN session/pgid, NOT a
+/// member of the daemon's group. The daemon runs under `setsid` in `pre_exec` (pid == pgid);
+/// each helper records its own `$$` (its session pgid) before `exec sleep`. Teardown
+/// SIGTERM/SIGKILLs the daemon group AND each recorded agent pgid, and PROVES every one is
+/// reaped (`kill(-pgid, 0)` → ESRCH) before removing the tempdir (harness_smoke pattern).
 #[cfg(unix)]
 #[test]
-fn api_port_published_before_agent_spawn_loop_completes() {
+fn api_port_published_before_every_agent_first_start() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     let bin = agend_binary();
     let tmp = std::env::temp_dir().join(format!(
         "agend-879v4-daemon-order-{}-{}",
@@ -99,56 +139,178 @@ fn api_port_published_before_agent_spawn_loop_completes() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&tmp).unwrap();
+    let markers = tmp.join("agend-markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    // Per-agent session pgid markers: portable-pty setsid's each agent, so teardown must reap
+    // each agent's OWN session group (recorded below) independently of the daemon group.
+    let pgids = tmp.join("agend-pgids");
+    std::fs::create_dir_all(&pgids).unwrap();
 
-    let start = Instant::now();
-    let mut child = Command::new(&bin)
-        .arg("start")
+    // Each agent's command is a first-start observer. It (1) records its own `$$` — portable-
+    // pty 0.9.0 (src/unix.rs:257) runs setsid() per spawn, so this helper is its session
+    // leader and `$$` == its PGID, which the following `exec sleep` preserves — then (2)
+    // records whether api.port already exists, then `exec sleep` to stay alive (never
+    // respawned). Each marker is keyed by AGEND_INSTANCE_NAME (unique per agent, single
+    // writer) and published via temp+rename so the poller only reads a COMPLETE marker. PATH
+    // is set explicitly because agent-backend env isolation may clear it.
+    //
+    // `set -eu` is LOAD-BEARING: the helper must NEVER reach `exec sleep` (stay alive) without
+    // first publishing a VALID pgid marker — otherwise a failed pgid write would leave an
+    // unreapable orphan while Rust fails closed on the missing pgid. So the pgid write is split
+    // into separate statements (a bare `A && B` short-circuit can be treated as a tested
+    // condition and NOT trip `set -e`); a failure exits BEFORE `exec sleep`. `set -u` also
+    // fail-fasts on an unset AGEND_HOME/AGEND_INSTANCE_NAME. The `ls` stays inside the `if`, so
+    // a glob miss (no api.port yet) yields v=0 rather than exiting.
+    let helper = tmp.join("first-start-observer.sh");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\n\
+         set -eu\n\
+         PATH=/bin:/usr/bin; export PATH\n\
+         n=\"$AGEND_INSTANCE_NAME\"; h=\"$AGEND_HOME\"\n\
+         printf '%s' \"$$\" > \"$h/agend-pgids/$n.tmp.$$\"\n\
+         mv \"$h/agend-pgids/$n.tmp.$$\" \"$h/agend-pgids/$n\"\n\
+         if ls \"$h\"/run/*/api.port >/dev/null 2>&1; then v=1; else v=0; fi\n\
+         printf '%s' \"$v\" > \"$h/agend-markers/$n.tmp.$$\"\n\
+         mv \"$h/agend-markers/$n.tmp.$$\" \"$h/agend-markers/$n\"\n\
+         exec sleep 3600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let agent = |n: &str| format!("{n}:{}", helper.display());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("start")
         .arg("--foreground")
-        .args(["--agents", "t1:/bin/sh"])
-        .args(["--agents", "t2:/bin/sh"])
-        .args(["--agents", "t3:/bin/sh"])
+        .args(["--agents", &agent("t1")])
+        .args(["--agents", &agent("t2")])
+        .args(["--agents", &agent("t3")])
         .env("AGEND_HOME", &tmp)
-        // Pin the stagger so the legacy agents-first ordering takes a
-        // deterministic ~2 s; the C1 reorder makes `api.port` appear
-        // independently of this.
-        .env("AGEND_SPAWN_STAGGER_MS", "1000")
-        // Disable any background work that could compete for startup time
-        // and inflate the legacy budget (false positives), and silence
-        // logs going to a real $HOME log dir.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn agend-terminal daemon");
+        // stderr → null: the daemon logs to a file, early-exit diagnostics are not the
+        // asserted contract, and a piped-but-undrained stderr could fill and deadlock the
+        // daemon over the 30 s liveness window.
+        .stderr(Stdio::null());
+    // Own process group so teardown can reap the daemon and its SAME-GROUP descendants via
+    // `kill(-pgid, …)`. The PTY agents setsid into their OWN groups (portable-pty unix.rs:257),
+    // so they are NOT in this group — they are reaped SEPARATELY below via their recorded pgids.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn agend-terminal daemon");
+    let pgid = child.id() as i32; // setsid ⇒ pid == pgid
 
-    // Budget: well below 2 s (legacy wall time with N=3 + 1000 ms stagger)
-    // and well above the C1-reordered actual wall time (~50-200 ms even on
-    // slow CI). Poll cheaply so we don't add measurement noise.
-    let deadline = start + Duration::from_millis(1500);
-    let mut api_port_path: Option<PathBuf> = None;
-    while Instant::now() < deadline {
-        if let Some(p) = find_api_port(&tmp) {
-            api_port_path = Some(p);
+    // GENEROUS liveness bound — we wait for all 3 agents to START ONCE, not race a
+    // correctness deadline. The marker VALUES (not the timing) carry the ordering evidence.
+    let names = ["t1", "t2", "t3"];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !names.iter().all(|n| markers.join(n).exists()) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let observed: Vec<(&str, Option<String>)> = names
+        .iter()
+        .map(|n| {
+            let v = std::fs::read_to_string(markers.join(n))
+                .ok()
+                .map(|s| s.trim().to_string());
+            (*n, v)
+        })
+        .collect();
+
+    // Recorded PTY-agent session pgids (portable-pty setsid'd each — NOT in the daemon group).
+    // FAIL-CLOSED: read all 3 NAMED pgids; a missing/unreadable/malformed marker is kept as an
+    // Err so the no-orphan proof below PANICS on it rather than silently skipping that group.
+    // The helper writes the pgid marker before its value marker, so all 3 exist once liveness
+    // holds.
+    let agent_pgids: Vec<(&str, Result<i32, String>)> = names
+        .iter()
+        .map(|n| {
+            let r = std::fs::read_to_string(pgids.join(n))
+                .map_err(|e| format!("unreadable ({e})"))
+                .and_then(|s| {
+                    s.trim()
+                        .parse::<i32>()
+                        .map_err(|e| format!("malformed {s:?} ({e})"))
+                });
+            (*n, r)
+        })
+        .collect();
+
+    // Teardown, BOUNDED (a `wait()` before SIGKILL would be unbounded if TERM is ignored).
+    // (a) daemon group: SIGTERM, bounded loop watching the GROUP (`try_wait` clears the leader
+    //     zombie so it does not count), SIGKILL backstop, then a bounded `wait`.
+    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    let term_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let _ = child.try_wait();
+        if !group_alive(pgid) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        if Instant::now() >= term_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    let elapsed = start.elapsed();
-
-    // Best-effort teardown. SIGKILL is fine — the test owns the tempdir
-    // and OS releases the .daemon.lock file lock on process death.
-    let _ = child.kill();
+    // SIGKILL the daemon group only if it is still alive — signalling an already-reaped
+    // `-pgid` risks a pgid-reuse window hitting an unrelated group.
+    if group_alive(pgid) {
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
     let _ = child.wait();
+    let daemon_reaped = poll_group_reaped(pgid, Duration::from_secs(5));
+    // (b) each PTY agent's OWN session group (for the pgids we read). The daemon's graceful
+    //     shutdown / PTY-master close (SIGHUP) may already have reaped it (`reap_group` treats
+    //     an already-dead group as clean); otherwise this is the load-bearing reap of the
+    //     `exec sleep` helpers the daemon group does NOT contain.
+    let agent_reaped: Vec<(&str, Result<bool, String>)> = agent_pgids
+        .iter()
+        .map(|(n, r)| {
+            (
+                *n,
+                r.as_ref().map(|pg| reap_group(*pg)).map_err(|e| e.clone()),
+            )
+        })
+        .collect();
     let _ = std::fs::remove_dir_all(&tmp);
 
+    // No-orphan proof: the daemon group AND every one of the 3 NAMED PTY agent groups are
+    // proven reaped — a missing/malformed pgid FAILS the proof (never silently skipped).
     assert!(
-        api_port_path.is_some(),
-        "Bug 1: api.port MUST be published before the agent spawn loop completes. \
-         With N=3 agents at 1000ms stagger, the legacy agents-first ordering \
-         delays api.port by ~2s; this test budget is 1500ms. Elapsed: {elapsed:?}. \
-         Without C1 (api::serve spawn BEFORE agent loop in src/daemon/mod.rs), \
-         the agents' mcp-bridges race against an unwritten api.port file."
+        daemon_reaped,
+        "teardown left the daemon process group {pgid} alive (kill(-pgid,0) never hit ESRCH)"
     );
+    for (n, r) in &agent_reaped {
+        match r {
+            Ok(true) => {}
+            Ok(false) => panic!(
+                "teardown left agent {n}'s PTY session group alive — a helper `sleep` orphan survived"
+            ),
+            Err(e) => panic!(
+                "agent {n} session pgid marker {e} — cannot prove its group reaped (fail-closed)"
+            ),
+        }
+    }
+    // Liveness: every agent must have started once within the bound.
+    for (n, v) in &observed {
+        assert!(
+            v.is_some(),
+            "liveness: agent {n} did not start within 30s (marker missing) — observed: {observed:?}"
+        );
+    }
+    // Causal invariant: every agent observed api.port ALREADY PUBLISHED at its first start.
+    for (n, v) in &observed {
+        assert_eq!(
+            v.as_deref(),
+            Some("1"),
+            "Bug 1: agent {n} observed api.port MISSING at its FIRST start — the legacy \
+             agents-first ordering. init_daemon_services MUST publish api.port BEFORE \
+             spawn_fleet_agents (src/daemon/mod.rs run_core C1). observed: {observed:?}"
+        );
+    }
 }
 
 /// Bug 2 contract: when the daemon is unreachable, the bridge's `tools/list`
