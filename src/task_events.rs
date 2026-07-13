@@ -1283,6 +1283,86 @@ where
     Ok(Ok(seqs))
 }
 
+/// #2760 R2: append events that are **COMPUTED from the FRESH on-disk replay under
+/// the append lock**. Unlike [`append_batch_checked_at`] (which GATES a fixed event
+/// set with a precondition), `compute(&state)` both re-validates authorization AND
+/// builds the events against the authoritative committed history — so a caller can
+/// re-evaluate an ACL/governance policy, or build an idempotent UNION (e.g. the
+/// `plan_acks` list), against state that no concurrent writer can change between the
+/// decision and the write. This closes the authorization/predicate TOCTOU that a
+/// route-only revalidation leaves open (a caller that read state out-of-lock, then
+/// appended a stale-derived event, could lose a concurrent update).
+///
+/// `compute` returns `Err(reason)` to REFUSE (no write; `Ok(Err(reason))`), an EMPTY
+/// vec for a computed no-op (idempotent; `Ok(Ok(vec![]))`), or the events to append.
+/// The outer `Err` is reserved for IO/replay failures. No `api::call` under the lock
+/// (#1629) — `compute` must be pure decision + event construction.
+pub(crate) fn append_batch_computed_at<F>(
+    board: &Path,
+    instance: &InstanceName,
+    compute: F,
+) -> anyhow::Result<Result<Vec<u64>, String>>
+where
+    F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
+{
+    let instance = instance.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
+        Ok((id, _)) => Some(id.full()),
+        Err(e) => {
+            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
+            None
+        }
+    };
+
+    let mut rejection: Option<String> = None;
+    let mut seqs: Vec<u64> = Vec::new();
+    let mut hot_lines = 0usize;
+    let mut appended = 0usize;
+    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
+        // FRESH replay under the lock — authoritative committed history.
+        let state = replay_uncached(board)?;
+        let events = match compute(&state) {
+            Ok(events) => events,
+            Err(reason) => {
+                rejection = Some(reason);
+                return Ok(Vec::new()); // empty ⇒ no write
+            }
+        };
+        if events.is_empty() {
+            return Ok(Vec::new()); // computed no-op (e.g. already-acked)
+        }
+        let count = events.len();
+        appended = count;
+        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
+        hot_lines = pre_lines;
+        let mut lines = Vec::with_capacity(count);
+        for (i, event) in events.into_iter().enumerate() {
+            let seq = start_seq + i as u64;
+            seqs.push(seq);
+            let envelope = TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq,
+                timestamp: now.clone(),
+                instance: instance.clone(),
+                emitter_id: emitter_id.clone(),
+                event,
+            };
+            lines.push(serde_json::to_string(&envelope)?);
+        }
+        Ok(lines)
+    })?;
+
+    if let Some(reason) = rejection {
+        return Ok(Err(reason));
+    }
+    if appended > 0 {
+        invalidate_replay_cache();
+        maybe_compact_events(board, hot_lines + appended);
+    }
+    Ok(Ok(seqs))
+}
+
 /// Append `event` atomically iff `precondition` — evaluated under the append
 /// lock against a FRESH on-disk replay — returns `Ok`. This closes the TOCTOU
 /// where a caller validates task state, then appends after a concurrent writer

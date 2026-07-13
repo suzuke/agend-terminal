@@ -232,6 +232,32 @@ fn fire_before_cross_board_release_hook_for_test() {
     }
 }
 
+// #2760 R2 (root+independent REJECT of a542517b): test-only seam for the per-id
+// authority-mutation TOCTOU. Fires in the OUT-OF-LOCK window right before a mutation
+// (`ack_plan` / `metadata_set`) takes its per-id + board locks, so a test can
+// deterministically land a CONCURRENT mutation on the same id and prove the
+// under-lock recompute (ack UNION / fresh authorization) is race-safe. The injected
+// mutation completes fully (acquires+releases its own locks) BEFORE the instrumented
+// caller locks, so there is no deadlock; fires at most once (`take`).
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MUTATION_COMMIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_mutation_commit_hook_for_test(f: impl FnOnce() + 'static) {
+    BEFORE_MUTATION_COMMIT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+pub(super) fn fire_before_mutation_commit_hook_for_test() {
+    let hook = BEFORE_MUTATION_COMMIT_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 impl<'a> DepResolver<'a> {
     fn new(home: &'a Path, local_board: &'a Path, snapshot: &[Task]) -> Self {
         let local = snapshot.iter().map(|t| (t.id.clone(), t.status)).collect();
@@ -543,6 +569,33 @@ impl RoutedTask {
             });
         }
         Ok(write(&board))
+    }
+
+    /// #2760 R2: like [`RoutedTask::with_revalidated_board`] but the append EVENTS
+    /// are COMPUTED from the FRESH under-lock replay ([`crate::task_events::append_batch_computed_at`]).
+    /// A route-only revalidation (board/incarnation) is NOT enough for a mutation
+    /// whose authority or payload depends on current task CONTENT — ownership,
+    /// status, metadata, the ack set. This runs the caller's `compute` under the
+    /// board writer lock (INNER; the per-id lock is OUTER), so it re-evaluates
+    /// authorization AND builds the events (e.g. an idempotent `plan_acks` UNION,
+    /// or a governance-policy re-check) against committed state that no concurrent
+    /// writer can change between the decision and the write — closing the
+    /// authorization/predicate TOCTOU. `compute` must be pure decision + event
+    /// construction (no `api::call` under the flocks, #1629).
+    pub(in crate::tasks) fn with_revalidated_computed<F>(
+        &self,
+        home: &Path,
+        emitter: &crate::task_events::InstanceName,
+        compute: F,
+    ) -> Result<anyhow::Result<Result<Vec<u64>, String>>, TaskRouteError>
+    where
+        F: FnOnce(
+            &crate::task_events::TaskBoardState,
+        ) -> Result<Vec<crate::task_events::TaskEvent>, String>,
+    {
+        self.with_revalidated_board(home, |board| {
+            crate::task_events::append_batch_computed_at(board, emitter, compute)
+        })
     }
 }
 

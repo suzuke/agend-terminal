@@ -1865,7 +1865,7 @@ fn handle_ack_plan(
             "code": "plan_not_set",
         });
     }
-    let mut acks: Vec<String> = record
+    let acks: Vec<String> = record
         .metadata
         .get("plan_acks")
         .and_then(|v| v.as_array())
@@ -1881,23 +1881,74 @@ fn handle_ack_plan(
             "id": id, "event": "ack_plan", "acked": acks.len(), "already_acked": true,
         });
     }
-    acks.push(instance_name.to_string());
-    let acked_count = acks.len();
-    let event = crate::task_events::TaskEvent::MetadataSet {
-        task_id: crate::task_events::TaskId(id.to_string()),
-        by: emitter.clone(),
-        key: "plan_acks".to_string(),
-        value: serde_json::json!(acks),
-    };
-    // #2760 items 2+3: append the ack under the per-id router lock with write-time
-    // route revalidation.
-    let revalidated = routed.with_revalidated_board(home, |board| {
-        crate::task_events::append_at(board, &emitter, event)
+    // #2760 R2 (root+independent REJECT of a542517b): the `acks` list read above is
+    // an OUT-OF-LOCK snapshot — used only for the fast idempotent already-acked
+    // response. The AUTHORITATIVE ack is built as a UNION from the FRESH under-lock
+    // `plan_acks` (`with_revalidated_computed`). A route-only revalidation
+    // (board/incarnation) cannot see CONTENT staleness, so two acks that both read
+    // the pre-lock list would last-write-wins and silently LOSE one. Building the
+    // union (and re-checking self-ack / plan-present) against the committed state no
+    // concurrent writer can change closes that lost-update TOCTOU.
+    let caller = instance_name.to_string();
+    let tid = crate::task_events::TaskId(id.to_string());
+    let ack_emitter = emitter.clone();
+    // Test seam: inject a concurrent ack in the out-of-lock window to prove the
+    // union preserves it (no-op in production).
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
+    let revalidated = routed.with_revalidated_computed(home, &emitter, move |fresh| {
+        let rec = fresh
+            .tasks
+            .get(&tid)
+            .ok_or_else(|| "task disappeared before ack".to_string())?;
+        // Re-validate the ack authorization against FRESH state.
+        if rec.owner.as_ref().map(|o| o.0.as_str()) == Some(caller.as_str()) {
+            return Err("the task's assignee cannot ack their own plan".to_string());
+        }
+        if !rec.metadata.contains_key("plan") {
+            return Err("task has no plan set".to_string());
+        }
+        let mut fresh_acks: Vec<String> = rec
+            .metadata
+            .get("plan_acks")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if fresh_acks.iter().any(|a| a == &caller) {
+            return Ok(Vec::new()); // already acked under the lock → idempotent no-op
+        }
+        fresh_acks.push(caller.clone());
+        Ok(vec![crate::task_events::TaskEvent::MetadataSet {
+            task_id: tid.clone(),
+            by: ack_emitter.clone(),
+            key: "plan_acks".to_string(),
+            value: serde_json::json!(fresh_acks),
+        }])
     });
     match revalidated {
-        Ok(Ok(_)) => serde_json::json!({
-            "id": id, "event": "ack_plan", "acked": acked_count, "already_acked": false,
-        }),
+        Ok(Ok(Ok(seqs))) => {
+            // Empty seqs ⇒ the compute returned a no-op (already acked under lock).
+            let already = seqs.is_empty();
+            let count = read_task_record_at(routed.board().path(), id)
+                .and_then(|r| {
+                    r.metadata
+                        .get("plan_acks")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                })
+                .unwrap_or(0);
+            serde_json::json!({
+                "id": id, "event": "ack_plan", "acked": count, "already_acked": already,
+            })
+        }
+        // The compute refused under the lock (self-ack / plan removed / owner drift).
+        Ok(Ok(Err(reason))) => {
+            serde_json::json!({"error": reason, "code": "ack_precondition_failed"})
+        }
         Ok(Err(e)) => serde_json::json!({"error": format!("{e}")}),
         Err(route_err) => serde_json::json!({
             "error": format!("task '{id}' route revalidation failed: {route_err}"),
