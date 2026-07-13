@@ -2226,6 +2226,54 @@ fn t15_malformed_pr_state_file_emits_observability_trace() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// t-…-17 B4 (codex m-…-425) — a MALFORMED/unreadable PrState file must NOT be able
+/// to OPEN the merge gate through the PRODUCTION emit path. The reconciler workset now
+/// enumerates live PrState identities from file CONTENT (`list_state_identities`); a
+/// malformed file is SURFACED + skipped there. But the authoritative fail-closed
+/// guarantee lives on the merge-ready EMIT path: `scan_and_emit_with` can never
+/// deserialize a garbage file into a MergeReady `PrState`, so it emits NO
+/// `[pr-ready-for-merge]` and stamps NO `ready_emitted_for_sha` (the file stays garbage;
+/// `load` returns None ⇒ nothing is merge-ready). This is the REAL-PATH proof — not just
+/// a comment — that an unreadable PrState keeps the gate CLOSED.
+#[test]
+#[tracing_test::traced_test]
+fn b4_malformed_pr_state_cannot_open_merge_gate_fail_closed() {
+    let home = tmp_home_for_1002("b4-malformed-gate");
+    let dir = pr_state_dir(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    // A team so that IF anything were (wrongly) emitted it WOULD route to the merge
+    // authority and be drainable — making the "no emit" assertion meaningful.
+    write_team_fleet(&home, "lead-w", &["dev"]);
+
+    // A MALFORMED PrState at the canonical (repo,branch) path — the shape a torn write
+    // or schema-skew leaves on disk. It must NEVER become merge-ready.
+    let bad_path = dir.join(pr_state_filename("owner/repo", "feat/test"));
+    std::fs::write(&bad_path, b"{ this is not valid pr_state json").unwrap();
+
+    let poller = MockGhPoller::new(vec![]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    // Production load path: a malformed file is NOT loadable ⇒ there is no gatable state.
+    assert!(
+        load(&home, "owner/repo", "feat/test").is_none(),
+        "a malformed PrState must not load into a gatable state (fail closed)"
+    );
+    // Production emit path: NO [pr-ready-for-merge] reached the merge-authority target.
+    assert!(
+        crate::inbox::drain(&home, "lead-w").is_empty(),
+        "a malformed PrState must NOT emit [pr-ready-for-merge] — the merge gate stays CLOSED"
+    );
+    // The scanner skipped the malformed file WITHOUT mutating it (no ready_emitted_for_sha
+    // could be stamped onto an unparseable file).
+    assert_eq!(
+        std::fs::read_to_string(&bad_path).unwrap(),
+        "{ this is not valid pr_state json",
+        "the scanner left the malformed file untouched"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// #1002 Phase 1 observability pin: record_verdict's gate A
 /// (reviewed_head is None) MUST emit a tracing::debug! identifying
 /// the silent skip with the gate marker. Pre-fix, the early-return

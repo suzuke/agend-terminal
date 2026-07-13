@@ -541,19 +541,22 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// B4 (codex m-…-378) RED — the A10b reconciler (`redrive_reserved`) must SET
-    /// `authority_unknown` when the branch authority is UNREADABLE, IDENTICALLY to the
-    /// A6 drain. Pre-fix the reconciler set `reserved_assignments` ONLY and NEVER touched
-    /// the flag, so a stale-false state whose authority went unreadable was never closed
-    /// by the reconciler — only an unrelated CI event through `record_ci_result` could
-    /// SET it. Here the branch's SOLE record is corrupt (probe ⇒ `Unreadable`): redrive
-    /// MUST set the flag and KEEP the existing reservation (never drop on corruption).
-    /// RED pre-fix: the flag stays false because redrive never set it.
+    /// B4 (codex m-…-416) REAL-ENTRY RED — a branch whose SOLE authority record is
+    /// corrupt is INVISIBLE to `active_branches` (which names a branch only via its
+    /// FIRST PARSEABLE record), so pre-fix it VANISHED from the reconciler workset,
+    /// `redrive_reserved` never ran, `authority_unknown` stayed stale-false, and the
+    /// merge gate stayed OPEN. The workset UNION with `pr_state::list_state_identities`
+    /// rediscovers the branch via its readable PrState ⇒ probe `Unreadable` ⇒ SET the
+    /// flag (fail closed) while KEEPING the existing reservation (never dropped on
+    /// corruption). This drives the PRODUCTION entry `reconcile_all_collect` — NOT
+    /// `redrive_reserved` directly, which would BYPASS the discovery gap. RED pre-fix:
+    /// `reconcile_all_collect` never reaches the branch, so the flag stays false.
     #[test]
     fn b4_reconcile_sets_authority_unknown_on_unreadable_fail_closed() {
         let home = tmp_home("b4-recon-set");
         // Seed the branch's SOLE authority record, then CORRUPT it ⇒ probe reports
-        // Unreadable (a corrupt record is never conflated with absence).
+        // Unreadable (a corrupt record is never conflated with absence) AND
+        // active_branches can no longer discover the branch.
         store::persist(
             &home,
             &mk("o/r", "feat/x", "rev-a", 42, "2026-07-13T00:00:00Z"),
@@ -562,8 +565,9 @@ mod tests {
         let rpath = store::record_path_for_test(&home, "o/r", "feat/x", "rev-a");
         std::fs::write(&rpath, b"{ not valid assignment json").unwrap();
 
-        // A LIVE pr_state with authority_unknown CLEAR and an EXISTING reservation the
-        // fail-closed transition must PRESERVE.
+        // A LIVE, READABLE pr_state with authority_unknown CLEAR and an EXISTING
+        // reservation the fail-closed transition must PRESERVE. This readable PrState is
+        // now the ONLY way the reconciler can discover the branch (union source (b)).
         let mut s = pr_state::new_for_branch("o/r", "feat/x", "sha-42", ReviewClass::Dual);
         s.pr_number = 42;
         s.merge_state = MergeState::NotReady;
@@ -575,13 +579,15 @@ mod tests {
         }];
         pr_state::save(&home, &s).unwrap();
 
-        // Drive the RECONCILER path directly (NOT record_ci_result).
-        store::redrive_reserved(&home, "o/r", "feat/x");
+        // Drive the PRODUCTION reconciler entry. Pre-fix: active_branches misses the
+        // corrupt-only branch and the union does not exist ⇒ the branch is never
+        // reconciled ⇒ authority_unknown stays false (gate open).
+        reconcile_all_collect(&home, "2026-07-13T00:05:00Z");
 
         let after = pr_state::load(&home, "o/r", "feat/x").expect("pr_state present");
         assert!(
             after.authority_unknown,
-            "reconcile on an UNREADABLE authority must SET authority_unknown (fail closed) — pre-fix redrive never set it"
+            "reconcile via the PrState-identity union on an UNREADABLE authority must SET authority_unknown (fail closed) — pre-fix the corrupt-only branch was never in the workset"
         );
         assert_eq!(
             after
@@ -595,14 +601,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// B4 (codex m-…-378) RED — the A10b reconciler must CLEAR `authority_unknown` once a
-    /// transient corruption/lock-failure is REPAIRED, WITHOUT waiting for an unrelated CI
-    /// event. Pre-fix only `record_ci_result` cleared the flag; the reconciler set
-    /// reserved but never cleared, so a repaired branch stayed STUCK merge-closed
-    /// (`is_merge_ready` gates unconditionally on the flag) until the next CI observation.
-    /// Here the record is VALID (repaired) and the seeded state carries a stale
-    /// `authority_unknown = true`: redrive MUST clear it. RED pre-fix: the flag stays true
-    /// because redrive never cleared it.
+    /// B4 (codex m-…-416) REAL-ENTRY — the reconciler must CLEAR `authority_unknown`
+    /// once a transient corruption/lock-failure is REPAIRED, WITHOUT waiting for an
+    /// unrelated CI event, THROUGH the production entry `reconcile_all_collect`. Here the
+    /// record is VALID (repaired) and the seeded state carries a stale
+    /// `authority_unknown = true`: the reconciler MUST clear it. (A repaired branch has a
+    /// valid record, so `active_branches` already discovers it — this proves the CLEAR
+    /// convergence direction runs via the SAME production path as the SET RED above; it
+    /// is not itself gated on the union.)
     #[test]
     fn b4_reconcile_clears_authority_unknown_after_repair_no_ci_event() {
         let home = tmp_home("b4-recon-clear");
@@ -622,13 +628,13 @@ mod tests {
         s.authority_unknown = true;
         pr_state::save(&home, &s).unwrap();
 
-        // Drive the RECONCILER path directly (NOT record_ci_result).
-        store::redrive_reserved(&home, "o/r", "feat/x");
+        // Drive the PRODUCTION reconciler entry (NOT record_ci_result, NOT redrive directly).
+        reconcile_all_collect(&home, "2026-07-13T00:05:00Z");
 
         let after = pr_state::load(&home, "o/r", "feat/x").expect("pr_state present");
         assert!(
             !after.authority_unknown,
-            "reconcile after repair must CLEAR authority_unknown with NO CI event — pre-fix redrive never cleared it"
+            "reconcile after repair must CLEAR authority_unknown with NO CI event, through the production entry reconcile_all_collect"
         );
         assert_eq!(
             after
