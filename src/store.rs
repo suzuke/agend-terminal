@@ -721,26 +721,27 @@ mod tests {
 
     #[test]
     fn test_acquire_file_lock_is_exclusive_same_process() {
-        // On the same process, a second lock on a different File
-        // handle for the same path blocks; try_lock should refuse.
-        // Explicit trait method (see comment in acquire_file_lock).
+        // Exercise the production non-blocking wrapper with fresh handles.
         let dir = tmp_dir("flock");
         let lock_path = dir.join("my.lock");
         let guard = acquire_file_lock(&lock_path).expect("first lock");
-
-        let second = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .expect("open");
         assert!(
-            fs4::FileExt::try_lock(&second).is_err(),
+            try_acquire_file_lock(&lock_path)
+                .expect("contended try lock")
+                .is_none(),
             "second exclusive lock must fail while first held"
         );
         drop(guard);
-        // After drop, second can acquire.
-        assert!(fs4::FileExt::try_lock(&second).is_ok());
+        let guard2 = try_acquire_file_lock(&lock_path)
+            .expect("acquire after first drop")
+            .expect("lock must be available after first drop");
+        assert!(
+            try_acquire_file_lock(&lock_path)
+                .expect("second contended try lock")
+                .is_none(),
+            "additional exclusive lock must fail while second guard held"
+        );
+        drop(guard2);
         fs::remove_dir_all(&dir).ok();
     }
 
