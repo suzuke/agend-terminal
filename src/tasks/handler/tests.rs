@@ -2055,3 +2055,171 @@ fn gov_r11_plan_frozen_when_blocked_t74() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── #2760 R2 (root+independent REJECT of a542517b): deterministic concurrent REDs ──
+//
+// A route-only revalidation (board+incarnation) left the AUTHZ/PREDICATE TOCTOU
+// open: a mutation that read/built state OUT of lock then appended could lose a
+// concurrent update or act on stale authorization. Each RED arms the
+// `before_mutation_commit` seam to land a CONCURRENT mutation in the out-of-lock
+// window (it fully completes — acquires+releases its own per-id lock — BEFORE the
+// instrumented caller locks, so no deadlock), and asserts the under-lock
+// recompute/union is race-safe. Each FAILS on the pre-R2 (a542517b) code.
+
+/// RED (finding 1 — ack_plan lost update): two reviewers ack concurrently; the
+/// under-lock UNION from fresh `plan_acks` must preserve BOTH. Pre-R2 built the ack
+/// list from the pre-lock snapshot and appended a full-list overwrite → last-write
+/// wins → one ack silently lost.
+#[test]
+fn concurrent_ack_union_preserves_both_2760_r2() {
+    let home = tmp_home("r2-concurrent-ack");
+    let id = gov_seed_claimed(&home, 2);
+    handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "the plan"
+        }),
+    );
+    // Reviewer B acks in reviewer A's out-of-lock window.
+    let home_h = home.clone();
+    let id_h = id.clone();
+    crate::tasks::set_before_mutation_commit_hook_for_test(move || {
+        handle(
+            &home_h,
+            "rev-b",
+            &serde_json::json!({"action": "ack_plan", "id": id_h}),
+        );
+    });
+    let resp = handle(
+        &home,
+        "rev-a",
+        &serde_json::json!({"action": "ack_plan", "id": id}),
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "rev-a's ack must succeed: {resp}"
+    );
+    let acks: std::collections::BTreeSet<String> = read_task_record(&home, &id)
+        .and_then(|r| {
+            r.metadata
+                .get("plan_acks")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    assert!(
+        acks.contains("rev-a") && acks.contains("rev-b"),
+        "both concurrent acks must be preserved by the fresh under-lock union, got {acks:?} \
+         (pre-R2 the stale-vector overwrite loses one)"
+    );
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        2,
+        "exactly the two distinct acks"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED (finding 2 — metadata_set stale authorization, STATUS dimension): the OWNER
+/// revises the plan while the task is still pre-work (authorized out-of-lock), but a
+/// concurrent transition to `in_progress` lands before the write commits. The
+/// under-lock re-evaluation of the plan-governance policy must REFUSE (the plan is
+/// FROZEN once work starts) and leave the plan unchanged. Pre-R2 evaluated the policy
+/// on the pre-lock record and appended the revised plan unchecked — silently running
+/// work under a hot-swapped plan.
+#[test]
+fn metadata_plan_revise_refused_when_status_advances_under_lock_2760_r2() {
+    let home = tmp_home("r2-status-advance");
+    let id = gov_seed_claimed(&home, 0); // required=0 → in_progress is ungated
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "v1"
+        }),
+    );
+    // The owner advances the task to in_progress in the plan-revise out-of-lock window.
+    let home_h = home.clone();
+    let id_h = id.clone();
+    crate::tasks::set_before_mutation_commit_hook_for_test(move || {
+        handle(
+            &home_h,
+            "worker",
+            &serde_json::json!({"action": "update", "id": id_h, "status": "in_progress"}),
+        );
+    });
+    let resp = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "v2"
+        }),
+    );
+    assert_eq!(
+        resp.get("code").and_then(|v| v.as_str()),
+        Some("metadata_precondition_failed"),
+        "the plan revise must be refused once the task advances to in_progress under the lock: {resp}"
+    );
+    assert_eq!(
+        gov_plan_text(&home, &id).as_deref(),
+        Some("v1"),
+        "the plan stays v1 — the revise is refused under the lock"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED (finding 2/3 — plan vs concurrent ack): the OWNER revises the plan pre-ack
+/// (authorized out-of-lock), but a reviewer's ack lands concurrently. The under-lock
+/// re-evaluation must REFUSE (plan is frozen once acked) and leave the plan
+/// unchanged. Pre-R2 appended the revised plan unchecked, silently running work
+/// under a replacement plan the ack no longer covers.
+#[test]
+fn plan_revise_refused_when_ack_lands_concurrently_2760_r2() {
+    let home = tmp_home("r2-plan-vs-ack");
+    let id = gov_seed_claimed(&home, 2);
+    handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "v1"
+        }),
+    );
+    // A reviewer acks in the owner's plan-revise out-of-lock window.
+    let home_h = home.clone();
+    let id_h = id.clone();
+    crate::tasks::set_before_mutation_commit_hook_for_test(move || {
+        handle(
+            &home_h,
+            "reviewer",
+            &serde_json::json!({"action": "ack_plan", "id": id_h}),
+        );
+    });
+    let resp = handle(
+        &home,
+        "worker",
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "plan", "metadata_value": "v2"
+        }),
+    );
+    assert_eq!(
+        resp.get("code").and_then(|v| v.as_str()),
+        Some("metadata_precondition_failed"),
+        "the owner's plan revise must be refused once a reviewer's ack lands concurrently: {resp}"
+    );
+    assert_eq!(
+        gov_plan_text(&home, &id).as_deref(),
+        Some("v1"),
+        "the plan stays v1 — the revise is refused under the lock"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
