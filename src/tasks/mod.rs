@@ -597,20 +597,6 @@ impl RoutedTask {
             crate::task_events::append_batch_computed_at(board, emitter, compute)
         })
     }
-
-    /// #2760 R2: re-resolve the strict route and return whether it STILL fingerprints
-    /// identically to this route (same board + incarnation). A batch mutator (the
-    /// task sweep) that groups ids by a PRE-lock route, then holds each id's per-id
-    /// lock, calls this UNDER the lock to confirm the id has not been re-routed
-    /// (duplicate-created / id-reused) since the grouping route — before it commits a
-    /// batch write to the grouped board. Any route failure → `false` (fail-closed:
-    /// never act on an unprovable/changed route).
-    pub(in crate::tasks) fn route_unchanged(&self, home: &Path) -> bool {
-        match board_router::route_task(home, &self.task.id) {
-            Ok((project, _, record)) => RouteFingerprint::of(&project, &record) == self.fingerprint,
-            Err(_) => false,
-        }
-    }
 }
 
 /// #2760: strict per-board mutation authorization for an EXTERNAL caller (the

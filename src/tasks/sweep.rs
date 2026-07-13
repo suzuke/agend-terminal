@@ -413,16 +413,14 @@ pub(super) fn emit_cancelled_batch(
     // Board-key order is deterministic (`BTreeMap`) so the per-board passes are
     // stable. Single-project → every id routes to the DEFAULT board → one group →
     // byte-identical to the pre-#2760 single-batch behaviour.
-    let mut by_board: std::collections::BTreeMap<
-        std::path::PathBuf,
-        Vec<(String, &'static str, crate::tasks::RoutedTask)>,
-    > = std::collections::BTreeMap::new();
+    let mut by_board: std::collections::BTreeMap<std::path::PathBuf, Vec<(String, &'static str)>> =
+        std::collections::BTreeMap::new();
     for id in confirm_ids {
         match crate::tasks::load_routed(home, id) {
             Ok(routed) => by_board
                 .entry(routed.board().path().to_path_buf())
                 .or_default()
-                .push((id.clone(), lookup_category(id), routed)),
+                .push((id.clone(), lookup_category(id))),
             Err(e) => {
                 tracing::warn!(
                     task = %id, route_err = %e,
@@ -440,35 +438,13 @@ pub(super) fn emit_cancelled_batch(
         let mut sorted = items.clone();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         let mut id_locks = Vec::with_capacity(sorted.len());
-        for (id, _, _) in &sorted {
+        for (id, _) in &sorted {
             match super::board_router::acquire_task_id_lock(home, id) {
                 Ok(g) => id_locks.push(g),
                 Err(e) => return Err(format!("acquire per-id lock for sweep of '{id}': {e}")),
             }
         }
-        // #2760 R2 (root REJECT of a542517b): the grouping route above is OUT of the
-        // per-id locks. RE-ROUTE each id UNDER its lock and DROP any whose route
-        // changed (duplicate-created / re-routed since the grouping route) — never
-        // cancel on a stale/changed route. Fail-closed skip, logged.
-        let survivors: Vec<(String, &'static str)> = sorted
-            .iter()
-            .filter(|(id, _, routed)| {
-                let ok = routed.route_unchanged(home);
-                if !ok {
-                    tracing::warn!(
-                        task = %id,
-                        "#2760 R2 sweep: skip cancel — route changed under the per-id lock"
-                    );
-                }
-                ok
-            })
-            .map(|(id, category, _)| (id.clone(), *category))
-            .collect();
-        if survivors.is_empty() {
-            drop(id_locks);
-            continue;
-        }
-        let events: Vec<TaskEvent> = survivors
+        let events: Vec<TaskEvent> = sorted
             .iter()
             .map(|(id, category)| TaskEvent::Cancelled {
                 task_id: TaskId(id.clone()),
@@ -476,8 +452,7 @@ pub(super) fn emit_cancelled_batch(
                 reason: format!("sweep:{category}: {audit_reason}"),
             })
             .collect();
-        let ids_on_board: Vec<TaskId> =
-            survivors.iter().map(|(id, _)| TaskId(id.clone())).collect();
+        let ids_on_board: Vec<TaskId> = sorted.iter().map(|(id, _)| TaskId(id.clone())).collect();
         // CR-2026-06-14 (row232): re-validate UNDER the append lock against FRESH
         // committed state. The dry-run that produced `confirm_ids` is out-of-lock,
         // so a task can race to a terminal state (Done/Cancelled) before apply. A
@@ -516,7 +491,7 @@ pub(super) fn emit_cancelled_batch(
                 // #78445-2 (d): each batch-cancelled task is terminal — clear BOTH
                 // obligation stores (this path previously cleared NEITHER).
                 // task_id-scoped → a co-dispatcher's other task rows survive.
-                for (id, category) in &survivors {
+                for (id, category) in &sorted {
                     super::task_terminal_cleanup(home, id);
                     crate::event_log::log(
                         home,
@@ -525,7 +500,7 @@ pub(super) fn emit_cancelled_batch(
                         &format!("task={id} category={category} reason={audit_reason}"),
                     );
                 }
-                total += survivors.len();
+                total += sorted.len();
             }
             Ok(Err(reason)) => return Err(reason),
             Err(e) => return Err(e.to_string()),
