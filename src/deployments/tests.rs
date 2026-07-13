@@ -1125,6 +1125,7 @@ fn reconcile_orphans_prunes_stale_entry_at_boot() {
         team: None,
         directory: home.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: None,
     });
     save(&home, &mut store).expect("save store");
 
@@ -1199,18 +1200,18 @@ fn deploy_with_custom_directory(
         .iter()
         .map(|m| format!("{deploy_name}-{m}"))
         .collect();
+    // #2764 R3: this helper simulates a DAEMON-CREATED deployment generation, so
+    // pin a nonce and seed each subdir's identity+nonce-bound marker matching the
+    // record — authorizing the whole-tree removal these tests assert. (Unproven /
+    // nonce-mismatch cases have their own preserve tests.)
+    let nonce = format!("test-nonce-{deploy_name}");
     for inst in &inst_names {
         let inst_dir = custom_root.join(inst);
         std::fs::create_dir_all(&inst_dir).unwrap();
         // Drop a sentinel file so we can tell the dir was actually
         // removed (vs e.g. moved or never created).
         std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
-        // #2764 C: this helper simulates a DAEMON-CREATED deployment, so seed
-        // the creation-provenance marker `prepare_work_dir` now writes —
-        // authorizing the whole-tree removal these tests assert. (The unproven
-        // case — a pre-existing operator dir with no marker — is covered by its
-        // own preserve-not-remove test.)
-        std::fs::write(inst_dir.join(DEPLOY_CREATED_MARKER), "created_by=agend\n").unwrap();
+        seed_deploy_marker(&inst_dir, deploy_name, inst, &nonce);
     }
     store.deployments.push(Deployment {
         name: deploy_name.to_string(),
@@ -1219,6 +1220,7 @@ fn deploy_with_custom_directory(
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some(nonce),
     });
     save(&home, &mut store).unwrap();
     // Empty fleet.yaml — simulates the "all instances closed" state
@@ -1341,6 +1343,7 @@ fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: None,
     };
 
     // Must not panic.
@@ -1410,9 +1413,9 @@ fn teardown_removes_branch_mode_worktree_and_orphan_branch_med4() {
         "pre: inst_dir is a worktree"
     );
     assert!(branch_exists(&repo, "deploy/lead"), "pre: branch exists");
-    // #2764 C: mirror prepare_work_dir writing the creation-provenance marker
+    // #2764 R3: mirror prepare_work_dir writing the identity+nonce-bound marker
     // after a successful `git worktree add`, authorizing the whole-tree removal.
-    std::fs::write(inst_dir.join(DEPLOY_CREATED_MARKER), "created_by=agend\n").unwrap();
+    seed_deploy_marker(&inst_dir, "deploy", "deploy-lead", "test-nonce-deploy");
 
     cleanup_deployment_dirs(&home, &make_deployment("deploy", &["lead"], &repo));
 
@@ -1468,7 +1471,26 @@ fn make_deployment(name: &str, members: &[&str], directory: &Path) -> Deployment
         team: None,
         directory: directory.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some(format!("test-nonce-{name}")),
     }
+}
+
+/// #2764 R3 test helper: seed a subdir's identity+nonce-bound creation marker
+/// matching a deployment record, so the proof-carrying cleanup authorizes its
+/// whole-tree removal.
+fn seed_deploy_marker(inst_dir: &Path, deployment: &str, instance: &str, nonce: &str) {
+    let body = crate::agent_ops::workspace_cleanup::deploy_marker_body(
+        &crate::agent_ops::workspace_cleanup::DeployProvenance {
+            deployment: deployment.to_string(),
+            instance: instance.to_string(),
+            nonce: nonce.to_string(),
+        },
+    );
+    std::fs::write(
+        inst_dir.join(crate::agent_ops::workspace_cleanup::DEPLOY_CREATED_MARKER),
+        body,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1485,8 +1507,8 @@ fn cleanup_deployment_dirs_rmdir_parent_when_only_member_subdirs() {
         let inst_dir = custom_root.join(&inst);
         std::fs::create_dir_all(&inst_dir).unwrap();
         std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
-        // #2764 C: daemon-created subdir → seed the provenance marker.
-        std::fs::write(inst_dir.join(DEPLOY_CREATED_MARKER), "created_by=agend\n").unwrap();
+        // #2764 R3: daemon-created subdir → seed the identity+nonce-bound marker.
+        seed_deploy_marker(&inst_dir, "p15clean", &inst, "test-nonce-p15clean");
     }
     let dep = make_deployment("p15clean", &["a", "b"], &custom_root);
 
@@ -1546,12 +1568,13 @@ fn cleanup_deployment_dirs_rmdir_is_idempotent() {
         std::env::temp_dir().join(format!("agend-p15-{}-idem-custom", std::process::id()));
     std::fs::create_dir_all(&custom_root).unwrap();
     std::fs::create_dir_all(custom_root.join("p15idem-a")).unwrap();
-    // #2764 C: daemon-created subdir → seed the provenance marker.
-    std::fs::write(
-        custom_root.join("p15idem-a").join(DEPLOY_CREATED_MARKER),
-        "created_by=agend\n",
-    )
-    .unwrap();
+    // #2764 R3: daemon-created subdir → seed the identity+nonce-bound marker.
+    seed_deploy_marker(
+        &custom_root.join("p15idem-a"),
+        "p15idem",
+        "p15idem-a",
+        "test-nonce-p15idem",
+    );
     let dep = make_deployment("p15idem", &["a"], &custom_root);
 
     cleanup_deployment_dirs(&home, &dep);
@@ -2023,27 +2046,32 @@ fn teardown_api_calls_not_under_flock() {
 
 // ── #2764 C: deployment custom-dir creation provenance ─────────────────────
 
-/// prepare_work_dir writes the creation-provenance marker for a subdir it
-/// FRESHLY creates, but NOT for a pre-existing operator dir (which it must not
-/// later claim authority to whole-tree remove).
+/// prepare_work_dir writes an IDENTITY+NONCE-bound creation marker for a subdir
+/// it FRESHLY creates, but NOT for a pre-existing operator dir (which it must
+/// not later claim authority to whole-tree remove).
 #[test]
 fn prepare_work_dir_marks_fresh_but_not_preexisting() {
+    use crate::agent_ops::workspace_cleanup::DEPLOY_CREATED_MARKER;
     let parent = tmp_home("prov_mark");
     std::fs::create_dir_all(&parent).unwrap();
 
-    // Fresh creation (non-branch) → marked.
+    // Fresh creation (non-branch) → marked with the exact deployment+instance+nonce.
     let fresh = parent.join("d-fresh");
-    prepare_work_dir(&fresh, &parent, "d", "fresh", "d-fresh", None);
+    prepare_work_dir(&fresh, &parent, "d", "fresh", "d-fresh", None, "nonce-xyz");
+    let body = std::fs::read_to_string(fresh.join(DEPLOY_CREATED_MARKER))
+        .expect("a freshly-created deployment subdir must carry the creation marker");
     assert!(
-        fresh.join(DEPLOY_CREATED_MARKER).exists(),
-        "a freshly-created deployment subdir must carry the creation marker"
+        body.contains("deployment=d")
+            && body.contains("instance=d-fresh")
+            && body.contains("nonce=nonce-xyz"),
+        "marker must bind deployment+instance+nonce, got: {body}"
     );
 
     // Pre-existing operator dir → NOT marked (unprovable ownership).
     let pre = parent.join("d-pre");
     std::fs::create_dir_all(&pre).unwrap();
     std::fs::write(pre.join("USER.txt"), b"precious").unwrap();
-    prepare_work_dir(&pre, &parent, "d", "pre", "d-pre", None);
+    prepare_work_dir(&pre, &parent, "d", "pre", "d-pre", None, "nonce-xyz");
     assert!(
         !pre.join(DEPLOY_CREATED_MARKER).exists(),
         "a pre-existing operator dir must NOT be marked as daemon-created"
@@ -2064,7 +2092,9 @@ fn unproven_custom_deploy(tag: &str, name: &str) -> (PathBuf, PathBuf, PathBuf, 
     let inst_dir = custom_root.join(&inst);
     std::fs::create_dir_all(&inst_dir).unwrap();
     std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
-    // NO marker → unproven ownership.
+    // Record HAS a provenance nonce but the subdir has NO marker → unproven
+    // (a valid record generation does not authorize removal without a matching
+    // marker on the actual dir).
     let mut store = load(&home);
     store.deployments.push(Deployment {
         name: name.to_string(),
@@ -2073,6 +2103,7 @@ fn unproven_custom_deploy(tag: &str, name: &str) -> (PathBuf, PathBuf, PathBuf, 
         team: None,
         directory: custom_root.display().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some(format!("nonce-{name}")),
     });
     save(&home, &mut store).unwrap();
     std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
@@ -2132,6 +2163,116 @@ fn reconcile_keeps_record_when_unproven_subdir_preserved() {
         "deployment record must be retained for retry"
     );
 
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+// ── #2764 R3: identity/nonce binding, survivor overlap, idempotent ledger ──
+
+/// A custom subdir with a marker whose NONCE does not match the Deployment
+/// record generation must be PRESERVED — the marker existing is not enough;
+/// its identity+nonce must bind to THIS record.
+#[test]
+fn custom_dir_nonce_mismatch_is_preserved() {
+    let home = tmp_home("nonce_mismatch");
+    let custom_root = std::env::temp_dir().join(format!("agend-nm-{}-custom", std::process::id()));
+    std::fs::create_dir_all(&custom_root).ok();
+    let inst = "nm-a".to_string();
+    let inst_dir = custom_root.join(&inst);
+    std::fs::create_dir_all(&inst_dir).unwrap();
+    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
+    // Marker present but with the WRONG nonce (a stale prior generation).
+    seed_deploy_marker(&inst_dir, "nm", &inst, "STALE-NONCE");
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "nm".to_string(),
+        template: "tpl".to_string(),
+        instances: vec![inst.clone()],
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some("CURRENT-NONCE".to_string()),
+    });
+    save(&home, &mut store).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+
+    let resp = teardown(&home, &serde_json::json!({"name": "nm"}));
+
+    assert!(
+        inst_dir.join("USER_DATA.txt").exists(),
+        "a marker with a mismatched nonce must NOT authorize removal"
+    );
+    assert_eq!(resp["status"], "torn_down_pending_cleanup");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+/// Even a correctly-marked custom subdir must be PRESERVED when a LIVE fleet
+/// instance (not in the deployment cohort) resolves to the same dir — the
+/// deployment path runs the same symmetric survivor-overlap check as full-delete.
+#[test]
+fn custom_dir_shared_with_live_instance_is_preserved() {
+    let home = tmp_home("cust_shared");
+    let custom_root = std::env::temp_dir().join(format!("agend-cs-{}-custom", std::process::id()));
+    std::fs::create_dir_all(&custom_root).ok();
+    let inst = "cs-a".to_string();
+    let inst_dir = custom_root.join(&inst);
+    std::fs::create_dir_all(&inst_dir).unwrap();
+    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
+    seed_deploy_marker(&inst_dir, "cs", &inst, "test-nonce-cs");
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: "cs".to_string(),
+        template: "tpl".to_string(),
+        instances: vec![inst.clone()],
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some("test-nonce-cs".to_string()),
+    });
+    save(&home, &mut store).unwrap();
+    // A LIVE instance `survivor` whose working_directory aliases the subdir.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            inst_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let _ = teardown(&home, &serde_json::json!({"name": "cs"}));
+
+    assert!(
+        inst_dir.join("USER_DATA.txt").exists(),
+        "a subdir shared with a live instance must be preserved even when marked"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+/// The cleanup-pending ledger is idempotent: reconciling the same unproven
+/// deployment twice records exactly ONE entry (deduped by deployment+instance+
+/// subdir), never accumulating duplicates.
+#[test]
+fn cleanup_pending_ledger_is_idempotent() {
+    let (home, custom_root, _inst_dir, inst) = unproven_custom_deploy("pending_idem", "pi");
+
+    // First reconcile — records pending, keeps the record.
+    let _ = reconcile_orphans(&home);
+    // Second reconcile — must NOT duplicate the ledger entry.
+    let _ = reconcile_orphans(&home);
+
+    let ledger = home.join("deploy-cleanup-pending.jsonl");
+    let body = std::fs::read_to_string(&ledger).unwrap();
+    let count = body
+        .lines()
+        .filter(|l| l.contains("\"pi\"") && l.contains(&format!("\"{inst}\"")))
+        .count();
+    assert_eq!(
+        count, 1,
+        "pending ledger must dedupe repeated reconcile passes, got {count} entries:\n{body}"
+    );
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&custom_root).ok();
 }

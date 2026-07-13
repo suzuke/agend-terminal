@@ -89,6 +89,223 @@ fn instance_wd(snapshot: &FleetConfig, home: &Path, name: &str) -> Option<PathBu
     })
 }
 
+/// Symmetric-canonical-overlap survivor check shared by the workspace and
+/// deployment planners. Returns `Some(Preserve*)` when any live instance NOT in
+/// `cohort` resolves to (or overlaps, or ambiguously might alias) the candidate;
+/// `None` when the candidate is provably unshared.
+fn survivor_conflict(
+    snapshot: &FleetConfig,
+    home: &Path,
+    cohort: &[&str],
+    candidate: &Path,
+    candidate_canonical: &Path,
+) -> Option<CleanupPlan> {
+    for name in snapshot.instances.keys() {
+        if cohort.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(swd) = instance_wd(snapshot, home, name) else {
+            continue;
+        };
+        match dunce::canonicalize(&swd) {
+            Ok(sc) => {
+                if paths_overlap(&sc, candidate_canonical) {
+                    return Some(CleanupPlan::PreserveShared {
+                        reason: format!(
+                            "surviving instance '{name}' resolves to overlapping dir {}",
+                            sc.display()
+                        ),
+                    });
+                }
+            }
+            Err(_) => {
+                // Un-canonicalizable survivor: a missing default dir cannot alias
+                // an existing candidate EXCEPT via symlink games. Fail closed only
+                // when the RAW survivor path lexically overlaps the candidate
+                // (raw or canonical) — an unrelated missing sibling is not a risk.
+                if paths_overlap(&swd, candidate) || paths_overlap(&swd, candidate_canonical) {
+                    return Some(CleanupPlan::PreserveAmbiguous {
+                        reason: format!(
+                            "surviving instance '{name}' working dir {} is un-canonicalizable and may alias the candidate",
+                            swd.display()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The durable creation-provenance a deployment custom subdir must prove before
+/// it may be whole-tree removed: the subdir's marker must match this exact
+/// deployment identity + persisted generation nonce. Built from the live
+/// Deployment record (the nonce lives ONLY in that record, so a marker whose
+/// nonce matches proves the daemon wrote it for THIS deployment generation).
+#[derive(Debug, Clone)]
+pub struct DeployProvenance {
+    pub deployment: String,
+    pub instance: String,
+    pub nonce: String,
+}
+
+/// Filename of the deployment creation-provenance marker.
+pub const DEPLOY_CREATED_MARKER: &str = ".agend-deploy-created";
+
+/// Render the marker body written at creation. Cleanup re-parses and matches it
+/// against the live Deployment record's [`DeployProvenance`].
+pub fn deploy_marker_body(p: &DeployProvenance) -> String {
+    format!(
+        "deployment={}\ninstance={}\nnonce={}\ncreated_by=agend\n",
+        p.deployment, p.instance, p.nonce
+    )
+}
+
+/// Parse a `key=value\n` marker body into (deployment, instance, nonce). Returns
+/// None if any required field is missing.
+fn parse_deploy_marker(body: &str) -> Option<(String, String, String)> {
+    let mut deployment = None;
+    let mut instance = None;
+    let mut nonce = None;
+    for line in body.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "deployment" => deployment = Some(v.trim().to_string()),
+                "instance" => instance = Some(v.trim().to_string()),
+                "nonce" => nonce = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    Some((deployment?, instance?, nonce?))
+}
+
+/// Extra git-teardown context for a deployment custom-subdir removal. The
+/// executor runs `git worktree remove` / `branch -D` / `worktree prune` (to
+/// clear a branch-mode worktree registration) BEFORE `remove_dir_all`, all
+/// AFTER revalidation and gated by the opaque proof.
+#[derive(Debug, Clone)]
+pub struct DeployRemoveCtx {
+    /// The deploy directory (source repo in branch mode) git commands run from.
+    pub custom_root: PathBuf,
+    /// True when `custom_root` is a git repo (branch-mode deploy).
+    pub is_repo: bool,
+    /// The per-instance worktree branch (`{deploy}/{suffix}`), if branch mode.
+    pub branch: Option<String>,
+}
+
+/// Plan the destructive cleanup of a deployment CUSTOM-directory subdir
+/// (`candidate = custom_root/<instance>`), minting a `RemoveOwned` proof ONLY
+/// after the full check chain: dotdot reject → canonical capture → symmetric
+/// survivor-overlap (via the same fleet snapshot as full-delete) → durable
+/// creation provenance (marker present AND its deployment+instance+nonce match
+/// the live Deployment record `expected`). Any failure fails closed to a
+/// `Preserve*` no-op. Legacy/unproven (no nonce on the record, missing/mismatched
+/// marker) → `PreserveAmbiguous`.
+pub fn plan_custom_dir_cleanup(
+    snapshot: Option<&FleetConfig>,
+    home: &Path,
+    cohort: &[&str],
+    candidate: &Path,
+    expected: &DeployProvenance,
+) -> CleanupPlan {
+    if has_dotdot(candidate) {
+        return CleanupPlan::PreserveAmbiguous {
+            reason: format!("candidate path contains '..': {}", candidate.display()),
+        };
+    }
+    let candidate_canonical = match dunce::canonicalize(candidate) {
+        Ok(c) => c,
+        Err(e) => {
+            return CleanupPlan::PreserveAmbiguous {
+                reason: format!(
+                    "candidate {} does not canonicalize ({e})",
+                    candidate.display()
+                ),
+            };
+        }
+    };
+    let Some(snapshot) = snapshot else {
+        return CleanupPlan::PreserveAmbiguous {
+            reason: "fleet snapshot unavailable — cannot prove exclusive ownership".to_string(),
+        };
+    };
+    if let Some(preserve) =
+        survivor_conflict(snapshot, home, cohort, candidate, &candidate_canonical)
+    {
+        return preserve;
+    }
+    // Durable creation provenance: the marker must exist AND its identity + nonce
+    // must match the live Deployment record. An empty expected nonce (legacy
+    // record without persisted provenance) can never match → fail closed.
+    if expected.nonce.is_empty() {
+        return CleanupPlan::PreserveAmbiguous {
+            reason: format!(
+                "deployment '{}' has no persisted provenance nonce (legacy/unproven) — preserving",
+                expected.deployment
+            ),
+        };
+    }
+    let marker = candidate.join(DEPLOY_CREATED_MARKER);
+    let body = match std::fs::read_to_string(&marker) {
+        Ok(b) => b,
+        Err(_) => {
+            return CleanupPlan::PreserveAmbiguous {
+                reason: format!(
+                    "no creation-provenance marker at {} — preserving (unproven)",
+                    marker.display()
+                ),
+            };
+        }
+    };
+    match parse_deploy_marker(&body) {
+        Some((d, i, n))
+            if d == expected.deployment && i == expected.instance && n == expected.nonce => {}
+        _ => {
+            return CleanupPlan::PreserveAmbiguous {
+                reason: format!(
+                    "creation marker at {} does not match deployment '{}' instance '{}' generation — preserving",
+                    marker.display(),
+                    expected.deployment,
+                    expected.instance
+                ),
+            };
+        }
+    }
+    CleanupPlan::RemoveOwned(RemoveOwnedProof {
+        original: candidate.to_path_buf(),
+        canonical: candidate_canonical,
+    })
+}
+
+/// Execute a proven deployment custom-subdir removal. Revalidates the proof
+/// (original still canonicalizes to the captured target) IMMEDIATELY before any
+/// mutation, then clears a branch-mode worktree registration and removes the
+/// tree. All destruction is gated by the opaque `RemoveOwnedProof`.
+pub fn execute_remove_owned_custom(
+    proof: &RemoveOwnedProof,
+    ctx: &DeployRemoveCtx,
+) -> Result<(), String> {
+    revalidate(&proof.original, &proof.canonical)?;
+    if ctx.is_repo {
+        // git registers worktrees by realpath → use the canonical path.
+        let subdir_str = proof.canonical.display().to_string();
+        let _ = crate::git_helpers::git_bypass(
+            &ctx.custom_root,
+            &["worktree", "remove", "--force", &subdir_str],
+        );
+        if let Some(branch) = ctx.branch.as_deref() {
+            let _ = crate::git_helpers::git_bypass(&ctx.custom_root, &["branch", "-D", branch]);
+        }
+        let _ = crate::git_helpers::git_bypass(&ctx.custom_root, &["worktree", "prune"]);
+    }
+    if proof.canonical.exists() {
+        std::fs::remove_dir_all(&proof.canonical)
+            .map_err(|e| format!("remove_dir_all {} failed: {e}", proof.canonical.display()))?;
+    }
+    Ok(())
+}
+
 /// Plan the destructive cleanup of `victim`'s `candidate` working dir using the
 /// IMMUTABLE pre-removal fleet `snapshot`. `cohort` names are excluded from the
 /// survivor set (the victim itself plus any co-deleted deployment instances).
@@ -128,40 +345,10 @@ pub fn plan_cleanup(
         };
     };
 
-    // --- Survivor sharing: symmetric canonical overlap with ANY live sibling ---
-    for name in snapshot.instances.keys() {
-        if cohort.contains(&name.as_str()) {
-            continue;
-        }
-        let Some(swd) = instance_wd(snapshot, home, name) else {
-            continue;
-        };
-        match dunce::canonicalize(&swd) {
-            Ok(sc) => {
-                if paths_overlap(&sc, &candidate_canonical) {
-                    return CleanupPlan::PreserveShared {
-                        reason: format!(
-                            "surviving instance '{name}' resolves to overlapping dir {}",
-                            sc.display()
-                        ),
-                    };
-                }
-            }
-            Err(_) => {
-                // Un-canonicalizable survivor: a missing default dir cannot alias
-                // an existing candidate EXCEPT via symlink games. Fail closed only
-                // when the RAW survivor path lexically overlaps the candidate
-                // (raw or canonical) — an unrelated missing sibling is not a risk.
-                if paths_overlap(&swd, candidate) || paths_overlap(&swd, &candidate_canonical) {
-                    return CleanupPlan::PreserveAmbiguous {
-                        reason: format!(
-                            "surviving instance '{name}' working dir {} is un-canonicalizable and may alias the candidate",
-                            swd.display()
-                        ),
-                    };
-                }
-            }
-        }
+    if let Some(preserve) =
+        survivor_conflict(snapshot, home, cohort, candidate, &candidate_canonical)
+    {
+        return preserve;
     }
 
     // --- Unshared: prove exclusive ownership ---

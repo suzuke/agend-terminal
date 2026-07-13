@@ -12,6 +12,13 @@ pub struct Deployment {
     pub team: Option<String>,
     pub directory: String,
     pub created_at: String,
+    /// #2764 R3: durable per-deployment creation-provenance generation nonce.
+    /// Minted at deploy time and embedded in each freshly-created custom subdir's
+    /// `.agend-deploy-created` marker. Custom-subdir whole-tree removal is
+    /// authorized ONLY when a subdir's marker nonce matches this record. `None`
+    /// on a legacy record (pre-R3) → its custom subdirs fail closed (preserved).
+    #[serde(default)]
+    pub provenance_nonce: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -137,6 +144,7 @@ fn yaml_str(val: &serde_yaml_ng::Value, key: &str) -> Option<String> {
 
 fn create_instance_entries(
     params: &DeployParams,
+    provenance_nonce: &str,
 ) -> (Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>) {
     let mut created = Vec::new();
     let mut yaml_entries = Vec::new();
@@ -205,6 +213,7 @@ fn create_instance_entries(
             inst_suffix,
             &inst_name,
             params.branch.as_deref(),
+            provenance_nonce,
         );
 
         yaml_entries.push((
@@ -257,12 +266,13 @@ fn prepare_work_dir(
     inst_suffix: &str,
     inst_name: &str,
     branch: Option<&str>,
+    provenance_nonce: &str,
 ) -> String {
-    // #2764 C: a custom-directory subdir is only whole-tree-removable at
-    // teardown when the daemon PROVABLY created it (arbitrary custom whole-tree
-    // deletion requires persisted creation provenance — `create_dir_all` and a
-    // Deployment record tolerate a pre-existing operator dir, so neither proves
-    // exclusive ownership). Capture whether the subdir pre-existed, and drop a
+    // #2764 R3: a custom-directory subdir is only whole-tree-removable at
+    // teardown when the daemon PROVABLY created it for THIS deployment
+    // generation — `create_dir_all` and a Deployment record tolerate a
+    // pre-existing operator dir, so neither proves exclusive ownership. Capture
+    // whether the subdir pre-existed, and drop an IDENTITY+NONCE-bound
     // creation-provenance marker ONLY when this call freshly created it.
     let preexisted = inst_dir.exists();
     if let Some(br) = branch {
@@ -286,8 +296,12 @@ fn prepare_work_dir(
             Ok(_) => {
                 tracing::info!(%inst_name, %branch_name, "created worktree");
                 // `git worktree add` refuses a pre-existing non-empty target, so
-                // an Ok here means the daemon created the subdir → provenance.
-                write_deploy_provenance(inst_dir, deploy_name, inst_name);
+                // an Ok here means the daemon created the subdir. Guard on
+                // `!preexisted` too, so an add into a pre-existing EMPTY operator
+                // dir is never claimed as daemon-owned.
+                if !preexisted {
+                    write_deploy_provenance(inst_dir, deploy_name, inst_name, provenance_nonce);
+                }
             }
             Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
                 tracing::warn!(%inst_name, error = %stderr, "worktree failed");
@@ -300,23 +314,30 @@ fn prepare_work_dir(
         // Only mark when THIS call created the dir — a pre-existing operator dir
         // is never provably daemon-owned, so it stays un-marked (preserved at
         // teardown).
-        write_deploy_provenance(inst_dir, deploy_name, inst_name);
+        write_deploy_provenance(inst_dir, deploy_name, inst_name, provenance_nonce);
     }
     inst_dir.display().to_string()
 }
 
-/// Filename of the #2764 deployment creation-provenance marker, dropped into a
-/// custom-directory subdir the daemon freshly created. Its PRESENCE authorizes
-/// whole-tree removal of that subdir at teardown; its absence fails closed.
-pub(crate) const DEPLOY_CREATED_MARKER: &str = ".agend-deploy-created";
-
-/// Write the creation-provenance marker into a freshly-created deployment
-/// subdir (best-effort — a marker write failure downgrades teardown to
-/// fail-closed-preserve, never to an unprovable removal).
-fn write_deploy_provenance(inst_dir: &std::path::Path, deploy_name: &str, inst_name: &str) {
+/// Write the identity+nonce-bound creation-provenance marker into a
+/// freshly-created deployment subdir (best-effort — a marker write failure
+/// downgrades teardown to fail-closed-preserve, never to an unprovable removal).
+fn write_deploy_provenance(
+    inst_dir: &std::path::Path,
+    deploy_name: &str,
+    inst_name: &str,
+    nonce: &str,
+) {
+    let body = crate::agent_ops::workspace_cleanup::deploy_marker_body(
+        &crate::agent_ops::workspace_cleanup::DeployProvenance {
+            deployment: deploy_name.to_string(),
+            instance: inst_name.to_string(),
+            nonce: nonce.to_string(),
+        },
+    );
     let _ = std::fs::write(
-        inst_dir.join(DEPLOY_CREATED_MARKER),
-        format!("deployment={deploy_name}\ninstance={inst_name}\ncreated_by=agend\n"),
+        inst_dir.join(crate::agent_ops::workspace_cleanup::DEPLOY_CREATED_MARKER),
+        body,
     );
 }
 
@@ -498,7 +519,11 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         return duplicate_deploy_error(&params.deploy_name);
     }
 
-    let (created, yaml_entries) = create_instance_entries(&params);
+    // #2764 R3: mint a per-deployment provenance generation nonce BEFORE
+    // creating subdirs, so each freshly-created custom subdir's marker embeds
+    // it and cleanup can bind removal authority to this exact record generation.
+    let provenance_nonce = uuid::Uuid::new_v4().to_string();
+    let (created, yaml_entries) = create_instance_entries(&params, &provenance_nonce);
 
     if let Err(e) =
         persist_to_fleet_yaml(home, &yaml_entries, &params.template, &params.deploy_name)
@@ -528,6 +553,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         },
         directory: params.directory,
         created_at: chrono::Utc::now().to_rfc3339(),
+        provenance_nonce: Some(provenance_nonce),
     };
     // #1629: narrow the deployment-store flock to JUST the load-modify-save (its
     // C1 lost-update purpose). spawn_instances (api::call SPAWN) and
@@ -599,10 +625,12 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
     // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
     // custom-`directory` deployments that the prior inline
     // `home/workspace/<inst>` loop missed.
-    // #2764 C: `clean` is false when a subdir was preserved (unproven ownership)
-    // and recorded to the cleanup-pending ledger — the store record is then kept
-    // so a later reconcile can retry with the deployment's provenance intact.
-    let clean = cleanup_deployment_dirs(home, &deployment);
+    // #2764 R3: `all_clean` is false when a subdir was preserved (unproven
+    // ownership) and recorded to the cleanup-pending ledger — the store record is
+    // then kept so a later reconcile can retry with the deployment's provenance
+    // intact. `pending_persist_failed` means a preserve was NOT durably recorded.
+    let outcome = cleanup_deployment_dirs(home, &deployment);
+    let clean = outcome.all_clean;
 
     // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
     // pane_factory could render identity; teardown must remove them or
@@ -647,12 +675,21 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
 
     if clean {
         serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
+    } else if outcome.pending_persist_failed {
+        serde_json::json!({
+            "status": "torn_down_pending_cleanup",
+            "name": name,
+            "instances": deployment.instances,
+            "note": "one or more custom-directory subdirs were PRESERVED (unproven ownership) but the cleanup-pending ledger write FAILED — the preserved dir is safe on disk but was NOT durably recorded; reconcile will re-detect it. The deployment record is retained.",
+            "pending_persisted": false,
+        })
     } else {
         serde_json::json!({
             "status": "torn_down_pending_cleanup",
             "name": name,
             "instances": deployment.instances,
-            "note": "one or more custom-directory subdirs had no daemon creation-provenance marker and were PRESERVED (fail closed); recorded to deploy-cleanup-pending.jsonl. The deployment record is retained for retry.",
+            "note": "one or more custom-directory subdirs lacked matching creation provenance and were PRESERVED (fail closed); durably recorded to deploy-cleanup-pending.jsonl. The deployment record is retained for retry.",
+            "pending_persisted": true,
         })
     }
 }
@@ -682,71 +719,99 @@ pub fn list(home: &Path) -> Value {
 ///   `cleanup_working_dir`, so the AGEND_HOME/workspace branch handles
 ///   default-directory deployments correctly.
 ///
-/// #2764 C: arbitrary custom-directory whole-tree removal requires PERSISTED
-/// creation provenance — the [`DEPLOY_CREATED_MARKER`] the daemon drops only
-/// when it freshly created the subdir. An unmarked custom subdir (pre-existing
-/// operator dir, or a marker-write failure) is NOT removed: it is preserved and
-/// recorded to the durable cleanup-pending ledger. Returns `true` when every
-/// subdir was cleaned (nothing left pending), `false` when at least one was
-/// preserved — the caller keeps the deployment record so a later reconcile can
-/// retry with authority.
+/// #2764 R3: arbitrary custom-directory whole-tree removal is routed through the
+/// SINGLE proof-carrying chokepoint (`workspace_cleanup::plan_custom_dir_cleanup`
+/// → `execute_remove_owned_custom`): a `RemoveOwned` opaque proof is minted only
+/// after dotdot reject, canonical capture, symmetric survivor-overlap (against
+/// the live fleet snapshot), and durable creation provenance (marker identity +
+/// nonce matching THIS Deployment record generation). Destruction (git worktree
+/// remove / branch -D / prune / remove_dir_all) runs only inside the executor,
+/// after a revalidation immediately before mutation. An unproven/ambiguous subdir
+/// is PRESERVED and durably+idempotently recorded to the cleanup-pending ledger.
 ///
-/// All filesystem ops are best-effort; a single per-instance failure doesn't
-/// abort the rest of the sweep.
-fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) -> bool {
+/// Returns the outcome: `all_clean` false when any subdir was preserved (the
+/// caller keeps the deployment record for retry); `pending_persist_failed` true
+/// when a preserve was NOT durably recorded (surfaced by the caller — never
+/// claimed as recorded).
+struct DeployCleanupOutcome {
+    all_clean: bool,
+    pending_persist_failed: bool,
+}
+
+fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) -> DeployCleanupOutcome {
     let custom_root = std::path::Path::new(&deployment.directory);
     let dir_is_repo = crate::worktree::is_git_repo(custom_root);
+    // Live fleet snapshot for the survivor-overlap check. MISSING → empty roster
+    // (nothing can share) proceeds; CORRUPT → None → the planner fails closed.
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let snapshot = if fleet_path.exists() {
+        crate::fleet::FleetConfig::load(&fleet_path).ok()
+    } else {
+        Some(crate::fleet::FleetConfig::default())
+    };
+    // The deployment's own instances are the deletion cohort (excluded from the
+    // survivor set); everyone else in the snapshot is a potential survivor.
+    let cohort: Vec<&str> = deployment.instances.iter().map(String::as_str).collect();
+    let nonce = deployment.provenance_nonce.clone().unwrap_or_default();
+
     let mut all_clean = true;
+    let mut pending_persist_failed = false;
+    let mut preserve = |home: &Path, inst: &str, subdir: &Path, reason: &str| {
+        tracing::warn!(inst = %inst, path = %subdir.display(), %reason,
+            "#2764 deployment cleanup: preserving custom subdir (fail closed) — recording cleanup-pending");
+        if record_cleanup_pending(home, &deployment.name, inst, subdir).is_err() {
+            pending_persist_failed = true;
+        }
+        all_clean = false;
+    };
+
     for inst in &deployment.instances {
-        // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
         let custom_subdir = custom_root.join(inst);
         if custom_subdir.exists() {
-            let proven = custom_subdir.join(DEPLOY_CREATED_MARKER).exists();
-            if !proven {
-                // Unproven ownership → fail closed: NO git worktree remove,
-                // branch -D, prune, or remove_dir_all. Preserve + record.
-                tracing::warn!(
-                    inst = %inst,
-                    path = %custom_subdir.display(),
-                    "#2764 deployment cleanup: custom subdir has no creation-provenance marker — preserving (fail closed), recording cleanup-pending"
-                );
-                record_cleanup_pending(home, &deployment.name, inst, &custom_subdir);
-                all_clean = false;
-            } else {
-                // Daemon-created → authorized whole-tree removal.
-                if dir_is_repo {
-                    // Instances are named `{deploy_name}-{suffix}`; the worktree
-                    // branch is `{deploy_name}/{suffix}` (see prepare_work_dir).
-                    let suffix = inst
-                        .strip_prefix(&format!("{}-", deployment.name))
-                        .unwrap_or(inst);
-                    let branch = format!("{}/{}", deployment.name, suffix);
-                    let subdir_str = custom_subdir.display().to_string();
-                    let _ = crate::git_helpers::git_bypass(
-                        custom_root,
-                        &["worktree", "remove", "--force", &subdir_str],
-                    );
-                    let _ = crate::git_helpers::git_bypass(custom_root, &["branch", "-D", &branch]);
-                    let _ = crate::git_helpers::git_bypass(custom_root, &["worktree", "prune"]);
-                }
-                if custom_subdir.exists() {
-                    match std::fs::remove_dir_all(&custom_subdir) {
-                        Ok(()) => tracing::info!(
-                            inst = %inst,
-                            path = %custom_subdir.display(),
-                            "deployment cleanup: removed custom subdir"
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                inst = %inst,
-                                path = %custom_subdir.display(),
-                                error = %e,
-                                "deployment cleanup: remove_dir_all failed"
-                            );
-                            record_cleanup_pending(home, &deployment.name, inst, &custom_subdir);
-                            all_clean = false;
-                        }
+            let suffix = inst
+                .strip_prefix(&format!("{}-", deployment.name))
+                .unwrap_or(inst);
+            let expected = crate::agent_ops::workspace_cleanup::DeployProvenance {
+                deployment: deployment.name.clone(),
+                instance: inst.clone(),
+                nonce: nonce.clone(),
+            };
+            use crate::agent_ops::workspace_cleanup::{
+                execute_remove_owned_custom, plan_custom_dir_cleanup, CleanupPlan, DeployRemoveCtx,
+            };
+            match plan_custom_dir_cleanup(
+                snapshot.as_ref(),
+                home,
+                &cohort,
+                &custom_subdir,
+                &expected,
+            ) {
+                CleanupPlan::RemoveOwned(proof) => {
+                    let ctx = DeployRemoveCtx {
+                        custom_root: custom_root.to_path_buf(),
+                        is_repo: dir_is_repo,
+                        branch: dir_is_repo.then(|| format!("{}/{}", deployment.name, suffix)),
+                    };
+                    if let Err(e) = execute_remove_owned_custom(&proof, &ctx) {
+                        preserve(home, inst, &custom_subdir, &format!("removal error: {e}"));
+                    } else {
+                        tracing::info!(inst = %inst, path = %custom_subdir.display(),
+                            "deployment cleanup: removed custom subdir (proof-gated)");
                     }
+                }
+                CleanupPlan::PreserveShared { reason }
+                | CleanupPlan::PreserveAmbiguous { reason } => {
+                    preserve(home, inst, &custom_subdir, &reason);
+                }
+                // A custom deployment subdir is never a workspace user-dir scrub
+                // target — the planner only returns RemoveOwned/Preserve* here.
+                CleanupPlan::ScrubExclusive(_) => {
+                    preserve(
+                        home,
+                        inst,
+                        &custom_subdir,
+                        "unexpected scrub plan for a custom deployment subdir",
+                    );
                 }
             }
         }
@@ -760,50 +825,65 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) -> bool {
             crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
         }
     }
-    // Sprint 54 P1-5: best-effort rmdir of the custom-directory parent.
-    // If every member subdir was just removed AND the operator left no
-    // unrelated files there, the parent is now empty — strip it so we
-    // don't leak `/tmp/team-foo/` shells behind. `remove_dir` (NOT
-    // `remove_dir_all`) errors on non-empty, which is exactly what we
-    // want: any operator-dropped file preserves the parent.
+    // Sprint 54 P1-5: best-effort rmdir of the custom-directory parent (only if
+    // now empty — an operator-dropped or preserved subdir keeps it).
     rmdir_if_empty(custom_root);
-    all_clean
+    DeployCleanupOutcome {
+        all_clean,
+        pending_persist_failed,
+    }
 }
 
-/// #2764 C: durable cleanup-pending ledger. When a deployment subdir cannot be
-/// safely removed (unproven ownership, or a removal error), append a record so
-/// the obligation is not lost when the deployment store entry is later dropped
-/// — and so an operator can find and reconcile the preserved dir. Best-effort:
-/// a ledger-write failure is logged, never fatal (the dir is preserved either
-/// way — the safe outcome).
 fn cleanup_pending_path(home: &Path) -> PathBuf {
     home.join("deploy-cleanup-pending.jsonl")
 }
 
-fn record_cleanup_pending(home: &Path, deployment: &str, instance: &str, subdir: &Path) {
-    use std::io::Write;
+/// #2764 R3: DURABLE + IDEMPOTENT cleanup-pending ledger. Records a preserved
+/// deployment subdir under the store flock, deduped by (deployment, instance,
+/// subdir) so repeated reconcile passes cannot accumulate duplicates. Returns
+/// `Err` when the record could NOT be durably persisted so the caller surfaces
+/// the failure instead of claiming it was recorded (the dir is preserved either
+/// way — the safe outcome).
+fn record_cleanup_pending(
+    home: &Path,
+    deployment: &str,
+    instance: &str,
+    subdir: &Path,
+) -> Result<(), String> {
+    let path = cleanup_pending_path(home);
+    let subdir_str = subdir.display().to_string();
+    // Serialize under the same flock the store uses, so concurrent reconcile /
+    // teardown appends don't interleave-corrupt the ledger.
+    let lock_path = store_path(home).with_extension("pending.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| format!("cleanup-pending lock failed: {e}"))?;
+    // Idempotency: skip if this exact (deployment, instance, subdir) is present.
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let already = existing.lines().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .map(|v| {
+                    v["deployment"] == deployment
+                        && v["instance"] == instance
+                        && v["subdir"] == subdir_str
+                })
+                .unwrap_or(false)
+        });
+        if already {
+            return Ok(());
+        }
+    }
     let line = serde_json::json!({
         "deployment": deployment,
         "instance": instance,
-        "subdir": subdir.display().to_string(),
+        "subdir": subdir_str,
         "reason": "unproven-ownership-or-removal-failed",
     })
     .to_string();
-    let path = cleanup_pending_path(home);
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{line}") {
-                tracing::warn!(path = %path.display(), error = %e, "#2764 cleanup-pending ledger write failed");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "#2764 cleanup-pending ledger open failed")
-        }
-    }
+    let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+    body.push_str(&line);
+    body.push('\n');
+    crate::store::atomic_write(&path, body.as_bytes())
+        .map_err(|e| format!("cleanup-pending ledger write failed: {e}"))
 }
 
 /// Best-effort rmdir of an empty directory (Sprint 54 P1-5).
@@ -895,7 +975,7 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
     let mut pruned_names = Vec::new();
     let mut pruned_teams = Vec::new();
     for dep in &orphans {
-        if cleanup_deployment_dirs(home, dep) {
+        if cleanup_deployment_dirs(home, dep).all_clean {
             pruned_names.push(dep.name.clone());
             if let Some(t) = dep.team.clone() {
                 pruned_teams.push(t);
