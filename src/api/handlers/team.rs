@@ -175,15 +175,22 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     // fleet write / instructions / spawn mutations below — any member name
     // mid-delete aborts the whole create_team zero-side-effect. Guards held
     // to fn end so a same-name delete cannot start mid-create.
-    let mut _member_admissions = Vec::with_capacity(planned.len());
+    let mut member_admissions: Vec<crate::agent::deleting::CreateAdmission> =
+        Vec::with_capacity(planned.len());
     for (inst_name, _, _) in &planned {
         match crate::agent::deleting::admit_create(ctx.home, inst_name) {
-            Ok(g) => _member_admissions.push(g),
+            Ok(g) => member_admissions.push(g),
             Err(reason) => {
                 return json!({"ok": false, "error": format!("create_team refused: {reason}")});
             }
         }
     }
+    let member_token = |name: &str| -> Option<u64> {
+        planned
+            .iter()
+            .position(|(n, _, _)| n == name)
+            .map(|i| member_admissions[i].token())
+    };
 
     if !planned.is_empty() {
         let entries = build_member_entries(&planned, topic_binding_mode.as_deref());
@@ -243,6 +250,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             work_dir,
             size,
             resolved_env.as_ref(),
+            member_token(inst_name),
         ) {
             Ok(_) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");

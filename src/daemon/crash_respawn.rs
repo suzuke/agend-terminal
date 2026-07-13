@@ -277,6 +277,17 @@ fn respawn_agent_worker(
         tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
         return;
     }
+    // #2764 R8: held admission across the WHOLE respawn transaction — the
+    // skills install below mutates the workspace BEFORE spawn_agent's
+    // deleting-set check, so a respawn racing a same-name delete must be
+    // zero-side-effect refused here (and a delete cannot start mid-respawn).
+    let _create_admission = match crate::agent::deleting::admit_create(home, &config.name) {
+        Ok(g) => g,
+        Err(reason) => {
+            tracing::info!(agent = %config.name, %reason, "crash-respawn refused (admission)");
+            return;
+        }
+    };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     if let Some(ref wd) = config.working_dir {
         let skills_filter: Option<Vec<String>> =
@@ -405,6 +416,48 @@ fn respawn_agent_worker(
 mod tests {
     use super::should_fire_terminal_p0;
     use crate::teams::SelfOrchStatus;
+
+    /// #2764 R8 C2 RED: a crash-respawn racing a same-name delete is
+    /// zero-side-effect refused by the held admission BEFORE the skills
+    /// install re-materializes `workspace/<name>` mid-teardown.
+    #[test]
+    fn respawn_refused_mid_delete_zero_side_effect_2764_r8() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let home = std::env::temp_dir().join(format!("agend-respawn-r8-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("mk test home");
+        let _del = crate::agent::deleting::mark_deleting(&home, "crashy").expect("mark deleting");
+        let wd = crate::paths::workspace_dir(&home).join("crashy");
+        let reg: crate::agent::AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        super::respawn_agent_worker(
+            &home,
+            crate::daemon::AgentConfig {
+                name: "crashy".to_string(),
+                backend_command: crate::default_shell().to_string(),
+                args: Vec::new(),
+                env: None,
+                working_dir: Some(wd.clone()),
+                submit_key: "\r".to_string(),
+            },
+            std::time::Duration::ZERO,
+            None,
+            &reg,
+            tx,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            !wd.exists(),
+            "zero-side-effect refusal: the workspace must NOT be re-materialized mid-delete"
+        );
+        assert!(
+            reg.lock().is_empty(),
+            "zero-side-effect refusal: nothing may be registered mid-delete"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     /// #1744-H4: the terminal self-orch P0 fires for a Failed (no-respawn)
     /// self-orchestrator — fail-closed (Yes|Unknown), skipped for No / non-terminal,

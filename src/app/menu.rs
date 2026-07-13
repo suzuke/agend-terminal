@@ -117,7 +117,11 @@ pub(super) fn pane_from_menu_item(
             // side effect that `handle_spawn` does. Now routes through
             // `tui_spawn::add_instance_with_topic` so the channel topic is
             // created + topic_id persisted to topics.json at TUI-spawn time.
-            if let Err(e) = tui_spawn::add_instance_with_topic(
+            // #2764 R8: the admission guard is OWNED here so it spans the
+            // whole pane-create transaction below; a refusal (mid-delete /
+            // independent create) ABORTS — never continue creating a pane for
+            // an instance whose registration was refused.
+            let _create_admission = match tui_spawn::add_instance_with_topic(
                 home,
                 &inst_name,
                 &crate::fleet::InstanceYamlEntry {
@@ -125,8 +129,12 @@ pub(super) fn pane_from_menu_item(
                     ..Default::default()
                 },
             ) {
-                tracing::warn!(error = %e, "failed to write fleet.yaml");
-            }
+                Ok((_, adm)) => adm,
+                Err(e) => {
+                    tracing::warn!(error = %e, "TUI spawn aborted — instance not created");
+                    return Err(anyhow::anyhow!("TUI spawn aborted: {e}"));
+                }
+            };
             // Resolve from fleet to get defaults merged
             let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
             if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {

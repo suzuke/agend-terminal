@@ -140,6 +140,9 @@ fn full_delete_removes_escalation_store_no_stale_rehydrate_1923_g12() {
         "precondition: escalation store seeded for victim"
     );
 
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     let _ = super::full_delete_instance(&home, "victim");
 
     assert!(
@@ -204,6 +207,9 @@ fn full_delete_instance_removes_uuid_inbox_1902() {
         uuid_inbox.exists(),
         "pre: uuid inbox must exist at {uuid_inbox:?}"
     );
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     let result = super::full_delete_instance(&home, "doomed");
     assert!(result.is_ok(), "delete must return Ok, got {result:?}");
     assert!(
@@ -301,6 +307,9 @@ fn full_delete_instance_unregisters_topic_even_when_telegram_delete_fails_2550()
         "pre: topic mapping must exist"
     );
 
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     let _ = super::full_delete_instance(&home, "doomed");
 
     assert_eq!(
@@ -777,6 +786,9 @@ fn full_delete_exact_owned_default_still_removed() {
     )
     .unwrap();
 
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     let result = super::full_delete_instance(&home, "victim");
     assert!(result.is_ok(), "delete must return Ok, got {result:?}");
     assert!(
@@ -910,6 +922,9 @@ fn full_delete_replacement_before_authority_acquisition_is_complete_noop_2764_r6
     super::full_delete_test_seam::set_after_gate(Box::new(move || {
         std::fs::write(&fleet_path, &swap).unwrap();
     }));
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
 
     let result = super::full_delete_instance(&home, "victim");
 
@@ -970,6 +985,9 @@ fn full_delete_replacement_after_precheck_before_commit_preserves_2764_r6() {
     let gen_b = crate::types::InstanceId::new();
     let fleet_path = crate::fleet::fleet_yaml_path(&home);
     let swap = yaml_for(&gen_b);
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     crate::agent_ops::workspace_cleanup::fence_test_seam::set(Box::new(move || {
         std::fs::write(&fleet_path, &swap).unwrap();
     }));
@@ -1064,6 +1082,9 @@ fn full_delete_post_cas_pre_tail_vs_create_refused_2764_r7() {
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let resp_slot = std::sync::Arc::clone(&create_resp);
     let h = home.clone();
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     super::full_delete_test_seam::set_post_commit(Box::new(move || {
         let resp = crate::mcp::handlers::instance_state::handle_create_instance(
             &h,
@@ -1091,12 +1112,13 @@ fn full_delete_post_cas_pre_tail_vs_create_refused_2764_r7() {
     std::fs::remove_dir_all(home).ok();
 }
 
-/// #2764 R7 RED (codex P0-2): the daemon API is unreachable AND live port
-/// evidence exists for the name → the process-stop disposition is unproven →
-/// the delete aborts BEFORE any destruction (workspace + fleet entry intact).
+/// #2764 R7/R8 RED (codex P0-2 + correction 2): a PINNED delete with the
+/// daemon API unreachable is ALWAYS unproven — deliberately NO `.port` file is
+/// seeded here, because a missing sidecar is not OS/registry/generation
+/// evidence of a dead child. The delete aborts BEFORE any destruction.
 #[test]
-fn full_delete_api_unreachable_with_live_port_evidence_aborts_2764_r7() {
-    let home = tmp_home("r7_unreachable_port");
+fn full_delete_pinned_api_unreachable_aborts_2764_r8() {
+    let home = tmp_home("r8_unreachable_pinned");
     let vdir = crate::paths::workspace_dir(&home).join("victim");
     seed_canaries(&vdir);
     let id = crate::types::InstanceId::new();
@@ -1109,11 +1131,6 @@ fn full_delete_api_unreachable_with_live_port_evidence_aborts_2764_r7() {
         ),
     )
     .unwrap();
-    // Live-agent evidence: a published TUI port file (same path expression the
-    // production check + residual audit use).
-    let port = crate::ipc::port_path(&crate::daemon::run_dir(&home), "victim");
-    std::fs::create_dir_all(port.parent().unwrap()).unwrap();
-    std::fs::write(&port, "12345").unwrap();
 
     let result = super::full_delete_instance(&home, "victim");
     let err = result.expect_err("unproven stop disposition must abort the delete");
@@ -1150,12 +1167,49 @@ fn full_delete_stop_timeout_aborts_2764_r7() {
         ),
     )
     .unwrap();
-    super::full_delete_test_seam::set_stop_call(Ok(serde_json::json!({
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({
         "ok": true, "stopped": false
-    })));
+    }));
 
     let result = super::full_delete_instance(&home, "victim");
     let err = result.expect_err("stopped=false must abort the delete");
+    assert!(
+        err.contains("disposition unproven"),
+        "Err must carry the disposition reason, got: {err}"
+    );
+    assert!(canaries_intact(&vdir), "nothing may be destroyed: {vdir:?}");
+    assert!(
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml parses")
+            .instances
+            .contains_key("victim"),
+        "fleet entry must be retained on an aborted delete"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 R8 RED (codex blocker 3 at d54a3ab4): a PINNED managed delete whose
+/// stop verdict is a bare `{ok:true}` WITHOUT the explicit `stopped:true`
+/// field is UNPROVEN → abort before any destruction.
+#[test]
+fn full_delete_pinned_missing_stopped_verdict_aborts_2764_r8() {
+    let home = tmp_home("r8_missing_stopped");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    id: {}\n    working_directory: {}\n",
+            id.full(),
+            vdir.display()
+        ),
+    )
+    .unwrap();
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true}));
+
+    let result = super::full_delete_instance(&home, "victim");
+    let err = result.expect_err("missing stopped verdict must abort a pinned delete");
     assert!(
         err.contains("disposition unproven"),
         "Err must carry the disposition reason, got: {err}"
@@ -1185,6 +1239,9 @@ fn full_delete_removes_name_keyed_metadata() {
     std::fs::create_dir_all(home.join("metadata")).unwrap();
     std::fs::write(home.join("metadata/doomed.json"), "{}").unwrap();
 
+    // #2764 R8: pinned deletes require a live stop verdict; no daemon runs in
+    // tests, so inject the explicit stopped:true the real handler would return.
+    super::full_delete_test_seam::set_stop_call(serde_json::json!({"ok": true, "stopped": true}));
     let result = super::full_delete_instance(&home, "doomed");
     assert!(result.is_ok(), "delete must return Ok, got {result:?}");
     assert!(

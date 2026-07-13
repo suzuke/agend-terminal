@@ -1245,6 +1245,13 @@ mod tests {
     /// - tasks previously owned by members are now `owner = None`
     #[test]
     fn delete_team_cascades_full_delete_instance_per_member() {
+        // #2764 R8: pinned deletes require a live stop verdict; inject the
+        // explicit stopped:true the real handler would return (persistent —
+        // covers every member's full_delete in the cascade).
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_test_seam::set_stop_call(
+            serde_json::json!({"ok": true, "stopped": true}),
+        );
+
         let home = tmp_home("828_cascade");
         // Seed two members so we can verify per-member cascade.
         create(
@@ -1423,6 +1430,13 @@ mod tests {
     /// affects every other team that shared the cascaded member.
     #[test]
     fn delete_team_with_multi_team_member_removes_from_all_teams() {
+        // #2764 R8: pinned deletes require a live stop verdict; inject the
+        // explicit stopped:true the real handler would return (persistent —
+        // covers every member's full_delete in the cascade).
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_test_seam::set_stop_call(
+            serde_json::json!({"ok": true, "stopped": true}),
+        );
+
         let home = tmp_home("828_multi_team");
         // Pre-seed two teams sharing the member "polyglot_alice828".
         // Skip the `create` API because it enforces one-agent-one-team;

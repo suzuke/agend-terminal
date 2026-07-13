@@ -86,6 +86,24 @@ pub fn delete_transaction(
     configs: Option<&Arc<Mutex<HashMap<String, super::AgentConfig>>>>,
     skip_exit_wait: bool,
 ) -> bool {
+    delete_transaction_expecting(home, name, registry, configs, skip_exit_wait, None)
+}
+
+/// #2764 R8 (codex correction 3): exact-generation stop. When `expected_id`
+/// is pinned, the registry/child are addressed by THAT id throughout — never
+/// re-resolved by name (an A→B replacement between the caller's validation
+/// and this lookup must not retarget the stop at B). Name-keyed cleanup
+/// (binding/config/port) runs only after the exact child's terminal
+/// disposition AND a fresh generation check confirming the name still maps to
+/// the pinned generation.
+pub fn delete_transaction_expecting(
+    home: &Path,
+    name: &str,
+    registry: &AgentRegistry,
+    configs: Option<&Arc<Mutex<HashMap<String, super::AgentConfig>>>>,
+    skip_exit_wait: bool,
+    expected_id: Option<crate::types::InstanceId>,
+) -> bool {
     // Step 1: snapshot the child handle while still holding registry entry,
     // then release the registry lock before issuing the kill so concurrent
     // listings aren't blocked while we wait for exit.
@@ -95,7 +113,12 @@ pub fn delete_transaction(
     // fleet.yaml (same source as inbox). `None` means no managed entry — the
     // remove/wait steps below all no-op, matching the prior "name absent"
     // behaviour.
-    let instance_id = crate::fleet::resolve_uuid(home, name);
+    let instance_id = match expected_id {
+        // Exact-generation authority: never fall back to a name re-resolve —
+        // that is exactly the A→B retarget window being closed.
+        Some(id) => Some(id),
+        None => crate::fleet::resolve_uuid(home, name),
+    };
     let child_arc = instance_id.and_then(|id| {
         let reg = crate::agent::lock_registry(registry);
         if let Some(h) = reg.get(&id) {
@@ -103,6 +126,13 @@ pub fn delete_transaction(
         }
         reg.get(&id).map(|h| Arc::clone(&h.child))
     });
+
+    // #2764 R8 test seam: force one wait-timeout verdict (a real
+    // SIGKILL-immune child is not constructible deterministically).
+    #[cfg(test)]
+    let forced_timeout = exit_wait_test_seam::take();
+    #[cfg(not(test))]
+    let forced_timeout = false;
 
     let waited_ok = if let Some(child_arc) = child_arc {
         // Step 2: kill process tree first (covers backend child trees like
@@ -119,6 +149,8 @@ pub fn delete_transaction(
             // signal has been sent; the OS will reap the child in the
             // background. Proceed to registry removal immediately.
             true
+        } else if forced_timeout {
+            false
         } else {
             // Step 3: synchronous wait for actual exit (Sprint 20 F2 fix —
             // previously delete returned before the OS had reaped the PID,
@@ -130,6 +162,28 @@ pub fn delete_transaction(
         true
     };
 
+    // #2764 R8 (codex blocker 2 at d54a3ab4): a wait TIMEOUT is an UNKNOWN
+    // stop disposition — RETAIN authority (registry handle, config entry, IPC
+    // port) so a retry re-kills and re-waits against the SAME evidence. The
+    // old force-removal made the retry resolve nothing and vacuously report
+    // stopped:true while the child was potentially alive. The `deleted` flag
+    // set above stays (reaper shell-fallback suppressed); only terminal proof
+    // (a later wait observing exit) releases the stores.
+    if !waited_ok {
+        crate::event_log::log(
+            home,
+            "delete",
+            name,
+            "delete: child kill timeout — authority RETAINED for retry (no store removed)",
+        );
+        tracing::warn!(
+            agent = %name,
+            timeout_secs = CHILD_EXIT_TIMEOUT.as_secs(),
+            "delete_transaction: child did not exit within timeout — registry/config/port retained for retry"
+        );
+        return false;
+    }
+
     // Step 4: registry remove (after child exit confirmed or timeout).
     // #P1-2607-followup (reviewer4, PR #2620): must go through
     // `remove_and_unregister`, not a bare `reg.remove`, so the removed
@@ -137,6 +191,22 @@ pub fn delete_transaction(
     // never-written writer) doesn't leak a stale fd-reuse bookkeeping entry.
     if let Some(id) = instance_id {
         crate::agent::remove_and_unregister(registry, &id);
+    }
+
+    // #2764 R8 (codex correction 3): the pinned child is terminally stopped,
+    // but the NAME-keyed stores below (binding/config/port) may already belong
+    // to a same-name replacement generation. Fresh generation check: skip the
+    // name-keyed cleanup when the name no longer maps to the pinned id.
+    if let Some(exp) = expected_id {
+        if crate::fleet::resolve_uuid(home, name) != Some(exp) {
+            crate::event_log::log(
+                home,
+                "delete",
+                name,
+                "delete: pinned child stopped, but the name now maps to a different                  generation — name-keyed cleanup skipped",
+            );
+            return true;
+        }
     }
 
     // Step 5: drop active-channel binding (Sprint 20.5 cross-validation finding).
@@ -151,23 +221,27 @@ pub fn delete_transaction(
     // Step 7: IPC port cleanup.
     crate::ipc::remove_port(&super::run_dir(home), name);
 
-    // Step 8: event log.
-    let detail = if waited_ok {
-        "delete: child exited cleanly"
-    } else {
-        "delete: child kill timeout — force-removed registry entry"
-    };
-    crate::event_log::log(home, "delete", name, detail);
+    // Step 8: event log (the timeout arm returned above with authority
+    // retained — reaching here means the child exited or nothing was waited on).
+    crate::event_log::log(home, "delete", name, "delete: child exited cleanly");
 
-    if !waited_ok {
-        tracing::warn!(
-            agent = %name,
-            timeout_secs = CHILD_EXIT_TIMEOUT.as_secs(),
-            "delete_transaction: child did not exit within timeout, force-removed"
-        );
+    true
+}
+
+/// #2764 R8 test seam: force the NEXT delete_transaction wait to report
+/// timeout (thread-local one-shot; nextest = process-per-test).
+#[cfg(test)]
+pub(crate) mod exit_wait_test_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static FORCE: Cell<bool> = const { Cell::new(false) };
     }
-
-    waited_ok
+    pub(crate) fn force_timeout_once() {
+        FORCE.with(|c| c.set(true));
+    }
+    pub(crate) fn take() -> bool {
+        FORCE.with(|c| c.replace(false))
+    }
 }
 
 /// RAII rollback guard for `agent::spawn_agent`'s ordered mutations.
@@ -429,6 +503,97 @@ mod tests {
             spawn_mode: crate::backend::SpawnMode::Fresh,
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// #2764 R8 (codex blocker 2 at d54a3ab4): a wait TIMEOUT is an UNKNOWN
+    /// disposition — the registry handle, config entry and IPC port are
+    /// RETAINED so a retry re-kills and re-waits against the SAME evidence.
+    /// Pre-R8 the timeout force-removed everything, making the retry resolve
+    /// nothing and vacuously report stopped=true while the child could live.
+    #[test]
+    fn delete_timeout_retains_authority_then_retry_succeeds_2764_r8() {
+        let home = tmp_home("delete-timeout-retry");
+        let reg = empty_registry();
+        let handle = make_placeholder_handle("stuck");
+        let id = handle.id;
+        reg.lock().insert(id, handle);
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!("instances:\n  stuck:\n    id: \"{}\"\n", id.full()),
+        )
+        .expect("write fleet.yaml");
+        let rdir = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&rdir).expect("mk run dir");
+        let port = crate::ipc::port_path(&rdir, "stuck");
+        std::fs::write(&port, "1").expect("seed port file");
+
+        exit_wait_test_seam::force_timeout_once();
+        let first = delete_transaction(&home, "stuck", &reg, None, false);
+        assert!(!first, "forced timeout must report stopped=false");
+        assert!(
+            reg.lock().contains_key(&id),
+            "registry handle must be RETAINED on timeout (retry authority)"
+        );
+        assert!(port.exists(), "IPC port must be retained on timeout");
+
+        // S1: the PINNED retry targets the SAME retained child handle.
+        let second = delete_transaction_expecting(&home, "stuck", &reg, None, false, Some(id));
+        assert!(
+            second,
+            "pinned retry with the retained handle must observe the exit"
+        );
+        assert!(
+            !reg.lock().contains_key(&id),
+            "retry removes the registry entry after terminal proof"
+        );
+        assert!(
+            !port.exists(),
+            "retry removes the port after terminal proof"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2764 R8 (codex correction 3): a PINNED stop addresses the registry by
+    /// the EXACT expected id — an A→B same-name replacement between the
+    /// caller's validation and the stop lookup must leave B's child, config
+    /// and port untouched. A itself is terminally absent (not registered), so
+    /// the stop verdict is true, and the fresh generation check skips ALL
+    /// name-keyed cleanup because the name now belongs to B.
+    #[test]
+    fn pinned_stop_never_retargets_replacement_generation_2764_r8() {
+        let home = tmp_home("pinned-no-retarget");
+        let reg = empty_registry();
+        // B is the live replacement: registered, fleet-mapped, port published.
+        let b_handle = make_placeholder_handle("swapped");
+        let b_id = b_handle.id;
+        reg.lock().insert(b_id, b_handle);
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!("instances:\n  swapped:\n    id: \"{}\"\n", b_id.full()),
+        )
+        .expect("write fleet.yaml");
+        let rdir = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&rdir).expect("mk run dir");
+        let port = crate::ipc::port_path(&rdir, "swapped");
+        std::fs::write(&port, "1").expect("seed port");
+
+        // A is the stale pinned generation (never registered here).
+        let a_id = crate::types::InstanceId::new();
+        let verdict = delete_transaction_expecting(&home, "swapped", &reg, None, false, Some(a_id));
+
+        assert!(
+            verdict,
+            "A is terminally absent from the registry — its stop verdict is true"
+        );
+        assert!(
+            reg.lock().contains_key(&b_id),
+            "the replacement B's child handle must be untouched"
+        );
+        assert!(
+            port.exists(),
+            "the replacement B's port (name-keyed) must be untouched"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

@@ -156,6 +156,37 @@ instances:
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2764 R8 C1 RED: two INDEPENDENT same-name creates that both passed the
+/// absent-name precheck — exactly one may proceed; the loser is refused with
+/// ZERO side effects (no fleet entry, no workdir) at the real create entry.
+#[test]
+fn independent_same_name_create_refused_zero_side_effect_2764_r8() {
+    let home = tmp_home("dup_create");
+    // Create A's transaction is in flight (top-level admission held).
+    let _a = crate::agent::deleting::admit_create(&home, "dup").expect("first create admission");
+    // Create B enters through the REAL production entry.
+    let resp = super::instance_state::handle_create_instance(
+        &home,
+        &serde_json::json!({"name": "dup", "backend": "claude"}),
+        "",
+    );
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("independent create in flight"),
+        "the losing create must be refused, got: {resp}"
+    );
+    let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        !yaml.contains("dup"),
+        "zero-side-effect refusal: no fleet entry may be written, got:\n{yaml}"
+    );
+    assert!(
+        !crate::paths::workspace_dir(&home).join("dup").exists(),
+        "zero-side-effect refusal: no workdir may be created"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // --- cleanup_working_dir: legacy wrapper removed (#2764 E). Workspace-remove /
 // selective-scrub coverage lives on the real entry in
 // `agent_ops::workspace_cleanup::tests` (phase_* tests); the metadata tail is

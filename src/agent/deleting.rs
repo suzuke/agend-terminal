@@ -34,13 +34,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// #2764 R7: the per-name lifecycle hold. `Creating` and `Deleting` are
+/// #2764 R7/R8: the per-name lifecycle hold. `Creating` and `Deleting` are
 /// MUTUALLY EXCLUSIVE per `(home, name)` — a create admitted mid-delete would
 /// have its fresh generation erased by the delete's tail cleanup, and a delete
-/// started mid-create would destroy a half-created generation. Same-kind holds
-/// refcount (concurrent same-name creates / re-entrant deletes stay correct).
+/// started mid-create would destroy a half-created generation.
+///
+/// R8: `Creating` is TOKEN-bound. Only the flow that minted the token may
+/// re-enter (nested spawn stage of the SAME create — e.g. MCP create → SPAWN
+/// RPC → spawn_one); an INDEPENDENT concurrent same-name create is refused,
+/// never refcounted in. Deleting holds refcount for re-entrant deletes.
 enum Hold {
-    Creating(u32),
+    Creating { count: u32, token: u64 },
     Deleting(u32),
 }
 
@@ -61,6 +65,12 @@ pub fn is_deleting(home: &Path, name: &str) -> bool {
     )
 }
 
+fn mint_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Mark `name` under `home` as deleting for the lifetime of the returned guard.
 /// Hold the guard across the WHOLE outermost-delete teardown; its `Drop` un-marks
 /// on every path (incl. panic) so the name can be re-created afterwards.
@@ -71,7 +81,7 @@ pub fn mark_deleting(home: &Path, name: &str) -> Result<DeletingGuard, String> {
     let k = key(home, name);
     let mut reg = registry().lock();
     match reg.entry(k.clone()).or_insert(Hold::Deleting(0)) {
-        Hold::Creating(_) => {
+        Hold::Creating { .. } => {
             // The entry existed as Creating — or_insert did not overwrite it.
             Err(format!(
                 "'{name}' has a create in flight — delete refused (retry after it settles)"
@@ -84,23 +94,50 @@ pub fn mark_deleting(home: &Path, name: &str) -> Result<DeletingGuard, String> {
     }
 }
 
-/// #2764 R7 (codex P0-1): create-side ADMISSION — every create/deploy/TUI
-/// instance-creation path must acquire this BEFORE its first mutation
-/// (worktree/workdir creation, fleet.yaml add, topic create). Refuses (Err)
-/// while the name is mid-delete, so a new generation is zero-side-effect
-/// refused instead of being erased by the delete's tail cleanup. Hold the
-/// returned guard across the create's mutations; while it lives, a same-name
-/// delete refuses to START (see [`mark_deleting`]).
+/// #2764 R7/R8 (codex P0-1): TOP-LEVEL create-side ADMISSION — every
+/// create/deploy/TUI/boot instance-creation transaction must acquire this
+/// BEFORE its first mutation (worktree/workdir creation, fleet.yaml add,
+/// topic create, skills install) and hold it through the WHOLE transaction
+/// (success or rollback). Refuses (Err) while the name is mid-delete OR while
+/// an INDEPENDENT same-name create is already in flight. While it lives, a
+/// same-name delete refuses to START (see [`mark_deleting`]). Nested spawn
+/// stages of the SAME create re-enter with [`CreateAdmission::token`] via
+/// [`admit_or_reenter_create`].
 pub fn admit_create(home: &Path, name: &str) -> Result<CreateAdmission, String> {
+    admit_or_reenter_create(home, name, None)
+}
+
+/// #2764 R8: admission with optional re-entry. `token` = the top-level
+/// admission's token forwarded through the spawn chain (SPAWN RPC params) —
+/// matching it re-enters the SAME create transaction; a mismatched/missing
+/// token against a live independent hold is refused (same-kind refcounting
+/// must never admit a concurrent INDEPENDENT create). No live hold → this
+/// call becomes the top-level admission.
+pub fn admit_or_reenter_create(
+    home: &Path,
+    name: &str,
+    token: Option<u64>,
+) -> Result<CreateAdmission, String> {
     let k = key(home, name);
     let mut reg = registry().lock();
-    match reg.entry(k.clone()).or_insert(Hold::Creating(0)) {
-        Hold::Deleting(_) => Err(format!(
+    match reg.get_mut(&k) {
+        Some(Hold::Deleting(_)) => Err(format!(
             "'{name}' is mid-delete — create refused before any side effect"
         )),
-        Hold::Creating(n) => {
-            *n += 1;
-            Ok(CreateAdmission { key: k })
+        Some(Hold::Creating { count, token: t }) => {
+            if token == Some(*t) {
+                *count += 1;
+                Ok(CreateAdmission { key: k, token: *t })
+            } else {
+                Err(format!(
+                    "'{name}' already has an independent create in flight — refused"
+                ))
+            }
+        }
+        None => {
+            let t = mint_token();
+            reg.insert(k.clone(), Hold::Creating { count: 1, token: t });
+            Ok(CreateAdmission { key: k, token: t })
         }
     }
 }
@@ -108,9 +145,13 @@ pub fn admit_create(home: &Path, name: &str) -> Result<CreateAdmission, String> 
 fn release(kind_is_delete: bool, k: &(PathBuf, String)) {
     let mut reg = registry().lock();
     let remove = match (kind_is_delete, reg.get_mut(k)) {
-        (true, Some(Hold::Deleting(n))) | (false, Some(Hold::Creating(n))) => {
+        (true, Some(Hold::Deleting(n))) => {
             *n -= 1;
             *n == 0
+        }
+        (false, Some(Hold::Creating { count, .. })) => {
+            *count -= 1;
+            *count == 0
         }
         // Mismatched/absent entry: unreachable by construction (each guard is
         // minted with its own variant present); tolerate silently.
@@ -136,6 +177,16 @@ impl Drop for DeletingGuard {
 /// alive; a same-name delete refuses to start.
 pub struct CreateAdmission {
     key: (PathBuf, String),
+    token: u64,
+}
+
+impl CreateAdmission {
+    /// #2764 R8: the transaction token — forward it through the spawn chain
+    /// (SPAWN RPC params) so nested stages re-enter THIS create instead of
+    /// being refused as an independent concurrent one.
+    pub fn token(&self) -> u64 {
+        self.token
+    }
 }
 
 impl Drop for CreateAdmission {
@@ -249,5 +300,41 @@ mod tests {
         );
         drop(a);
         let _g = mark_deleting(&home, "victim").expect("mark after create settles");
+    }
+
+    /// #2764 R8: an INDEPENDENT concurrent same-name create is refused — the
+    /// same-kind hold must never refcount a second top-level create in.
+    #[test]
+    fn independent_concurrent_create_is_refused() {
+        let home = tmp("indep-create");
+        let a = admit_create(&home, "victim").expect("first top-level admit");
+        assert!(
+            admit_create(&home, "victim").is_err(),
+            "second independent create must be refused"
+        );
+        drop(a);
+        let _b = admit_create(&home, "victim").expect("admitted after the first settles");
+    }
+
+    /// #2764 R8: the SAME create transaction re-enters with its token; a
+    /// mismatched token is refused; the hold clears only when all guards drop.
+    #[test]
+    fn token_reenter_same_transaction_only() {
+        let home = tmp("token-reenter");
+        let top = admit_create(&home, "victim").expect("top-level admit");
+        let tok = top.token();
+        let nested =
+            admit_or_reenter_create(&home, "victim", Some(tok)).expect("matching token re-enters");
+        assert!(
+            admit_or_reenter_create(&home, "victim", Some(tok + 999)).is_err(),
+            "mismatched token must be refused"
+        );
+        drop(top);
+        assert!(
+            mark_deleting(&home, "victim").is_err(),
+            "nested guard still holds the create — delete must refuse"
+        );
+        drop(nested);
+        let _g = mark_deleting(&home, "victim").expect("all guards dropped → delete admitted");
     }
 }

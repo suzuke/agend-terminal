@@ -36,12 +36,14 @@ pub(crate) fn add_instance_with_topic(
     home: &Path,
     name: &str,
     entry: &crate::fleet::InstanceYamlEntry,
-) -> anyhow::Result<TopicOutcome> {
-    // #2764 R7 (codex P0-1): create-side ADMISSION before the first mutation
-    // (fleet.yaml add + topic create/register below) — a TUI create racing a
-    // same-name delete is zero-side-effect refused, and while this guard lives
-    // a same-name delete refuses to start.
-    let _create_admission = crate::agent::deleting::admit_create(home, name)
+) -> anyhow::Result<(TopicOutcome, crate::agent::deleting::CreateAdmission)> {
+    // #2764 R7/R8 (codex P0-1): create-side ADMISSION before the first
+    // mutation (fleet.yaml add + topic create/register below) — a TUI create
+    // racing a same-name delete is zero-side-effect refused. R8: the guard is
+    // RETURNED so the caller owns it through the COMPLETE top-level TUI
+    // transaction (pane creation: skills/workdir/process/registry) — dropping
+    // it at the end of this fn left the pane-create tail unfenced.
+    let create_admission = crate::agent::deleting::admit_create(home, name)
         .map_err(|reason| anyhow::anyhow!("create refused: {reason}"))?;
     crate::fleet::add_instance_to_yaml(home, name, entry)
         .map_err(|e| anyhow::anyhow!("failed to persist instance to fleet.yaml: {e}"))?;
@@ -71,7 +73,7 @@ pub(crate) fn add_instance_with_topic(
         );
     }
 
-    Ok(outcome)
+    Ok((outcome, create_admission))
 }
 
 #[cfg(test)]
@@ -194,7 +196,7 @@ mod tests {
         let entry = make_entry();
         let outcome = add_instance_with_topic(&home, "t1-agent", &entry).expect("helper Ok");
 
-        match outcome {
+        match outcome.0 {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "7001"),
             other => panic!("expected Created, got {other:?}"),
         }
@@ -220,7 +222,7 @@ mod tests {
         let outcome = add_instance_with_topic(&home, "t2-agent", &entry).expect("helper Ok");
 
         assert_eq!(
-            outcome,
+            outcome.0,
             TopicOutcome::NoChannel,
             "no active channel must yield NoChannel outcome"
         );
@@ -267,7 +269,7 @@ mod tests {
         };
         let outcome = add_instance_with_topic(&home, "ctrlb-c-agent", &entry).expect("Ok");
 
-        match outcome {
+        match outcome.0 {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "9100"),
             other => panic!("expected Created, got {other:?}"),
         }
@@ -301,7 +303,7 @@ mod tests {
         };
         let outcome = add_instance_with_topic(&home, "palette-agent", &entry).expect("Ok");
 
-        match outcome {
+        match outcome.0 {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "9200"),
             other => panic!("expected Created, got {other:?}"),
         }
@@ -369,7 +371,7 @@ mod tests {
 
         // First call: no channel.
         let outcome_pre = add_instance_with_topic(&home, "early-agent", &entry).expect("Ok");
-        assert_eq!(outcome_pre, TopicOutcome::NoChannel);
+        assert_eq!(outcome_pre.0, TopicOutcome::NoChannel);
 
         // Channel becomes available later (mimics post-#945 background telegram_init).
         let mock = Arc::new(MockChannel::new(8500));
@@ -377,7 +379,7 @@ mod tests {
 
         // Second call MUST see the channel via runtime active_channel() lookup.
         let outcome_post = add_instance_with_topic(&home, "late-agent", &entry).expect("Ok");
-        match outcome_post {
+        match outcome_post.0 {
             TopicOutcome::Created(ref tid) => assert_eq!(tid, "8500"),
             other => panic!("expected Created via runtime lookup, got {other:?}"),
         }
@@ -388,5 +390,31 @@ mod tests {
         );
         reset_active_channel_for_test();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #2764 R8 RED: the TUI create entry racing a same-name delete is
+    /// zero-side-effect refused BEFORE the fleet write / topic registration —
+    /// and the caller (menu/palette) must abort instead of continuing to the
+    /// pane create (see menu.rs / commands.rs admission binding).
+    #[test]
+    fn add_instance_with_topic_refused_mid_delete_zero_side_effect_2764_r8() {
+        let home = tmp_home("r8-tui-barrier");
+        let _del = crate::agent::deleting::mark_deleting(&home, "newbie").expect("mark deleting");
+        let r = add_instance_with_topic(
+            &home,
+            "newbie",
+            &crate::fleet::InstanceYamlEntry {
+                backend: Some("claude".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(r.is_err(), "mid-delete TUI create must be refused, got Ok");
+        let yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+        assert!(
+            !yaml.contains("newbie"),
+            "zero-side-effect refusal: no fleet entry may be written, got:\n{yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

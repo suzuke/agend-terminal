@@ -145,7 +145,7 @@ fn yaml_str(val: &serde_yaml_ng::Value, key: &str) -> Option<String> {
 type DeployEntries = (
     Vec<String>,
     Vec<(String, crate::fleet::InstanceYamlEntry)>,
-    Vec<crate::agent::deleting::CreateAdmission>,
+    std::collections::HashMap<String, crate::agent::deleting::CreateAdmission>,
 );
 
 fn create_instance_entries(
@@ -160,7 +160,7 @@ fn create_instance_entries(
     // any mutation (prepare_work_dir below creates directories). Any name
     // mid-delete aborts the WHOLE deploy zero-side-effect; the returned
     // guards are held by the caller through fleet persist + spawn.
-    let mut admissions = Vec::new();
+    let mut admissions = std::collections::HashMap::new();
     for (name_val, _) in &params.instances_def {
         let Some(inst_suffix) = name_val.as_str() else {
             continue;
@@ -173,7 +173,9 @@ fn create_instance_entries(
             continue;
         }
         match crate::agent::deleting::admit_create(home, &inst_name) {
-            Ok(g) => admissions.push(g),
+            Ok(g) => {
+                admissions.insert(inst_name, g);
+            }
             Err(reason) => return Err(format!("deploy refused: {reason}")),
         }
     }
@@ -383,6 +385,7 @@ fn spawn_instances(
     home: &Path,
     yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
     directory: &str,
+    admissions: &std::collections::HashMap<String, crate::agent::deleting::CreateAdmission>,
 ) {
     for (inst_name, entry) in yaml_entries {
         let backend_name = resolve_spawn_backend(home, inst_name, entry);
@@ -392,6 +395,12 @@ fn spawn_instances(
             "backend": backend_name,
             "working_directory": work_dir,
         });
+        // #2764 R8: re-enter the deploy's create transaction in the daemon's
+        // spawn_one — without the token the spawn is refused as an
+        // independent concurrent create.
+        if let Some(adm) = admissions.get(inst_name) {
+            params["create_admission_token"] = serde_json::json!(adm.token());
+        }
         if let Some(ref model) = entry.model {
             params["model"] = serde_json::json!(model);
         }
@@ -512,7 +521,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     let provenance_nonce = uuid::Uuid::new_v4().to_string();
     // #2764 R7: `_admissions` guards are HELD through fleet persist + spawn —
     // a same-name delete refuses to start while a deploy create is in flight.
-    let (created, yaml_entries, _admissions) = match create_instance_entries(home, &params) {
+    let (created, yaml_entries, admissions) = match create_instance_entries(home, &params) {
         Ok(t) => t,
         Err(e) => return serde_json::json!({"error": e}),
     };
@@ -523,7 +532,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         return e;
     }
 
-    spawn_instances(home, &yaml_entries, &params.directory);
+    spawn_instances(home, &yaml_entries, &params.directory, &admissions);
 
     let team_created = create_deployment_team(
         home,

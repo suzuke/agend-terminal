@@ -1703,13 +1703,21 @@ fn spawn_and_register_agent(
     // recheck in the spawn loop — that catches a delete that already removed the
     // fleet.yaml entry; this deleting-set check covers the in-flight teardown
     // (entry not yet removed). Leaf-lock check, no registry lock held.
-    if crate::agent::deleting::is_deleting(home, name) {
-        tracing::info!(
-            agent = %name,
-            "skipping spawn — instance is mid-delete (#1915 deleting-set chokepoint)"
-        );
-        return Ok(());
-    }
+    // #2764 R8: TOP-LEVEL admission held across the WHOLE boot transaction
+    // (configs insert → spawn → registry → TUI listener/rollback). The old
+    // point-in-time is_deleting check left everything after it unfenced — a
+    // delete starting mid-boot could erase the half-registered generation.
+    let _create_admission = match crate::agent::deleting::admit_create(home, name) {
+        Ok(g) => g,
+        Err(reason) => {
+            tracing::info!(
+                agent = %name,
+                %reason,
+                "skipping spawn — admission refused (#1915/#2764 chokepoint)"
+            );
+            return Ok(());
+        }
+    };
     configs.lock().insert(
         name.clone(),
         AgentConfig {

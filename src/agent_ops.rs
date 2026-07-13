@@ -540,14 +540,18 @@ pub fn spawn_one(
     work_dir: &Path,
     size: (u16, u16),
     env: Option<&std::collections::HashMap<String, String>>,
+    create_token: Option<u64>,
 ) -> anyhow::Result<crate::backend::SpawnMode> {
-    // #2764 R7 (codex P0-1): admission BEFORE the first side effect — the dir
-    // creation + skills install below run long before spawn_agent's
-    // deleting-set check, so a spawn racing a same-name delete used to
-    // re-materialize workspace state mid-teardown. While this guard lives a
+    // #2764 R7/R8 (codex P0-1): admission BEFORE the first side effect — the
+    // dir creation + skills install below run long before spawn_agent's
+    // deleting-set check. `create_token` re-enters the OUTER create
+    // transaction (MCP create / CREATE_TEAM / deploy forwarded it); without a
+    // token this call is itself the top-level admission (start / restart) and
+    // an independent concurrent create is refused. While the guard lives a
     // same-name delete refuses to start (and vice versa).
-    let _create_admission = crate::agent::deleting::admit_create(home, name)
-        .map_err(|reason| anyhow::anyhow!("spawn refused: {reason}"))?;
+    let _create_admission =
+        crate::agent::deleting::admit_or_reenter_create(home, name, create_token)
+            .map_err(|reason| anyhow::anyhow!("spawn refused: {reason}"))?;
     std::fs::create_dir_all(work_dir).ok();
     // #1080: skills auto-install for dynamically spawned instances.
     // spawn_one is the SPAWN-RPC choke point — without this, instances

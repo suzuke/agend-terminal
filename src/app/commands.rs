@@ -357,7 +357,11 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
             // returning create_topic). Route through
             // `tui_spawn::add_instance_with_topic` so the topic is created
             // + topic_id persisted before the spawn proceeds.
-            if let Err(e) = super::tui_spawn::add_instance_with_topic(
+            // #2764 R8: the admission guard is OWNED here so it spans the
+            // whole pane-create transaction below; a refusal (mid-delete /
+            // independent create) ABORTS the palette spawn — never continue
+            // creating a pane for a refused registration.
+            let _create_admission = match super::tui_spawn::add_instance_with_topic(
                 ctx.home,
                 &inst_name,
                 &crate::fleet::InstanceYamlEntry {
@@ -365,8 +369,12 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     ..Default::default()
                 },
             ) {
-                tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");
-            }
+                Ok((_, adm)) => adm,
+                Err(e) => {
+                    tracing::warn!(name = %inst_name, error = %e, "palette spawn aborted — instance not created");
+                    return false;
+                }
+            };
             let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
             let pane_result = if let Some(resolved) =
                 fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))

@@ -44,9 +44,11 @@ pub(crate) mod full_delete_test_seam {
     thread_local! {
         static AFTER_GATE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         static POST_COMMIT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
-        // #2764 R7: forced result for the process-stop DELETE call (P0-2 REDs).
-        static STOP_CALL: RefCell<Option<anyhow::Result<serde_json::Value>>> =
-            const { RefCell::new(None) };
+        // #2764 R7/R8: forced RESPONSE for the process-stop DELETE call
+        // (P0-2 REDs + pinned-success injection for daemon-less tests).
+        // PERSISTENT until the thread ends — multi-delete flows (team
+        // cascades) re-read it per delete.
+        static STOP_CALL: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
     }
     pub(crate) fn set_after_gate(f: Box<dyn FnOnce()>) {
         AFTER_GATE.with(|h| *h.borrow_mut() = Some(f));
@@ -67,11 +69,11 @@ pub(crate) mod full_delete_test_seam {
             f();
         }
     }
-    pub(crate) fn set_stop_call(r: anyhow::Result<serde_json::Value>) {
-        STOP_CALL.with(|h| *h.borrow_mut() = Some(r));
+    pub(crate) fn set_stop_call(v: serde_json::Value) {
+        STOP_CALL.with(|h| *h.borrow_mut() = Some(v));
     }
     pub(crate) fn take_stop_call() -> Option<anyhow::Result<serde_json::Value>> {
-        STOP_CALL.with(|h| h.borrow_mut().take())
+        STOP_CALL.with(|h| h.borrow().clone().map(Ok))
     }
 }
 
@@ -207,16 +209,39 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
         stop_resp = forced;
     }
     let disposition: Result<(), String> = match &stop_resp {
-        Ok(v) if v["ok"].as_bool() == Some(true) && v["stopped"].as_bool() != Some(false) => Ok(()),
-        Ok(v) if v["ok"].as_bool() == Some(true) => {
+        // #2764 R8: a PINNED managed delete requires the EXPLICIT
+        // `stopped:true` verdict — a missing field (older daemon, unexpected
+        // arm) is unproven, not implicit success. Only the unpinned ghost
+        // flow (no generation to protect) accepts a bare ok:true.
+        Ok(v) if v["ok"].as_bool() == Some(true) && v["stopped"].as_bool() == Some(true) => Ok(()),
+        Ok(v)
+            if v["ok"].as_bool() == Some(true)
+                && instance_id.is_none()
+                && v["stopped"].as_bool() != Some(false) =>
+        {
+            Ok(())
+        }
+        Ok(v) if v["ok"].as_bool() == Some(true) && v["stopped"].as_bool() == Some(false) => {
             Err("child did not exit within the kill timeout (stopped=false)".to_string())
+        }
+        Ok(v) if v["ok"].as_bool() == Some(true) => {
+            Err("pinned delete requires an explicit stopped:true verdict (missing)".to_string())
         }
         Ok(v) => Err(format!(
             "DELETE refused: {}",
             v["error"].as_str().unwrap_or("unknown")
         )),
         Err(e) => {
-            if crate::ipc::port_path(&crate::daemon::run_dir(home), name).exists() {
+            // R8': for a PINNED managed delete an unreachable daemon API is
+            // ALWAYS unproven — a missing `.port` sidecar is not OS/registry/
+            // generation evidence of a dead child. Only the unpinned ghost
+            // flow (no generation to protect) proceeds, and even it fails
+            // closed when live port evidence exists.
+            if instance_id.is_some() {
+                Err(format!(
+                    "daemon API unreachable ({e}) — a pinned delete requires a live stop verdict"
+                ))
+            } else if crate::ipc::port_path(&crate::daemon::run_dir(home), name).exists() {
                 Err(format!(
                     "daemon API unreachable ({e}) while live port evidence exists for '{name}'"
                 ))

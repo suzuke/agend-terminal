@@ -112,22 +112,24 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = agent::validate_name(name) {
         return json!({"ok": false, "error": e});
     }
-    // Check external registry first
-    {
-        let mut ext = agent::lock_external(ctx.externals);
-        if ext.remove(name).is_some() {
-            crate::event_log::log(ctx.home, "delete", name, "external agent deleted");
-            return json!({"ok": true});
-        }
-    }
-    // #2764 R7 (codex P0-2): exact-generation stop gate — when the caller pins
-    // the expected durable id, refuse outright if the current fleet mapping no
-    // longer matches (same-name replacement): the stop must only ever target
-    // the designated generation, never whatever now holds the name.
-    if let Some(expected) = params["expected_id"]
-        .as_str()
-        .and_then(crate::types::InstanceId::parse)
-    {
+    // #2764 R7/R8 (codex P0-2): exact-generation stop gate FIRST — before the
+    // external/name-only removal below. When the caller pins the expected
+    // durable id, refuse outright if the current fleet mapping no longer
+    // matches (same-name replacement): the stop must only ever target the
+    // designated generation, never whatever now holds the name.
+    // R8': a MALFORMED expected_id fails closed — silently parsing to None
+    // would degrade a pinned delete to name-only authority.
+    let expected_id = match params.get("expected_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().and_then(crate::types::InstanceId::parse) {
+            Some(id) => Some(id),
+            None => {
+                return json!({"ok": false, "stopped": false,
+                    "error": "malformed expected_id — refusing name-only fallback"});
+            }
+        },
+    };
+    if let Some(expected) = expected_id {
         let current = crate::fleet::resolve_uuid(ctx.home, name);
         if current != Some(expected) {
             return json!({"ok": false, "stopped": false, "error": format!(
@@ -137,24 +139,44 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             )});
         }
     }
+    // Check external registry (after the generation gate). External agents
+    // have no daemon-managed child to stop — deregistration IS the terminal
+    // disposition, reported explicitly.
+    {
+        let mut ext = agent::lock_external(ctx.externals);
+        if ext.remove(name).is_some() {
+            crate::event_log::log(ctx.home, "delete", name, "external agent deleted");
+            return json!({"ok": true, "stopped": true});
+        }
+    }
     // delete_transaction kills the process tree, waits up to CHILD_EXIT_TIMEOUT
     // for actual exit, then removes registry / drops Telegram binding /
     // removes configs / removes IPC port / emits event log. Sprint 20 F2 fix:
     // the previous implementation removed the registry entry before the OS
     // had reaped the PID, exposing PID re-use + concurrent-spawn collision
     // races.
-    let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false);
+    // R8': a PINNED delete must OBSERVE the exit — `stopped:true` means
+    // terminal absence of that exact generation, so the caller's no_wait
+    // optimism is ignored when expected_id is pinned.
+    let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false) && expected_id.is_none();
     // #2764 R7 (codex P0-2): the exit disposition is no longer collapsed —
     // `stopped:false` = the child did NOT provably exit within the kill
     // timeout; `full_delete_instance` refuses to run its destructive commit
     // on that verdict.
-    let stopped = crate::daemon::lifecycle::delete_transaction(
+    let stopped = crate::daemon::lifecycle::delete_transaction_expecting(
         ctx.home,
         name,
         ctx.registry,
         Some(ctx.configs),
         skip_exit_wait,
+        expected_id,
     );
+    if !stopped {
+        // #2764 R8: UNKNOWN disposition — authority retained inside
+        // delete_transaction; do NOT emit deleted-events or clean reminder
+        // state for an instance that may still be alive.
+        return json!({"ok": true, "stopped": false});
+    }
     // H3: clean up poll_reminder dedup state for deleted agent
     crate::daemon::poll_reminder::remove_agent(name);
     if let Some(n) = ctx.notifier {
@@ -163,7 +185,7 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             name: name.to_string(),
         });
     }
-    json!({"ok": true, "stopped": stopped})
+    json!({"ok": true, "stopped": true})
 }
 
 /// Parse the SPAWN-RPC `env` field into a `HashMap` of process env vars.
@@ -338,6 +360,9 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     };
     let env_for_spawn = env_from_params.as_ref().or(env_from_fleet.as_ref());
 
+    // #2764 R8: the create transaction's admission token (forwarded by the
+    // MCP create / deploy caller) re-enters that transaction in spawn_one.
+    let create_token = params["create_admission_token"].as_u64();
     match crate::agent_ops::spawn_one(
         ctx.home,
         ctx.registry,
@@ -348,6 +373,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         &work_dir,
         size,
         env_for_spawn,
+        create_token,
     ) {
         Ok(_spawn_mode) => {
             // fresh-restart self-kick: fire the first-turn recovery inject ONLY when
@@ -1036,6 +1062,66 @@ mod tests {
     }
 
     /// §3.5.10: spawn_one (team-spawn path) also clears stale metadata.
+    /// #2764 R8 S2: a malformed expected_id fails CLOSED — never degrades a
+    /// pinned delete to name-only authority.
+    #[test]
+    fn handle_delete_malformed_expected_id_fails_closed_2764_r8() {
+        let (ctx, home) = test_ctx_with_agent("badexp");
+        let resp = handle_delete(
+            &json!({"name": "badexp", "expected_id": "not-a-uuid"}),
+            &ctx,
+        );
+        assert_eq!(resp["ok"].as_bool(), Some(false), "got {resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("malformed expected_id"),
+            "got {resp}"
+        );
+        let id = crate::fleet::resolve_uuid(ctx.home, "badexp").expect("seeded id");
+        assert!(
+            agent::lock_registry(ctx.registry).contains_key(&id),
+            "a refused delete must not touch the registry"
+        );
+        cleanup_agent(&ctx, "badexp");
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    /// #2764 R8 S2: a PINNED delete ignores the caller's no_wait optimism —
+    /// the verdict reflects the REAL wait (forced timeout → stopped:false with
+    /// authority retained), and the pinned retry then observes the exit.
+    #[test]
+    fn handle_delete_pinned_ignores_no_wait_2764_r8() {
+        let (ctx, home) = test_ctx_with_agent("pinned-nowait");
+        let id = crate::fleet::resolve_uuid(ctx.home, "pinned-nowait").expect("seeded id");
+        crate::daemon::lifecycle::exit_wait_test_seam::force_timeout_once();
+        let resp = handle_delete(
+            &json!({"name": "pinned-nowait", "expected_id": id.full(), "no_wait": true}),
+            &ctx,
+        );
+        assert_eq!(resp["ok"].as_bool(), Some(true), "got {resp}");
+        assert_eq!(
+            resp["stopped"].as_bool(),
+            Some(false),
+            "pinned + forced timeout must NOT be optimistic true (no_wait ignored): {resp}"
+        );
+        assert!(
+            agent::lock_registry(ctx.registry).contains_key(&id),
+            "timeout must retain the registry authority for the retry"
+        );
+        let resp2 = handle_delete(
+            &json!({"name": "pinned-nowait", "expected_id": id.full()}),
+            &ctx,
+        );
+        assert_eq!(
+            resp2["stopped"].as_bool(),
+            Some(true),
+            "the pinned retry must observe the exit: {resp2}"
+        );
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
     #[test]
     fn spawn_one_clears_stale_metadata_for_team_path() {
         let (ctx, home) = test_ctx_with_agent("team-meta");
@@ -1068,6 +1154,7 @@ mod tests {
             crate::backend::SpawnMode::Fresh,
             &work_dir,
             size,
+            None,
             None,
         );
         assert!(result.is_ok(), "spawn_one must succeed: {result:?}");

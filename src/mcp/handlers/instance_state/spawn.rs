@@ -216,6 +216,10 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         "layout": layout, "spawner": instance_name,
         "target_pane": target_pane,
         "role": role,
+        // #2764 R8: nested spawn stages re-enter THIS create transaction —
+        // without the token the daemon-side spawn_one would refuse the spawn
+        // as an independent concurrent create.
+        "create_admission_token": _create_admission.token(),
     });
     if let Some(env) = env_value.as_ref() {
         spawn_params["env"] = env.clone();
