@@ -21,7 +21,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::super::comms_gates::{self, DispatchPreChecks};
+use super::super::comms_gates::{self, DispatchPreChecks, ReviewAuthor};
 use super::super::dispatch_hook;
 use super::super::send_envelope::SendEnvelope;
 use super::super::{err_needs_identity, is_ok_result, require_instance};
@@ -486,6 +486,104 @@ fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
     result
 }
 
+/// t-…-17 reviewer-assignment marker gate. Runs BETWEEN `run_dispatch_pre_checks`
+/// and `maybe_auto_bind_lease` — i.e. AFTER the generic pre-send gates but BEFORE
+/// any bind / task-create / deliver side effect — and ATOMICALLY REJECTS on the
+/// FIRST failure so a marker dispatch that fails authority never mutates state.
+/// Only invoked when `checks.review_assignment` is true; an ordinary dispatch never
+/// enters here (byte-identical legacy path).
+///
+/// Order is load-bearing (fail-closed):
+///   (a) explicit non-empty `task_id` + non-empty `branch` + nonzero `pr_number`
+///       (generation identity; B18) — else reject BEFORE resolving anything;
+///   (b) provider-neutral repo resolve (fail-closed, no default);
+///   (c) source-repo → EXACTLY-ONE team, and sender == that team's SOLE CURRENT
+///       orchestrator (live fleet; NO operator-allow);
+///   (d) review_author self-review deny — `Agent(author) == reviewer target` is
+///       same-namespace self-review; `External(login)` is a distinct principal and
+///       is NEVER string-compared to the agent target. (sender == target is already
+///       rejected upstream in `resolve_delegate`.)
+fn validate_review_assignment_marker(
+    home: &Path,
+    sender: &Sender,
+    target: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+) -> Result<(), Value> {
+    // (a) mandatory explicit generation-bound identifiers.
+    if args["task_id"].as_str().unwrap_or("").is_empty() {
+        return Err(json!({
+            "error": "review_assignment requires an explicit non-empty `task_id` \
+                      (the marker path never auto-creates a task)",
+            "code": "review_assignment_missing_task_id",
+        }));
+    }
+    if args["branch"].as_str().unwrap_or("").is_empty() {
+        return Err(json!({
+            "error": "review_assignment requires a non-empty `branch`",
+            "code": "review_assignment_missing_branch",
+        }));
+    }
+    match checks.pr_number {
+        Some(n) if n != 0 => {}
+        _ => {
+            return Err(json!({
+                "error": "review_assignment requires a nonzero `pr_number` \
+                          (mandatory generation identity — B18)",
+                "code": "review_assignment_missing_pr_number",
+            }))
+        }
+    }
+
+    // (b) fail-closed provider-neutral repo resolve (the ACL key).
+    let repo_slug = dispatch_hook::resolve_review_assignment_repo(home, args, target)?;
+
+    // (c) source-repo → exactly-one team + sole-current-orchestrator authority.
+    let team =
+        crate::teams::resolve_team_by_source_repo(home, &repo_slug).map_err(|e| match e {
+            crate::teams::TeamAuthorityError::NoMatch => json!({
+                "error": format!(
+                    "review_assignment rejected: no team's `source_repo` matches `{repo_slug}` \
+                     — operator must set the owning team's source_repo (fail-closed, no default)"
+                ),
+                "code": "review_assignment_no_team",
+            }),
+            crate::teams::TeamAuthorityError::Ambiguous(n) => json!({
+                "error": format!(
+                    "review_assignment rejected: {n} teams share `source_repo` `{repo_slug}` \
+                     — ambiguous authority, operator must disambiguate (fail-closed)"
+                ),
+                "code": "review_assignment_ambiguous_team",
+            }),
+        })?;
+    if team.orchestrator.as_deref() != Some(sender.as_str()) {
+        return Err(json!({
+            "error": format!(
+                "review_assignment rejected: sender `{}` is not the sole current \
+                 orchestrator of team `{}` (source-repo `{repo_slug}`) — authority is \
+                 the owning team's orchestrator only, no operator-allow",
+                sender.as_str(),
+                team.name
+            ),
+            "code": "review_assignment_not_authorized",
+        }));
+    }
+
+    // (d) review_author self-review deny (typed; External never compared).
+    if let Some(ReviewAuthor::Agent(author)) = &checks.review_author {
+        if author == target {
+            return Err(json!({
+                "error": format!(
+                    "review_assignment rejected: reviewer target `{target}` is the code \
+                     author (same-namespace self-review)"
+                ),
+                "code": "review_assignment_self_review",
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Ordered choreography for MCP `delegate_task` / unified send kind=task.
 pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let resolved = match resolve_delegate(home, args, sender) {
@@ -503,12 +601,28 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     };
 
     let composed = compose_delegate_message(task, args, &checks);
+
+    // t-…-17 reviewer-assignment marker gate — fail-closed, BEFORE any bind/create/
+    // deliver side effect. A dispatch WITHOUT the marker skips this entirely and is
+    // byte-identical to the legacy path.
+    if checks.review_assignment {
+        if let Err(e) = validate_review_assignment_marker(home, sender, target, args, &checks) {
+            return e;
+        }
+    }
+
     if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
         return e;
     }
 
-    let (effective_task_id, auto_created_task_id) =
-        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required);
+    let (effective_task_id, auto_created_task_id) = if checks.review_assignment {
+        // Marker path: `task_id` is explicit + validated (gate step a) — BYPASS
+        // `maybe_auto_create_task` (the durable outbox store, a later slice, owns
+        // the assignment record; no board auto-create here).
+        (args["task_id"].as_str().map(String::from), None)
+    } else {
+        maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required)
+    };
     let task_id_str = effective_task_id.as_deref();
     let mut msg = composed.msg;
     if let Some(tid) = task_id_str {
@@ -675,5 +789,330 @@ mod review_class_authority_tests {
             resolve_existing_task_review_class(Some("single"), Some("single"), false),
             Ok(ReviewClass::Single)
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// t-…-17 reviewer-assignment marker gate (C4/C5/C6 + reject wiring).
+// Real-entry: the validation-layer cases drive `validate_review_assignment_marker`
+// directly (no bind/deliver side effects); the reject cases drive the full
+// `handle_delegate_task` to prove ZERO side effects (no auto-create) on rejection.
+// ─────────────────────────────────────────────────────────────────
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_assignment_marker_tests {
+    use super::{handle_delegate_task, validate_review_assignment_marker, DispatchPreChecks};
+    use crate::identity::Sender;
+    use crate::mcp::handlers::comms_gates::ReviewAuthor;
+    use serde_json::{json, Value};
+
+    fn tmp_home(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-ra-marker-{}-{label}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// Seed a fleet.yaml with the given raw `teams:` body. `source_repo` is a bare
+    /// `owner/repo` slug so the provider-neutral canonicalizer resolves it with NO
+    /// git subprocess (lockstep with the dispatch side, which uses the same
+    /// canonicalizer on the explicit `repository` arg).
+    fn seed_fleet(home: &std::path::Path, teams_yaml: &str) {
+        let yaml = format!("instances:\n  lead:\n    backend: claude\n{teams_yaml}");
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    fn marker_checks(
+        review_author: Option<ReviewAuthor>,
+        pr_number: Option<u64>,
+    ) -> DispatchPreChecks {
+        DispatchPreChecks {
+            force: false,
+            force_reason: None,
+            second_reviewer: false,
+            plan_ack_required: 0,
+            review_assignment: true,
+            review_author,
+            pr_number,
+        }
+    }
+
+    fn marker_args(repo: &str, pr_number: u64) -> Value {
+        json!({
+            "instance": "reviewer",
+            "task": "review the PR",
+            "task_id": "t-rev-1",
+            "branch": "feat/x",
+            "repository": repo,
+            "pr_number": pr_number,
+        })
+    }
+
+    /// T2: sender is the SOLE CURRENT orchestrator of the team owning the repo ⇒ allow.
+    #[test]
+    fn t2_sole_orchestrator_authority_allows() {
+        let home = tmp_home("t2-allow");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 42),
+            &marker_checks(None, Some(42)),
+        )
+        .expect("sole-orchestrator dispatch must pass the marker gate");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T3: sender is NOT the team's orchestrator ⇒ deny (no operator-allow).
+    #[test]
+    fn t3_non_authority_denied() {
+        let home = tmp_home("t3-deny");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("intruder").unwrap();
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 42),
+            &marker_checks(None, Some(42)),
+        )
+        .expect_err("non-orchestrator must be denied");
+        assert_eq!(err["code"], "review_assignment_not_authorized", "{err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T4a: no team's source_repo matches the dispatch repo ⇒ operator-repair reject.
+    #[test]
+    fn t4_zero_team_match_rejected() {
+        let home = tmp_home("t4-zero");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("other/repo", 42),
+            &marker_checks(None, Some(42)),
+        )
+        .expect_err("no team owning other/repo ⇒ reject");
+        assert_eq!(err["code"], "review_assignment_no_team", "{err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T4b: ≥2 teams share the same source_repo ⇒ ambiguous-authority reject.
+    #[test]
+    fn t4_ambiguous_team_match_rejected() {
+        let home = tmp_home("t4-ambig");
+        seed_fleet(
+            &home,
+            "teams:\n  \
+               edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n  \
+               edge2:\n    orchestrator: lead\n    members:\n      - lead2\n    source_repo: Owner/Repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 42),
+            &marker_checks(None, Some(42)),
+        )
+        .expect_err("two teams owning the same canonical repo ⇒ reject");
+        assert_eq!(err["code"], "review_assignment_ambiguous_team", "{err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T5 / T8-Agent: review_author Agent(name) == reviewer target ⇒ self-review deny.
+    #[test]
+    fn t5_review_author_agent_self_review_denied() {
+        let home = tmp_home("t5-self");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 42),
+            &marker_checks(Some(ReviewAuthor::Agent("reviewer".to_string())), Some(42)),
+        )
+        .expect_err("agent reviewing own code must be denied");
+        assert_eq!(err["code"], "review_assignment_self_review", "{err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T8-External: External(login) equal-string to the target is a DISTINCT
+    /// principal — an agent reviewing external-authored code is allowed.
+    #[test]
+    fn t8_review_author_external_matching_target_allowed() {
+        let home = tmp_home("t8-ext");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 42),
+            &marker_checks(
+                Some(ReviewAuthor::External("reviewer".to_string())),
+                Some(42),
+            ),
+        )
+        .expect("external author string-equal to target is a distinct principal ⇒ allow");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T6: authority is derived from a LIVE fleet load — reassigning the team's
+    /// orchestrator flips the verdict without any restart/cache.
+    #[test]
+    fn t6_authority_uses_live_fleet_load() {
+        let home = tmp_home("t6-live");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n      - lead2\n    source_repo: owner/repo\n",
+        );
+        let lead = Sender::new("lead").unwrap();
+        let lead2 = Sender::new("lead2").unwrap();
+        let args = marker_args("owner/repo", 42);
+        let checks = marker_checks(None, Some(42));
+        // lead is orchestrator ⇒ allowed; lead2 is not ⇒ denied.
+        validate_review_assignment_marker(&home, &lead, "reviewer", &args, &checks)
+            .expect("current orchestrator allowed");
+        assert!(
+            validate_review_assignment_marker(&home, &lead2, "reviewer", &args, &checks).is_err()
+        );
+        // Reassign orchestrator to lead2 via the real teams API (rewrites fleet.yaml).
+        let updated =
+            crate::teams::update(&home, &json!({"name": "edge", "orchestrator": "lead2"}));
+        assert_eq!(updated["status"], "updated", "{updated}");
+        // The verdict flips on the very next call — proving a live read.
+        assert!(
+            validate_review_assignment_marker(&home, &lead, "reviewer", &args, &checks).is_err(),
+            "former orchestrator must lose authority after reassignment"
+        );
+        validate_review_assignment_marker(&home, &lead2, "reviewer", &args, &checks)
+            .expect("new orchestrator must gain authority from the live fleet");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T1: an unresolvable repo (malformed slug, no team/instance source_repo)
+    /// ⇒ fail-closed reject with NO default.
+    #[test]
+    fn t1_unresolvable_repo_rejected() {
+        let home = tmp_home("t1-repo");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Sender::new("lead").unwrap();
+        // "single" is a one-component slug the provider-neutral canonicalizer rejects.
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("single", 42),
+            &marker_checks(None, Some(42)),
+        )
+        .expect_err("unresolvable repo must fail closed");
+        assert_eq!(err["code"], "review_assignment_repo_unresolved", "{err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T7: a marker dispatch MISSING task_id (or branch) is atomically rejected at
+    /// the full entry point, and `maybe_auto_create_task` is NEVER invoked (zero
+    /// board side effects).
+    #[test]
+    fn t7_missing_task_id_rejects_no_auto_create() {
+        let home = tmp_home("t7-taskid");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        let sender = Some(Sender::new("lead").unwrap());
+        // review_assignment=true, branch + repo + pr_number present, task_id MISSING.
+        let out = handle_delegate_task(
+            &home,
+            &json!({
+                "instance": "reviewer",
+                "task": "review the PR",
+                "review_assignment": true,
+                "branch": "feat/x",
+                "repository": "owner/repo",
+                "pr_number": 42,
+            }),
+            &sender,
+        );
+        assert_eq!(out["code"], "review_assignment_missing_task_id", "{out}");
+        // ZERO side effects: no task auto-created on the board.
+        let board = crate::tasks::handle(&home, "lead", &json!({"action": "list"}));
+        assert!(
+            board["tasks"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "marker reject must NOT auto-create a task: {board}"
+        );
+        assert!(out.get("auto_created_task_id").is_none(), "{out}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T17 (B18): a marker dispatch with missing OR zero pr_number is atomically
+    /// rejected BEFORE any side effect (no bind/create).
+    #[test]
+    fn t17_missing_or_zero_pr_number_rejects_no_side_effects() {
+        for (label, pr) in [("zero", json!(0)), ("absent", Value::Null)] {
+            let home = tmp_home(&format!("t17-{label}"));
+            seed_fleet(
+                &home,
+                "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+            );
+            let sender = Some(Sender::new("lead").unwrap());
+            let mut args = json!({
+                "instance": "reviewer",
+                "task": "review the PR",
+                "review_assignment": true,
+                "task_id": "t-rev-1",
+                "branch": "feat/x",
+                "repository": "owner/repo",
+            });
+            if !pr.is_null() {
+                args["pr_number"] = pr;
+            }
+            let out = handle_delegate_task(&home, &args, &sender);
+            assert_eq!(
+                out["code"], "review_assignment_missing_pr_number",
+                "pr_number {label} must atomically reject: {out}"
+            );
+            let board = crate::tasks::handle(&home, "lead", &json!({"action": "list"}));
+            assert!(
+                board["tasks"]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true),
+                "pr_number reject must NOT create a task ({label}): {board}"
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
     }
 }
