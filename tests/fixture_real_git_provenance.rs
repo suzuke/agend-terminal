@@ -134,3 +134,86 @@ fn t122_fixture_uses_real_git_end_to_end() {
     );
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// (task122 RED #1) the #2770 suite (scripts/test_fmt_owned.sh) passes 10/10 through
+/// the shell seam even when a DENY-SHIM occupies `$AGEND_HOME/bin` on the child PATH
+/// — proof the migrated shell fixture + its child git procs use REAL git.
+#[cfg(unix)]
+#[test]
+fn t122_test_fmt_owned_passes_under_simulated_deny_shim() {
+    use std::os::unix::fs::PermissionsExt;
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    // Temp AGEND_HOME whose bin/git is a deny-shim (exit 42) — must be EXCLUDED.
+    let home = std::env::temp_dir().join(format!(
+        "t122-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim_git = bin.join("git");
+    std::fs::write(&shim_git, "#!/bin/sh\necho 'deny-shim' >&2\nexit 42\n").unwrap();
+    std::fs::set_permissions(&shim_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let real_dir = real_git_dir();
+    let base = std::env::var("PATH").unwrap_or_default();
+    // deny-shim FIRST, then real git, then the ambient PATH (for rustfmt etc.).
+    let path = format!("{}:{}:{}", bin.display(), real_dir.display(), base);
+    let out = std::process::Command::new("bash")
+        .arg(format!("{manifest}/scripts/test_fmt_owned.sh"))
+        .current_dir(manifest)
+        .env("AGEND_HOME", &home)
+        .env("PATH", &path)
+        .env_remove("AGEND_REAL_GIT")
+        .env_remove("AGEND_INSTANCE_NAME")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("10 passed, 0 failed"),
+        "test_fmt_owned.sh must pass 10/10 via the seam under a deny-shim.\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// (task122 RED #3) the real-git seam is FIXTURE-ONLY — no production (`src/`)
+/// consumer of the resolver symbols or the shell helper. The seam targets
+/// test-created temp repos (`setup_temp_repo` → `std::env::temp_dir`), never the
+/// enclosing worktree.
+#[test]
+fn t122_source_invariant_no_production_consumer() {
+    fn walk(dir: &std::path::Path, needles: &[&str], hits: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, needles, hits);
+            } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
+                let c = std::fs::read_to_string(&p).unwrap_or_default();
+                for n in needles {
+                    if c.contains(n) {
+                        hits.push(format!("{}: {n}", p.display()));
+                    }
+                }
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let needles = [
+        "resolve_real_git_in",
+        "real_git_first_path_from",
+        "assert_real_git_or_die",
+        "lib/real-git.sh",
+    ];
+    let mut hits = Vec::new();
+    walk(&src, &needles, &mut hits);
+    assert!(
+        hits.is_empty(),
+        "the real-git fixture seam must have NO production (src/) consumer: {hits:?}"
+    );
+}
