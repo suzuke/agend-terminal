@@ -1257,6 +1257,10 @@ mod tests {
             s
         };
         let future = (now + chrono::Duration::seconds(300)).to_rfc3339();
+        // R2: a SUB-second future stamp (+500ms) is the truncation trap —
+        // `num_seconds()` would floor it to 0 and pass `0 <= age`. Full-Duration
+        // comparison must still reject it.
+        let future_ms = (now + chrono::Duration::milliseconds(500)).to_rfc3339();
 
         // Sanity: the un-tampered tuple (stamped in the past) is Fresh at `now`.
         assert_eq!(freshness_gate(&valid(0), now, 600), FreshnessGate::Fresh);
@@ -1279,8 +1283,28 @@ mod tests {
             "future freshness_checked_at must fail closed"
         );
 
-        // Negative ttl ⇒ empty 0..=ttl range ⇒ never Fresh, even for a perfectly
-        // current tuple.
+        // R2: SUB-second future observed_at (+500ms) ⇒ Suppress. Under the
+        // truncating `num_seconds()` this floored to 0 and passed — the fix's
+        // full-Duration compare rejects it.
+        let mut s = valid(0);
+        s.observed_at = Some(future_ms.clone());
+        assert_eq!(
+            freshness_gate(&s, now, 600),
+            FreshnessGate::Suppress,
+            "sub-second future observed_at (+500ms) must fail closed (num_seconds truncation trap)"
+        );
+
+        // R2: SUB-second future freshness_checked_at (+500ms) ⇒ Suppress.
+        let mut s = valid(0);
+        s.freshness_checked_at = Some(future_ms);
+        assert_eq!(
+            freshness_gate(&s, now, 600),
+            FreshnessGate::Suppress,
+            "sub-second future freshness_checked_at (+500ms) must fail closed"
+        );
+
+        // Negative ttl ⇒ empty window ⇒ never Fresh, even for a perfectly current
+        // tuple.
         assert_eq!(
             freshness_gate(&valid(0), now, -1),
             FreshnessGate::Suppress,

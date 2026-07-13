@@ -635,21 +635,24 @@ pub fn freshness_gate(
         return FreshnessGate::Suppress;
     }
     // Both the observation and the compare must be at-or-before `now` AND within
-    // TTL. #2749 review-fix (codex): a FUTURE observed_at / freshness_checked_at
-    // yields a NEGATIVE signed age, which the old `<= ttl_secs` check accepted — a
-    // fail-OPEN that let a clock-skewed or forged-future stamp read Fresh
-    // indefinitely. Require `0 <= age <= ttl_secs` (strict fail-closed, no skew
-    // allowance); a negative `ttl_secs` then yields an empty range and can never
-    // admit Fresh.
+    // TTL. #2749 review-fix R2 (codex): a FUTURE observed_at / freshness_checked_at
+    // yields a NEGATIVE age, which a `<= ttl_secs` check accepted — a fail-OPEN that
+    // let a clock-skewed / forged-future stamp read Fresh indefinitely. Compare at
+    // FULL `chrono::Duration` precision: `num_seconds()` truncates toward zero, so a
+    // SUB-second future stamp (+1..999ms) would collapse to age 0 and slip through
+    // `0 <= age`. Require `Duration::zero() <= age <= Duration::seconds(ttl_secs)`
+    // (strict fail-closed, no skew allowance). A negative `ttl_secs` short-circuits
+    // false — an empty window can never admit Fresh.
     let within_ttl = |ts: Option<&str>| -> bool {
+        if ttl_secs < 0 {
+            return false;
+        }
         let Some(ts) = ts else { return false };
         let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
             return false;
         };
-        let age = now
-            .signed_duration_since(parsed.with_timezone(&chrono::Utc))
-            .num_seconds();
-        (0..=ttl_secs).contains(&age)
+        let age = now.signed_duration_since(parsed.with_timezone(&chrono::Utc));
+        age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(ttl_secs)
     };
     if !within_ttl(state.observed_at.as_deref())
         || !within_ttl(state.freshness_checked_at.as_deref())
