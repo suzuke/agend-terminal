@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::gh_poll;
 use super::{
-    apply, format_ready_body, freshness_gate, pr_state_dir, remove, resolve_author,
+    apply, format_ready_body, freshness_gate, is_merge_ready, pr_state_dir, remove, resolve_author,
     resolve_merge_authority, with_pr_state, CiState, DraftState, Event, FreshnessGate, MergeState,
     PrState, ReviewClass, VerdictState, FRESHNESS_TTL_SECS,
 };
@@ -182,22 +182,30 @@ pub fn scan_and_emit_with(
             if matches!(state.merge_state, MergeState::MergeReady)
                 && state.ready_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
             {
-                // #2749 A5 (Fable): a legacy/torn state can carry a stale
-                // `merge_state == MergeReady` while `review_class` is Unresolved
-                // (files persisted before #2745, or a future off-tick populator
-                // stamping a legacy Unresolved watch fresh). `is_merge_ready`
-                // already refuses Unresolved, but a PERSISTED MergeReady reaches
-                // this arm WITHOUT re-running that reducer — so refuse HERE, before
-                // ANY freshness delivery (pr-ready now, or the pr-needs-rebase
-                // Behind arm in the next increment). Fail closed: emit nothing. The
-                // #2745 [review-class-unresolved] diagnostic below is NotReady-gated,
-                // so it does not fire for a MergeReady state either.
-                if matches!(state.review_class, ReviewClass::Unresolved) {
+                // codex m-…-479: DEFENSIVE revalidation + self-heal. A cached
+                // `merge_state == MergeReady` reaches this arm WITHOUT re-running the
+                // reducer's readiness gate — so a late ACTIVE reservation or a
+                // freshly-unreadable authority (`authority_unknown`) that invalidated
+                // readiness AFTER the cache was written would still emit pr-ready →
+                // the fail-closed merge gate bypassed. Re-run `is_merge_ready` HERE.
+                // It SUBSUMES the earlier #2749 A5 Unresolved-only re-check (it also
+                // gates authority_unknown + reserved + draft + CI + verdicts). If it
+                // now returns FALSE the cache is STALE: SELF-HEAL the persisted
+                // `merge_state` to `NotReady` (dirty ⇒ saved under this flock) and
+                // SUPPRESS — emit nothing (fail closed). The freshness gate below runs
+                // only on a still-ready state, so a self-healed NotReady never reaches
+                // it (t-9's freshness gate is unchanged). This complements the
+                // reducer/redrive recompute (the primary fix): the scanner is the last
+                // fail-closed backstop for any stale MergeReady reaching disk by any
+                // path (e.g. a legacy file persisted before the recompute existed).
+                if !is_merge_ready(state) {
+                    state.merge_state = MergeState::NotReady;
+                    dirty = true;
                     tracing::debug!(
                         repo = %state.repo,
                         branch = %state.branch,
                         head = %state.head_sha,
-                        "#2749 A5 pr_state: freshness delivery suppressed — review_class Unresolved on a MergeReady state"
+                        "codex m-…-479 pr_state: cached MergeReady failed defensive is_merge_ready re-check (stale reservation / authority_unknown / unresolved) — self-healed to NotReady, pr-ready suppressed (fail closed)"
                     );
                 } else {
                     // #2749 (decision d-20260712092257798199-17): read-only freshness

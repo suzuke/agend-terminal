@@ -1033,6 +1033,31 @@ pub(crate) fn apply_authority_transition(
             );
         }
     }
+    // t-…-17 B4 (codex m-…-479): recompute the CACHED derived `merge_state` from the
+    // authority we JUST mutated (reserved_assignments / authority_unknown). This is the
+    // FINAL step of the shared transition, so BOTH callers — the `record_ci_result` A6
+    // drain AND `redrive_reserved` — get it and cannot diverge. Why it is required: the
+    // reducer (`apply(Event::CiObserved)`) derived `merge_state` BEFORE this transition
+    // ran, and `redrive_reserved` never derived it at all — so a late ACTIVE reservation
+    // or a freshly-unreadable authority left a STALE `MergeReady`, and the scanner emits
+    // `[pr-ready-for-merge]` on that cached value → the fail-closed merge gate is
+    // bypassed. Mirror the reducer's derivation EXACTLY (reuse `is_merge_ready`, do NOT
+    // hand-roll a divergent gate). Guard STRICTLY: only a NONTERMINAL `merge_state` is
+    // re-derived — a terminal `Merged` / `ClosedUnmerged` is sticky and NEVER resurrected
+    // (mirrors the reducer's terminal guard). This is pure state derivation under the
+    // caller's pr_state flock: it emits/wakes nothing and changes no lock order. Being in
+    // the shared helper makes the recompute bidirectional (a revoked reservation / repaired
+    // authority re-derives back to `MergeReady` when otherwise ready — not a one-way latch).
+    if !matches!(
+        state.merge_state,
+        MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. }
+    ) {
+        state.merge_state = if crate::daemon::pr_state::is_merge_ready(state) {
+            MergeState::MergeReady
+        } else {
+            MergeState::NotReady
+        };
+    }
 }
 
 /// A10b — re-derive `reserved_assignments` on the LIVE `PrState` for `(repo,branch)`
