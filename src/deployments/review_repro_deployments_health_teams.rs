@@ -17,7 +17,16 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::{deploy, list};
+use super::list;
+
+// #2764 R10 (item 2): spawn outcomes now drive the deploy transaction, so the
+// daemon-less repro injects a SUCCEEDING spawn stub (same migration as
+// deployments::tests) — the duplicate-name contract under test is unchanged.
+fn deploy(home: &std::path::Path, caller: &str, args: &serde_json::Value) -> serde_json::Value {
+    super::deploy_impl(home, caller, args, &|_h, _req| {
+        Ok(serde_json::json!({"ok": true, "result": {}}))
+    })
+}
 
 fn tmp_home(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};

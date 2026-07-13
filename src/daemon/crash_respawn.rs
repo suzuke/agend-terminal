@@ -289,6 +289,9 @@ fn respawn_agent_worker(
         }
     };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    // #2764 R10 (item 3): staged skills txn — a post-mutation spawn failure
+    // drops it uncommitted, restoring the pre-transaction workspace.
+    let mut skills_txn: Option<crate::skills::SkillsInstallTxn> = None;
     if let Some(ref wd) = config.working_dir {
         let skills_filter: Option<Vec<String>> =
             crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
@@ -305,14 +308,23 @@ fn respawn_agent_worker(
                 .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill = crate::backend::Backend::from_command(&config.backend_command)
             .and_then(|b| b.skill_dir_name());
-        if let Err(e) = crate::skills::install_for_agent_backend_with_source(
-            home,
-            wd,
-            skills_filter.as_deref(),
-            backend_skill,
-            custom_skills_source.as_deref(),
-        ) {
-            tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
+        match crate::skills::begin_install_txn(wd, backend_skill) {
+            Ok(txn) => {
+                skills_txn = Some(txn);
+                if let Err(e) = crate::skills::install_for_agent_backend_with_source(
+                    home,
+                    wd,
+                    skills_filter.as_deref(),
+                    backend_skill,
+                    custom_skills_source.as_deref(),
+                ) {
+                    tracing::warn!(agent = %config.name, error = %e, "crash-respawn skills install failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(agent = %config.name, error = %e,
+                    "crash-respawn skills txn staging failed — skipping install (no unstaged mutation)");
+            }
         }
     }
     match agent::spawn_agent(
@@ -333,6 +345,10 @@ fn respawn_agent_worker(
         reg,
     ) {
         Ok(_) => {
+            // #2764 R10: respawn took — keep the staged skills.
+            if let Some(txn) = skills_txn.take() {
+                txn.commit();
+            }
             tracing::info!(agent = %config.name, "respawned");
             crate::event_log::log(home, "respawn", &config.name, "agent respawned");
             // #1441: registry is UUID-keyed; resolve the respawned name once.
@@ -416,6 +432,58 @@ fn respawn_agent_worker(
 mod tests {
     use super::should_fire_terminal_p0;
     use crate::teams::SelfOrchStatus;
+
+    /// #2764 R10 (item 3) RED: a respawn whose SPAWN fails after the skills
+    /// mutation must leave the workspace byte-identical to its
+    /// pre-transaction state (staged txn rollback).
+    #[test]
+    fn respawn_spawn_failure_restores_pre_txn_skills_2764_r10() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let home =
+            std::env::temp_dir().join(format!("agend-respawn-skills-r10-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("mk home");
+        let wd = crate::paths::workspace_dir(&home).join("skillful");
+        let target = wd.join(".claude/skills");
+        std::fs::create_dir_all(&target).expect("mk skills");
+        std::fs::write(target.join("precious.md"), "pre-txn").expect("seed");
+        let reg: crate::agent::AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        super::respawn_agent_worker(
+            &home,
+            crate::daemon::AgentConfig {
+                name: "skillful".to_string(),
+                backend_command: "claude".to_string(),
+                args: Vec::new(),
+                env: None,
+                working_dir: Some(wd.clone()),
+                submit_key: "\r".to_string(),
+            },
+            std::time::Duration::ZERO,
+            None,
+            &reg,
+            tx,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("precious.md")).unwrap_or_default(),
+            "pre-txn",
+            "a failed respawn must restore the pre-transaction skills state"
+        );
+        let bak_leftover = std::fs::read_dir(target.parent().expect("skills target has a parent"))
+            .ok()
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().contains("agend-txn-bak"))
+            })
+            .unwrap_or(false);
+        assert!(!bak_leftover, "rollback must consume the backup");
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     /// #2764 R8 C2 RED: a crash-respawn racing a same-name delete is
     /// zero-side-effect refused by the held admission BEFORE the skills

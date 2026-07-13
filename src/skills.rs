@@ -57,6 +57,108 @@ pub fn skills_root(home: &Path) -> PathBuf {
     home.join("skills")
 }
 
+/// #2764 R10 (item 3): STAGED skills-install transaction for the boot /
+/// crash-respawn paths, whose skills mutation precedes the spawn — a
+/// post-mutation spawn/listener failure must leave the workspace
+/// byte-identical to its pre-transaction state.
+///
+/// `begin_install_txn` renames every existing install target aside to a
+/// same-directory sibling backup (a rename is atomic and preserves the exact
+/// bytes/symlink); `commit` deletes the backups; DROP WITHOUT COMMIT rolls
+/// back: whatever the install materialized is removed and the backups are
+/// renamed back — so every early-return/`?`/panic path restores
+/// automatically.
+pub struct SkillsInstallTxn {
+    /// (target, backup path when the target pre-existed)
+    entries: Vec<(PathBuf, Option<PathBuf>)>,
+    committed: bool,
+}
+
+fn txn_backup_path(target: &Path) -> Option<PathBuf> {
+    let name = target.file_name()?.to_str()?;
+    Some(target.with_file_name(format!(".{name}.agend-txn-bak")))
+}
+
+fn remove_path_any(p: &Path) {
+    match p.symlink_metadata() {
+        Ok(m) if m.is_dir() => {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(p);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Begin the staged transaction over every target
+/// [`install_for_agent_backend_with_source`] would touch for this
+/// working-dir/backend pair. Errors are fail-closed: the caller must NOT
+/// proceed with the install (state may be partially staged; the returned-Err
+/// path restores what it moved).
+pub fn begin_install_txn(
+    working_dir: &Path,
+    backend: Option<&str>,
+) -> std::io::Result<SkillsInstallTxn> {
+    let mut txn = SkillsInstallTxn {
+        entries: Vec::new(),
+        committed: false,
+    };
+    for (name, rel) in BACKEND_SKILL_DIRS
+        .iter()
+        .filter(|(n, _)| backend.is_none_or(|b| *n == b))
+    {
+        let _ = name;
+        let target = working_dir.join(rel);
+        let backup = if target.symlink_metadata().is_ok() {
+            let Some(bak) = txn_backup_path(&target) else {
+                continue;
+            };
+            // A stale backup from a crashed transaction would block the
+            // rename — clear it (the CURRENT target is the live truth).
+            remove_path_any(&bak);
+            std::fs::rename(&target, &bak)?; // Err → Drop restores moved entries
+            Some(bak)
+        } else {
+            None
+        };
+        txn.entries.push((target, backup));
+    }
+    Ok(txn)
+}
+
+impl SkillsInstallTxn {
+    /// The install (and the spawn it guarded) succeeded — drop the backups.
+    pub fn commit(mut self) {
+        self.committed = true;
+        for (_, backup) in &self.entries {
+            if let Some(bak) = backup {
+                remove_path_any(bak);
+            }
+        }
+    }
+}
+
+impl Drop for SkillsInstallTxn {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (target, backup) in &self.entries {
+            // Remove whatever the install materialized at the target…
+            remove_path_any(target);
+            // …and restore the pre-transaction entry byte-identically.
+            if let Some(bak) = backup {
+                if let Err(e) = std::fs::rename(bak, target) {
+                    tracing::error!(target = %target.display(), backup = %bak.display(), error = %e,
+                        "#2764 skills txn rollback FAILED to restore — backup left in place (loud, fail-closed)");
+                }
+            }
+        }
+        tracing::warn!("#2764 skills txn rolled back — pre-transaction state restored");
+    }
+}
+
 /// Ensure the unified source root exists. Idempotent.
 pub fn ensure_skills_root(home: &Path) -> Result<PathBuf> {
     let root = skills_root(home);
@@ -780,6 +882,55 @@ fn compute_version(dest: &Path, source: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// #2764 R10 (item 3): txn rollback restores the pre-transaction skills
+    /// dir byte-identically; commit keeps the new state and drops the backup.
+    #[test]
+    fn skills_txn_rollback_restores_and_commit_keeps() {
+        let wd = std::env::temp_dir().join(format!(
+            "agend-skills-txn-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::remove_dir_all(&wd).ok();
+        let target = wd.join(".claude/skills");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("precious.md"), "pre-txn").unwrap();
+
+        // Rollback arm: stage, simulate an install, drop uncommitted.
+        {
+            let _txn = crate::skills::begin_install_txn(&wd, Some("claude")).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("installed.md"), "new").unwrap();
+        } // drop = rollback
+        assert_eq!(
+            std::fs::read_to_string(target.join("precious.md")).unwrap(),
+            "pre-txn",
+            "rollback must restore the pre-transaction file byte-identically"
+        );
+        assert!(
+            !target.join("installed.md").exists(),
+            "rollback must remove what the install materialized"
+        );
+
+        // Commit arm: stage, install, commit.
+        {
+            let txn = crate::skills::begin_install_txn(&wd, Some("claude")).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("installed.md"), "new").unwrap();
+            txn.commit();
+        }
+        assert!(
+            target.join("installed.md").exists(),
+            "commit must keep the installed state"
+        );
+        let leftover = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("agend-txn-bak"));
+        assert!(!leftover, "commit must drop the backup");
+        std::fs::remove_dir_all(&wd).ok();
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 

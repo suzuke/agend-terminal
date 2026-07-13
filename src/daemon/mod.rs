@@ -1731,6 +1731,9 @@ fn spawn_and_register_agent(
     );
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    // #2764 R10 (item 3): staged skills txn — uncommitted drop (any failure
+    // path below) restores the pre-transaction workspace byte-identically.
+    let mut skills_txn: Option<crate::skills::SkillsInstallTxn> = None;
     // Default to Resume so daemon (re)starts pick up where each agent left off,
     // but downgrade when the backend reports nothing to resume — see
     // `SpawnMode::downgraded_for` for the why.
@@ -1760,27 +1763,42 @@ fn spawn_and_register_agent(
                 .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
         let backend_skill =
             crate::backend::Backend::from_command(command).and_then(|b| b.skill_dir_name());
-        match crate::skills::install_for_agent_backend_with_source(
-            home,
-            wd,
-            skills_filter.as_deref(),
-            backend_skill,
-            custom_skills_source.as_deref(),
-        ) {
-            Ok(outcomes) => {
-                let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
-                    .iter()
-                    .map(|o| (o.backend.as_str(), o.mode))
-                    .collect();
-                tracing::info!(
-                    agent = %name,
-                    ?modes,
-                    filter = ?skills_filter,
-                    "skills auto-install complete"
-                );
-            }
+        // #2764 R10 (item 3): stage the skills mutation — a post-mutation
+        // spawn/listener failure below drops the txn uncommitted, restoring
+        // the workspace byte-identically. Committed only after the whole boot
+        // transaction succeeds (bottom of this fn).
+        match crate::skills::begin_install_txn(wd, backend_skill) {
+            Ok(txn) => skills_txn = Some(txn),
             Err(e) => {
-                tracing::warn!(agent = %name, error = %e, "skills auto-install failed, proceeding without skills");
+                tracing::warn!(agent = %name, error = %e,
+                    "skills txn staging failed — skipping skills install (fail-closed, no mutation)");
+            }
+        }
+        if skills_txn.is_none() {
+            // Staging failed → no install this round (never mutate unstaged).
+        } else {
+            match crate::skills::install_for_agent_backend_with_source(
+                home,
+                wd,
+                skills_filter.as_deref(),
+                backend_skill,
+                custom_skills_source.as_deref(),
+            ) {
+                Ok(outcomes) => {
+                    let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
+                        .iter()
+                        .map(|o| (o.backend.as_str(), o.mode))
+                        .collect();
+                    tracing::info!(
+                        agent = %name,
+                        ?modes,
+                        filter = ?skills_filter,
+                        "skills auto-install complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %name, error = %e, "skills auto-install failed, proceeding without skills");
+                }
             }
         }
     }
@@ -1870,6 +1888,10 @@ fn spawn_and_register_agent(
         );
         lifecycle::delete_transaction(home, name, registry, Some(configs), false);
         return Err(e.into());
+    }
+    // #2764 R10: the whole boot transaction succeeded — keep the skills.
+    if let Some(txn) = skills_txn {
+        txn.commit();
     }
     Ok(())
 }

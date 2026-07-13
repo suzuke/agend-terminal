@@ -19,6 +19,13 @@ pub struct Deployment {
     /// on a legacy record (pre-R3) → its custom subdirs fail closed (preserved).
     #[serde(default)]
     pub provenance_nonce: Option<String>,
+    /// #2764 R10 (item 2): LOUD recovery record — members whose SPAWN failed
+    /// at deploy time (their fleet entries + created dirs were rolled back;
+    /// `instances` above lists only the members that actually spawned). A
+    /// non-empty list means this deployment is PARTIAL, never "deployed"
+    /// status. Empty/absent on fully-successful (and legacy) records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spawn_failures: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -146,6 +153,9 @@ type DeployEntries = (
     Vec<String>,
     Vec<(String, crate::fleet::InstanceYamlEntry)>,
     std::collections::HashMap<String, crate::agent::deleting::CreateAdmission>,
+    // #2764 R10: per-member (inst_dir, preexisted) — the rollback may remove a
+    // dir ONLY when this deploy created it.
+    std::collections::HashMap<String, (std::path::PathBuf, bool)>,
 );
 
 fn create_instance_entries(
@@ -161,6 +171,8 @@ fn create_instance_entries(
     // mid-delete aborts the WHOLE deploy zero-side-effect; the returned
     // guards are held by the caller through fleet persist + spawn.
     let mut admissions = std::collections::HashMap::new();
+    let mut dir_provenance: std::collections::HashMap<String, (std::path::PathBuf, bool)> =
+        std::collections::HashMap::new();
     for (name_val, _) in &params.instances_def {
         let Some(inst_suffix) = name_val.as_str() else {
             continue;
@@ -236,6 +248,7 @@ fn create_instance_entries(
             .or(params.template_source_repo.clone());
 
         let inst_dir = dir.join(&inst_name);
+        dir_provenance.insert(inst_name.clone(), (inst_dir.clone(), inst_dir.exists()));
         let work_dir = prepare_work_dir(
             &inst_dir,
             &dir,
@@ -285,7 +298,7 @@ fn create_instance_entries(
         ));
         created.push(inst_name);
     }
-    Ok((created, yaml_entries, admissions))
+    Ok((created, yaml_entries, admissions, dir_provenance))
 }
 
 fn prepare_work_dir(
@@ -381,12 +394,17 @@ fn resolve_spawn_backend(
         })
 }
 
-fn spawn_instances(
+/// #2764 R10 (item 2): spawn every member through the injectable `spawn_fn`
+/// seam, propagating a PER-MEMBER outcome instead of logging-and-forgetting.
+fn spawn_instances_impl(
     home: &Path,
     yaml_entries: &[(String, crate::fleet::InstanceYamlEntry)],
     directory: &str,
     admissions: &std::collections::HashMap<String, crate::agent::deleting::CreateAdmission>,
-) {
+    spawn_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut spawned_ok: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for (inst_name, entry) in yaml_entries {
         let backend_name = resolve_spawn_backend(home, inst_name, entry);
         let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
@@ -422,19 +440,52 @@ fn spawn_instances(
         if let Some(ref tb) = entry.topic_binding_mode {
             params["topic_binding"] = serde_json::json!(tb);
         }
-        let spawn_result = crate::api::call(
+        let spawn_result = spawn_fn(
             home,
             &serde_json::json!({"method": crate::api::method::SPAWN, "params": params}),
         );
         match spawn_result {
-            Ok(ref v) if v.get("ok").and_then(|b| b.as_bool()) == Some(false) => {
-                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+            Ok(ref v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+                spawned_ok.push(inst_name.clone());
+            }
+            Ok(ref v) => {
+                let err = v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 tracing::error!(instance = %inst_name, error = %err, "deploy: Phase 3 spawn failed");
+                failed.push((inst_name.clone(), err));
             }
             Err(e) => {
                 tracing::error!(instance = %inst_name, error = %e, "deploy: Phase 3 spawn call failed");
+                failed.push((inst_name.clone(), e.to_string()));
             }
-            _ => {}
+        }
+    }
+    (spawned_ok, failed)
+}
+
+/// #2764 R10: roll back a failed member's transaction-owned effects — its
+/// fleet entry, and its instance dir ONLY when this deploy created it
+/// (`preexisted == false`); a pre-existing operator dir is never touched.
+fn rollback_failed_member(
+    home: &Path,
+    inst_name: &str,
+    dir_provenance: &std::collections::HashMap<String, (std::path::PathBuf, bool)>,
+) {
+    if let Err(e) = crate::fleet::remove_instance_from_yaml(home, inst_name) {
+        tracing::error!(instance = %inst_name, error = %e,
+            "deploy rollback: fleet entry removal FAILED — residue left (loud)");
+    }
+    if let Some((dir, preexisted)) = dir_provenance.get(inst_name) {
+        if !preexisted {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(instance = %inst_name, dir = %dir.display(), error = %e,
+                        "deploy rollback: created dir removal FAILED — residue left (loud)");
+                }
+            }
         }
     }
 }
@@ -493,6 +544,18 @@ fn create_deployment_team(
 }
 
 pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
+    deploy_impl(home, instance_name, args, &crate::api::call)
+}
+
+/// Inner impl parameterized on the SPAWN RPC (#2764 R10 item 2 seam) so tests
+/// can drive real per-member spawn outcomes. Production passes
+/// [`crate::api::call`].
+pub(crate) fn deploy_impl(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    spawn_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+) -> Value {
     let params = match validate_deploy_args(home, args) {
         Ok(p) => p,
         Err(e) => return e,
@@ -521,10 +584,11 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     let provenance_nonce = uuid::Uuid::new_v4().to_string();
     // #2764 R7: `_admissions` guards are HELD through fleet persist + spawn —
     // a same-name delete refuses to start while a deploy create is in flight.
-    let (created, yaml_entries, admissions) = match create_instance_entries(home, &params) {
-        Ok(t) => t,
-        Err(e) => return serde_json::json!({"error": e}),
-    };
+    let (created, yaml_entries, admissions, dir_provenance) =
+        match create_instance_entries(home, &params) {
+            Ok(t) => t,
+            Err(e) => return serde_json::json!({"error": e}),
+        };
 
     if let Err(e) =
         persist_to_fleet_yaml(home, &yaml_entries, &params.template, &params.deploy_name)
@@ -532,21 +596,60 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         return e;
     }
 
-    spawn_instances(home, &yaml_entries, &params.directory, &admissions);
-
-    let team_created = create_deployment_team(
+    // #2764 R10 (item 2): per-member spawn outcomes drive the transaction.
+    let (spawned_ok, spawn_failed) = spawn_instances_impl(
         home,
-        &params.deploy_name,
-        &params.template,
-        &params.template_def,
-        &params.template_source_repo,
-        &created,
+        &yaml_entries,
+        &params.directory,
+        &admissions,
+        spawn_fn,
     );
 
+    // Every failed member's transaction-owned effects are rolled back NOW
+    // (fleet entry + created dir) — a failed member must not linger as a
+    // resurrectable fleet entry with no deployment authority.
+    for (inst_name, _) in &spawn_failed {
+        rollback_failed_member(home, inst_name, &dir_provenance);
+    }
+
+    if spawned_ok.is_empty() && !yaml_entries.is_empty() {
+        // TOTAL spawn failure: full rollback already ran per member above; no
+        // team, NO deployment record, loud error.
+        crate::event_log::log(
+            home,
+            "deploy_failed",
+            &params.deploy_name,
+            "every member spawn failed — all transaction-owned effects rolled back, no record persisted",
+        );
+        return serde_json::json!({"error": format!(
+            "deploy '{}' failed: every member spawn failed ({:?}) — all transaction-owned effects rolled back",
+            params.deploy_name,
+            spawn_failed.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>()
+        )});
+    }
+
+    // NEVER create the team past a spawn failure (a partial roster team is a
+    // routing hazard); a fully-successful deploy keeps the existing behavior.
+    let team_created = if spawn_failed.is_empty() {
+        create_deployment_team(
+            home,
+            &params.deploy_name,
+            &params.template,
+            &params.template_def,
+            &params.template_source_repo,
+            &created,
+        )
+    } else {
+        false
+    };
+
+    let failed_names: Vec<String> = spawn_failed.iter().map(|(n, _)| n.clone()).collect();
     let deployment = Deployment {
         name: params.deploy_name.to_string(),
         template: params.template.to_string(),
-        instances: created.clone(),
+        // Only the members that actually spawned belong to the deployment;
+        // failed members were rolled back above.
+        instances: spawned_ok.clone(),
         team: if team_created {
             Some(params.deploy_name.to_string())
         } else {
@@ -555,6 +658,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         directory: params.directory,
         created_at: chrono::Utc::now().to_rfc3339(),
         provenance_nonce: Some(provenance_nonce),
+        spawn_failures: failed_names.clone(),
     };
     // #1629: narrow the deployment-store flock to JUST the load-modify-save (its
     // C1 lost-update purpose). spawn_instances (api::call SPAWN) and
@@ -597,7 +701,26 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     }
 
     let _ = instance_name;
-    serde_json::json!({"status": "deployed", "name": params.deploy_name, "instances": created})
+    let _ = created;
+    if failed_names.is_empty() {
+        serde_json::json!({"status": "deployed", "name": params.deploy_name, "instances": spawned_ok})
+    } else {
+        // #2764 R10: a spawn failure is NEVER "deployed" — the persisted
+        // record above is the LOUD recovery record (spawn_failures listed).
+        crate::event_log::log(
+            home,
+            "deploy_partial",
+            &params.deploy_name,
+            "some member spawns failed — recovery record persisted, failed members rolled back, no team created",
+        );
+        serde_json::json!({
+            "status": "partial_spawn_failure",
+            "name": params.deploy_name,
+            "instances": spawned_ok,
+            "spawn_failures": failed_names,
+            "error": "some member spawns failed — failed members rolled back; deployment recorded as PARTIAL (not deployed)"
+        })
+    }
 }
 
 /// #2764 D (decision d-20260713091213053694-25): deployment teardown performs

@@ -706,6 +706,55 @@ fn lookup_fleet_name(layout: &Layout, agent_name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// #2764 R10 (4b) RED: the PRODUCTION palette spawn entry with a backend
+    /// command that cannot spawn — the pane create fails and the transaction
+    /// must leave ZERO residue: no fleet entry, no topic mapping, no
+    /// registered process, no worktree dir.
+    #[test]
+    fn palette_spawn_pane_failure_leaves_zero_residue_2764_r10() {
+        let home = std::env::temp_dir().join(format!("agend-cmd-r10-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("mk home");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").expect("seed");
+        let registry: &'static crate::agent::AgentRegistry = Box::leak(Box::default());
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (wakeup_tx, _rx) = crossbeam_channel::unbounded();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry,
+            home: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+        };
+
+        let changed = execute("spawn doomedpane /definitely/not/a/binary-2764", &mut ctx);
+
+        assert!(!changed, "a failed pane create must not change the layout");
+        let yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+        assert!(
+            !yaml.contains("doomedpane"),
+            "fleet residue after pane failure: {yaml}"
+        );
+        assert_eq!(
+            crate::channel::telegram::lookup_topic_for_instance(&home, "doomedpane"),
+            None,
+            "topic residue after pane failure"
+        );
+        assert!(
+            crate::agent::lock_registry(registry).is_empty(),
+            "process/registry residue after pane failure"
+        );
+        assert!(
+            !crate::worktree_pool::daemon_managed_worktree_root(&home)
+                .join("doomedpane")
+                .exists(),
+            "worktree residue after pane failure"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     use super::*;
     use crate::layout::{Layout, Pane, PaneSource, Tab};
     use crate::vterm::VTerm;

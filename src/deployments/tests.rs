@@ -1,5 +1,16 @@
 use super::*;
 
+// #2764 R10 (item 2): the deploy tests predate the spawn seam and encoded
+// "record created even when every daemon-less spawn fails". The seam makes
+// spawn outcomes drive the transaction, so the suite injects a SUCCEEDING
+// spawn stub — the failure arms get their own dedicated REDs below. This
+// local `deploy` shadows the production wrapper for every existing call.
+fn deploy(home: &std::path::Path, caller: &str, args: &serde_json::Value) -> serde_json::Value {
+    super::deploy_impl(home, caller, args, &|_h, _req| {
+        Ok(serde_json::json!({"ok": true, "result": {}}))
+    })
+}
+
 fn tmp_home(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1341,7 +1352,8 @@ fn fn_body<'a>(prod: &'a str, sig: &str) -> &'a str {
 #[test]
 fn deploy_api_calls_not_under_flock() {
     let prod = prod_src();
-    let body = fn_body(prod, "pub fn deploy(home");
+    // #2764 R10: the transaction body moved to `deploy_impl` (spawn seam).
+    let body = fn_body(prod, "pub(crate) fn deploy_impl(");
     // H14: deploy's duplicate-name guard is a plain `load()` READ (no flock)
     // before spawn — #1629 forbids holding ANY flock across the self-IPC
     // spawn/team. So the ONLY `acquire_file_lock` in deploy is still the store
@@ -1350,7 +1362,7 @@ fn deploy_api_calls_not_under_flock() {
         .find(&["acquire_file", "_lock"].concat())
         .expect("deploy locks the store save");
     let spawn_at = body
-        .find("spawn_instances(")
+        .find("spawn_instances_impl(")
         .expect("deploy spawns instances");
     let team_at = body
         .find("create_deployment_team(")
@@ -1437,6 +1449,134 @@ fn deployment_pending_ledger_is_idempotent_per_generation() {
     assert!(
         load(&home).deployments.iter().any(|d| d.name == "idem"),
         "reconcile must NOT prune the deployment record under D"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2764 R10 (item 2) RED: EVERY member spawn fails → full rollback (no
+/// fleet entries, created dirs removed), NO team, NO deployment record, loud
+/// error.
+#[test]
+fn deploy_total_spawn_failure_rolls_back_everything_2764_r10() {
+    let home = tmp_home("r10-total-fail");
+    let yaml = r#"
+templates:
+  duo:
+    instances:
+      a:
+        backend: claude
+      b:
+        backend: claude
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "duo",
+        "directory": home.display().to_string(),
+    });
+
+    let out = super::deploy_impl(&home, "caller", &args, &|_h, _req| {
+        Ok(serde_json::json!({"ok": false, "error": "spawn boom"}))
+    });
+
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("every member spawn failed"),
+        "total failure must be a loud error: {out}"
+    );
+    assert!(
+        super::load(&home).deployments.is_empty(),
+        "NO deployment record may persist after total spawn failure"
+    );
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml parses");
+    assert!(
+        !cfg.instances.contains_key("duo-a") && !cfg.instances.contains_key("duo-b"),
+        "fleet entries must be rolled back, got {:?}",
+        cfg.instances.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        cfg.teams.is_empty(),
+        "no team may be created after total spawn failure"
+    );
+    assert!(
+        !home.join("duo-a").exists() && !home.join("duo-b").exists(),
+        "created member dirs must be rolled back"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2764 R10 (item 2) RED: PARTIAL spawn failure → failed member rolled back
+/// (entry + created dir), NO team, deployment record persisted as the LOUD
+/// recovery record (spawn_failures listed, instances = survivors only),
+/// response is NOT "deployed".
+#[test]
+fn deploy_partial_spawn_failure_records_recovery_no_team_2764_r10() {
+    let home = tmp_home("r10-partial-fail");
+    let yaml = r#"
+templates:
+  duo:
+    instances:
+      a:
+        backend: claude
+      b:
+        backend: claude
+"#;
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    let args = serde_json::json!({
+        "template": "duo",
+        "directory": home.display().to_string(),
+    });
+
+    let out = super::deploy_impl(&home, "caller", &args, &|_h, req| {
+        let name = req["params"]["name"].as_str().unwrap_or_default();
+        if name == "duo-b" {
+            Ok(serde_json::json!({"ok": false, "error": "b refused"}))
+        } else {
+            Ok(serde_json::json!({"ok": true, "result": {}}))
+        }
+    });
+
+    assert_eq!(
+        out["status"].as_str(),
+        Some("partial_spawn_failure"),
+        "partial failure must NEVER report deployed: {out}"
+    );
+    let store = super::load(&home);
+    let rec = store
+        .deployments
+        .iter()
+        .find(|d| d.name == "duo")
+        .expect("the loud recovery record must persist");
+    assert_eq!(
+        rec.instances,
+        vec!["duo-a".to_string()],
+        "record.instances must list survivors only"
+    );
+    assert_eq!(
+        rec.spawn_failures,
+        vec!["duo-b".to_string()],
+        "spawn_failures must name the failed member"
+    );
+    assert!(
+        rec.team.is_none(),
+        "no team may be created past a spawn failure"
+    );
+    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml parses");
+    assert!(
+        !cfg.instances.contains_key("duo-b"),
+        "the failed member's fleet entry must be rolled back"
+    );
+    assert!(
+        cfg.instances.contains_key("duo-a"),
+        "the surviving member's entry stays"
+    );
+    assert!(cfg.teams.is_empty(), "no team in fleet.yaml either");
+    assert!(
+        !home.join("duo-b").exists(),
+        "the failed member's created dir must be rolled back"
     );
     std::fs::remove_dir_all(&home).ok();
 }
