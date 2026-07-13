@@ -18,6 +18,13 @@ set -uo pipefail
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 fmt_owned="$script_dir/fmt-owned.sh"
 
+# task122: run the hermetic git fixture against REAL git (not the agend-git shim on
+# an agent's PATH), so `git -c … submodule` + child git procs work and nothing is
+# rerouted into a bound worktree. Fail-loud if only the shim resolves (never SKIP).
+# shellcheck source=scripts/lib/real-git.sh
+. "$script_dir/lib/real-git.sh"
+assert_real_git_or_die
+
 pass=0
 fail=0
 ok()  { echo "PASS  $1"; pass=$((pass + 1)); }
