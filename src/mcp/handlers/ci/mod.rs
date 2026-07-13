@@ -20,6 +20,7 @@ mod source_resolve;
 // the re-exports below preserve EVERY `ci::handle_*` path used by dispatch.rs and
 // every `super::*` path used by the child `tests` module (zero caller/test edits).
 mod checkout;
+mod checkout_txn;
 mod cleanup;
 mod merge;
 mod release;

@@ -228,6 +228,51 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // branch — subsequent commits write to the right ref without the
     // extra `git switch` that triggered the #778 chicken-and-egg.
     let worktree_path_str = worktree_dir.display().to_string();
+    // #2755 INNER provisioning lock + transaction journal (d-20260713024125724636-10).
+    // The branch-lease (`_lease_lock`, OUTER, bind-only) is already held above;
+    // this per-worktree-path flock (bind AND non-bind) serializes two attempts on
+    // the SAME mangled path and releases INNER-first — declared AFTER `_lease_lock`
+    // so it drops first at fn exit. Journal + lock live OUTSIDE the worktree
+    // (home/checkout_txn/…) so a rollback `remove --force` can never delete the
+    // recovery record.
+    let mangled = worktree_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let _path_lock = match super::checkout_txn::acquire_path_lock(home, &mangled) {
+        Ok(g) => g,
+        Err(e) => {
+            return json!({
+                "error": format!("could not acquire provisioning lock for '{branch}': {e}"),
+                "code": "path_lock",
+                "branch": branch,
+            })
+        }
+    };
+    let txn_now = chrono::Utc::now();
+    // Replay a journal left by a CRASHED prior provision of this path so the fresh
+    // `git worktree add` below cannot collide with a stale worktree.
+    if let Err(e) = super::checkout_txn::recover_stale(home, &mangled, txn_now, |_j| {
+        crate::git_helpers::git_bypass(
+            Path::new(&source_path),
+            &["worktree", "remove", "--force", &worktree_path_str],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    }) {
+        return json!({"error": e, "code": "stale_txn_rollback", "branch": branch});
+    }
+    // Prepared: durably journal the intent BEFORE any filesystem side effect.
+    let mut journal = super::checkout_txn::Journal::prepared(
+        super::checkout_txn::new_nonce(),
+        worktree_path_str.clone(),
+        source_canonical.display().to_string(),
+        branch,
+        bind,
+        txn_now.to_rfc3339(),
+    );
+    let _ = journal.save(home, &mangled);
     let git_args: Vec<&str> = if bind {
         vec!["worktree", "add", &worktree_path_str, branch]
     } else {
@@ -235,6 +280,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     };
     match git_bypass(Path::new(&source_path), &git_args) {
         Ok(o) if o.status.success() => {
+            journal.advance(super::checkout_txn::Phase::WorktreeAdded);
+            let _ = journal.save(home, &mangled);
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
             // #1275: write .agend-managed unconditionally so
@@ -250,19 +297,32 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             ) {
                 warnings.push(format!("marker: {e}"));
             }
+            journal.advance(super::checkout_txn::Phase::MarkerDurable);
+            let _ = journal.save(home, &mangled);
             // #2755 SubmodulesReady phase: `git worktree add` materializes the
             // superproject (`.gitmodules` + gitlinks) but leaves submodule dirs
             // EMPTY, so a build with path-dependency submodules (e.g.
             // vendor/agentic-git) fails on a freshly provisioned worktree.
             // Recursively init them; a failure ABORTS the transaction — roll the
-            // worktree back with `remove --force` (a mere prune can't remove a
-            // still-present dir) and return a structured error, never a
-            // half-provisioned tree. Runs for bind AND non-bind (a reviewer/triage
-            // inspection worktree needs its submodule content too).
+            // worktree back (arm retained intent + `remove --force`; a mere prune
+            // can't remove a still-present dir) and return a structured error,
+            // never a half-provisioned tree. Runs for bind AND non-bind (a
+            // reviewer/triage inspection worktree needs its submodule content too).
             if let Err(e) = crate::worktree::init_submodules_strict(&worktree_dir) {
-                let _ = crate::git_helpers::git_bypass(
-                    Path::new(&source_path),
-                    &["worktree", "remove", "--force", &worktree_path_str],
+                super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    || {
+                        crate::git_helpers::git_bypass(
+                            Path::new(&source_path),
+                            &["worktree", "remove", "--force", &worktree_path_str],
+                        )
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                    },
+                    || {}, // no binding written before SubmodulesReady
                 );
                 let mut err = json!({
                     "error": format!("submodule init failed, worktree rolled back: {e}"),
@@ -276,6 +336,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 }
                 return err;
             }
+            journal.advance(super::checkout_txn::Phase::SubmodulesReady);
+            let _ = journal.save(home, &mangled);
             if bind {
                 // #2533: optional caller-supplied task_id — attributes this self-claim
                 // to a task (§3.19.1 reviewer checkout is the common case) so `bind_full`
@@ -300,10 +362,22 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         error = %e,
                         "bind_full failed after worktree add — rolling back worktree"
                     );
-                    // #1899: bounded via git_bypass (LOCAL 60s) — best-effort rollback.
-                    let _ = crate::git_helpers::git_bypass(
-                        Path::new(&source_path),
-                        &["worktree", "remove", "--force", &worktree_path_str],
+                    // #1899 + #2755: retained-intent rollback (arm journal + bounded
+                    // `remove --force`; bind_full failed ⇒ no binding to unbind).
+                    super::checkout_txn::rollback_failed(
+                        home,
+                        &mangled,
+                        &mut journal,
+                        txn_now,
+                        || {
+                            crate::git_helpers::git_bypass(
+                                Path::new(&source_path),
+                                &["worktree", "remove", "--force", &worktree_path_str],
+                            )
+                            .map(|o| o.status.success())
+                            .unwrap_or(false)
+                        },
+                        || {},
                     );
                     return json!({
                         "error": format!("bind_full failed, worktree rolled back: {e}"),
@@ -326,12 +400,48 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
             }
+            // #2755 Committed: the durable linearization point. Success is returned
+            // ONLY after this journal write lands; a store::atomic_write failure
+            // aborts into rollback (worktree + binding), never a half-visible
+            // provision.
+            journal.advance(super::checkout_txn::Phase::Committed);
+            if journal.save(home, &mangled).is_err() {
+                super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    || {
+                        crate::git_helpers::git_bypass(
+                            Path::new(&source_path),
+                            &["worktree", "remove", "--force", &worktree_path_str],
+                        )
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                    },
+                    || {
+                        if bind {
+                            crate::binding::unbind(home, instance_name);
+                        }
+                    },
+                );
+                return json!({
+                    "error": "commit journal write failed, worktree rolled back",
+                    "code": "commit_failed",
+                    "branch": branch,
+                });
+            }
+            // Committed durable ⇒ transaction resolved; drop the journal tombstone.
+            super::checkout_txn::Journal::clear(home, &mangled);
             if !warnings.is_empty() {
                 resp["warnings"] = json!(warnings);
             }
             resp
         }
         Ok(o) => {
+            // Prepared journal but `git worktree add` failed ⇒ no worktree to roll
+            // back; drop the journal.
+            super::checkout_txn::Journal::clear(home, &mangled);
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             let mut err = json!({
                 "error": format!("git worktree add failed: {}", stderr.trim()),
@@ -346,6 +456,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             err
         }
         Err(e) => {
+            super::checkout_txn::Journal::clear(home, &mangled);
             let mut err = json!({
                 "error": format!("git worktree add spawn failed: {e}"),
                 "code": "worktree_add_failed",

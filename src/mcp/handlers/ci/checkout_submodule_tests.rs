@@ -173,3 +173,284 @@ fn checkout_initializes_nested_submodules_2755() {
         std::fs::remove_dir_all(root).ok();
     }
 }
+
+// ─── #2755 transaction journal (pure state machine — no live git) ────────────
+// These pin the durable-transaction invariants from d-20260713024125724636-10
+// deterministically (fixed clock, temp home), independent of `git worktree add`
+// — the vendored shim's agent-ancestry stray-worktree guard flakes live
+// concurrent worktree adds under an agent process tree (CI-safe, but not a
+// reliable seam for unit tests).
+
+use super::checkout_txn::{backoff_secs, Journal, Phase, INTERVENTION_CEILING_SECS};
+
+fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-07-13T00:00:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+fn sample_journal() -> Journal {
+    Journal::prepared(
+        "nonce-abc",
+        "/wt/agent-src",
+        "/src",
+        "feat/x",
+        true,
+        fixed_now().to_rfc3339(),
+    )
+}
+
+/// Phases advance monotonically; only Prepared has no on-disk worktree.
+#[test]
+fn txn_phase_order_and_worktree_existence() {
+    let order = [
+        Phase::Prepared,
+        Phase::WorktreeAdded,
+        Phase::MarkerDurable,
+        Phase::SubmodulesReady,
+        Phase::Committed,
+    ];
+    for w in order.windows(2) {
+        assert!(w[0].rank() < w[1].rank(), "{:?} < {:?}", w[0], w[1]);
+    }
+    assert!(!Phase::Prepared.worktree_exists());
+    assert!(Phase::WorktreeAdded.worktree_exists());
+    assert!(Phase::Committed.worktree_exists());
+}
+
+/// save → load round-trips durably (via store::atomic_write).
+#[test]
+fn txn_journal_persists_and_loads() {
+    let home = tmp_home("txn-persist");
+    let mangled = "agent-co-_src";
+    let mut j = sample_journal();
+    j.advance(Phase::WorktreeAdded);
+    j.save(&home, mangled).expect("save");
+    let loaded = Journal::load(&home, mangled).expect("load");
+    assert_eq!(loaded.nonce, "nonce-abc");
+    assert_eq!(loaded.phase, Phase::WorktreeAdded);
+    assert_eq!(loaded.schema_version, 1);
+    Journal::clear(&home, mangled);
+    assert!(
+        Journal::load(&home, mangled).is_none(),
+        "clear removes journal"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A minimal on-disk record (pre-rollback fields absent) loads with defaults —
+/// forward/back compat via serde(default).
+#[test]
+fn txn_journal_serde_back_compat_defaults() {
+    let home = tmp_home("txn-compat");
+    let mangled = "agent-co-_src";
+    let path = super::checkout_txn::journal_path(&home, mangled);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // No rollback_pending / attempts / next_attempt_at / intervention keys.
+    let minimal = r#"{"schema_version":1,"nonce":"n","phase":"submodules_ready",
+        "worktree_path":"/wt","source_repo":"/src","branch":"b","bind":false,
+        "created_at":"2026-07-13T00:00:00+00:00"}"#;
+    std::fs::write(&path, minimal).unwrap();
+    let j = Journal::load(&home, mangled).expect("loads minimal record");
+    assert_eq!(j.phase, Phase::SubmodulesReady);
+    assert!(!j.rollback_pending);
+    assert_eq!(j.attempts, 0);
+    assert!(j.next_attempt_at.is_none());
+    assert!(!j.intervention);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// backoff doubles per attempt and is capped at the intervention ceiling.
+#[test]
+fn txn_backoff_doubles_then_caps_at_ceiling() {
+    assert_eq!(backoff_secs(0), 1);
+    assert_eq!(backoff_secs(1), 2);
+    assert_eq!(backoff_secs(4), 16);
+    assert_eq!(backoff_secs(8), 256);
+    assert_eq!(
+        backoff_secs(9),
+        INTERVENTION_CEILING_SECS,
+        "2^9=512 capped to 300"
+    );
+    assert_eq!(
+        backoff_secs(40),
+        INTERVENTION_CEILING_SECS,
+        "huge attempts stay capped, no overflow"
+    );
+}
+
+/// arm_rollback sets pending + a future deadline, increments attempts, and flips
+/// intervention once the backoff reaches the ceiling; retained intent persists.
+#[test]
+fn txn_arm_rollback_backoff_and_intervention() {
+    let now = fixed_now();
+    let mut j = sample_journal();
+    j.advance(Phase::SubmodulesReady);
+
+    j.arm_rollback(now);
+    assert!(j.rollback_pending, "rollback owed");
+    assert_eq!(j.attempts, 1);
+    assert!(!j.intervention, "first failure is under the ceiling");
+    // Deadline is now + backoff(0) = 1s.
+    let deadline = chrono::DateTime::parse_from_rfc3339(j.next_attempt_at.as_deref().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert_eq!(
+        deadline,
+        now + chrono::Duration::seconds(1),
+        "backoff(0)=1s deadline"
+    );
+
+    // Drive attempts up to the ceiling → intervention, still retrying.
+    for _ in 0..9 {
+        j.arm_rollback(now);
+    }
+    assert!(
+        j.intervention,
+        "backoff reached the 300s ceiling ⇒ operator intervention"
+    );
+    assert!(
+        j.rollback_pending,
+        "intervention keeps retrying, never abandons"
+    );
+}
+
+/// A stale journal (different nonce) is distinguishable from the in-flight attempt.
+#[test]
+fn txn_nonce_distinguishes_attempts() {
+    let a = Journal::prepared(
+        "nonce-1",
+        "/wt",
+        "/src",
+        "b",
+        false,
+        fixed_now().to_rfc3339(),
+    );
+    let b = Journal::prepared(
+        "nonce-2",
+        "/wt",
+        "/src",
+        "b",
+        false,
+        fixed_now().to_rfc3339(),
+    );
+    assert_ne!(a.nonce, b.nonce);
+}
+
+// ─── recover_stale / rollback_failed (injected remove/unbind — no live git) ──
+
+use super::checkout_txn::{recover_stale, rollback_failed};
+
+fn save_at_phase(home: &std::path::Path, mangled: &str, phase: Phase) {
+    let mut j = sample_journal();
+    // advance from Prepared up to `phase`
+    for p in [
+        Phase::WorktreeAdded,
+        Phase::MarkerDurable,
+        Phase::SubmodulesReady,
+        Phase::Committed,
+    ] {
+        if p.rank() <= phase.rank() {
+            j.advance(p);
+        }
+    }
+    j.save(home, mangled).unwrap();
+}
+
+/// A Committed tombstone left by a crashed cleanup is cleared, and no worktree
+/// removal is attempted (the provision had completed).
+#[test]
+fn txn_recover_committed_clears_without_remove() {
+    let home = tmp_home("rec-committed");
+    save_at_phase(&home, "m", Phase::Committed);
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", fixed_now(), |_j| {
+        removed.set(true);
+        true
+    });
+    assert!(r.is_ok());
+    assert!(!removed.get(), "Committed ⇒ no worktree removal");
+    assert!(Journal::load(&home, "m").is_none(), "tombstone cleared");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A crashed in-flight attempt whose worktree is successfully removed clears.
+#[test]
+fn txn_recover_inflight_remove_ok_clears() {
+    let home = tmp_home("rec-ok");
+    save_at_phase(&home, "m", Phase::WorktreeAdded);
+    let r = recover_stale(&home, "m", fixed_now(), |_j| true);
+    assert!(r.is_ok());
+    assert!(Journal::load(&home, "m").is_none(), "removed ⇒ cleared");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A crashed in-flight attempt whose worktree CANNOT be removed retains intent
+/// (armed + backoff) and returns Err so the caller aborts rather than colliding.
+#[test]
+fn txn_recover_inflight_remove_fail_retains_intent() {
+    let home = tmp_home("rec-fail");
+    save_at_phase(&home, "m", Phase::SubmodulesReady);
+    let r = recover_stale(&home, "m", fixed_now(), |_j| false);
+    assert!(r.is_err(), "remove failed ⇒ Err");
+    let retained = Journal::load(&home, "m").expect("journal retained");
+    assert!(retained.rollback_pending, "retained intent armed");
+    assert!(
+        retained.next_attempt_at.is_some(),
+        "backoff deadline persisted"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A Prepared journal (no worktree materialized) is cleared without a remove.
+#[test]
+fn txn_recover_prepared_clears_without_remove() {
+    let home = tmp_home("rec-prepared");
+    sample_journal().save(&home, "m").unwrap(); // Prepared
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", fixed_now(), |_j| {
+        removed.set(true);
+        true
+    });
+    assert!(r.is_ok());
+    assert!(!removed.get(), "Prepared has no worktree ⇒ no remove");
+    assert!(Journal::load(&home, "m").is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// rollback_failed: worktree removed ⇒ unbind runs and the journal is cleared.
+#[test]
+fn txn_rollback_failed_remove_ok_unbinds_and_clears() {
+    let home = tmp_home("rb-ok");
+    let mut j = sample_journal();
+    j.advance(Phase::SubmodulesReady);
+    j.save(&home, "m").unwrap();
+    let unbound = std::cell::Cell::new(false);
+    rollback_failed(
+        &home,
+        "m",
+        &mut j,
+        fixed_now(),
+        || true,
+        || unbound.set(true),
+    );
+    assert!(unbound.get(), "unbind runs");
+    assert!(Journal::load(&home, "m").is_none(), "removed ⇒ cleared");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// rollback_failed: worktree NOT removed ⇒ journal retained (armed) for recovery.
+#[test]
+fn txn_rollback_failed_remove_fail_retains() {
+    let home = tmp_home("rb-fail");
+    let mut j = sample_journal();
+    j.advance(Phase::SubmodulesReady);
+    j.save(&home, "m").unwrap();
+    rollback_failed(&home, "m", &mut j, fixed_now(), || false, || {});
+    let retained = Journal::load(&home, "m").expect("retained");
+    assert!(
+        retained.rollback_pending && retained.next_attempt_at.is_some(),
+        "armed retained intent survives a failed remove"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
