@@ -819,10 +819,20 @@ fn apply_gh_observations(
     // observation also CLEARS any prior `observed_error` (e.g. from an earlier
     // transport failure).
     if let (Some(h), Some(b)) = (meta.head_ref_oid.as_deref(), meta.base_ref_oid.as_deref()) {
+        // #2749 correction (codex): an observed (head/base) tuple CHANGE makes any
+        // prior freshness_error + retry lease STALE (they were for the old tuple) —
+        // discard them so the off-tick populator re-attempts the NEW tuple
+        // immediately instead of waiting out a lease that no longer applies.
+        let tuple_changed = state.observed_head_sha.as_deref() != Some(h)
+            || state.observed_base_sha.as_deref() != Some(b);
         state.observed_head_sha = Some(h.to_string());
         state.observed_base_sha = Some(b.to_string());
         state.observed_at = Some(now.to_string());
         state.observed_error = false;
+        if tuple_changed {
+            state.freshness_error = false;
+            state.freshness_retry_after = None;
+        }
     }
 
     // First observation — populate identity fields.

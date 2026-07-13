@@ -24,6 +24,26 @@ use super::{gh_poll, load, with_pr_state, FRESHNESS_TTL_SECS};
 /// cadence to land a refresh before the gate would go stale.
 const FRESHNESS_REFRESH_SECS: i64 = FRESHNESS_TTL_SECS / 2;
 
+/// #2749 correction (codex): the retry-lease window for a FAILED ancestry compare
+/// on the exact observed tuple — bounds a persistently-failing forge to ONE compare
+/// per lease (not one per 15s worker cycle).
+const FRESHNESS_RETRY_LEASE_SECS: i64 = 60;
+
+/// Is the failing tuple still within its retry lease (⇒ SKIP the re-attempt)? A
+/// deadline in the FUTURE and within a sane bound (≤ 2× the lease) holds the lease.
+/// An absent / malformed / absurdly-far-future deadline is NOT treated as an
+/// indefinite lease — re-attempt to self-heal it back to a valid one (fail-closed
+/// against a stuck PR; the gate stays fail-closed on `freshness_error` regardless).
+fn lease_active(retry_after: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match retry_after.and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok()) {
+        Some(d) => {
+            let d = d.with_timezone(&chrono::Utc);
+            d > now && (d - now).num_seconds() <= FRESHNESS_RETRY_LEASE_SECS * 2
+        }
+        None => false,
+    }
+}
+
 /// Should the populator run the (remote-I/O) compare for this state? True when
 /// the checked tuple is not current for the observed (head, base), a prior
 /// compare errored, or the cached tuple is aging past the refresh window. False
@@ -39,7 +59,11 @@ fn needs_recompute(
         return false; // torn/stale observation — a re-observe must land first
     }
     if state.freshness_error {
-        return true;
+        // Respect the persisted retry lease — at most one compare per 60s per
+        // exact tuple, not one per 15s worker cycle. A tuple change clears the
+        // error+lease upstream (apply_gh_observations), so a still-set error is
+        // for the CURRENT tuple; only re-attempt once the lease is not active.
+        return !lease_active(state.freshness_retry_after.as_deref(), now);
     }
     if state.freshness_checked_head_sha.as_deref() != Some(state.head_sha.as_str())
         || state.freshness_checked_base_sha.as_deref() != Some(observed_base)
@@ -100,6 +124,7 @@ pub(crate) fn stamp_freshness_off_tick(home: &Path, repo: &str, prs: &[gh_poll::
                         s.freshness_checked_at = Some(ts.clone());
                         s.freshness_behind_by = Some(result.behind_by);
                         s.freshness_error = false;
+                        s.freshness_retry_after = None;
                     }
                 });
             }
@@ -108,10 +133,21 @@ pub(crate) fn stamp_freshness_off_tick(home: &Path, repo: &str, prs: &[gh_poll::
                     repo = %repo, branch = %branch, error = %e,
                     "#2749 3b: ancestry compare failed — freshness_error (last-good tuple preserved)"
                 );
-                // Flag the error WITHOUT clobbering the last-good checked tuple.
+                let deadline = (chrono::Utc::now()
+                    + chrono::Duration::seconds(FRESHNESS_RETRY_LEASE_SECS))
+                .to_rfc3339();
+                // Full-tuple CAS: only error+lease the tuple we ACTUALLY compared. A
+                // concurrent head/base move (a stale old-base failure) fails the CAS,
+                // so the newer tuple is NOT errored. The last-good checked tuple and
+                // its behind_by are left intact (no clobber); the 60s lease bounds the
+                // re-attempt cadence.
                 let _ = with_pr_state(home, repo, branch, |s| {
-                    if s.head_sha == head {
+                    if s.head_sha == head
+                        && s.observed_head_sha.as_deref() == Some(head.as_str())
+                        && s.observed_base_sha.as_deref() == Some(base.as_str())
+                    {
                         s.freshness_error = true;
+                        s.freshness_retry_after = Some(deadline.clone());
                     }
                 });
             }
