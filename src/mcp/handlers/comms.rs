@@ -14,7 +14,7 @@ use super::{
 };
 
 // W2.2: delegate_task phase pipeline (resolve→validate→compose→lease→create→send→track).
-#[path = "comms_delegate.rs"]
+#[path = "comms_delegate/mod.rs"]
 mod comms_delegate;
 pub(crate) use comms_delegate::handle_delegate_task;
 // p0c_tests (cfg test child) pin `super::dispatch_should_skip_auto_bind`.
