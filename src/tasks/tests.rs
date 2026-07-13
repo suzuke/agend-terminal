@@ -2124,7 +2124,9 @@ fn cross_board_dep_detective_flags_but_does_not_release_in_progress_audit2_014()
     // already shows "blocked" for ANY InProgress task with an unsatisfied dep,
     // pre-existing behavior unrelated to this detective) must be untouched:
     // no event was emitted for A.
-    let board_a = super::board_router::board_for_task(&home, &a);
+    let board_a = super::board_router::route_task(&home, &a)
+        .expect("route A's board")
+        .1;
     let persisted = crate::task_events::replay_at(&board_a)
         .expect("replay A's board")
         .tasks
@@ -2193,7 +2195,9 @@ fn cross_board_dep_detective_release_toctou_skips_when_task_advances_audit2_014(
         "must not release a task that advanced to InProgress mid-scan: {report:?}"
     );
 
-    let board_a = super::board_router::board_for_task(&home, &a);
+    let board_a = super::board_router::route_task(&home, &a)
+        .expect("route A's board")
+        .1;
     let persisted = crate::task_events::replay_at(&board_a)
         .expect("replay A's board")
         .tasks
@@ -2298,7 +2302,9 @@ fn cross_board_dep_derived_block_is_in_memory_not_persisted_2117_q2() {
 
     // But the canonical event log persisted NO Blocked transition for A: a raw
     // replay of A's own board still yields Open.
-    let board_a = super::board_router::board_for_task(&home, &a);
+    let board_a = super::board_router::route_task(&home, &a)
+        .expect("route A's board")
+        .1;
     let persisted = crate::task_events::replay_at(&board_a)
         .expect("replay A's board")
         .tasks

@@ -21,12 +21,15 @@ pub fn auto_close_on_report(
     if !correlation_id.starts_with("t-") {
         return Ok(false);
     }
-    let board = super::board_router::board_for_task(home, correlation_id);
-    let state = crate::task_events::replay_at(&board).unwrap_or_default();
-    let tid = crate::task_events::TaskId(correlation_id.to_string());
-    let Some(record) = state.tasks.get(&tid) else {
-        return Ok(false);
+    // #2760: resolve the task's authoritative board via the strict route. Fail
+    // closed — a task whose board cannot be uniquely proven (route error / unknown
+    // id) is NOT auto-closed (matches the pre-#2760 "record not found → Ok(false)").
+    let routed = match super::load_routed(home, correlation_id) {
+        Ok(rt) => rt,
+        Err(_) => return Ok(false),
     };
+    let tid = crate::task_events::TaskId(correlation_id.to_string());
+    let record = routed.record();
     use crate::task_events::TaskStatus;
     // #1942: `InReview` was added in #1265 but never added to this whitelist, so
     // a terminal report on a task the lead promoted to `in_review` was silently
@@ -67,8 +70,12 @@ pub fn auto_close_on_report(
     let emitter = crate::task_events::InstanceName::from("system:auto_close");
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
-    let closed =
-        crate::task_events::append_done_if_legal_at(&board, &emitter, correlation_id, vec![event])?;
+    let closed = crate::task_events::append_done_if_legal_at(
+        routed.board().path(),
+        &emitter,
+        correlation_id,
+        vec![event],
+    )?;
     if closed {
         // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
         super::task_terminal_cleanup(home, correlation_id);

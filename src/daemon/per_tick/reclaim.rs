@@ -283,16 +283,27 @@ fn do_reclaim(
     // board → every owned task passes → byte-identical today.
     let mut agent_tasks: Vec<crate::task_events::TaskId> = Vec::new();
     for tid in owned {
-        let board_project = crate::tasks::resolve_task_project(home, &tid.0);
-        if crate::tasks::can_mutate_on_board(home, agent, &board_project) {
-            agent_tasks.push(tid);
-        } else {
-            tracing::warn!(
-                agent,
-                task = %tid.0,
-                board = %board_project,
-                "#2127 reclaim cross-board skip (fail-closed): agent not authorized on task's board"
-            );
+        // #2760: strict route + per-board ACL through the narrow tasks op (the raw
+        // board identity stays tasks-private). Ok(true) → authorized; Ok(false) →
+        // cross-board, skip; Err(route) → fail-closed skip (never reclaim a task
+        // whose authoritative board cannot be uniquely proven).
+        match crate::tasks::caller_can_mutate_task(home, agent, &tid.0) {
+            Ok(true) => agent_tasks.push(tid),
+            Ok(false) => {
+                tracing::warn!(
+                    agent,
+                    task = %tid.0,
+                    "#2127 reclaim cross-board skip (fail-closed): agent not authorized on task's board"
+                );
+            }
+            Err(route_err) => {
+                tracing::warn!(
+                    agent,
+                    task = %tid.0,
+                    %route_err,
+                    "#2760 reclaim skip (fail-closed): task route unresolved"
+                );
+            }
         }
     }
     if agent_tasks.is_empty() {

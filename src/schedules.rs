@@ -180,7 +180,11 @@ impl From<ScheduleRaw> for Schedule {
 /// and made `fire_strategy=until_success` permanently unreachable. The old name
 /// (`task_file_exists`) baked in that wrong filesystem abstraction.
 fn task_exists(home: &Path, task_id: &str) -> bool {
-    !task_id.is_empty() && crate::tasks::load_by_id(home, task_id).is_some()
+    // #2760: strict route — existence means the id resolves to EXACTLY ONE readable
+    // board. Any route error (NotFound / Unreadable / Ambiguous) → `false` →
+    // fail-closed reject of `fire_strategy=until_success` (never gate on a task
+    // whose board cannot be uniquely proven).
+    !task_id.is_empty() && crate::tasks::load_routed(home, task_id).is_ok()
 }
 
 /// #1521: validate a (fire_strategy, linked_task_id) pair. `Ok(())` when the
@@ -922,8 +926,8 @@ mod tests {
 
     // ── #1521: fire-strategy validation + backward-compat ──
 
-    /// #1608: create a REAL task on the event-sourced board (so
-    /// `tasks::load_by_id` finds it), NOT a `tasks/<id>.json` file. The old
+    /// #1608: create a REAL task on the event-sourced board (so the strict
+    /// `tasks::load_routed` finds it), NOT a `tasks/<id>.json` file. The old
     /// `seed_task_file` wrote a file the real lookup never reads — which is
     /// exactly why this test passed while the feature was broken. Mirrors the
     /// task subsystem's own `create_task` helper (tasks/handler.rs).
@@ -950,8 +954,8 @@ mod tests {
         .expect("seed real task");
         // Sanity: the authoritative lookup the fix relies on must now resolve.
         assert!(
-            crate::tasks::load_by_id(home, id).is_some(),
-            "seeded task '{id}' must be visible to tasks::load_by_id"
+            crate::tasks::load_routed(home, id).is_ok(),
+            "seeded task '{id}' must be visible to tasks::load_routed"
         );
     }
 

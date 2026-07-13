@@ -13,6 +13,13 @@ mod sweep;
 #[path = "tests.rs"]
 mod tests;
 
+// #2760 RED (frozen-plan d-…-7): strict-routing contract for `load_routed`.
+// Proven-failing against the checkpoint stub; the GREEN strict-resolution body
+// turns them green.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod routing_red_2760;
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -39,13 +46,15 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch
 // auto-create (target board) and the per-board task sweep (project id from a
 // team's source_repo).
+// #2760: `board_for_task` / `resolve_task_project` (the LENIENT default-fallback
+// seams) are no longer re-exported — every per-id authority path routes through
+// the strict `load_routed` / `caller_can_mutate_task` above instead.
 pub(crate) use board_router::{
-    board_for_task, list_all_boards, project_id_from_source_repo, resolve_target_project,
-    resolve_task_project,
+    list_all_boards, project_id_from_source_repo, resolve_target_project,
 };
-// #2127 Phase 1 / #2117 P3: shared per-board mutation ACL primitive, re-exported
-// for callers outside the `tasks` module (the reclaim per-tick handler).
-pub(crate) use acl::can_mutate_on_board;
+// #2760: the per-board mutation ACL is no longer re-exported for external callers
+// (reclaim now routes through the strict `caller_can_mutate_task` above). It stays
+// tasks-internal — `caller_can_mutate_task` and the handler ACL use `acl::` directly.
 pub use orphan::{
     cancel_tasks_for_owner, orphan_tasks_for_owner, reconcile_orphan_owners_with_live,
     release_inprogress_orphans_with_live,
@@ -161,9 +170,10 @@ struct DepResolver<'a> {
     /// absent there) → skip the redundant replay.
     local_board: &'a Path,
     local: std::collections::HashMap<String, crate::task_events::TaskStatus>,
-    /// Memoized `resolve_task_project` per dep_id (its index-miss fallback is a
-    /// full-board scan — resolve each distinct dep at most once per pass).
-    proj_cache: std::collections::HashMap<String, String>,
+    /// #2760: memoized STRICT route per dep_id → the dep's authoritative board, or
+    /// `None` when the route fails closed (NotFound/Unreadable/Ambiguous). Resolve
+    /// each distinct dep at most once per pass (its index-miss path is a full scan).
+    proj_cache: std::collections::HashMap<String, Option<std::path::PathBuf>>,
     /// Lazily-replayed foreign boards: board path → {task_id → status}.
     board_cache: std::collections::HashMap<
         std::path::PathBuf,
@@ -237,12 +247,19 @@ impl<'a> DepResolver<'a> {
         if let Some(s) = self.local.get(dep_id) {
             return Some(*s);
         }
-        let project = self
+        // #2760: resolve the dep's board via the STRICT route (cached per dep_id).
+        // A route error → `None` → the dep is not-reachable → not-Done → blocking
+        // (the conservative pre-#2117 missing-dep rule); never a silent DEFAULT read.
+        let board = self
             .proj_cache
             .entry(dep_id.to_string())
-            .or_insert_with(|| board_router::resolve_task_project(self.home, dep_id))
+            .or_insert_with(|| {
+                board_router::route_task(self.home, dep_id)
+                    .map(|(_, board, _)| board)
+                    .ok()
+            })
             .clone();
-        let board = crate::task_events::board_root(self.home, &project);
+        let board = board?;
         if board.as_path() == self.local_board {
             // Resolves back to the local board → already covered by `local`
             // (and definitively absent, since the local check above missed).
@@ -379,8 +396,171 @@ pub(super) fn status_to_legacy_str(s: crate::task_events::TaskStatus) -> &'stati
     }
 }
 
-pub fn load_by_id(home: &Path, task_id: &str) -> Option<Task> {
-    handler::read_task_record(home, task_id).map(|r| record_to_task(&r))
+// ── #2760: strict routed task authority ────────────────────────────────
+//
+// The removed `load_by_id` seam read ONLY the default board
+// (`read_task_record_at(home, id)`, where `home` IS the default board root), so a
+// task on a per-project board was invisible to it — the t-…-35 live failure (a
+// project-board task with `review_class=single` dispatched as
+// `review_class_unspecified`). `load_routed` is its fail-closed replacement: it
+// resolves the ONE board that authoritatively holds the id and NEVER silently
+// falls back to the default board on a miss.
+
+/// #2760: an opaque board identity carried by a [`RoutedTask`]. The inner path
+/// and its constructor are PRIVATE to the `tasks` module (`pub(in crate::tasks)`),
+/// so an external consumer receives a [`RoutedTask`] — a [`Task`] view — and can
+/// never obtain a raw board `Path` to write to the wrong board. The high-level
+/// `tasks` write operations (branch-link, usage-limit) that DO need the board
+/// take it back through this opaque handle, not as a bare path.
+#[derive(Debug, Clone)]
+pub struct BoardRoot {
+    /// The resolved project id (a read-only board LABEL — used by the per-board
+    /// mutation ACL). NOT a filesystem path: exposing it via [`RoutedTask`] cannot
+    /// let an external module write to a board.
+    project: String,
+    path: std::path::PathBuf,
+}
+
+impl BoardRoot {
+    pub(in crate::tasks) fn new(project: String, path: std::path::PathBuf) -> Self {
+        Self { project, path }
+    }
+    /// The board's project id (the ACL axis). `tasks`-private.
+    pub(in crate::tasks) fn project(&self) -> &str {
+        &self.project
+    }
+    /// The board's on-disk root. `tasks`-private so no external module can obtain a
+    /// raw board `Path` to write to the wrong board (#2760 point 3/7).
+    pub(in crate::tasks) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// #2760: a task resolved through the strict router — the public [`Task`] view
+/// PLUS the opaque board it authoritatively lives on. External consumers read
+/// `.task`; the board identity is `tasks`-private, so no caller outside this
+/// module can mutate the resolved task on some other board.
+#[derive(Debug, Clone)]
+pub struct RoutedTask {
+    pub task: Task,
+    /// The raw replay record for the routed task — carries fields the [`Task`]
+    /// view omits (e.g. `block_reason`) that a write-owner (usage-limit) needs for
+    /// an idempotency pre-check on the SAME single route (no re-load).
+    record: crate::task_events::TaskRecord,
+    board: BoardRoot,
+}
+
+impl RoutedTask {
+    /// The opaque board this task was routed to — `tasks`-private, so only the
+    /// high-level task operations (which own branch-link / usage-limit writes)
+    /// can reach it.
+    pub(in crate::tasks) fn board(&self) -> &BoardRoot {
+        &self.board
+    }
+
+    /// The raw replay record (fields not projected into the [`Task`] view, e.g.
+    /// `block_reason`). Read-only snapshot from the strict route.
+    pub(crate) fn record(&self) -> &crate::task_events::TaskRecord {
+        &self.record
+    }
+
+    /// #2760: append `events` to THIS task's authoritative board under a checked
+    /// precondition, reusing the SINGLE route already resolved (no re-load). The
+    /// board identity stays `tasks`-private — a write-owner (usage-limit) supplies
+    /// the domain events + precondition; `tasks` owns WHERE they land.
+    pub(crate) fn append_batch_checked<F>(
+        &self,
+        emitter: &crate::task_events::InstanceName,
+        events: Vec<crate::task_events::TaskEvent>,
+        check: F,
+    ) -> anyhow::Result<Result<Vec<u64>, String>>
+    where
+        F: FnOnce(&crate::task_events::TaskBoardState) -> Result<(), String>,
+    {
+        crate::task_events::append_batch_checked_at(self.board.path(), emitter, events, check)
+    }
+}
+
+/// #2760: strict per-board mutation authorization for an EXTERNAL caller (the
+/// reclaim per-tick handler). Resolves the task's authoritative board via the
+/// strict route (fail-closed) and applies the per-board mutation ACL. `Err` on any
+/// route failure so the caller DENIES (never mutates a task it cannot uniquely
+/// route). Keeps the board identity `tasks`-private — the caller learns only the
+/// yes/no authorization.
+pub(crate) fn caller_can_mutate_task(
+    home: &Path,
+    caller: &str,
+    task_id: &str,
+) -> Result<bool, TaskRouteError> {
+    let routed = load_routed(home, task_id)?;
+    Ok(acl::can_mutate_on_board(
+        home,
+        caller,
+        routed.board().project(),
+    ))
+}
+
+/// #2760: why a strict route failed. There is deliberately NO variant that means
+/// "fell back to the default board" — a route either names the ONE authoritative
+/// board or fails closed here. Consumers map these to their own fail-closed
+/// policy (deny / keep-obligation / keep-reserved-live); they must never treat an
+/// error as "assume default".
+// #2760 checkpoint: consumers migrate onto this in the GREEN step; until then
+// the strict variants have no non-test constructor in the bin build.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum TaskRouteError {
+    /// The id is present on NO readable board — a definitive absence (every board
+    /// enumerated and replayed cleanly, none held the id).
+    NotFound,
+    /// A board's index or event log could not be read/parsed, so uniqueness could
+    /// not be proven. Fails closed rather than guessing a board.
+    Unreadable {
+        path: std::path::PathBuf,
+        cause: String,
+    },
+    /// The id resolves to more than one board (a duplicate id across boards, or
+    /// conflicting distinct index entries) — there is no single authority.
+    Ambiguous {
+        candidates: Vec<String>,
+        cause: String,
+    },
+}
+
+impl std::fmt::Display for TaskRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskRouteError::NotFound => write!(f, "task not found on any board"),
+            TaskRouteError::Unreadable { path, cause } => {
+                write!(f, "task route unreadable ({}): {cause}", path.display())
+            }
+            TaskRouteError::Ambiguous { candidates, cause } => {
+                write!(f, "task route ambiguous across {candidates:?}: {cause}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskRouteError {}
+
+/// #2760 STRICT per-id task router — the fail-closed replacement for the
+/// default-board [`load_by_id`] seam. Resolves the ONE board that authoritatively
+/// holds `task_id` and returns its [`Task`] view + opaque board, or a typed
+/// [`TaskRouteError`] that NEVER means "assume the default board".
+///
+/// Resolves the ONE board that authoritatively holds `task_id` (frozen-plan
+/// point 2: indexed route replay-verified, else a checked scan of the default +
+/// every project board — exactly-one hit = success, zero = NotFound, >1 =
+/// Ambiguous, any replay/index failure = Unreadable) and returns its [`Task`] view
+/// and its opaque board. A [`TaskRouteError`] NEVER means "assume the default
+/// board": consumers map it to their own fail-closed policy.
+pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, TaskRouteError> {
+    let (project, board, record) = board_router::route_task(home, task_id)?;
+    Ok(RoutedTask {
+        task: record_to_task(&record),
+        record,
+        board: BoardRoot::new(project, board),
+    })
 }
 
 /// Return all tasks as typed structs. **PR3 cutover** — sources state
@@ -420,26 +600,59 @@ pub fn link_branch_to_task(home: &Path, task_id: &str, branch: &str) -> anyhow::
     if branch.is_empty() || !task_id.starts_with("t-") {
         return Ok(false);
     }
-    let state = crate::task_events::replay(home).unwrap_or_default();
-    let tid = crate::task_events::TaskId(task_id.to_string());
-    let Some(record) = state.tasks.get(&tid) else {
-        return Ok(false);
+    // #2760: resolve the ONE authoritative board via the strict route and append
+    // BranchLinked THERE under a checked precondition — never a silent default-board
+    // write (the pre-#2760 body read `replay(home)`, invisible to project boards).
+    // A route error is surfaced (logged) and writes nothing.
+    let routed = match load_routed(home, task_id) {
+        Ok(rt) => rt,
+        Err(TaskRouteError::NotFound) => return Ok(false),
+        Err(e) => {
+            tracing::warn!(
+                task_id, branch, route_err = %e,
+                "#2760 branch-link skipped: task route unresolved (no default-board write)"
+            );
+            return Ok(false);
+        }
     };
-    if record.branch.as_deref() == Some(branch) {
+    if routed.task.branch.as_deref() == Some(branch) {
         return Ok(false);
     }
+    let tid = crate::task_events::TaskId(task_id.to_string());
     let emitter = crate::task_events::InstanceName::from("system:branch-link");
-    crate::task_events::append_batch(
-        home,
+    let branch_owned = branch.to_string();
+    let closure_tid = tid.clone();
+    let checked = routed.append_batch_checked(
         &emitter,
         vec![crate::task_events::TaskEvent::BranchLinked {
             task_id: tid,
             by: emitter.clone(),
-            branch: branch.to_string(),
+            branch: branch_owned.clone(),
         }],
+        move |fresh| match fresh.tasks.get(&closure_tid) {
+            None => Err(format!(
+                "task '{}' disappeared before branch-link",
+                closure_tid.0
+            )),
+            // A concurrent link raced the same branch in → idempotent no-op.
+            Some(record) if record.branch.as_deref() == Some(branch_owned.as_str()) => {
+                Err("branch already linked".to_string())
+            }
+            Some(_) => Ok(()),
+        },
     )?;
-    tracing::info!(task_id, branch, "linked branch to task (#1942)");
-    Ok(true)
+    match checked {
+        Ok(_) => {
+            tracing::info!(
+                task_id,
+                branch,
+                "linked branch to task (#1942, #2760 routed)"
+            );
+            Ok(true)
+        }
+        // Precondition failed at commit (raced re-link / task gone) → no-op.
+        Err(_) => Ok(false),
+    }
 }
 
 /// Sweep overdue claimed tasks back to open by **emitting `Released`
@@ -553,10 +766,14 @@ pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileRep
         }
         let mut resolver = DepResolver::new(home, &board, &snapshot);
         for task in candidates {
-            let has_cross_board_dep = task
-                .depends_on
-                .iter()
-                .any(|d| board_router::resolve_task_project(home, d) != project);
+            // #2760: classify cross-board via the STRICT route. A dep that cannot
+            // be uniquely routed → treated as NOT cross-board (`unwrap_or(false)`) →
+            // the detective skips it (never releases a claim on an unprovable dep).
+            let has_cross_board_dep = task.depends_on.iter().any(|d| {
+                board_router::route_task(home, d)
+                    .map(|(dep_project, _, _)| dep_project != project)
+                    .unwrap_or(false)
+            });
             if !has_cross_board_dep {
                 continue;
             }
@@ -617,7 +834,9 @@ pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileRep
                         fresh_state.tasks.values().map(record_to_task).collect();
                     let mut fresh_resolver = DepResolver::new(home, &board, &fresh_snapshot);
                     let still_cross_board = record.depends_on.iter().any(|d| {
-                        board_router::resolve_task_project(home, &d.0) != project_for_check
+                        board_router::route_task(home, &d.0)
+                            .map(|(dep_project, _, _)| dep_project != project_for_check)
+                            .unwrap_or(false)
                     });
                     if !still_cross_board {
                         return Err(format!("task '{task_id}' no longer has a cross-board dep"));

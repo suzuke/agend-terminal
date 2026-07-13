@@ -491,10 +491,14 @@ fn task_still_live(home: &Path, task_id: &str) -> Option<bool> {
     // #1608b/#1614: event-sourced lookup, NOT a `tasks/{id}.json` probe — that
     // file is never written, so the old read always failed → this check was dead
     // (always `None`) and the #1018 "skip the nudge for a closed task" branch was
-    // unreachable. `load_by_id` returns `None` on absent OR a transient replay
-    // error → fail-open (treat as live), the existing safe semantics.
-    let task = crate::tasks::load_by_id(home, task_id)?;
-    let status = task.status.to_string();
+    // unreachable.
+    // #2760: resolve via the STRICT router. Found → real liveness; ANY route error
+    // (NotFound / Unreadable / Ambiguous) → `None` → treated as live (fail-open),
+    // preserving the pre-#2760 "can't prove it closed ⇒ keep nudging" semantics.
+    // (Per frozen-plan pt5, treating a definitive NotFound as orphan-dead would be
+    // a deliberate policy change; the watchdog stays conservative and does not.)
+    let routed = crate::tasks::load_routed(home, task_id).ok()?;
+    let status = routed.task.status.to_string();
     Some(LIVE_TASK_STATUSES.contains(&status.as_str()))
 }
 

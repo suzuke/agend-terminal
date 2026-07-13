@@ -407,17 +407,20 @@ impl ControlEffects for FsEffects<'_> {
         if !self.current_binding_matches(key) {
             anyhow::bail!("binding generation changed before UsageLimit block");
         }
-        let board = crate::tasks::board_for_task(self.home, &key.task_id);
+        // #2760: resolve the task's authoritative board via the STRICT route
+        // (fail-closed) ONCE and reuse the snapshot; the raw board path stays
+        // tasks-private (the checked append rides `routed.append_batch_checked`).
+        let routed = crate::tasks::load_routed(self.home, &key.task_id)
+            .map_err(|e| anyhow::anyhow!("UsageLimit block: task route unresolved: {e}"))?;
         let task_id = crate::task_events::TaskId(key.task_id.clone());
         let notification_id = key.notification_id();
-        let state = crate::task_events::replay_at(&board)?;
-        if state.tasks.get(&task_id).is_some_and(|record| {
-            record.status == crate::task_events::TaskStatus::Blocked
-                && record
-                    .block_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(&notification_id))
-        }) {
+        if routed.record().status == crate::task_events::TaskStatus::Blocked
+            && routed
+                .record()
+                .block_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(&notification_id))
+        {
             return Ok(());
         }
         let episode = self.episode.as_ref().cloned();
@@ -437,8 +440,7 @@ impl ControlEffects for FsEffects<'_> {
         })
         .to_string();
         let key_for_check = key.clone();
-        let checked = crate::task_events::append_batch_checked_at(
-            &board,
+        let checked = routed.append_batch_checked(
             &crate::task_events::InstanceName("system:usage-limit".into()),
             vec![crate::task_events::TaskEvent::Blocked {
                 task_id: task_id.clone(),
@@ -468,13 +470,17 @@ impl ControlEffects for FsEffects<'_> {
         if !self.current_binding_matches(key) {
             return Ok(false);
         }
-        let board = crate::tasks::board_for_task(self.home, &key.task_id);
+        // #2760: strict route (fail-closed), resolved ONCE and reused for both the
+        // idempotency pre-check and the checked append. Board path stays private.
+        let routed = crate::tasks::load_routed(self.home, &key.task_id)
+            .map_err(|e| anyhow::anyhow!("UsageLimit recovery: task route unresolved: {e}"))?;
         let task_id = crate::task_events::TaskId(key.task_id.clone());
         let owner = crate::task_events::InstanceName(key.source.clone());
-        let state = crate::task_events::replay_at(&board)?;
-        if state.tasks.get(&task_id).is_some_and(|record| {
-            Self::task_matches_key(record, key, &[crate::task_events::TaskStatus::InProgress])
-        }) {
+        if Self::task_matches_key(
+            routed.record(),
+            key,
+            &[crate::task_events::TaskStatus::InProgress],
+        ) {
             // Crash window: the atomic Unblocked+InProgress append committed but
             // persisting EpisodeState::Recovered did not. Treat the exact
             // original generation as an idempotent completed recovery.
@@ -482,8 +488,7 @@ impl ControlEffects for FsEffects<'_> {
         }
         let key_for_check = key.clone();
         let notification_id = key.notification_id();
-        let checked = crate::task_events::append_batch_checked_at(
-            &board,
+        let checked = routed.append_batch_checked(
             &crate::task_events::InstanceName("system:usage-limit".into()),
             vec![
                 crate::task_events::TaskEvent::Unblocked {
@@ -560,10 +565,13 @@ impl ControlEffects for FsEffects<'_> {
     }
 }
 
-fn correlation_from_disk(home: &Path, source: &str) -> Option<Correlation> {
+fn correlation_from_disk(home: &Path, source: &str) -> Option<(Correlation, crate::tasks::Task)> {
     let binding = read_current_binding(home, source)?;
     let task_id = binding.get("task_id")?.as_str()?.to_string();
-    let task = crate::tasks::load_by_id(home, &task_id)?;
+    // #2760: resolve via the STRICT route (any route error → None: no correlation
+    // is built on a task whose board cannot be uniquely proven). The resolved Task
+    // is RETURNED so `episode_start` reuses this SINGLE route (no double load).
+    let task = crate::tasks::load_routed(home, &task_id).ok()?.task;
     let task_status = match task.status {
         crate::task_events::TaskStatus::Claimed => "claimed",
         crate::task_events::TaskStatus::InProgress => "in_progress",
@@ -571,16 +579,17 @@ fn correlation_from_disk(home: &Path, source: &str) -> Option<Correlation> {
         _ => "other",
     }
     .to_string();
-    Some(Correlation {
+    let correlation = Correlation {
         task_id,
         source: source.to_string(),
-        owner: task.assignee.unwrap_or_default(),
+        owner: task.assignee.clone().unwrap_or_default(),
         task_status,
-        task_branch: task.branch.unwrap_or_default(),
+        task_branch: task.branch.clone().unwrap_or_default(),
         binding_task_id: binding.get("task_id")?.as_str()?.to_string(),
         binding_branch: binding.get("branch")?.as_str()?.to_string(),
         binding_issued_at: binding.get("issued_at")?.as_str()?.to_string(),
-    })
+    };
+    Some((correlation, task))
 }
 
 fn fleet_facts(
@@ -745,10 +754,12 @@ pub(crate) fn observe_supervisor_tick(
     }
 
     let _binding_guard = acquire_binding_lock(home, source)?;
-    let correlation = correlation_from_disk(home, source);
-    let task = correlation
-        .as_ref()
-        .and_then(|correlation| crate::tasks::load_by_id(home, &correlation.task_id));
+    // #2760: `correlation_from_disk` resolves the task ONCE and returns it, so the
+    // fleet-facts lookup reuses that snapshot instead of a second `load_by_id`.
+    let (correlation, task) = match correlation_from_disk(home, source) {
+        Some((correlation, task)) => (Some(correlation), Some(task)),
+        None => (None, None),
+    };
     let (source_team, source_role, candidates, recipient) =
         fleet_facts(home, registry, source, task.as_ref());
     let now = Utc::now();
@@ -1393,7 +1404,7 @@ teams:
             source_team: Some("archfix".into()),
             source_role: Some("dev".into()),
             unlock_at: Some(now() + Duration::seconds(29 * 60 + 59)),
-            correlation: super::correlation_from_disk(&home, "worker-a"),
+            correlation: super::correlation_from_disk(&home, "worker-a").map(|(c, _)| c),
             candidates: Vec::new(),
             recipient: "lead".into(),
         };
@@ -1577,7 +1588,7 @@ teams:
             source_team: Some("archfix".into()),
             source_role: Some("dev".into()),
             unlock_at: Some(now() + Duration::seconds(29 * 60 + 59)),
-            correlation: super::correlation_from_disk(&home, "worker-a"),
+            correlation: super::correlation_from_disk(&home, "worker-a").map(|(c, _)| c),
             candidates: Vec::new(),
             recipient: "lead".into(),
         };

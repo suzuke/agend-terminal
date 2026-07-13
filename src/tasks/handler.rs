@@ -11,13 +11,12 @@ fn parse_due_at(args: &Value) -> Option<String> {
     Some(dt.with_timezone(&chrono::Utc).to_rfc3339())
 }
 
-/// Read a single task's current replay-derived record. Used by
-/// `handle`'s mutation arms to validate `(prev_status, transition)`
-/// before emitting an event.
+/// #2760: default-root record read. Production mutation arms now resolve their
+/// board via the strict `super::load_routed` (no default-board assumption), so this
+/// remains only as a convenience for the default-board handler tests.
+#[cfg(test)]
 pub(super) fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRecord> {
-    // #2117 P1: home IS the default board root (`board_root(home, DEFAULT)`), so
-    // this is byte-identical; routed callers use `read_task_record_at` with the
-    // task's resolved board.
+    // `home` IS the default board root (`board_root(home, DEFAULT)`).
     read_task_record_at(home, id)
 }
 
@@ -172,7 +171,21 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     // composition — cross-board references are allowed there per the epic and are
     // NOT guarded here.)
     if let Some(parent_id) = args["parent_id"].as_str() {
-        let parent_project = super::board_router::resolve_task_project(home, parent_id);
+        // #2760: resolve the parent's board via the strict route. A route error
+        // (NotFound / Unreadable / Ambiguous) fails closed — a subtask is never
+        // created against a parent whose board cannot be uniquely proven.
+        let parent_project = match super::load_routed(home, parent_id) {
+            Ok(rt) => rt.board().project().to_string(),
+            Err(e) => {
+                return serde_json::json!({
+                    "error": format!(
+                        "cross-project parent_id rejected: parent {parent_id} could not be \
+                         routed ({e}) — a subtask must live in its parent's uniquely-resolved \
+                         project (board isolation, #2117 P3a / #2760)"
+                    )
+                });
+            }
+        };
         if parent_project != project {
             return serde_json::json!({
                 "error": format!(
@@ -449,40 +462,52 @@ fn minimal_task_value(v: &mut Value) {
 /// task on the caller's current project board first, then falls back to scanning
 /// every board (the id may live elsewhere). Returns `{ "task": {...} }` or an
 /// `{ "error": ... }` when the id is absent.
-fn handle_get(home: &Path, caller: &str, args: &Value) -> Value {
+fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
     let Some(id) = id_arg(args).map(str::to_string) else {
         return serde_json::json!({"error": "missing 'id' (or 'task_id')"});
     };
-    // Primary board: explicit `project`, else the caller's current project.
-    let project = args["project"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
-    let board = crate::task_events::board_root(home, &project);
-    let mut found = super::list_all_at(home, &board)
-        .into_iter()
-        .find(|t| t.id == id);
-    let mut found_project = found.as_ref().map(|_| project);
-    // Cross-board fallback: the id may live on another project's board.
-    if found.is_none() {
-        for (p, ts) in super::board_router::list_all_boards(home) {
-            if let Some(t) = ts.into_iter().find(|t| t.id == id) {
-                found_project = Some(p);
-                found = Some(t);
-                break;
+    // #2760: an EXPLICIT `project` scopes the read to that operator-named board
+    // (deliberate disambiguation, NOT a silent default). With no `project`, the id
+    // resolves through the strict router — a duplicate across boards or an
+    // unreadable board fails closed instead of the old arbitrary first-hit scan.
+    let (task, project) = if let Some(project) = args["project"].as_str() {
+        let board = crate::task_events::board_root(home, project);
+        match super::list_all_at(home, &board)
+            .into_iter()
+            .find(|t| t.id == id)
+        {
+            Some(t) => (t, project.to_string()),
+            None => return serde_json::json!({"error": format!("task not found: {id}")}),
+        }
+    } else {
+        match super::load_routed(home, &id) {
+            // Re-read via `list_all_at` on the ROUTED board so the response keeps
+            // the dep-derived status (in-memory blocking), matching pre-#2760 `get`.
+            Ok(rt) => {
+                match super::list_all_at(home, rt.board().path())
+                    .into_iter()
+                    .find(|t| t.id == id)
+                {
+                    Some(t) => (t, rt.board().project().to_string()),
+                    None => return serde_json::json!({"error": format!("task not found: {id}")}),
+                }
+            }
+            Err(super::TaskRouteError::NotFound) => {
+                return serde_json::json!({"error": format!("task not found: {id}")})
+            }
+            Err(e) => {
+                return serde_json::json!({
+                    "error": format!("task '{id}' route unresolved: {e}"),
+                    "code": "task_route_unresolved",
+                })
             }
         }
+    };
+    let mut v = serde_json::to_value(&task).unwrap_or(Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("project".to_string(), Value::String(project));
     }
-    match found {
-        Some(t) => {
-            let mut v = serde_json::to_value(&t).unwrap_or(Value::Null);
-            if let (Some(obj), Some(p)) = (v.as_object_mut(), found_project) {
-                obj.insert("project".to_string(), Value::String(p));
-            }
-            serde_json::json!({ "task": v })
-        }
-        None => serde_json::json!({"error": format!("task not found: {id}")}),
-    }
+    serde_json::json!({ "task": v })
 }
 
 /// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task
@@ -493,12 +518,20 @@ fn handle_get(home: &Path, caller: &str, args: &Value) -> Value {
 /// SAME axis as the owner-ACL `can_mutate_record` — bypasses it on the paths that
 /// carry it. Single-project → caller project == task board project (both DEFAULT)
 /// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
-fn cross_board_denied(home: &Path, caller: &str, id: &str, force: bool) -> Option<Value> {
+// #2760: `board_project` is the caller's ALREADY-resolved authoritative board
+// (from `super::load_routed`), so the mutation routes ONCE and this gate never
+// re-resolves (nor silently defaults). `None` = allowed.
+fn cross_board_denied(
+    home: &Path,
+    caller: &str,
+    id: &str,
+    board_project: &str,
+    force: bool,
+) -> Option<Value> {
     if force {
         return None;
     }
-    let board_project = super::board_router::resolve_task_project(home, id);
-    if super::acl::can_mutate_on_board(home, caller, &board_project) {
+    if super::acl::can_mutate_on_board(home, caller, board_project) {
         return None;
     }
     Some(serde_json::json!({
@@ -523,10 +556,24 @@ fn handle_claim(
     if !instance_exists(home, &iname) {
         return serde_json::json!({"error": format!("instance '{iname}' not found in fleet.yaml")});
     }
+    // #2760: resolve the task's authoritative board ONCE via the strict route
+    // (fail-closed) and reuse it for the board-isolation gate + the append below.
+    let routed = match super::load_routed(home, &id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task '{id}' not found")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
+    };
     // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
     // project's board (claim has no `force`/owner-ACL — an open task is claimable
     // by anyone, but only within the board). Single-project → allow.
-    if let Some(deny) = cross_board_denied(home, &iname, &id, false) {
+    if let Some(deny) = cross_board_denied(home, &iname, &id, routed.board().project(), false) {
         return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
@@ -548,8 +595,8 @@ fn handle_claim(
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(iname.clone()),
     };
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, &id);
+    // #2760: the board resolved once above (strict route).
+    let board = routed.board().path().to_path_buf();
     let result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
         let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
         // #2117 Q2: cross-board dep eval — a claim gate on a task whose
@@ -640,12 +687,22 @@ fn handle_done(
     };
     let result_text = args["result"].as_str().map(String::from);
     let caller = instance_name.to_string();
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, &id);
-    let record = match read_task_record_at(&board, &id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task '{id}' not found")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route
+    // (fail-closed); reuse it for the ACL gate, pre-checks, and the checked append.
+    let routed = match super::load_routed(home, &id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task '{id}' not found")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
     // #808: force flag bypasses the ACL gate for historical
     // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -659,7 +716,7 @@ fn handle_done(
         });
     }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
         return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
@@ -888,12 +945,22 @@ fn handle_update(
         None
     };
     let caller = instance_name.to_string();
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, &id);
-    let record = match read_task_record_at(&board, &id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task '{id}' not found")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route
+    // (fail-closed); reuse it for the ACL gate, pre-checks, and the checked append.
+    let routed = match super::load_routed(home, &id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task '{id}' not found")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
     // #808: force flag bypasses the ACL gate for historical
     // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -907,7 +974,7 @@ fn handle_update(
         });
     }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
         return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
@@ -1482,15 +1549,25 @@ fn handle_metadata_set(
             "code": "metadata_value_too_large"
         });
     }
-    // #2117 P1: operate on the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, id);
-    let record = match read_task_record_at(&board, id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task not found: {id}")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route.
+    let routed = match super::load_routed(home, id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task not found: {id}")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
     // unconditional owner-ACL below).
-    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
+    {
         return deny;
     }
     // ── t-…-74 governance-key ACL (decision d-…-22, Root ruling m-1087) ──
@@ -1661,12 +1738,23 @@ fn handle_ack_plan(
         Some(i) => i,
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
-    let board = super::board_router::board_for_task(home, id);
-    let record = match read_task_record_at(&board, id) {
-        Some(r) => r,
-        None => return serde_json::json!({"error": format!("task not found: {id}")}),
+    // #2760: resolve the task's authoritative board ONCE via the strict route.
+    let routed = match super::load_routed(home, id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task not found: {id}")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
     };
-    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+    let board = routed.board().path().to_path_buf();
+    let record = routed.record().clone();
+    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
+    {
         return deny;
     }
     if record.owner.as_ref().map(|o| o.0.as_str()) == Some(instance_name) {
@@ -1721,20 +1809,37 @@ fn handle_metadata_get(home: &Path, args: &Value) -> Value {
         Some(i) => i,
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
-    let board = super::board_router::board_for_task(home, id);
-    match read_task_record_at(&board, id) {
-        Some(r) => {
-            serde_json::json!({"id": id, "metadata": r.metadata})
+    // #2760: strict route (read). Fail closed on Ambiguous/Unreadable.
+    match super::load_routed(home, id) {
+        Ok(rt) => serde_json::json!({"id": id, "metadata": rt.task.metadata}),
+        Err(super::TaskRouteError::NotFound) => {
+            serde_json::json!({"error": format!("task not found: {id}")})
         }
-        None => serde_json::json!({"error": format!("task not found: {id}")}),
+        Err(e) => serde_json::json!({
+            "error": format!("task '{id}' route unresolved: {e}"),
+            "code": "task_route_unresolved",
+        }),
     }
 }
 
 /// #1147: Build a chronological activity timeline for a task.
 fn activity_timeline(home: &Path, task_id: &str) -> Value {
-    // #2117 P1: read the task's resolved board (default → home).
-    let board = super::board_router::board_for_task(home, task_id);
-    let envelopes = match crate::task_events::envelopes_for_task_at(&board, task_id) {
+    // #2760: read the task's events from its authoritative board (strict route).
+    // Fail closed on Ambiguous/Unreadable; unknown id → not found.
+    let routed = match super::load_routed(home, task_id) {
+        Ok(rt) => rt,
+        Err(super::TaskRouteError::NotFound) => {
+            return serde_json::json!({"error": format!("task not found: {task_id}")})
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task '{task_id}' route unresolved: {e}"),
+                "code": "task_route_unresolved",
+            })
+        }
+    };
+    let envelopes = match crate::task_events::envelopes_for_task_at(routed.board().path(), task_id)
+    {
         Ok(e) => e,
         Err(e) => return serde_json::json!({"error": format!("failed to read task events: {e}")}),
     };
