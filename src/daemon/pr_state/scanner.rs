@@ -2220,6 +2220,72 @@ mod tests {
         );
     }
 
+    /// R3 mutation guard (codex): the STRONGER form of the test above — it proves
+    /// the delayed old-tuple error is discarded by the populator's Err-path
+    /// FULL-TUPLE CAS, not merely by the upstream `apply_gh_observations` clear.
+    /// The observation advances base1→base2 *in-flight of the compare* (via a mock
+    /// hook), and only THEN does the compare return Err for base1. A head-only Err
+    /// CAS (head unchanged) would wrongly stamp the stale base1 error onto the
+    /// base2 tuple; the full-tuple CAS discards it, leaving base2 clean and
+    /// immediately eligible. Regressing the CAS in freshness_populator.rs to
+    /// head-only makes this test FAIL.
+    #[test]
+    fn off_tick_inflight_observation_change_discards_delayed_stale_error() {
+        let home = tmp_home(line!());
+        write_team_fleet(&home, "lead", "dev");
+        let head = full_head(9);
+        let base1 = full_head(31);
+        let base2 = full_head(42);
+        ready_state(&home, 88, &head);
+        scan_observe(&home, 88, &head, &base1); // observed = (head, base1)
+
+        // compare(base1) advances the persisted observation to base2 WHILE IN
+        // FLIGHT, then fails — the delayed base1 Err now targets a superseded tuple.
+        let home_hook = home.clone();
+        let base2_hook = base2.clone();
+        let mock = crate::scm::MockScmProvider::with_compare_err_hook("forge 500", move || {
+            let _ = super::super::with_pr_state(&home_hook, "owner/repo", "feat/x", |s| {
+                s.observed_base_sha = Some(base2_hook.clone());
+            });
+        });
+        {
+            let _scm = crate::scm::set_test_scm_provider(mock);
+            run_off_tick(&home, 88, &head, &base1); // compare(base1) → [obs→base2] → Err
+        }
+
+        let s = load(&home, "owner/repo", "feat/x").unwrap();
+        assert_eq!(
+            s.observed_base_sha.as_deref(),
+            Some(base2.as_str()),
+            "precondition: the in-flight hook advanced the observation to base2"
+        );
+        assert!(
+            !s.freshness_error,
+            "#2749 R3: a delayed base1 Err must NOT be stamped onto the base2 tuple \
+             (full-tuple CAS); a head-only CAS would wrongly error base2"
+        );
+        assert!(
+            s.freshness_retry_after.is_none(),
+            "#2749 R3: no stale retry lease on the superseding base2 tuple"
+        );
+
+        // base2 is immediately eligible: a subsequent GOOD compare stamps it fresh
+        // (a stale error/lease would have suppressed/leased it instead).
+        {
+            let _scm =
+                crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_compare(0));
+            run_off_tick(&home, 88, &head, &base2);
+        }
+        let s2 = load(&home, "owner/repo", "feat/x").unwrap();
+        assert_eq!(
+            s2.freshness_checked_base_sha.as_deref(),
+            Some(base2.as_str()),
+            "#2749 R3: base2 was immediately eligible and got a fresh tuple"
+        );
+        assert_eq!(s2.freshness_behind_by, Some(0));
+        assert!(!s2.freshness_error);
+    }
+
     /// The retry lease persists across restart (serde) and a MALFORMED / absurd
     /// deadline fails-closed by re-attempting (self-heal to a valid lease) rather
     /// than sticking the PR errored; the gate stays fail-closed on freshness_error.

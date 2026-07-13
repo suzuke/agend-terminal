@@ -669,6 +669,11 @@ impl ScmProvider for TestScmHandle {
     }
 }
 
+/// A closure run inside [`MockScmProvider::compare`] before it returns — see
+/// [`MockScmProvider::with_compare_err_hook`].
+#[cfg(test)]
+type CompareHook = Box<dyn Fn() + Send + Sync>;
+
 /// Reusable [`ScmProvider`] test double. Only the methods a test configures are
 /// implemented; the rest panic to surface an unexpected call. Extend as new call
 /// sites need mocking (this is the single shared mock).
@@ -680,6 +685,10 @@ pub(crate) struct MockScmProvider {
     /// #2749 correction: counts `compare` invocations so a test can assert the
     /// off-tick populator's retry-lease BACKOFF (one compare per lease, not per cycle).
     compare_calls: std::sync::atomic::AtomicUsize,
+    /// #2749 R3: a hook run INSIDE `compare` before it returns, so a test can
+    /// inject an in-flight observation change (the delayed old-tuple Err race) and
+    /// prove the populator's full-tuple CAS discards the stale error.
+    compare_hook: Option<CompareHook>,
 }
 
 /// Configured `pr_list` behavior for [`MockScmProvider`].
@@ -721,6 +730,21 @@ impl MockScmProvider {
         })
     }
 
+    /// #2749 R3: a `compare` that runs `hook` and THEN fails — lets a test inject
+    /// an in-flight observation advance (A→B) during the compare and prove the
+    /// off-tick populator's FULL-TUPLE CAS discards the delayed base-A error (a
+    /// head-only CAS would wrongly stamp it onto the superseding base-B tuple).
+    pub(crate) fn with_compare_err_hook(
+        msg: &str,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            compare: Some(Err(msg.to_string())),
+            compare_hook: Some(Box::new(hook)),
+            ..Default::default()
+        })
+    }
+
     /// #2749 correction: how many times `compare` has been invoked (backoff assert).
     pub(crate) fn compare_calls(&self) -> usize {
         self.compare_calls
@@ -758,6 +782,11 @@ impl ScmProvider for MockScmProvider {
     fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<CompareResult> {
         self.compare_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // #2749 R3: fire the in-flight hook (e.g. an observation advance) BEFORE
+        // returning, so a delayed old-tuple Err races a superseding observation.
+        if let Some(hook) = &self.compare_hook {
+            hook();
+        }
         match &self.compare {
             Some(Ok(r)) => Ok(r.clone()),
             Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
