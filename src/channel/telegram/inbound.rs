@@ -343,6 +343,8 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     force_meta: None,
                     correlation_id: None,
                     reviewed_head: None,
+                    report_purpose: Default::default(),
+                    validated_code_review: None,
                     from: "system:status".to_string(),
                     text: summary,
                     kind: Some("status-summary".to_string()),
@@ -362,6 +364,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     pr_number: None,
                     terminal: None,
                     delivery_nonce: None,
+                    review_assignment: None,
                 },
             ),
             "status_summary",
@@ -679,6 +682,8 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             force_meta: None,
             correlation_id: None,
             reviewed_head: None,
+            report_purpose: Default::default(),
+            validated_code_review: None,
             from: format!("user:{username}"),
             text: text.to_string(),
             kind: None,
@@ -706,6 +711,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             pr_number: None,
             terminal: None,
             delivery_nonce: None,
+            review_assignment: None,
         };
         persist_or_log!(
             inbox::enqueue(&home, &instance_name, msg_obj),

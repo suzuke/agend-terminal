@@ -21,19 +21,15 @@
 //!
 //! ## Ingestion
 //!
-//! Two entry points, both fire from existing daemon code:
+//! Two authoritative entry points fire from existing daemon code:
 //!
 //! - [`record_ci_result`] — called from
 //!   `src/daemon/ci_watch/poller.rs` right after the existing
 //!   `[ci-ready-for-action]` emission. Records `CiState::Green` or
 //!   `CiState::Failed { conclusion }` against the observed head SHA.
-//! - [`record_verdict`] — called from
-//!   `src/api/handlers/messaging.rs` right after
-//!   `auto_release::enqueue_intent`. Records the verdict variant
-//!   (Verified / Rejected / Unverified) with reviewer + reviewed_head.
-//!
-//! Both call [`scan_and_emit_for_pr`] internally to recompute derived
-//! state and fire any newly-eligible events.
+//! - [`record_validated_receipt`] — called only by the unified messaging API
+//!   after it has constructed an assignment-bound typed receipt. Legacy
+//!   name/SHA verdict rows remain display-only and cannot open the merge gate.
 //!
 //! ## §4.2 stale-head invariant (LOAD-BEARING)
 //!
@@ -84,6 +80,10 @@ pub struct PrState {
     pub subscribers: Vec<String>,
     pub ci_state: CiState,
     pub verdict_state: VerdictState,
+    /// task66: the only merge-authoritative review evidence. Legacy collapsed
+    /// `verdict_state` remains display-compatible but cannot unlock the gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) validated_review_receipts: Vec<crate::review_receipt::ReviewReceiptSummary>,
     pub merge_state: MergeState,
     pub draft_state: DraftState,
     pub review_class: ReviewClass,
@@ -432,6 +432,9 @@ pub fn apply(state: &mut PrState, event: Event<'_>) {
                 state.auto_armed_for_sha = None;
                 state.ready_emitted_for_sha = None;
                 state.diagnostic_emitted_for_sha = None;
+                state
+                    .validated_review_receipts
+                    .retain(|r| r.reviewed_head == head_sha);
                 // Drop verdicts whose reviewed_head no longer matches.
                 // Verified gets dropped per-reviewer; Rejected/Unverified
                 // collapse to None since they were about an old commit.
@@ -558,6 +561,7 @@ pub fn apply(state: &mut PrState, event: Event<'_>) {
 /// single repo's PR set are negligible — noted in #2079). A non-hex or
 /// <7-char `asserted` (e.g. a test's `"sha-A"`) gets NO loosening — it falls
 /// back to exact equality, so this can never widen a non-SHA comparison.
+#[cfg(test)]
 pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
     if full == asserted {
         return true;
@@ -610,17 +614,27 @@ pub fn is_merge_ready(state: &PrState) -> bool {
     if ci_sha != &state.head_sha {
         return false;
     }
-    let VerdictState::Verified { reviewers } = &state.verdict_state else {
-        return false;
-    };
-    if reviewers.len() < state.review_class.required_verified_count() {
+    let current: Vec<_> = state
+        .validated_review_receipts
+        .iter()
+        .filter(|r| r.matches_state(state))
+        .collect();
+    if current
+        .iter()
+        .any(|r| !matches!(r.verdict, crate::review_receipt::ReviewVerdict::Verified))
+    {
         return false;
     }
-    // #2079: prefix-tolerant — a reviewer that asserted an abbreviated SHA
-    // (e.g. `7e1d422`) still counts toward merge-ready against the full head.
-    reviewers
+    let distinct_reviewers: std::collections::HashSet<_> = current
         .iter()
-        .all(|(_, reviewed)| sha_prefix_match(&state.head_sha, reviewed))
+        .filter(|r| matches!(r.verdict, crate::review_receipt::ReviewVerdict::Verified))
+        .map(|r| r.reviewer_instance_id)
+        .collect();
+    if distinct_reviewers.len() < state.review_class.required_verified_count() {
+        return false;
+    }
+    // Receipt validation is exact-full-head; prefixes are never authoritative.
+    current.iter().all(|r| r.reviewed_head == state.head_sha)
 }
 
 /// #2749 read-only freshness gate outcome (decision d-20260712092257798199-17).
@@ -1142,6 +1156,7 @@ pub fn new_for_branch(
         subscribers: Vec::new(),
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
+        validated_review_receipts: Vec::new(),
         merge_state: MergeState::NotReady,
         draft_state: DraftState::Ready,
         review_class,
@@ -1239,26 +1254,28 @@ pub fn record_ci_result(
     // lock of the drain below (the pr_state flock `with_pr_state_or_create` takes is
     // the INNER lock — the mandated assignment-OUTER / pr_state-INNER order), so the
     // `reserved_assignments` derivation is consistent with a concurrent
-    // revoke/transfer/tombstone. Acquired ONLY when the branch is ACTIVE (so an
-    // assignment-free branch never creates an empty store dir); if the lock cannot be
-    // acquired the drain FAILS CLOSED (below) rather than deriving lock-free — the
-    // per-tick reconciler re-derives under the lock later. Held for the whole
-    // `with_pr_state_or_create` scope via the binding's lifetime.
+    // revoke/transfer/tombstone. Acquired when the branch is ACTIVE, or when a
+    // typed-buffer hint requires a safe destructive revalidation. Ordinary
+    // assignment-free branches still create no empty store dir. If acquisition
+    // fails the drain FAILS CLOSED; the reconciler retries later.
     // t-…-17 B4 (codex m-…-322): probe the branch authority with the TRI-STATE probe,
     // NOT the lossy `has_active`. `has_active` DROPS a corrupt record's `Err`, so a
     // branch whose SOLE record is corrupt looks assignment-free — the drain then
     // derives an EMPTY reserved set on a fresh state and OPENs the merge gate. The
     // probe reports `Unreadable` for that case so the drain fails closed (below).
-    let authority = crate::daemon::assignment_authority::probe_branch_authority(home, repo, branch);
-    // Acquire the OUTER assignment lock ONLY when the branch is ACTIVE (has ≥1 valid
-    // record). `Absent` needs none (empty reserved is correct); `Unreadable` is not
-    // derived at all. Best-effort — an `Active` branch whose lock cannot be acquired is
-    // handled fail-closed in the drain below. Held for the whole
-    // `with_pr_state_or_create` scope via the binding's lifetime.
+    let initial_authority =
+        crate::daemon::assignment_authority::probe_branch_authority(home, repo, branch);
+    let typed_buffer_hint =
+        verdict_buffer::has_validated_subject_hint(home, repo, branch, head_sha);
+    // A typed buffered receipt requires the lock even when the first probe says
+    // Absent: acquire before the destructive drain, then re-probe under lock.
+    // This consumes revoked receipts safely without creating lock sidecars for
+    // ordinary assignment-free branches.
     let _assignment_lock = if matches!(
-        authority,
+        initial_authority,
         crate::daemon::assignment_authority::BranchAuthority::Active
-    ) {
+    ) || typed_buffer_hint
+    {
         crate::daemon::assignment_authority::lock_branch_for_drain(home, repo, branch)
     } else {
         None
@@ -1267,6 +1284,11 @@ pub fn record_ci_result(
     // closure need not borrow the guard. A lock-free derivation on an `Active` branch
     // could read a torn reserved set that CLEARS the gate, so it is refused fail-closed.
     let lock_acquired = _assignment_lock.is_some();
+    let authority = if lock_acquired {
+        crate::daemon::assignment_authority::probe_branch_authority(home, repo, branch)
+    } else {
+        initial_authority
+    };
     if let Err(e) = with_pr_state_or_create(
         home,
         repo,
@@ -1304,7 +1326,7 @@ pub fn record_ci_result(
                 },
             );
             // t-…-17 A6 (I13/I16): DRAIN — after the head is applied (above) and
-            // BEFORE the buffered-verdict replay (below), REPLACE the whole
+            // BEFORE the typed-receipt buffer replay (below), REPLACE the whole
             // `reserved_assignments` vec with the full-typed derivation from the
             // authority store: every active record whose stored pr_number equals THIS
             // state's pr_number and whose evidence is NOT SatisfiedExactHead. This is
@@ -1335,30 +1357,40 @@ pub fn record_ci_result(
                     )
                 },
             );
-            // #2059 #2(c): the state's head_sha is now established at `head_sha`.
-            // Drain + replay any verdicts that were buffered for this SHA before
-            // the state existed (the #2058 verdict-before-CI ordering gap). They
-            // apply against the current head, so a VERIFIED here can flip the PR
-            // merge-ready on the next scan tick — closing the dead zone. The
-            // buffer drain touches a SEPARATE dir (verdict-buffer/), not this
-            // file's flock, so there is no self-deadlock.
-            for v in verdict_buffer::drain_for_head(home, head_sha) {
-                tracing::info!(
-                    repo = %repo,
-                    branch = %branch,
-                    head = %head_sha,
-                    reviewer = %v.reviewer,
-                    kind = %v.kind,
-                    "#2059 verdict_buffer: replaying buffered verdict onto newly-observed state"
-                );
-                apply(
-                    state,
-                    Event::VerdictObserved {
-                        reviewer: &v.reviewer,
-                        reviewed_head: head_sha,
-                        kind: v.verdict_kind(),
-                    },
-                );
+            // A typed receipt may have preceded creation of this exact PR state.
+            // Drain only while the assignment lock is held: the buffer read is
+            // destructive, so a transient lock failure must leave the receipt for
+            // retry, and revoke/transfer must not cross revalidation→mutation.
+            // The legacy name+SHA namespace is never read here.
+            if lock_acquired
+                && !matches!(
+                    authority,
+                    crate::daemon::assignment_authority::BranchAuthority::Unreadable
+                )
+            {
+                for receipt in verdict_buffer::drain_validated_for_subject(
+                    home,
+                    repo,
+                    branch,
+                    state.pr_number,
+                    head_sha,
+                ) {
+                    if !crate::review_receipt::assignment_still_authorizes(home, &receipt)
+                        || !receipt.matches_state(state)
+                        || receipt_seen(state, &receipt)
+                    {
+                        continue;
+                    }
+                    tracing::info!(
+                        repo = %repo,
+                        branch = %branch,
+                        head = %head_sha,
+                        reviewer = %receipt.reviewer_name,
+                        receipt_id = %receipt.receipt_id,
+                        "task66 verdict_buffer: replaying validated receipt onto exact subject"
+                    );
+                    apply_receipt_to_state(state, receipt);
+                }
             }
         },
     ) {
@@ -1371,18 +1403,141 @@ pub fn record_ci_result(
     }
 }
 
-/// Verdict ingestion entry point — called from
-/// `api::handlers::messaging::handle_send`. `task_id` is the verdict's
-/// correlation_id, kept only for logging.
+fn receipt_seen(state: &PrState, receipt: &crate::review_receipt::ReviewReceiptSummary) -> bool {
+    state.validated_review_receipts.iter().any(|existing| {
+        existing.receipt_id == receipt.receipt_id || existing.source_id == receipt.source_id
+    })
+}
+
+fn apply_receipt_to_state(
+    state: &mut PrState,
+    receipt: crate::review_receipt::ReviewReceiptSummary,
+) {
+    let reviewer = receipt.reviewer_name.clone();
+    let head = receipt.reviewed_head.clone();
+    let verdict = receipt.verdict;
+    let assignment_id = receipt.assignment_id;
+    // Containment (not task68's append-only/worst-verdict ledger): one current
+    // authoritative receipt per assignment/slot. A later independently validated
+    // generation replaces the collapsed current view.
+    state
+        .validated_review_receipts
+        .retain(|old| old.assignment_id != receipt.assignment_id && old.slot != receipt.slot);
+    state.validated_review_receipts.push(receipt);
+    if matches!(verdict, crate::review_receipt::ReviewVerdict::Verified) {
+        state
+            .reserved_assignments
+            .retain(|reserved| reserved.assignment_id != assignment_id);
+    }
+    let kind = match verdict {
+        crate::review_receipt::ReviewVerdict::Verified => VerdictKind::Verified,
+        crate::review_receipt::ReviewVerdict::Rejected => VerdictKind::Rejected { reason: None },
+        crate::review_receipt::ReviewVerdict::Unverified => VerdictKind::Unverified,
+    };
+    // Legacy collapsed state remains display-compatible only; is_merge_ready and
+    // assignment evidence consume validated_review_receipts instead.
+    apply(
+        state,
+        Event::VerdictObserved {
+            reviewer: &reviewer,
+            reviewed_head: &head,
+            kind,
+        },
+    );
+}
+
+/// Typed verdict ingestion entry. Exact repo/branch/PR/full-head selection comes
+/// only from the server-validated assignment receipt; there is no SHA scan.
+/// Returns true only for the first accepted receipt/source identity.
+pub(crate) fn record_validated_receipt(
+    home: &Path,
+    receipt: &crate::review_receipt::ValidatedCodeReviewReceipt,
+) -> bool {
+    let summary = receipt.summary();
+    // Keep the same assignment-OUTER / pr_state-INNER lock order used by the
+    // CI drain. Authorization at the API sink precedes inbox delivery; a revoke
+    // may race after that check. Re-acquire the exact subject's assignment lock
+    // here and revalidate while it is held so revoke/transfer cannot cross the
+    // final check→PR-state mutation boundary.
+    let Some(_assignment_lock) = crate::daemon::assignment_authority::lock_branch_for_drain(
+        home,
+        &summary.repo,
+        &summary.branch,
+    ) else {
+        tracing::warn!(
+            repo = %summary.repo,
+            branch = %summary.branch,
+            "task66 validated receipt could not acquire assignment lock; failing closed"
+        );
+        return false;
+    };
+    if !crate::review_receipt::assignment_still_authorizes(home, summary) {
+        return false;
+    }
+    let mut applied = false;
+    let mut subject_found = false;
+    let mut pending_notify: Option<(String, crate::inbox::InboxMessage)> = None;
+    match with_pr_state(home, &summary.repo, &summary.branch, |state| {
+        subject_found = true;
+        if !summary.matches_state(state) || receipt_seen(state, summary) {
+            return;
+        }
+        apply_receipt_to_state(state, summary.clone());
+        let label = match summary.verdict {
+            crate::review_receipt::ReviewVerdict::Verified => "VERIFIED",
+            crate::review_receipt::ReviewVerdict::Rejected => "REJECTED",
+            crate::review_receipt::ReviewVerdict::Unverified => "UNVERIFIED",
+        };
+        if !is_merge_ready(state) {
+            let recipient = resolve_notify_recipient(home, state);
+            let body = format_verdict_body(state, &summary.reviewer_name, label);
+            let msg =
+                crate::inbox::InboxMessage::new_system("system:pr-state", "review-verdict", body)
+                    .with_correlation_id(format!("{}@{}", state.repo, state.branch))
+                    .with_reviewed_head(state.head_sha.clone());
+            pending_notify = Some((recipient, msg));
+        }
+        applied = true;
+    }) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                repo = %summary.repo,
+                branch = %summary.branch,
+                error = %e,
+                "task66 validated receipt state update failed closed"
+            );
+            return false;
+        }
+    }
+    if !subject_found {
+        return verdict_buffer::buffer_validated(home, summary);
+    }
+    drop(_assignment_lock);
+    if let Some((recipient, msg)) = pending_notify {
+        if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
+            tracing::warn!(recipient, error = %e, "task66 review-verdict notify enqueue failed");
+        }
+    }
+    applied
+}
+
+/// Legacy test-only ingestion helper. Production has no raw name+SHA verdict
+/// entry after task66; legacy durable evidence is display-only and cannot open
+/// the merge gate.
+#[cfg(test)]
+/// Pre-task66 name+SHA ingestion model retained only for compatibility tests.
+/// `task_id` is the old correlation id, kept only for logging. Production
+/// messaging never calls this function and `VerdictState` is display-only.
 ///
 /// #2059 #2(c): keyed on `reviewed_head` (the SHA the reviewer asserts they
 /// reviewed), not the task→branch chain. Applies the verdict to the pr-state
 /// whose `head_sha == reviewed_head`; if none exists yet (the verdict preceded
 /// the first CI/gh-poll observation — the #2058 dead zone), the verdict is
-/// BUFFERED keyed by the SHA and replayed by [`record_ci_result`] when it
-/// creates/observes a branch state at that head (see [`verdict_buffer`]).
-/// Best-effort throughout — a failure never propagates into the verdict path.
-pub fn record_verdict(
+/// BUFFERED in the legacy TTL namespace. Production never replays that namespace
+/// after task66. Best-effort throughout — a failure never propagates into this
+/// compatibility-only path.
+pub(crate) fn record_verdict(
     home: &Path,
     task_id: &str,
     reviewer: &str,
@@ -1471,10 +1626,8 @@ pub fn record_verdict(
                     kind,
                 },
             );
-            // Surface the verdict to the author UNLESS it already made the PR
-            // merge-ready — in that case the scanner's [pr-ready-for-merge] covers
-            // it (no double-notify). REJECTED/UNVERIFIED never reach merge-ready,
-            // so they always notify (the author must learn they need to fix).
+            // The legacy display projection cannot make the PR merge-ready, so
+            // surface it as an ordinary author notification.
             if !is_merge_ready(s) {
                 let recipient = resolve_notify_recipient(home, s);
                 let body = format_verdict_body(s, reviewer, label);
@@ -1509,13 +1662,9 @@ pub fn record_verdict(
         }
     }
     if !matched_any {
-        // #2059 #2(c): the verdict-before-CI ordering gap (gate E) — no pr-state
-        // exists at this SHA yet (the verdict preceded the first gh-poll
-        // observation, the #2058 case). Instead of dropping it, BUFFER it keyed
-        // by `reviewed_head`; `record_ci_result` drains + replays it the moment
-        // it creates/observes a branch state at this head. The #1888
-        // track-until-resolution pattern — a signal that precedes its consumer
-        // is persisted and replayed, never silently lost.
+        // Preserve the old row in its TTL-bounded compatibility namespace for
+        // migration visibility. `record_ci_result` never drains this namespace;
+        // only assignment-bound typed receipts may replay.
         verdict_buffer::buffer(home, reviewed_head, reviewer, kind_str, kind_reason);
     }
 }
@@ -1615,6 +1764,7 @@ pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
 }
 
 /// t-verdict-to-author-routing-design (#2): the wire label for a verdict kind.
+#[cfg(test)]
 fn verdict_label(kind: &VerdictKind) -> &'static str {
     match kind {
         VerdictKind::Verified => "VERIFIED",

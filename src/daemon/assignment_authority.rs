@@ -36,7 +36,7 @@ use crate::mcp::handlers::comms_gates::ReviewAuthor;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// The SINGLE internal re-nudge/repair lease. FIXED — there is NO runtime config
 /// (plan §2 / I12). A record's `next_nudge_at` advances by exactly this on each
@@ -74,6 +74,17 @@ pub(crate) struct ActiveAssignment {
     pub task_id: String,
     pub review_class: ReviewClass,
     pub review_author: ReviewAuthor,
+    /// task66: stable reviewer identity captured at dispatch. `None` marks a
+    /// legacy assignment that cannot authorize a code-review receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_instance_id: Option<crate::types::InstanceId>,
+    /// Exact full PR head assigned for review. Prefixes and bind-on-observation
+    /// are forbidden; `None` is LegacyAssignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_head: Option<String>,
+    /// Explicit review slot within the task's review class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_slot: Option<crate::review_receipt::ReviewSlot>,
     pub created_at: String,
     // ── engagement (authenticated correlated ack; a LATER slice sets these) ──
     #[serde(default)]
@@ -98,6 +109,20 @@ pub(crate) struct ActiveAssignment {
 }
 
 impl ActiveAssignment {
+    /// Whether this active row carries every immutable field required to mint a
+    /// task66 receipt. Anything else is a LegacyAssignment and must be
+    /// explicitly re-dispatched; it is never upgraded by inference.
+    pub(crate) fn is_receipt_capable(&self) -> bool {
+        self.schema_version >= SCHEMA_VERSION
+            && self.target_instance_id.is_some()
+            && self
+                .reviewed_head
+                .as_deref()
+                .is_some_and(crate::review_receipt::is_full_head)
+            && self.review_slot.is_some()
+            && !matches!(self.review_class, ReviewClass::Unresolved)
+    }
+
     /// Construct a fresh PENDING record: mint `assignment_id` + `delivery_nonce`,
     /// `row = Pending`, `acked = ∅`, and `next_nudge_at = created_at` (immediately
     /// eligible for the first nudge/repair). `created_at` is CLOCK-INJECTED so
@@ -118,13 +143,16 @@ impl ActiveAssignment {
         created_at: &str,
     ) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: 1,
             assignment_id: uuid::Uuid::new_v4(),
             pr_number,
             sender: sender.into(),
             task_id: task_id.into(),
             review_class,
             review_author,
+            target_instance_id: None,
+            reviewed_head: None,
+            review_slot: None,
             created_at: created_at.to_string(),
             acked_at: None,
             acked_by: None,
@@ -138,6 +166,48 @@ impl ActiveAssignment {
             branch: branch.into(),
             target: target.into(),
         }
+    }
+
+    /// Construct a receipt-capable assignment. Only the authoritative review
+    /// dispatch uses this; the old constructor intentionally creates a legacy
+    /// row so fixtures/imports cannot gain authority by inference.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pending_typed(
+        repo: impl Into<String>,
+        branch: impl Into<String>,
+        target: impl Into<String>,
+        target_instance_id: crate::types::InstanceId,
+        pr_number: u64,
+        reviewed_head: impl Into<String>,
+        review_slot: crate::review_receipt::ReviewSlot,
+        sender: impl Into<String>,
+        task_id: impl Into<String>,
+        review_class: ReviewClass,
+        review_author: ReviewAuthor,
+        text: impl Into<String>,
+        thread_id: Option<String>,
+        parent_id: Option<String>,
+        created_at: &str,
+    ) -> Self {
+        let mut record = Self::new_pending(
+            repo,
+            branch,
+            target,
+            pr_number,
+            sender,
+            task_id,
+            review_class,
+            review_author,
+            text,
+            thread_id,
+            parent_id,
+            created_at,
+        );
+        record.schema_version = SCHEMA_VERSION;
+        record.target_instance_id = Some(target_instance_id);
+        record.reviewed_head = Some(reviewed_head.into());
+        record.review_slot = Some(review_slot);
+        record
     }
 }
 
@@ -372,6 +442,30 @@ fn add_interval(now: &str) -> String {
 /// `delivery_nonce` so [`crate::inbox::storage::nonce_present_actionable`] and the
 /// supersede path can key on it.
 fn build_delivery_message(record: &ActiveAssignment, now: &str) -> crate::inbox::InboxMessage {
+    let review_assignment = if record.is_receipt_capable() {
+        match (
+            record.target_instance_id,
+            record.reviewed_head.clone(),
+            record.review_slot,
+        ) {
+            (Some(target_instance_id), Some(reviewed_head), Some(slot)) => {
+                Some(crate::review_receipt::ReviewAssignmentEnvelope {
+                    assignment_id: record.assignment_id,
+                    repo: record.repo.clone(),
+                    pr_number: record.pr_number,
+                    branch: record.branch.clone(),
+                    task_id: record.task_id.clone(),
+                    reviewed_head,
+                    review_class: record.review_class,
+                    slot,
+                    target_instance_id,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     crate::inbox::InboxMessage {
         from: record.sender.clone(),
         text: record.text.clone(),
@@ -383,6 +477,7 @@ fn build_delivery_message(record: &ActiveAssignment, now: &str) -> crate::inbox:
         correlation_id: Some(record.task_id.clone()),
         pr_number: Some(record.pr_number),
         delivery_nonce: Some(record.delivery_nonce.clone()),
+        review_assignment,
         ..Default::default()
     }
 }
@@ -486,6 +581,7 @@ fn list_active_checked(
 /// authority — a TRI-STATE distinction the lossy `list_active` cannot make. The A6
 /// drain in [`crate::daemon::pr_state::record_ci_result`] uses THIS (not a lossy read)
 /// so a SOLE corrupt record fails the gate closed instead of looking assignment-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BranchAuthority {
     /// The branch dir is MISSING (`read_dir` `NotFound`) OR exists with ZERO records —
     /// a genuine absence. The reserved derivation may proceed (an empty reserved set is
@@ -551,6 +647,112 @@ pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option
     read_record(&record_file(home, repo, branch, target))
         .ok()
         .flatten()
+}
+
+/// Strict store-wide lookup for a receipt's generation token. Missing,
+/// unreadable/corrupt, duplicated, terminal, revoked, and superseded assignments
+/// all fail closed. Unlike the lossy reconcile scans, one corrupt row aborts the
+/// lookup rather than being treated as absence.
+pub(crate) fn lookup_by_assignment_id_strict(
+    home: &Path,
+    assignment_id: uuid::Uuid,
+) -> anyhow::Result<ActiveAssignment> {
+    let base = base_dir(home);
+    let dirs = match std::fs::read_dir(&base) {
+        Ok(dirs) => dirs,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("active assignment not found")
+        }
+        Err(e) => anyhow::bail!("unreadable assignment store {}: {e}", base.display()),
+    };
+    let mut found: Option<ActiveAssignment> = None;
+    for dir in dirs {
+        let dir = dir.map_err(|e| anyhow::anyhow!("unreadable assignment directory: {e}"))?;
+        if !dir.path().is_dir() {
+            continue;
+        }
+        let rows = std::fs::read_dir(dir.path()).map_err(|e| {
+            anyhow::anyhow!("unreadable assignment branch {}: {e}", dir.path().display())
+        })?;
+        for row in rows {
+            let path = row
+                .map_err(|e| anyhow::anyhow!("unreadable assignment row: {e}"))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json")
+                || path.file_name().and_then(|n| n.to_str()) == Some("markers.json")
+            {
+                continue;
+            }
+            let Some(record) = read_record(&path)? else {
+                continue;
+            };
+            if record.assignment_id != assignment_id {
+                continue;
+            }
+            if found.is_some() {
+                anyhow::bail!("assignment id is ambiguous (duplicate active rows)");
+            }
+            found = Some(record);
+        }
+    }
+    let record = found.ok_or_else(|| anyhow::anyhow!("active assignment not found"))?;
+    let markers = read_markers(&markers_file(home, &record.repo, &record.branch))?;
+    if markers.contains(record.pr_number) {
+        anyhow::bail!("assignment generation is terminal");
+    }
+    Ok(record)
+}
+
+/// Strict pre-cutover census of every active LegacyAssignment. A corrupt or
+/// unreadable row aborts the census instead of producing a misleading empty
+/// inventory. Terminal generations are excluded; they cannot authorize a
+/// receipt and are handled by the retained terminal-marker reconciler.
+pub(crate) fn legacy_active_assignments_strict(
+    home: &Path,
+) -> anyhow::Result<Vec<ActiveAssignment>> {
+    let base = base_dir(home);
+    let dirs = match std::fs::read_dir(&base) {
+        Ok(dirs) => dirs,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => anyhow::bail!("unreadable assignment store {}: {e}", base.display()),
+    };
+    let mut legacy = Vec::new();
+    for dir in dirs {
+        let dir = dir.map_err(|e| anyhow::anyhow!("unreadable assignment directory: {e}"))?;
+        if !dir.path().is_dir() {
+            continue;
+        }
+        let rows = std::fs::read_dir(dir.path()).map_err(|e| {
+            anyhow::anyhow!("unreadable assignment branch {}: {e}", dir.path().display())
+        })?;
+        for row in rows {
+            let path = row
+                .map_err(|e| anyhow::anyhow!("unreadable assignment row: {e}"))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json")
+                || path.file_name().and_then(|n| n.to_str()) == Some("markers.json")
+            {
+                continue;
+            }
+            let Some(record) = read_record(&path)? else {
+                continue;
+            };
+            let markers = read_markers(&markers_file(home, &record.repo, &record.branch))?;
+            if !markers.contains(record.pr_number) && !record.is_receipt_capable() {
+                legacy.push(record);
+            }
+        }
+    }
+    legacy.sort_by(|a, b| {
+        (&a.repo, &a.branch, a.pr_number, &a.target, a.assignment_id).cmp(&(
+            &b.repo,
+            &b.branch,
+            b.pr_number,
+            &b.target,
+            b.assignment_id,
+        ))
+    });
+    Ok(legacy)
 }
 
 /// The retained terminal-marker set for `(repo,branch)`. Inspection-only accessor:
@@ -816,7 +1018,7 @@ pub(crate) fn transfer(
     revoke_under_lock(home, repo, branch, old_target, now)?;
     // {persist new} — fresh assignment_id + nonce, SAME pr_number, authority
     // carried over. Written directly (persist would re-lock the same branch).
-    let new_record = ActiveAssignment::new_pending(
+    let mut new_record = ActiveAssignment::new_pending(
         repo,
         branch,
         new_target,
@@ -830,6 +1032,16 @@ pub(crate) fn transfer(
         old.parent_id,
         now,
     );
+    if old.target_instance_id.is_some() || old.reviewed_head.is_some() || old.review_slot.is_some()
+    {
+        let target_instance_id = crate::fleet::resolve_uuid(home, new_target).ok_or_else(|| {
+            anyhow::anyhow!("assignment_authority::transfer: new target has no stable InstanceId")
+        })?;
+        new_record.schema_version = SCHEMA_VERSION;
+        new_record.target_instance_id = Some(target_instance_id);
+        new_record.reviewed_head = old.reviewed_head;
+        new_record.review_slot = old.review_slot;
+    }
     atomic_write_json(&record_file(home, repo, branch, new_target), &new_record)?;
     Ok(())
 }
@@ -1143,68 +1355,59 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
     out
 }
 
-// ─────────────────────────── C7: 4-state evidence classifier ───────────────────────────
+// ─────────────────────────── C7: 3-state evidence classifier ───────────────────────────
 
-/// The FROZEN 4-state evidence classification for one active assignment (plan §1).
+/// The 3-state evidence classification for one active assignment.
 /// DERIVED, never stored. `SatisfiedExactHead` ⇒ NOT reserved / no nudge; the other
-/// three ⇒ reserved; only `Unengaged` is eligible for nudge/repair.
+/// two ⇒ reserved; only `Unengaged` is eligible for nudge/repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssignmentEvidence {
     /// `record.target` is VERIFIED at the CURRENT head.
     SatisfiedExactHead,
     /// `record.target` REJECTED / UNVERIFIED at the CURRENT head.
     EngagedUnsatisfied,
-    /// Authenticated correlated ACK received, but no current-head verdict yet.
-    EngagedPending,
     /// None of the above (incl. no `PrState`/head yet, and not acked).
     Unengaged,
 }
 
-/// C7 — classify one assignment's evidence (plan §1, EXACT). PURE: reads ONLY the
-/// record's `target`/`acked_at` and the passed-in `PrState`'s current-head
-/// `VerdictState` (the `prstate` is the one for `record.pr_number`; its `head_sha`
-/// is the current head). NEVER reads `read_at`/`delivering_at`/report text. A
-/// DIFFERENT reviewer's verdict NEVER satisfies/engages THIS record.
+/// C7 — classify one assignment's code-review evidence. Only a typed receipt
+/// retained by the PR-state funnel may satisfy or engage the assignment. Legacy
+/// collapsed verdicts, reviewer names, reviewed_head display data, report text,
+/// and the old generic correlated ACK are never code-review authority.
 pub(crate) fn classify_assignment(
     record: &ActiveAssignment,
     prstate: Option<&crate::daemon::pr_state::PrState>,
 ) -> AssignmentEvidence {
-    use crate::daemon::pr_state::VerdictState;
-    // A verdict counts ONLY when it names THIS record's target AND was rendered at
-    // the CURRENT head (`prstate.head_sha`). `record_verdict` already drops stale
-    // Verified entries on head-advance, but the head match is asserted defensively
-    // here so a stale entry can never satisfy/engage (plan §1).
-    if let Some(ps) = prstate {
-        match &ps.verdict_state {
-            VerdictState::Verified { reviewers } => {
-                if reviewers
-                    .iter()
-                    .any(|(name, head)| name == &record.target && head == &ps.head_sha)
-                {
-                    return AssignmentEvidence::SatisfiedExactHead;
+    if let (Some(ps), Some(target_instance_id), Some(reviewed_head), Some(slot)) = (
+        prstate,
+        record.target_instance_id,
+        record.reviewed_head.as_deref(),
+        record.review_slot,
+    ) {
+        if let Some(receipt) = ps.validated_review_receipts.iter().find(|receipt| {
+            receipt.assignment_id == record.assignment_id
+                && receipt.reviewer_instance_id == target_instance_id
+                && receipt.reviewer_name == record.target
+                && receipt.repo == record.repo
+                && receipt.pr_number == record.pr_number
+                && receipt.branch == record.branch
+                && receipt.task_id == record.task_id
+                && receipt.reviewed_head == reviewed_head
+                && receipt.reviewed_head == ps.head_sha
+                && receipt.review_class == record.review_class
+                && receipt.slot == slot
+                && receipt.matches_state(ps)
+        }) {
+            return match receipt.verdict {
+                crate::review_receipt::ReviewVerdict::Verified => {
+                    AssignmentEvidence::SatisfiedExactHead
                 }
-            }
-            VerdictState::Rejected {
-                reviewer,
-                reviewed_head,
-                ..
-            }
-            | VerdictState::Unverified {
-                reviewer,
-                reviewed_head,
-            } => {
-                if reviewer == &record.target && reviewed_head == &ps.head_sha {
-                    return AssignmentEvidence::EngagedUnsatisfied;
+                crate::review_receipt::ReviewVerdict::Rejected
+                | crate::review_receipt::ReviewVerdict::Unverified => {
+                    AssignmentEvidence::EngagedUnsatisfied
                 }
-            }
-            VerdictState::None | VerdictState::Pending => {}
+            };
         }
-    }
-    // No current-head verdict for the target. An authenticated correlated ACK means
-    // the reviewer engaged but hasn't rendered a verdict yet ⇒ EngagedPending
-    // (TRUE stop — no nudge). Otherwise ⇒ Unengaged (the only nudge-eligible state).
-    if record.acked_at.is_some() {
-        return AssignmentEvidence::EngagedPending;
     }
     AssignmentEvidence::Unengaged
 }
@@ -1213,6 +1416,7 @@ pub(crate) fn classify_assignment(
 
 /// The outcome of an authenticated correlated ACK ([`ack`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum AckOutcome {
     /// EXACTLY ONE active assignment matched `(target,task_id)` — its `acked_at` is
     /// now set (or was already set: re-ack is an idempotent no-op success).
@@ -1231,6 +1435,7 @@ pub(crate) enum AckOutcome {
 ///   - 0 ⇒ [`AckOutcome::NoMatch`] (no-op).
 ///
 /// Takes ONLY the assignment-lock — NEVER the inbox or pr_state lock (no inversion).
+#[cfg(test)]
 pub(crate) fn ack(home: &Path, sender_target: &str, task_id: &str, now: &str) -> AckOutcome {
     let mut matches = list_active_by_target_task(home, sender_target, task_id);
     // >1 ⇒ FAIL CLOSED: touch NOTHING (no lock taken) — I20.
@@ -1270,6 +1475,7 @@ pub(crate) fn ack(home: &Path, sender_target: &str, task_id: &str, now: &str) ->
 /// `target`/`task_id` match. Lock-free — atomic whole-record writes make torn reads
 /// impossible. Cheap on the common path: an empty store means the base dir does not
 /// exist, so `read_dir` yields nothing and no record files are opened.
+#[cfg(test)]
 fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<ActiveAssignment> {
     let mut out = Vec::new();
     for branch_entry in std::fs::read_dir(base_dir(home))
@@ -1431,6 +1637,26 @@ mod tests {
             "no record written on rejection"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A legacy schema row cannot look receipt-capable merely because partial
+    /// rollout fields happen to be present. It must be re-dispatched before the
+    /// reviewer receives a typed assignment envelope.
+    #[test]
+    fn legacy_schema_with_typed_fields_does_not_emit_assignment_envelope_2760() {
+        let mut record = mk_record("o/r", "feat/legacy", "reviewer", 7, "2026-07-13T00:00:00Z");
+        record.target_instance_id = Some(crate::types::InstanceId::new());
+        record.reviewed_head = Some("a".repeat(40));
+        record.review_slot = Some(crate::review_receipt::ReviewSlot::Primary);
+
+        assert!(build_delivery_message(&record, "2026-07-13T00:00:01Z")
+            .review_assignment
+            .is_none());
+
+        record.schema_version = SCHEMA_VERSION;
+        assert!(build_delivery_message(&record, "2026-07-13T00:00:01Z")
+            .review_assignment
+            .is_some());
     }
 
     /// T12: crash BEFORE enqueue — `row = Pending`, nonce NOT in inbox. Recovery
@@ -1766,121 +1992,128 @@ mod tests {
 
     use crate::daemon::pr_state::{PrState, VerdictState};
 
-    /// A fresh `PrState` at `head` carrying `verdict` (the production constructor,
-    /// so the shape never drifts from the real default).
-    fn prstate_with(head: &str, verdict: VerdictState) -> PrState {
+    fn typed_record(head: &str) -> ActiveAssignment {
+        let mut record = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+        record.schema_version = SCHEMA_VERSION;
+        record.target_instance_id = Some(crate::types::InstanceId::new());
+        record.reviewed_head = Some(head.to_string());
+        record.review_slot = Some(crate::review_receipt::ReviewSlot::Primary);
+        record
+    }
+
+    fn prstate_with_receipt(
+        record: &ActiveAssignment,
+        head: &str,
+        verdict: Option<crate::review_receipt::ReviewVerdict>,
+    ) -> PrState {
         let mut ps =
             crate::daemon::pr_state::new_for_branch("o/r", "feat/x", head, ReviewClass::Dual);
-        ps.verdict_state = verdict;
+        ps.pr_number = 42;
+        if let Some(verdict) = verdict {
+            ps.validated_review_receipts
+                .push(crate::review_receipt::ReviewReceiptSummary {
+                    receipt_id: "review-receipt:m-test".into(),
+                    source_id: "m-test".into(),
+                    evidence_digest: "a".repeat(64),
+                    assignment_id: record.assignment_id,
+                    reviewer_instance_id: record.target_instance_id.unwrap(),
+                    reviewer_name: record.target.clone(),
+                    repo: record.repo.clone(),
+                    pr_number: record.pr_number,
+                    branch: record.branch.clone(),
+                    task_id: record.task_id.clone(),
+                    reviewed_head: record.reviewed_head.clone().unwrap(),
+                    review_class: record.review_class,
+                    slot: record.review_slot.unwrap(),
+                    verdict,
+                });
+        }
         ps
     }
 
-    /// C7 (T24/T25): the FROZEN 4-state classifier (plan §1). Target VERIFIED@head ⇒
-    /// Satisfied; a DIFFERENT reviewer's verdict NEVER satisfies/engages this record;
-    /// a head-advanced (stale) verdict ⇒ NOT Satisfied; acked-no-verdict ⇒
-    /// EngagedPending; nothing ⇒ Unengaged; target REJECTED/UNVERIFIED@head ⇒
-    /// EngagedUnsatisfied.
+    /// task66: only exact typed receipt evidence classifies an assignment. The
+    /// collapsed legacy VerdictState and generic correlated ACK remain inert.
     #[test]
-    fn c7_classify_four_state_evidence() {
-        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+    fn c7_classify_only_typed_exact_receipt_evidence() {
+        let head = "a".repeat(40);
+        let rec = typed_record(&head);
 
-        // target VERIFIED @ current head ⇒ Satisfied.
-        let ps = prstate_with(
-            "sha-1",
-            VerdictState::Verified {
-                reviewers: vec![("reviewer".into(), "sha-1".into())],
-            },
+        let ps = prstate_with_receipt(
+            &rec,
+            &head,
+            Some(crate::review_receipt::ReviewVerdict::Verified),
         );
         assert_eq!(
             classify_assignment(&rec, Some(&ps)),
             AssignmentEvidence::SatisfiedExactHead,
-            "target VERIFIED@head ⇒ Satisfied"
+            "exact typed VERIFIED receipt satisfies its assignment"
         );
 
-        // A DIFFERENT reviewer VERIFIED @ head does NOT satisfy this record.
-        let ps = prstate_with(
-            "sha-1",
-            VerdictState::Verified {
-                reviewers: vec![("other".into(), "sha-1".into())],
-            },
+        let mut wrong_identity = ps.clone();
+        wrong_identity.validated_review_receipts[0].reviewer_instance_id =
+            crate::types::InstanceId::new();
+        assert_eq!(
+            classify_assignment(&rec, Some(&wrong_identity)),
+            AssignmentEvidence::Unengaged,
+            "another stable reviewer identity cannot satisfy the assignment"
+        );
+
+        let advanced = "b".repeat(40);
+        let ps = prstate_with_receipt(
+            &rec,
+            &advanced,
+            Some(crate::review_receipt::ReviewVerdict::Verified),
         );
         assert_eq!(
             classify_assignment(&rec, Some(&ps)),
             AssignmentEvidence::Unengaged,
-            "a different reviewer's VERIFIED never satisfies/engages this record"
+            "a stale typed receipt does not satisfy after head advance"
         );
 
-        // Head advanced AFTER the target's VERIFIED (stale) ⇒ NOT Satisfied.
-        let ps = prstate_with(
-            "sha-2",
-            VerdictState::Verified {
-                reviewers: vec![("reviewer".into(), "sha-1".into())],
-            },
-        );
-        assert_eq!(
-            classify_assignment(&rec, Some(&ps)),
-            AssignmentEvidence::Unengaged,
-            "a stale (head-advanced) verdict does NOT satisfy"
-        );
-
-        // target REJECTED @ head ⇒ EngagedUnsatisfied.
-        let ps = prstate_with(
-            "sha-1",
-            VerdictState::Rejected {
-                reviewer: "reviewer".into(),
-                reviewed_head: "sha-1".into(),
-                reason: None,
-            },
+        let ps = prstate_with_receipt(
+            &rec,
+            &head,
+            Some(crate::review_receipt::ReviewVerdict::Rejected),
         );
         assert_eq!(
             classify_assignment(&rec, Some(&ps)),
             AssignmentEvidence::EngagedUnsatisfied,
-            "target REJECTED@head ⇒ EngagedUnsatisfied"
+            "exact typed REJECTED receipt is engaged-unsatisfied"
         );
 
-        // target UNVERIFIED @ head ⇒ EngagedUnsatisfied.
-        let ps = prstate_with(
-            "sha-1",
-            VerdictState::Unverified {
-                reviewer: "reviewer".into(),
-                reviewed_head: "sha-1".into(),
-            },
+        let ps = prstate_with_receipt(
+            &rec,
+            &head,
+            Some(crate::review_receipt::ReviewVerdict::Unverified),
         );
         assert_eq!(
             classify_assignment(&rec, Some(&ps)),
             AssignmentEvidence::EngagedUnsatisfied,
-            "target UNVERIFIED@head ⇒ EngagedUnsatisfied"
+            "exact typed UNVERIFIED receipt is engaged-unsatisfied"
         );
 
-        // A DIFFERENT reviewer REJECTED @ head does NOT engage this record.
-        let ps = prstate_with(
-            "sha-1",
-            VerdictState::Rejected {
-                reviewer: "other".into(),
-                reviewed_head: "sha-1".into(),
-                reason: None,
-            },
-        );
+        let mut legacy = prstate_with_receipt(&rec, &head, None);
+        legacy.verdict_state = VerdictState::Verified {
+            reviewers: vec![("reviewer".into(), head.clone())],
+        };
         assert_eq!(
-            classify_assignment(&rec, Some(&ps)),
+            classify_assignment(&rec, Some(&legacy)),
             AssignmentEvidence::Unengaged,
-            "a different reviewer's REJECTED never engages this record"
+            "legacy collapsed verdict state is display-only"
         );
 
-        // acked, no current-head verdict ⇒ EngagedPending.
         let mut acked = rec.clone();
         acked.acked_at = Some("2026-07-13T00:00:05Z".into());
         assert_eq!(
-            classify_assignment(&acked, Some(&prstate_with("sha-1", VerdictState::None))),
-            AssignmentEvidence::EngagedPending,
-            "acked + no verdict ⇒ EngagedPending"
+            classify_assignment(&acked, Some(&prstate_with_receipt(&acked, &head, None))),
+            AssignmentEvidence::Unengaged,
+            "generic correlated ACK is not code-review evidence"
         );
 
-        // nothing (no PrState, not acked) ⇒ Unengaged.
         assert_eq!(
             classify_assignment(&rec, None),
             AssignmentEvidence::Unengaged,
-            "no PrState + not acked ⇒ Unengaged"
+            "no PR state means no receipt evidence"
         );
     }
 
@@ -1905,11 +2138,12 @@ mod tests {
         let got = get(&home, "o/r", "feat/x", "reviewer").unwrap();
         assert_eq!(got.acked_at.as_deref(), Some("2026-07-13T00:00:05Z"));
         assert_eq!(got.acked_by.as_deref(), Some("reviewer"));
-        // Persists across re-read; classify now sees EngagedPending (no verdict).
+        // Legacy ACK persists for backwards-compatible audit display, but it no
+        // longer counts as code-review evidence.
         assert_eq!(
-            classify_assignment(&got, Some(&prstate_with("sha-1", VerdictState::None))),
-            AssignmentEvidence::EngagedPending,
-            "acked record classifies EngagedPending"
+            classify_assignment(&got, None),
+            AssignmentEvidence::Unengaged,
+            "acked record remains unengaged without a typed receipt"
         );
 
         // Re-ack is an idempotent success — the original timestamp is NOT overwritten.
@@ -1987,6 +2221,90 @@ mod tests {
             Some("2026-07-13T00:00:07Z"),
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// task66/RED 11: the receipt-generation lookup is strict across the active
+    /// store. Missing IDs, duplicate generations, and even an unrelated corrupt
+    /// co-resident row all fail closed instead of degrading to "not found".
+    #[test]
+    fn strict_assignment_id_lookup_rejects_missing_duplicate_and_corrupt_2760() {
+        let missing_home = tmp_home("strict-id-missing");
+        assert!(lookup_by_assignment_id_strict(&missing_home, uuid::Uuid::new_v4()).is_err());
+
+        let duplicate_home = tmp_home("strict-id-duplicate");
+        let a = mk_record("o/r", "feat/a", "reviewer-a", 42, "2026-07-14T00:00:00Z");
+        let mut b = mk_record("o/r", "feat/b", "reviewer-b", 43, "2026-07-14T00:00:00Z");
+        b.assignment_id = a.assignment_id;
+        persist(&duplicate_home, &a).unwrap();
+        persist(&duplicate_home, &b).unwrap();
+        let duplicate = lookup_by_assignment_id_strict(&duplicate_home, a.assignment_id)
+            .expect_err("duplicate generation must reject");
+        assert!(duplicate.to_string().contains("ambiguous"));
+
+        let corrupt_home = tmp_home("strict-id-corrupt");
+        let valid = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-14T00:00:00Z");
+        persist(&corrupt_home, &valid).unwrap();
+        std::fs::write(
+            record_file(&corrupt_home, "o/r", "feat/x", "corrupt-row"),
+            b"{not-json",
+        )
+        .unwrap();
+        let corrupt = lookup_by_assignment_id_strict(&corrupt_home, valid.assignment_id)
+            .expect_err("corrupt store must reject even when the target row parses");
+        assert!(corrupt.to_string().contains("corrupt assignment record"));
+
+        std::fs::remove_dir_all(missing_home).ok();
+        std::fs::remove_dir_all(duplicate_home).ok();
+        std::fs::remove_dir_all(corrupt_home).ok();
+    }
+
+    #[test]
+    fn cutover_census_enumerates_only_active_receipt_incapable_rows_2760() {
+        let home = tmp_home("legacy-census");
+        let legacy = mk_record(
+            "o/r",
+            "feat/legacy",
+            "reviewer-a",
+            41,
+            "2026-07-14T00:00:00Z",
+        );
+        let mut partial = mk_record(
+            "o/r",
+            "feat/partial",
+            "reviewer-b",
+            42,
+            "2026-07-14T00:00:00Z",
+        );
+        partial.schema_version = SCHEMA_VERSION;
+        partial.target_instance_id = Some(crate::types::InstanceId::new());
+        let typed = ActiveAssignment::new_pending_typed(
+            "o/r",
+            "feat/typed",
+            "reviewer-c",
+            crate::types::InstanceId::new(),
+            43,
+            "a".repeat(40),
+            crate::review_receipt::ReviewSlot::Primary,
+            "lead",
+            "t-typed",
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "review",
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        );
+        persist(&home, &legacy).unwrap();
+        persist(&home, &partial).unwrap();
+        persist(&home, &typed).unwrap();
+
+        let rows = legacy_active_assignments_strict(&home).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.assignment_id).collect::<Vec<_>>(),
+            vec![legacy.assignment_id, partial.assignment_id],
+            "schema-1 and partially upgraded rows require audited re-dispatch; an exact typed row does not"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     /// B1 — persisting a NEW record (different `assignment_id`) at a key that ALREADY

@@ -1,19 +1,12 @@
-//! #2059 #2(c): the verdict buffer — a TTL-bounded sidecar that holds a review
-//! verdict which arrived BEFORE its pr-state existed (the verdict-before-CI
-//! ordering gap that caused the #2058 dead zone).
+//! Review evidence buffers have two deliberately disjoint namespaces:
 //!
-//! [`super::record_verdict`] now keys on the verdict's `reviewed_head` (the SHA
-//! the reviewer asserts they reviewed) instead of the task→branch chain. When no
-//! pr-state for that SHA exists yet, the verdict is buffered here keyed by the
-//! SHA; [`super::record_ci_result`] drains + replays matching buffered verdicts
-//! the moment it creates/observes a branch state at that head. This is the #1888
-//! *track-until-resolution* pattern: a signal that precedes its consumer is
-//! persisted and replayed on the resolving event, never dropped on the floor.
-//!
-//! Storage: file-per-entry under
-//! `<home>/pr-state/verdict-buffer/<sha>--<reviewer>.json`, atomic write
-//! (`tmp`+`rename`), 24 h TTL — a SHA that never becomes any branch's head
-//! self-expires so the buffer can't leak.
+//! - `validated-verdict-buffer/` stores server-validated, assignment-bound
+//!   receipts that preceded creation of their exact PR state. CI observation
+//!   drains them only while holding the assignment lock and revalidates the
+//!   active generation before applying them.
+//! - `verdict-buffer/` is the pre-task66 name+SHA sidecar. It remains readable
+//!   only by compatibility tests and the TTL sweeper; production never replays
+//!   it as review authority.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -21,6 +14,128 @@ use std::path::{Path, PathBuf};
 /// A SHA that never resolves to a branch head is dropped after this. 24 h
 /// matches the `ci_handoff_track` TTL (#1888) — the same orphan-signal horizon.
 const TTL_HOURS: i64 = 24;
+
+/// task66 typed buffer. It is intentionally a separate namespace from the
+/// legacy name+SHA buffer: old entries can expire but can never be replayed as
+/// receipt authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BufferedValidatedReceipt {
+    receipt: crate::review_receipt::ReviewReceiptSummary,
+    buffered_at: String,
+}
+
+fn validated_buffer_dir(home: &Path) -> PathBuf {
+    super::pr_state_dir(home).join("validated-verdict-buffer")
+}
+
+/// Non-destructive hint used to decide whether CI observation must acquire the
+/// assignment lock even when the first authority probe says `Absent`. Exact PR
+/// number matching still happens during the locked drain; this only avoids
+/// creating assignment-lock sidecars for ordinary branches with no typed buffer.
+pub(crate) fn has_validated_subject_hint(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    head: &str,
+) -> bool {
+    std::fs::read_dir(validated_buffer_dir(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<BufferedValidatedReceipt>(&bytes).ok())
+        .any(|buffered| {
+            buffered.receipt.repo == repo
+                && buffered.receipt.branch == branch
+                && buffered.receipt.reviewed_head == head
+        })
+}
+
+/// Buffer one server-validated receipt. Returns true only for a newly accepted
+/// receipt/source identity; replays and conflicting reuse are inert.
+pub(crate) fn buffer_validated(
+    home: &Path,
+    receipt: &crate::review_receipt::ReviewReceiptSummary,
+) -> bool {
+    let dir = validated_buffer_dir(home);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !is_buffer_file(&path) {
+            continue;
+        }
+        let Some(existing) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<BufferedValidatedReceipt>(&b).ok())
+        else {
+            continue;
+        };
+        if existing.receipt.receipt_id == receipt.receipt_id
+            || existing.receipt.source_id == receipt.source_id
+        {
+            return false;
+        }
+    }
+    let entry = BufferedValidatedReceipt {
+        receipt: receipt.clone(),
+        buffered_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let name = format!(
+        "{}--{}.json",
+        sanitize(&receipt.receipt_id),
+        receipt.assignment_id
+    );
+    let final_path = dir.join(&name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let Ok(bytes) = serde_json::to_vec_pretty(&entry) else {
+        return false;
+    };
+    if std::fs::write(&tmp, bytes).is_err() || std::fs::rename(&tmp, &final_path).is_err() {
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    true
+}
+
+/// Drain only receipts whose full subject exactly equals the newly observed PR.
+/// No SHA-prefix or cross-PR scan is permitted.
+pub(crate) fn drain_validated_for_subject(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    head: &str,
+) -> Vec<crate::review_receipt::ReviewReceiptSummary> {
+    let dir = validated_buffer_dir(home);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_buffer_file(&path) {
+            continue;
+        }
+        let Some(buffered) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<BufferedValidatedReceipt>(&b).ok())
+        else {
+            continue;
+        };
+        let receipt = buffered.receipt;
+        if receipt.repo == repo
+            && receipt.branch == branch
+            && receipt.pr_number == pr_number
+            && receipt.reviewed_head == head
+        {
+            let _ = std::fs::remove_file(&path);
+            out.push(receipt);
+        }
+    }
+    out
+}
 
 /// An owned snapshot of a verdict, parked until its pr-state appears. `kind` is
 /// the lowercased verdict word (`VerdictKind` carries a borrow, so it can't be
@@ -40,6 +155,7 @@ impl BufferedVerdict {
     /// Reconstruct the borrowed [`super::VerdictKind`] for replay. Unknown kind
     /// strings map to `Unverified` (the evidence-exempt, never-merge-ready
     /// verdict) — a corrupt buffer entry can never spuriously flip merge-ready.
+    #[cfg(test)]
     pub(crate) fn verdict_kind(&self) -> super::VerdictKind<'_> {
         match self.kind.as_str() {
             "verified" => super::VerdictKind::Verified,
@@ -72,6 +188,7 @@ fn sanitize(s: &str) -> String {
 /// Buffer a verdict keyed by (reviewed_head, reviewer). Idempotent per key (a
 /// re-buffer of the same reviewer+SHA overwrites). Best-effort: errors are
 /// logged, never propagated — the verdict path must stay non-fragile.
+#[cfg(test)]
 pub(crate) fn buffer(
     home: &Path,
     reviewed_head: &str,
@@ -91,12 +208,13 @@ pub(crate) fn buffer(
             reviewed_head,
             reviewer,
             kind,
-            "#2059 verdict_buffer: buffered verdict (no pr-state at this SHA yet — replays on CI observe)"
+            "task66 legacy verdict_buffer: buffered display-only verdict; production never replays it"
         ),
         Err(e) => tracing::warn!(reviewed_head, reviewer, error = %e, "#2059 verdict_buffer: write failed"),
     }
 }
 
+#[cfg(test)]
 fn write_atomic(home: &Path, v: &BufferedVerdict) -> std::io::Result<()> {
     let dir = buffer_dir(home);
     std::fs::create_dir_all(&dir)?;
@@ -111,11 +229,9 @@ fn write_atomic(home: &Path, v: &BufferedVerdict) -> std::io::Result<()> {
     std::fs::rename(&tmp, &final_path)
 }
 
-/// Drain (read **and delete**) every buffered verdict whose `reviewed_head`
-/// matches `head`. Called by [`super::record_ci_result`] the moment a pr-state's
-/// head_sha is established at `head`, so the replayed verdicts land on the
-/// just-created/observed state. A SHA mismatch leaves the entry parked (a future
-/// CI observation at that SHA, or the TTL sweep, resolves it).
+/// Test-only drain for the legacy namespace. Production never calls this; a SHA
+/// match is insufficient review authority after task66.
+#[cfg(test)]
 pub(crate) fn drain_for_head(home: &Path, head: &str) -> Vec<BufferedVerdict> {
     let dir = buffer_dir(home);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -150,29 +266,41 @@ pub(crate) fn drain_for_head(home: &Path, head: &str) -> Vec<BufferedVerdict> {
 /// becomes any branch's head (abandoned PR, force-push past it) must not leak.
 /// Wired into the hourly retention sweep. Returns the count removed.
 pub(crate) fn sweep_expired(home: &Path, now: chrono::DateTime<chrono::Utc>) -> usize {
-    let dir = buffer_dir(home);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
-    };
     let mut removed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !is_buffer_file(&path) {
+    for (dir, typed) in [
+        (buffer_dir(home), false),
+        (validated_buffer_dir(home), true),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
-        }
-        let expired = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<BufferedVerdict>(&c).ok())
-            .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v.buffered_at).ok())
-            .map(|t| {
-                now.signed_duration_since(t.with_timezone(&chrono::Utc))
-                    > chrono::Duration::hours(TTL_HOURS)
-            })
-            // Unparseable / unreadable → a broken entry must not linger forever.
-            .unwrap_or(true);
-        if expired {
-            let _ = std::fs::remove_file(&path);
-            removed += 1;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_buffer_file(&path) {
+                continue;
+            }
+            let timestamp = std::fs::read(&path).ok().and_then(|bytes| {
+                if typed {
+                    serde_json::from_slice::<BufferedValidatedReceipt>(&bytes)
+                        .ok()
+                        .map(|v| v.buffered_at)
+                } else {
+                    serde_json::from_slice::<BufferedVerdict>(&bytes)
+                        .ok()
+                        .map(|v| v.buffered_at)
+                }
+            });
+            let expired = timestamp
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
+                .map(|t| {
+                    now.signed_duration_since(t.with_timezone(&chrono::Utc))
+                        > chrono::Duration::hours(TTL_HOURS)
+                })
+                .unwrap_or(true);
+            if expired {
+                let _ = std::fs::remove_file(&path);
+                removed += 1;
+            }
         }
     }
     removed

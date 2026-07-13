@@ -7,6 +7,7 @@
 /// MUST pass `summary + artifacts` (the PR URL may live in either), the SAME scan
 /// surface as the sibling evidence gate. Passing `summary` alone false-rejects a
 /// verdict whose URL is in `artifacts` (#t-78445-3).
+#[cfg(test)]
 pub(crate) fn check_sha_gate(
     reviewed_head: &str,
     scan_text: &str,
@@ -80,33 +81,6 @@ pub(crate) fn extract_pr_number(text: &str) -> Option<String> {
         return None;
     }
     Some(format!("{repo_path}#{pr_num}"))
-}
-
-/// Fetch the current HEAD SHA of a PR via the [`crate::scm::ScmProvider`]
-/// abstraction (#PR-C; was a direct `gh pr view ... -q .headRefOid`).
-pub(crate) fn fetch_pr_head_sha(pr_ref: &str) -> Result<String, String> {
-    let parts: Vec<&str> = pr_ref.splitn(2, '#').collect();
-    if parts.len() != 2 {
-        return Err(format!("invalid PR ref: {pr_ref}"));
-    }
-    let (repo, number) = (parts[0], parts[1]);
-    // #PR-C: behavior-identical conversion. The prior call used gh's
-    // `-q .headRefOid` to print the SHA string server-side; the typed
-    // `pr_view` returns the parsed `head_ref_oid` field instead — the
-    // `-q` gh-ism is intentionally abstracted away (same SHA). argv
-    // delta: `-q .headRefOid` removed (only difference). Return contract
-    // unchanged: Err on gh failure, Err on empty SHA, Ok(sha) otherwise.
-    let num: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid PR number in ref: {pr_ref}"))?;
-    let summary = crate::scm::make_scm_provider(repo, None)
-        .pr_view(repo, num, &["headRefOid"])
-        .map_err(|e| e.to_string())?;
-    let sha = summary.head_ref_oid.unwrap_or_default();
-    if sha.is_empty() {
-        return Err("gh pr view returned empty SHA".to_string());
-    }
-    Ok(sha)
 }
 
 #[cfg(test)]

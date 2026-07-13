@@ -70,6 +70,7 @@ mod provider_detect;
 mod quickstart;
 mod render;
 mod reply_ledger;
+mod review_receipt;
 #[cfg(test)]
 mod review_repro_test_util;
 mod runtime;

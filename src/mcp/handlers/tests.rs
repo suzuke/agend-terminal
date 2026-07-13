@@ -1049,6 +1049,8 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             force_meta: None,
             correlation_id: None,
             reviewed_head: None,
+            report_purpose: Default::default(),
+            validated_code_review: None,
             from: "user:test".to_string(),
             text: "hello".to_string(),
             kind: Some("telegram".to_string()),
@@ -1068,6 +1070,7 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             pr_number: None,
             terminal: None,
             delivery_nonce: None,
+            review_assignment: None,
         },
     );
 
@@ -1122,6 +1125,8 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             force_meta: None,
             correlation_id: None,
             reviewed_head: None,
+            report_purpose: Default::default(),
+            validated_code_review: None,
             from: "user:test".to_string(),
             text: "burst".to_string(),
             kind: Some("telegram".to_string()),
@@ -1141,6 +1146,7 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             pr_number: None,
             terminal: None,
             delivery_nonce: None,
+            review_assignment: None,
         },
     );
 
@@ -1310,6 +1316,8 @@ fn test_describe_message_shows_delivery_mode() {
         force_meta: None,
         correlation_id: None,
         reviewed_head: None,
+        report_purpose: Default::default(),
+        validated_code_review: None,
         task_id: None,
         attachments: vec![],
         in_reply_to_msg_id: None,
@@ -1324,6 +1332,7 @@ fn test_describe_message_shows_delivery_mode() {
         pr_number: None,
         terminal: None,
         delivery_nonce: None,
+        review_assignment: None,
     };
     let inbox_dir = home.join("inbox");
     std::fs::create_dir_all(&inbox_dir).ok();

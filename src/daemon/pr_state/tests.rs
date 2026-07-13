@@ -54,6 +54,7 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         subscribers: vec!["dev".to_string()],
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
+        validated_review_receipts: Vec::new(),
         merge_state: MergeState::NotReady,
         draft_state: DraftState::Ready,
         review_class: class,
@@ -81,6 +82,301 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
         created_at: now(),
         updated_at: now(),
     }
+}
+
+/// Seed the server-validated receipt view used by the production merge gate.
+/// Tests that only exercise the pure PR-state reducer do not need to construct
+/// an assignment-authority store, but they must not accidentally regain
+/// authority through the legacy name+SHA `VerdictState` projection.
+fn observe_typed_verdict(
+    state: &mut PrState,
+    reviewer: &str,
+    reviewed_head: &str,
+    verdict: crate::review_receipt::ReviewVerdict,
+) {
+    let existing = state
+        .validated_review_receipts
+        .iter()
+        .find(|receipt| receipt.reviewer_name == reviewer)
+        .cloned();
+    let slot = existing
+        .as_ref()
+        .map(|receipt| receipt.slot)
+        .unwrap_or_else(|| {
+            if state
+                .validated_review_receipts
+                .iter()
+                .any(|receipt| receipt.slot == crate::review_receipt::ReviewSlot::Primary)
+            {
+                crate::review_receipt::ReviewSlot::Secondary
+            } else {
+                crate::review_receipt::ReviewSlot::Primary
+            }
+        });
+    let reviewer_instance_id = existing
+        .as_ref()
+        .map(|receipt| receipt.reviewer_instance_id)
+        .unwrap_or_else(crate::types::InstanceId::new);
+    let assignment_id = existing
+        .as_ref()
+        .map(|receipt| receipt.assignment_id)
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    let source_id = format!("test-source-{}", uuid::Uuid::new_v4());
+    let receipt = crate::review_receipt::ReviewReceiptSummary {
+        receipt_id: format!("review-receipt:{source_id}"),
+        source_id,
+        evidence_digest: "a".repeat(64),
+        assignment_id,
+        reviewer_instance_id,
+        reviewer_name: reviewer.to_string(),
+        repo: state.repo.clone(),
+        pr_number: state.pr_number,
+        branch: state.branch.clone(),
+        task_id: "t-test-review".to_string(),
+        reviewed_head: reviewed_head.to_string(),
+        review_class: state.review_class,
+        slot,
+        verdict,
+    };
+    super::apply_receipt_to_state(state, receipt);
+}
+
+fn observe_typed_verified(state: &mut PrState, reviewer: &str, reviewed_head: &str) {
+    observe_typed_verdict(
+        state,
+        reviewer,
+        reviewed_head,
+        crate::review_receipt::ReviewVerdict::Verified,
+    );
+}
+
+fn observe_assignment_verdict(
+    state: &mut PrState,
+    assignment: &crate::daemon::assignment_authority::ActiveAssignment,
+    verdict: crate::review_receipt::ReviewVerdict,
+) {
+    let source_id = format!("test-source-{}", uuid::Uuid::new_v4());
+    let receipt = crate::review_receipt::ReviewReceiptSummary {
+        receipt_id: format!("review-receipt:{source_id}"),
+        source_id,
+        evidence_digest: "b".repeat(64),
+        assignment_id: assignment.assignment_id,
+        reviewer_instance_id: assignment.target_instance_id.unwrap(),
+        reviewer_name: assignment.target.clone(),
+        repo: assignment.repo.clone(),
+        pr_number: assignment.pr_number,
+        branch: assignment.branch.clone(),
+        task_id: assignment.task_id.clone(),
+        reviewed_head: assignment.reviewed_head.clone().unwrap(),
+        review_class: assignment.review_class,
+        slot: assignment.review_slot.unwrap(),
+        verdict,
+    };
+    super::apply_receipt_to_state(state, receipt);
+}
+
+/// task66/A1: receipt validation can race the PR-state file becoming absent and
+/// therefore enter the typed buffer. Replay must re-check the generation; a
+/// revoke between buffer and state creation makes the buffered receipt inert.
+#[test]
+fn typed_buffer_replay_revalidates_active_assignment_2760() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-prstate-buffer-revoke-2760-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let head = "c".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/buffered",
+        "reviewer",
+        reviewer_id,
+        42,
+        &head,
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-buffered-review",
+        ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-07-14T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+    let receipt = crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:m-buffered".into(),
+            source_id: "m-buffered".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: assignment.assignment_id,
+            reviewer_instance_id: reviewer_id,
+            reviewer_name: "reviewer".into(),
+            repo: "owner/repo".into(),
+            pr_number: 42,
+            branch: "fix/buffered".into(),
+            task_id: "t-buffered-review".into(),
+            reviewed_head: head.clone(),
+            review_class: ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        },
+    );
+    assert!(
+        super::record_validated_receipt(&home, &receipt),
+        "validated receipt is buffered when its exact PR state is momentarily absent"
+    );
+    crate::daemon::assignment_authority::revoke(
+        &home,
+        "owner/repo",
+        "fix/buffered",
+        "reviewer",
+        "2026-07-14T00:00:01Z",
+    )
+    .unwrap();
+
+    super::with_pr_state_or_create(
+        &home,
+        "owner/repo",
+        "fix/buffered",
+        || {
+            let mut state =
+                super::new_for_branch("owner/repo", "fix/buffered", &head, ReviewClass::Single);
+            state.pr_number = 42;
+            state
+        },
+        |_| {},
+    )
+    .unwrap();
+    super::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/buffered",
+        &head,
+        super::CiConclusion::Green,
+        vec!["lead".into()],
+        ReviewClass::Single,
+    );
+    let state = super::load(&home, "owner/repo", "fix/buffered").unwrap();
+    assert!(state.validated_review_receipts.is_empty());
+    assert!(!super::is_merge_ready(&state));
+    assert!(
+        super::verdict_buffer::drain_validated_for_subject(
+            &home,
+            "owner/repo",
+            "fix/buffered",
+            42,
+            &head,
+        )
+        .is_empty(),
+        "revoked buffered receipt is consumed/quarantined, never replayed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// task66/A1: a destructive typed-buffer drain is forbidden unless the
+/// assignment lock is held. A transient lock failure leaves the receipt parked;
+/// the next successful observation revalidates it, removes the reservation, and
+/// applies it exactly once.
+#[test]
+fn typed_buffer_lock_failure_retries_without_losing_receipt_2760() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-prstate-buffer-lock-2760-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let head = "d".repeat(40);
+    let reviewer_id = crate::types::InstanceId::new();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/buffer-lock",
+        "reviewer",
+        reviewer_id,
+        43,
+        &head,
+        crate::review_receipt::ReviewSlot::Primary,
+        "lead",
+        "t-buffer-lock-review",
+        ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-07-14T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+    let receipt = crate::review_receipt::ReviewReceiptSummary {
+        receipt_id: "review-receipt:m-buffer-lock".into(),
+        source_id: "m-buffer-lock".into(),
+        evidence_digest: "a".repeat(64),
+        assignment_id: assignment.assignment_id,
+        reviewer_instance_id: reviewer_id,
+        reviewer_name: "reviewer".into(),
+        repo: "owner/repo".into(),
+        pr_number: 43,
+        branch: "fix/buffer-lock".into(),
+        task_id: "t-buffer-lock-review".into(),
+        reviewed_head: head.clone(),
+        review_class: ReviewClass::Single,
+        slot: crate::review_receipt::ReviewSlot::Primary,
+        verdict: crate::review_receipt::ReviewVerdict::Verified,
+    };
+    assert!(super::verdict_buffer::buffer_validated(&home, &receipt));
+    let mut state =
+        super::new_for_branch("owner/repo", "fix/buffer-lock", &head, ReviewClass::Single);
+    state.pr_number = 43;
+    super::save(&home, &state).unwrap();
+
+    let lock_path = crate::daemon::assignment_authority::branch_lock_path_for_test(
+        &home,
+        "owner/repo",
+        "fix/buffer-lock",
+    );
+    std::fs::remove_file(&lock_path).ok();
+    std::fs::create_dir_all(&lock_path).unwrap();
+    super::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/buffer-lock",
+        &head,
+        super::CiConclusion::Green,
+        vec!["lead".into()],
+        ReviewClass::Single,
+    );
+    let after_failed_lock = super::load(&home, "owner/repo", "fix/buffer-lock").unwrap();
+    assert!(after_failed_lock.validated_review_receipts.is_empty());
+    assert!(after_failed_lock.authority_unknown);
+
+    std::fs::remove_dir(&lock_path).unwrap();
+    super::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/buffer-lock",
+        &head,
+        super::CiConclusion::Green,
+        vec!["lead".into()],
+        ReviewClass::Single,
+    );
+    let replayed = super::load(&home, "owner/repo", "fix/buffer-lock").unwrap();
+    assert_eq!(replayed.validated_review_receipts, vec![receipt]);
+    assert!(replayed.reserved_assignments.is_empty());
+    assert!(!replayed.authority_unknown);
+    assert!(super::is_merge_ready(&replayed));
+    assert!(
+        super::verdict_buffer::drain_validated_for_subject(
+            &home,
+            "owner/repo",
+            "fix/buffer-lock",
+            43,
+            &head,
+        )
+        .is_empty(),
+        "successful retry consumed the buffered receipt exactly once"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// #2749 (Fable mandatory evidence): a PrState JSON written BEFORE #2749 added the
@@ -168,14 +464,7 @@ fn t1_ci_then_verdict_at_same_sha_yields_merge_ready() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert_eq!(s.merge_state, MergeState::MergeReady);
 }
 
@@ -217,14 +506,7 @@ fn t3_head_advance_invalidates_verdict() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert_eq!(s.merge_state, MergeState::MergeReady);
     // Head advances (force-push).
     apply(
@@ -260,14 +542,7 @@ fn t4_reducer_recomputes_merge_ready_every_event() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert_eq!(s.merge_state, MergeState::MergeReady);
     // No-op event (re-record same CI). MergeReady should stay.
     apply(
@@ -294,24 +569,10 @@ fn t5_dual_review_requires_two_verified() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     // Only 1 of 2 — not ready.
     assert_eq!(s.merge_state, MergeState::NotReady);
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-2",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-2", "sha-A");
     assert_eq!(s.merge_state, MergeState::MergeReady);
 }
 
@@ -380,14 +641,7 @@ fn t8_draft_refuses_merge_ready() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert_eq!(s.merge_state, MergeState::NotReady);
     // Draft → Ready transition unblocks.
     apply(&mut s, Event::DraftTransition { is_draft: false });
@@ -407,14 +661,7 @@ fn t9_post_merge_ready_force_push_invalidates() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert_eq!(s.merge_state, MergeState::MergeReady);
     // Simulate implementer armed --auto.
     s.auto_armed = true;
@@ -450,14 +697,7 @@ fn t10_closed_unmerged_is_sticky() {
             observed_at: now(),
         },
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert!(matches!(s.merge_state, MergeState::ClosedUnmerged { .. }));
 }
 
@@ -620,10 +860,8 @@ fn t18_scan_and_emit_fires_once_per_sha() {
         sha: "sha-A".to_string(),
         observed_at: now(),
     };
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
-    };
-    s.merge_state = MergeState::MergeReady;
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
+    assert_eq!(s.merge_state, MergeState::MergeReady);
     s.pr_author = "dev".to_string();
     // #2749: this test pins once-per-sha dedup, not ancestry — stamp a fresh
     // tuple so the read-only freshness gate admits the emission.
@@ -777,9 +1015,10 @@ fn t17_record_ci_result_creates_then_updates() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ── #2059 #2(c) §3.9 — SHA-key + create-or-buffer, the 5 edge cases ──
-// All drive the REAL entry points (record_verdict + record_ci_result), no
-// binding and no task board — proving the SHA key needs neither.
+// ── task66 legacy-containment regression cases ────────────────────────
+// `record_verdict` remains test-only so old durable name+SHA behavior can be
+// pinned fail-closed. It may update the display projection or legacy sidecar,
+// but neither can create a validated receipt or open the merge gate.
 
 fn vbuf_home(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -795,12 +1034,10 @@ fn vbuf_home(tag: &str) -> std::path::PathBuf {
     d
 }
 
-/// EDGE 1 (review-before-impl — the #2058 dead zone) + EDGE 2 (no-binding):
-/// a verdict that PRECEDES the pr-state is buffered, then replayed when
-/// `record_ci_result` first observes that SHA, flipping the PR merge-ready.
-/// No binding and no task board are involved — the SHA carries everything.
+/// A legacy verdict that precedes PR state may remain in its TTL sidecar, but
+/// observing CI must never replay it into typed review authority.
 #[test]
-fn buffered_verdict_replays_on_ci_observe_2059() {
+fn legacy_buffered_verdict_never_replays_as_authority_2760() {
     let dir = vbuf_home("replay");
     // Verdict arrives first — no pr-state exists yet (gate E / #2058).
     record_verdict(
@@ -826,21 +1063,23 @@ fn buffered_verdict_replays_on_ci_observe_2059() {
     );
     let s = load(&dir, "owner/repo", "feat/x").expect("created");
     assert!(
-        is_merge_ready(&s),
-        "buffered VERIFIED + CI green at the same SHA → merge-ready (#2058 closed)"
+        !is_merge_ready(&s),
+        "legacy buffered VERIFIED must stay inert even when CI observes the same SHA"
     );
-    // The buffer entry was consumed.
+    assert!(s.validated_review_receipts.is_empty());
+    // The production typed drain did not consume the legacy entry. Drain it
+    // explicitly through the test-only helper for a deterministic cleanup pin.
     assert!(
-        verdict_buffer::drain_for_head(&dir, "sha-A").is_empty(),
-        "the buffered verdict was drained on observe"
+        !verdict_buffer::drain_for_head(&dir, "sha-A").is_empty(),
+        "legacy sidecar may await TTL cleanup, but is never replayed"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// EDGE 3 (fork PR — same branch NAME, different SHA): a verdict for sha-A
-/// lands only on the sha-A state, never the same-named fork at sha-B.
+/// A legacy SHA/name verdict cannot authorize either the matching state or a
+/// same-named fork at a different SHA.
 #[test]
-fn verdict_keys_by_sha_not_branch_name_fork_2059() {
+fn legacy_verdict_cannot_authorize_same_branch_fork_2760() {
     let dir = vbuf_home("fork");
     record_ci_result(
         &dir,
@@ -869,21 +1108,18 @@ fn verdict_keys_by_sha_not_branch_name_fork_2059() {
         Some("sha-A"),
         VerdictKind::Verified,
     );
-    assert!(
-        is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
-        "the sha-A PR is merge-ready"
-    );
-    assert!(
-        !is_merge_ready(&load(&dir, "fork/repo", "feat/x").unwrap()),
-        "the same-named fork at a DIFFERENT sha must be untouched (SHA-keyed, not branch-keyed)"
-    );
+    let original = load(&dir, "owner/repo", "feat/x").unwrap();
+    let fork = load(&dir, "fork/repo", "feat/x").unwrap();
+    assert!(!is_merge_ready(&original));
+    assert!(!is_merge_ready(&fork));
+    assert!(original.validated_review_receipts.is_empty());
+    assert!(fork.validated_review_receipts.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// EDGE 4 (multi-reviewer, dual class): two DISTINCT verdicts on the same SHA
-/// accumulate; merge-ready only after the quorum (not collapsed to one row).
+/// Even two distinct legacy names cannot manufacture a Dual typed quorum.
 #[test]
-fn multi_reviewer_dual_quorum_on_sha_2059() {
+fn legacy_multi_reviewer_names_cannot_form_typed_quorum_2760() {
     let dir = vbuf_home("multi");
     record_ci_result(
         &dir,
@@ -913,17 +1149,20 @@ fn multi_reviewer_dual_quorum_on_sha_2059() {
         VerdictKind::Verified,
     );
     assert!(
-        is_merge_ready(&load(&dir, "owner/repo", "feat/d").unwrap()),
-        "2 distinct reviewers on the SHA → dual quorum met"
+        !is_merge_ready(&load(&dir, "owner/repo", "feat/d").unwrap()),
+        "two legacy names still provide zero typed assignment receipts"
     );
+    assert!(load(&dir, "owner/repo", "feat/d")
+        .unwrap()
+        .validated_review_receipts
+        .is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// EDGE 5 (stale force-push): after the head advances, neither the cleared
-/// old-SHA verdict nor a LATE verdict for the stale SHA flips the new head
-/// merge-ready (the §4.2 staleness invariant + SHA-keyed buffer).
+/// A legacy verdict is inert before and after a force-push; a late stale-SHA
+/// row cannot resurrect review authority.
 #[test]
-fn stale_forcepush_verdict_does_not_flip_2059() {
+fn legacy_forcepush_verdict_never_flips_gate_2760() {
     let dir = vbuf_home("stale");
     record_ci_result(
         &dir,
@@ -942,8 +1181,8 @@ fn stale_forcepush_verdict_does_not_flip_2059() {
         VerdictKind::Verified,
     );
     assert!(
-        is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
-        "baseline: CI green + VERIFIED at sha-A → merge-ready"
+        !is_merge_ready(&load(&dir, "owner/repo", "feat/x").unwrap()),
+        "legacy VERIFIED is display-only at the original head"
     );
     // Force-push: CI now observes a NEW head sha-B. CiObserved clears the
     // accumulated sha-A verdict.
@@ -1073,26 +1312,12 @@ fn r2a_persisted_unresolved_recovers_on_rearm_dual_2745() {
     );
 
     // Readiness now enforces the 2-distinct-VERIFIED Dual threshold.
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert!(
         !is_merge_ready(&s),
         "one VERIFIED is not enough for recovered Dual"
     );
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-2",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-2", "sha-A");
     assert!(
         is_merge_ready(&s),
         "two distinct VERIFIED open the recovered Dual gate"
@@ -1327,14 +1552,7 @@ fn t20_dual_review_does_not_merge_until_two_verdicts_e2e() {
 
     // ONE verdict arrives. State must NOT transition to MergeReady.
     let mut s = load(&dir, "owner/repo", "feat/dual-e2e").unwrap();
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-1",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
     assert_eq!(
         s.merge_state,
         MergeState::NotReady,
@@ -1356,14 +1574,7 @@ fn t20_dual_review_does_not_merge_until_two_verdicts_e2e() {
 
     // SECOND verdict from distinct reviewer. Now MergeReady.
     let mut s = load(&dir, "owner/repo", "feat/dual-e2e").unwrap();
-    apply(
-        &mut s,
-        Event::VerdictObserved {
-            reviewer: "rev-2",
-            reviewed_head: "sha-A",
-            kind: VerdictKind::Verified,
-        },
-    );
+    observe_typed_verified(&mut s, "rev-2", "sha-A");
     assert_eq!(s.merge_state, MergeState::MergeReady);
     // #2749: dual-review gate test — stamp a fresh ancestry tuple so the
     // read-only freshness gate admits the emission once both verdicts land.
@@ -2047,13 +2258,13 @@ fn t12_gh_poll_failure_increments_backoff_counter() {
 
 /// #986 T-load-bearing (reviewer #990 BLOCKING #1) — the actual
 /// regression path that motivated #986: PrState in MergeReady
-/// state but `pr_author=""` / `pr_number=0` (placeholder values
-/// from `new_for_branch` when ci_watch arms before any gh-poll).
+/// state but `pr_author=""` (placeholder value from `new_for_branch`
+/// when ci_watch arms before any gh-poll). A typed receipt requires an exact,
+/// non-zero PR subject, so this fixture starts with the already-known PR number.
 /// After scan_and_emit_with applies gh-poll:
 /// - pr_author populated via 4-tier resolution chain
-/// - pr_number populated from gh metadata
 /// - `[pr-ready-for-merge]` event enqueued to RESOLVED author with
-///   the gh-discovered PR number in the body
+///   the exact PR number in the body
 ///
 /// Pre-#986: pre-poll state sat MergeReady forever, ready event
 /// fired to subscribers[0] (fallback) with `repo@branch` body
@@ -2062,18 +2273,16 @@ fn t12_gh_poll_failure_increments_backoff_counter() {
 #[test]
 fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
     // Build a state ALREADY MergeReady (CI green + 1×VERIFIED at
-    // same sha) but with placeholder pr_author / pr_number.
+    // same sha) but with placeholder pr_author.
     let mut s = new_state("sha-A", ReviewClass::Single);
     s.pr_author = String::new();
-    s.pr_number = 0;
+    s.pr_number = 990;
     s.ci_state = CiState::Green {
         sha: "sha-A".to_string(),
         observed_at: now(),
     };
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
-    };
-    s.merge_state = MergeState::MergeReady;
+    observe_typed_verified(&mut s, "rev-1", "sha-A");
+    assert_eq!(s.merge_state, MergeState::MergeReady);
     // #2749: this test pins author promotion + merge-authority routing, not
     // ancestry — stamp a fresh tuple so the freshness gate admits emission.
     stamp_fresh_ancestry(&mut s);
@@ -2098,11 +2307,11 @@ fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
 
     scan_and_emit_with(&home, &empty_registry(), &poller);
 
-    // Post-scan state: pr_number/author populated, ready event swept
+    // Post-scan state: author populated, ready event swept
     // (file persists because state is OPEN not Merged), ready event
     // enqueued.
     let loaded = load(&home, "owner/repo", "feat/test").expect("state persists post-scan");
-    assert_eq!(loaded.pr_number, 990, "pr_number populated from gh-poll");
+    assert_eq!(loaded.pr_number, 990, "exact receipt subject stays stable");
     assert_eq!(
         loaded.pr_author, "suzuke",
         "pr_author resolved via tier-2 name match against fleet.yaml"
@@ -2395,7 +2604,7 @@ fn verdict_verified_not_merge_ready_notifies_bound_author() {
 }
 
 #[test]
-fn verdict_verified_merge_ready_does_not_double_notify() {
+fn legacy_verified_green_stays_not_ready_and_notifies_2760() {
     let home = verdict_home("verified-ready");
     seed_task_with_branch(&home, "t-v", "feat/x");
     bind_author(&home, "dev-x", "feat/x");
@@ -2408,10 +2617,12 @@ fn verdict_verified_merge_ready_does_not_double_notify() {
         VerdictKind::Verified,
     );
     assert!(
-        has_verdict_msg(&home, "dev-x").is_none(),
-        "VERIFIED that becomes merge-ready must NOT emit [review-verdict] \
-             (dedup — the scanner sends [pr-ready-for-merge])"
+        has_verdict_msg(&home, "dev-x").is_some(),
+        "legacy VERIFIED never becomes merge-ready, so its display notification remains ordinary"
     );
+    let state = load(&home, "owner/repo", "feat/x").unwrap();
+    assert!(!is_merge_ready(&state));
+    assert!(state.validated_review_receipts.is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -2498,17 +2709,13 @@ fn pr_ready_for_merge_routes_to_merge_authority_2059() {
     // is who merges.
     write_team_fleet(&home, "lead-x", &["dev-x", "fixup-reviewer"]);
     write_verdict_state(&home, "feat/x", "headsha", true); // green, pr_author="suzuke"
-    record_verdict(
-        &home,
-        "t-p",
-        "fixup-reviewer",
-        Some("headsha"),
-        VerdictKind::Verified,
-    );
-    // #2749: this test pins merge-authority ROUTING, not ancestry — stamp a
-    // fresh tuple on the now-MergeReady state so the freshness gate admits it.
+                                                           // #2749: this test pins merge-authority ROUTING, not ancestry — stamp a
+                                                           // fresh tuple on the now-MergeReady state so the freshness gate admits it.
     {
         let mut s = load(&home, "owner/repo", "feat/x").expect("merge-ready state present");
+        s.pr_number = 42;
+        observe_typed_verified(&mut s, "fixup-reviewer", "headsha");
+        assert!(is_merge_ready(&s));
         stamp_fresh_ancestry(&mut s);
         save(&home, &s).unwrap();
     }
@@ -2777,9 +2984,8 @@ fn t31_reserved_assignment_holds_merge_ready_closed() {
         sha: "sha-A".into(),
         observed_at: now(),
     };
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("r1".into(), "sha-A".into()), ("r2".into(), "sha-A".into())],
-    };
+    observe_typed_verified(&mut s, "r1", "sha-A");
+    observe_typed_verified(&mut s, "r2", "sha-A");
     // Baseline: Dual threshold met at head, zero reserved ⇒ merge-ready.
     assert!(
         is_merge_ready(&s),
@@ -2799,9 +3005,9 @@ fn t31_reserved_assignment_holds_merge_ready_closed() {
 
     // A reserved entry NEVER counts toward the verified threshold: 1 real VERIFIED
     // + 1 reserved must NOT become "2" and go ready.
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("r1".into(), "sha-A".into())],
-    };
+    s.validated_review_receipts
+        .retain(|receipt| receipt.reviewer_name == "r1");
+    apply(&mut s, Event::DraftTransition { is_draft: false });
     assert!(
         !is_merge_ready(&s),
         "reserved never increments required_verified_count"
@@ -2864,10 +3070,40 @@ fn t30_persist_asgn(home: &std::path::Path, repo: &str, branch: &str, target: &s
     crate::daemon::assignment_authority::persist(home, &rec).unwrap();
 }
 
-/// T30 (ordering + gate): the drain sets `reserved_assignments` AFTER the head apply
-/// but BEFORE the buffered-verdict replay — so a reviewer whose buffered VERIFIED is
-/// replayed in the SAME call is STILL reserved (reserved excludes Satisfied only at
-/// derive time), and that reserved entry holds an otherwise-ready Single PR CLOSED.
+fn t30_persist_typed_asgn(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    pr: u64,
+    head: &str,
+    class: ReviewClass,
+    slot: crate::review_receipt::ReviewSlot,
+) -> crate::daemon::assignment_authority::ActiveAssignment {
+    let rec = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        repo,
+        branch,
+        target,
+        crate::types::InstanceId::new(),
+        pr,
+        head,
+        slot,
+        "lead",
+        "t-rev-typed",
+        class,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-07-13T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(home, &rec).unwrap();
+    rec
+}
+
+/// T30 containment ordering: the drain sets `reserved_assignments` while a legacy
+/// buffered verdict remains inert. The active legacy assignment stays reserved and
+/// the PR remains closed; only the separate typed buffer may replay authority.
 #[test]
 fn t30_drain_reserved_before_verdict_replay_holds_merge_closed() {
     let home = t30_home("order");
@@ -2875,7 +3111,7 @@ fn t30_drain_reserved_before_verdict_replay_holds_merge_closed() {
     let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
     ps.pr_number = 42;
     save(&home, &ps).unwrap();
-    // A verdict that WOULD satisfy `reviewer` is buffered BEFORE the CI observation.
+    // A legacy verdict is buffered BEFORE the CI observation.
     verdict_buffer::buffer(&home, "sha-A", "reviewer", "verified", None);
 
     record_ci_result(
@@ -2895,11 +3131,11 @@ fn t30_drain_reserved_before_verdict_replay_holds_merge_closed() {
             .map(|r| r.target.clone())
             .collect::<Vec<_>>(),
         vec!["reviewer".to_string()],
-        "reserved is derived BEFORE the buffered verdict replay (ordering)"
+        "the active legacy assignment remains reserved"
     );
     assert!(
-        matches!(s.verdict_state, VerdictState::Verified { .. }),
-        "the buffered VERIFIED WAS replayed in this same call"
+        s.validated_review_receipts.is_empty(),
+        "legacy buffered VERIFIED must not replay into typed receipt authority"
     );
     assert!(
         !is_merge_ready(&s),
@@ -2915,13 +3151,24 @@ fn t30_drain_reserved_before_verdict_replay_holds_merge_closed() {
 fn t30_drain_excludes_satisfied_and_foreign_generation() {
     let home = t30_home("excl");
     t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42); // matching gen, unengaged
-    t30_persist_asgn(&home, "owner/repo", "feat/x", "satisfied", 42); // matching gen, VERIFIED@head
+    let satisfied = t30_persist_typed_asgn(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "satisfied",
+        42,
+        "sha-A",
+        ReviewClass::Single,
+        crate::review_receipt::ReviewSlot::Primary,
+    );
     t30_persist_asgn(&home, "owner/repo", "feat/x", "other-gen", 99); // FOREIGN generation
     let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
     ps.pr_number = 42;
-    ps.verdict_state = VerdictState::Verified {
-        reviewers: vec![("satisfied".into(), "sha-A".into())],
-    };
+    observe_assignment_verdict(
+        &mut ps,
+        &satisfied,
+        crate::review_receipt::ReviewVerdict::Verified,
+    );
     save(&home, &ps).unwrap();
 
     record_ci_result(
@@ -3039,9 +3286,7 @@ fn b4_sole_corrupt_record_holds_merge_gate_closed_fail_closed() {
     // reservation) — the exact state the fail-open OPENs the gate on.
     let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
     ps.pr_number = 42;
-    ps.verdict_state = VerdictState::Verified {
-        reviewers: vec![("reviewer".to_string(), "sha-A".to_string())],
-    };
+    observe_typed_verified(&mut ps, "reviewer", "sha-A");
     assert!(ps.reserved_assignments.is_empty(), "no prior reservation");
     assert!(!ps.authority_unknown, "authority_unknown starts clear");
     save(&home, &ps).unwrap();
@@ -3104,9 +3349,7 @@ fn b4_record_ci_result_recomputes_cached_merge_state_after_reservation_drain() {
     // derivation computes MergeReady (the stale value the drain must recompute away).
     let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
     ps.pr_number = 42;
-    ps.verdict_state = VerdictState::Verified {
-        reviewers: vec![("verifier".into(), "sha-A".into())],
-    };
+    observe_typed_verified(&mut ps, "verifier", "sha-A");
     save(&home, &ps).unwrap();
 
     record_ci_result(

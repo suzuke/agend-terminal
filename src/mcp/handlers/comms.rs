@@ -195,30 +195,16 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         args["artifacts"].as_str(),
     );
     let result = {
-        let reviewed_head = args["reviewed_head"].as_str();
+        let is_code_review = args["report_purpose"].as_str() == Some("code_review");
 
-        // #t-78445-3: shared scan surface for BOTH gates below — `summary +
-        // artifacts` (a PR URL / evidence token may live in either) — built once via
-        // one helper so the two can't drift (the drift that false-rejected verdicts).
+        // UX-only evidence checks are scoped by the caller's typed purpose. The
+        // API sink validates again and is the sole trust boundary; reviewed_head
+        // is display-only and never drives an MCP SHA/PR lookup.
         let scan_body = super::comms_gates::report_scan_body(summary, args["artifacts"].as_str());
-
-        // M3: SHA-staleness gate — verify reviewed_head against PR HEAD; scans
-        // scan_body (keep the surface in sync with the evidence gate below).
-        if let Some(rh) = reviewed_head {
-            if let Err(e) = super::comms_gates::check_sha_gate(
-                rh,
-                &scan_body,
-                super::comms_gates::fetch_pr_head_sha,
-            ) {
-                return json!({"error": e});
-            }
-        }
-
-        // #1666 Phase A: reviewer-evidence gate. Only fires on actual verdict reports
-        // (summary STARTS WITH VERIFIED/REJECTED/UNVERIFIED — §3.12). VERIFIED/
-        // REJECTED must carry an evidence token; UNVERIFIED is exempt. Scans scan_body
-        // (in sync with the SHA gate above). Reuses the reject path back to the sender.
-        if let Some(verdict) = super::comms_gates::detect_verdict(summary) {
+        if is_code_review {
+            let Some(verdict) = super::comms_gates::detect_verdict(summary) else {
+                return json!({"error": "code_review text must begin with VERIFIED, REJECTED, or UNVERIFIED"});
+            };
             if let Err(e) = super::comms_gates::check_evidence_gate(&scan_body, verdict) {
                 return json!({"error": e});
             }
@@ -316,20 +302,8 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             task_id,
         }));
     }
-    // t-…-17 C9: authenticated correlated ACK into the reviewer-assignment
-    // authority. STRICTLY ADDITIVE + best-effort — it never touches `result`
-    // (an ordinary report is byte-identical to before). The sender is already
-    // authenticated (the `err_needs_identity` guard above) and `correlation_id`
-    // is the task_id; the store op resolves the ACTIVE assignment by
-    // `(target == sender, task_id)`, so a non-target sender or a non-matching
-    // task_id is a cheap no-op (the scan short-circuits on an empty store). It
-    // takes ONLY its own per-branch assignment-lock — NEVER the inbox or
-    // pr_state lock — and is sequenced OUTSIDE the inbox-settle above, so there
-    // is no lock inversion.
-    if let Some(task_id) = args["correlation_id"].as_str().filter(|s| !s.is_empty()) {
-        let now = chrono::Utc::now().to_rfc3339();
-        let _ = crate::daemon::assignment_authority::ack(home, sender.as_str(), task_id, &now);
-    }
+    // task66: generic correlated reports no longer write assignment evidence.
+    // The validated receipt retained by PR state is the sole evidence source.
     result
 }
 
@@ -486,6 +460,8 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
 // #1286: inbox describe handlers extracted to stay under file_size_invariant.
 #[path = "comms_inbox.rs"]
 mod comms_inbox;
+#[cfg(test)]
+pub(crate) use comms_inbox::build_report_text;
 pub(super) use comms_inbox::{
     handle_describe_message, handle_describe_thread, handle_inbox_ack, handle_inbox_clear,
 };

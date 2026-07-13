@@ -1423,6 +1423,8 @@ fn enqueue_reply_ledger_lead_escalation(
         force_meta: None,
         correlation_id: None,
         reviewed_head: None,
+        report_purpose: Default::default(),
+        validated_code_review: None,
         from: "system:reply-ledger".to_string(),
         text,
         kind: Some("update".to_string()),
@@ -1442,6 +1444,7 @@ fn enqueue_reply_ledger_lead_escalation(
         pr_number: None,
         terminal: None,
         delivery_nonce: None,
+        review_assignment: None,
     };
     if let Err(e) = crate::inbox::enqueue(home, lead, msg) {
         tracing::warn!(
