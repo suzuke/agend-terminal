@@ -96,6 +96,47 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
     })
 }
 
+/// #2764 E: exact-id generation-CAS removal of ONE instance entry — the only
+/// legitimate fleet-entry remover on the `full_delete_instance` path. Removes
+/// `instances.<name>` ONLY when the persisted entry still carries `id ==
+/// expected`; a same-name replacement (different id), a legacy/no-id entry, or
+/// a missing/corrupt entry refuses the CAS and writes NOTHING.
+pub fn remove_instance_from_yaml_cas(
+    home: &Path,
+    name: &str,
+    expected: &crate::types::InstanceId,
+) -> Result<()> {
+    let fleet_path = fleet_yaml_path(home);
+    if !fleet_path.exists() {
+        // Without this gate `mutate_fleet_yaml("")` early-returns Ok on a
+        // missing file — a silently "successful" CAS against nothing.
+        anyhow::bail!("fleet.yaml missing at CAS time");
+    }
+    mutate_fleet_yaml(home, "", |doc| {
+        let instances = doc
+            .get_mut("instances")
+            .and_then(|v| v.as_mapping_mut())
+            .ok_or_else(|| anyhow::anyhow!("fleet.yaml has no instances mapping"))?;
+        let key = serde_yaml_ng::Value::String(name.to_string());
+        let actual = instances
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("instance entry '{name}' missing at CAS time"))?
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(crate::types::InstanceId::parse);
+        if actual != Some(*expected) {
+            anyhow::bail!(
+                "instance '{name}' id CAS mismatch: expected {}, found {:?}",
+                expected.full(),
+                actual.map(|i| i.full())
+            );
+        }
+        instances.remove(&key);
+        tracing::info!(%name, id = %expected.short(), "removed instance from fleet.yaml (exact-id CAS)");
+        Ok(true)
+    })
+}
+
 pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
     if names.is_empty() {
         return Ok(());
@@ -648,6 +689,80 @@ mod tests {
             other => panic!("expected a telegram active channel, got {other:?}"),
         }
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2764 E: exact-id generation-CAS removal ─────────────────────────
+
+    fn seed_instance(home: &Path, name: &str, id: Option<&str>) {
+        let mut yaml = format!("instances:\n  {name}:\n    backend: claude\n");
+        if let Some(id) = id {
+            yaml.push_str(&format!("    id: {id}\n"));
+        }
+        std::fs::write(fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    fn raw_has_entry(home: &Path, name: &str) -> bool {
+        std::fs::read_to_string(fleet_yaml_path(home))
+            .map(|s| s.contains(&format!("{name}:")))
+            .unwrap_or(false)
+    }
+
+    /// Matching exact id → the entry is removed.
+    #[test]
+    fn cas_removes_entry_on_exact_id_match_2764() {
+        let home = tmp_home("cas-match");
+        let id = crate::types::InstanceId::new();
+        seed_instance(&home, "victim", Some(&id.full()));
+        remove_instance_from_yaml_cas(&home, "victim", &id).expect("CAS must succeed");
+        assert!(!raw_has_entry(&home, "victim"), "entry must be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Different persisted id (same-name replacement) → Err, NOTHING written.
+    #[test]
+    fn cas_refuses_on_id_mismatch_and_writes_nothing_2764() {
+        let home = tmp_home("cas-mismatch");
+        let replacement = crate::types::InstanceId::new();
+        seed_instance(&home, "victim", Some(&replacement.full()));
+        let before = std::fs::read_to_string(fleet_yaml_path(&home)).unwrap();
+        let stale = crate::types::InstanceId::new();
+        let err = remove_instance_from_yaml_cas(&home, "victim", &stale)
+            .expect_err("id mismatch must refuse the CAS");
+        assert!(err.to_string().contains("CAS mismatch"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(fleet_yaml_path(&home)).unwrap(),
+            before,
+            "a refused CAS must write nothing"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Legacy/no-id entry → Err (no generation anchor), NOTHING written.
+    #[test]
+    fn cas_refuses_on_missing_id_2764() {
+        let home = tmp_home("cas-noid");
+        seed_instance(&home, "victim", None);
+        let expected = crate::types::InstanceId::new();
+        assert!(remove_instance_from_yaml_cas(&home, "victim", &expected).is_err());
+        assert!(raw_has_entry(&home, "victim"), "entry must be retained");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Missing entry / missing file → Err, never a silent Ok.
+    #[test]
+    fn cas_refuses_on_missing_entry_or_file_2764() {
+        let home = tmp_home("cas-missing");
+        let expected = crate::types::InstanceId::new();
+        assert!(
+            remove_instance_from_yaml_cas(&home, "victim", &expected).is_err(),
+            "missing fleet.yaml must refuse the CAS (no silent success)"
+        );
+        std::fs::write(fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        assert!(
+            remove_instance_from_yaml_cas(&home, "victim", &expected).is_err(),
+            "missing entry must refuse the CAS"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

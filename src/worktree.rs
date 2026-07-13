@@ -443,8 +443,8 @@ pub fn resolve_auto_worktree(
     // through to auto-worktree and broke `claude --continue` session resume on
     // restart. Everything under `<home>/workspace/` is daemon-managed default (a
     // real user working_directory is explicit-config'd OUTSIDE it) — the same
-    // invariant `agent_ops::cleanup_working_dir` already encodes via
-    // `starts_with(&workspaces)`.
+    // invariant `agent_ops::workspace_cleanup::plan_cleanup` encodes via its
+    // workspace-root ownership check.
     if base_dir.starts_with(crate::paths::workspace_dir(home)) {
         // #2234 cure-(B): under the gray-rollout flag, the workspace dir BECOMES
         // a canonical worktree (cwd == worktree; cwd PATH stays stable so #1919

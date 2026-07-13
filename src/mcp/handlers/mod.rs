@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 // Re-exported for tests (via `use super::*`).
 #[cfg(test)]
-use crate::agent_ops::{cleanup_working_dir, merge_metadata};
+use crate::agent_ops::merge_metadata;
 
 /// True iff the MCP handler output should be treated as a success for
 /// `FleetEvent` emission purposes. Handlers that wrap `send_to` return

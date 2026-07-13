@@ -635,11 +635,13 @@ fn full_delete_clears_binding_and_succeeds_1879() {
 
 // ── #2764: proof-carrying workspace ownership (real full_delete entry) ──────
 //
-// These drive the REAL `full_delete_instance`, exercising the
-// removal-before-cleanup ordering: the victim's fleet entry is removed, then
-// cleanup runs against the PRE-removal snapshot. A victim whose
-// `working_directory` aliases (or nests inside) a SURVIVING instance's dir must
-// leave that dir byte-identical.
+// These drive the REAL `full_delete_instance`. #2764 E: the destructive phase
+// is id-anchored and the fleet entry is removed ONLY via the exact-id CAS
+// after a Clean path phase — a Preserved/Failed phase RETAINS the entry and
+// the delete surfaces as Err. A victim whose `working_directory` aliases (or
+// nests inside) a SURVIVING instance's dir must leave that dir byte-identical
+// AND keep its own fleet entry (loud, fail-closed — never success over a
+// preserved cleanup).
 
 /// Seed three canary files whose survival proves no whole-tree removal / scrub.
 fn seed_canaries(dir: &std::path::Path) {
@@ -675,10 +677,21 @@ fn full_delete_victim_aliasing_sibling_default_preserves_sibling() {
     .unwrap();
 
     let result = super::full_delete_instance(&home, "victim");
-    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    let err = result.expect_err("#2764 E: a preserved cleanup must surface as Err, not success");
+    assert!(
+        err.contains("preserved") || err.contains("fleet.yaml"),
+        "Err must carry the preserve reason / fleet residual, got: {err}"
+    );
     assert!(
         canaries_intact(&sibling_dir),
         "victim delete recursively removed/scrubbed the live sibling's dir {sibling_dir:?}"
+    );
+    assert!(
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml still parses")
+            .instances
+            .contains_key("victim"),
+        "#2764 E: the victim's fleet entry must be RETAINED on a preserved cleanup"
     );
     std::fs::remove_dir_all(home).ok();
 }
@@ -700,7 +713,10 @@ fn full_delete_shared_external_dir_preserves_survivor_config() {
     .unwrap();
 
     let result = super::full_delete_instance(&home, "victim");
-    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        result.is_err(),
+        "#2764 E: a preserved (shared) cleanup must surface as Err, got {result:?}"
+    );
     assert!(
         canaries_intact(&shared),
         "victim delete scrubbed a survivor-shared external dir {shared:?}"
@@ -729,7 +745,10 @@ fn full_delete_symlink_alias_preserves_target() {
     .unwrap();
 
     let result = super::full_delete_instance(&home, "victim");
-    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        result.is_err(),
+        "#2764 E: a preserved (aliased) cleanup must surface as Err, got {result:?}"
+    );
     assert!(
         canaries_intact(&sibling_dir),
         "victim delete followed a symlink and removed the live sibling's real dir {sibling_dir:?}"
@@ -764,6 +783,15 @@ fn full_delete_exact_owned_default_still_removed() {
         !vdir.exists(),
         "victim's exact owned default dir must still be removed, but survived: {vdir:?}"
     );
+    // #2764 E: the entry left via the exact-id CAS (backfill minted the id at
+    // the raw snapshot load; the CAS matched it).
+    assert!(
+        !crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml still parses")
+            .instances
+            .contains_key("victim"),
+        "victim's fleet entry must be CAS-removed after a Clean cleanup"
+    );
     std::fs::remove_dir_all(home).ok();
 }
 
@@ -782,6 +810,92 @@ fn full_delete_unreadable_fleet_fails_closed() {
     assert!(
         canaries_intact(&vdir),
         "unreadable fleet must fail closed (preserve), but the dir was mutated: {vdir:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 E (R5 blocker 1): a RAW `working_directory` containing `..` must fail
+/// closed BEFORE any mutation — no resolver fallback may substitute the
+/// default dir as a different deletion target, and the fleet entry stays.
+#[test]
+fn full_delete_dotdot_raw_working_directory_fails_closed() {
+    let home = tmp_home("dotdot_raw_wd");
+    let escape = crate::paths::workspace_dir(&home).join("escape");
+    seed_canaries(&escape);
+    let wd = crate::paths::workspace_dir(&home)
+        .join("victim")
+        .join("..")
+        .join("escape");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n",
+            wd.display()
+        ),
+    )
+    .unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(
+        result.is_err(),
+        "dotdot raw wd must fail closed as Err, got {result:?}"
+    );
+    assert!(
+        canaries_intact(&escape),
+        "the dotdot target must be untouched: {escape:?}"
+    );
+    assert!(
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml still parses")
+            .instances
+            .contains_key("victim"),
+        "the victim's fleet entry must be retained on a preserved cleanup"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 E: an EXISTING default workspace dir with NO fleet entry (ghost) has
+/// no raw-entry ownership anchor → preserved, loud Err. (A ghost with nothing
+/// on disk still deletes clean — see
+/// `full_delete_instance_returns_ok_when_no_residual`.)
+#[test]
+fn full_delete_entryless_existing_workspace_dir_fails_closed() {
+    let home = tmp_home("ghost_dir");
+    let gdir = crate::paths::workspace_dir(&home).join("ghost");
+    seed_canaries(&gdir);
+    // No fleet.yaml at all.
+
+    let result = super::full_delete_instance(&home, "ghost");
+    assert!(
+        result.is_err(),
+        "entry-less existing dir must fail closed as Err, got {result:?}"
+    );
+    assert!(
+        canaries_intact(&gdir),
+        "the anchor-less dir must be untouched: {gdir:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 E: the always-run metadata tail — full_delete removes the name-keyed
+/// `metadata/<name>.json` (port of the legacy `cleanup_working_dir` metadata
+/// coverage; the uuid path is covered by the #1682 tests above).
+#[test]
+fn full_delete_removes_name_keyed_metadata() {
+    let home = tmp_home("name_metadata");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  doomed:\n    backend: claude\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join("metadata")).unwrap();
+    std::fs::write(home.join("metadata/doomed.json"), "{}").unwrap();
+
+    let result = super::full_delete_instance(&home, "doomed");
+    assert!(result.is_ok(), "delete must return Ok, got {result:?}");
+    assert!(
+        !home.join("metadata/doomed.json").exists(),
+        "name-keyed metadata must be removed by full_delete"
     );
     std::fs::remove_dir_all(home).ok();
 }

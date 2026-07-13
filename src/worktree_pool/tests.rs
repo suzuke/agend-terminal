@@ -41,6 +41,32 @@ fn managed_workspace_worktree(home: &Path, repo: &Path, agent: &str, branch: &st
     wt
 }
 
+/// #2764 E: drive the REAL destructive entry (`full_delete_destructive_phase`)
+/// for a single-instance fleet whose entry points at `wd`. Replaces the
+/// deleted legacy `cleanup_working_dir` wrapper in the teardown tests below —
+/// the executor path (plan → fresh recheck → `execute_remove_owned`) is what
+/// those tests pin.
+fn e_phase_cleanup(home: &Path, agent: &str, wd: &Path) {
+    use crate::agent_ops::workspace_cleanup::{full_delete_destructive_phase, CleanupOutcome};
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(home),
+        format!(
+            "instances:\n  {agent}:\n    backend: claude\n    id: {}\n    working_directory: {}\n",
+            id.full(),
+            wd.display()
+        ),
+    )
+    .expect("seed fleet.yaml");
+    let fleet =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).expect("load fleet");
+    let out = full_delete_destructive_phase(home, agent, Some(&fleet));
+    assert!(
+        matches!(out, CleanupOutcome::Clean),
+        "destructive phase must be Clean for the exclusive owned dir, got {out:?}"
+    );
+}
+
 /// `git worktree list --porcelain` for `repo` — used to assert no orphan
 /// registration survives a teardown.
 fn worktree_list(repo: &Path) -> String {
@@ -70,7 +96,7 @@ fn worktree_entry_count(repo: &Path) -> usize {
 /// the canonical registration) — NOT a bare `remove_dir_all`, which deletes
 /// the dir but leaves an ORPHAN worktree entry in `<canonical>/.git/worktrees/`.
 #[test]
-fn cleanup_working_dir_managed_worktree_removes_via_git_no_orphan() {
+fn destructive_phase_managed_worktree_removes_via_git_no_orphan() {
     let home = tmp_home("p0-wt-noorphan");
     let repo = tmp_repo("p0-wt-noorphan-repo");
     let wt = managed_workspace_worktree(&home, &repo, "devw", "feat/p0");
@@ -80,7 +106,7 @@ fn cleanup_working_dir_managed_worktree_removes_via_git_no_orphan() {
         "baseline: main + the agent worktree are registered"
     );
 
-    crate::agent_ops::cleanup_working_dir(&home, "devw", &wt);
+    e_phase_cleanup(&home, "devw", &wt);
 
     assert!(!wt.exists(), "worktree dir must be removed");
     let after = worktree_list(&repo);
@@ -112,13 +138,13 @@ fn backup_dir_for(home: &Path, agent: &str) -> Option<PathBuf> {
 /// #2234 Phase 0: a worktree with UNCOMMITTED work is backed up WHOLE before
 /// the git removal — never silently destroyed.
 #[test]
-fn cleanup_working_dir_dirty_worktree_backs_up_before_remove() {
+fn destructive_phase_dirty_worktree_backs_up_before_remove() {
     let home = tmp_home("p0-wt-dirty");
     let repo = tmp_repo("p0-wt-dirty-repo");
     let wt = managed_workspace_worktree(&home, &repo, "devd", "feat/p0d");
     std::fs::write(wt.join("WIP.txt"), "unsaved work").unwrap();
 
-    crate::agent_ops::cleanup_working_dir(&home, "devd", &wt);
+    e_phase_cleanup(&home, "devd", &wt);
 
     assert!(!wt.exists(), "worktree removed");
     let backup = backup_dir_for(&home, "devd").expect("backup dir created");
@@ -139,7 +165,7 @@ fn cleanup_working_dir_dirty_worktree_backs_up_before_remove() {
 /// (committed-orphan) is backed up before removal — the has_uncommitted
 /// guard alone would miss it.
 #[test]
-fn cleanup_working_dir_committed_orphan_backs_up_before_remove() {
+fn destructive_phase_committed_orphan_backs_up_before_remove() {
     let home = tmp_home("p0-wt-orphan");
     let repo = tmp_repo("p0-wt-orphan-repo");
     let wt = managed_workspace_worktree(&home, &repo, "devo", "feat/p0o");
@@ -152,7 +178,7 @@ fn cleanup_working_dir_committed_orphan_backs_up_before_remove() {
         .output()
         .expect("git remote add");
 
-    crate::agent_ops::cleanup_working_dir(&home, "devo", &wt);
+    e_phase_cleanup(&home, "devo", &wt);
 
     assert!(!wt.exists(), "worktree removed");
     assert!(
@@ -198,7 +224,7 @@ fn teardown_marker_missing_still_removes_via_git_no_orphan() {
 
 /// #2234 Phase 0: a pre-(B) STANDALONE clone (`.git` is a DIRECTORY) is NOT
 /// a worktree → `teardown_workspace_worktree` declines (returns false) and
-/// `cleanup_working_dir` falls back to the byte-identical remove_dir_all.
+/// the E destructive phase falls back to the byte-identical remove_dir_all.
 #[test]
 fn teardown_standalone_clone_declines_byte_identical() {
     let home = tmp_home("p0-standalone");
@@ -217,8 +243,8 @@ fn teardown_standalone_clone_declines_byte_identical() {
 
     // Helper declines (not a worktree).
     assert!(!teardown_workspace_worktree(&home, "devs", &ws));
-    // Public path still removes the whole dir (byte-identical pre-(B)).
-    crate::agent_ops::cleanup_working_dir(&home, "devs", &ws);
+    // Real destructive path still removes the whole dir (byte-identical pre-(B)).
+    e_phase_cleanup(&home, "devs", &ws);
     assert!(!ws.exists(), "standalone workspace dir removed as before");
     assert!(
         backup_dir_for(&home, "devs").is_none(),

@@ -47,14 +47,17 @@ fn remove_empty_dir_tree(dir: &Path) {
 ///   active-channel binding drop, configs map remove, IPC port remove,
 ///   event log).
 /// - **fleet.yaml entry removal** so daemon restart's `auto_start_fleet`
-///   doesn't resurrect the dead agent.
+///   doesn't resurrect the dead agent. #2764 E: removal happens ONLY via the
+///   exact-id generation-CAS inside the destructive phase, and ONLY after the
+///   working-dir cleanup came back Clean — a preserved/failed cleanup keeps
+///   the entry and surfaces as `Err`.
 /// - **Telegram topic delete** for the resolved per-instance topic — leaving
 ///   it would orphan the topic on the chat side.
-/// - **Working-dir cleanup** via `cleanup_working_dir` (the shared
-///   `home/workspace/<name>` whole-tree branch + the user-dir agend-files
-///   branch). Custom-directory deployment subdirs are still cleaned by the
-///   reconcile path's `cleanup_deployment_dirs` after this — see
-///   `app/overlay.rs` for the layering.
+/// - **Working-dir cleanup** via
+///   `workspace_cleanup::full_delete_destructive_phase` (#2764 E): id-anchored
+///   whole-tree removal of the exclusive canonical default dir, or agend-file
+///   scrub of an exclusive user-provided dir; every ownership ambiguity is a
+///   complete fail-closed no-op.
 /// - **Team membership removal** so a closed instance doesn't leave a
 ///   dangling team-member reference.
 ///
@@ -74,14 +77,20 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // early `Err`, panic), so the name is always re-creatable afterwards — a
     // leaked mark would make it un-spawnable for the daemon's lifetime.
     let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
-    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    let (topic_id, working_dir) = fleet
+    // #2764 E: the RAW immutable pre-removal snapshot is the path authority.
+    // Distinguish MISSING (no roster → empty survivor set, ghost-delete flow)
+    // from UNREADABLE/CORRUPT (a roster may exist that we cannot read → the
+    // destructive phase fails closed on `None`).
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let fleet = if fleet_path.exists() {
+        crate::fleet::FleetConfig::load(&fleet_path).ok()
+    } else {
+        Some(crate::fleet::FleetConfig::default())
+    };
+    let topic_id = fleet
         .as_ref()
-        .and_then(|c| {
-            c.resolve_instance(name)
-                .map(|r| (r.topic_id, r.working_directory))
-        })
-        .unwrap_or((None, None));
+        .and_then(|c| c.resolve_instance(name))
+        .and_then(|r| r.topic_id);
     // #1157: extract InstanceId before fleet.yaml removal for id-based metadata cleanup.
     let instance_id = fleet
         .as_ref()
@@ -99,10 +108,6 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
         home,
         &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
     );
-    if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
-        step_errors.push(format!("fleet.yaml removal: {e}"));
-        tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
-    }
     if let Some(tid) = topic_id {
         // #2550 identity-confusion root cause: `delete_topic` only unregisters
         // `topics.json` on its own `Deleted` outcome. A `PermissionDenied` /
@@ -131,28 +136,42 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     } else {
         tracing::warn!(%name, "no topic_id found for full_delete_instance — possible orphan");
     }
-    // #1907: default to `workspace/<name>` when the fleet entry has no explicit
-    // `working_directory`. Otherwise the daemon-created default workspace dir
-    // (per-backend skills/config under `$AGEND_HOME/workspace/<name>`) LEAKS on
-    // delete — cleanup only ran when the resolver returned a path, but it
-    // returns `None` for the (common) entries that never set
-    // `working_directory:` explicitly.
-    let wd = working_dir
-        .clone()
-        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
-    // #2764: route the destructive cleanup through the proof-carrying planner
-    // using the IMMUTABLE pre-removal `fleet` snapshot captured above (BEFORE
-    // `remove_instance_from_yaml`), NOT a fresh post-removal reload — so
-    // survivor ownership authority reflects the true pre-delete roster. A
-    // victim `working_directory` that aliases a surviving instance's dir (the
-    // 2026-07-13 incident) now resolves to a complete path-local no-op instead
-    // of recursively removing the survivor's tree. `cohort = [name]` excludes
-    // only the victim from the survivor set.
-    crate::agent_ops::cleanup_working_dir_proven(home, fleet.as_ref(), &[name], name, &wd);
-    // #1157: clean id-based metadata. Fleet.yaml is already removed above,
-    // so cleanup_working_dir's best-effort lookup may miss the id path.
-    // #1682: construct the id path via agent_ops (fleet.yaml is gone, so the
-    // name→id resolver can't be used here — feed the captured id directly).
+    // #2764 E: the id-anchored destructive phase — the ONLY path that may
+    // destroy the victim's working dir (whole-tree remove / external scrub) AND
+    // the ONLY remover of its fleet.yaml entry (exact-id generation-CAS, run
+    // only after a Clean path phase). Authority is the RAW immutable `fleet`
+    // snapshot captured above; every ambiguity (no entry for an existing dir,
+    // legacy/no-id, dotdot, canonicalization, shared/overlapping survivor,
+    // stale exact-id at the pre-mutation re-check) is a complete no-op that
+    // KEEPS the fleet entry — so the delete surfaces loudly as Err instead of
+    // reporting success over preserved/failed cleanup (the 2026-07-13
+    // incident class).
+    {
+        use crate::agent_ops::workspace_cleanup::{full_delete_destructive_phase, CleanupOutcome};
+        match full_delete_destructive_phase(home, name, fleet.as_ref()) {
+            CleanupOutcome::Clean => {}
+            CleanupOutcome::Preserved { reason } => {
+                step_errors.push(format!(
+                    "workspace cleanup preserved (fail-closed): {reason}"
+                ));
+                tracing::warn!(name, %reason,
+                    "full_delete_instance: destructive phase preserved — fleet entry retained");
+            }
+            CleanupOutcome::Failed { reason } => {
+                step_errors.push(format!("workspace cleanup failed: {reason}"));
+                tracing::error!(name, %reason,
+                    "full_delete_instance: destructive phase failed — fleet entry retained unless CAS'd");
+            }
+        }
+    }
+    // Always-run metadata tail (never touches the workspace tree): the
+    // name-keyed metadata file + the non-hidden agy workspace link.
+    let _ = std::fs::remove_file(crate::agent_ops::metadata_path(home, name));
+    crate::agy_workspace::remove_link(home, name);
+    // #1157: clean id-based metadata. The fleet entry may already be removed
+    // by the CAS above, so a name→id resolver can't be used here.
+    // #1682: construct the id path via agent_ops — feed the captured id
+    // directly.
     // #1907: also drop the `<…>.lock` flock sidecar that `with_json_state` /
     // `acquire_file_lock` leaves next to the data file. The data removal above
     // (and the inbox removal below) left the advisory-lock files behind, and the

@@ -156,60 +156,10 @@ instances:
     std::fs::remove_dir_all(&home).ok();
 }
 
-// --- cleanup_working_dir ---
-
-#[test]
-fn cleanup_agend_workspace_removes_entire_dir() {
-    let home = tmp_home("cleanup_ws");
-    let ws = crate::paths::workspace_dir(&home).join("test-agent");
-    std::fs::create_dir_all(&ws).ok();
-    std::fs::write(ws.join("somefile.txt"), "data").ok();
-    std::fs::write(ws.join("opencode.json"), "{}").ok();
-
-    cleanup_working_dir(&home, "test-agent", &ws);
-    assert!(!ws.exists(), "workspace dir should be fully removed");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn cleanup_user_dir_only_removes_agend_files() {
-    let home = tmp_home("cleanup_user");
-    let user_dir = tmp_home("cleanup_user_proj");
-
-    // Create user file + agend-generated files
-    std::fs::write(user_dir.join("main.rs"), "fn main() {}").ok();
-    std::fs::write(user_dir.join("opencode.json"), "{}").ok();
-    std::fs::write(user_dir.join("mcp-config.json"), "{}").ok();
-    std::fs::create_dir_all(user_dir.join(".claude")).ok();
-    std::fs::write(user_dir.join(".claude/settings.local.json"), "{}").ok();
-
-    cleanup_working_dir(&home, "agent1", &user_dir);
-
-    // User file preserved
-    assert!(user_dir.join("main.rs").exists(), "user file must survive");
-    // Agend files removed
-    assert!(!user_dir.join("opencode.json").exists());
-    assert!(!user_dir.join("mcp-config.json").exists());
-    assert!(!user_dir.join(".claude/settings.local.json").exists());
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&user_dir).ok();
-}
-
-#[test]
-fn cleanup_removes_metadata() {
-    let home = tmp_home("cleanup_meta");
-    let ws = crate::paths::workspace_dir(&home).join("agent1");
-    std::fs::create_dir_all(&ws).ok();
-
-    std::fs::create_dir_all(home.join("metadata")).ok();
-    std::fs::write(home.join("metadata/agent1.json"), "{}").ok();
-
-    cleanup_working_dir(&home, "agent1", &ws);
-
-    assert!(!home.join("metadata/agent1.json").exists());
-    std::fs::remove_dir_all(&home).ok();
-}
+// --- cleanup_working_dir: legacy wrapper removed (#2764 E). Workspace-remove /
+// selective-scrub coverage lives on the real entry in
+// `agent_ops::workspace_cleanup::tests` (phase_* tests); the metadata tail is
+// covered in `instance_state/lifecycle/tests.rs`.
 
 // ---------------------------------------------------------------------
 // FleetEvent emission tests (Stage B-UX PR-A, design §2)

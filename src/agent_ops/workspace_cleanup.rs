@@ -118,15 +118,23 @@ fn survivor_conflict(
                     });
                 }
             }
-            Err(_) => {
-                // Un-canonicalizable survivor: a missing default dir cannot alias
-                // an existing candidate EXCEPT via symlink games. Fail closed only
-                // when the RAW survivor path lexically overlaps the candidate
-                // (raw or canonical) — an unrelated missing sibling is not a risk.
-                if paths_overlap(&swd, candidate) || paths_overlap(&swd, candidate_canonical) {
+            Err(e) => {
+                // Un-canonicalizable survivor. `NotFound` is definitive absence —
+                // no data of the survivor's exists to destroy through the
+                // candidate — so it only fails closed when the RAW survivor path
+                // lexically overlaps the candidate (its FUTURE home would sit
+                // inside the tree being removed). EVERY other failure
+                // (permission-hidden parent, symlink loop, I/O) leaves the
+                // survivor's real location unknowable: it may alias the candidate
+                // invisibly → PreserveAmbiguous (R5 blocker 2: the old
+                // lexical-overlap-only gate missed permission-hidden aliases).
+                if e.kind() != std::io::ErrorKind::NotFound
+                    || paths_overlap(&swd, candidate)
+                    || paths_overlap(&swd, candidate_canonical)
+                {
                     return Some(CleanupPlan::PreserveAmbiguous {
                         reason: format!(
-                            "surviving instance '{name}' working dir {} is un-canonicalizable and may alias the candidate",
+                            "surviving instance '{name}' working dir {} is un-canonicalizable ({e}) and may alias the candidate",
                             swd.display()
                         ),
                     });
@@ -187,13 +195,17 @@ pub fn plan_cleanup(
     let ws_root_canon = match dunce::canonicalize(&workspace_root) {
         Ok(c) => c,
         Err(e) => {
-            // Workspace root itself un-canonicalizable. If the candidate is
-            // lexically under the RAW workspace root we cannot prove default
-            // ownership → ambiguous. Otherwise it is an external user dir.
-            if candidate.starts_with(&workspace_root) {
+            // Workspace root itself un-canonicalizable. `NotFound` is definitive:
+            // no workspace root exists, so no default ownership is possible and
+            // nothing under it exists to alias — a candidate that canonicalized
+            // is genuinely external → scrub-only remains provable. EVERY other
+            // failure (permission-hidden root, I/O) is ambiguous → fail closed
+            // (R5 blocker 2: the old arm authorized ScrubExclusive for any
+            // lexically-external candidate even when the root was unreadable).
+            if e.kind() != std::io::ErrorKind::NotFound || candidate.starts_with(&workspace_root) {
                 return CleanupPlan::PreserveAmbiguous {
                     reason: format!(
-                        "workspace root {} does not canonicalize ({e}); candidate is under the raw workspace root",
+                        "workspace root {} does not canonicalize ({e})",
                         workspace_root.display()
                     ),
                 };
@@ -303,24 +315,29 @@ pub(crate) const AGEND_FILES: &[&str] = &[
 
 /// Execute a proven exclusive scrub: remove only agend-generated files (never a
 /// whole-tree remove) plus the `.worktrees/<agent>` helper worktree, from an
-/// external user-provided dir proven unshared. Revalidates first.
-pub fn execute_scrub_exclusive(home: &Path, agent: &str, proof: &ScrubExclusiveProof) {
+/// external user-provided dir proven unshared. Revalidates first. #2764 E: every
+/// fs/git failure propagates — a swallowed error must not read as a clean scrub.
+pub fn execute_scrub_exclusive(
+    home: &Path,
+    agent: &str,
+    proof: &ScrubExclusiveProof,
+) -> Result<(), String> {
     let _ = home; // reserved for symmetry with execute_remove_owned
-    if let Err(e) = revalidate(&proof.original, &proof.canonical) {
-        tracing::warn!(agent, error = %e, "#2764 scrub: revalidation failed — skipping");
-        return;
-    }
+    revalidate(&proof.original, &proof.canonical)?;
     let dir = &proof.canonical;
+    let mut errors: Vec<String> = Vec::new();
     for file in AGEND_FILES {
         let path = dir.join(file);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => errors.push(format!("remove {}: {e}", path.display())),
         }
     }
-    // Clean up the helper worktree if present (best-effort, bounded).
+    // Clean up the helper worktree if present.
     let wt_dir = dir.join(".worktrees").join(agent);
     if wt_dir.exists() {
-        let _ = crate::git_helpers::git_ok(
+        if crate::git_helpers::git_ok(
             dir,
             &[
                 "worktree",
@@ -328,9 +345,218 @@ pub fn execute_scrub_exclusive(home: &Path, agent: &str, proof: &ScrubExclusiveP
                 "--force",
                 &wt_dir.display().to_string(),
             ],
-        );
-        tracing::info!(dir = %wt_dir.display(), "removed worktree");
+        ) {
+            tracing::info!(dir = %wt_dir.display(), "removed worktree");
+        } else {
+            errors.push(format!("git worktree remove {} failed", wt_dir.display()));
+        }
     }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2764 E: id-anchored full-delete destructive phase
+// ---------------------------------------------------------------------------
+
+/// Typed outcome of [`full_delete_destructive_phase`] — the ONLY destructive
+/// path for an instance's working directory and the ONLY remover of its
+/// fleet.yaml entry (decision d-20260713091213053694-25).
+#[derive(Debug)]
+pub enum CleanupOutcome {
+    /// Path destruction completed (or nothing existed to destroy) AND — when a
+    /// fleet entry existed — that entry was removed via the exact-id CAS.
+    Clean,
+    /// Fail-closed complete no-op: authority unprovable (fleet unreadable, no
+    /// raw entry for an existing dir, no parseable durable id, dotdot,
+    /// canonicalization ambiguity, shared/overlapping survivor, or the fresh
+    /// pre-mutation recheck no longer authorizes). NOTHING was mutated — the
+    /// fleet entry (if any) remains.
+    Preserved { reason: String },
+    /// Destruction was authorized and attempted, but an operation failed
+    /// (worktree/fs/scrub error, or the exact-id fleet CAS was refused).
+    /// Never reported as success; the fleet entry is gone only when the CAS
+    /// itself succeeded.
+    Failed { reason: String },
+}
+
+/// #2764 E: the id-anchored destructive phase of `full_delete_instance`.
+///
+/// Authority chain, all fail-closed:
+/// 1. The candidate path comes from the RAW immutable snapshot entry — never
+///    `resolve_instance`, whose unrelated failures (ready-pattern, `..`
+///    rejection) fall back to a DIFFERENT default target (R5 blocker 1).
+/// 2. The entry must carry a parseable durable [`crate::types::InstanceId`]
+///    (the generation anchor); legacy/no-id preserves.
+/// 3. A missing filesystem entry at the raw candidate is vacuously clean —
+///    nothing to destroy — and proceeds straight to the fleet-entry CAS.
+/// 4. Otherwise [`plan_cleanup`] must authorize on the raw snapshot, the fleet
+///    is re-loaded IMMEDIATELY before mutation, the victim entry must still
+///    match its exact id (same-name replacement = survivor → preserve), and a
+///    fresh re-plan must re-authorize the SAME action on the SAME canonical
+///    target before the (self-revalidating) executor runs.
+/// 5. The fleet entry is removed only via the exact-id generation-CAS
+///    ([`crate::fleet::remove_instance_from_yaml_cas`]); refusal → `Failed`,
+///    and the entry stays (never `Ok`/provenance-erasure on failure).
+pub fn full_delete_destructive_phase(
+    home: &Path,
+    name: &str,
+    raw: Option<&FleetConfig>,
+) -> CleanupOutcome {
+    // Fleet unreadable/corrupt → an entry may exist that we cannot see →
+    // nothing is provable → complete no-op.
+    let Some(raw) = raw else {
+        return CleanupOutcome::Preserved {
+            reason: "fleet.yaml unreadable — cannot derive raw entry authority".to_string(),
+        };
+    };
+
+    let Some(entry) = raw.instances.get(name) else {
+        // No raw entry: nothing to CAS-remove. The default dir is only
+        // vacuously clean when NOTHING exists at it — an existing dir without
+        // a fleet entry has no ownership anchor → preserve.
+        let default_dir = crate::paths::workspace_dir(home).join(name);
+        return match std::fs::symlink_metadata(&default_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CleanupOutcome::Clean,
+            Ok(_) => CleanupOutcome::Preserved {
+                reason: format!(
+                    "no fleet entry for '{name}' but {} exists — ownership unprovable",
+                    default_dir.display()
+                ),
+            },
+            Err(e) => CleanupOutcome::Preserved {
+                reason: format!(
+                    "no fleet entry for '{name}' and {} is unreadable ({e})",
+                    default_dir.display()
+                ),
+            },
+        };
+    };
+
+    // The durable generation anchor: the entry's exact persisted InstanceId.
+    let Some(expected_id) = entry
+        .id
+        .as_deref()
+        .and_then(crate::types::InstanceId::parse)
+    else {
+        return CleanupOutcome::Preserved {
+            reason: format!("fleet entry '{name}' has no parseable durable id (legacy entry)"),
+        };
+    };
+
+    // RAW candidate from the snapshot entry itself (tilde-expanded explicit
+    // working_directory, else the default `workspace/<name>`).
+    let candidate = match entry.working_directory.as_deref() {
+        Some(d) => crate::fleet::resolve::expand_tilde_path(d),
+        None => crate::paths::workspace_dir(home).join(name),
+    };
+    if has_dotdot(&candidate) {
+        return CleanupOutcome::Preserved {
+            reason: format!(
+                "raw working_directory contains '..': {}",
+                candidate.display()
+            ),
+        };
+    }
+
+    // Vacuously clean: no filesystem entry at the raw candidate → nothing to
+    // destroy; fall through to the fleet-entry CAS.
+    let candidate_present = match std::fs::symlink_metadata(&candidate) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return CleanupOutcome::Preserved {
+                reason: format!("candidate {} unreadable ({e})", candidate.display()),
+            };
+        }
+    };
+
+    if candidate_present {
+        let stale_plan = plan_cleanup(Some(raw), home, &[name], name, &candidate);
+        let stale_canonical = match &stale_plan {
+            CleanupPlan::RemoveOwned(p) => p.canonical.clone(),
+            CleanupPlan::ScrubExclusive(p) => p.canonical.clone(),
+            CleanupPlan::PreserveShared { reason } | CleanupPlan::PreserveAmbiguous { reason } => {
+                return CleanupOutcome::Preserved {
+                    reason: reason.clone(),
+                };
+            }
+        };
+
+        // Immediately re-load the fleet before mutation. The victim is
+        // excluded from survivors ONLY because its exact durable id still
+        // matches; a same-name replacement (different/absent id) means the
+        // snapshot's authority is stale → preserve.
+        let fresh = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+            Ok(f) => f,
+            Err(e) => {
+                return CleanupOutcome::Preserved {
+                    reason: format!("pre-mutation fleet re-load failed ({e})"),
+                };
+            }
+        };
+        let fresh_id = fresh
+            .instances
+            .get(name)
+            .and_then(|i| i.id.as_deref())
+            .and_then(crate::types::InstanceId::parse);
+        if fresh_id != Some(expected_id) {
+            return CleanupOutcome::Preserved {
+                reason: format!(
+                    "victim entry '{name}' no longer matches its durable id \
+                     (replaced or removed since the snapshot)"
+                ),
+            };
+        }
+        // Fresh re-plan: re-canonicalization + symmetric overlap vs ALL fresh
+        // survivors + root/default ownership. It must re-authorize the SAME
+        // action on the SAME canonical target; the executor then revalidates
+        // original→canonical once more immediately before destruction.
+        match plan_cleanup(Some(&fresh), home, &[name], name, &candidate) {
+            CleanupPlan::RemoveOwned(fresh_proof)
+                if matches!(stale_plan, CleanupPlan::RemoveOwned(_))
+                    && fresh_proof.canonical == stale_canonical =>
+            {
+                if let Err(e) = execute_remove_owned(home, name, &fresh_proof) {
+                    return CleanupOutcome::Failed {
+                        reason: format!("remove owned workspace: {e}"),
+                    };
+                }
+            }
+            CleanupPlan::ScrubExclusive(fresh_proof)
+                if matches!(stale_plan, CleanupPlan::ScrubExclusive(_))
+                    && fresh_proof.canonical == stale_canonical =>
+            {
+                if let Err(e) = execute_scrub_exclusive(home, name, &fresh_proof) {
+                    return CleanupOutcome::Failed {
+                        reason: format!("scrub exclusive dir: {e}"),
+                    };
+                }
+            }
+            other => {
+                return CleanupOutcome::Preserved {
+                    reason: format!(
+                        "fresh pre-mutation recheck no longer authorizes the planned action \
+                         (was {stale_plan:?}, now {other:?})"
+                    ),
+                };
+            }
+        }
+    }
+
+    // Path phase clean → the fleet entry may now be removed, ONLY via the
+    // exact-id generation-CAS. Refusal (same-name replacement landed, entry
+    // vanished, read/write failure) → Failed; the entry is never force-removed
+    // and the caller never reports success.
+    if let Err(e) = crate::fleet::remove_instance_from_yaml_cas(home, name, &expected_id) {
+        return CleanupOutcome::Failed {
+            reason: format!("fleet entry exact-id CAS removal refused: {e}"),
+        };
+    }
+    CleanupOutcome::Clean
 }
 
 #[cfg(test)]
@@ -606,6 +832,392 @@ mod tests {
         assert!(
             matches!(plan, CleanupPlan::PreserveShared { .. }),
             "leaf symlink to a live sibling must PreserveShared, got {plan:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 blocker 2: an UN-CANONICALIZABLE survivor for a reason OTHER than
+    /// NotFound (permission-hidden parent) must PreserveAmbiguous even when the
+    /// raw paths do not lexically overlap — the survivor may alias the
+    /// candidate invisibly.
+    #[test]
+    #[cfg(unix)]
+    fn permission_hidden_survivor_is_preserve_ambiguous() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("permsurv");
+        let vdir = ws(&home, "victim");
+        std::fs::create_dir_all(&vdir).unwrap();
+        // Survivor's wd sits under a 0o000 parent OUTSIDE the workspace — no
+        // lexical overlap with the candidate.
+        let hidden_parent = home.join("hidden-parent");
+        std::fs::create_dir_all(hidden_parent.join("survivor-wd")).unwrap();
+        let fleet = fleet_with(
+            &home,
+            &[
+                ("victim", None),
+                (
+                    "survivor",
+                    Some(&hidden_parent.join("survivor-wd").display().to_string()),
+                ),
+            ],
+        );
+        std::fs::set_permissions(&hidden_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can traverse anything — skip when the hide didn't take.
+        let hidden = dunce::canonicalize(hidden_parent.join("survivor-wd")).is_err();
+        let plan = plan_cleanup(Some(&fleet), &home, &["victim"], "victim", &vdir);
+        std::fs::set_permissions(&hidden_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if hidden {
+            assert!(
+                matches!(plan, CleanupPlan::PreserveAmbiguous { .. }),
+                "permission-hidden survivor must fail closed, got {plan:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// R5 blocker 2: a workspace ROOT that fails to canonicalize for a reason
+    /// OTHER than NotFound (permission-hidden home) must PreserveAmbiguous —
+    /// never fall through to ScrubExclusive of a lexically-external candidate.
+    #[test]
+    #[cfg(unix)]
+    fn permission_hidden_workspace_root_is_preserve_ambiguous() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("permroot");
+        std::fs::create_dir_all(crate::paths::workspace_dir(&home)).unwrap();
+        let ext = tmp_home("permroot-ext");
+        let fleet = fleet_with(&home, &[("victim", Some(ext.to_str().unwrap()))]);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let hidden = dunce::canonicalize(crate::paths::workspace_dir(&home)).is_err();
+        let plan = plan_cleanup(Some(&fleet), &home, &["victim"], "victim", &ext);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if hidden {
+            assert!(
+                matches!(plan, CleanupPlan::PreserveAmbiguous { .. }),
+                "permission-hidden workspace root must fail closed, got {plan:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&ext).ok();
+    }
+
+    // ── #2764 E: full_delete_destructive_phase (id-anchored) ────────────────
+
+    /// Write fleet.yaml with EXPLICIT ids and load it. Returns the loaded
+    /// snapshot plus each instance's id in entry order.
+    fn fleet_with_ids(
+        home: &Path,
+        entries: &[(&str, Option<&str>)],
+    ) -> (FleetConfig, Vec<crate::types::InstanceId>) {
+        let mut yaml = String::from("instances:\n");
+        let mut ids = Vec::new();
+        for (name, wd) in entries {
+            let id = crate::types::InstanceId::new();
+            yaml.push_str(&format!(
+                "  {name}:\n    backend: claude\n    id: {}\n",
+                id.full()
+            ));
+            if let Some(d) = wd {
+                yaml.push_str(&format!("    working_directory: {d}\n"));
+            }
+            ids.push(id);
+        }
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+        let fleet = FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).unwrap();
+        (fleet, ids)
+    }
+
+    fn fleet_still_has(home: &Path, name: &str) -> bool {
+        FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .map(|c| c.instances.contains_key(name))
+            .unwrap_or(false)
+    }
+
+    /// Happy path: exclusive canonical default dir → whole tree removed AND the
+    /// fleet entry is removed via the exact-id CAS.
+    #[test]
+    fn phase_exact_owned_default_removes_and_cas_removes_entry() {
+        let home = tmp_home("ph-owned");
+        let vdir = ws(&home, "victim");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("f.txt"), "x").unwrap();
+        let (fleet, _) = fleet_with_ids(&home, &[("victim", Some(vdir.to_str().unwrap()))]);
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(matches!(out, CleanupOutcome::Clean), "got {out:?}");
+        assert!(!vdir.exists(), "owned default dir must be removed");
+        assert!(
+            !fleet_still_has(&home, "victim"),
+            "fleet entry must be CAS-removed after a Clean path phase"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// External exclusive user dir → EVERY canonical scrub entry is removed,
+    /// user files survive, entry CAS-removed. Port of the legacy 19-entry
+    /// drift guard onto the E entry: the list is spelled out LITERALLY
+    /// (independent of `AGEND_FILES`) so dropping an entry from the canonical
+    /// constant regresses this test — including the 5 Kiro paths the 2026-04-14
+    /// `mcp/handlers.rs` copy drifted on.
+    #[test]
+    fn phase_external_scrub_removes_all_19_canonical_entries_keeps_user_files() {
+        let home = tmp_home("ph-scrub");
+        let ext = tmp_home("ph-scrub-ext");
+        let canonical: [&str; 19] = [
+            // Claude (6)
+            ".claude/settings.local.json",
+            "mcp-config.json",
+            "claude-settings.json",
+            "statusline.sh",
+            "statusline.json",
+            ".claude/rules/agend.md",
+            // Gemini (1)
+            ".gemini/settings.json",
+            // OpenCode (2)
+            "opencode.json",
+            "instructions/agend.md",
+            // Codex (2)
+            ".codex/config.toml",
+            "AGENTS.md",
+            // Kiro (8) — the last 5 are the paths the drifted 14-entry copy missed
+            ".kiro/settings/mcp.json",
+            ".kiro/settings/agend-mcp-wrapper.sh",
+            ".kiro/steering/agend.md",
+            ".kiro/agents/agend.json",
+            ".kiro/agents/agend-prompt.md",
+            ".kiro/agents/default.json",
+            ".kiro/prompts/agend.md",
+            ".kiro/settings.json",
+        ];
+        assert_eq!(
+            AGEND_FILES.len(),
+            canonical.len(),
+            "AGEND_FILES drifted from the canonical 19-entry list"
+        );
+        for rel in &canonical {
+            let p = ext.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, "x").unwrap();
+        }
+        std::fs::write(ext.join("user-code.rs"), "fn main(){}").unwrap();
+        let (fleet, _) = fleet_with_ids(&home, &[("victim", Some(ext.to_str().unwrap()))]);
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(matches!(out, CleanupOutcome::Clean), "got {out:?}");
+        for rel in &canonical {
+            assert!(
+                !ext.join(rel).exists(),
+                "canonical entry not removed: {rel}"
+            );
+        }
+        assert!(
+            ext.join("user-code.rs").exists(),
+            "user file must survive the selective scrub"
+        );
+        assert!(!fleet_still_has(&home, "victim"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&ext).ok();
+    }
+
+    /// Legacy/no-id entry → Preserved, dir untouched, entry retained
+    /// (decision d-20260713090932932337-24: the durable InstanceId is the
+    /// generation anchor; without it nothing may be destroyed). Hand-built
+    /// snapshot — the YAML loader auto-backfills ids, so a no-id entry can
+    /// only reach the phase when that backfill could not persist.
+    #[test]
+    fn phase_no_id_entry_preserves() {
+        let home = tmp_home("ph-noid");
+        let vdir = ws(&home, "victim");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("f.txt"), "x").unwrap();
+        let mut fleet = FleetConfig::default();
+        fleet.instances.insert(
+            "victim".to_string(),
+            crate::fleet::InstanceConfig {
+                working_directory: Some(vdir.display().to_string()),
+                ..Default::default()
+            },
+        );
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "no-id entry must preserve, got {out:?}"
+        );
+        assert!(vdir.join("f.txt").exists(), "dir must be untouched");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Raw working_directory containing '..' → Preserved before any mutation
+    /// (R5 blocker 1: the raw record's own path is the authority — no
+    /// resolver fallback may substitute a different deletion target).
+    #[test]
+    fn phase_dotdot_raw_wd_preserves() {
+        let home = tmp_home("ph-dotdot");
+        let escape = ws(&home, "escape");
+        std::fs::create_dir_all(&escape).unwrap();
+        std::fs::write(escape.join("f.txt"), "x").unwrap();
+        let wd = ws(&home, "victim").join("..").join("escape");
+        let (fleet, _) = fleet_with_ids(&home, &[("victim", Some(&wd.display().to_string()))]);
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "dotdot raw wd must preserve, got {out:?}"
+        );
+        assert!(escape.join("f.txt").exists());
+        assert!(fleet_still_has(&home, "victim"), "entry must be retained");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// No fleet entry + nothing on disk at the default dir → vacuously Clean
+    /// (ghost delete keeps working); no CAS is attempted.
+    #[test]
+    fn phase_no_entry_no_dir_is_vacuously_clean() {
+        let home = tmp_home("ph-ghost");
+        let fleet = FleetConfig::default();
+        let out = full_delete_destructive_phase(&home, "ghost", Some(&fleet));
+        assert!(matches!(out, CleanupOutcome::Clean), "got {out:?}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// No fleet entry but the default workspace dir EXISTS → Preserved (an
+    /// existing dir without a raw-entry ownership anchor may not be removed).
+    #[test]
+    fn phase_no_entry_existing_default_dir_preserves() {
+        let home = tmp_home("ph-ghostdir");
+        let gdir = ws(&home, "ghost");
+        std::fs::create_dir_all(&gdir).unwrap();
+        std::fs::write(gdir.join("f.txt"), "x").unwrap();
+        let fleet = FleetConfig::default();
+        let out = full_delete_destructive_phase(&home, "ghost", Some(&fleet));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "entry-less existing dir must preserve, got {out:?}"
+        );
+        assert!(gdir.join("f.txt").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Entry with id but NOTHING at the raw candidate → vacuously Clean and
+    /// the fleet entry is still CAS-removed (deleting an instance whose
+    /// workspace never materialized must succeed).
+    #[test]
+    fn phase_missing_candidate_is_clean_and_cas_removes_entry() {
+        let home = tmp_home("ph-vacuous");
+        let (fleet, _) = fleet_with_ids(&home, &[("victim", None)]);
+        assert!(!ws(&home, "victim").exists(), "precondition: no dir");
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(matches!(out, CleanupOutcome::Clean), "got {out:?}");
+        assert!(!fleet_still_has(&home, "victim"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ABA: between the raw snapshot and the phase, the victim was replaced by
+    /// a SAME-NAME instance with a DIFFERENT id. The fresh exact-id recheck
+    /// must preserve — the replacement is a survivor, its dir and entry stay.
+    #[test]
+    fn phase_same_name_different_id_replacement_preserves() {
+        let home = tmp_home("ph-aba");
+        let vdir = ws(&home, "victim");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("f.txt"), "x").unwrap();
+        let (raw, _) = fleet_with_ids(&home, &[("victim", Some(vdir.to_str().unwrap()))]);
+        // Same-name replacement lands after the snapshot (new id).
+        let replacement = crate::types::InstanceId::new();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  victim:\n    backend: claude\n    id: {}\n    working_directory: {}\n",
+                replacement.full(),
+                vdir.display()
+            ),
+        )
+        .unwrap();
+        let out = full_delete_destructive_phase(&home, "victim", Some(&raw));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "same-name different-id replacement must preserve, got {out:?}"
+        );
+        assert!(
+            vdir.join("f.txt").exists(),
+            "replacement's dir must survive"
+        );
+        assert!(
+            fleet_still_has(&home, "victim"),
+            "replacement's entry must survive"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Victim entry REMOVED between snapshot and phase → preserve (no stale
+    /// destruction on vanished authority).
+    #[test]
+    fn phase_entry_vanished_since_snapshot_preserves() {
+        let home = tmp_home("ph-vanish");
+        let vdir = ws(&home, "victim");
+        std::fs::create_dir_all(&vdir).unwrap();
+        let (raw, _) = fleet_with_ids(&home, &[("victim", Some(vdir.to_str().unwrap()))]);
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let out = full_delete_destructive_phase(&home, "victim", Some(&raw));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "vanished entry must preserve, got {out:?}"
+        );
+        assert!(vdir.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Shared alias (victim wd = live sibling's default) → Preserved AND the
+    /// victim's fleet entry is retained (no CAS on a non-Clean path phase).
+    #[test]
+    fn phase_shared_alias_preserves_and_retains_entry() {
+        let home = tmp_home("ph-shared");
+        let sib = ws(&home, "sibling");
+        std::fs::create_dir_all(&sib).unwrap();
+        std::fs::write(sib.join("f.txt"), "x").unwrap();
+        let (fleet, _) = fleet_with_ids(
+            &home,
+            &[("victim", Some(sib.to_str().unwrap())), ("sibling", None)],
+        );
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "sibling alias must preserve, got {out:?}"
+        );
+        assert!(sib.join("f.txt").exists(), "sibling dir must be untouched");
+        assert!(
+            fleet_still_has(&home, "victim"),
+            "victim entry must be retained on Preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Dangling-symlink candidate: something EXISTS at the raw path (the link)
+    /// but it does not canonicalize → Preserved (not vacuous-clean).
+    #[test]
+    #[cfg(unix)]
+    fn phase_dangling_symlink_candidate_preserves() {
+        let home = tmp_home("ph-dangle");
+        let link = ws(&home, "victim");
+        std::fs::create_dir_all(crate::paths::workspace_dir(&home)).unwrap();
+        std::os::unix::fs::symlink(home.join("nowhere"), &link).unwrap();
+        let (fleet, _) = fleet_with_ids(&home, &[("victim", Some(link.to_str().unwrap()))]);
+        let out = full_delete_destructive_phase(&home, "victim", Some(&fleet));
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "dangling symlink candidate must preserve, got {out:?}"
+        );
+        assert!(fleet_still_has(&home, "victim"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Unreadable fleet (None snapshot) → Preserved (an entry may exist that
+    /// we cannot see; nothing is provable).
+    #[test]
+    fn phase_unreadable_fleet_preserves() {
+        let home = tmp_home("ph-nofleet");
+        let out = full_delete_destructive_phase(&home, "victim", None);
+        assert!(
+            matches!(out, CleanupOutcome::Preserved { .. }),
+            "unreadable fleet must preserve, got {out:?}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
