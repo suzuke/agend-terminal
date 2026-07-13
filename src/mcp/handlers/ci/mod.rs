@@ -125,3 +125,10 @@ mod exact_head_watch_tests;
 #[path = "exact_head_merge_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
+
+// #2755 repo-checkout transactional submodule provisioning — real-entry tests in
+// a sibling file (test-named ⇒ file_size_invariant-exempt; keeps checkout.rs small).
+#[cfg(test)]
+#[path = "checkout_submodule_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod checkout_submodule_tests;
