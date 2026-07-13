@@ -20,6 +20,19 @@ mod source_resolve;
 // the re-exports below preserve EVERY `ci::handle_*` path used by dispatch.rs and
 // every `super::*` path used by the child `tests` module (zero caller/test edits).
 mod checkout;
+// #2755 R3: response-mapping + marker-durability helpers extracted from checkout.rs
+// to keep that handler under the LOC ceiling (same relief pattern as source_resolve).
+mod checkout_helpers;
+// #2755 R4: the idempotent bind-reuse contract, extracted from checkout.rs for the LOC
+// ceiling (deadlock-safe lock transfer + canonical provenance + sync/init/verify).
+mod checkout_reuse;
+// #2755: pub(crate) so the daemon per-tick + boot-repair recovery can reach the
+// shared `recover_pending_sweep_prod` (checkout provisioning is in `ci`, the
+// recovery driver is in `daemon`/`bootstrap`).
+pub(crate) mod checkout_txn;
+// #2755 R4: the crash-recovery sweep driver, split out of checkout_txn for the LOC
+// ceiling (re-exported from checkout_txn so caller paths are unchanged).
+pub(crate) mod checkout_recovery;
 mod cleanup;
 mod merge;
 mod release;
@@ -125,3 +138,10 @@ mod exact_head_watch_tests;
 #[path = "exact_head_merge_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
+
+// #2755 repo-checkout transactional submodule provisioning — real-entry tests in
+// a sibling file (test-named ⇒ file_size_invariant-exempt; keeps checkout.rs small).
+#[cfg(test)]
+#[path = "checkout_submodule_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod checkout_submodule_tests;

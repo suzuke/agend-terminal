@@ -361,18 +361,8 @@ fn init_submodules_after_create(wt_dir: &Path) {
     if !wt_dir.join(".gitmodules").is_file() {
         return;
     }
-    match crate::git_helpers::git_cmd(
-        wt_dir,
-        &[
-            "-c",
-            "protocol.file.allow=always",
-            "submodule",
-            "update",
-            "--init",
-            "--recursive",
-        ],
-    ) {
-        Ok(_) => {
+    match init_submodules_strict(wt_dir) {
+        Ok(()) => {
             tracing::info!(
                 path = %wt_dir.display(),
                 "initialized submodules after worktree create"
@@ -388,6 +378,88 @@ fn init_submodules_after_create(wt_dir: &Path) {
             );
         }
     }
+}
+
+/// #2755: recursively initialize submodules in a freshly-added worktree, returning
+/// the git error string on failure (a HARD variant of the soft-warn
+/// [`init_submodules_after_create`]). `repo action=checkout`'s SubmodulesReady
+/// phase uses this so a failed init ABORTS into rollback instead of returning a
+/// worktree with missing path-dependency content. No-op (`Ok`) when `.gitmodules`
+/// is absent.
+///
+/// `-c protocol.file.allow=always` is intentional: git's submodule clone helper
+/// ignores the superproject's stored `protocol.file.allow` (security default
+/// post-2.38), so hermetic file-path submodule fixtures — and rare local-path
+/// submodules — need the command-line override. https/ssh remotes are unaffected.
+pub(crate) fn init_submodules_strict(wt_dir: &Path) -> Result<(), String> {
+    if !wt_dir.join(".gitmodules").is_file() {
+        return Ok(());
+    }
+    crate::git_helpers::git_cmd(
+        wt_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// #2755 R3 (root review): after a recursive init, PROVE the working tree's submodules
+/// are at the EXACT commits the superproject's gitlinks record. `git worktree add` +
+/// init succeeding is NOT sufficient for a REUSED tree whose branch ref advanced (or a
+/// partial init) — a submodule can be left at a stale commit. `git submodule status
+/// --recursive` prefixes each line: ` ` = at the recorded commit, `-` = not initialized,
+/// `+` = a DIFFERENT commit than the gitlink, `U` = merge conflict. Any of `-`/`+`/`U`
+/// ⇒ the final tree is NOT proven buildable ⇒ Err (fail closed). No `.gitmodules` ⇒ Ok.
+pub(crate) fn verify_submodules_at_gitlinks(wt_dir: &Path) -> Result<(), String> {
+    if !wt_dir.join(".gitmodules").is_file() {
+        return Ok(());
+    }
+    let status = crate::git_helpers::git_cmd(
+        wt_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "status",
+            "--recursive",
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    for line in status.lines() {
+        if matches!(line.chars().next(), Some('-' | '+' | 'U')) {
+            return Err(format!(
+                "submodule not at its recorded gitlink commit: {}",
+                line.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// #2755 R3 (root review / decision d-…37): FAIL-CLOSED variant of
+/// [`sync_worktree_to_head`] for idempotent reuse — the reused tree must be synced to
+/// the FINAL HEAD (an externally advanced branch may change gitlinks) BEFORE recursive
+/// init, and a sync failure must ABORT the reuse (return no success), not be swallowed.
+/// A clean tree is a no-op (never a destructive reset on a clean worktree); a
+/// reset/clean failure returns `Err`.
+pub(crate) fn sync_worktree_to_head_strict(worktree_dir: &Path) -> Result<(), String> {
+    use crate::git_helpers::git_cmd;
+    match git_cmd(worktree_dir, &["status", "--porcelain"]) {
+        Ok(status) if status.is_empty() => return Ok(()), // clean ⇒ nothing to sync
+        Ok(_) => {}
+        Err(e) => return Err(format!("status probe failed: {e}")),
+    }
+    git_cmd(worktree_dir, &["reset", "--hard", "HEAD"])
+        .map_err(|e| format!("reset failed: {e}"))?;
+    git_cmd(worktree_dir, &["clean", "-fd"]).map_err(|e| format!("clean failed: {e}"))?;
+    Ok(())
 }
 
 /// #888 affirmative-signal predicate: does this instance opt into a per-agent

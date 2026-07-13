@@ -297,6 +297,13 @@ pub(crate) fn boot_hygiene_sweeps(home: &Path) {
             );
         }
     });
+    // #2755: retry any checkout-transaction rollback left pending by a prior
+    // (possibly crashed) daemon — the SAME callable the per-tick handler runs, so
+    // a worktree whose rollback `remove --force` failed recovers at boot, not only
+    // on the next tick.
+    time_step("checkout_txn_recover", || {
+        crate::mcp::handlers::ci::checkout_txn::recover_pending_sweep_prod(home);
+    });
 }
 
 /// Result of [`resolve_fleet_and_reconcile`]: the normalized fleet config, the
