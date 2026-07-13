@@ -555,13 +555,17 @@ fn t18_scan_and_emit_fires_once_per_sha() {
     save(&dir, &s).unwrap();
 
     let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // #2749 3a: a SUCCESSFUL gh poll (open PR, no OIDs) so apply_gh_observations
+    // leaves the stamped observed_* intact. CliGhPoller errors in tests, and the
+    // #2749 failure arm now sets observed_error — which would close the freshness
+    // gate. One response per scan (both open).
+    let poller = MockGhPoller::new(vec![
+        Ok(vec![gh_meta_open(100, "feat/test", "dev")]),
+        Ok(vec![gh_meta_open(100, "feat/test", "dev")]),
+    ]);
 
     // First scan: emit.
-    scan_and_emit_with(
-        &dir,
-        &registry,
-        &crate::daemon::pr_state::gh_poll::CliGhPoller,
-    );
+    scan_and_emit_with(&dir, &registry, &poller);
     let inbox_msgs = crate::inbox::drain(&dir, "lead-w");
     assert_eq!(inbox_msgs.len(), 1, "expected one [pr-ready-for-merge]");
     assert_eq!(inbox_msgs[0].kind.as_deref(), Some("pr-ready-for-merge"));
@@ -584,11 +588,7 @@ fn t18_scan_and_emit_fires_once_per_sha() {
     assert_eq!(inbox_msgs[0].reviewed_head.as_deref(), Some("sha-A"));
 
     // Second scan: must NOT re-emit (debounce per ready_emitted_for_sha).
-    scan_and_emit_with(
-        &dir,
-        &registry,
-        &crate::daemon::pr_state::gh_poll::CliGhPoller,
-    );
+    scan_and_emit_with(&dir, &registry, &poller);
     let inbox_msgs = crate::inbox::drain(&dir, "lead-w");
     assert!(
         inbox_msgs.is_empty(),

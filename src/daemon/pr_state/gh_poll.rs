@@ -8,7 +8,7 @@
 //! ## Architecture
 //!
 //! - [`GhPoller`] trait — production [`CliGhPoller`] shells out to
-//!   `gh pr list --json author,number,headRefName,isCrossRepository,isDraft,state,mergedAt
+//!   `gh pr list --json author,number,headRefName,isCrossRepository,isDraft,state,mergedAt,headRefOid,baseRefOid
 //!   --state all`; tests inject [`MockGhPoller`] with canned responses
 //!   (§3.20 SOP 1 — no subprocess invocation in unit tests).
 //! - Single batched call per repo per scanner tick (NOT per-PR
@@ -115,6 +115,9 @@ impl GhPoller for CliGhPoller {
                 "isDraft",
                 "state",
                 "mergedAt",
+                // #2749: atomic head+base tip OIDs in the SAME response.
+                "headRefOid",
+                "baseRefOid",
             ],
             None, // #PR-D: uses --repo (no cwd), byte-identical to before
         );
@@ -167,8 +170,10 @@ fn summary_to_gh_metadata(s: crate::scm::PrSummary) -> Option<GhPrMetadata> {
         is_draft: s.is_draft.unwrap_or(false),
         state,
         merged_at: s.merged_at,
-        head_ref_oid: None,
-        base_ref_oid: None,
+        // #2749: carry the atomic head/base OIDs through (may be None if the
+        // provider did not surface them — the gate then fails closed).
+        head_ref_oid: s.head_ref_oid,
+        base_ref_oid: s.base_ref_oid,
     })
 }
 

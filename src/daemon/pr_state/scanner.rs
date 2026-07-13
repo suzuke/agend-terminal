@@ -781,6 +781,11 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                     let _ = with_pr_state(home, &repo, &branch, |s| {
                         s.gh_poll_failures = s.gh_poll_failures.saturating_add(1);
                         s.last_gh_poll_at = Some(now.clone());
+                        // #2749: a transport failure means we could NOT re-observe
+                        // the head/base tips — the gate must fail closed. Flag it
+                        // but do NOT advance `observed_at` and do NOT clobber the
+                        // last-good observed pair (CORRECTION 3 / GO-proof).
+                        s.observed_error = true;
                     });
                 }
             }
@@ -804,6 +809,21 @@ fn apply_gh_observations(
     let Some(meta) = prs.iter().find(|m| m.head_ref == state.branch) else {
         return;
     };
+
+    // #2749: ATOMIC observation — write the head + base tips from the SAME gh
+    // response TOGETHER (never a torn two-read compose; CORRECTION 3 / codex R2).
+    // Only write when BOTH OIDs are present: GitHub always surfaces them, so
+    // production always refreshes; a provider (or older gh) that omits them leaves
+    // the last observation untouched so it simply ages out past the gate TTL
+    // (fail-closed) rather than being clobbered into a half-pair. A fresh good
+    // observation also CLEARS any prior `observed_error` (e.g. from an earlier
+    // transport failure).
+    if let (Some(h), Some(b)) = (meta.head_ref_oid.as_deref(), meta.base_ref_oid.as_deref()) {
+        state.observed_head_sha = Some(h.to_string());
+        state.observed_base_sha = Some(b.to_string());
+        state.observed_at = Some(now.to_string());
+        state.observed_error = false;
+    }
 
     // First observation — populate identity fields.
     if state.pr_author.is_empty() {
