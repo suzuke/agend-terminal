@@ -80,6 +80,74 @@ fn new_state(head: &str, class: ReviewClass) -> PrState {
     }
 }
 
+/// #2749 (Fable mandatory evidence): a PrState JSON written BEFORE #2749 added the
+/// freshness/observed fields — and a nested last_gh_state GhPrMetadata written
+/// before the atomic-OID fields — MUST load with every new field defaulted, never
+/// a `missing field` deserialize error. `#[serde(default)]` on each new field is
+/// what keeps pre-existing on-disk state files loadable across the upgrade.
+#[test]
+fn pre_2749_state_json_loads_with_defaulted_freshness_and_oid_fields() {
+    // Populate a state (incl. a last_gh_state), serialize, then STRIP the
+    // #2749-added keys to simulate a file written before they existed.
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.observed_head_sha = Some("h".into());
+    s.observed_error = true;
+    s.freshness_behind_by = Some(3);
+    s.last_gh_state = Some(GhPrMetadata {
+        number: 1,
+        author_login: "dev".into(),
+        head_ref: "feat/test".into(),
+        is_cross_repository: false,
+        is_draft: false,
+        state: GhPrState::Open,
+        merged_at: None,
+        head_ref_oid: Some("oid".into()),
+        base_ref_oid: Some("oid2".into()),
+    });
+    let mut v = serde_json::to_value(&s).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    for k in [
+        "observed_head_sha",
+        "observed_base_sha",
+        "observed_at",
+        "observed_error",
+        "freshness_checked_head_sha",
+        "freshness_checked_base_sha",
+        "freshness_checked_at",
+        "freshness_behind_by",
+        "freshness_error",
+    ] {
+        obj.remove(k);
+    }
+    if let Some(gh) = obj.get_mut("last_gh_state").and_then(|g| g.as_object_mut()) {
+        gh.remove("head_ref_oid");
+        gh.remove("base_ref_oid");
+    }
+
+    let loaded: PrState = serde_json::from_value(v).expect("pre-#2749 json must load, not error");
+    assert!(
+        loaded.observed_head_sha.is_none(),
+        "observed_head_sha ⇒ None"
+    );
+    assert!(loaded.observed_base_sha.is_none());
+    assert!(loaded.observed_at.is_none());
+    assert!(!loaded.observed_error, "observed_error ⇒ false");
+    assert!(loaded.freshness_checked_head_sha.is_none());
+    assert!(loaded.freshness_checked_base_sha.is_none());
+    assert!(loaded.freshness_checked_at.is_none());
+    assert!(
+        loaded.freshness_behind_by.is_none(),
+        "freshness_behind_by ⇒ None"
+    );
+    assert!(!loaded.freshness_error);
+    let gh = loaded.last_gh_state.expect("last_gh_state survives");
+    assert!(
+        gh.head_ref_oid.is_none(),
+        "GhPrMetadata head_ref_oid ⇒ None"
+    );
+    assert!(gh.base_ref_oid.is_none());
+}
+
 /// T1: CI green at head_sha + Verified at same head_sha → MergeReady.
 #[test]
 fn t1_ci_then_verdict_at_same_sha_yields_merge_ready() {
