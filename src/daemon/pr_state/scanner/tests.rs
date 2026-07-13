@@ -1480,3 +1480,161 @@ fn terminal_marker_recorded_before_pr_state_file_removed() {
              backstop a marker that was never written)"
     );
 }
+
+// ─────── t-…-17 B4 (codex m-…-479): scanner defensive revalidation + self-heal ───────
+// The scanner emits [pr-ready-for-merge] off the CACHED `merge_state == MergeReady`
+// WITHOUT re-running `is_merge_ready`. A late active reservation or a freshly-unreadable
+// authority (`authority_unknown`) leaves a stale cached MergeReady → the fail-closed
+// merge gate is bypassed. The scanner now DEFENSIVELY re-runs is_merge_ready before the
+// freshness delivery; a stale MergeReady is self-healed to NotReady + the event
+// suppressed. Emission is asserted via the persisted `ready_emitted_for_sha` flag (the
+// #2749 harness convention), self-heal via the persisted `merge_state`.
+
+fn a_reservation() -> super::super::ReservedAssignment {
+    super::super::ReservedAssignment {
+        target: "reviewer".into(),
+        review_author: crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        assignment_id: uuid::Uuid::new_v4(),
+    }
+}
+
+/// RED (a): a cached FRESH MergeReady PR that ALSO carries a late ACTIVE reservation.
+/// Pre-fix the gate-less scanner sees MergeReady + a Fresh tuple and emits pr-ready
+/// (fail-open). The defensive re-check finds `is_merge_ready` false (reserved non-empty),
+/// self-heals `merge_state` to NotReady, and emits NOTHING.
+#[test]
+fn b4_scanner_self_heals_cached_mergeready_with_late_reservation() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-479-scan-reserved-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let head = "abcdef0";
+    let mut s = merge_ready_state("o/r", "b", head, 81);
+    stamp_fresh_tuple(&mut s, head, "beef0001", 0);
+    // A late ACTIVE reservation — `is_merge_ready` closes on this (I17), but the cached
+    // MergeReady predates it.
+    s.reserved_assignments = vec![a_reservation()];
+    save(&home, &s).unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(81, "b")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    let reloaded = load(&home, "o/r", "b").expect("state persists");
+    assert_eq!(
+        reloaded.ready_emitted_for_sha, None,
+        "codex m-…-479: a cached MergeReady with a late reservation must NOT emit \
+             [pr-ready-for-merge] (defensive re-check fails closed)"
+    );
+    assert_eq!(
+        reloaded.merge_state,
+        MergeState::NotReady,
+        "codex m-…-479: the stale cached MergeReady must be SELF-HEALED to NotReady"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED (b): a cached FRESH MergeReady PR whose authority became UNREADABLE
+/// (`authority_unknown == true`, the fail-closed flag set by the tri-state probe).
+/// Pre-fix the scanner emits pr-ready off the stale cache; the defensive re-check finds
+/// `is_merge_ready` false (authority_unknown), self-heals to NotReady, suppresses.
+#[test]
+fn b4_scanner_self_heals_cached_mergeready_with_authority_unknown() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-479-scan-authunknown-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let head = "abcdef0";
+    let mut s = merge_ready_state("o/r", "b", head, 82);
+    stamp_fresh_tuple(&mut s, head, "beef0001", 0);
+    // The authority was UNREADABLE at the last drain ⇒ fail-closed flag set, but the
+    // cached MergeReady predates it.
+    s.authority_unknown = true;
+    save(&home, &s).unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(82, "b")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    let reloaded = load(&home, "o/r", "b").expect("state persists");
+    assert_eq!(
+        reloaded.ready_emitted_for_sha, None,
+        "codex m-…-479: a cached MergeReady with authority_unknown must NOT emit \
+             [pr-ready-for-merge] (defensive re-check fails closed)"
+    );
+    assert_eq!(
+        reloaded.merge_state,
+        MergeState::NotReady,
+        "codex m-…-479: the stale cached MergeReady must be SELF-HEALED to NotReady"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED (d): a DIRECTLY-PERSISTED stale MergeReady carrying BOTH a reservation AND
+/// authority_unknown ⇒ a real scan self-heals it to NotReady and emits nothing (the
+/// self-heal is durably persisted). Repair-convergence via the OTHER modified path:
+/// once the reservation/authority is repaired (no active records ⇒ probe Absent), a
+/// `redrive_reserved` (the A10b reconciler's per-branch step) clears the flags AND
+/// recomputes `merge_state` back to MergeReady — proving the shared
+/// `apply_authority_transition` recompute is bidirectional in BOTH callers.
+#[test]
+fn b4_scanner_self_heal_persists_then_redrive_recomputes_bidirectional() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-479-scan-heal-redrive-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let head = "abcdef0";
+    let mut s = merge_ready_state("o/r", "b", head, 83);
+    stamp_fresh_tuple(&mut s, head, "beef0001", 0);
+    s.reserved_assignments = vec![a_reservation()];
+    s.authority_unknown = true;
+    save(&home, &s).unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(83, "b")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    let healed = load(&home, "o/r", "b").expect("state persists");
+    assert_eq!(
+        healed.ready_emitted_for_sha, None,
+        "codex m-…-479: a stale corrupt-carrying MergeReady must NOT emit pr-ready"
+    );
+    assert_eq!(
+        healed.merge_state,
+        MergeState::NotReady,
+        "codex m-…-479: the scan must self-heal the stale MergeReady to NotReady (persisted)"
+    );
+
+    // Repair-convergence via redrive_reserved: there is NO assignment store for this
+    // branch (reserved/authority_unknown were set directly), so the probe reports Absent
+    // ⇒ derive lock-free ⇒ reserved emptied, authority_unknown CLEARED, and the recompute
+    // restores MergeReady (the state is otherwise ready). This exercises the redrive
+    // caller of the shared recompute (the reconciler path), complementing RED (c)'s
+    // record_ci_result caller.
+    crate::daemon::assignment_authority::redrive_reserved(&home, "o/r", "b");
+    let repaired = load(&home, "o/r", "b").expect("state persists");
+    assert!(
+        repaired.reserved_assignments.is_empty(),
+        "redrive with no active records ⇒ reserved cleared"
+    );
+    assert!(
+        !repaired.authority_unknown,
+        "redrive with Absent authority ⇒ authority_unknown CLEARED"
+    );
+    assert_eq!(
+        repaired.merge_state,
+        MergeState::MergeReady,
+        "repair-convergence: redrive's recompute restores MergeReady when readiness returns \
+             (bidirectional — not a one-way latch)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

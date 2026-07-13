@@ -3079,3 +3079,104 @@ fn b4_sole_corrupt_record_holds_merge_gate_closed_fail_closed() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// t-…-17 B4 (codex m-…-479) RED (c) — the REDUCER-side cached-`merge_state`
+/// recompute. `record_ci_result` applies `Event::CiObserved` (which derives
+/// `merge_state`) BEFORE the A6 authority drain sets `reserved_assignments`, so
+/// pre-fix the CACHED `merge_state` stays `MergeReady` even though the just-added
+/// reservation makes `is_merge_ready` false — a stale `MergeReady` the scanner would
+/// emit `[pr-ready-for-merge]` on, bypassing the fail-closed gate. The shared
+/// `apply_authority_transition` now recomputes nonterminal `merge_state` as its FINAL
+/// step, so a same-head CI observation whose drain adds a reservation persists
+/// `merge_state == NotReady`. Repair-convergence: once the reservation is revoked, a
+/// subsequent `record_ci_result` re-derives back to `MergeReady` (bidirectional — the
+/// recompute is not a one-way latch).
+#[test]
+fn b4_record_ci_result_recomputes_cached_merge_state_after_reservation_drain() {
+    let home = t30_home("b4-479-reducer");
+    // An active assignment for a SEPARATE, still-unverified reviewer on THIS generation
+    // ⇒ the A6 drain reserves it (it is NOT the verified reviewer below, so `classify`
+    // does not mark it SatisfiedExactHead and exclude it).
+    t30_persist_asgn(&home, "owner/repo", "feat/x", "reviewer", 42);
+    // A state otherwise fully ready at sha-A: a DIFFERENT reviewer VERIFIED at head
+    // satisfies the Single threshold, not draft; CI is set Green at head by
+    // record_ci_result below. reserved starts empty, so the pre-drain CiObserved
+    // derivation computes MergeReady (the stale value the drain must recompute away).
+    let mut ps = new_for_branch("owner/repo", "feat/x", "sha-A", ReviewClass::Single);
+    ps.pr_number = 42;
+    ps.verdict_state = VerdictState::Verified {
+        reviewers: vec![("verifier".into(), "sha-A".into())],
+    };
+    save(&home, &ps).unwrap();
+
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+
+    let s = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(
+        s.reserved_assignments
+            .iter()
+            .map(|r| r.target.clone())
+            .collect::<Vec<_>>(),
+        vec!["reviewer".to_string()],
+        "the A6 drain reserved the active record"
+    );
+    assert!(
+        !is_merge_ready(&s),
+        "a reserved required reviewer ⇒ is_merge_ready false"
+    );
+    // THE RED: pre-fix, merge_state stayed the stale MergeReady derived BEFORE the
+    // drain; the recompute must persist NotReady.
+    assert_eq!(
+        s.merge_state,
+        MergeState::NotReady,
+        "codex m-…-479: apply_authority_transition must recompute the cached merge_state to \
+         NotReady after the drain adds a reservation (pre-fix it stayed a stale MergeReady)"
+    );
+
+    // Repair-convergence: revoke the reservation (remove the sole active record), then a
+    // subsequent same-head CI observation must re-derive merge_state back to MergeReady —
+    // proving the recompute is bidirectional (not a one-way latch that only closes).
+    let rpath = crate::daemon::assignment_authority::record_path_for_test(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "reviewer",
+    );
+    std::fs::remove_file(&rpath).unwrap();
+    record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/x",
+        "sha-A",
+        CiConclusion::Green,
+        vec![],
+        ReviewClass::Single,
+    );
+    let s2 = load(&home, "owner/repo", "feat/x").unwrap();
+    assert!(
+        s2.reserved_assignments.is_empty(),
+        "reservation revoked ⇒ reserved empty"
+    );
+    assert!(
+        !s2.authority_unknown,
+        "record removed ⇒ authority Absent ⇒ authority_unknown CLEARED"
+    );
+    assert!(
+        is_merge_ready(&s2),
+        "the otherwise-ready state is merge-ready again once the reservation is gone"
+    );
+    assert_eq!(
+        s2.merge_state,
+        MergeState::MergeReady,
+        "repair-convergence: the recompute restores MergeReady when readiness returns (bidirectional)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
