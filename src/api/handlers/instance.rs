@@ -120,6 +120,23 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             return json!({"ok": true});
         }
     }
+    // #2764 R7 (codex P0-2): exact-generation stop gate — when the caller pins
+    // the expected durable id, refuse outright if the current fleet mapping no
+    // longer matches (same-name replacement): the stop must only ever target
+    // the designated generation, never whatever now holds the name.
+    if let Some(expected) = params["expected_id"]
+        .as_str()
+        .and_then(crate::types::InstanceId::parse)
+    {
+        let current = crate::fleet::resolve_uuid(ctx.home, name);
+        if current != Some(expected) {
+            return json!({"ok": false, "stopped": false, "error": format!(
+                "generation mismatch: expected {} but fleet.yaml maps '{name}' to {:?}",
+                expected.full(),
+                current.map(|c| c.full())
+            )});
+        }
+    }
     // delete_transaction kills the process tree, waits up to CHILD_EXIT_TIMEOUT
     // for actual exit, then removes registry / drops Telegram binding /
     // removes configs / removes IPC port / emits event log. Sprint 20 F2 fix:
@@ -127,7 +144,11 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     // had reaped the PID, exposing PID re-use + concurrent-spawn collision
     // races.
     let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false);
-    crate::daemon::lifecycle::delete_transaction(
+    // #2764 R7 (codex P0-2): the exit disposition is no longer collapsed —
+    // `stopped:false` = the child did NOT provably exit within the kill
+    // timeout; `full_delete_instance` refuses to run its destructive commit
+    // on that verdict.
+    let stopped = crate::daemon::lifecycle::delete_transaction(
         ctx.home,
         name,
         ctx.registry,
@@ -142,7 +163,7 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             name: name.to_string(),
         });
     }
-    json!({"ok": true})
+    json!({"ok": true, "stopped": stopped})
 }
 
 /// Parse the SPAWN-RPC `env` field into a `HashMap` of process env vars.

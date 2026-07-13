@@ -998,6 +998,179 @@ fn full_delete_replacement_after_precheck_before_commit_preserves_2764_r6() {
     std::fs::remove_dir_all(home).ok();
 }
 
+/// #2764 R7 RED (codex P0-1): a PRODUCTION create (real
+/// `handle_create_instance` entry) racing a GHOST delete must be
+/// zero-side-effect refused by the admission gate — pre-R7 the ghost flow had
+/// no fence at all, so the fresh generation's fleet entry / workdir landed
+/// mid-delete and the delete tail erased them.
+#[test]
+fn full_delete_ghost_vs_create_admission_refused_2764_r7() {
+    let home = tmp_home("r7_ghost_vs_create");
+    // Ghost: no fleet.yaml, nothing on disk → VacuousGhost flow.
+    let create_resp: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let resp_slot = std::sync::Arc::clone(&create_resp);
+    let h = home.clone();
+    super::full_delete_test_seam::set_after_gate(Box::new(move || {
+        let resp = crate::mcp::handlers::instance_state::handle_create_instance(
+            &h,
+            &serde_json::json!({"name": "ghost", "backend": "claude"}),
+            "",
+        );
+        *resp_slot.lock().unwrap() = Some(resp);
+    }));
+
+    let result = super::full_delete_instance(&home, "ghost");
+    assert!(
+        result.is_ok(),
+        "clean ghost delete must succeed: {result:?}"
+    );
+
+    let resp = create_resp.lock().unwrap().take().expect("seam fired");
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("mid-delete"),
+        "mid-delete create must be refused by the admission gate, got: {resp}"
+    );
+    assert!(
+        !crate::fleet::fleet_yaml_path(&home).exists(),
+        "zero-side-effect refusal: no fleet.yaml may be written by the refused create"
+    );
+    assert!(
+        !crate::paths::workspace_dir(&home).join("ghost").exists(),
+        "zero-side-effect refusal: no workdir may be created by the refused create"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 R7 RED (codex P0-1): a PRODUCTION create landing AFTER the fenced
+/// commit (fleet entry CAS-removed) but BEFORE the delete's tail cleanup must
+/// be refused — pre-R7 the admission was released with the fence, so the new
+/// generation's entry landed and the tail erased its stores.
+#[test]
+fn full_delete_post_cas_pre_tail_vs_create_refused_2764_r7() {
+    let home = tmp_home("r7_post_cas_vs_create");
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    id: {}\n",
+            id.full()
+        ),
+    )
+    .unwrap();
+    // No workspace dir → vacuous path phase → CAS-remove at commit.
+    let create_resp: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let resp_slot = std::sync::Arc::clone(&create_resp);
+    let h = home.clone();
+    super::full_delete_test_seam::set_post_commit(Box::new(move || {
+        let resp = crate::mcp::handlers::instance_state::handle_create_instance(
+            &h,
+            &serde_json::json!({"name": "victim", "backend": "claude"}),
+            "",
+        );
+        *resp_slot.lock().unwrap() = Some(resp);
+    }));
+
+    let result = super::full_delete_instance(&home, "victim");
+    assert!(result.is_ok(), "delete must complete Ok, got {result:?}");
+
+    let resp = create_resp.lock().unwrap().take().expect("seam fired");
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("mid-delete"),
+        "post-CAS/pre-tail create must be refused, got: {resp}"
+    );
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml parses");
+    assert!(
+        !fleet.instances.contains_key("victim"),
+        "the refused create must NOT have re-added the entry after the CAS removal"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 R7 RED (codex P0-2): the daemon API is unreachable AND live port
+/// evidence exists for the name → the process-stop disposition is unproven →
+/// the delete aborts BEFORE any destruction (workspace + fleet entry intact).
+#[test]
+fn full_delete_api_unreachable_with_live_port_evidence_aborts_2764_r7() {
+    let home = tmp_home("r7_unreachable_port");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    id: {}\n    working_directory: {}\n",
+            id.full(),
+            vdir.display()
+        ),
+    )
+    .unwrap();
+    // Live-agent evidence: a published TUI port file (same path expression the
+    // production check + residual audit use).
+    let port = crate::ipc::port_path(&crate::daemon::run_dir(&home), "victim");
+    std::fs::create_dir_all(port.parent().unwrap()).unwrap();
+    std::fs::write(&port, "12345").unwrap();
+
+    let result = super::full_delete_instance(&home, "victim");
+    let err = result.expect_err("unproven stop disposition must abort the delete");
+    assert!(
+        err.contains("disposition unproven"),
+        "Err must carry the disposition reason, got: {err}"
+    );
+    assert!(canaries_intact(&vdir), "nothing may be destroyed: {vdir:?}");
+    assert!(
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml parses")
+            .instances
+            .contains_key("victim"),
+        "fleet entry must be retained on an aborted delete"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 R7 RED (codex P0-2): the DELETE call reports `stopped:false` (child
+/// did not exit within the kill timeout) → the destructive commit must not
+/// run; the delete aborts with everything intact.
+#[test]
+fn full_delete_stop_timeout_aborts_2764_r7() {
+    let home = tmp_home("r7_stop_timeout");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    id: {}\n    working_directory: {}\n",
+            id.full(),
+            vdir.display()
+        ),
+    )
+    .unwrap();
+    super::full_delete_test_seam::set_stop_call(Ok(serde_json::json!({
+        "ok": true, "stopped": false
+    })));
+
+    let result = super::full_delete_instance(&home, "victim");
+    let err = result.expect_err("stopped=false must abort the delete");
+    assert!(
+        err.contains("disposition unproven"),
+        "Err must carry the disposition reason, got: {err}"
+    );
+    assert!(canaries_intact(&vdir), "nothing may be destroyed: {vdir:?}");
+    assert!(
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml parses")
+            .instances
+            .contains_key("victim"),
+        "fleet entry must be retained on an aborted delete"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
 /// #2764 E: the always-run metadata tail — full_delete removes the name-keyed
 /// `metadata/<name>.json` (port of the legacy `cleanup_working_dir` metadata
 /// coverage; the uuid path is covered by the #1682 tests above).

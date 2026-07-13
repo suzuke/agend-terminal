@@ -541,6 +541,13 @@ pub fn spawn_one(
     size: (u16, u16),
     env: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<crate::backend::SpawnMode> {
+    // #2764 R7 (codex P0-1): admission BEFORE the first side effect — the dir
+    // creation + skills install below run long before spawn_agent's
+    // deleting-set check, so a spawn racing a same-name delete used to
+    // re-materialize workspace state mid-teardown. While this guard lives a
+    // same-name delete refuses to start (and vice versa).
+    let _create_admission = crate::agent::deleting::admit_create(home, name)
+        .map_err(|reason| anyhow::anyhow!("spawn refused: {reason}"))?;
     std::fs::create_dir_all(work_dir).ok();
     // #1080: skills auto-install for dynamically spawned instances.
     // spawn_one is the SPAWN-RPC choke point — without this, instances

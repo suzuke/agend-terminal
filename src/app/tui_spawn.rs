@@ -37,6 +37,12 @@ pub(crate) fn add_instance_with_topic(
     name: &str,
     entry: &crate::fleet::InstanceYamlEntry,
 ) -> anyhow::Result<TopicOutcome> {
+    // #2764 R7 (codex P0-1): create-side ADMISSION before the first mutation
+    // (fleet.yaml add + topic create/register below) — a TUI create racing a
+    // same-name delete is zero-side-effect refused, and while this guard lives
+    // a same-name delete refuses to start.
+    let _create_admission = crate::agent::deleting::admit_create(home, name)
+        .map_err(|reason| anyhow::anyhow!("create refused: {reason}"))?;
     crate::fleet::add_instance_to_yaml(home, name, entry)
         .map_err(|e| anyhow::anyhow!("failed to persist instance to fleet.yaml: {e}"))?;
 

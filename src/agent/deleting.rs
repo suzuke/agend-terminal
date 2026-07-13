@@ -34,9 +34,19 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-fn registry() -> &'static Mutex<HashMap<(PathBuf, String), u32>> {
-    static DELETING: OnceLock<Mutex<HashMap<(PathBuf, String), u32>>> = OnceLock::new();
-    DELETING.get_or_init(|| Mutex::new(HashMap::new()))
+/// #2764 R7: the per-name lifecycle hold. `Creating` and `Deleting` are
+/// MUTUALLY EXCLUSIVE per `(home, name)` — a create admitted mid-delete would
+/// have its fresh generation erased by the delete's tail cleanup, and a delete
+/// started mid-create would destroy a half-created generation. Same-kind holds
+/// refcount (concurrent same-name creates / re-entrant deletes stay correct).
+enum Hold {
+    Creating(u32),
+    Deleting(u32),
+}
+
+fn registry() -> &'static Mutex<HashMap<(PathBuf, String), Hold>> {
+    static HOLDS: OnceLock<Mutex<HashMap<(PathBuf, String), Hold>>> = OnceLock::new();
+    HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn key(home: &Path, name: &str) -> (PathBuf, String) {
@@ -45,17 +55,70 @@ fn key(home: &Path, name: &str) -> (PathBuf, String) {
 
 /// True iff `name` under `home` is currently mid-delete and must not be spawned.
 pub fn is_deleting(home: &Path, name: &str) -> bool {
-    registry().lock().contains_key(&key(home, name))
+    matches!(
+        registry().lock().get(&key(home, name)),
+        Some(Hold::Deleting(_))
+    )
 }
 
 /// Mark `name` under `home` as deleting for the lifetime of the returned guard.
 /// Hold the guard across the WHOLE outermost-delete teardown; its `Drop` un-marks
 /// on every path (incl. panic) so the name can be re-created afterwards.
-#[must_use = "hold the DeletingGuard for the delete's duration; dropping it immediately un-marks the instance"]
-pub fn mark_deleting(home: &Path, name: &str) -> DeletingGuard {
+/// #2764 R7: refuses (Err) while a same-name CREATE admission is in flight —
+/// deleting a half-created generation is neither "zero-side-effect refused"
+/// nor "survives completely".
+pub fn mark_deleting(home: &Path, name: &str) -> Result<DeletingGuard, String> {
     let k = key(home, name);
-    *registry().lock().entry(k.clone()).or_insert(0) += 1;
-    DeletingGuard { key: k }
+    let mut reg = registry().lock();
+    match reg.entry(k.clone()).or_insert(Hold::Deleting(0)) {
+        Hold::Creating(_) => {
+            // The entry existed as Creating — or_insert did not overwrite it.
+            Err(format!(
+                "'{name}' has a create in flight — delete refused (retry after it settles)"
+            ))
+        }
+        Hold::Deleting(n) => {
+            *n += 1;
+            Ok(DeletingGuard { key: k })
+        }
+    }
+}
+
+/// #2764 R7 (codex P0-1): create-side ADMISSION — every create/deploy/TUI
+/// instance-creation path must acquire this BEFORE its first mutation
+/// (worktree/workdir creation, fleet.yaml add, topic create). Refuses (Err)
+/// while the name is mid-delete, so a new generation is zero-side-effect
+/// refused instead of being erased by the delete's tail cleanup. Hold the
+/// returned guard across the create's mutations; while it lives, a same-name
+/// delete refuses to START (see [`mark_deleting`]).
+pub fn admit_create(home: &Path, name: &str) -> Result<CreateAdmission, String> {
+    let k = key(home, name);
+    let mut reg = registry().lock();
+    match reg.entry(k.clone()).or_insert(Hold::Creating(0)) {
+        Hold::Deleting(_) => Err(format!(
+            "'{name}' is mid-delete — create refused before any side effect"
+        )),
+        Hold::Creating(n) => {
+            *n += 1;
+            Ok(CreateAdmission { key: k })
+        }
+    }
+}
+
+fn release(kind_is_delete: bool, k: &(PathBuf, String)) {
+    let mut reg = registry().lock();
+    let remove = match (kind_is_delete, reg.get_mut(k)) {
+        (true, Some(Hold::Deleting(n))) | (false, Some(Hold::Creating(n))) => {
+            *n -= 1;
+            *n == 0
+        }
+        // Mismatched/absent entry: unreachable by construction (each guard is
+        // minted with its own variant present); tolerate silently.
+        _ => false,
+    };
+    if remove {
+        reg.remove(k);
+    }
 }
 
 /// RAII marker: the `(home, name)` is "deleting" while this guard is alive.
@@ -65,13 +128,19 @@ pub struct DeletingGuard {
 
 impl Drop for DeletingGuard {
     fn drop(&mut self) {
-        let mut reg = registry().lock();
-        if let Some(count) = reg.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                reg.remove(&self.key);
-            }
-        }
+        release(true, &self.key);
+    }
+}
+
+/// RAII marker: a create for `(home, name)` is in flight while this guard is
+/// alive; a same-name delete refuses to start.
+pub struct CreateAdmission {
+    key: (PathBuf, String),
+}
+
+impl Drop for CreateAdmission {
+    fn drop(&mut self) {
+        release(false, &self.key);
     }
 }
 
@@ -97,7 +166,7 @@ mod tests {
         let home = tmp("basic");
         assert!(!is_deleting(&home, "victim"));
         {
-            let _g = mark_deleting(&home, "victim");
+            let _g = mark_deleting(&home, "victim").expect("no create in flight");
             assert!(is_deleting(&home, "victim"), "marked → deleting");
         }
         assert!(
@@ -110,7 +179,7 @@ mod tests {
     fn home_scoped_keys_do_not_collide() {
         let a = tmp("home-a");
         let b = tmp("home-b");
-        let _g = mark_deleting(&a, "victim");
+        let _g = mark_deleting(&a, "victim").expect("mark");
         assert!(is_deleting(&a, "victim"));
         assert!(
             !is_deleting(&b, "victim"),
@@ -121,8 +190,8 @@ mod tests {
     #[test]
     fn refcount_clears_only_on_last_guard() {
         let home = tmp("refcount");
-        let g1 = mark_deleting(&home, "victim");
-        let g2 = mark_deleting(&home, "victim");
+        let g1 = mark_deleting(&home, "victim").expect("first mark");
+        let g2 = mark_deleting(&home, "victim").expect("re-entrant mark");
         drop(g1);
         assert!(
             is_deleting(&home, "victim"),
@@ -139,7 +208,7 @@ mod tests {
         let home = tmp("panic");
         let home2 = home.clone();
         let r = std::panic::catch_unwind(move || {
-            let _g = mark_deleting(&home2, "victim");
+            let _g = mark_deleting(&home2, "victim").expect("mark");
             assert!(is_deleting(&home2, "victim"));
             panic!("delete blew up mid-teardown");
         });
@@ -148,5 +217,37 @@ mod tests {
             !is_deleting(&home, "victim"),
             "guard Drop ran on unwind → name un-marked even after a panic"
         );
+    }
+
+    /// #2764 R7: a create admission mid-delete is REFUSED (zero side effect),
+    /// and admission works again once the delete guard drops.
+    #[test]
+    fn admit_create_refused_while_deleting_then_allowed() {
+        let home = tmp("adm-vs-del");
+        let g = mark_deleting(&home, "victim").expect("mark");
+        assert!(
+            admit_create(&home, "victim").is_err(),
+            "create must be refused while mid-delete"
+        );
+        drop(g);
+        let _a = admit_create(&home, "victim").expect("admitted after delete ends");
+    }
+
+    /// #2764 R7: a delete cannot START while a create admission is in flight;
+    /// it works again once the admission drops.
+    #[test]
+    fn mark_deleting_refused_while_creating_then_allowed() {
+        let home = tmp("del-vs-adm");
+        let a = admit_create(&home, "victim").expect("admit");
+        assert!(
+            !is_deleting(&home, "victim"),
+            "a create admission is NOT a deleting hold"
+        );
+        assert!(
+            mark_deleting(&home, "victim").is_err(),
+            "delete must refuse while a create is in flight"
+        );
+        drop(a);
+        let _g = mark_deleting(&home, "victim").expect("mark after create settles");
     }
 }

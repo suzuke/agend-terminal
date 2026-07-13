@@ -142,12 +142,41 @@ fn yaml_str(val: &serde_yaml_ng::Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+type DeployEntries = (
+    Vec<String>,
+    Vec<(String, crate::fleet::InstanceYamlEntry)>,
+    Vec<crate::agent::deleting::CreateAdmission>,
+);
+
 fn create_instance_entries(
+    home: &std::path::Path,
     params: &DeployParams,
-) -> (Vec<String>, Vec<(String, crate::fleet::InstanceYamlEntry)>) {
+) -> Result<DeployEntries, String> {
     let mut created = Vec::new();
     let mut yaml_entries = Vec::new();
     let dir = std::path::PathBuf::from(&params.directory);
+
+    // #2764 R7 (codex P0-1): admission pre-pass for EVERY member name BEFORE
+    // any mutation (prepare_work_dir below creates directories). Any name
+    // mid-delete aborts the WHOLE deploy zero-side-effect; the returned
+    // guards are held by the caller through fleet persist + spawn.
+    let mut admissions = Vec::new();
+    for (name_val, _) in &params.instances_def {
+        let Some(inst_suffix) = name_val.as_str() else {
+            continue;
+        };
+        if crate::agent::validate_name(inst_suffix).is_err() {
+            continue;
+        }
+        let inst_name = format!("{}-{inst_suffix}", params.deploy_name);
+        if crate::agent::validate_name(&inst_name).is_err() {
+            continue;
+        }
+        match crate::agent::deleting::admit_create(home, &inst_name) {
+            Ok(g) => admissions.push(g),
+            Err(reason) => return Err(format!("deploy refused: {reason}")),
+        }
+    }
 
     for (name_val, inst_val) in &params.instances_def {
         let inst_suffix = match name_val.as_str() {
@@ -254,7 +283,7 @@ fn create_instance_entries(
         ));
         created.push(inst_name);
     }
-    (created, yaml_entries)
+    Ok((created, yaml_entries, admissions))
 }
 
 fn prepare_work_dir(
@@ -481,7 +510,12 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     // generation anchor bound into the cleanup-pending/audit record written at
     // teardown (teardown itself performs NO destructive cleanup this PR).
     let provenance_nonce = uuid::Uuid::new_v4().to_string();
-    let (created, yaml_entries) = create_instance_entries(&params);
+    // #2764 R7: `_admissions` guards are HELD through fleet persist + spawn —
+    // a same-name delete refuses to start while a deploy create is in flight.
+    let (created, yaml_entries, _admissions) = match create_instance_entries(home, &params) {
+        Ok(t) => t,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
 
     if let Err(e) =
         persist_to_fleet_yaml(home, &yaml_entries, &params.template, &params.deploy_name)

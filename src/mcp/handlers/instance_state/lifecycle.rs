@@ -42,15 +42,36 @@ fn remove_empty_dir_tree(dir: &Path) {
 pub(crate) mod full_delete_test_seam {
     use std::cell::RefCell;
     thread_local! {
-        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static AFTER_GATE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static POST_COMMIT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        // #2764 R7: forced result for the process-stop DELETE call (P0-2 REDs).
+        static STOP_CALL: RefCell<Option<anyhow::Result<serde_json::Value>>> =
+            const { RefCell::new(None) };
     }
     pub(crate) fn set_after_gate(f: Box<dyn FnOnce()>) {
-        HOOK.with(|h| *h.borrow_mut() = Some(f));
+        AFTER_GATE.with(|h| *h.borrow_mut() = Some(f));
     }
     pub(crate) fn fire_after_gate() {
-        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+        if let Some(f) = AFTER_GATE.with(|h| h.borrow_mut().take()) {
             f();
         }
+    }
+    /// Fires after a Clean destructive commit (or the vacuous-ghost
+    /// fall-through), BEFORE the tail cleanup — the reviewer's
+    /// "post-CAS / pre-tail" injection point.
+    pub(crate) fn set_post_commit(f: Box<dyn FnOnce()>) {
+        POST_COMMIT.with(|h| *h.borrow_mut() = Some(f));
+    }
+    pub(crate) fn fire_post_commit() {
+        if let Some(f) = POST_COMMIT.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+    pub(crate) fn set_stop_call(r: anyhow::Result<serde_json::Value>) {
+        STOP_CALL.with(|h| *h.borrow_mut() = Some(r));
+    }
+    pub(crate) fn take_stop_call() -> Option<anyhow::Result<serde_json::Value>> {
+        STOP_CALL.with(|h| h.borrow_mut().take())
     }
 }
 
@@ -97,7 +118,14 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // chokepoints. `DeletingGuard::drop` un-marks on EVERY path (normal return,
     // early `Err`, panic), so the name is always re-creatable afterwards — a
     // leaked mark would make it un-spawnable for the daemon's lifetime.
-    let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
+    // #2764 R7: refuses while a same-name CREATE admission is in flight —
+    // deleting a half-created generation is neither refuse-clean nor survive.
+    let _delete_guard = match crate::agent::deleting::mark_deleting(home, name) {
+        Ok(g) => g,
+        Err(reason) => {
+            return Err(format!("delete refused before any mutation: {reason}"));
+        }
+    };
     // #2764 E: the RAW immutable pre-removal snapshot is the path authority.
     // Distinguish MISSING (no roster → empty survivor set, ghost-delete flow)
     // from UNREADABLE/CORRUPT (a roster may exist that we cannot read → the
@@ -149,16 +177,61 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // Process stop (PTY kill + child reap). Generation fence for this step is
     // the `_delete_guard` held above, NOT the fleet flock: `mark_deleting`
     // makes every same-name spawn refuse at the `spawn_agent` /
-    // `spawn_and_register_agent` chokepoints for the lifetime of this fn, so
-    // the registry cannot hold a REPLACEMENT process under this name — the
-    // kill can only ever hit the generation designated by the snapshot above.
-    // (Holding the fleet flock across this IPC round-trip instead would risk a
-    // self-deadlock: the daemon-side DELETE handler may load fleet.yaml, whose
-    // id-backfill write re-acquires the flock.)
-    let _ = crate::api::call(
+    // `spawn_and_register_agent` chokepoints AND every create path refuse at
+    // its `admit_create` admission for the lifetime of this fn, so the
+    // registry cannot hold a REPLACEMENT process under this name. The DELETE
+    // call additionally pins `expected_id` so the daemon refuses a
+    // generation-mismatched stop outright. (Holding the fleet flock across
+    // this IPC round-trip instead would risk a self-deadlock: the daemon-side
+    // DELETE handler loads fleet.yaml, whose id-backfill write re-acquires
+    // the flock.)
+    //
+    // #2764 R7 (codex P0-2): the destructive commit REQUIRES a proven
+    // process-stop disposition. `{ok:true}` without `stopped:false` proves the
+    // stop (or that nothing was registered to stop); `stopped:false` = the
+    // child did not exit within the kill timeout → abort; an unreachable
+    // daemon API is provably-nothing-to-stop ONLY when no live-agent port
+    // evidence exists for the name. Nothing destructive has happened yet, so
+    // an abort here is a complete no-op beyond the kill attempt itself.
+    let stop_params = match &instance_id {
+        Some(id) => json!({"name": name, "expected_id": id}),
+        None => json!({"name": name}),
+    };
+    #[allow(unused_mut)]
+    let mut stop_resp = crate::api::call(
         home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+        &json!({"method": crate::api::method::DELETE, "params": stop_params}),
     );
+    #[cfg(test)]
+    if let Some(forced) = full_delete_test_seam::take_stop_call() {
+        stop_resp = forced;
+    }
+    let disposition: Result<(), String> = match &stop_resp {
+        Ok(v) if v["ok"].as_bool() == Some(true) && v["stopped"].as_bool() != Some(false) => Ok(()),
+        Ok(v) if v["ok"].as_bool() == Some(true) => {
+            Err("child did not exit within the kill timeout (stopped=false)".to_string())
+        }
+        Ok(v) => Err(format!(
+            "DELETE refused: {}",
+            v["error"].as_str().unwrap_or("unknown")
+        )),
+        Err(e) => {
+            if crate::ipc::port_path(&crate::daemon::run_dir(home), name).exists() {
+                Err(format!(
+                    "daemon API unreachable ({e}) while live port evidence exists for '{name}'"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    };
+    if let Err(reason) = disposition {
+        tracing::error!(name, %reason,
+            "full_delete_instance: process-stop disposition unproven — aborting before any destruction");
+        return Err(format!(
+            "process-stop disposition unproven — full delete aborted before any destruction: {reason}"
+        ));
+    }
 
     // #2764 E/R6: the id-anchored destructive commit — the ONLY path that may
     // destroy the victim's working dir AND the ONLY remover of its fleet.yaml
@@ -190,6 +263,9 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     }
     // (FullDeletePlan::VacuousGhost falls through: no entry, nothing on disk —
     // the remaining name-keyed cleanup below is orphan-remnant reaping.)
+
+    #[cfg(test)]
+    full_delete_test_seam::fire_post_commit();
 
     if let Some(tid) = topic_id {
         // #2550 identity-confusion root cause: `delete_topic` only unregisters

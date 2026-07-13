@@ -48,6 +48,15 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         }
     };
     let name: &str = &name_owned;
+    // #2764 R7 (codex P0-1): create-side ADMISSION before ANY mutation. This
+    // path mutates (worktree create / create_dir_all / fleet.yaml add / SPAWN)
+    // long before spawn_agent's deleting-set check — a create racing a
+    // same-name delete is zero-side-effect refused here, and while this guard
+    // lives a same-name delete refuses to START (mutual exclusion).
+    let _create_admission = match crate::agent::deleting::admit_create(home, name) {
+        Ok(g) => g,
+        Err(reason) => return json!({"error": format!("create refused: {reason}")}),
+    };
     let command = args["backend"]
         .as_str()
         .or_else(|| args["command"].as_str())

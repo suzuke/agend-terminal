@@ -171,6 +171,20 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         planned.push((inst_name, backend.clone(), work_dir));
     }
 
+    // #2764 R7 (codex P0-1): admission for EVERY planned member BEFORE the
+    // fleet write / instructions / spawn mutations below — any member name
+    // mid-delete aborts the whole create_team zero-side-effect. Guards held
+    // to fn end so a same-name delete cannot start mid-create.
+    let mut _member_admissions = Vec::with_capacity(planned.len());
+    for (inst_name, _, _) in &planned {
+        match crate::agent::deleting::admit_create(ctx.home, inst_name) {
+            Ok(g) => _member_admissions.push(g),
+            Err(reason) => {
+                return json!({"ok": false, "error": format!("create_team refused: {reason}")});
+            }
+        }
+    }
+
     if !planned.is_empty() {
         let entries = build_member_entries(&planned, topic_binding_mode.as_deref());
         let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =

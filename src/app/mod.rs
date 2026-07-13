@@ -2254,7 +2254,15 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
     // #1915: app-mode teardown entry — mark "deleting" so a concurrent spawn
     // (e.g. a crash-respawn triggered by the kill below) cannot resurrect the
     // instance. Guard held to fn return; Drop un-marks on every path.
-    let _delete_guard = crate::agent::deleting::mark_deleting(home, name);
+    // #2764 R7: refuses while a same-name create admission is in flight —
+    // killing a half-created generation is neither refuse-clean nor survive.
+    let _delete_guard = match crate::agent::deleting::mark_deleting(home, name) {
+        Ok(g) => g,
+        Err(reason) => {
+            tracing::warn!(agent = %name, %reason, "kill_agent refused (create in flight)");
+            return;
+        }
+    };
     crate::daemon::lifecycle::delete_transaction(home, name, registry, None, false);
 }
 
