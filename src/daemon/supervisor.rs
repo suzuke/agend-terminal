@@ -1441,6 +1441,7 @@ fn enqueue_reply_ledger_lead_escalation(
         worktree_binding_required: None,
         pr_number: None,
         terminal: None,
+        delivery_nonce: None,
     };
     if let Err(e) = crate::inbox::enqueue(home, lead, msg) {
         tracing::warn!(

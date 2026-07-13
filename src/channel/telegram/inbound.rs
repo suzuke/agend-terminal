@@ -361,6 +361,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                     worktree_binding_required: None,
                     pr_number: None,
                     terminal: None,
+                    delivery_nonce: None,
                 },
             ),
             "status_summary",
@@ -704,6 +705,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             worktree_binding_required: None,
             pr_number: None,
             terminal: None,
+            delivery_nonce: None,
         };
         persist_or_log!(
             inbox::enqueue(&home, &instance_name, msg_obj),

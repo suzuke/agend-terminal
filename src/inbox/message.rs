@@ -147,6 +147,14 @@ pub struct InboxMessage {
     /// this flag is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<bool>,
+    /// t-…-17 reviewer-assignment outbox: opaque delivery generation nonce carried
+    /// from [`crate::mcp::handlers`]'s `SendEnvelope`, minted at dispatch (A1) and
+    /// rotated on row-repair (A4). `#[serde(default, skip_serializing_if)]` keeps
+    /// legacy rows deserializing to `None` AND serializing byte-identically when
+    /// `None` — no schema break for pre-outbox inboxes. Distinct from any task/
+    /// assignment id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_nonce: Option<String>,
 }
 
 /// Reply-to correlation context for a quoted bot message (resolved from the
@@ -253,4 +261,43 @@ pub enum MessageStatus {
     UnreadExpired,
     /// Message not found.
     NotFound,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::InboxMessage;
+
+    /// t-…-17 (T10): `delivery_nonce` is additive `serde(default, skip)` — a legacy
+    /// row without the key deserializes to `None`, and a `None` nonce is OMITTED on
+    /// serialize so the JSON is byte-identical to a pre-outbox message (no schema
+    /// break, no spurious `"delivery_nonce": null`).
+    #[test]
+    fn delivery_nonce_serde_default_and_skip_byte_identical() {
+        // absent → None (legacy row).
+        let legacy =
+            r#"{"schema_version":1,"from":"dev","text":"hi","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let m: InboxMessage = serde_json::from_str(legacy).unwrap();
+        assert!(
+            m.delivery_nonce.is_none(),
+            "absent key must deserialize None"
+        );
+
+        // None → field OMITTED on serialize (not present-null).
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(
+            v.as_object().unwrap().get("delivery_nonce").is_none(),
+            "a None nonce must be skipped, got: {v}"
+        );
+
+        // Some → present with the value.
+        let mut m2 = m.clone();
+        m2.delivery_nonce = Some("n-1".to_string());
+        let v2 = serde_json::to_value(&m2).unwrap();
+        assert_eq!(v2["delivery_nonce"], "n-1");
+
+        // round-trip preserves the nonce.
+        let back: InboxMessage = serde_json::from_value(v2).unwrap();
+        assert_eq!(back.delivery_nonce.as_deref(), Some("n-1"));
+    }
 }
