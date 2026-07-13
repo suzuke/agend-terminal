@@ -1205,6 +1205,12 @@ fn deploy_with_custom_directory(
         // Drop a sentinel file so we can tell the dir was actually
         // removed (vs e.g. moved or never created).
         std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
+        // #2764 C: this helper simulates a DAEMON-CREATED deployment, so seed
+        // the creation-provenance marker `prepare_work_dir` now writes —
+        // authorizing the whole-tree removal these tests assert. (The unproven
+        // case — a pre-existing operator dir with no marker — is covered by its
+        // own preserve-not-remove test.)
+        std::fs::write(inst_dir.join(DEPLOY_CREATED_MARKER), "created_by=agend\n").unwrap();
     }
     store.deployments.push(Deployment {
         name: deploy_name.to_string(),
@@ -1404,6 +1410,9 @@ fn teardown_removes_branch_mode_worktree_and_orphan_branch_med4() {
         "pre: inst_dir is a worktree"
     );
     assert!(branch_exists(&repo, "deploy/lead"), "pre: branch exists");
+    // #2764 C: mirror prepare_work_dir writing the creation-provenance marker
+    // after a successful `git worktree add`, authorizing the whole-tree removal.
+    std::fs::write(inst_dir.join(DEPLOY_CREATED_MARKER), "created_by=agend\n").unwrap();
 
     cleanup_deployment_dirs(&home, &make_deployment("deploy", &["lead"], &repo));
 
@@ -1476,6 +1485,8 @@ fn cleanup_deployment_dirs_rmdir_parent_when_only_member_subdirs() {
         let inst_dir = custom_root.join(&inst);
         std::fs::create_dir_all(&inst_dir).unwrap();
         std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
+        // #2764 C: daemon-created subdir → seed the provenance marker.
+        std::fs::write(inst_dir.join(DEPLOY_CREATED_MARKER), "created_by=agend\n").unwrap();
     }
     let dep = make_deployment("p15clean", &["a", "b"], &custom_root);
 
@@ -1535,6 +1546,12 @@ fn cleanup_deployment_dirs_rmdir_is_idempotent() {
         std::env::temp_dir().join(format!("agend-p15-{}-idem-custom", std::process::id()));
     std::fs::create_dir_all(&custom_root).unwrap();
     std::fs::create_dir_all(custom_root.join("p15idem-a")).unwrap();
+    // #2764 C: daemon-created subdir → seed the provenance marker.
+    std::fs::write(
+        custom_root.join("p15idem-a").join(DEPLOY_CREATED_MARKER),
+        "created_by=agend\n",
+    )
+    .unwrap();
     let dep = make_deployment("p15idem", &["a"], &custom_root);
 
     cleanup_deployment_dirs(&home, &dep);
@@ -2002,4 +2019,119 @@ fn teardown_api_calls_not_under_flock() {
         delete_at < lock_at,
         "the DELETE api::call loop must run BEFORE the record-removal flock (#1617 class)"
     );
+}
+
+// ── #2764 C: deployment custom-dir creation provenance ─────────────────────
+
+/// prepare_work_dir writes the creation-provenance marker for a subdir it
+/// FRESHLY creates, but NOT for a pre-existing operator dir (which it must not
+/// later claim authority to whole-tree remove).
+#[test]
+fn prepare_work_dir_marks_fresh_but_not_preexisting() {
+    let parent = tmp_home("prov_mark");
+    std::fs::create_dir_all(&parent).unwrap();
+
+    // Fresh creation (non-branch) → marked.
+    let fresh = parent.join("d-fresh");
+    prepare_work_dir(&fresh, &parent, "d", "fresh", "d-fresh", None);
+    assert!(
+        fresh.join(DEPLOY_CREATED_MARKER).exists(),
+        "a freshly-created deployment subdir must carry the creation marker"
+    );
+
+    // Pre-existing operator dir → NOT marked (unprovable ownership).
+    let pre = parent.join("d-pre");
+    std::fs::create_dir_all(&pre).unwrap();
+    std::fs::write(pre.join("USER.txt"), b"precious").unwrap();
+    prepare_work_dir(&pre, &parent, "d", "pre", "d-pre", None);
+    assert!(
+        !pre.join(DEPLOY_CREATED_MARKER).exists(),
+        "a pre-existing operator dir must NOT be marked as daemon-created"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// Build a custom-dir deployment whose subdir has NO creation marker (a
+/// pre-existing operator dir), fleet.yaml empty (orphan). Returns (home,
+/// custom_root, inst_dir).
+fn unproven_custom_deploy(tag: &str, name: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+    let home = tmp_home(tag);
+    let custom_root =
+        std::env::temp_dir().join(format!("agend-2764c-{}-{}-custom", std::process::id(), tag));
+    std::fs::create_dir_all(&custom_root).ok();
+    let inst = format!("{name}-a");
+    let inst_dir = custom_root.join(&inst);
+    std::fs::create_dir_all(&inst_dir).unwrap();
+    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
+    // NO marker → unproven ownership.
+    let mut store = load(&home);
+    store.deployments.push(Deployment {
+        name: name.to_string(),
+        template: "tpl".to_string(),
+        instances: vec![inst.clone()],
+        team: None,
+        directory: custom_root.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
+    save(&home, &mut store).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    (home, custom_root, inst_dir, inst)
+}
+
+/// teardown must PRESERVE an unproven custom subdir, write a cleanup-pending
+/// ledger entry, keep the deployment record, and signal pending in the response.
+#[test]
+fn teardown_preserves_unproven_custom_subdir_and_records_pending() {
+    let (home, custom_root, inst_dir, inst) = unproven_custom_deploy("unproven_td", "unp-td");
+
+    let resp = teardown(&home, &serde_json::json!({"name": "unp-td"}));
+
+    assert!(
+        inst_dir.join("USER_DATA.txt").exists(),
+        "unproven custom subdir must be PRESERVED (operator data intact): {inst_dir:?}"
+    );
+    let ledger = home.join("deploy-cleanup-pending.jsonl");
+    assert!(ledger.exists(), "cleanup-pending ledger must be written");
+    let body = std::fs::read_to_string(&ledger).unwrap();
+    assert!(
+        body.contains("unp-td") && body.contains(&inst),
+        "ledger must record the preserved subdir, got: {body}"
+    );
+    assert!(
+        load(&home).deployments.iter().any(|d| d.name == "unp-td"),
+        "deployment record must be RETAINED (provenance not erased before cleanup)"
+    );
+    assert_eq!(
+        resp["status"], "torn_down_pending_cleanup",
+        "response must signal pending cleanup, got {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
+}
+
+/// reconcile must NOT prune a deployment whose custom subdir is unproven — the
+/// record is kept so a later reconcile retries with authority.
+#[test]
+fn reconcile_keeps_record_when_unproven_subdir_preserved() {
+    let (home, custom_root, inst_dir, _inst) = unproven_custom_deploy("unproven_rc", "unp-rc");
+
+    let pruned = reconcile_orphans(&home);
+
+    assert!(
+        !pruned.contains(&"unp-rc".to_string()),
+        "an unproven-subdir deployment must NOT be pruned, got {pruned:?}"
+    );
+    assert!(
+        inst_dir.join("USER_DATA.txt").exists(),
+        "unproven custom subdir must be preserved through reconcile"
+    );
+    assert!(
+        load(&home).deployments.iter().any(|d| d.name == "unp-rc"),
+        "deployment record must be retained for retry"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&custom_root).ok();
 }

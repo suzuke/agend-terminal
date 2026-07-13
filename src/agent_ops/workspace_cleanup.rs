@@ -321,6 +321,84 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// #2764 D — scoped source invariant (defense-in-depth behind the type-level
+    /// forcing function). The PRIMARY guard is the opaque `RemoveOwnedProof` /
+    /// `ScrubExclusiveProof` (private fields → whole-tree removal is
+    /// unrepresentable without [`plan_cleanup`]). This tripwire additionally
+    /// pins that the RAW `teardown_workspace_worktree` — the other destructive
+    /// workspace-worktree entry the contract names — is only ever CALLED from
+    /// the proof-gated wrapper (`teardown_workspace_worktree_proven`) or its own
+    /// definition module. The literal `teardown_workspace_worktree(` token does
+    /// NOT match `teardown_workspace_worktree_proven(` (the `_proven` sits
+    /// between the name and the paren), so proof-gated calls are excluded. A new
+    /// un-gated caller anywhere else FAILS this test, forcing the author to route
+    /// through a proof.
+    #[test]
+    fn raw_workspace_worktree_teardown_is_confined_to_proof_gate() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Files allowed to name the raw call: the proof-gated wrapper lives in
+        // worktree_pool.rs; the fn is defined in worktree_pool/workspace.rs; and
+        // this module (workspace_cleanup.rs) hosts the invariant test itself,
+        // whose diagnostic strings mention the token (its production code calls
+        // only the `_proven` wrapper).
+        let allow: &[&str] = &["worktree_pool.rs", "workspace.rs", "workspace_cleanup.rs"];
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if allow.contains(&fname) {
+                    continue;
+                }
+                // Test modules legitimately exercise the pub(crate) primitive
+                // directly — the invariant targets PRODUCTION bypasses only.
+                if fname == "tests.rs"
+                    || fname.ends_with("_tests.rs")
+                    || fname.starts_with("review_repro")
+                    || path.components().any(|c| c.as_os_str() == "tests")
+                {
+                    continue;
+                }
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in body.lines().enumerate() {
+                    // Skip comments / doc references — only real call syntax.
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                        continue;
+                    }
+                    if line.contains("teardown_workspace_worktree(") {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.strip_prefix(&root).unwrap_or(&path).display(),
+                            i + 1,
+                            trimmed.trim_end()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "#2764: raw teardown_workspace_worktree() called outside the proof gate — \
+             route it through teardown_workspace_worktree_proven (which requires a \
+             RemoveOwnedProof). Offending call sites:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     fn tmp_home(tag: &str) -> PathBuf {
         static C: AtomicU32 = AtomicU32::new(0);
         let id = C.fetch_add(1, Ordering::Relaxed);
