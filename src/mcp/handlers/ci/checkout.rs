@@ -76,6 +76,33 @@ pub(super) fn rollback_response(
     }
 }
 
+/// #2755 R3 (independent P1.4): fsync the `.agend-managed` marker file's CONTENTS
+/// durable — `std::fs::write` + a parent-dir fsync makes the DIRENT durable but not
+/// the bytes, so a crash/power loss could leave a durable journal phase (or Committed
+/// success) with an empty/torn marker. Open + `sync_all()` and OBSERVE the result; a
+/// failure aborts the transaction fail-closed. A `cfg(test)` thread-local seam forces
+/// the sync error so the crash/durability rollback path is testable cross-platform.
+pub(super) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other(
+            "test seam: forced marker sync_all failure",
+        ));
+    }
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_MARKER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: arm/disarm the [`sync_marker_contents`] failure seam (current thread).
+#[cfg(test)]
+pub(super) fn set_fail_marker_sync(fail: bool) {
+    FAIL_MARKER_SYNC.with(|c| c.set(fail));
+}
+
 pub(crate) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let result = handle_checkout_repo_inner(home, args, instance_name);
     log_checkout_outcome(home, args, instance_name, &result);
@@ -438,7 +465,28 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     branch,
                 );
             }
-            crate::store::fsync_parent_dir(&marker_path); // best-effort durability
+            // #2755 R3 (independent P1.4): make the marker CONTENTS durable BEFORE the
+            // parent-dir fsync and the MarkerDurable phase advance. A sync failure rolls
+            // back fail-closed — never record MarkerDurable (or later Committed success)
+            // over a non-durable marker.
+            if let Err(e) = sync_marker_contents(&marker_path) {
+                let outcome = super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                return rollback_response(
+                    outcome,
+                    &format!("marker fsync failed: {}", redact_paths(&e.to_string())),
+                    "marker_fsync_failed",
+                    "marker_durable",
+                    branch,
+                );
+            }
+            crate::store::fsync_parent_dir(&marker_path); // dirent durability
             journal.advance(super::checkout_txn::Phase::MarkerDurable);
             if journal.save(home, &mangled).is_err() {
                 let outcome = super::checkout_txn::rollback_failed(

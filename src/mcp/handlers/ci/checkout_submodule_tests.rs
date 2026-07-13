@@ -611,6 +611,29 @@ fn rollback_response_pending_never_claims_rolled_back() {
     );
 }
 
+/// #2755 R3 (marker durability): `sync_marker_contents` opens + fsyncs the marker
+/// CONTENTS and OBSERVES failure — a `std::fs::write` + parent-dir fsync makes only the
+/// dirent durable, not the bytes. The seam forces the `sync_all` error (crash/power-loss
+/// surrogate); disarmed it durably syncs a real file. Cross-platform (no real checkout).
+#[test]
+fn marker_sync_contents_observes_failure_via_seam() {
+    let home = tmp_home("marker-sync");
+    let f = home.join(".agend-managed");
+    std::fs::write(&f, "agent=x\n").unwrap();
+    super::checkout::set_fail_marker_sync(true);
+    let armed = super::checkout::sync_marker_contents(&f);
+    super::checkout::set_fail_marker_sync(false);
+    assert!(
+        armed.is_err(),
+        "armed seam ⇒ marker fsync observed as failure"
+    );
+    assert!(
+        super::checkout::sync_marker_contents(&f).is_ok(),
+        "disarmed ⇒ real marker contents fsync succeeds"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ─── recover_pending_sweep (shared boot+periodic — injected try_lock/remove) ───
 // try_lock: Some(_) ⇒ path-lock free (crashed, safe to recover); None ⇒ held (a
 // live checkout owns the path — skip).
@@ -1007,6 +1030,44 @@ fn checkout_commit_write_failure_rolls_back_2755() {
     assert!(
         !home.join("worktrees").join(&mangled).exists(),
         "worktree rolled back on Committed-write failure"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #2755 R3 (marker durability, real entry): a marker CONTENTS fsync failure during
+/// provisioning ABORTS the transaction — the worktree is rolled back and a structured
+/// `marker_fsync_failed` error returned, never a success with a non-durable marker.
+/// Seam forces `sync_all` err at the MarkerDurable stage.
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract
+/// (see `checkout_initializes_nested_submodules_2755`). The cross-platform durability
+/// observation is covered by `marker_sync_contents_observes_failure_via_seam`.
+#[cfg(unix)]
+#[test]
+fn checkout_marker_fsync_failure_rolls_back_2755() {
+    let home = tmp_home("markerfail");
+    let repo = tmp_repo_with_file("markerfail", "readme.txt", "x\n");
+    let instance = "agent-mf";
+    let mangled = mangled_for(instance, &repo);
+    super::checkout::set_fail_marker_sync(true);
+    let args =
+        json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    super::checkout::set_fail_marker_sync(false);
+    assert_eq!(
+        resp["stage"].as_str(),
+        Some("marker_durable"),
+        "aborts at marker durability: {resp}"
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("marker_fsync_failed"),
+        "marker fsync failure ⇒ structured marker_fsync_failed (worktree removable ⇒ rolled back): {resp}"
+    );
+    assert!(
+        !home.join("worktrees").join(&mangled).exists(),
+        "worktree rolled back on marker fsync failure"
     );
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
