@@ -266,124 +266,21 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 .filter(|p| p.exists());
             if same_branch {
                 if let Some(wt) = live_wt {
-                    let wt_str = wt.display().to_string();
-                    tracing::info!(
-                        instance = instance_name,
-                        %branch,
-                        path = %wt_str,
-                        "repo checkout bind:true idempotent — agent already bound to this branch, revalidating + self-healing existing worktree"
-                    );
-                    // #2755 R3 (B4): the binding's worktree `wt` may be a DIFFERENT path
-                    // than the DERIVED `worktree_dir` the path-lock A guards (normal
-                    // dispatch layout worktrees/<agent>/<branch> vs the derived
-                    // <agent>-<source>). Mutating `wt` under A is a lock-for-the-wrong-
-                    // path hole. Under the OUTER branch-lease (held), DROP A and acquire
-                    // the EXACT lock B for `wt` (no A→B inversion → no deadlock), then CAS
-                    // re-read the binding + validate provenance BEFORE any destructive
-                    // sync/reset/init.
-                    drop(path_lock); // release A; the branch-lease still serializes us
-                    let wt_mangled = wt
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let wt_lock = match super::checkout_txn::acquire_path_lock(
+                    // #2755: the full fail-closed reuse contract (deadlock-safe exact-path
+                    // lock transfer, CAS re-read, canonical daemon-managed provenance, then
+                    // sync-to-final-HEAD → strict init → gitlink verify) lives in the sibling
+                    // `checkout_reuse` module to keep this handler under the LOC ceiling.
+                    return super::checkout_reuse::try_reuse_bound_worktree(
                         home,
-                        &wt,
-                        &wt_mangled,
-                    ) {
-                        Ok(g) => g,
-                        Err(e) => {
-                            return json!({
-                                "error": format!(
-                                    "reuse: could not acquire provisioning lock for the bound worktree: {}",
-                                    redact_paths(&e.to_string())
-                                ),
-                                "code": "reuse_path_lock",
-                                "branch": branch,
-                            })
-                        }
-                    };
-                    if !wt_lock.guards(&wt) {
-                        return json!({
-                            "error": "reuse: provisioning lock identity does not match the bound worktree path",
-                            "code": "reuse_path_lock_identity",
-                            "branch": branch,
-                        });
-                    }
-                    // CAS re-read + provenance from ONE fresh read under lock B. The
-                    // binding must STILL map this exact branch+worktree (a concurrent
-                    // release/rebind may have changed it), AND — fail closed (decision
-                    // d-…38; signature verification is out of #2755 scope) — the bound
-                    // worktree must be a DAEMON-MANAGED worktree (`.agend-managed` marker,
-                    // within the daemon worktree area) of the REQUESTED source.
-                    let reread = crate::binding::read(home, instance_name);
-                    let maps_exact = reread.as_ref().is_some_and(|r| {
-                        r.get("branch").and_then(|v| v.as_str()) == Some(branch)
-                            && r.get("worktree").and_then(|v| v.as_str()) == Some(wt_str.as_str())
-                    });
-                    if !maps_exact {
-                        return json!({
-                            "error": "reuse: binding changed while acquiring the worktree lock — retry",
-                            "code": "reuse_binding_race",
-                            "branch": branch,
-                        });
-                    }
-                    let bound_source_ok = reread
-                        .as_ref()
-                        .and_then(|r| r.get("source_repo").and_then(|v| v.as_str()))
-                        .and_then(|s| Path::new(s).canonicalize().ok())
-                        .map(|c| c == source_canonical)
-                        .unwrap_or(false);
-                    let managed = wt.join(crate::worktree_pool::MANAGED_MARKER).is_file()
-                        && wt.starts_with(home.join("worktrees"));
-                    if !bound_source_ok || !managed {
-                        return json!({
-                            "error": "reuse refused: the bound worktree is not a daemon-managed worktree of the requested source at the exact bound path",
-                            "code": "reuse_provenance",
-                            "branch": branch,
-                        });
-                    }
-                    // #2755 R3 (B1): sync to the FINAL HEAD FIRST (an externally advanced
-                    // branch may change/add gitlinks), THEN strict recursive init, THEN
-                    // verify EXACT gitlink commits — any sync/init/verify failure returns
-                    // NO success (fail closed), never a bound:true over a broken tree.
-                    if let Err(e) = crate::worktree::sync_worktree_to_head_strict(&wt) {
-                        return json!({
-                            "error": format!("reuse: sync to HEAD failed: {}", redact_paths(&e)),
-                            "code": "reuse_sync_failed",
-                            "branch": branch,
-                        });
-                    }
-                    if let Err(e) = crate::worktree::init_submodules_strict(&wt) {
-                        return json!({
-                            "error": format!(
-                                "reuse: recursive submodule init failed: {}",
-                                redact_paths(&e)
-                            ),
-                            "code": "reuse_submodule_init_failed",
-                            "branch": branch,
-                        });
-                    }
-                    if let Err(e) = crate::worktree::verify_submodules_at_gitlinks(&wt) {
-                        return json!({
-                            "error": format!(
-                                "reuse: submodule gitlink verification failed: {}",
-                                redact_paths(&e)
-                            ),
-                            "code": "reuse_gitlink_mismatch",
-                            "branch": branch,
-                        });
-                    }
-                    return json!({
-                        "path": wt_str,
-                        "source": source_path,
-                        "branch": branch,
-                        "bound": true,
-                        "idempotent": true,
-                        "auto_created_branch": auto_created_branch,
-                        "fetch_attempted": fetch_attempted,
-                    });
+                        instance_name,
+                        branch,
+                        &source_canonical,
+                        &source_path,
+                        wt,
+                        path_lock,
+                        auto_created_branch,
+                        fetch_attempted,
+                    );
                 }
                 let existing_task_id = existing
                     .get("task_id")
@@ -512,7 +409,28 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     branch,
                 );
             }
-            crate::store::fsync_parent_dir(&marker_path); // dirent durability
+            // #2755 R4 (item 5): OBSERVE the parent-dir (dirent) durability on Unix — a
+            // failure must NOT advance MarkerDurable over a non-durable directory entry.
+            if let Err(e) = crate::store::fsync_parent_dir_checked(&marker_path) {
+                let outcome = super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                return rollback_response(
+                    outcome,
+                    &format!(
+                        "marker dirent fsync failed: {}",
+                        redact_paths(&e.to_string())
+                    ),
+                    "marker_fsync_failed",
+                    "marker_durable",
+                    branch,
+                );
+            }
             journal.advance(super::checkout_txn::Phase::MarkerDurable);
             if journal.save(home, &mangled).is_err() {
                 let outcome = super::checkout_txn::rollback_failed(
@@ -553,6 +471,36 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     outcome,
                     &format!("submodule init failed: {}", redact_paths(&e)),
                     "submodule_init_failed",
+                    "submodules_ready",
+                    branch,
+                );
+                if bind {
+                    err["fetch_attempted"] = json!(fetch_attempted);
+                    err["auto_created_branch"] = json!(auto_created_branch);
+                }
+                return err;
+            }
+            // #2755 R4 (item 2): a successful `submodule update --init --recursive` is NOT
+            // proof the tree is buildable — `submodule.<name>.update=none` makes it exit 0
+            // while leaving the submodule uninitialized (`-` in status). Verify the EXACT
+            // gitlink commits BEFORE advancing SubmodulesReady; a mismatch rolls back
+            // fail-closed (mirrors the reuse path's verify).
+            if let Err(e) = crate::worktree::verify_submodules_at_gitlinks(&worktree_dir) {
+                let outcome = super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                let mut err = rollback_response(
+                    outcome,
+                    &format!(
+                        "submodule gitlink verification failed after init: {}",
+                        redact_paths(&e)
+                    ),
+                    "submodule_gitlink_mismatch",
                     "submodules_ready",
                     branch,
                 );

@@ -215,6 +215,23 @@ pub fn fsync_parent_dir(path: &Path) {
 #[cfg(not(unix))]
 pub fn fsync_parent_dir(_path: &Path) {}
 
+/// #2755 R4 (item 5): CHECKED variant of [`fsync_parent_dir`] — OBSERVES the
+/// directory-entry durability result so a caller can fail closed (e.g. MarkerDurable
+/// must not advance over a non-durable dirent). On Unix, opens the parent + `sync_all`
+/// and returns the result; on non-Unix it is a no-op success (no clean std equivalent).
+#[cfg(unix)]
+pub fn fsync_parent_dir_checked(path: &Path) -> std::io::Result<()> {
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => std::fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn fsync_parent_dir_checked(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Serialize `data` as pretty JSON and [`atomic_write`] it to `path`.
 pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(data)?;

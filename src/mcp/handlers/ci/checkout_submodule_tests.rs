@@ -389,6 +389,22 @@ fn write_corrupt_journal(home: &Path, mangled: &str) {
     std::fs::write(&jp, b"{ not valid json").unwrap();
 }
 
+/// #2755 R4: a corrupt journal is quarantined to a COLLISION-SAFE sidecar
+/// (`journal.json.corrupt-<hash>`), so evidence is asserted by prefix, not a fixed name.
+fn has_corrupt_evidence(home: &Path, mangled: &str) -> bool {
+    super::checkout_txn::journal_path(home, mangled)
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("journal.json.corrupt")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// A Committed tombstone → cleared, NO worktree removal (the provision completed;
 /// its worktree is valid for reuse).
 #[test]
@@ -489,9 +505,7 @@ fn txn_recover_corrupt_removes_worktree() {
     assert!(r.is_ok());
     assert!(removed.get(), "corrupt + real worktree ⇒ removed");
     assert!(
-        super::checkout_txn::journal_path(&home, "m")
-            .with_file_name("journal.json.corrupt")
-            .exists(),
+        has_corrupt_evidence(&home, "m"),
         "torn record quarantined (evidence retained), not silently cleared"
     );
     assert!(
@@ -514,9 +528,7 @@ fn txn_recover_corrupt_remove_fail_arms_replacement() {
     let r = recover_stale(&home, "m", &wt, "/src-xyz", fixed_now(), || false);
     assert!(r.is_err(), "corrupt + remove fail ⇒ Err (caller aborts)");
     assert!(
-        super::checkout_txn::journal_path(&home, "m")
-            .with_file_name("journal.json.corrupt")
-            .exists(),
+        has_corrupt_evidence(&home, "m"),
         "torn record quarantined (evidence retained)"
     );
     let replacement = Journal::load(&home, "m").expect("synthesized replacement armed");
@@ -912,9 +924,7 @@ fn txn_sweep_corrupt_quarantined_not_cleared() {
     let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
     assert_eq!(n, 0, "corrupt is not an auto-resolved removal");
     assert!(
-        super::checkout_txn::journal_path(&home, "m")
-            .with_file_name("journal.json.corrupt")
-            .exists(),
+        has_corrupt_evidence(&home, "m"),
         "corrupt journal quarantined (evidence retained), NOT cleared"
     );
     assert!(
@@ -1038,16 +1048,22 @@ fn checkout_prepared_write_failure_fails_clean_2755() {
     let home = tmp_home("prepfail");
     let repo = tmp_repo_with_file("prepfail", "readme.txt", "x\n");
     let instance = "agent-pf";
+    use std::os::unix::fs::PermissionsExt;
     let mangled = mangled_for(instance, &repo);
-    let jpath = home
-        .join("checkout_txn")
-        .join(&mangled)
-        .join("journal.json");
-    std::fs::create_dir_all(&jpath).unwrap(); // seam: journal.json is a DIR
+    // Seam: the checkout_txn/<mangled>/ dir EXISTS but is READ-ONLY. recover_stale then
+    // sees journal.json genuinely ABSENT (NotFound ⇒ proceeds), and the Prepared
+    // `atomic_write` into the read-only dir FAILS ⇒ journal_write fatal-but-clean. (A
+    // journal.json-as-DIR seam no longer works: R4 recover_stale reads it as Unreadable
+    // and fails closed before the Prepared save.)
+    let jdir = home.join("checkout_txn").join(&mangled);
+    std::fs::create_dir_all(&jdir).unwrap();
+    std::fs::set_permissions(&jdir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let args =
         json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
     let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    // Restore perms so cleanup (and any assertion failure path) can remove the tree.
+    std::fs::set_permissions(&jdir, std::fs::Permissions::from_mode(0o755)).ok();
     assert_eq!(
         resp["code"].as_str(),
         Some("journal_write"),

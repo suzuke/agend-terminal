@@ -203,7 +203,7 @@ impl Journal {
     pub(crate) fn load(home: &Path, mangled: &str) -> Option<Journal> {
         match load_typed(home, mangled) {
             JournalLoad::Loaded(j) => Some(j),
-            JournalLoad::Absent | JournalLoad::Corrupt => None,
+            JournalLoad::Absent | JournalLoad::Corrupt | JournalLoad::Unreadable => None,
         }
     }
 
@@ -219,14 +219,22 @@ impl Journal {
 /// corrupt journal must not be silently treated as "nothing to recover".
 pub(crate) enum JournalLoad {
     Absent,
+    /// #2755 R4: the file EXISTS but could not be READ (permission / transient I/O).
+    /// Recovery authority is UNCERTAIN, so consumers MUST fail closed — never conflate
+    /// this with `Absent` (which is a genuine NotFound = nothing to recover).
+    Unreadable,
     Corrupt,
     Loaded(Journal),
 }
 
-/// Read the journal for `mangled`, distinguishing Absent / Corrupt / Loaded.
+/// Read the journal for `mangled`, distinguishing Absent / Unreadable / Corrupt /
+/// Loaded. #2755 R4: ONLY `NotFound` is `Absent`; any other read error is `Unreadable`
+/// (fail-closed authority), so a permission/transient error can't silently bypass a
+/// still-outstanding recovery record.
 pub(crate) fn load_typed(home: &Path, mangled: &str) -> JournalLoad {
     match std::fs::read(journal_path(home, mangled)) {
-        Err(_) => JournalLoad::Absent,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => JournalLoad::Absent,
+        Err(_) => JournalLoad::Unreadable,
         Ok(bytes) => match serde_json::from_slice::<Journal>(&bytes) {
             Ok(j) => JournalLoad::Loaded(j),
             Err(_) => JournalLoad::Corrupt,
@@ -236,7 +244,7 @@ pub(crate) fn load_typed(home: &Path, mangled: &str) -> JournalLoad {
 
 /// The daemon-owned transaction area (sibling of `worktrees/`, NOT inside any
 /// worktree — a `remove --force` can never delete the recovery record).
-fn txn_root(home: &Path) -> PathBuf {
+pub(crate) fn txn_root(home: &Path) -> PathBuf {
     home.join("checkout_txn")
 }
 
@@ -254,9 +262,27 @@ pub(crate) fn journal_path(home: &Path, mangled: &str) -> PathBuf {
 /// torn record is not reprocessed every tick. Safe WITHOUT a lock: journal writes are
 /// atomic (`store::save_atomic` = temp+rename), so a *corrupt* `journal.json` is
 /// always a genuine crash/corruption artifact, never a live checkout's mid-write.
-pub(crate) fn quarantine_corrupt(home: &Path, mangled: &str) {
+pub(crate) fn quarantine_corrupt(home: &Path, mangled: &str) -> bool {
     let jp = journal_path(home, mangled);
-    let _ = std::fs::rename(&jp, jp.with_file_name("journal.json.corrupt"));
+    // #2755 R4: collision-safe evidence name (hash the corrupt bytes) so two distinct
+    // torn records at this path don't clobber each other's evidence; OBSERVE the rename.
+    let dest = match std::fs::read(&jp) {
+        Ok(bytes) => corrupt_evidence_path(home, mangled, &bytes),
+        Err(_) => jp.with_file_name("journal.json.corrupt"), // unreadable ⇒ stable fallback
+    };
+    std::fs::rename(&jp, &dest).is_ok()
+}
+
+/// #2755 R4: collision-safe sidecar path for a corrupt journal's retained evidence —
+/// the corrupt BYTES are hashed so distinct torn records don't overwrite each other's
+/// evidence, and re-quarantining the SAME bytes is idempotent.
+fn corrupt_evidence_path(home: &Path, mangled: &str, bytes: &[u8]) -> PathBuf {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, bytes);
+    journal_path(home, mangled).with_file_name(format!(
+        "journal.json.corrupt-{:016x}",
+        std::hash::Hasher::finish(&h)
+    ))
 }
 
 /// Normalize an absolute worktree TARGET path into the stable identity used as
@@ -480,36 +506,74 @@ pub(crate) fn recover_stale(
     now: chrono::DateTime<chrono::Utc>,
     remove: impl Fn() -> bool,
 ) -> Result<(), String> {
+    // #2755 R4 (item 3a): NotFound ⇒ Absent (nothing to do); UNREADABLE (permission /
+    // transient I/O) leaves recovery authority UNCERTAIN ⇒ abort fail-closed, never
+    // silently proceed as if there were nothing to recover.
     let existing = match load_typed(home, mangled) {
         JournalLoad::Absent => return Ok(()),
-        JournalLoad::Corrupt => {
-            quarantine_corrupt(home, mangled); // retain recovery authority — never drop
-            None
+        JournalLoad::Unreadable => {
+            return Err(
+                "checkout journal storage is unreadable — recovery authority \
+                 uncertain, aborting fail-closed"
+                    .into(),
+            )
         }
+        JournalLoad::Corrupt => None, // evidence-retain + fail-closed arm handled below
         JournalLoad::Loaded(j) => Some(j),
+    };
+    let is_corrupt = existing.is_none();
+    // For a corrupt record, retire it to a collision-safe evidence sidecar whenever the
+    // path is otherwise resolved (no worktree / adopted / removed).
+    let retire = |home: &Path| {
+        if is_corrupt {
+            quarantine_corrupt(home, mangled);
+        } else {
+            Journal::clear(home, mangled);
+        }
     };
     if matches!(&existing, Some(j) if j.phase == Phase::Committed) {
         Journal::clear(home, mangled); // completed attempt's tombstone
         return Ok(());
     }
     if !worktree_dir.exists() {
-        // No worktree to reconcile; drop a loaded record (corrupt already quarantined).
-        if existing.is_some() {
-            Journal::clear(home, mangled);
-        }
+        retire(home); // no worktree ⇒ nothing to reconcile
         return Ok(());
+    }
+    // #2755 R4 (item 1): NEVER delete a still-BOUND worktree (a crash after `bind_full`
+    // but before the Committed journal leaves the binding written yet the journal
+    // non-Committed). Under the caller's path lock, ADOPT a bound worktree as committed;
+    // an UNCERTAIN binding fails closed.
+    match crate::binding::worktree_binding_state(home, worktree_dir) {
+        crate::binding::WorktreeBindingState::Bound => {
+            retire(home); // provision effectively committed — keep the worktree + binding
+            return Ok(());
+        }
+        crate::binding::WorktreeBindingState::Uncertain => {
+            return Err(
+                "a prior checkout left a worktree whose binding could not be read \
+                 — refusing to remove a possibly-bound worktree (fail closed)"
+                    .into(),
+            )
+        }
+        crate::binding::WorktreeBindingState::Unbound => {}
     }
     if remove() {
-        if existing.is_some() {
-            Journal::clear(home, mangled);
-        }
+        retire(home);
         return Ok(());
     }
-    // Remove FAILED with a worktree still on disk ⇒ arm a DURABLE recovery record the
-    // sweep retries. Loaded ⇒ arm it; corrupt/absent-but-worktree-present ⇒ SYNTHESIZE a
-    // replacement from the caller-known source + this path so the sweep drives
-    // `git worktree remove` with a valid source — never orphan a worktree without
-    // recovery authority (indep P0.2).
+    // Remove FAILED, worktree on disk, UNBOUND ⇒ arm a DURABLE recovery record.
+    // #2755 R4 (item 3c): the arm-save is OBSERVED. For a corrupt record, COPY the
+    // evidence aside FIRST, then the atomic replacement save OVERWRITES journal.json; if
+    // that save FAILS, journal.json stays the (corrupt or loaded) record — a durable
+    // BLOCKING state — so the next attempt never sees Absent (never fail-open).
+    if is_corrupt {
+        if let Ok(bytes) = std::fs::read(journal_path(home, mangled)) {
+            let _ = std::fs::copy(
+                journal_path(home, mangled),
+                corrupt_evidence_path(home, mangled, &bytes),
+            );
+        }
+    }
     let mut j = existing.unwrap_or_else(|| {
         Journal::prepared(
             new_nonce(),
@@ -521,7 +585,14 @@ pub(crate) fn recover_stale(
         )
     });
     j.arm_rollback(now);
-    let _ = j.save(home, mangled);
+    if j.save(home, mangled).is_err() {
+        return Err(
+            "a prior checkout left an un-removable worktree AND its recovery \
+             record could not be persisted — the original journal is retained as a durable \
+             blocking record; aborting fail-closed"
+                .into(),
+        );
+    }
     Err(
         "a prior checkout of this path left a worktree that could not be rolled \
          back (retained for recovery)"
@@ -529,143 +600,12 @@ pub(crate) fn recover_stale(
     )
 }
 
-/// Drive recovery of CRASHED (orphaned) checkout-transaction journals — the ONE
-/// shared callable for boot-repair AND a periodic tick (no dedicated worker; the
-/// caller sets cadence). Race-safe against a concurrent live checkout:
-///
-///   1. read the journal (unlocked) for its path + nonce;
-///   2. `try_lock` its EXACT normalized path — SKIP if held (an ACTIVE checkout
-///      owns it; not crashed) so a live provision is never disturbed;
-///   3. RE-READ under the lock and CAS the nonce — SKIP if the record changed
-///      (a NEWER checkout generation took over) so its worktree is never deleted;
-///   4. `Committed` ⇒ clear the tombstone; any other (non-Committed / corrupt-now)
-///      record with a real worktree on disk ⇒ `remove` it (respecting backoff for
-///      an already-armed retry) then clear; on remove failure re-arm backoff and
-///      emit a deduped INTERVENTION `audit`.
-///
-/// Handles EVERY non-Committed phase (not just `rollback_pending`), incl. the
-/// Prepared-with-real-worktree crash window (the on-disk-worktree check, not the
-/// phase, decides whether there is anything to remove). `try_lock`/`remove`/
-/// `audit` are injected so the sweep is unit-testable without live git or flocks.
-/// Returns the count of journals resolved this pass.
-pub(crate) fn recover_pending_sweep<G>(
-    home: &Path,
-    now: chrono::DateTime<chrono::Utc>,
-    try_lock: impl Fn(&Journal) -> Option<G>,
-    remove: impl Fn(&Journal) -> bool,
-    mut audit: impl FnMut(&Journal),
-) -> usize {
-    let Ok(entries) = std::fs::read_dir(txn_root(home)) else {
-        return 0; // no transaction area yet ⇒ nothing pending
-    };
-    let mut resolved = 0;
-    for entry in entries.flatten() {
-        let Some(mangled) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        // (1) Unlocked read for path + nonce. Sibling `<key>.lock` files load as
-        // Absent (skipped); a corrupt record is QUARANTINED (retained as intervention
-        // authority — #2755 R3), NOT cleared: a torn record still marks a path where a
-        // managed worktree may remain, and it is the only source/path/nonce evidence.
-        let seen = match load_typed(home, &mangled) {
-            JournalLoad::Loaded(j) => j,
-            JournalLoad::Corrupt => {
-                tracing::warn!(mangled = %mangled, "corrupt checkout-txn journal — quarantined for intervention");
-                crate::event_log::log(
-                    home,
-                    "checkout_txn_corrupt_quarantine",
-                    "checkout_txn",
-                    &format!("corrupt checkout-txn journal quarantined (manual intervention; managed worktree may remain): {mangled}"),
-                );
-                quarantine_corrupt(home, &mangled);
-                continue;
-            }
-            JournalLoad::Absent => continue,
-        };
-        // (2) Acquire the EXACT path-lock; a held lock ⇒ a live checkout ⇒ skip.
-        let Some(_lock) = try_lock(&seen) else {
-            continue;
-        };
-        // (3) Re-read UNDER the lock + nonce CAS.
-        let j = match load_typed(home, &mangled) {
-            JournalLoad::Loaded(j) if j.nonce == seen.nonce => j,
-            JournalLoad::Loaded(_) => continue, // newer generation took over
-            JournalLoad::Corrupt => {
-                // Corrupt after the unlocked read (crashed mid-provision) — QUARANTINE +
-                // surface, never clear: same recovery-authority retention as arm (1).
-                tracing::warn!(mangled = %mangled, "corrupt checkout-txn journal (under lock) — quarantined for intervention");
-                crate::event_log::log(
-                    home,
-                    "checkout_txn_corrupt_quarantine",
-                    "checkout_txn",
-                    &format!("corrupt checkout-txn journal quarantined under lock (manual intervention): {mangled}"),
-                );
-                quarantine_corrupt(home, &mangled);
-                continue;
-            }
-            JournalLoad::Absent => continue, // cleared concurrently
-        };
-        // (4) Resolve.
-        if j.phase == Phase::Committed {
-            Journal::clear(home, &mangled); // completed attempt's tombstone
-            continue;
-        }
-        if !Path::new(&j.worktree_path).exists() {
-            Journal::clear(home, &mangled); // crashed with no worktree on disk
-            continue;
-        }
-        if j.rollback_pending && !j.rollback_due(now) {
-            continue; // backoff pacing for an already-armed stuck retry
-        }
-        if remove(&j) {
-            Journal::clear(home, &mangled);
-            resolved += 1;
-        } else {
-            let mut j = j;
-            let was_intervention = j.intervention;
-            j.arm_rollback(now);
-            if j.intervention && !was_intervention {
-                audit(&j); // deduped: only on ENTERING intervention
-            }
-            let _ = j.save(home, &mangled);
-        }
-    }
-    resolved
-}
-
-/// Production entry to [`recover_pending_sweep`] — the ONE shared callable invoked
-/// from BOTH boot-repair (`bootstrap::boot_hygiene_sweeps`) and the per-tick
-/// recovery handler (no dedicated worker). Supplies the real `git worktree remove
-/// --force` (run in each journal's recorded source repo) and the operator-visible
-/// INTERVENTION audit (`event_log`). Returns the count resolved this pass.
-pub(crate) fn recover_pending_sweep_prod(home: &Path) -> usize {
-    recover_pending_sweep(
-        home,
-        chrono::Utc::now(),
-        |j| {
-            // Non-blocking exact path-lock; None (a live checkout holds it) ⇒ skip.
-            let wt = Path::new(&j.worktree_path);
-            let mangled = wt.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-            try_acquire_path_lock(home, wt, mangled)
-        },
-        |j| {
-            crate::git_helpers::git_bypass(
-                Path::new(&j.source_repo),
-                &["worktree", "remove", "--force", &j.worktree_path],
-            )
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        },
-        |j| {
-            crate::event_log::log(
-                home,
-                "checkout_txn_intervention",
-                "checkout_txn",
-                &format!(
-                    "stuck checkout-worktree rollback entered INTERVENTION after {} attempts: {}",
-                    j.attempts, j.worktree_path
-                ),
-            );
-        },
-    )
-}
+// #2755 R4: the crash-recovery SWEEP (boot + per-tick driver, `recover_pending_sweep`
+// [`_prod`]) lives in the sibling `checkout_recovery` module to keep both files under the
+// LOC ceiling; re-exported so every `checkout_txn::recover_pending_sweep[_prod]` caller
+// and test path is unchanged.
+pub(crate) use super::checkout_recovery::recover_pending_sweep_prod;
+// `recover_pending_sweep` (the injected-closure core) is only reached from tests;
+// `recover_pending_sweep_prod` is its sole production caller (inside checkout_recovery).
+#[cfg(test)]
+pub(crate) use super::checkout_recovery::recover_pending_sweep;
