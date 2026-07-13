@@ -29,9 +29,12 @@ pub(super) use anti_stall::enforce_send_invariants;
 pub(super) use request_kind_gate::validate_request_kind;
 
 // Delegate-task pre-send gates (handle_delegate_task / comms_delegate).
+pub(super) use dispatch::{run_dispatch_pre_checks, DispatchPreChecks};
 // t-…-17: `ReviewAuthor` is consumed by the reviewer-assignment marker gate in
-// `comms_delegate`.
-pub(super) use dispatch::{run_dispatch_pre_checks, DispatchPreChecks, ReviewAuthor};
+// `comms_delegate` AND persisted verbatim in the durable assignment store
+// (`crate::daemon::assignment_authority`, C8) — so it is crate-visible, not just
+// visible to the handlers facade.
+pub(crate) use dispatch::ReviewAuthor;
 
 // #2537/#2524 P6: triaged pre-send gate (handle_send_to_instance / handle_report_result).
 pub(super) use triaged_gate::{record_triaged_if_present, validate_triaged};

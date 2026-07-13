@@ -21,7 +21,11 @@ use std::path::Path;
 /// is rejected); `External` is a forge login — a distinct principal type that is
 /// NEVER string-compared to the agent target (an agent reviewing external-authored
 /// code is legitimate). Parsed once, fail-closed, via [`parse_review_author`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// t-…-17 C8: `Serialize`/`Deserialize` are additive here so the durable
+// `ActiveAssignment` record (assignment_authority.rs) can persist the authenticated
+// author verbatim. The enum stays the single source of truth (no shadow copy); the
+// derive is a no-behavior-change addition to slice-1's typed principal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ReviewAuthor {
     Agent(String),
     External(String),

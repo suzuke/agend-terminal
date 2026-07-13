@@ -599,6 +599,132 @@ pub fn mark_ci_watch_superseded(
     });
 }
 
+/// t-…-17 reviewer-assignment outbox: is there an ACTIONABLE inbox row for
+/// `target` carrying `delivery_nonce == nonce`? "Actionable" = the same
+/// post-#2299 predicate `is_actionable` uses (`read_at.is_none() &&
+/// delivering_at.is_none() && superseded_by.is_none()`). Used by the durable
+/// outbox's A2 enqueue to DEDUP: a crash between `storage::enqueue` and the
+/// row→Persisted CAS leaves an actionable row already carrying the nonce, so on
+/// recovery we detect it here and skip the duplicate append (nonce-hit ⇒
+/// Persisted, no dup row — invariant I10). Lock-free read: the caller already
+/// holds the per-branch assignment lock, and the nonce is unique per record
+/// generation, so no concurrent writer produces the SAME nonce; a torn/partial
+/// trailing line just fails to parse and is skipped (never a false positive).
+pub fn nonce_present_actionable(home: &Path, target: &str, nonce: &str) -> bool {
+    let path = inbox_path_resolved(home, target);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        // Cheap screen before the JSON parse; the equality below is authoritative.
+        .filter(|l| l.contains(nonce))
+        .any(|l| {
+            serde_json::from_str::<InboxMessage>(l)
+                .ok()
+                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
+                .map(|m| {
+                    m.read_at.is_none() && m.delivering_at.is_none() && m.superseded_by.is_none()
+                })
+                .unwrap_or(false)
+        })
+}
+
+/// Outcome of [`supersede_by_nonce`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NonceSupersedeOutcome {
+    /// A row carrying the nonce was found (any state).
+    pub found: bool,
+    /// That row had already been READ (`read_at` set) when we looked — the
+    /// revoke path (A8) enqueues a revocation notice only in this case, since a
+    /// still-unread row is retracted silently by the supersede itself.
+    pub was_read: bool,
+}
+
+/// t-…-17 reviewer-assignment outbox: mark the inbox row for `target` carrying
+/// `delivery_nonce == nonce` as SUPERSEDED (set `superseded_by = successor`) so
+/// [`UnreadProbe::is_unread`] / the drain filter stop treating it as actionable.
+/// Mirrors [`mark_ci_watch_superseded`] (same tmp+rename+fsync rewrite under the
+/// per-agent inbox flock) but keys on the OUTBOX delivery nonce instead of the
+/// ci-watch `(kind, from, correlation_id)` triple.
+///
+/// Used by row-repair (A4: retire the STALE nonce's row after enqueuing the fresh
+/// one) and by revoke/transfer (A8/A9: retract the current row). Only an UNREAD,
+/// not-already-superseded row is rewritten (an already-read row is left verbatim —
+/// it is already non-actionable), but the returned [`NonceSupersedeOutcome`]
+/// reports `was_read` so revoke can surface a revocation notice for a row the
+/// reviewer had already seen (invariant I21).
+pub fn supersede_by_nonce(
+    home: &Path,
+    target: &str,
+    nonce: &str,
+    successor: &str,
+) -> NonceSupersedeOutcome {
+    let path = inbox_path_resolved(home, target);
+    if !path.exists() {
+        return NonceSupersedeOutcome::default();
+    }
+    with_inbox_lock(home, target, |path| -> NonceSupersedeOutcome {
+        let mut outcome = NonceSupersedeOutcome::default();
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let mut changed = false;
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                lines.push(line.to_string());
+                continue;
+            }
+            // Cheap screen: a row that can't contain the nonce is preserved verbatim.
+            if !line.contains(nonce) {
+                lines.push(line.to_string());
+                continue;
+            }
+            if let Ok(mut msg) = serde_json::from_str::<InboxMessage>(line) {
+                if msg.delivery_nonce.as_deref() == Some(nonce) {
+                    outcome.found = true;
+                    if msg.read_at.is_some() {
+                        outcome.was_read = true;
+                    }
+                    // Only retract a still-live row; an already-read/superseded
+                    // row is already non-actionable and is left byte-identical.
+                    if msg.read_at.is_none() && msg.superseded_by.is_none() {
+                        msg.superseded_by = Some(successor.to_string());
+                        changed = true;
+                    }
+                }
+                lines.push(serde_json::to_string(&msg).unwrap_or_else(|_| line.to_string()));
+            } else {
+                // Forward-schema / torn line: preserve verbatim (never drop).
+                lines.push(line.to_string());
+            }
+        }
+        if changed {
+            let tmp = path.with_extension("jsonl.tmp");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+            {
+                use std::io::Write;
+                let write_ok = (|| -> std::io::Result<()> {
+                    for l in &lines {
+                        writeln!(f, "{l}")?;
+                    }
+                    f.sync_all()
+                })()
+                .is_ok();
+                if write_ok && std::fs::rename(&tmp, path).is_ok() {
+                    crate::store::fsync_parent_dir(path); // durable rename
+                }
+            }
+        }
+        outcome
+    })
+    .unwrap_or_default()
+}
+
 /// Drain unread messages: mark them with `read_at` and write back.
 /// Returns only the messages that were previously unread.
 ///
