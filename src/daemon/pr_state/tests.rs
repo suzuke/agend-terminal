@@ -3070,6 +3070,7 @@ fn t30_persist_asgn(home: &std::path::Path, repo: &str, branch: &str, target: &s
     crate::daemon::assignment_authority::persist(home, &rec).unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn t30_persist_typed_asgn(
     home: &std::path::Path,
     repo: &str,
