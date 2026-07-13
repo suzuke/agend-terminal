@@ -203,9 +203,10 @@ pub struct PrState {
     /// failure — so the reserved derivation could not be trusted. While set,
     /// [`is_merge_ready`] returns false unconditionally. This closes the
     /// sole-corrupt-record fail-open: a branch whose ONLY record is corrupt looks
-    /// assignment-free to the lossy [`crate::daemon::assignment_authority::has_active`],
-    /// so the drain would otherwise derive an EMPTY reserved set on a fresh state and
-    /// OPEN the gate. CLEARED only by a successful locked-or-genuinely-absent derive.
+    /// assignment-free to a lossy record read, so without the tri-state
+    /// [`crate::daemon::assignment_authority::probe_branch_authority`] the A6 drain
+    /// would derive an EMPTY reserved set on a fresh state and OPEN the gate. CLEARED
+    /// only by a successful locked-or-genuinely-absent derive.
     /// Additive serde (`default` + skip-when-false) ⇒ legacy state files load
     /// byte-identical; an old file without the field defaults `false` and is
     /// re-derived on the next CI observation.
@@ -577,6 +578,16 @@ pub(crate) fn sha_prefix_match(full: &str, asserted: &str) -> bool {
 /// - Draft state — `gh pr merge` rejects drafts; refuse to mark ready
 /// - Threshold per `review_class` (Single=1 / Dual=2)
 pub fn is_merge_ready(state: &PrState) -> bool {
+    // t-…-17 B4 (codex m-…-322): the assignment authority was UNREADABLE at the last
+    // A6 drain (a corrupt/unreadable record, an exists-but-unreadable branch dir, or a
+    // required assignment-lock failure), so the reserved derivation could NOT be
+    // trusted. FAIL CLOSED. This is the explicit "authority unreadable ⇒ close" state
+    // that closes the sole-corrupt-record fail-open: a branch whose only record is
+    // corrupt looks assignment-free to the lossy `has_active`, so the drain would
+    // otherwise derive an EMPTY reserved set on a fresh state and OPEN this gate.
+    if state.authority_unknown {
+        return false;
+    }
     // t-…-17 C13: a required reviewer whose assignment is RESERVED-but-unverified
     // holds the PR closed. Reserved entries are DERIVED (excl. Satisfied) by the
     // reconciler and are NEVER counted toward `required_verified_count` / pushed
@@ -1167,25 +1178,34 @@ pub fn record_ci_result(
     // lock of the drain below (the pr_state flock `with_pr_state_or_create` takes is
     // the INNER lock — the mandated assignment-OUTER / pr_state-INNER order), so the
     // `reserved_assignments` derivation is consistent with a concurrent
-    // revoke/transfer/tombstone. Acquired ONLY when the branch actually has active
-    // assignments (so an assignment-free branch never creates an empty store dir);
-    // best-effort — a lock failure logs nothing and the drain still runs lock-free
-    // (the per-tick reconciler re-derives, so convergence is preserved). Held for the
-    // whole `with_pr_state_or_create` scope via the binding's lifetime.
-    let has_active = crate::daemon::assignment_authority::has_active(home, repo, branch);
-    let _assignment_lock = if has_active {
+    // revoke/transfer/tombstone. Acquired ONLY when the branch is ACTIVE (so an
+    // assignment-free branch never creates an empty store dir); if the lock cannot be
+    // acquired the drain FAILS CLOSED (below) rather than deriving lock-free — the
+    // per-tick reconciler re-derives under the lock later. Held for the whole
+    // `with_pr_state_or_create` scope via the binding's lifetime.
+    // t-…-17 B4 (codex m-…-322): probe the branch authority with the TRI-STATE probe,
+    // NOT the lossy `has_active`. `has_active` DROPS a corrupt record's `Err`, so a
+    // branch whose SOLE record is corrupt looks assignment-free — the drain then
+    // derives an EMPTY reserved set on a fresh state and OPENs the merge gate. The
+    // probe reports `Unreadable` for that case so the drain fails closed (below).
+    let authority = crate::daemon::assignment_authority::probe_branch_authority(home, repo, branch);
+    // Acquire the OUTER assignment lock ONLY when the branch is ACTIVE (has ≥1 valid
+    // record). `Absent` needs none (empty reserved is correct); `Unreadable` is not
+    // derived at all. Best-effort — an `Active` branch whose lock cannot be acquired is
+    // handled fail-closed in the drain below. Held for the whole
+    // `with_pr_state_or_create` scope via the binding's lifetime.
+    let _assignment_lock = if matches!(
+        authority,
+        crate::daemon::assignment_authority::BranchAuthority::Active
+    ) {
         crate::daemon::assignment_authority::lock_branch_for_drain(home, repo, branch)
     } else {
         None
     };
-    // t-…-17 B4(d): the reserved derivation is only SAFE when it runs under the
-    // assignment lock (consistent w.r.t. a concurrent revoke/transfer). Derive ONLY
-    // when the lock IS held, or when the branch has NO active assignments (an empty
-    // reserved set is then correct). If `has_active` but the lock could NOT be
-    // acquired, a lock-free derivation could read a torn reserved set that CLEARS the
-    // gate — so skip it and KEEP the existing set (fail closed); the per-tick
-    // reconciler re-derives under the lock later.
-    let derive_reserved = !has_active || _assignment_lock.is_some();
+    // Whether the OUTER assignment lock is actually held — captured (Copy) so the drain
+    // closure need not borrow the guard. A lock-free derivation on an `Active` branch
+    // could read a torn reserved set that CLEARS the gate, so it is refused fail-closed.
+    let lock_acquired = _assignment_lock.is_some();
     if let Err(e) = with_pr_state_or_create(
         home,
         repo,
@@ -1234,23 +1254,73 @@ pub fn record_ci_result(
             // (I17). A freshly-created state still carries pr_number 0 (gh-poll fills
             // it later), matching no record (persist rejects pr_number 0), so the
             // reconciler backstops the reservation until the generation is known.
-            if derive_reserved {
-                // B4: a corrupt authority record makes the derivation Err — KEEP the
-                // existing reserved set (never drop a reservation on corruption).
-                match crate::daemon::assignment_authority::derive_reserved_for_prstate(
+            // t-…-17 B4 (codex m-…-322): set/clear the fail-closed `authority_unknown`
+            // gate flag from the probe + derive outcome. SET on corrupt/unreadable/
+            // required-lock-failure; CLEARED only on a successful locked-or-absent
+            // derive. This is the explicit "authority unreadable ⇒ close" state that
+            // closes the sole-corrupt-record fail-open (`is_merge_ready` gates on it).
+            use crate::daemon::assignment_authority::BranchAuthority;
+            let derive = |state: &mut PrState| {
+                crate::daemon::assignment_authority::derive_reserved_for_prstate(
                     home, repo, branch, state,
-                ) {
-                    Ok(v) => state.reserved_assignments = v,
-                    Err(e) => tracing::error!(
-                        repo = %repo, branch = %branch, error = %e,
-                        "t-…-17 B4: reserved derivation skipped — corrupt authority record; keeping existing reserved set (fail closed, gate stays closed)"
-                    ),
+                )
+            };
+            match authority {
+                // Genuine absence — an empty reserved set is correct; derive lock-free
+                // (nothing to race). On Ok, adopt it and CLEAR the flag (authority is
+                // readable). A dir that flipped to unreadable between probe and derive
+                // KEEPS the existing set and fails closed.
+                BranchAuthority::Absent => match derive(state) {
+                    Ok(v) => {
+                        state.reserved_assignments = v;
+                        state.authority_unknown = false;
+                    }
+                    Err(e) => {
+                        state.authority_unknown = true;
+                        tracing::error!(
+                            repo = %repo, branch = %branch, error = %e,
+                            "t-…-17 B4: reserved derivation failed on an absent-probed branch (raced to unreadable) — keeping existing reserved set + authority_unknown SET (fail closed)"
+                        );
+                    }
+                },
+                // Active + lock held — derive under the OUTER lock (consistent w.r.t. a
+                // concurrent revoke/transfer). Ok ⇒ adopt + CLEAR; Err (a co-resident
+                // corrupt record) ⇒ keep existing set + SET (never drop on corruption).
+                BranchAuthority::Active if lock_acquired => match derive(state) {
+                    Ok(v) => {
+                        state.reserved_assignments = v;
+                        state.authority_unknown = false;
+                    }
+                    Err(e) => {
+                        state.authority_unknown = true;
+                        tracing::error!(
+                            repo = %repo, branch = %branch, error = %e,
+                            "t-…-17 B4: reserved derivation skipped — corrupt authority record; keeping existing reserved set + authority_unknown SET (fail closed, gate stays closed)"
+                        );
+                    }
+                },
+                // Active but the required lock could NOT be acquired — a lock-free
+                // derive could read a torn set that CLEARS the gate. Keep the existing
+                // set + SET (fail closed); the per-tick reconciler re-derives under the
+                // lock later.
+                BranchAuthority::Active => {
+                    state.authority_unknown = true;
+                    tracing::warn!(
+                        repo = %repo, branch = %branch,
+                        "t-…-17 B4(d): reserved derivation skipped fail-closed — assignment lock not acquired while active assignments exist; keeping existing reserved set + authority_unknown SET (reconciler re-derives under the lock)"
+                    );
                 }
-            } else {
-                tracing::warn!(
-                    repo = %repo, branch = %branch,
-                    "t-…-17 B4(d): reserved derivation skipped fail-closed — assignment lock not acquired while active assignments exist; keeping existing reserved set (reconciler re-derives under the lock)"
-                );
+                // The authority is UNREADABLE (a corrupt/unreadable record or an
+                // unreadable branch dir) — do NOT derive (can't read reliably). Keep the
+                // existing set + SET (fail closed). THIS is the sole-corrupt-record path
+                // the lossy `has_active` used to mis-read as assignment-free.
+                BranchAuthority::Unreadable => {
+                    state.authority_unknown = true;
+                    tracing::error!(
+                        repo = %repo, branch = %branch,
+                        "t-…-17 B4: reserved derivation skipped — branch authority UNREADABLE (corrupt/unreadable record or dir); keeping existing reserved set + authority_unknown SET (fail closed, gate stays closed)"
+                    );
+                }
             }
             // #2059 #2(c): the state's head_sha is now established at `head_sha`.
             // Drain + replay any verdicts that were buffered for this SHA before

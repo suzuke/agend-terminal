@@ -441,9 +441,32 @@ fn list_active_checked(
     branch: &str,
 ) -> anyhow::Result<Vec<ActiveAssignment>> {
     let dir = branch_dir(home, repo, branch);
+    // B4 (codex m-…-322): a `read_dir` error must NOT be swallowed. A genuinely-
+    // MISSING dir (`NotFound`) is a genuine ABSENCE (no assignments) ⇒ `Ok(empty)`;
+    // any OTHER error means the dir EXISTS but is unreadable ⇒ propagate `Err` so the
+    // merge-gate caller keeps the existing reserved set (never read as "no
+    // reservation"). The old `read_dir(&dir).into_iter().flatten().flatten()` mapped
+    // BOTH cases to empty — an exists-but-unreadable dir then silently DROPPED the
+    // reservation and OPENed the gate.
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "unreadable assignment dir {}: {e}",
+                dir.display()
+            ))
+        }
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let path = entry.path();
+    for entry in rd {
+        // A directory entry that fails to read mid-scan (the dir became unreadable)
+        // propagates ⇒ fail closed, same as a corrupt record.
+        let path = entry
+            .map_err(|e| {
+                anyhow::anyhow!("unreadable assignment dir entry in {}: {e}", dir.display())
+            })?
+            .path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
@@ -457,6 +480,65 @@ fn list_active_checked(
         }
     }
     Ok(out)
+}
+
+/// t-…-17 B4 (codex m-…-322): the merge-gate outcome of reading a branch's assignment
+/// authority — a TRI-STATE distinction the lossy `list_active` cannot make. The A6
+/// drain in [`crate::daemon::pr_state::record_ci_result`] uses THIS (not a lossy read)
+/// so a SOLE corrupt record fails the gate closed instead of looking assignment-free.
+pub(crate) enum BranchAuthority {
+    /// The branch dir is MISSING (`read_dir` `NotFound`) OR exists with ZERO records —
+    /// a genuine absence. The reserved derivation may proceed (an empty reserved set is
+    /// then correct) and CLEAR `authority_unknown`.
+    Absent,
+    /// The branch dir exists with ≥1 VALID record AND no corrupt one. Take the
+    /// assignment lock and derive under it.
+    Active,
+    /// The branch dir `read_dir` errored (non-`NotFound`) OR ANY record is
+    /// corrupt/unreadable. The authority cannot be read reliably ⇒ FAIL CLOSED (keep
+    /// the existing reserved set and SET `authority_unknown`); do NOT derive.
+    Unreadable,
+}
+
+/// t-…-17 B4 (codex m-…-322): probe `(repo,branch)`'s assignment authority for the
+/// merge-gate drain. NotFound dir OR zero records ⇒ [`BranchAuthority::Absent`]; a dir
+/// with ≥1 valid record and no corrupt one ⇒ [`BranchAuthority::Active`]; a
+/// non-NotFound `read_dir` error OR ANY corrupt record ⇒ [`BranchAuthority::Unreadable`]
+/// (fail closed). Unlike a lossy read, a corrupt record is NEVER conflated with
+/// absence. Lock-free (mirrors the enumeration in [`list_active`]); creates no dir.
+pub(crate) fn probe_branch_authority(home: &Path, repo: &str, branch: &str) -> BranchAuthority {
+    let dir = branch_dir(home, repo, branch);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BranchAuthority::Absent,
+        Err(_) => return BranchAuthority::Unreadable,
+    };
+    let mut saw_record = false;
+    for entry in rd {
+        let path = match entry {
+            Ok(e) => e.path(),
+            // The dir became unreadable mid-scan ⇒ fail closed.
+            Err(_) => return BranchAuthority::Unreadable,
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+            continue;
+        }
+        match read_record(&path) {
+            Ok(Some(_)) => saw_record = true,
+            // A concurrent remove raced us — genuine absence of THIS record; keep scanning.
+            Ok(None) => {}
+            // A corrupt record ⇒ authority unreadable, whatever else the dir holds.
+            Err(_) => return BranchAuthority::Unreadable,
+        }
+    }
+    if saw_record {
+        BranchAuthority::Active
+    } else {
+        BranchAuthority::Absent
+    }
 }
 
 /// The record for one `(repo,branch,target)`, if any.
@@ -896,13 +978,6 @@ pub(crate) fn lock_branch_for_drain(
     branch: &str,
 ) -> Option<crate::store::FileFlockGuard> {
     lock_branch(home, repo, branch).ok()
-}
-
-/// True iff `(repo,branch)` has at least one active record. Lock-free (mirrors
-/// [`list_active`]). Lets the A6 drain skip acquiring the branch lock — and creating
-/// an empty branch dir — for a branch with no reviewer assignments.
-pub(crate) fn has_active(home: &Path, repo: &str, branch: &str) -> bool {
-    !list_active(home, repo, branch).is_empty()
 }
 
 /// Enumerate every `(repo,branch)` with at least one active record — the reconciler's
