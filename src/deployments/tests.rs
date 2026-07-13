@@ -582,59 +582,6 @@ templates:
 }
 
 #[test]
-fn teardown_removes_deployed_entries_from_fleet_yaml() {
-    // Cleanup symmetry: without this, daemon restart would auto-spawn
-    // dead agents because auto_start_fleet reads fleet.yaml instances.
-    let home = tmp_home("teardown_cleanup");
-    let yaml = r#"
-templates:
-  dev:
-    instances:
-      lead:
-        backend: claude
-        role: orchestrator
-      impl:
-        backend: claude
-        role: implementer
-instances:
-  preexisting:
-    backend: claude
-    role: survivor
-"#;
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
-
-    let _ = deploy(
-        &home,
-        "caller",
-        &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
-    );
-    // Sanity: deployed entries are there.
-    let after_deploy = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
-        .expect("post-deploy");
-    assert!(after_deploy.instances.contains_key("dev-lead"));
-    assert!(after_deploy.instances.contains_key("dev-impl"));
-
-    let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
-
-    let after_teardown = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
-        .expect("post-teardown");
-    assert!(
-        !after_teardown.instances.contains_key("dev-lead"),
-        "deployed entry must be removed"
-    );
-    assert!(
-        !after_teardown.instances.contains_key("dev-impl"),
-        "deployed entry must be removed"
-    );
-    // Entries not owned by the deployment stay.
-    assert!(
-        after_teardown.instances.contains_key("preexisting"),
-        "teardown must not touch pre-existing instances"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
 fn deploy_sets_orchestrator_from_template_suffix() {
     // Template nominates orchestrator by suffix; deploy must rewrite it
     // to the fully-prefixed name (`<deploy_name>-<suffix>`) before calling
@@ -816,38 +763,6 @@ templates:
 // ── Issue #456: teardown cleanup tests ───────────────────────────
 
 #[test]
-fn teardown_removes_workspace_dir() {
-    let home = tmp_home("teardown_workspace");
-    let yaml = r#"
-templates:
-  dev:
-    instances:
-      worker:
-        backend: claude
-instances: {}
-"#;
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
-    let _ = deploy(
-        &home,
-        "caller",
-        &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
-    );
-    // Create workspace dir (simulates what daemon would create).
-    let workspace = crate::paths::workspace_dir(&home).join("dev-worker");
-    std::fs::create_dir_all(&workspace).ok();
-    std::fs::write(workspace.join("test.txt"), "data").ok();
-    assert!(workspace.exists());
-
-    let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
-
-    assert!(
-        !workspace.exists(),
-        "teardown must remove workspace directory"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
 fn teardown_clears_configs_and_bindings() {
     let home = tmp_home("teardown_configs");
     let yaml = r#"
@@ -874,36 +789,6 @@ instances: {}
     // Workspace dir should not exist.
     let workspace = crate::paths::workspace_dir(&home).join("dev-agent");
     assert!(!workspace.exists(), "workspace must be cleaned");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn teardown_prevents_respawn_by_removing_fleet_entry() {
-    // After teardown, fleet.yaml must not contain the instance.
-    // This prevents daemon restart from auto-spawning the dead agent.
-    let home = tmp_home("teardown_respawn");
-    let yaml = r#"
-templates:
-  dev:
-    instances:
-      impl:
-        backend: claude
-instances: {}
-"#;
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
-    let _ = deploy(
-        &home,
-        "caller",
-        &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
-    );
-    let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
-
-    let config =
-        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).expect("load fleet");
-    assert!(
-        !config.instances.contains_key("dev-impl"),
-        "teardown must remove fleet entry to prevent respawn"
-    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -1020,35 +905,6 @@ fn teardown_surfaces_record_save_failure_not_fake_torn_down() {
 }
 
 #[test]
-fn close_last_instance_prunes_deployment_entry() {
-    // Production smoke for the Issue #474 fix: deploy → simulate the
-    // TUI close path (remove from fleet.yaml + reconcile_after_close)
-    // → deployment store entry gone.
-    let home = deploy_single_instance_for_test("close_last", "tpl");
-    let store = load(&home);
-    assert!(
-        store.deployments.iter().any(|d| d.name == "tpl"),
-        "pre: deployment must exist"
-    );
-
-    // TUI close path mirror: fleet.yaml first, then reconcile.
-    let names: Vec<String> = vec!["tpl-worker".to_string()];
-    let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
-    let pruned = reconcile_after_close(&home, &names);
-
-    assert!(
-        pruned.iter().any(|n| n == "tpl"),
-        "reconcile must prune the empty deployment, got {pruned:?}"
-    );
-    let store = load(&home);
-    assert!(
-        store.deployments.iter().all(|d| d.name != "tpl"),
-        "deployment store must NOT contain 'tpl' post-close"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
 fn close_non_last_instance_keeps_deployment_intact() {
     // Multi-instance deployment: closing one of three keeps the
     // deployment entry intact — only when ALL members are gone does
@@ -1102,530 +958,6 @@ instances: {}
         "instances list unchanged: {entry:?}"
     );
     std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn reconcile_orphans_prunes_stale_entry_at_boot() {
-    // Defensive sweep (Option 3): a stale deployment-store entry left
-    // by an unclean shutdown — fleet.yaml has zero matching members
-    // — gets pruned on next `reconcile_orphans` call.
-    let home = tmp_home("reconcile_orphans");
-    std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
-        )
-        .unwrap();
-
-    // Hand-craft a deployment-store entry with no live members.
-    let mut store = load(&home);
-    store.deployments.push(Deployment {
-        name: "ghost".into(),
-        template: "tpl".into(),
-        instances: vec!["ghost-instance-that-never-was".into()],
-        team: None,
-        directory: home.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: None,
-    });
-    save(&home, &mut store).expect("save store");
-
-    let pruned = reconcile_orphans(&home);
-    assert!(
-        pruned.iter().any(|n| n == "ghost"),
-        "boot reconcile must prune stale entry, got {pruned:?}"
-    );
-    let store = load(&home);
-    assert!(
-        store.deployments.iter().all(|d| d.name != "ghost"),
-        "stale entry must be gone from store"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn reconcile_after_close_is_idempotent() {
-    // Repeated reconciles on the same already-clean state must no-op
-    // (no spurious team-delete calls, no panics).
-    let home = deploy_single_instance_for_test("reconcile_idem", "tpl");
-    let names: Vec<String> = vec!["tpl-worker".to_string()];
-    let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
-    let r1 = reconcile_after_close(&home, &names);
-    assert_eq!(r1, vec!["tpl".to_string()], "first reconcile prunes");
-    let r2 = reconcile_after_close(&home, &names);
-    assert!(r2.is_empty(), "second reconcile no-ops, got {r2:?}");
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// ── Smoke 2 (post-#475) — workspace dir cleanup tests ─────────────
-//
-// Issue: TUI close path + `deployment teardown` both invoked
-// `cleanup_working_dir` for `home/workspace/<inst>` only. Deployments
-// with `directory: /tmp/foo` left `/tmp/foo/<inst>/` on disk because
-// `cleanup_working_dir`'s user-provided-dir branch only strips agend
-// files (by design — protects user data).
-//
-// Fix: `cleanup_deployment_dirs` (this module) now removes both the
-// custom-directory subdir (whole-tree) AND the default workspace
-// path. Wired into both `reconcile_orphan_deployments` (close path /
-// boot sweep) and `teardown` (operator action).
-//
-// Regression-proof: comment out the `for dep in &pruned_deployments`
-// loop in `reconcile_orphan_deployments` and
-// `reconcile_prunes_custom_directory_subdirs` FAILS — restore → PASS.
-
-/// Helper: build a deployment-shaped fixture with a custom directory
-/// outside `home/workspace/`. Mirrors deploy()'s `inst_dir = dir.join(name)`
-/// shape so the test exercises the same on-disk layout production
-/// produces.
-fn deploy_with_custom_directory(
-    tag: &str,
-    deploy_name: &str,
-    members: &[&str],
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let home = tmp_home(tag);
-    // Custom directory parent — outside home/workspace/ so the
-    // user-provided-dir branch of cleanup_working_dir would normally
-    // skip whole-tree removal.
-    let custom_root = std::env::temp_dir().join(format!(
-        "agend-smoke2-{}-{}-custom",
-        std::process::id(),
-        tag
-    ));
-    std::fs::create_dir_all(&custom_root).ok();
-    // Hand-craft the deployment store entry + matching subdirs +
-    // fleet.yaml entries. Simpler than running deploy() because the
-    // deploy fn would also try to spawn instances via the API.
-    let mut store = load(&home);
-    let inst_names: Vec<String> = members
-        .iter()
-        .map(|m| format!("{deploy_name}-{m}"))
-        .collect();
-    // #2764 R3: this helper simulates a DAEMON-CREATED deployment generation, so
-    // pin a nonce and seed each subdir's identity+nonce-bound marker matching the
-    // record — authorizing the whole-tree removal these tests assert. (Unproven /
-    // nonce-mismatch cases have their own preserve tests.)
-    let nonce = format!("test-nonce-{deploy_name}");
-    for inst in &inst_names {
-        let inst_dir = custom_root.join(inst);
-        std::fs::create_dir_all(&inst_dir).unwrap();
-        // Drop a sentinel file so we can tell the dir was actually
-        // removed (vs e.g. moved or never created).
-        std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
-        seed_deploy_marker(&inst_dir, deploy_name, inst, &nonce);
-    }
-    store.deployments.push(Deployment {
-        name: deploy_name.to_string(),
-        template: "tpl".to_string(),
-        instances: inst_names.clone(),
-        team: None,
-        directory: custom_root.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: Some(nonce),
-    });
-    save(&home, &mut store).unwrap();
-    // Empty fleet.yaml — simulates the "all instances closed" state
-    // that triggers the prune branch in reconcile.
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-    (home, custom_root)
-}
-
-#[test]
-fn reconcile_prunes_custom_directory_subdirs() {
-    // Production smoke matching general's m-13 Smoke 2 reproduction.
-    // Custom directory + multi-member deployment + all instances
-    // already removed from fleet.yaml → reconcile must prune the
-    // entry AND remove every spawned subdir.
-    let (home, custom_root) = deploy_with_custom_directory(
-        "smoke2_custom",
-        "smoke2-team",
-        &["lead", "impl-1", "impl-2", "reviewer"],
-    );
-
-    // Pre-condition: subdirs exist with the sentinel file.
-    for member in ["lead", "impl-1", "impl-2", "reviewer"] {
-        let inst = format!("smoke2-team-{member}");
-        let inst_dir = custom_root.join(&inst);
-        assert!(
-            inst_dir.exists(),
-            "test setup: {inst_dir:?} must exist pre-reconcile"
-        );
-        assert!(
-            inst_dir.join("sentinel.txt").exists(),
-            "test setup: sentinel must exist in {inst_dir:?}"
-        );
-    }
-
-    let pruned = reconcile_orphans(&home);
-    assert!(
-        pruned.contains(&"smoke2-team".to_string()),
-        "reconcile must prune the deployment, got {pruned:?}"
-    );
-
-    // Post-condition: every per-member subdir gone.
-    for member in ["lead", "impl-1", "impl-2", "reviewer"] {
-        let inst = format!("smoke2-team-{member}");
-        let inst_dir = custom_root.join(&inst);
-        assert!(
-            !inst_dir.exists(),
-            "Smoke 2 fix: custom-directory subdir {inst_dir:?} must be gone post-reconcile"
-        );
-    }
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-#[test]
-fn close_last_instance_cleans_default_workspace_dir() {
-    // Default-directory deployment: `home/workspace/<deploy>/<inst>/`.
-    // After close + reconcile, the per-instance default workspace dir
-    // should be removed via cleanup_working_dir's AGEND_HOME branch.
-    let home = deploy_single_instance_for_test("close_default_wd", "tpl");
-    // Hand-create the workspace subdir (production's spawn path
-    // would have created it; deploy_single_instance_for_test stops
-    // short of spawning).
-    let wd = crate::paths::workspace_dir(&home).join("tpl-worker");
-    std::fs::create_dir_all(&wd).unwrap();
-    std::fs::write(wd.join("agent_data.txt"), "data").unwrap();
-    assert!(wd.exists(), "test setup: workspace dir must exist");
-
-    let names: Vec<String> = vec!["tpl-worker".to_string()];
-    let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
-    let _ = reconcile_after_close(&home, &names);
-
-    assert!(
-        !wd.exists(),
-        "default workspace dir must be cleaned post-reconcile: {wd:?}"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn teardown_cleans_custom_directory_subdirs() {
-    // Operator-driven `deployment teardown` action must also clean
-    // custom-directory subdirs (not just the home/workspace fallback
-    // the prior inline loop covered).
-    let (home, custom_root) =
-        deploy_with_custom_directory("smoke2_teardown", "td-team", &["a", "b"]);
-
-    // teardown looks up by deployment name from the store.
-    let _ = teardown(&home, &serde_json::json!({"name": "td-team"}));
-
-    for member in ["a", "b"] {
-        let inst = format!("td-team-{member}");
-        let inst_dir = custom_root.join(&inst);
-        assert!(
-            !inst_dir.exists(),
-            "teardown must remove custom subdir {inst_dir:?}"
-        );
-    }
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-#[test]
-fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
-    // Pre-removed subdirs (e.g., manual cleanup, or a previous reconcile
-    // already ran) must not panic the helper. Tests the
-    // `if custom_subdir.exists()` guard.
-    let home = tmp_home("smoke2_missing");
-    let custom_root = std::env::temp_dir().join(format!(
-        "agend-smoke2-{}-missing-custom",
-        std::process::id()
-    ));
-    // No subdir created — just point a Deployment at the (non-existent)
-    // path.
-    let dep = Deployment {
-        name: "ghost".to_string(),
-        template: "tpl".to_string(),
-        instances: vec!["ghost-a".to_string()],
-        team: None,
-        directory: custom_root.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: None,
-    };
-
-    // Must not panic.
-    cleanup_deployment_dirs(&home, &dep);
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-/// §3.9 (MED-4): a branch-mode deploy creates a git worktree + branch per
-/// instance; teardown must remove BOTH so a same-name re-deploy succeeds.
-/// Pre-fix, `cleanup_deployment_dirs` only `remove_dir_all`'d the subdir,
-/// leaking a prunable worktree registry entry + the orphan branch. Drives
-/// the real `cleanup_deployment_dirs`; the decisive check is that re-creating
-/// the same worktree+branch succeeds afterward. Regression-proof: revert the
-/// worktree/branch GC and the re-add fails ("already exists").
-#[test]
-fn teardown_removes_branch_mode_worktree_and_orphan_branch_med4() {
-    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-        crate::git_helpers::git_bypass(dir, args).expect("git")
-    }
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
-        git(repo, &["rev-parse", "--verify", "--quiet", branch])
-            .status
-            .success()
-    }
-
-    let home = tmp_home("med4-worktree");
-    // #2764 R5: custom-dir cleanup fails closed on an unreadable fleet — provide
-    // an empty-but-present roster (no survivors) to authorize the removal.
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-    // Branch-mode: the deploy directory IS the source repo.
-    let repo = home.join("srcrepo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "init",
-        ],
-    );
-
-    // Mirror prepare_work_dir: worktree `deploy-lead` on branch `deploy/lead`.
-    let inst_dir = repo.join("deploy-lead");
-    let inst_dir_str = inst_dir.display().to_string();
-    assert!(
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "deploy/lead",
-                &inst_dir_str,
-                "main"
-            ]
-        )
-        .status
-        .success(),
-        "setup: worktree add must succeed"
-    );
-    assert!(
-        inst_dir.join(".git").is_file(),
-        "pre: inst_dir is a worktree"
-    );
-    assert!(branch_exists(&repo, "deploy/lead"), "pre: branch exists");
-    // #2764 R3: mirror prepare_work_dir writing the identity+nonce-bound marker
-    // after a successful `git worktree add`, authorizing the whole-tree removal.
-    seed_deploy_marker(&inst_dir, "deploy", "deploy-lead", "test-nonce-deploy");
-
-    cleanup_deployment_dirs(&home, &make_deployment("deploy", &["lead"], &repo));
-
-    assert!(
-        !inst_dir.exists(),
-        "MED-4: the worktree dir must be removed"
-    );
-    assert!(
-        !branch_exists(&repo, "deploy/lead"),
-        "MED-4: the orphan branch must be deleted"
-    );
-    // Decisive: a same-name re-deploy (re-`worktree add -b`) must succeed —
-    // proving no leftover registry entry or branch.
-    assert!(
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "deploy/lead",
-                &inst_dir_str,
-                "main"
-            ]
-        )
-        .status
-        .success(),
-        "MED-4: same-name re-deploy must succeed after teardown (no orphan)"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// -----------------------------------------------------------------
-// Sprint 54 P1-5 — rmdir empty deployment parent. Three contract
-// gates from dispatch m-20260507033740155107-2:
-//  1. all-subdirs-removed → parent gone
-//  2. unrelated file present → parent preserved
-//  3. running cleanup twice → second call silent
-//
-// Empirical regression-proof anchor: commenting out the
-// `rmdir_if_empty(custom_root)` call at the end of
-// `cleanup_deployment_dirs` trips test (1) with the FAIL signature
-// attached to the PR description.
-// -----------------------------------------------------------------
-
-fn make_deployment(name: &str, members: &[&str], directory: &Path) -> Deployment {
-    let inst_names: Vec<String> = members.iter().map(|m| format!("{name}-{m}")).collect();
-    Deployment {
-        name: name.to_string(),
-        template: "tpl".to_string(),
-        instances: inst_names,
-        team: None,
-        directory: directory.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: Some(format!("test-nonce-{name}")),
-    }
-}
-
-/// #2764 R3 test helper: seed a subdir's identity+nonce-bound creation marker
-/// matching a deployment record, so the proof-carrying cleanup authorizes its
-/// whole-tree removal.
-fn seed_deploy_marker(inst_dir: &Path, deployment: &str, instance: &str, nonce: &str) {
-    let body = crate::agent_ops::workspace_cleanup::deploy_marker_body(
-        &crate::agent_ops::workspace_cleanup::DeployProvenance {
-            deployment: deployment.to_string(),
-            instance: instance.to_string(),
-            nonce: nonce.to_string(),
-        },
-    );
-    std::fs::write(
-        inst_dir.join(crate::agent_ops::workspace_cleanup::DEPLOY_CREATED_MARKER),
-        body,
-    )
-    .unwrap();
-}
-
-#[test]
-fn cleanup_deployment_dirs_rmdir_parent_when_only_member_subdirs() {
-    // Gate 1: deploy two members into a custom parent → cleanup →
-    // parent must be GONE because both subdirs are removed and
-    // nothing else lives there.
-    let home = tmp_home("p15_rmdir_clean");
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-    let custom_root =
-        std::env::temp_dir().join(format!("agend-p15-{}-clean-custom", std::process::id()));
-    std::fs::create_dir_all(&custom_root).unwrap();
-    for member in ["a", "b"] {
-        let inst = format!("p15clean-{member}");
-        let inst_dir = custom_root.join(&inst);
-        std::fs::create_dir_all(&inst_dir).unwrap();
-        std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
-        // #2764 R3: daemon-created subdir → seed the identity+nonce-bound marker.
-        seed_deploy_marker(&inst_dir, "p15clean", &inst, "test-nonce-p15clean");
-    }
-    let dep = make_deployment("p15clean", &["a", "b"], &custom_root);
-
-    cleanup_deployment_dirs(&home, &dep);
-
-    assert!(
-        !custom_root.exists(),
-        "parent must be removed when only deployment subdirs were inside: {custom_root:?}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-#[test]
-fn cleanup_deployment_dirs_preserves_parent_with_unrelated_file() {
-    // Gate 2: same shape as gate 1 but with an unrelated file
-    // dropped into the parent. The rmdir MUST be skipped — never
-    // strip an operator's own data.
-    let home = tmp_home("p15_rmdir_keep");
-    let custom_root =
-        std::env::temp_dir().join(format!("agend-p15-{}-keep-custom", std::process::id()));
-    std::fs::create_dir_all(&custom_root).unwrap();
-    for member in ["a", "b"] {
-        let inst = format!("p15keep-{member}");
-        let inst_dir = custom_root.join(&inst);
-        std::fs::create_dir_all(&inst_dir).unwrap();
-    }
-    // Operator-dropped file at the parent root.
-    let unrelated = custom_root.join("operator-notes.md");
-    std::fs::write(&unrelated, "do not delete").unwrap();
-    let dep = make_deployment("p15keep", &["a", "b"], &custom_root);
-
-    cleanup_deployment_dirs(&home, &dep);
-
-    assert!(
-        custom_root.exists(),
-        "parent MUST be preserved when it holds unrelated files: {custom_root:?}"
-    );
-    assert!(
-        unrelated.exists(),
-        "operator-dropped file MUST remain on disk: {unrelated:?}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-#[test]
-fn cleanup_deployment_dirs_rmdir_is_idempotent() {
-    // Gate 3: a second cleanup invocation after the first removed
-    // the parent must NOT panic and must NOT log error-level
-    // noise (`NotFound` is mapped to a silent no-op in
-    // `rmdir_if_empty`).
-    let home = tmp_home("p15_rmdir_idem");
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-    let custom_root =
-        std::env::temp_dir().join(format!("agend-p15-{}-idem-custom", std::process::id()));
-    std::fs::create_dir_all(&custom_root).unwrap();
-    std::fs::create_dir_all(custom_root.join("p15idem-a")).unwrap();
-    // #2764 R3: daemon-created subdir → seed the identity+nonce-bound marker.
-    seed_deploy_marker(
-        &custom_root.join("p15idem-a"),
-        "p15idem",
-        "p15idem-a",
-        "test-nonce-p15idem",
-    );
-    let dep = make_deployment("p15idem", &["a"], &custom_root);
-
-    cleanup_deployment_dirs(&home, &dep);
-    assert!(!custom_root.exists(), "first call must remove parent");
-
-    // Second call — must not panic, must remain a silent no-op.
-    cleanup_deployment_dirs(&home, &dep);
-    assert!(!custom_root.exists(), "parent stays gone after second call");
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn reconcile_keeps_subdirs_when_deployment_still_alive() {
-    // Negative control: if any member still in fleet.yaml, the
-    // deployment is NOT pruned and the subdirs are NOT touched.
-    // Guards against an over-eager cleanup that runs on any
-    // reconcile invocation regardless of prune outcome.
-    let (home, custom_root) =
-        deploy_with_custom_directory("smoke2_alive", "alive-team", &["a", "b"]);
-    // Re-add one member back into fleet.yaml so reconcile sees it
-    // as live and refuses to prune.
-    std::fs::write(
-        crate::fleet::fleet_yaml_path(&home),
-        "instances:\n  alive-team-a:\n    backend: claude\n",
-    )
-    .unwrap();
-
-    let pruned = reconcile_orphans(&home);
-    assert!(
-        pruned.is_empty(),
-        "deployment with one live member must NOT be pruned: {pruned:?}"
-    );
-
-    // Both subdirs must still be on disk.
-    for member in ["a", "b"] {
-        let inst = format!("alive-team-{member}");
-        let inst_dir = custom_root.join(&inst);
-        assert!(
-            inst_dir.exists(),
-            "subdir must NOT be cleaned when deployment alive: {inst_dir:?}"
-        );
-    }
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
 }
 
 // ── #787: deploy backend/command field conflation ─────────────────
@@ -2033,289 +1365,78 @@ fn deploy_api_calls_not_under_flock() {
         );
 }
 
+// ── #2764 D: deployment teardown/reconcile mutation embargo ────────────────
+
+/// teardown performs ZERO destructive/authority mutation: it records a durable
+/// cleanup-pending/audit entry and returns `torn_down:false, cleanup_pending:true`
+/// — the deployment record, fleet entries, and directories all remain.
 #[test]
-fn teardown_api_calls_not_under_flock() {
-    let prod = prod_src();
-    let body = fn_body(prod, "pub fn teardown(home");
-    let lock_at = body
-        .find(&["acquire_file", "_lock"].concat())
-        .expect("teardown locks the record removal");
-    let delete_at = body
-        .find(&["crate::api::", "call"].concat())
-        .expect("teardown DELETEs instances via api::call");
-    assert!(
-        delete_at < lock_at,
-        "the DELETE api::call loop must run BEFORE the record-removal flock (#1617 class)"
+fn teardown_is_embargoed_records_pending_mutates_nothing() {
+    let home = deploy_single_instance_for_test("d_embargo_td", "emb");
+    let inst = "emb-worker";
+    // Pre: the deployment record + fleet entry + subdir all exist.
+    assert!(load(&home).deployments.iter().any(|d| d.name == "emb"));
+    let fleet_before = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(fleet_before.contains(inst), "pre: fleet entry present");
+    let subdir = home.join(inst);
+    assert!(subdir.exists(), "pre: deploy subdir exists");
+
+    let resp = teardown(&home, &serde_json::json!({"name": "emb"}));
+
+    assert_eq!(resp["torn_down"], false);
+    assert_eq!(resp["cleanup_pending"], true);
+    assert_eq!(
+        resp["reason"],
+        "ownership_safe_teardown_temporarily_unavailable"
     );
-}
-
-// ── #2764 C: deployment custom-dir creation provenance ─────────────────────
-
-/// prepare_work_dir writes an IDENTITY+NONCE-bound creation marker for a subdir
-/// it FRESHLY creates, but NOT for a pre-existing operator dir (which it must
-/// not later claim authority to whole-tree remove).
-#[test]
-fn prepare_work_dir_marks_fresh_but_not_preexisting() {
-    use crate::agent_ops::workspace_cleanup::DEPLOY_CREATED_MARKER;
-    let parent = tmp_home("prov_mark");
-    std::fs::create_dir_all(&parent).unwrap();
-
-    // Fresh creation (non-branch) → marked with the exact deployment+instance+nonce.
-    let fresh = parent.join("d-fresh");
-    prepare_work_dir(&fresh, &parent, "d", "fresh", "d-fresh", None, "nonce-xyz");
-    let body = std::fs::read_to_string(fresh.join(DEPLOY_CREATED_MARKER))
-        .expect("a freshly-created deployment subdir must carry the creation marker");
+    // Zero mutation: record kept, fleet entry kept, subdir kept.
     assert!(
-        body.contains("deployment=d")
-            && body.contains("instance=d-fresh")
-            && body.contains("nonce=nonce-xyz"),
-        "marker must bind deployment+instance+nonce, got: {body}"
-    );
-
-    // Pre-existing operator dir → NOT marked (unprovable ownership).
-    let pre = parent.join("d-pre");
-    std::fs::create_dir_all(&pre).unwrap();
-    std::fs::write(pre.join("USER.txt"), b"precious").unwrap();
-    prepare_work_dir(&pre, &parent, "d", "pre", "d-pre", None, "nonce-xyz");
-    assert!(
-        !pre.join(DEPLOY_CREATED_MARKER).exists(),
-        "a pre-existing operator dir must NOT be marked as daemon-created"
-    );
-
-    std::fs::remove_dir_all(&parent).ok();
-}
-
-/// Build a custom-dir deployment whose subdir has NO creation marker (a
-/// pre-existing operator dir), fleet.yaml empty (orphan). Returns (home,
-/// custom_root, inst_dir).
-fn unproven_custom_deploy(tag: &str, name: &str) -> (PathBuf, PathBuf, PathBuf, String) {
-    let home = tmp_home(tag);
-    let custom_root =
-        std::env::temp_dir().join(format!("agend-2764c-{}-{}-custom", std::process::id(), tag));
-    std::fs::create_dir_all(&custom_root).ok();
-    let inst = format!("{name}-a");
-    let inst_dir = custom_root.join(&inst);
-    std::fs::create_dir_all(&inst_dir).unwrap();
-    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
-    // Record HAS a provenance nonce but the subdir has NO marker → unproven
-    // (a valid record generation does not authorize removal without a matching
-    // marker on the actual dir).
-    let mut store = load(&home);
-    store.deployments.push(Deployment {
-        name: name.to_string(),
-        template: "tpl".to_string(),
-        instances: vec![inst.clone()],
-        team: None,
-        directory: custom_root.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: Some(format!("nonce-{name}")),
-    });
-    save(&home, &mut store).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-    (home, custom_root, inst_dir, inst)
-}
-
-/// teardown must PRESERVE an unproven custom subdir, write a cleanup-pending
-/// ledger entry, keep the deployment record, and signal pending in the response.
-#[test]
-fn teardown_preserves_unproven_custom_subdir_and_records_pending() {
-    let (home, custom_root, inst_dir, inst) = unproven_custom_deploy("unproven_td", "unp-td");
-
-    let resp = teardown(&home, &serde_json::json!({"name": "unp-td"}));
-
-    assert!(
-        inst_dir.join("USER_DATA.txt").exists(),
-        "unproven custom subdir must be PRESERVED (operator data intact): {inst_dir:?}"
-    );
-    let ledger = home.join("deploy-cleanup-pending.jsonl");
-    assert!(ledger.exists(), "cleanup-pending ledger must be written");
-    let body = std::fs::read_to_string(&ledger).unwrap();
-    assert!(
-        body.contains("unp-td") && body.contains(&inst),
-        "ledger must record the preserved subdir, got: {body}"
-    );
-    assert!(
-        load(&home).deployments.iter().any(|d| d.name == "unp-td"),
-        "deployment record must be RETAINED (provenance not erased before cleanup)"
+        load(&home).deployments.iter().any(|d| d.name == "emb"),
+        "deployment record must NOT be removed"
     );
     assert_eq!(
-        resp["status"], "torn_down_pending_cleanup",
-        "response must signal pending cleanup, got {resp}"
+        std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap(),
+        fleet_before,
+        "fleet.yaml must be byte-identical (no instance removal)"
     );
-
+    assert!(subdir.exists(), "deploy subdir must NOT be removed");
+    // The pending/audit ledger was written with the deployment identity.
+    let ledger = std::fs::read_to_string(home.join("deploy-cleanup-pending.jsonl")).unwrap();
+    assert!(
+        ledger.contains("\"emb\"") && ledger.contains("\"source\":\"teardown\""),
+        "pending ledger must record the deployment identity, got: {ledger}"
+    );
     std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
 }
 
-/// reconcile must NOT prune a deployment whose custom subdir is unproven — the
-/// record is kept so a later reconcile retries with authority.
+/// The cleanup-pending ledger is idempotent per generation: teardown + repeated
+/// reconcile for the SAME deployment generation record exactly ONE entry.
 #[test]
-fn reconcile_keeps_record_when_unproven_subdir_preserved() {
-    let (home, custom_root, inst_dir, _inst) = unproven_custom_deploy("unproven_rc", "unp-rc");
-
-    let pruned = reconcile_orphans(&home);
-
-    assert!(
-        !pruned.contains(&"unp-rc".to_string()),
-        "an unproven-subdir deployment must NOT be pruned, got {pruned:?}"
-    );
-    assert!(
-        inst_dir.join("USER_DATA.txt").exists(),
-        "unproven custom subdir must be preserved through reconcile"
-    );
-    assert!(
-        load(&home).deployments.iter().any(|d| d.name == "unp-rc"),
-        "deployment record must be retained for retry"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-// ── #2764 R3: identity/nonce binding, survivor overlap, idempotent ledger ──
-
-/// A custom subdir with a marker whose NONCE does not match the Deployment
-/// record generation must be PRESERVED — the marker existing is not enough;
-/// its identity+nonce must bind to THIS record.
-#[test]
-fn custom_dir_nonce_mismatch_is_preserved() {
-    let home = tmp_home("nonce_mismatch");
-    let custom_root = std::env::temp_dir().join(format!("agend-nm-{}-custom", std::process::id()));
-    std::fs::create_dir_all(&custom_root).ok();
-    let inst = "nm-a".to_string();
-    let inst_dir = custom_root.join(&inst);
-    std::fs::create_dir_all(&inst_dir).unwrap();
-    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
-    // Marker present but with the WRONG nonce (a stale prior generation).
-    seed_deploy_marker(&inst_dir, "nm", &inst, "STALE-NONCE");
-    let mut store = load(&home);
-    store.deployments.push(Deployment {
-        name: "nm".to_string(),
-        template: "tpl".to_string(),
-        instances: vec![inst.clone()],
-        team: None,
-        directory: custom_root.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: Some("CURRENT-NONCE".to_string()),
-    });
-    save(&home, &mut store).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-
-    let resp = teardown(&home, &serde_json::json!({"name": "nm"}));
-
-    assert!(
-        inst_dir.join("USER_DATA.txt").exists(),
-        "a marker with a mismatched nonce must NOT authorize removal"
-    );
-    assert_eq!(resp["status"], "torn_down_pending_cleanup");
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-/// Even a correctly-marked custom subdir must be PRESERVED when a LIVE fleet
-/// instance (not in the deployment cohort) resolves to the same dir — the
-/// deployment path runs the same symmetric survivor-overlap check as full-delete.
-#[test]
-fn custom_dir_shared_with_live_instance_is_preserved() {
-    let home = tmp_home("cust_shared");
-    let custom_root = std::env::temp_dir().join(format!("agend-cs-{}-custom", std::process::id()));
-    std::fs::create_dir_all(&custom_root).ok();
-    let inst = "cs-a".to_string();
-    let inst_dir = custom_root.join(&inst);
-    std::fs::create_dir_all(&inst_dir).unwrap();
-    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
-    seed_deploy_marker(&inst_dir, "cs", &inst, "test-nonce-cs");
-    let mut store = load(&home);
-    store.deployments.push(Deployment {
-        name: "cs".to_string(),
-        template: "tpl".to_string(),
-        instances: vec![inst.clone()],
-        team: None,
-        directory: custom_root.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: Some("test-nonce-cs".to_string()),
-    });
-    save(&home, &mut store).unwrap();
-    // A LIVE instance `survivor` whose working_directory aliases the subdir.
+fn deployment_pending_ledger_is_idempotent_per_generation() {
+    let home = deploy_single_instance_for_test("d_embargo_idem", "idem");
+    // Remove the instance from fleet.yaml so reconcile sees an orphan.
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
-        format!(
-            "instances:\n  survivor:\n    backend: claude\n    working_directory: {}\n",
-            inst_dir.display()
-        ),
+        "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
     )
     .unwrap();
 
-    let _ = teardown(&home, &serde_json::json!({"name": "cs"}));
-
+    let _ = teardown(&home, &serde_json::json!({"name": "idem"}));
+    // Reconcile several times — each is a no-op prune and an idempotent record.
+    let r1 = reconcile_orphans(&home);
+    let r2 = reconcile_orphans(&home);
     assert!(
-        inst_dir.join("USER_DATA.txt").exists(),
-        "a subdir shared with a live instance must be preserved even when marked"
+        r1.is_empty() && r2.is_empty(),
+        "reconcile must prune NOTHING under D"
     );
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
 
-/// The cleanup-pending ledger is idempotent: reconciling the same unproven
-/// deployment twice records exactly ONE entry (deduped by deployment+instance+
-/// subdir), never accumulating duplicates.
-#[test]
-fn cleanup_pending_ledger_is_idempotent() {
-    let (home, custom_root, _inst_dir, inst) = unproven_custom_deploy("pending_idem", "pi");
-
-    // First reconcile — records pending, keeps the record.
-    let _ = reconcile_orphans(&home);
-    // Second reconcile — must NOT duplicate the ledger entry.
-    let _ = reconcile_orphans(&home);
-
-    let ledger = home.join("deploy-cleanup-pending.jsonl");
-    let body = std::fs::read_to_string(&ledger).unwrap();
-    let count = body
-        .lines()
-        .filter(|l| l.contains("\"pi\"") && l.contains(&format!("\"{inst}\"")))
-        .count();
-    assert_eq!(
-        count, 1,
-        "pending ledger must dedupe repeated reconcile passes, got {count} entries:\n{body}"
-    );
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
-}
-
-/// #2764 R5 (blocker 1): a correctly-marked custom deployment whose fleet.yaml
-/// is ABSENT must PRESERVE the subdir at teardown (fleet-read ambiguity fails
-/// closed) rather than proceed on an assumed-empty roster.
-#[test]
-fn teardown_preserves_when_fleet_absent() {
-    let home = tmp_home("r5_absent_fleet");
-    let custom_root =
-        std::env::temp_dir().join(format!("agend-r5af-{}-custom", std::process::id()));
-    std::fs::create_dir_all(&custom_root).ok();
-    let inst = "af-a".to_string();
-    let inst_dir = custom_root.join(&inst);
-    std::fs::create_dir_all(&inst_dir).unwrap();
-    std::fs::write(inst_dir.join("USER_DATA.txt"), b"precious").unwrap();
-    seed_deploy_marker(&inst_dir, "af", &inst, "test-nonce-af");
-    let mut store = load(&home);
-    store.deployments.push(Deployment {
-        name: "af".to_string(),
-        template: "tpl".to_string(),
-        instances: vec![inst.clone()],
-        team: None,
-        directory: custom_root.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        provenance_nonce: Some("test-nonce-af".to_string()),
-    });
-    save(&home, &mut store).unwrap();
-    // NO fleet.yaml written — the roster is unreadable.
-    assert!(!crate::fleet::fleet_yaml_path(&home).exists());
-
-    let _ = teardown(&home, &serde_json::json!({"name": "af"}));
-
+    let ledger = std::fs::read_to_string(home.join("deploy-cleanup-pending.jsonl")).unwrap();
+    let count = ledger.lines().filter(|l| l.contains("\"idem\"")).count();
+    assert_eq!(count, 1, "one entry per generation, got {count}:\n{ledger}");
+    // The orphan deployment record is retained (reconcile prunes nothing).
     assert!(
-        inst_dir.join("USER_DATA.txt").exists(),
-        "an absent fleet must fail closed — the marked subdir must be preserved"
+        load(&home).deployments.iter().any(|d| d.name == "idem"),
+        "reconcile must NOT prune the deployment record under D"
     );
     std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&custom_root).ok();
 }

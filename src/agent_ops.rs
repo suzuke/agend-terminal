@@ -501,6 +501,13 @@ pub fn ensure_not_protected_json(branch: &str) -> Result<(), serde_json::Value> 
 /// The copy in `mcp/handlers.rs` drifted to 14 entries on 2026-04-14 and
 /// is missing the 5 Kiro paths: `.kiro/agents/{agend.json,agend-prompt.md,
 /// default.json}`, `.kiro/prompts/agend.md`, `.kiro/settings.json`.
+// #2764 D checkpoint: the deployment default-path caller was removed under the
+// deployment mutation embargo, and `full_delete_instance` uses
+// `cleanup_working_dir_proven` directly — so this legacy fresh-snapshot wrapper
+// currently has only test callers. E (id-anchored full_delete) re-wires the
+// production workspace-cleanup entry; kept here (tests exercise its
+// workspace-vs-user-dir behavior) until that lands.
+#[allow(dead_code)]
 pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
     // #2764: legacy entry — callers that hold no pre-removal fleet snapshot
     // load a fresh one. `full_delete_instance` MUST instead use
