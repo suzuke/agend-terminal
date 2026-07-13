@@ -548,6 +548,90 @@ fn txn_recover_corrupt_remove_fail_arms_replacement() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2755 R4 (item 1): recover_stale must NOT delete a still-BOUND worktree (a crash after
+/// bind_full but before the Committed journal) — it ADOPTS it (keeps the worktree, drops
+/// the stale journal) rather than tearing down a live binding's worktree.
+#[test]
+fn txn_recover_stale_adopts_bound_worktree() {
+    let home = tmp_home("rec-bound");
+    let wt = home.join("worktrees").join("agent-b-src");
+    save_journal_at(&home, "m", &wt, Phase::SubmodulesReady, true);
+    let bdir = home.join("runtime").join("agent-b");
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        serde_json::json!({
+            "version": 1,
+            "agent": "agent-b",
+            "branch": "b",
+            "worktree": wt.display().to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
+        removed.set(true);
+        true
+    });
+    assert!(r.is_ok(), "bound worktree adopted, not an error: {r:?}");
+    assert!(!removed.get(), "a still-BOUND worktree must NOT be removed");
+    assert!(wt.exists(), "bound worktree kept (adopted as committed)");
+    assert!(
+        Journal::load(&home, "m").is_none(),
+        "stale journal dropped on adopt"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R4 (item 3a): an UNREADABLE journal (exists but the read errors — NOT NotFound)
+/// leaves recovery authority uncertain — recover_stale aborts FAIL-CLOSED, never treating
+/// it as Absent (nothing-to-recover).
+#[test]
+fn txn_recover_stale_unreadable_fails_closed() {
+    let home = tmp_home("rec-unread");
+    // A DIRECTORY at journal.json ⇒ `std::fs::read` errors (not NotFound) ⇒ Unreadable.
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, "m")).unwrap();
+    let r = recover_stale(&home, "m", &home.join("wt"), "/src", fixed_now(), || true);
+    assert!(
+        r.is_err(),
+        "unreadable journal ⇒ recover_stale fails closed (not Ok/Absent): {r:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R4 (item 3c): a corrupt record whose worktree can't be removed AND whose
+/// replacement SAVE also fails must leave journal.json still CORRUPT — a durable BLOCKING
+/// record — so the next recovery attempt sees Corrupt, NEVER Absent (never fail-open).
+/// `#[cfg(unix)]`: forces the save failure via a read-only journal dir (fs permissions).
+#[cfg(unix)]
+#[test]
+fn txn_recover_stale_corrupt_save_failure_stays_blocking() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp_home("rec-corrupt-saveblock");
+    let wt = home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    write_corrupt_journal(&home, "m");
+    let jdir = super::checkout_txn::journal_path(&home, "m")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // Read-only dir ⇒ the evidence copy + replacement save both fail, but the corrupt
+    // journal.json remains (readable) as a blocking record.
+    std::fs::set_permissions(&jdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || false);
+    std::fs::set_permissions(&jdir, std::fs::Permissions::from_mode(0o755)).ok();
+    assert!(r.is_err(), "remove+save failure ⇒ Err (fail closed): {r:?}");
+    assert!(
+        matches!(
+            super::checkout_txn::load_typed(&home, "m"),
+            super::checkout_txn::JournalLoad::Corrupt
+        ),
+        "journal.json stays CORRUPT (durable blocking) — the next attempt never sees Absent"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// rollback_failed: worktree removed ⇒ unbind runs and the journal is cleared.
 #[test]
 fn txn_rollback_failed_remove_ok_unbinds_and_clears() {
@@ -1514,6 +1598,128 @@ fn checkout_reuse_stale_branch_syncs_final_head_then_inits_2755() {
     if let Some(root) = super_repo.parent() {
         std::fs::remove_dir_all(root).ok();
     }
+}
+
+/// #2755 R4 (item 2): a FRESH checkout must FAIL CLOSED when `submodule.<name>.update=none`
+/// makes `submodule update --init --recursive` exit 0 while SKIPPING the submodule (a `-`
+/// in `git submodule status`). The fresh-path `verify_submodules_at_gitlinks` catches it.
+///
+/// `#[cfg(unix)]`: absolute temp `repository_path` — Unix-only source contract.
+#[cfg(unix)]
+#[test]
+fn checkout_fresh_update_none_gitlink_mismatch_fails_closed_2755() {
+    let home = tmp_home("update-none");
+    let super_repo = tmp_super_with_nested_submodules("update-none");
+    // Pin vendor/mid to update=none so the init command registers but SKIPS it.
+    git_run_ok(
+        &super_repo,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.vendor/mid.update",
+            "none",
+        ],
+        false,
+    );
+    git_run_ok(&super_repo, &["add", ".gitmodules"], false);
+    git_run_ok(
+        &super_repo,
+        &["commit", "-m", "vendor/mid update=none"],
+        false,
+    );
+
+    let args = json!({
+        "repository_path": super_repo.display().to_string(),
+        "branch": "main",
+        "bind": false,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, "agent-un");
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("submodule_gitlink_mismatch"),
+        "fresh init that leaves a submodule uninitialized (update=none) must fail closed: {resp}"
+    );
+    assert_eq!(resp["stage"].as_str(), Some("submodules_ready"));
+
+    std::fs::remove_dir_all(&home).ok();
+    if let Some(root) = super_repo.parent() {
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// #2755 R4 (item 4): a reuse whose bound worktree is a SYMLINK inside the pool pointing
+/// at an EXTERNAL directory must FAIL CLOSED — the canonical-descendant confinement
+/// rejects it (a lexical `starts_with` would have passed), and the external target is
+/// never synced/reset/inited.
+///
+/// `#[cfg(unix)]`: symlink mechanics + absolute temp source.
+#[cfg(unix)]
+#[test]
+fn checkout_reuse_symlink_out_of_pool_fails_closed_2755() {
+    let home = tmp_home("reuse-symlink");
+    let repo = tmp_repo_with_file("reuse-symlink", "readme.txt", "x\n");
+    let instance = "agent-sym";
+    let branch = "feat/sym";
+    git_run_ok(&repo, &["branch", branch, "main"], false);
+
+    // A REAL worktree OUTSIDE the pool, with a sentinel + marker.
+    let external = home.join("external-wt");
+    git_run_ok(
+        &repo,
+        &["worktree", "add", &external.display().to_string(), branch],
+        false,
+    );
+    std::fs::write(
+        external.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=agent-sym\n",
+    )
+    .unwrap();
+    let sentinel = external.join("sentinel.txt");
+    std::fs::write(&sentinel, "UNTOUCHED").unwrap();
+
+    // A symlink INSIDE the pool → the external worktree (lexically "within worktrees/").
+    let pool = home.join("worktrees");
+    std::fs::create_dir_all(&pool).unwrap();
+    let link = pool.join("agent-sym-link");
+    std::os::unix::fs::symlink(&external, &link).unwrap();
+
+    let bdir = home.join("runtime").join(instance);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        json!({
+            "version": 1,
+            "agent": instance,
+            "task_id": "T",
+            "branch": branch,
+            "worktree": link.display().to_string(),
+            "source_repo": repo.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00+00:00",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let args = json!({
+        "repository_path": repo.display().to_string(),
+        "branch": branch,
+        "bind": true,
+    });
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("reuse_provenance"),
+        "a symlink escaping the canonical pool must fail closed: {resp}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "UNTOUCHED",
+        "the external symlink target must NOT be mutated"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// Windows/open-handle: a rollback whose `git worktree remove --force` FAILS
