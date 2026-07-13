@@ -359,12 +359,12 @@ pub fn execute_scrub_exclusive(
 }
 
 // ---------------------------------------------------------------------------
-// #2764 E: id-anchored full-delete destructive phase
+// #2764 E/R6: id-anchored full-delete destructive phase (plan → fenced commit)
 // ---------------------------------------------------------------------------
 
-/// Typed outcome of [`full_delete_destructive_phase`] — the ONLY destructive
-/// path for an instance's working directory and the ONLY remover of its
-/// fleet.yaml entry (decision d-20260713091213053694-25).
+/// Typed outcome of the destructive phase — the ONLY destructive path for an
+/// instance's working directory and the ONLY remover of its fleet.yaml entry
+/// (decision d-20260713091213053694-25).
 #[derive(Debug)]
 pub enum CleanupOutcome {
     /// Path destruction completed (or nothing existed to destroy) AND — when a
@@ -372,62 +372,85 @@ pub enum CleanupOutcome {
     Clean,
     /// Fail-closed complete no-op: authority unprovable (fleet unreadable, no
     /// raw entry for an existing dir, no parseable durable id, dotdot,
-    /// canonicalization ambiguity, shared/overlapping survivor, or the fresh
-    /// pre-mutation recheck no longer authorizes). NOTHING was mutated — the
-    /// fleet entry (if any) remains.
+    /// canonicalization ambiguity, shared/overlapping survivor, or the fenced
+    /// pre-commit recheck no longer authorizes). NOTHING was mutated — the
+    /// fleet entry (if any) remains. R6: the production caller must treat this
+    /// as a COMPLETE full-delete no-op (no name-keyed store cleanup either).
     Preserved { reason: String },
     /// Destruction was authorized and attempted, but an operation failed
     /// (worktree/fs/scrub error, or the exact-id fleet CAS was refused).
     /// Never reported as success; the fleet entry is gone only when the CAS
-    /// itself succeeded.
+    /// itself succeeded. R6: the production caller must stop all remaining
+    /// cleanup — a surviving generation must never be erased past a failure.
     Failed { reason: String },
 }
 
-/// #2764 E: the id-anchored destructive phase of `full_delete_instance`.
-///
-/// Authority chain, all fail-closed:
-/// 1. The candidate path comes from the RAW immutable snapshot entry — never
+/// #2764 R6: the pure authority gate's verdict. `Destructive` is an opaque
+/// intent (private fields, constructible only by [`plan_full_delete`]) that
+/// [`execute_full_delete`] commits under the fleet-flock generation fence.
+#[derive(Debug)]
+pub enum FullDeletePlan {
+    /// Complete production no-op — the caller must mutate NOTHING (not the
+    /// process, not the topic, not any name-keyed store).
+    Preserve { reason: String },
+    /// No fleet entry and nothing on disk at the default dir: there is no
+    /// generation to protect and no entry to CAS. Name-keyed remnant cleanup
+    /// may proceed (ghost delete keeps working).
+    VacuousGhost,
+    /// Authorized destructive intent for exactly one generation.
+    Destructive(DestructiveIntent),
+}
+
+/// Opaque, id-anchored destructive intent. Carries the generation anchor and
+/// the stale-plan action it must re-authorize under the fence.
+#[derive(Debug)]
+pub struct DestructiveIntent {
+    expected_id: crate::types::InstanceId,
+    candidate: PathBuf,
+    /// `None` = nothing existed at the candidate at plan time (vacuous path
+    /// phase — fence still verifies the id and CASes the entry).
+    stale_action: Option<StaleAction>,
+}
+
+#[derive(Debug)]
+enum StaleAction {
+    RemoveOwned { canonical: PathBuf },
+    Scrub { canonical: PathBuf },
+}
+
+/// #2764 E: the PURE authority gate of `full_delete_instance` — no mutation of
+/// any kind. Fail-closed chain:
+/// 1. Fleet unreadable/corrupt (`raw == None`) → Preserve.
+/// 2. The candidate path comes from the RAW immutable snapshot entry — never
 ///    `resolve_instance`, whose unrelated failures (ready-pattern, `..`
-///    rejection) fall back to a DIFFERENT default target (R5 blocker 1).
-/// 2. The entry must carry a parseable durable [`crate::types::InstanceId`]
-///    (the generation anchor); legacy/no-id preserves.
-/// 3. A missing filesystem entry at the raw candidate is vacuously clean —
-///    nothing to destroy — and proceeds straight to the fleet-entry CAS.
-/// 4. Otherwise [`plan_cleanup`] must authorize on the raw snapshot, the fleet
-///    is re-loaded IMMEDIATELY before mutation, the victim entry must still
-///    match its exact id (same-name replacement = survivor → preserve), and a
-///    fresh re-plan must re-authorize the SAME action on the SAME canonical
-///    target before the (self-revalidating) executor runs.
-/// 5. The fleet entry is removed only via the exact-id generation-CAS
-///    ([`crate::fleet::remove_instance_from_yaml_cas`]); refusal → `Failed`,
-///    and the entry stays (never `Ok`/provenance-erasure on failure).
-pub fn full_delete_destructive_phase(
-    home: &Path,
-    name: &str,
-    raw: Option<&FleetConfig>,
-) -> CleanupOutcome {
-    // Fleet unreadable/corrupt → an entry may exist that we cannot see →
-    // nothing is provable → complete no-op.
+///    rejection) fall back to a DIFFERENT default target (R5 blocker 1). Raw
+///    dotdot → Preserve.
+/// 3. The entry must carry a parseable durable [`crate::types::InstanceId`]
+///    (the generation anchor); legacy/no-id → Preserve. No entry + an existing
+///    default dir → Preserve; no entry + nothing on disk → VacuousGhost.
+/// 4. [`plan_cleanup`] must authorize on the raw snapshot (shared/ambiguous →
+///    Preserve); a missing candidate is a vacuous path phase.
+pub fn plan_full_delete(home: &Path, name: &str, raw: Option<&FleetConfig>) -> FullDeletePlan {
     let Some(raw) = raw else {
-        return CleanupOutcome::Preserved {
+        return FullDeletePlan::Preserve {
             reason: "fleet.yaml unreadable — cannot derive raw entry authority".to_string(),
         };
     };
 
     let Some(entry) = raw.instances.get(name) else {
         // No raw entry: nothing to CAS-remove. The default dir is only
-        // vacuously clean when NOTHING exists at it — an existing dir without
+        // vacuously absent when NOTHING exists at it — an existing dir without
         // a fleet entry has no ownership anchor → preserve.
         let default_dir = crate::paths::workspace_dir(home).join(name);
         return match std::fs::symlink_metadata(&default_dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CleanupOutcome::Clean,
-            Ok(_) => CleanupOutcome::Preserved {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => FullDeletePlan::VacuousGhost,
+            Ok(_) => FullDeletePlan::Preserve {
                 reason: format!(
                     "no fleet entry for '{name}' but {} exists — ownership unprovable",
                     default_dir.display()
                 ),
             },
-            Err(e) => CleanupOutcome::Preserved {
+            Err(e) => FullDeletePlan::Preserve {
                 reason: format!(
                     "no fleet entry for '{name}' and {} is unreadable ({e})",
                     default_dir.display()
@@ -442,7 +465,7 @@ pub fn full_delete_destructive_phase(
         .as_deref()
         .and_then(crate::types::InstanceId::parse)
     else {
-        return CleanupOutcome::Preserved {
+        return FullDeletePlan::Preserve {
             reason: format!("fleet entry '{name}' has no parseable durable id (legacy entry)"),
         };
     };
@@ -454,7 +477,7 @@ pub fn full_delete_destructive_phase(
         None => crate::paths::workspace_dir(home).join(name),
     };
     if has_dotdot(&candidate) {
-        return CleanupOutcome::Preserved {
+        return FullDeletePlan::Preserve {
             reason: format!(
                 "raw working_directory contains '..': {}",
                 candidate.display()
@@ -462,40 +485,95 @@ pub fn full_delete_destructive_phase(
         };
     }
 
-    // Vacuously clean: no filesystem entry at the raw candidate → nothing to
-    // destroy; fall through to the fleet-entry CAS.
-    let candidate_present = match std::fs::symlink_metadata(&candidate) {
+    // Vacuous path phase: no filesystem entry at the raw candidate → nothing
+    // to destroy; the fence still verifies the id and CASes the entry.
+    let present = match std::fs::symlink_metadata(&candidate) {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            return CleanupOutcome::Preserved {
+            return FullDeletePlan::Preserve {
                 reason: format!("candidate {} unreadable ({e})", candidate.display()),
             };
         }
     };
-
-    if candidate_present {
-        let stale_plan = plan_cleanup(Some(raw), home, &[name], name, &candidate);
-        let stale_canonical = match &stale_plan {
-            CleanupPlan::RemoveOwned(p) => p.canonical.clone(),
-            CleanupPlan::ScrubExclusive(p) => p.canonical.clone(),
+    let stale_action = if present {
+        match plan_cleanup(Some(raw), home, &[name], name, &candidate) {
+            CleanupPlan::RemoveOwned(p) => Some(StaleAction::RemoveOwned {
+                canonical: p.canonical.clone(),
+            }),
+            CleanupPlan::ScrubExclusive(p) => Some(StaleAction::Scrub {
+                canonical: p.canonical.clone(),
+            }),
             CleanupPlan::PreserveShared { reason } | CleanupPlan::PreserveAmbiguous { reason } => {
-                return CleanupOutcome::Preserved {
-                    reason: reason.clone(),
-                };
+                return FullDeletePlan::Preserve { reason };
             }
-        };
+        }
+    } else {
+        None
+    };
+    FullDeletePlan::Destructive(DestructiveIntent {
+        expected_id,
+        candidate,
+        stale_action,
+    })
+}
 
-        // Immediately re-load the fleet before mutation. The victim is
-        // excluded from survivors ONLY because its exact durable id still
-        // matches; a same-name replacement (different/absent id) means the
-        // snapshot's authority is stale → preserve.
-        let fresh = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+/// #2764 R6 seam: fires INSIDE the held fence, after the fresh exact-id
+/// precheck/re-plan and BEFORE the final pre-commit verify — the reviewer's
+/// "replacement after precheck / before workspace commit" injection point.
+/// Thread-local one-shot (nextest = process-per-test keeps it hermetic).
+#[cfg(test)]
+pub(crate) mod fence_test_seam {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn set(f: Box<dyn FnOnce()>) {
+        HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
+    pub(crate) fn fire() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
+/// #2764 R6: commit a [`DestructiveIntent`] under the fleet-flock GENERATION
+/// FENCE (codex review blocker 2 at 650e24e0: a replacement landing between
+/// the fresh check and the commit could have its workspace destroyed while
+/// only the trailing CAS refused).
+///
+/// The entire sequence — fresh RAW read → exact-id verify → fresh re-plan →
+/// final pre-destruction re-verify → execute → exact-id CAS entry removal —
+/// runs while HOLDING the fleet flock ([`crate::fleet::lock_fleet`]). Every
+/// in-model fleet.yaml writer serializes on that flock, so no same-name
+/// replacement can land anywhere inside the fence. Belt for lock-bypassing
+/// writers (hand-edits): a final raw re-read + id compare immediately before
+/// destruction, plus the CAS's own re-read at removal time. Inside the fence
+/// only [`crate::fleet::read_fleet_raw_locked`] is used — `FleetConfig::load`
+/// could fire its id-backfill WRITE and self-deadlock on the flock.
+pub fn execute_full_delete(home: &Path, name: &str, intent: DestructiveIntent) -> CleanupOutcome {
+    let DestructiveIntent {
+        expected_id,
+        candidate,
+        stale_action,
+    } = intent;
+
+    let fence = match crate::fleet::lock_fleet(home) {
+        Ok(f) => f,
+        Err(e) => {
+            return CleanupOutcome::Preserved {
+                reason: format!("fleet lock unavailable ({e})"),
+            };
+        }
+    };
+    let verify_generation = |ctx: &str| -> Result<FleetConfig, CleanupOutcome> {
+        let fresh = match crate::fleet::read_fleet_raw_locked(home, &fence) {
             Ok(f) => f,
             Err(e) => {
-                return CleanupOutcome::Preserved {
-                    reason: format!("pre-mutation fleet re-load failed ({e})"),
-                };
+                return Err(CleanupOutcome::Preserved {
+                    reason: format!("{ctx}: fleet re-read failed ({e})"),
+                });
             }
         };
         let fresh_id = fresh
@@ -504,21 +582,43 @@ pub fn full_delete_destructive_phase(
             .and_then(|i| i.id.as_deref())
             .and_then(crate::types::InstanceId::parse);
         if fresh_id != Some(expected_id) {
-            return CleanupOutcome::Preserved {
+            return Err(CleanupOutcome::Preserved {
                 reason: format!(
-                    "victim entry '{name}' no longer matches its durable id \
+                    "{ctx}: victim entry '{name}' no longer matches its durable id \
                      (replaced or removed since the snapshot)"
                 ),
-            };
+            });
         }
+        Ok(fresh)
+    };
+
+    // Fenced fresh check: the victim is excluded from survivors ONLY because
+    // its exact durable id still matches; a same-name replacement
+    // (different/absent id) means the snapshot's authority is stale → preserve.
+    let fresh = match verify_generation("pre-commit") {
+        Ok(f) => f,
+        Err(out) => return out,
+    };
+
+    if let Some(stale) = stale_action {
         // Fresh re-plan: re-canonicalization + symmetric overlap vs ALL fresh
         // survivors + root/default ownership. It must re-authorize the SAME
         // action on the SAME canonical target; the executor then revalidates
         // original→canonical once more immediately before destruction.
-        match plan_cleanup(Some(&fresh), home, &[name], name, &candidate) {
-            CleanupPlan::RemoveOwned(fresh_proof)
-                if matches!(stale_plan, CleanupPlan::RemoveOwned(_))
-                    && fresh_proof.canonical == stale_canonical =>
+        let fresh_plan = plan_cleanup(Some(&fresh), home, &[name], name, &candidate);
+
+        #[cfg(test)]
+        fence_test_seam::fire();
+
+        // Belt against lock-BYPASSING writers: one final raw re-read + id
+        // compare immediately before any destruction.
+        if let Err(out) = verify_generation("final pre-destruction verify") {
+            return out;
+        }
+
+        match (&stale, fresh_plan) {
+            (StaleAction::RemoveOwned { canonical }, CleanupPlan::RemoveOwned(fresh_proof))
+                if fresh_proof.canonical == *canonical =>
             {
                 if let Err(e) = execute_remove_owned(home, name, &fresh_proof) {
                     return CleanupOutcome::Failed {
@@ -526,9 +626,8 @@ pub fn full_delete_destructive_phase(
                     };
                 }
             }
-            CleanupPlan::ScrubExclusive(fresh_proof)
-                if matches!(stale_plan, CleanupPlan::ScrubExclusive(_))
-                    && fresh_proof.canonical == stale_canonical =>
+            (StaleAction::Scrub { canonical }, CleanupPlan::ScrubExclusive(fresh_proof))
+                if fresh_proof.canonical == *canonical =>
             {
                 if let Err(e) = execute_scrub_exclusive(home, name, &fresh_proof) {
                     return CleanupOutcome::Failed {
@@ -536,27 +635,66 @@ pub fn full_delete_destructive_phase(
                     };
                 }
             }
-            other => {
+            (_, other) => {
                 return CleanupOutcome::Preserved {
                     reason: format!(
-                        "fresh pre-mutation recheck no longer authorizes the planned action \
-                         (was {stale_plan:?}, now {other:?})"
+                        "fenced recheck no longer authorizes the planned action \
+                         (was {stale:?}, now {other:?})"
+                    ),
+                };
+            }
+        }
+    } else {
+        // Vacuous path phase: nothing existed at plan time. Verify that is
+        // STILL true under the fence — a materialized candidate means a
+        // generation we did not plan for.
+        #[cfg(test)]
+        fence_test_seam::fire();
+        if let Err(out) = verify_generation("final pre-CAS verify") {
+            return out;
+        }
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return CleanupOutcome::Preserved {
+                    reason: format!(
+                        "candidate {} materialized between plan and commit",
+                        candidate.display()
                     ),
                 };
             }
         }
     }
 
-    // Path phase clean → the fleet entry may now be removed, ONLY via the
-    // exact-id generation-CAS. Refusal (same-name replacement landed, entry
-    // vanished, read/write failure) → Failed; the entry is never force-removed
-    // and the caller never reports success.
-    if let Err(e) = crate::fleet::remove_instance_from_yaml_cas(home, name, &expected_id) {
+    // Path phase clean → remove the fleet entry, ONLY via the exact-id
+    // generation-CAS (lock-held variant — the fence flock is already ours).
+    // Refusal → Failed; the entry is never force-removed and the caller never
+    // reports success.
+    if let Err(e) =
+        crate::fleet::remove_instance_from_yaml_cas_locked(home, name, &expected_id, &fence)
+    {
         return CleanupOutcome::Failed {
             reason: format!("fleet entry exact-id CAS removal refused: {e}"),
         };
     }
     CleanupOutcome::Clean
+}
+
+/// Test-facing composite of the production `plan_full_delete` →
+/// `execute_full_delete` decomposition (the production caller,
+/// `full_delete_instance`, needs the split so a `Preserve` verdict aborts
+/// BEFORE any mutation — see lifecycle.rs).
+#[cfg(test)]
+pub(crate) fn full_delete_destructive_phase(
+    home: &Path,
+    name: &str,
+    raw: Option<&FleetConfig>,
+) -> CleanupOutcome {
+    match plan_full_delete(home, name, raw) {
+        FullDeletePlan::Preserve { reason } => CleanupOutcome::Preserved { reason },
+        FullDeletePlan::VacuousGhost => CleanupOutcome::Clean,
+        FullDeletePlan::Destructive(intent) => execute_full_delete(home, name, intent),
+    }
 }
 
 #[cfg(test)]

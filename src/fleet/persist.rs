@@ -16,6 +16,34 @@ fn acquire_lock(home: &Path) -> Result<crate::store::FileFlockGuard> {
     crate::store::acquire_file_lock(&lock_path).context("failed to acquire fleet lock")
 }
 
+/// #2764 R6: an owned, type-level proof that the fleet flock is HELD. The only
+/// constructor is [`lock_fleet`]; lock-held (`*_locked`) entry points take it
+/// by reference so a caller cannot reach them without actually holding the
+/// lock. Dropping it releases the flock.
+pub(crate) struct FleetLock(#[allow(dead_code)] crate::store::FileFlockGuard);
+
+/// #2764 R6: acquire the fleet flock for a multi-step generation-fenced
+/// section (fresh read → exact-id verify → destructive commit). Every in-model
+/// fleet.yaml writer routes through [`mutate_fleet_yaml`]'s own acquisition of
+/// the same flock, so no entry can be added/replaced/removed while this guard
+/// lives. NEVER call [`crate::fleet::FleetConfig::load`] (or anything that
+/// can trigger its id-backfill write) while holding it — that write path
+/// re-acquires this flock on a fresh fd and self-deadlocks; use
+/// [`read_fleet_raw_locked`] inside the fence instead.
+pub(crate) fn lock_fleet(home: &Path) -> Result<FleetLock> {
+    acquire_lock(home).map(FleetLock)
+}
+
+/// #2764 R6: RAW fleet read for use INSIDE a held [`FleetLock`] fence —
+/// straight file read + serde parse. No mtime cache, no id-backfill write
+/// (both belong to `FleetConfig::load`, which must not run under the fence).
+pub(crate) fn read_fleet_raw_locked(home: &Path, _lock: &FleetLock) -> Result<super::FleetConfig> {
+    let fleet_path = fleet_yaml_path(home);
+    let content = std::fs::read_to_string(&fleet_path)
+        .with_context(|| format!("read {}", fleet_path.display()))?;
+    serde_yaml_ng::from_str(&content).context("parse fleet.yaml")
+}
+
 pub(crate) fn mutate_fleet_yaml(
     home: &Path,
     default_content: &str,
@@ -26,6 +54,17 @@ pub(crate) fn mutate_fleet_yaml(
         return Ok(());
     }
     let _lock = acquire_lock(home)?;
+    mutate_fleet_yaml_locked(home, default_content, mutate)
+}
+
+/// Lock-held body of [`mutate_fleet_yaml`] — callers must hold the fleet
+/// flock (directly via [`lock_fleet`] or through the public wrapper above).
+fn mutate_fleet_yaml_locked(
+    home: &Path,
+    default_content: &str,
+    mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<bool>,
+) -> Result<()> {
+    let fleet_path = fleet_yaml_path(home);
     let content =
         std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| default_content.to_string());
     let mut doc: serde_yaml_ng::Value =
@@ -96,23 +135,26 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
     })
 }
 
-/// #2764 E: exact-id generation-CAS removal of ONE instance entry — the only
-/// legitimate fleet-entry remover on the `full_delete_instance` path. Removes
-/// `instances.<name>` ONLY when the persisted entry still carries `id ==
-/// expected`; a same-name replacement (different id), a legacy/no-id entry, or
-/// a missing/corrupt entry refuses the CAS and writes NOTHING.
-pub fn remove_instance_from_yaml_cas(
+/// #2764 E/R6: exact-id generation-CAS removal of ONE instance entry — the
+/// only legitimate fleet-entry remover on the `full_delete_instance` path,
+/// callable ONLY inside a held [`FleetLock`] fence (re-acquiring here would
+/// self-deadlock). Removes `instances.<name>` ONLY when the persisted entry
+/// still carries `id == expected`; a same-name replacement (different id), a
+/// legacy/no-id entry, or a missing/corrupt entry refuses the CAS and writes
+/// NOTHING.
+pub(crate) fn remove_instance_from_yaml_cas_locked(
     home: &Path,
     name: &str,
     expected: &crate::types::InstanceId,
+    _lock: &FleetLock,
 ) -> Result<()> {
     let fleet_path = fleet_yaml_path(home);
     if !fleet_path.exists() {
-        // Without this gate `mutate_fleet_yaml("")` early-returns Ok on a
-        // missing file — a silently "successful" CAS against nothing.
+        // Without this gate the empty-default mutate body would parse "" — a
+        // silently "successful" CAS against nothing.
         anyhow::bail!("fleet.yaml missing at CAS time");
     }
-    mutate_fleet_yaml(home, "", |doc| {
+    mutate_fleet_yaml_locked(home, "", |doc| {
         let instances = doc
             .get_mut("instances")
             .and_then(|v| v.as_mapping_mut())
@@ -692,7 +734,13 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // ── #2764 E: exact-id generation-CAS removal ─────────────────────────
+    // ── #2764 E/R6: exact-id generation-CAS removal ──────────────────────
+
+    /// Test entry mirroring the production call shape: fence, then CAS.
+    fn cas(home: &Path, name: &str, expected: &crate::types::InstanceId) -> Result<()> {
+        let lock = lock_fleet(home)?;
+        remove_instance_from_yaml_cas_locked(home, name, expected, &lock)
+    }
 
     fn seed_instance(home: &Path, name: &str, id: Option<&str>) {
         let mut yaml = format!("instances:\n  {name}:\n    backend: claude\n");
@@ -714,7 +762,7 @@ mod tests {
         let home = tmp_home("cas-match");
         let id = crate::types::InstanceId::new();
         seed_instance(&home, "victim", Some(&id.full()));
-        remove_instance_from_yaml_cas(&home, "victim", &id).expect("CAS must succeed");
+        cas(&home, "victim", &id).expect("CAS must succeed");
         assert!(!raw_has_entry(&home, "victim"), "entry must be removed");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -727,8 +775,7 @@ mod tests {
         seed_instance(&home, "victim", Some(&replacement.full()));
         let before = std::fs::read_to_string(fleet_yaml_path(&home)).unwrap();
         let stale = crate::types::InstanceId::new();
-        let err = remove_instance_from_yaml_cas(&home, "victim", &stale)
-            .expect_err("id mismatch must refuse the CAS");
+        let err = cas(&home, "victim", &stale).expect_err("id mismatch must refuse the CAS");
         assert!(err.to_string().contains("CAS mismatch"), "got: {err}");
         assert_eq!(
             std::fs::read_to_string(fleet_yaml_path(&home)).unwrap(),
@@ -744,7 +791,7 @@ mod tests {
         let home = tmp_home("cas-noid");
         seed_instance(&home, "victim", None);
         let expected = crate::types::InstanceId::new();
-        assert!(remove_instance_from_yaml_cas(&home, "victim", &expected).is_err());
+        assert!(cas(&home, "victim", &expected).is_err());
         assert!(raw_has_entry(&home, "victim"), "entry must be retained");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -755,12 +802,12 @@ mod tests {
         let home = tmp_home("cas-missing");
         let expected = crate::types::InstanceId::new();
         assert!(
-            remove_instance_from_yaml_cas(&home, "victim", &expected).is_err(),
+            cas(&home, "victim", &expected).is_err(),
             "missing fleet.yaml must refuse the CAS (no silent success)"
         );
         std::fs::write(fleet_yaml_path(&home), "instances: {}\n").unwrap();
         assert!(
-            remove_instance_from_yaml_cas(&home, "victim", &expected).is_err(),
+            cas(&home, "victim", &expected).is_err(),
             "missing entry must refuse the CAS"
         );
         std::fs::remove_dir_all(&home).ok();

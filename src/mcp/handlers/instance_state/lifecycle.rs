@@ -34,6 +34,26 @@ fn remove_empty_dir_tree(dir: &Path) {
     let _ = std::fs::remove_dir(dir); // succeeds only if now-empty
 }
 
+/// #2764 R6 seam: fires after the pure authority gate and BEFORE the first
+/// mutation (process stop) — the reviewer's "replacement before authority
+/// acquisition" injection point. Thread-local one-shot (nextest =
+/// process-per-test keeps it hermetic).
+#[cfg(test)]
+pub(crate) mod full_delete_test_seam {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn set_after_gate(f: Box<dyn FnOnce()>) {
+        HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
+    pub(crate) fn fire_after_gate() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
 /// the MCP `delete_instance` handler and the TUI close path
 /// (`app/overlay.rs::Overlay::ConfirmClose`). Covers everything
@@ -53,11 +73,12 @@ fn remove_empty_dir_tree(dir: &Path) {
 ///   the entry and surfaces as `Err`.
 /// - **Telegram topic delete** for the resolved per-instance topic — leaving
 ///   it would orphan the topic on the chat side.
-/// - **Working-dir cleanup** via
-///   `workspace_cleanup::full_delete_destructive_phase` (#2764 E): id-anchored
-///   whole-tree removal of the exclusive canonical default dir, or agend-file
-///   scrub of an exclusive user-provided dir; every ownership ambiguity is a
-///   complete fail-closed no-op.
+/// - **Working-dir cleanup** via `workspace_cleanup::plan_full_delete` →
+///   `execute_full_delete` (#2764 E/R6): id-anchored whole-tree removal of the
+///   exclusive canonical default dir, or agend-file scrub of an exclusive
+///   user-provided dir, committed under the fleet-flock generation fence;
+///   every ownership ambiguity aborts the WHOLE delete as a complete
+///   fail-closed no-op (no process kill, no store cleanup).
 /// - **Team membership removal** so a closed instance doesn't leave a
 ///   dangling team-member reference.
 ///
@@ -97,6 +118,27 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
         .and_then(|c| c.instances.get(name))
         .and_then(|i| i.id.clone());
 
+    // #2764 R6 (codex blocker 1 at 650e24e0): PURE authority gate BEFORE ANY
+    // mutation. A `Preserve` verdict (fleet unreadable, no entry for an
+    // existing dir, legacy/no-id, raw dotdot, shared/ambiguous plan) makes the
+    // ENTIRE full delete a complete production no-op — no process kill, no
+    // topic delete, no name-keyed store cleanup. A stale delete must never
+    // gut a same-name replacement's stores while "only" preserving its dir.
+    use crate::agent_ops::workspace_cleanup::{
+        execute_full_delete, plan_full_delete, CleanupOutcome, FullDeletePlan,
+    };
+    let plan = plan_full_delete(home, name, fleet.as_ref());
+    if let FullDeletePlan::Preserve { reason } = &plan {
+        tracing::warn!(name, %reason,
+            "full_delete_instance: authority gate preserved — complete no-op");
+        return Err(format!(
+            "workspace ownership preserved (fail-closed) — full delete aborted with no mutation: {reason}"
+        ));
+    }
+
+    #[cfg(test)]
+    full_delete_test_seam::fire_after_gate();
+
     // Sprint 54 P1-B Bug 1: collect per-step errors instead of silently
     // swallowing them. Each cleanup step runs best-effort so even when
     // earlier steps fail the later ones still get a chance, but every
@@ -104,10 +146,51 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
+    // Process stop (PTY kill + child reap). Generation fence for this step is
+    // the `_delete_guard` held above, NOT the fleet flock: `mark_deleting`
+    // makes every same-name spawn refuse at the `spawn_agent` /
+    // `spawn_and_register_agent` chokepoints for the lifetime of this fn, so
+    // the registry cannot hold a REPLACEMENT process under this name — the
+    // kill can only ever hit the generation designated by the snapshot above.
+    // (Holding the fleet flock across this IPC round-trip instead would risk a
+    // self-deadlock: the daemon-side DELETE handler may load fleet.yaml, whose
+    // id-backfill write re-acquires the flock.)
     let _ = crate::api::call(
         home,
         &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
     );
+
+    // #2764 E/R6: the id-anchored destructive commit — the ONLY path that may
+    // destroy the victim's working dir AND the ONLY remover of its fleet.yaml
+    // entry (exact-id generation-CAS). The whole commit runs under the fleet
+    // flock (codex blocker 2): fresh raw read → exact-id verify → re-plan →
+    // final pre-destruction verify → execute → CAS, so no in-model writer can
+    // interleave a same-name replacement between check and commit. Preserved /
+    // Failed STOPS the delete here: no topic, metadata, inbox, team, task,
+    // watch, worktree, binding, runtime or port cleanup runs — a surviving
+    // generation's stores must never be erased past a non-Clean phase.
+    if let FullDeletePlan::Destructive(intent) = plan {
+        match execute_full_delete(home, name, intent) {
+            CleanupOutcome::Clean => {}
+            CleanupOutcome::Preserved { reason } => {
+                tracing::warn!(name, %reason,
+                    "full_delete_instance: fenced commit preserved — remaining cleanup skipped");
+                return Err(format!(
+                    "workspace ownership preserved at commit (fail-closed) — remaining cleanup skipped: {reason}"
+                ));
+            }
+            CleanupOutcome::Failed { reason } => {
+                tracing::error!(name, %reason,
+                    "full_delete_instance: destructive commit failed — remaining cleanup skipped");
+                return Err(format!(
+                    "workspace cleanup failed — remaining cleanup skipped: {reason}"
+                ));
+            }
+        }
+    }
+    // (FullDeletePlan::VacuousGhost falls through: no entry, nothing on disk —
+    // the remaining name-keyed cleanup below is orphan-remnant reaping.)
+
     if let Some(tid) = topic_id {
         // #2550 identity-confusion root cause: `delete_topic` only unregisters
         // `topics.json` on its own `Deleted` outcome. A `PermissionDenied` /
@@ -136,36 +219,10 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     } else {
         tracing::warn!(%name, "no topic_id found for full_delete_instance — possible orphan");
     }
-    // #2764 E: the id-anchored destructive phase — the ONLY path that may
-    // destroy the victim's working dir (whole-tree remove / external scrub) AND
-    // the ONLY remover of its fleet.yaml entry (exact-id generation-CAS, run
-    // only after a Clean path phase). Authority is the RAW immutable `fleet`
-    // snapshot captured above; every ambiguity (no entry for an existing dir,
-    // legacy/no-id, dotdot, canonicalization, shared/overlapping survivor,
-    // stale exact-id at the pre-mutation re-check) is a complete no-op that
-    // KEEPS the fleet entry — so the delete surfaces loudly as Err instead of
-    // reporting success over preserved/failed cleanup (the 2026-07-13
-    // incident class).
-    {
-        use crate::agent_ops::workspace_cleanup::{full_delete_destructive_phase, CleanupOutcome};
-        match full_delete_destructive_phase(home, name, fleet.as_ref()) {
-            CleanupOutcome::Clean => {}
-            CleanupOutcome::Preserved { reason } => {
-                step_errors.push(format!(
-                    "workspace cleanup preserved (fail-closed): {reason}"
-                ));
-                tracing::warn!(name, %reason,
-                    "full_delete_instance: destructive phase preserved — fleet entry retained");
-            }
-            CleanupOutcome::Failed { reason } => {
-                step_errors.push(format!("workspace cleanup failed: {reason}"));
-                tracing::error!(name, %reason,
-                    "full_delete_instance: destructive phase failed — fleet entry retained unless CAS'd");
-            }
-        }
-    }
-    // Always-run metadata tail (never touches the workspace tree): the
-    // name-keyed metadata file + the non-hidden agy workspace link.
+    // Metadata tail (never touches the workspace tree): the name-keyed
+    // metadata file + the non-hidden agy workspace link. Runs only past a
+    // Clean destructive commit (or the vacuous-ghost flow) — see the R6
+    // authority gate + fenced commit above.
     let _ = std::fs::remove_file(crate::agent_ops::metadata_path(home, name));
     crate::agy_workspace::remove_link(home, name);
     // #1157: clean id-based metadata. The fleet entry may already be removed

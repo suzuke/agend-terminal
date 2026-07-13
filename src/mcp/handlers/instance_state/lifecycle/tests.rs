@@ -877,6 +877,127 @@ fn full_delete_entryless_existing_workspace_dir_fails_closed() {
     std::fs::remove_dir_all(home).ok();
 }
 
+/// #2764 R6 RED (codex blocker 1 at 650e24e0): a same-name REPLACEMENT
+/// (different durable id) lands after the pure authority gate and BEFORE any
+/// mutation-bearing step ("replacement before authority acquisition"). The
+/// REAL `full_delete_instance` must be a COMPLETE no-op on the replacement's
+/// generation: workspace intact, topic mapping intact, metadata + inbox
+/// intact, replacement fleet entry intact — and the delete fails loudly.
+#[test]
+fn full_delete_replacement_before_authority_acquisition_is_complete_noop_2764_r6() {
+    let home = tmp_home("r6_pre_auth_swap");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    let yaml_for = |id: &crate::types::InstanceId| {
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    id: {}\n    topic_id: 501\n    working_directory: {}\n",
+            id.full(),
+            vdir.display()
+        )
+    };
+    let gen_a = crate::types::InstanceId::new();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml_for(&gen_a)).unwrap();
+    // Replacement-generation stores that must survive a stale delete.
+    crate::channel::telegram::register_topic(&home, 501, "victim").expect("seed topics.json");
+    std::fs::create_dir_all(home.join("metadata")).unwrap();
+    std::fs::write(home.join("metadata/victim.json"), "{}").unwrap();
+    std::fs::create_dir_all(home.join("inbox")).unwrap();
+    std::fs::write(home.join("inbox/victim.jsonl"), "").unwrap();
+
+    let gen_b = crate::types::InstanceId::new();
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    let swap = yaml_for(&gen_b);
+    super::full_delete_test_seam::set_after_gate(Box::new(move || {
+        std::fs::write(&fleet_path, &swap).unwrap();
+    }));
+
+    let result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        result.is_err(),
+        "stale delete over a replacement must fail loudly, got {result:?}"
+    );
+    assert!(
+        canaries_intact(&vdir),
+        "replacement's workspace must be untouched: {vdir:?}"
+    );
+    assert_eq!(
+        crate::channel::telegram::lookup_topic_for_instance(&home, "victim"),
+        Some(501),
+        "replacement's topic mapping must survive a stale delete"
+    );
+    assert!(
+        home.join("metadata/victim.json").exists(),
+        "replacement's metadata must survive"
+    );
+    assert!(
+        home.join("inbox/victim.jsonl").exists(),
+        "replacement's inbox must survive"
+    );
+    let fresh = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml still parses");
+    assert_eq!(
+        fresh.instances.get("victim").and_then(|i| i.id.as_deref()),
+        Some(gen_b.full().as_str()),
+        "replacement's fleet entry must survive"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// #2764 R6 RED (codex blocker 2 at 650e24e0): a same-name replacement lands
+/// AFTER the fenced fresh precheck and BEFORE the workspace commit (the seam
+/// bypasses the fleet flock, standing in for any lock-bypassing writer). The
+/// final pre-destruction re-verify must preserve: workspace intact, no CAS,
+/// replacement entry intact, and the REAL `full_delete_instance` fails loudly
+/// without touching any other store.
+#[test]
+fn full_delete_replacement_after_precheck_before_commit_preserves_2764_r6() {
+    let home = tmp_home("r6_in_fence_swap");
+    let vdir = crate::paths::workspace_dir(&home).join("victim");
+    seed_canaries(&vdir);
+    let yaml_for = |id: &crate::types::InstanceId| {
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    id: {}\n    working_directory: {}\n",
+            id.full(),
+            vdir.display()
+        )
+    };
+    let gen_a = crate::types::InstanceId::new();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml_for(&gen_a)).unwrap();
+    std::fs::create_dir_all(home.join("metadata")).unwrap();
+    std::fs::write(home.join("metadata/victim.json"), "{}").unwrap();
+
+    let gen_b = crate::types::InstanceId::new();
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    let swap = yaml_for(&gen_b);
+    crate::agent_ops::workspace_cleanup::fence_test_seam::set(Box::new(move || {
+        std::fs::write(&fleet_path, &swap).unwrap();
+    }));
+
+    let result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        result.is_err(),
+        "in-fence replacement must abort the delete, got {result:?}"
+    );
+    assert!(
+        canaries_intact(&vdir),
+        "replacement's workspace must NOT be destroyed past the precheck: {vdir:?}"
+    );
+    assert!(
+        home.join("metadata/victim.json").exists(),
+        "no store cleanup may run past a preserved commit"
+    );
+    let fresh = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml still parses");
+    assert_eq!(
+        fresh.instances.get("victim").and_then(|i| i.id.as_deref()),
+        Some(gen_b.full().as_str()),
+        "replacement's fleet entry must survive (no CAS on a preserved commit)"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
 /// #2764 E: the always-run metadata tail — full_delete removes the name-keyed
 /// `metadata/<name>.json` (port of the legacy `cleanup_working_dir` metadata
 /// coverage; the uuid path is covered by the #1682 tests above).
