@@ -270,31 +270,63 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, val: &T) -> std::io::Resu
         .unwrap_or_default();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
-    std::fs::write(&tmp, serde_json::to_vec(val).unwrap_or_default())?;
+    // B4(c): NEVER write an empty/partial file — a serialization failure must
+    // propagate, not silently truncate the record/markers to `[]`/`{}`.
+    let bytes = serde_json::to_vec(val)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     crate::store::fsync_parent_dir(path);
     Ok(())
 }
 
-fn read_record(path: &Path) -> Option<ActiveAssignment> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<ActiveAssignment>(&b).ok())
+/// Read one authority record. Three-state (B4): `Ok(None)` = genuinely ABSENT
+/// (NotFound), `Ok(Some)` = present + parsed, `Err` = the file EXISTS but is
+/// unreadable/corrupt. A corrupt record is NEVER conflated with absent — merge-gate
+/// callers (reserved derivation) MUST fail closed on `Err` (keep the reservation),
+/// and destructive callers (revoke/tombstone/repair/persist-overwrite) MUST refuse
+/// to act. Lossy callers that legitimately skip both absent + corrupt use
+/// `read_record(..).ok().flatten()`.
+fn read_record(path: &Path) -> anyhow::Result<Option<ActiveAssignment>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let r = serde_json::from_slice::<ActiveAssignment>(&bytes).map_err(|e| {
+                anyhow::anyhow!("corrupt assignment record {}: {e}", path.display())
+            })?;
+            Ok(Some(r))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
+            "unreadable assignment record {}: {e}",
+            path.display()
+        )),
+    }
 }
 
-fn read_markers(path: &Path) -> TerminalMarkers {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<TerminalMarkers>(&b).ok())
-        .unwrap_or_default()
+/// Read the retained terminal-markers set. Like [`read_record`], corruption is
+/// SURFACED (B4): `Ok(default-empty)` only for a genuinely ABSENT file; a present
+/// but unparseable file is `Err` (never silently emptied — an empty read would let
+/// `record_terminal` overwrite/lose the retained set and let the A10a tombstoning
+/// pass proceed as if there were zero terminals).
+fn read_markers(path: &Path) -> anyhow::Result<TerminalMarkers> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<TerminalMarkers>(&bytes)
+            .map_err(|e| anyhow::anyhow!("corrupt terminal markers {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TerminalMarkers::default()),
+        Err(e) => Err(anyhow::anyhow!(
+            "unreadable terminal markers {}: {e}",
+            path.display()
+        )),
+    }
 }
 
 /// CAS delete: remove the record at `path` ONLY if its on-disk `assignment_id`
 /// still equals `expect` — the ABA guard (B9/I14). The caller holds the branch
 /// lock, so the re-read + remove are atomic w.r.t. any other op on the branch.
+/// B4: a CORRUPT record cannot confirm the CAS match ⇒ do NOT remove (fail closed).
 fn remove_if_assignment_matches(path: &Path, expect: uuid::Uuid) -> bool {
     match read_record(path) {
-        Some(r) if r.assignment_id == expect => std::fs::remove_file(path).is_ok(),
+        Ok(Some(r)) if r.assignment_id == expect => std::fs::remove_file(path).is_ok(),
         _ => false,
     }
 }
@@ -385,11 +417,38 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
         if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
             continue;
         }
-        if let Some(r) = read_record(&path) {
+        // Lossy: skip both absent + corrupt (this feeds ack-scan / reconcile-loop /
+        // tombstone enumeration, none of which is the merge gate; the gate uses the
+        // corruption-aware [`list_active_checked`]).
+        if let Some(r) = read_record(&path).ok().flatten() {
             out.push(r);
         }
     }
     out
+}
+
+/// Like [`list_active`] but FAILS CLOSED on a corrupt/unreadable record: any `Err`
+/// from [`read_record`] propagates instead of silently dropping the record. The
+/// SOLE reader for the merge-gate-affecting reserved derivation (B4) — a corrupt
+/// record must NEVER be read as "no reservation".
+fn list_active_checked(home: &Path, repo: &str, branch: &str) -> anyhow::Result<Vec<ActiveAssignment>> {
+    let dir = branch_dir(home, repo, branch);
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+            continue;
+        }
+        // `Err` (corrupt) propagates ⇒ caller keeps the existing reserved set.
+        // `Ok(None)` (a concurrent remove raced us) is a genuine absence — skip it.
+        if let Some(r) = read_record(&path)? {
+            out.push(r);
+        }
+    }
+    Ok(out)
 }
 
 /// The record for one `(repo,branch,target)`, if any.
@@ -400,11 +459,16 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 #[allow(dead_code)]
 pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option<ActiveAssignment> {
     read_record(&record_file(home, repo, branch, target))
+        .ok()
+        .flatten()
 }
 
-/// The retained terminal-marker set for `(repo,branch)`.
+/// The retained terminal-marker set for `(repo,branch)`. Inspection-only accessor:
+/// a corrupt/absent file yields an empty set. Production terminal paths
+/// ([`record_terminal`] / [`tombstone_terminal_matches`]) read markers through the
+/// corruption-aware [`read_markers`] instead so they can fail closed on corruption.
 pub(crate) fn terminal_markers(home: &Path, repo: &str, branch: &str) -> TerminalMarkers {
-    read_markers(&markers_file(home, repo, branch))
+    read_markers(&markers_file(home, repo, branch)).unwrap_or_default()
 }
 
 // ─────────────────────────── operations ───────────────────────────
@@ -436,8 +500,16 @@ pub(crate) fn durable_enqueue(
 ) -> anyhow::Result<()> {
     let _lock = lock_branch(home, repo, branch)?;
     let path = record_file(home, repo, branch, target);
-    let Some(record) = read_record(&path) else {
-        return Ok(()); // nothing to enqueue (revoked/tombstoned)
+    let record = match read_record(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(()), // nothing to enqueue (revoked/tombstoned)
+        Err(e) => {
+            // B4: a corrupt record is NOT absent — surface + skip the enqueue rather
+            // than silently treating it as gone. The reconciler retries next tick.
+            tracing::error!(repo, branch, target, error = %e,
+                "t-…-17 B4: durable_enqueue skipped — corrupt authority record (fail closed)");
+            return Ok(());
+        }
     };
     if record.row == RowState::Persisted {
         return Ok(()); // idempotent
@@ -447,8 +519,9 @@ pub(crate) fn durable_enqueue(
     if !crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce) {
         crate::inbox::storage::enqueue(home, target, build_delivery_message(&record, now))?;
     }
-    // CAS row → Persisted on assignment_id (re-read under the same lock).
-    if let Some(mut cur) = read_record(&path) {
+    // CAS row → Persisted on assignment_id (re-read under the same lock). A corrupt
+    // re-read ⇒ skip the mark (fail closed; retried next tick).
+    if let Ok(Some(mut cur)) = read_record(&path) {
         if cur.assignment_id == record.assignment_id {
             cur.row = RowState::Persisted;
             atomic_write_json(&path, &cur)?;
@@ -471,8 +544,15 @@ pub(crate) fn repair_row(
 ) -> anyhow::Result<bool> {
     let _lock = lock_branch(home, repo, branch)?;
     let path = record_file(home, repo, branch, target);
-    let Some(record) = read_record(&path) else {
-        return Ok(false);
+    let record = match read_record(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            // B4: corrupt record ⇒ surface + skip the destructive rotate/supersede.
+            tracing::error!(repo, branch, target, error = %e,
+                "t-…-17 B4: repair_row skipped — corrupt authority record (fail closed)");
+            return Ok(false);
+        }
     };
     // FIXED-interval lease: repair only when the lease is due (bounded).
     if !now_ge(now, &record.next_nudge_at) {
@@ -493,8 +573,8 @@ pub(crate) fn repair_row(
     // 2) SUPERSEDE the stale row by the OLD nonce (never resets read_at).
     crate::inbox::storage::supersede_by_nonce(home, target, &old_nonce, &successor);
 
-    // 3) Advance nonce + lease under the assignment_id CAS.
-    if let Some(mut cur) = read_record(&path) {
+    // 3) Advance nonce + lease under the assignment_id CAS (corrupt re-read ⇒ skip).
+    if let Ok(Some(mut cur)) = read_record(&path) {
         if cur.assignment_id == record.assignment_id {
             cur.delivery_nonce = new_nonce;
             cur.next_nudge_at = add_interval(now);
@@ -532,8 +612,16 @@ fn revoke_under_lock(
     now: &str,
 ) -> anyhow::Result<bool> {
     let path = record_file(home, repo, branch, target);
-    let Some(record) = read_record(&path) else {
-        return Ok(false);
+    let record = match read_record(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            // B4: corrupt record ⇒ surface + do NOT act (cannot derive the nonce to
+            // supersede, and remove_if_assignment_matches would refuse anyway).
+            tracing::error!(repo, branch, target, error = %e,
+                "t-…-17 B4: revoke skipped — corrupt authority record (fail closed)");
+            return Ok(false);
+        }
     };
     let removed = remove_if_assignment_matches(&path, record.assignment_id);
     let successor = format!("revoked-{}", record.assignment_id);
@@ -585,7 +673,9 @@ pub(crate) fn transfer(
     now: &str,
 ) -> anyhow::Result<()> {
     let _lock = lock_branch(home, repo, branch)?;
-    let old = read_record(&record_file(home, repo, branch, old_target)).ok_or_else(|| {
+    // B4: `?` propagates a corrupt-record Err (fail closed — never transfer off a
+    // record we cannot read); `ok_or_else` handles a genuinely absent old target.
+    let old = read_record(&record_file(home, repo, branch, old_target))?.ok_or_else(|| {
         anyhow::anyhow!("assignment_authority::transfer: no active assignment for old target")
     })?;
     // {revoke old} under the held lock.
@@ -623,9 +713,12 @@ pub(crate) fn record_terminal(
     kind: TerminalKind,
 ) -> anyhow::Result<usize> {
     let _lock = lock_branch(home, repo, branch)?;
-    // 1) Add the marker to the RETAINED set (idempotent; NO compaction — I19).
+    // 1) Add the marker to the RETAINED set (idempotent; NO compaction — I19). B4:
+    //    `?` propagates a corrupt-markers Err — a silent default-empty read here
+    //    would OVERWRITE the retained set with just this marker on the write below,
+    //    losing every prior terminal generation. Fail closed instead.
     let mpath = markers_file(home, repo, branch);
-    let mut markers = read_markers(&mpath);
+    let mut markers = read_markers(&mpath)?;
     if !markers.contains(pr_number) {
         markers.schema_version = SCHEMA_VERSION;
         markers.markers.push(TerminalMarker { pr_number, kind });
@@ -667,7 +760,17 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
     let Ok(_lock) = lock_branch(home, repo, branch) else {
         return 0;
     };
-    let markers = terminal_markers(home, repo, branch);
+    // B4: a corrupt markers file is NOT "zero terminals" — SKIP the pass (surface +
+    // return) rather than act on an unreliable empty set. Acting as if there are no
+    // terminals would fail to tombstone a replayed old-generation record (B20).
+    let markers = match read_markers(&markers_file(home, repo, branch)) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(repo, branch, error = %e,
+                "t-…-17 B4: A10a tombstone pass skipped — corrupt terminal markers (fail closed)");
+            return 0;
+        }
+    };
     if markers.markers.is_empty() {
         return 0;
     }
@@ -687,15 +790,18 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
 /// records of its `(repo,branch)`: every active record whose stored `pr_number`
 /// equals `prstate.pr_number` AND whose evidence is NOT `SatisfiedExactHead`
 /// (plan §1/I16). FULL-TYPED (`target`/`review_author`/`assignment_id`), generation-
-/// matched, Satisfied-excluded. Reads records LOCK-FREE ([`list_active`]), so it is
-/// safe to call while the caller already holds the branch lock (the A6 drain does).
+/// matched, Satisfied-excluded. Reads records LOCK-FREE ([`list_active_checked`]), so
+/// it is safe to call while the caller already holds the branch lock (the A6 drain
+/// does). B4: returns `Err` if ANY record on the branch is corrupt/unreadable — the
+/// merge-gate caller MUST then KEEP the existing reserved set (a corrupt record must
+/// NEVER silently drop a reservation and OPEN the reserved gate).
 pub(crate) fn derive_reserved_for_prstate(
     home: &Path,
     repo: &str,
     branch: &str,
     prstate: &PrState,
-) -> Vec<ReservedAssignment> {
-    list_active(home, repo, branch)
+) -> anyhow::Result<Vec<ReservedAssignment>> {
+    Ok(list_active_checked(home, repo, branch)?
         .into_iter()
         .filter(|r| r.pr_number == prstate.pr_number)
         .filter(|r| classify_assignment(r, Some(prstate)) != AssignmentEvidence::SatisfiedExactHead)
@@ -704,7 +810,7 @@ pub(crate) fn derive_reserved_for_prstate(
             review_author: r.review_author,
             assignment_id: r.assignment_id,
         })
-        .collect()
+        .collect())
 }
 
 /// A10b — re-derive `reserved_assignments` on the LIVE `PrState` for `(repo,branch)`
@@ -712,13 +818,18 @@ pub(crate) fn derive_reserved_for_prstate(
 /// pr_state-flock INNER (I11/I15): the branch lock is acquired FIRST, then
 /// [`crate::daemon::pr_state::with_pr_state`] takes the pr_state flock. A missing
 /// pr_state file is a no-op. Best-effort (a lock/save failure is swallowed — the
-/// next tick re-derives).
+/// next tick re-derives). B4: a corrupt-record derivation failure KEEPS the existing
+/// reserved set (fail closed) — the reservation is never dropped on corruption.
 pub(crate) fn redrive_reserved(home: &Path, repo: &str, branch: &str) {
     let Ok(_lock) = lock_branch(home, repo, branch) else {
         return;
     };
     let _ = crate::daemon::pr_state::with_pr_state(home, repo, branch, |ps| {
-        ps.reserved_assignments = derive_reserved_for_prstate(home, repo, branch, ps);
+        match derive_reserved_for_prstate(home, repo, branch, ps) {
+            Ok(v) => ps.reserved_assignments = v,
+            Err(e) => tracing::error!(repo, branch, error = %e,
+                "t-…-17 B4: reserved re-derive skipped — corrupt authority record; keeping existing reserved set (fail closed, gate stays closed)"),
+        }
     });
 }
 
@@ -767,7 +878,7 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
             if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
                 continue;
             }
-            if let Some(r) = read_record(&path) {
+            if let Some(r) = read_record(&path).ok().flatten() {
                 if seen.insert((r.repo.clone(), r.branch.clone())) {
                     out.push((r.repo, r.branch));
                 }
@@ -882,7 +993,8 @@ pub(crate) fn ack(home: &Path, sender_target: &str, task_id: &str, now: &str) ->
         return AckOutcome::NoMatch;
     };
     let path = record_file(home, &rec.repo, &rec.branch, &rec.target);
-    let Some(mut cur) = read_record(&path) else {
+    // B4: absent OR corrupt ⇒ NoMatch (never ack a record we cannot read).
+    let Ok(Some(mut cur)) = read_record(&path) else {
         return AckOutcome::NoMatch;
     };
     if cur.assignment_id != rec.assignment_id {
@@ -923,7 +1035,7 @@ fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<A
             if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
                 continue;
             }
-            if let Some(r) = read_record(&path) {
+            if let Some(r) = read_record(&path).ok().flatten() {
                 if r.target == target && r.task_id == task_id {
                     out.push(r);
                 }

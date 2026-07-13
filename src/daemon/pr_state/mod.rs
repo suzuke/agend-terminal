@@ -1156,11 +1156,20 @@ pub fn record_ci_result(
     // best-effort — a lock failure logs nothing and the drain still runs lock-free
     // (the per-tick reconciler re-derives, so convergence is preserved). Held for the
     // whole `with_pr_state_or_create` scope via the binding's lifetime.
-    let _assignment_lock = if crate::daemon::assignment_authority::has_active(home, repo, branch) {
+    let has_active = crate::daemon::assignment_authority::has_active(home, repo, branch);
+    let _assignment_lock = if has_active {
         crate::daemon::assignment_authority::lock_branch_for_drain(home, repo, branch)
     } else {
         None
     };
+    // t-…-17 B4(d): the reserved derivation is only SAFE when it runs under the
+    // assignment lock (consistent w.r.t. a concurrent revoke/transfer). Derive ONLY
+    // when the lock IS held, or when the branch has NO active assignments (an empty
+    // reserved set is then correct). If `has_active` but the lock could NOT be
+    // acquired, a lock-free derivation could read a torn reserved set that CLEARS the
+    // gate — so skip it and KEEP the existing set (fail closed); the per-tick
+    // reconciler re-derives under the lock later.
+    let derive_reserved = !has_active || _assignment_lock.is_some();
     if let Err(e) = with_pr_state_or_create(
         home,
         repo,
@@ -1209,10 +1218,24 @@ pub fn record_ci_result(
             // (I17). A freshly-created state still carries pr_number 0 (gh-poll fills
             // it later), matching no record (persist rejects pr_number 0), so the
             // reconciler backstops the reservation until the generation is known.
-            state.reserved_assignments =
-                crate::daemon::assignment_authority::derive_reserved_for_prstate(
+            if derive_reserved {
+                // B4: a corrupt authority record makes the derivation Err — KEEP the
+                // existing reserved set (never drop a reservation on corruption).
+                match crate::daemon::assignment_authority::derive_reserved_for_prstate(
                     home, repo, branch, state,
+                ) {
+                    Ok(v) => state.reserved_assignments = v,
+                    Err(e) => tracing::error!(
+                        repo = %repo, branch = %branch, error = %e,
+                        "t-…-17 B4: reserved derivation skipped — corrupt authority record; keeping existing reserved set (fail closed, gate stays closed)"
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    repo = %repo, branch = %branch,
+                    "t-…-17 B4(d): reserved derivation skipped fail-closed — assignment lock not acquired while active assignments exist; keeping existing reserved set (reconciler re-derives under the lock)"
                 );
+            }
             // #2059 #2(c): the state's head_sha is now established at `head_sha`.
             // Drain + replay any verdicts that were buffered for this SHA before
             // the state existed (the #2058 verdict-before-CI ordering gap). They
