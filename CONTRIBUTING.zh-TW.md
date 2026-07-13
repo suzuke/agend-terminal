@@ -12,8 +12,8 @@ cargo build --release                # release (strip + LTO, matches CI)
 cargo test                           # unit + integration + MCP round-trip
 cargo test --bin agend-terminal      # unit tests only
 cargo test --test integration        # integration tests (Unix-only for now)
-cargo fmt --check
-cargo clippy -- -D warnings          # must be warning-free
+scripts/fmt-owned.sh --check         # 唯一的 owned-source fmt surface（排除 vendor/）；不帶參數即直接格式化
+cargo clippy -- -D warnings          # 快速檢查；scripts/preflight.sh 會跑 CI 完整的 owned-target 集合
 ```
 
 `cargo clippy` 會強制 `unwrap_used = "deny"`（參見 `Cargo.toml`）。請用 `?` / `anyhow::Result` 來處理錯誤。
@@ -38,7 +38,7 @@ CI 會在 Ubuntu + macOS + Windows 上複製這些步驟（`.github/workflows/ci
 scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
 ```
 
-它執行的正是 CI 的 `check` job——`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo test --tests --features tray`，以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
+它執行與 CI `check` job 相同的 fmt/clippy 介面——`scripts/fmt-owned.sh --check`（owned `*.rs`，排除 `vendor/`）與 owned-target 的 `cargo clippy`——外加 `cargo test --tests --features tray`，以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。（注意：CI 是用 `nextest` 而非 `cargo test` 跑測試，且浮動的 stable toolchain 並非長期逐位元組一致——preflight 是強力的預先檢查，而非與 CI 逐位元組一致的保證。）Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
 
 ### 覆蓋率（選填，本地）
 

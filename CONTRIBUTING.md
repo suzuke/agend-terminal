@@ -12,8 +12,8 @@ cargo build --release                # release (strip + LTO, matches CI)
 cargo test                           # unit + integration + MCP round-trip
 cargo test --bin agend-terminal      # unit tests only
 cargo test --test integration        # integration tests (Unix-only for now)
-cargo fmt --check
-cargo clippy -- -D warnings          # must be warning-free
+scripts/fmt-owned.sh --check         # THE owned-source fmt surface (excludes vendor/); no arg = format
+cargo clippy -- -D warnings          # quick check; scripts/preflight.sh runs CI's exact owned-target set
 ```
 
 `cargo clippy` enforces `unwrap_used = "deny"` (see `Cargo.toml`). Handle errors with `?` / `anyhow::Result`.
@@ -39,7 +39,7 @@ Run the one-shot CI-parity preflight to catch failures locally instead of after 
 scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
 ```
 
-It runs exactly CI's `check` job — `cargo fmt --check`, `cargo clippy --all-targets --features tray -- -D warnings`, `cargo test --tests --features tray`, and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
+It runs the same fmt/clippy surface CI's `check` job runs — `scripts/fmt-owned.sh --check` (owned `*.rs`, `vendor/` excluded) and the owned-target `cargo clippy` — plus `cargo test --tests --features tray` and a **Windows cross-check** (`x86_64-pc-windows-msvc`) that catches windows-only compile errors a unix dev box would otherwise miss. (CI runs the tests via `nextest`, not `cargo test`, and a floating stable toolchain is not byte-exact over time — so preflight is a strong pre-check, not a byte-exact CI guarantee.) The Windows step prefers [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`) since a transitive C dependency (`ring`) won't cross-compile on macOS/Linux without the MSVC toolchain; if it's not installed the step SKIPs with a hint rather than false-failing.
 
 ### Coverage (optional, local)
 
