@@ -39,6 +39,11 @@ if ! command -v rustfmt >/dev/null 2>&1; then
     exit 2
 fi
 
+# Version-scope evidence (task83/d-46): record the EXACT rustfmt this run used, to
+# stderr, so a "matches CI" claim is scoped to a concrete version in the logs
+# rather than asserted as byte-exact — and without pinning a toolchain here.
+echo "fmt-owned: $(rustfmt --version 2>/dev/null) [edition 2021, owned *.rs, vendor/** excluded]" >&2
+
 # Resolve the SUPERPROJECT root so enumeration + rustfmt run against the owned
 # tree regardless of CWD — including when invoked from within a submodule (then
 # --show-superproject-working-tree names the parent superproject; otherwise we
