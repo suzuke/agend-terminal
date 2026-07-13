@@ -165,6 +165,23 @@ static RUNTIME_CONFIG: OnceLock<RwLock<RuntimeConfig>> = OnceLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// #1576: de-dupes the corrupt-config warning across 10s ticks.
 static CORRUPT_WARNED: AtomicBool = AtomicBool::new(false);
+/// #2753: de-dupes the invalid-effective-thresholds warning across per-tick
+/// resolves — warn on the FIRST invalid resolution of an episode, stay silent
+/// while it persists, re-arm as soon as a valid triplet resolves. Mirrors
+/// `CORRUPT_WARNED`.
+static INVALID_THRESHOLDS_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only probe: per-thread count of `resolve_effective_thresholds`
+    /// calls, pinning the per-tick consumers' one-resolve-per-tick contract.
+    static RESOLVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_calls_this_thread() -> usize {
+    RESOLVE_CALLS.with(std::cell::Cell::get)
+}
 
 fn global() -> &'static RwLock<RuntimeConfig> {
     RUNTIME_CONFIG.get_or_init(|| RwLock::new(RuntimeConfig::default()))
@@ -263,9 +280,23 @@ pub fn validate_thresholds(alert: f32, handoff: f32, escalate: f32) -> Result<()
     Ok(())
 }
 
+/// Latch step for the once-per-invalid-episode warning: records this
+/// resolution's validity and returns whether the invalid warning should be
+/// emitted NOW (true only on the first invalid resolution after a valid one).
+fn note_thresholds_validity(valid: bool) -> bool {
+    if valid {
+        INVALID_THRESHOLDS_WARNED.store(false, Ordering::Relaxed);
+        false
+    } else {
+        !INVALID_THRESHOLDS_WARNED.swap(true, Ordering::Relaxed)
+    }
+}
+
 /// Resolve and validate the effective context threshold triplet.
 /// Checks the environment variables first, falling back to RuntimeConfig, then to defaults.
 pub fn resolve_effective_thresholds() -> (f32, f32, f32) {
+    #[cfg(test)]
+    RESOLVE_CALLS.with(|c| c.set(c.get() + 1));
     let config = get();
     let alert = std::env::var("AGEND_CONTEXT_ALERT_PCT")
         .ok()
@@ -280,9 +311,8 @@ pub fn resolve_effective_thresholds() -> (f32, f32, f32) {
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(config.context_handoff_escalate_pct);
 
-    if validate_thresholds(alert, handoff, escalate).is_ok() {
-        (alert, handoff, escalate)
-    } else {
+    let valid = validate_thresholds(alert, handoff, escalate).is_ok();
+    if note_thresholds_validity(valid) {
         tracing::warn!(
             alert,
             handoff,
@@ -292,6 +322,10 @@ pub fn resolve_effective_thresholds() -> (f32, f32, f32) {
             config_escalate = config.context_handoff_escalate_pct,
             "effective context thresholds combination is invalid. falling back to runtime config values."
         );
+    }
+    if valid {
+        (alert, handoff, escalate)
+    } else {
         let fallback_alert = config.context_alert_pct;
         let fallback_handoff = config.context_handoff_pct;
         let fallback_escalate = config.context_handoff_escalate_pct;
@@ -919,6 +953,69 @@ mod tests {
             std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
         } else {
             std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        reload(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2753 final review: the invalid-effective-thresholds warning must fire
+    /// once per invalid EPISODE, not once per resolve —
+    /// `resolve_effective_thresholds` runs every tick from the per-tick
+    /// consumers, so an un-latched warn floods the log for as long as the
+    /// invalid override persists. A valid resolution ends the episode and
+    /// re-arms the latch.
+    #[test]
+    #[serial(runtime_config)]
+    fn invalid_thresholds_warning_latches_once_per_episode() {
+        // Normalize: a valid resolution re-arms the latch.
+        assert!(!note_thresholds_validity(true));
+        // First invalid resolution of an episode warns...
+        assert!(note_thresholds_validity(false));
+        // ...further invalid resolutions in the same episode stay silent.
+        assert!(!note_thresholds_validity(false));
+        assert!(!note_thresholds_validity(false));
+        // A valid triplet ends the episode without warning...
+        assert!(!note_thresholds_validity(true));
+        // ...and the next invalid episode warns exactly once again.
+        assert!(note_thresholds_validity(false));
+        assert!(!note_thresholds_validity(false));
+    }
+
+    /// Wiring counterpart of the latch-semantics test:
+    /// `resolve_effective_thresholds` itself must drive the latch — an invalid
+    /// env override latches it, a valid resolution re-arms it.
+    #[test]
+    #[serial(runtime_config)]
+    fn resolve_effective_thresholds_drives_warn_latch() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-warnlatch");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Valid resolution → latch re-armed.
+        resolve_effective_thresholds();
+        assert!(!INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        // Invalid override (alert >= handoff) → latch set after first resolve.
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "95.0");
+        resolve_effective_thresholds();
+        assert!(INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        // Back to valid → latch re-armed for the next episode.
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        resolve_effective_thresholds();
+        assert!(!INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
         }
         std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
         reload(&dir);
