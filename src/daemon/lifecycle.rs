@@ -169,7 +169,7 @@ pub fn delete_transaction_expecting(
         //                                recorded pid — pid reuse).
         match instance_id.and_then(|id| crate::agent::child_ledger::lookup(home, &id)) {
             None => true,
-            Some(pid) if !crate::agent::child_ledger::pid_alive(pid) => {
+            Some(pid) if !crate::agent::child_ledger::os_pid_alive(pid) => {
                 if let Some(id) = instance_id {
                     crate::agent::child_ledger::clear(home, &id);
                 }
@@ -631,6 +631,7 @@ mod tests {
     /// report false, retain the ledger, release nothing name-keyed. Registry
     /// absence alone must never convert into terminal-absence authority.
     #[test]
+    #[cfg(unix)] // the OS liveness probe (kill-0) is unix; non-unix is fail-closed-alive
     fn pinned_stop_lost_child_alive_is_unknown_2764_r9() {
         let home = tmp_home("lost-child-alive");
         let reg = empty_registry();
@@ -663,6 +664,7 @@ mod tests {
     /// GONE (freshly-reaped child) → terminal absence proven via the OS probe;
     /// the ledger is cleared and the stop reports true.
     #[test]
+    #[cfg(unix)] // the OS liveness probe (kill-0) is unix; non-unix is fail-closed-alive
     fn pinned_stop_lost_child_dead_is_terminal_2764_r9() {
         let home = tmp_home("lost-child-dead");
         let reg = empty_registry();

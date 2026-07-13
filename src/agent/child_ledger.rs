@@ -55,7 +55,7 @@ pub fn lookup(home: &Path, id: &InstanceId) -> Option<u32> {
 /// OS liveness probe: `kill(pid, 0)`. `ESRCH` → provably gone; anything else
 /// (delivered, `EPERM`, unexpected errno) → treat as alive (fail closed).
 #[cfg(unix)]
-pub fn pid_alive(pid: u32) -> bool {
+pub fn os_pid_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
@@ -64,7 +64,7 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-pub fn pid_alive(_pid: u32) -> bool {
+pub fn os_pid_alive(_pid: u32) -> bool {
     // No portable probe — fail closed (UNKNOWN reads as alive).
     true
 }
