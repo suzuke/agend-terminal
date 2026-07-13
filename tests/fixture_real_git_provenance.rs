@@ -202,6 +202,35 @@ fn t122_rejects_non_temp_repo_target() {
     let _ = git_isolated::git(&src, &["status"]);
 }
 
+/// (task122 RED — managed-worktree fence) even UNDER the system temp dir, a daemon-
+/// MANAGED worktree (or a subdir of one) is REFUSED: `starts_with(temp_dir())` alone is
+/// insufficient because test suites set AGEND_HOME under temp, so a live `.agend-managed`
+/// worktree can sit under temp. The production `git()` helper must PANIC via the
+/// ancestor-marker walk (root + Fable r1 blocker). Targets a SUBDIR so the walk is
+/// exercised, not just the leaf.
+#[test]
+#[should_panic(expected = "daemon-MANAGED worktree")]
+fn t122_rejects_managed_worktree_under_temp() {
+    // <temp>/t122-managed-<pid>-<ns>/worktrees/dev/feat/{.agend-managed, src/}
+    let wt = std::env::temp_dir()
+        .join(format!(
+            "t122-managed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ))
+        .join("worktrees")
+        .join("dev")
+        .join("feat");
+    let sub = wt.join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(wt.join(".agend-managed"), "dev\n").unwrap(); // MANAGED_MARKER
+                                                                 // reaches the production git() chokepoint against a subdir under a managed ancestor
+    let _ = git_isolated::git(&sub, &["status"]);
+}
+
 /// (task122 RED — shell fence) the shell real-git seam is FIXTURE-ONLY: every script
 /// under scripts/ that references scripts/lib/real-git.sh MUST be an audited fixture
 /// script. A NEW (unaudited) consumer fails this LOUD — the shell analogue of the src/

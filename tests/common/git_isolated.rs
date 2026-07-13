@@ -41,6 +41,11 @@ const PROVENANCE_HINT: &str = "a fixture must run against REAL git, but after ex
     agend-git shim dir(s) no real git resolved on PATH. Set AGEND_REAL_GIT to a real git binary \
     or put one on PATH. This is a fail-loud provenance guard (task122) — never a SKIP.";
 
+/// Marker file the daemon places in a managed worktree. MIRRORS
+/// `worktree_pool::MANAGED_MARKER` (bin-private → not importable from an integration
+/// test); it is the SAME authoritative signal `worktree_pool::is_daemon_managed` uses.
+const MANAGED_MARKER: &str = ".agend-managed";
+
 /// Directories whose `git` is the agend-git shim (or its default install), to be
 /// EXCLUDED from real-git resolution: `$AGEND_HOME/bin` and `~/.agend-terminal/bin`.
 #[allow(dead_code)]
@@ -193,6 +198,34 @@ fn assert_temp_repo(repo_dir: &Path) {
         canon_repo.display(),
         canon_tmp.display(),
     );
+    // `starts_with(temp)` is necessary but NOT sufficient: a daemon-MANAGED worktree can
+    // live UNDER the system temp dir — test suites set AGEND_HOME under temp_dir, so
+    // `<temp>/…/worktrees/<agent>/<branch>/.agend-managed` is a real topology. Running real
+    // git (shim stripped) against live managed state is the exact pollution class this fence
+    // prevents (root + Fable r1 blocker). Reject if `repo_dir` OR any ancestor up to
+    // `canon_tmp` carries the `.agend-managed` marker — the SAME signal the daemon uses
+    // (worktree_pool::is_daemon_managed). Ancestor walk bounded at canon_tmp; fail-CLOSED on
+    // an un-statable marker (`try_exists` Err → treat as present → panic).
+    let mut cur: &Path = &canon_repo;
+    loop {
+        if cur.join(MANAGED_MARKER).try_exists().unwrap_or(true) {
+            panic!(
+                "git_isolated: refusing to run real git against {} — it (or an ancestor at {}) is \
+                 a daemon-MANAGED worktree ({MANAGED_MARKER} marker). The seam targets ONLY \
+                 test-created temp repos, NEVER a managed worktree, even under the temp dir \
+                 (task122 source invariant).",
+                canon_repo.display(),
+                cur.display(),
+            );
+        }
+        if cur == canon_tmp {
+            break;
+        }
+        cur = match cur.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
 }
 
 /// Base command: REAL git binary, real-git-first PATH (children inherit it), cwd
