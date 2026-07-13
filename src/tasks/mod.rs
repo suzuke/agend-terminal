@@ -269,21 +269,26 @@ impl<'a> DepResolver<'a> {
     }
 }
 
-/// Evaluate dependency status for a single task against a [`DepResolver`].
-/// - open + any dep not done → "blocked"
-/// - blocked + all deps done → "open" (auto-unblock)
-/// - claimed/done/cancelled → unchanged
+/// Evaluate the VIEW status of a single task against a [`DepResolver`] (decision
+/// d-20260713172801677583-63). Dependency-derived blocking is view-only and applies
+/// to RAW `Open` ONLY:
+/// - raw Open + any dep not Done → "blocked" (view; the raw replay stays Open)
+/// - raw Open + all deps Done (or no deps) → "open"
+/// - EVERY other raw status (Blocked / InProgress / InReview / Verified / Backlog /
+///   Claimed / Done / Cancelled) → UNCHANGED
+///
+/// So an EXPLICIT/persisted Blocked (operator, usage-limit, legacy migration) never
+/// auto-unblocks when its deps finish, and non-Open statuses are never projected to
+/// Blocked — get/list agree with the update response and the raw replay (no
+/// split-brain). Dep-derived Blocked is never persisted (see
+/// [`apply_dependency_eval_in_memory`]).
 fn evaluate_with_resolver(
     resolver: &mut DepResolver,
     task: &Task,
 ) -> crate::task_events::TaskStatus {
     use crate::task_events::TaskStatus;
-    if task.depends_on.is_empty()
-        || matches!(
-            task.status,
-            TaskStatus::Claimed | TaskStatus::Done | TaskStatus::Cancelled
-        )
-    {
+    // Only RAW Open is view-derived; everything else passes through unchanged.
+    if task.status != TaskStatus::Open || task.depends_on.is_empty() {
         return task.status;
     }
     let all_deps_done = task
@@ -291,11 +296,7 @@ fn evaluate_with_resolver(
         .iter()
         .all(|dep_id| resolver.status_of(dep_id) == Some(TaskStatus::Done));
     if all_deps_done {
-        if task.status == TaskStatus::Blocked {
-            TaskStatus::Open
-        } else {
-            task.status
-        }
+        TaskStatus::Open
     } else {
         TaskStatus::Blocked
     }
