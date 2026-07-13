@@ -33,32 +33,18 @@ use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
-/// Handoff-injection threshold (percent). Override: `AGEND_CONTEXT_HANDOFF_PCT`.
-const DEFAULT_HANDOFF_PCT: f32 = 85.0;
-/// Operator-escalation threshold (percent). Override:
-/// `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT`.
-const DEFAULT_ESCALATE_PCT: f32 = 92.0;
-/// Re-arm requires dropping this far below the handoff threshold
-/// (compact/restart), so boundary wobble can't start a second episode.
-const HYSTERESIS_PCT: f32 = 5.0;
-
 /// The handoff file the injection asks for, relative to the agent's
 /// working directory. Matches the manual-rescue convention from the 6/10
 /// incident.
 pub(crate) const HANDOFF_FILENAME: &str = "SESSION-HANDOFF.md";
 
-fn handoff_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_HANDOFF_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_HANDOFF_PCT)
-}
-
-fn escalate_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_ESCALATE_PCT)
+/// One resolve per tick: handoff and escalate must come from the SAME
+/// effective-triplet snapshot, so a config reload / env change between two
+/// separate resolves can't hand `decide` a torn pair. Overrides:
+/// `AGEND_CONTEXT_HANDOFF_PCT` / `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT`.
+fn tick_thresholds() -> (f32, f32) {
+    let (_, handoff, escalate) = crate::runtime_config::resolve_effective_thresholds();
+    (handoff, escalate)
 }
 
 /// Episode phase per agent. One episode = one continuous stay above the
@@ -110,7 +96,7 @@ fn decide(
     escalate_pct: f32,
 ) -> Option<Action> {
     // Auto-resolve (silent): compact/restart dropped the usage — re-arm.
-    if pct < handoff_pct - HYSTERESIS_PCT {
+    if pct < handoff_pct - crate::runtime_config::HYSTERESIS_PCT {
         state.phase = Phase::Armed;
         return None;
     }
@@ -256,8 +242,7 @@ impl PerTickHandler for ContextHandoffHandler {
             live
         };
 
-        let handoff_pct = handoff_threshold();
-        let escalate_pct = escalate_threshold();
+        let (handoff_pct, escalate_pct) = tick_thresholds();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut states = self.states.lock();
         for (name, pct, is_idle) in snapshot {
@@ -353,6 +338,7 @@ impl PerTickHandler for ContextHandoffHandler {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const HP: f32 = 85.0;
     const EP: f32 = 92.0;
@@ -560,5 +546,89 @@ mod tests {
              must be UNCONDITIONAL, not gated on resolved_context()"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn handoff_threshold_precedence() {
+        let temp_dir = std::env::temp_dir().join("agend-test-clean-handoff");
+        std::fs::create_dir_all(&temp_dir).ok();
+
+        // 1. Write non-default valid config to check loader/consumer fallback
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        crate::runtime_config::reload(&temp_dir);
+
+        let old_handoff = std::env::var("AGEND_CONTEXT_HANDOFF_PCT").ok();
+        let old_escalate = std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT");
+
+        // Runtime config non-default value resolved
+        assert_eq!(tick_thresholds(), (70.0, 80.0));
+
+        // 2. Env var set overrides config
+        std::env::set_var("AGEND_CONTEXT_HANDOFF_PCT", "65.5");
+        std::env::set_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT", "75.5");
+        assert_eq!(tick_thresholds(), (65.5, 75.5));
+
+        // 3. Invalid env var resolved combination falls back to config value
+        // handoff 90.0, escalate 85.0 -> invalid triplet combination (handoff >= escalate), should fallback to config (handoff=70.0, escalate=80.0)
+        std::env::set_var("AGEND_CONTEXT_HANDOFF_PCT", "90.0");
+        std::env::set_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT", "85.0");
+        assert_eq!(tick_thresholds(), (70.0, 80.0));
+
+        // Restore env vars
+        if let Some(val) = old_handoff {
+            std::env::set_var("AGEND_CONTEXT_HANDOFF_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_HANDOFF_PCT");
+        }
+        if let Some(val) = old_escalate {
+            std::env::set_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT");
+        }
+
+        // Clean up global config back to default
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
+        crate::runtime_config::reload(&temp_dir);
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// #2753 final review: handoff+escalate must come from ONE
+    /// `resolve_effective_thresholds` snapshot per tick — two separate resolves
+    /// can tear the pair when a config reload / env change lands between them,
+    /// handing `decide` a handoff from one triplet and an escalate from another.
+    #[test]
+    #[serial(runtime_config)]
+    fn tick_resolves_one_threshold_snapshot() {
+        let temp_dir = std::env::temp_dir().join("agend-test-handoff-snapshot");
+        std::fs::create_dir_all(&temp_dir).ok();
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
+        crate::runtime_config::reload(&temp_dir);
+
+        let before = crate::runtime_config::resolve_calls_this_thread();
+        let (handoff, escalate) = tick_thresholds();
+        let resolves = crate::runtime_config::resolve_calls_this_thread() - before;
+        assert_eq!(
+            resolves, 1,
+            "handoff and escalate must be read from the SAME effective-triplet resolve"
+        );
+        // Any resolve output is a validated triplet (or the validated fallback),
+        // so the pair is ordered by construction.
+        assert!(handoff < escalate);
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 }

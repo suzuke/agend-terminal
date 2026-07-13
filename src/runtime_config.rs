@@ -84,6 +84,15 @@ pub struct RuntimeConfig {
     /// bump — only a non-additive change to an existing field does.
     #[serde(default)]
     pub schema_version: u32,
+    /// Context-window usage percent at which the per-tick context-alert watchdog notifies.
+    #[serde(default = "default_context_alert")]
+    pub context_alert_pct: f32,
+    /// Context-window usage percent at which the context-handoff watchdog injects a handoff request.
+    #[serde(default = "default_context_handoff")]
+    pub context_handoff_pct: f32,
+    /// Higher context-window percent at which the handoff watchdog escalates to the operator.
+    #[serde(default = "default_context_handoff_escalate")]
+    pub context_handoff_escalate_pct: f32,
 }
 
 impl SchemaVersioned for RuntimeConfig {
@@ -97,6 +106,18 @@ fn default_true() -> bool {
     true
 }
 
+pub const DEFAULT_ALERT_PCT: f32 = 80.0;
+pub const DEFAULT_HANDOFF_PCT: f32 = 85.0;
+pub const DEFAULT_ESCALATE_PCT: f32 = 92.0;
+
+/// Re-arm requires the usage to drop this far below a threshold (compact/restart)
+/// before a handler's latch re-arms — the single source of truth shared by the
+/// per-tick consumers (`context_alert`/`context_handoff`) AND by
+/// `validate_thresholds`' lower bound: a threshold <= this floor makes the
+/// re-arm condition `pct < threshold - HYSTERESIS_PCT` impossible, so such
+/// values are rejected as invalid.
+pub const HYSTERESIS_PCT: f32 = 5.0;
+
 fn default_dev_idle() -> i64 {
     3600
 }
@@ -105,6 +126,15 @@ fn default_fleet_idle() -> i64 {
 }
 fn default_fleet_ack_ttl() -> i64 {
     2700
+}
+fn default_context_alert() -> f32 {
+    DEFAULT_ALERT_PCT
+}
+fn default_context_handoff() -> f32 {
+    DEFAULT_HANDOFF_PCT
+}
+fn default_context_handoff_escalate() -> f32 {
+    DEFAULT_ESCALATE_PCT
 }
 
 impl Default for RuntimeConfig {
@@ -120,6 +150,9 @@ impl Default for RuntimeConfig {
             copy_on_select: true,
             dim_unfocused_panes: true,
             observed_badge: true,
+            context_alert_pct: default_context_alert(),
+            context_handoff_pct: default_context_handoff(),
+            context_handoff_escalate_pct: default_context_handoff_escalate(),
             schema_version: RuntimeConfig::CURRENT,
         }
     }
@@ -132,6 +165,23 @@ static RUNTIME_CONFIG: OnceLock<RwLock<RuntimeConfig>> = OnceLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// #1576: de-dupes the corrupt-config warning across 10s ticks.
 static CORRUPT_WARNED: AtomicBool = AtomicBool::new(false);
+/// #2753: de-dupes the invalid-effective-thresholds warning across per-tick
+/// resolves — warn on the FIRST invalid resolution of an episode, stay silent
+/// while it persists, re-arm as soon as a valid triplet resolves. Mirrors
+/// `CORRUPT_WARNED`.
+static INVALID_THRESHOLDS_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only probe: per-thread count of `resolve_effective_thresholds`
+    /// calls, pinning the per-tick consumers' one-resolve-per-tick contract.
+    static RESOLVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_calls_this_thread() -> usize {
+    RESOLVE_CALLS.with(std::cell::Cell::get)
+}
 
 fn global() -> &'static RwLock<RuntimeConfig> {
     RUNTIME_CONFIG.get_or_init(|| RwLock::new(RuntimeConfig::default()))
@@ -171,8 +221,16 @@ pub fn reload(home: &Path) {
                 ),
             ),
             Ok(config) => {
-                *global().write() = config;
-                CORRUPT_WARNED.store(false, Ordering::Relaxed);
+                if let Err(msg) = validate_thresholds(
+                    config.context_alert_pct,
+                    config.context_handoff_pct,
+                    config.context_handoff_escalate_pct,
+                ) {
+                    fail_closed(is_startup, &format!("invalid context thresholds: {msg}"));
+                } else {
+                    *global().write() = config;
+                    CORRUPT_WARNED.store(false, Ordering::Relaxed);
+                }
             }
             Err(e) => fail_closed(is_startup, &format!("unparseable: {e}")),
         },
@@ -183,6 +241,98 @@ pub fn reload(home: &Path) {
         Err(_) => {
             // Vanished at runtime — keep last-known-good rather than resetting.
             fail_closed(false, "runtime-config.json disappeared");
+        }
+    }
+}
+
+/// Validate the context threshold values triplet semantically.
+pub fn validate_thresholds(alert: f32, handoff: f32, escalate: f32) -> Result<(), String> {
+    if !alert.is_finite() || !handoff.is_finite() || !escalate.is_finite() {
+        return Err("values must be finite".to_string());
+    }
+    // Values <= HYSTERESIS_PCT are invalid: the re-arm condition
+    // `pct < threshold - HYSTERESIS_PCT` would be impossible, wedging the latch.
+    if alert <= HYSTERESIS_PCT || alert > 100.0 {
+        return Err(format!(
+            "alert_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {alert}"
+        ));
+    }
+    if handoff <= HYSTERESIS_PCT || handoff > 100.0 {
+        return Err(format!(
+            "handoff_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {handoff}"
+        ));
+    }
+    if escalate <= HYSTERESIS_PCT || escalate > 100.0 {
+        return Err(format!(
+            "escalate_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {escalate}"
+        ));
+    }
+    if alert >= handoff {
+        return Err(format!(
+            "alert_pct ({alert}) must be less than handoff_pct ({handoff})"
+        ));
+    }
+    if handoff >= escalate {
+        return Err(format!(
+            "handoff_pct ({handoff}) must be less than escalate_pct ({escalate})"
+        ));
+    }
+    Ok(())
+}
+
+/// Latch step for the once-per-invalid-episode warning: records this
+/// resolution's validity and returns whether the invalid warning should be
+/// emitted NOW (true only on the first invalid resolution after a valid one).
+fn note_thresholds_validity(valid: bool) -> bool {
+    if valid {
+        INVALID_THRESHOLDS_WARNED.store(false, Ordering::Relaxed);
+        false
+    } else {
+        !INVALID_THRESHOLDS_WARNED.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// Resolve and validate the effective context threshold triplet.
+/// Checks the environment variables first, falling back to RuntimeConfig, then to defaults.
+pub fn resolve_effective_thresholds() -> (f32, f32, f32) {
+    #[cfg(test)]
+    RESOLVE_CALLS.with(|c| c.set(c.get() + 1));
+    let config = get();
+    let alert = std::env::var("AGEND_CONTEXT_ALERT_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_alert_pct);
+    let handoff = std::env::var("AGEND_CONTEXT_HANDOFF_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_handoff_pct);
+    let escalate = std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_handoff_escalate_pct);
+
+    let valid = validate_thresholds(alert, handoff, escalate).is_ok();
+    if note_thresholds_validity(valid) {
+        tracing::warn!(
+            alert,
+            handoff,
+            escalate,
+            config_alert = config.context_alert_pct,
+            config_handoff = config.context_handoff_pct,
+            config_escalate = config.context_handoff_escalate_pct,
+            "effective context thresholds combination is invalid. falling back to runtime config values."
+        );
+    }
+    if valid {
+        (alert, handoff, escalate)
+    } else {
+        let fallback_alert = config.context_alert_pct;
+        let fallback_handoff = config.context_handoff_pct;
+        let fallback_escalate = config.context_handoff_escalate_pct;
+        if validate_thresholds(fallback_alert, fallback_handoff, fallback_escalate).is_ok() {
+            (fallback_alert, fallback_handoff, fallback_escalate)
+        } else {
+            (DEFAULT_ALERT_PCT, DEFAULT_HANDOFF_PCT, DEFAULT_ESCALATE_PCT)
         }
     }
 }
@@ -300,8 +450,28 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
                 _ => return Err(format!("invalid boolean: {value} (use on/off)")),
             };
         }
+        "context_alert_pct" => {
+            config.context_alert_pct = value
+                .parse()
+                .map_err(|_| format!("invalid float: {value}"))?;
+        }
+        "context_handoff_pct" => {
+            config.context_handoff_pct = value
+                .parse()
+                .map_err(|_| format!("invalid float: {value}"))?;
+        }
+        "context_handoff_escalate_pct" => {
+            config.context_handoff_escalate_pct = value
+                .parse()
+                .map_err(|_| format!("invalid float: {value}"))?;
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
+    validate_thresholds(
+        config.context_alert_pct,
+        config.context_handoff_pct,
+        config.context_handoff_escalate_pct,
+    )?;
     let path = home.join("runtime-config.json");
     // #1990 (reviewer-2 P1): `config` comes from in-memory `get()` (the
     // keep-last-good snapshot), NOT the disk file — so a blind write here would
@@ -345,6 +515,9 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "copy_on_select" => Ok(config.copy_on_select.to_string()),
         "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
         "observed_badge" => Ok(config.observed_badge.to_string()),
+        "context_alert_pct" => Ok(config.context_alert_pct.to_string()),
+        "context_handoff_pct" => Ok(config.context_handoff_pct.to_string()),
+        "context_handoff_escalate_pct" => Ok(config.context_handoff_escalate_pct.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -674,6 +847,178 @@ mod tests {
             disk.contains("999"),
             "the future-version file must be left intact, not downgraded: {disk}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn context_pcts_default_and_toggleable() {
+        let c = RuntimeConfig::default();
+        assert_eq!(c.context_alert_pct, 80.0);
+        assert_eq!(c.context_handoff_pct, 85.0);
+        assert_eq!(c.context_handoff_escalate_pct, 92.0);
+
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-ctxpct");
+        std::fs::create_dir_all(&dir).ok();
+
+        // Test valid setting
+        set(&dir, "context_alert_pct", "60").unwrap();
+        set(&dir, "context_handoff_pct", "65.5").unwrap();
+        set(&dir, "context_handoff_escalate_pct", "70.2").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("context_alert_pct").unwrap(), "60");
+        assert_eq!(get_key("context_handoff_pct").unwrap(), "65.5");
+        assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
+
+        // Test invalid setting (setting a value that breaks order or bounds must return Err)
+        assert!(set(&dir, "context_alert_pct", "80.0").is_err()); // alert 80.0 >= handoff 65.5
+        assert!(set(&dir, "context_handoff_pct", "4.0").is_err()); // handoff <= 5.0 (hysteresis)
+        assert!(set(&dir, "context_handoff_escalate_pct", "NaN").is_err()); // NaN is not finite
+
+        // Test invalid disk configuration reload keeps last known good
+        // Write invalid reload file directly
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 95.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+        // Kept last good (60.0 / 65.5 / 70.2)
+        assert_eq!(get_key("context_alert_pct").unwrap(), "60");
+        assert_eq!(get_key("context_handoff_pct").unwrap(), "65.5");
+        assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins the single-source-of-truth coupling: `validate_thresholds`' lower
+    /// bound IS `HYSTERESIS_PCT` and is exclusive. A threshold exactly at the
+    /// floor is rejected (the re-arm condition `pct < threshold - HYSTERESIS_PCT`
+    /// would be impossible); a value just above it (with valid ordered
+    /// handoff/escalate) is accepted. If someone re-tunes `HYSTERESIS_PCT`, the
+    /// validate bound moves with it — they cannot drift apart.
+    #[test]
+    fn validate_lower_bound_is_hysteresis_pct_single_source() {
+        // Exactly at the floor is out of the exclusive lower bound → Err.
+        assert!(
+            validate_thresholds(HYSTERESIS_PCT, HYSTERESIS_PCT + 10.0, HYSTERESIS_PCT + 20.0)
+                .is_err(),
+            "a threshold == HYSTERESIS_PCT must be rejected (exclusive lower bound)"
+        );
+        // Just above the floor, ordered handoff/escalate → Ok.
+        assert!(
+            validate_thresholds(
+                HYSTERESIS_PCT + 0.1,
+                HYSTERESIS_PCT + 10.0,
+                HYSTERESIS_PCT + 20.0
+            )
+            .is_ok(),
+            "a threshold just above HYSTERESIS_PCT (ordered) must be accepted"
+        );
+    }
+
+    /// Reviewer follow-up: `set()`'s NaN rejection is tested, but the ENV path
+    /// wasn't. `"NaN".parse::<f32>()` returns `Ok(NaN)`, so a NaN env override
+    /// must NOT silently poison the effective threshold (which would disable the
+    /// watchdog) — `resolve_effective_thresholds` must fall back to the config
+    /// value because `validate_thresholds` rejects the non-finite triplet.
+    #[test]
+    #[serial(runtime_config)]
+    fn nan_env_override_falls_back_not_poisons() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-nanenv");
+        std::fs::create_dir_all(&dir).ok();
+
+        // Known-good config so the fallback value is deterministic.
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "NaN");
+
+        let (alert, _, _) = resolve_effective_thresholds();
+        assert!(
+            alert.is_finite(),
+            "a NaN env override must not poison the effective alert threshold"
+        );
+        assert_eq!(
+            alert, 60.0,
+            "NaN env value is rejected → falls back to the config value"
+        );
+
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        reload(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2753 final review: the invalid-effective-thresholds warning must fire
+    /// once per invalid EPISODE, not once per resolve —
+    /// `resolve_effective_thresholds` runs every tick from the per-tick
+    /// consumers, so an un-latched warn floods the log for as long as the
+    /// invalid override persists. A valid resolution ends the episode and
+    /// re-arms the latch.
+    #[test]
+    #[serial(runtime_config)]
+    fn invalid_thresholds_warning_latches_once_per_episode() {
+        // Normalize: a valid resolution re-arms the latch.
+        assert!(!note_thresholds_validity(true));
+        // First invalid resolution of an episode warns...
+        assert!(note_thresholds_validity(false));
+        // ...further invalid resolutions in the same episode stay silent.
+        assert!(!note_thresholds_validity(false));
+        assert!(!note_thresholds_validity(false));
+        // A valid triplet ends the episode without warning...
+        assert!(!note_thresholds_validity(true));
+        // ...and the next invalid episode warns exactly once again.
+        assert!(note_thresholds_validity(false));
+        assert!(!note_thresholds_validity(false));
+    }
+
+    /// Wiring counterpart of the latch-semantics test:
+    /// `resolve_effective_thresholds` itself must drive the latch — an invalid
+    /// env override latches it, a valid resolution re-arms it.
+    #[test]
+    #[serial(runtime_config)]
+    fn resolve_effective_thresholds_drives_warn_latch() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-warnlatch");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Valid resolution → latch re-armed.
+        resolve_effective_thresholds();
+        assert!(!INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        // Invalid override (alert >= handoff) → latch set after first resolve.
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "95.0");
+        resolve_effective_thresholds();
+        assert!(INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        // Back to valid → latch re-armed for the next episode.
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        resolve_effective_thresholds();
+        assert!(!INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        }
+        std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        reload(&dir);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
