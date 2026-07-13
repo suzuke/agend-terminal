@@ -476,7 +476,8 @@ pub(super) fn emit_cancelled_batch(
                 reason: format!("sweep:{category}: {audit_reason}"),
             })
             .collect();
-        let ids_on_board: Vec<TaskId> = survivors.iter().map(|(id, _)| TaskId(id.clone())).collect();
+        let ids_on_board: Vec<TaskId> =
+            survivors.iter().map(|(id, _)| TaskId(id.clone())).collect();
         // CR-2026-06-14 (row232): re-validate UNDER the append lock against FRESH
         // committed state. The dry-run that produced `confirm_ids` is out-of-lock,
         // so a task can race to a terminal state (Done/Cancelled) before apply. A

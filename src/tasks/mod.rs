@@ -607,9 +607,7 @@ impl RoutedTask {
     /// never act on an unprovable/changed route).
     pub(in crate::tasks) fn route_unchanged(&self, home: &Path) -> bool {
         match board_router::route_task(home, &self.task.id) {
-            Ok((project, _, record)) => {
-                RouteFingerprint::of(&project, &record) == self.fingerprint
-            }
+            Ok((project, _, record)) => RouteFingerprint::of(&project, &record) == self.fingerprint,
             Err(_) => false,
         }
     }
