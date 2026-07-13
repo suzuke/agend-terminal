@@ -31,6 +31,14 @@
 //! APPEND-ONLY: it mints a NEW nonce, enqueues a fresh row, and SUPERSEDES the
 //! stale row by the OLD nonce — it NEVER resets `read_at` in place (I12).
 
+// t-…-17 C8 lands the store + its unit tests as one slice; the dispatch/tick/ack
+// call sites that CONSUME this surface are separate later slices (plan C9–C13).
+// Until those land, the whole module is reachable only from its own `#[cfg(test)]`
+// tests, so the non-test bin build sees every item as dead. This module-level
+// allow keeps the standalone slice green under CI's `-D warnings`; DROP it once
+// the wiring slices reference the store.
+#![allow(dead_code)]
+
 use crate::daemon::pr_state::ReviewClass;
 use crate::mcp::handlers::comms_gates::ReviewAuthor;
 use std::path::{Path, PathBuf};
@@ -381,12 +389,7 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 }
 
 /// The record for one `(repo,branch,target)`, if any.
-pub(crate) fn get(
-    home: &Path,
-    repo: &str,
-    branch: &str,
-    target: &str,
-) -> Option<ActiveAssignment> {
+pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option<ActiveAssignment> {
     read_record(&record_file(home, repo, branch, target))
 }
 
@@ -422,7 +425,27 @@ pub(crate) fn durable_enqueue(
     target: &str,
     now: &str,
 ) -> anyhow::Result<()> {
-    todo!("C8-A2 durable_enqueue")
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    let Some(record) = read_record(&path) else {
+        return Ok(()); // nothing to enqueue (revoked/tombstoned)
+    };
+    if record.row == RowState::Persisted {
+        return Ok(()); // idempotent
+    }
+    // Dedup by the CURRENT nonce: an actionable row already carrying it means the
+    // enqueue landed but the mark crashed — do NOT append a duplicate (I10).
+    if !crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce) {
+        crate::inbox::storage::enqueue(home, target, build_delivery_message(&record, now))?;
+    }
+    // CAS row → Persisted on assignment_id (re-read under the same lock).
+    if let Some(mut cur) = read_record(&path) {
+        if cur.assignment_id == record.assignment_id {
+            cur.row = RowState::Persisted;
+            atomic_write_json(&path, &cur)?;
+        }
+    }
+    Ok(())
 }
 
 /// A4 — APPEND-ONLY row repair, gated on `now >= next_nudge_at` (FIXED-interval
@@ -437,7 +460,40 @@ pub(crate) fn repair_row(
     target: &str,
     now: &str,
 ) -> anyhow::Result<bool> {
-    todo!("C8-A4 repair_row")
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    let Some(record) = read_record(&path) else {
+        return Ok(false);
+    };
+    // FIXED-interval lease: repair only when the lease is due (bounded).
+    if !now_ge(now, &record.next_nudge_at) {
+        return Ok(false);
+    }
+    let old_nonce = record.delivery_nonce.clone();
+    let new_nonce = uuid::Uuid::new_v4().to_string();
+
+    // 1) Enqueue a FRESH actionable row carrying the new nonce (append-only). The
+    //    successor id is pre-stamped so it can name the supersede relationship.
+    let mut fresh = record.clone();
+    fresh.delivery_nonce = new_nonce.clone();
+    let mut msg = build_delivery_message(&fresh, now);
+    let successor = format!("m-asgn-{new_nonce}");
+    msg.id = Some(successor.clone());
+    crate::inbox::storage::enqueue(home, target, msg)?;
+
+    // 2) SUPERSEDE the stale row by the OLD nonce (never resets read_at).
+    crate::inbox::storage::supersede_by_nonce(home, target, &old_nonce, &successor);
+
+    // 3) Advance nonce + lease under the assignment_id CAS.
+    if let Some(mut cur) = read_record(&path) {
+        if cur.assignment_id == record.assignment_id {
+            cur.delivery_nonce = new_nonce;
+            cur.next_nudge_at = add_interval(now);
+            cur.row = RowState::Persisted;
+            atomic_write_json(&path, &cur)?;
+        }
+    }
+    Ok(true)
 }
 
 /// A8 — revoke. CAS-remove the record by `assignment_id`, supersede the current
@@ -451,7 +507,35 @@ pub(crate) fn revoke(
     target: &str,
     now: &str,
 ) -> anyhow::Result<bool> {
-    todo!("C8-A8 revoke")
+    let _lock = lock_branch(home, repo, branch)?;
+    revoke_under_lock(home, repo, branch, target, now)
+}
+
+/// The revoke body WITHOUT acquiring the branch lock — the caller MUST already
+/// hold it. Shared by [`revoke`] (which locks) and [`transfer`] (which revokes
+/// the old target and persists the new one under ONE lock so a same-process
+/// re-lock cannot deadlock on `flock`).
+fn revoke_under_lock(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let path = record_file(home, repo, branch, target);
+    let Some(record) = read_record(&path) else {
+        return Ok(false);
+    };
+    let removed = remove_if_assignment_matches(&path, record.assignment_id);
+    let successor = format!("revoked-{}", record.assignment_id);
+    let outcome =
+        crate::inbox::storage::supersede_by_nonce(home, target, &record.delivery_nonce, &successor);
+    // A row the reviewer had already READ is not retracted by the supersede alone
+    // (it is already non-actionable) — surface an explicit revocation notice (I21).
+    if outcome.was_read {
+        crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
+    }
+    Ok(removed)
 }
 
 /// A9 — transfer old→new atomically under ONE branch lock: {revoke old} + {persist
@@ -465,7 +549,30 @@ pub(crate) fn transfer(
     new_target: &str,
     now: &str,
 ) -> anyhow::Result<()> {
-    todo!("C8-A9 transfer")
+    let _lock = lock_branch(home, repo, branch)?;
+    let old = read_record(&record_file(home, repo, branch, old_target)).ok_or_else(|| {
+        anyhow::anyhow!("assignment_authority::transfer: no active assignment for old target")
+    })?;
+    // {revoke old} under the held lock.
+    revoke_under_lock(home, repo, branch, old_target, now)?;
+    // {persist new} — fresh assignment_id + nonce, SAME pr_number, authority
+    // carried over. Written directly (persist would re-lock the same branch).
+    let new_record = ActiveAssignment::new_pending(
+        repo,
+        branch,
+        new_target,
+        old.pr_number,
+        old.sender,
+        old.task_id,
+        old.review_class,
+        old.review_author,
+        old.text,
+        old.thread_id,
+        old.parent_id,
+        now,
+    );
+    atomic_write_json(&record_file(home, repo, branch, new_target), &new_record)?;
+    Ok(())
 }
 
 /// A7 (store half) — record a terminal PR generation: add `pr_number` to the
@@ -480,7 +587,27 @@ pub(crate) fn record_terminal(
     pr_number: u64,
     kind: TerminalKind,
 ) -> anyhow::Result<usize> {
-    todo!("C8-A7 record_terminal")
+    let _lock = lock_branch(home, repo, branch)?;
+    // 1) Add the marker to the RETAINED set (idempotent; NO compaction — I19).
+    let mpath = markers_file(home, repo, branch);
+    let mut markers = read_markers(&mpath);
+    if !markers.contains(pr_number) {
+        markers.schema_version = SCHEMA_VERSION;
+        markers.markers.push(TerminalMarker { pr_number, kind });
+        atomic_write_json(&mpath, &markers)?;
+    }
+    // 2) CAS-tombstone ONLY records whose stored pr_number matches — NEVER a
+    //    different generation (B18/B19/I18).
+    let mut tombstoned = 0;
+    for record in list_active(home, repo, branch) {
+        if record.pr_number == pr_number {
+            let path = record_file(home, repo, branch, &record.target);
+            if remove_if_assignment_matches(&path, record.assignment_id) {
+                tombstoned += 1;
+            }
+        }
+    }
+    Ok(tombstoned)
 }
 
 #[cfg(test)]
@@ -492,17 +619,19 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static C: AtomicU32 = AtomicU32::new(0);
         let id = C.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!(
-            "agend-asgn-{}-{}-{}",
-            std::process::id(),
-            tag,
-            id
-        ));
+        let p =
+            std::env::temp_dir().join(format!("agend-asgn-{}-{}-{}", std::process::id(), tag, id));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
 
-    fn mk_record(repo: &str, branch: &str, target: &str, pr: u64, created_at: &str) -> ActiveAssignment {
+    fn mk_record(
+        repo: &str,
+        branch: &str,
+        target: &str,
+        pr: u64,
+        created_at: &str,
+    ) -> ActiveAssignment {
         ActiveAssignment::new_pending(
             repo,
             branch,
@@ -623,7 +752,11 @@ mod tests {
         let rec = mk_record("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
         persist(&home, &rec).unwrap();
         assert!(
-            !crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &rec.delivery_nonce),
+            !crate::inbox::storage::nonce_present_actionable(
+                &home,
+                "reviewer",
+                &rec.delivery_nonce
+            ),
             "no row before enqueue (crash window)"
         );
 
@@ -655,7 +788,10 @@ mod tests {
             build_delivery_message(&rec, "2026-07-13T00:00:01Z"),
         )
         .unwrap();
-        assert_eq!(rows_with_nonce(&home, "reviewer", &rec.delivery_nonce).len(), 1);
+        assert_eq!(
+            rows_with_nonce(&home, "reviewer", &rec.delivery_nonce).len(),
+            1
+        );
 
         durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:05Z").unwrap();
         assert_eq!(
@@ -679,13 +815,17 @@ mod tests {
         let home = tmp_home("t26");
         let r1 = mk_record("o/r", "feat/x", "reviewer", 5, "2026-07-13T00:00:00Z");
         persist(&home, &r1).unwrap();
-        let x = get(&home, "o/r", "feat/x", "reviewer").unwrap().assignment_id;
+        let x = get(&home, "o/r", "feat/x", "reviewer")
+            .unwrap()
+            .assignment_id;
 
         // Revoke (removes id X), then recreate the SAME key with a fresh id Y.
         revoke(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:10Z").unwrap();
         let r2 = mk_record("o/r", "feat/x", "reviewer", 5, "2026-07-13T00:01:00Z");
         persist(&home, &r2).unwrap();
-        let y = get(&home, "o/r", "feat/x", "reviewer").unwrap().assignment_id;
+        let y = get(&home, "o/r", "feat/x", "reviewer")
+            .unwrap()
+            .assignment_id;
         assert_ne!(x, y, "recreated record has a fresh assignment_id");
 
         // A STALE op carrying X must be rejected (does not touch Y).
@@ -695,7 +835,9 @@ mod tests {
             "stale assignment_id X must NOT mutate the recreated record"
         );
         assert_eq!(
-            get(&home, "o/r", "feat/x", "reviewer").unwrap().assignment_id,
+            get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .assignment_id,
             y,
             "record with id Y survives the stale X op"
         );
@@ -726,7 +868,11 @@ mod tests {
             "record removed"
         );
         assert!(
-            !crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &rec.delivery_nonce),
+            !crate::inbox::storage::nonce_present_actionable(
+                &home,
+                "reviewer",
+                &rec.delivery_nonce
+            ),
             "row superseded ⇒ not actionable"
         );
         assert_eq!(
@@ -744,7 +890,12 @@ mod tests {
         let rec = mk_record("o/r", "feat/x", "reviewer", 11, "2026-07-13T00:00:00Z");
         persist(&home, &rec).unwrap();
         durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:05Z").unwrap();
-        mark_row_read(&home, "reviewer", &rec.delivery_nonce, "2026-07-13T00:00:07Z");
+        mark_row_read(
+            &home,
+            "reviewer",
+            &rec.delivery_nonce,
+            "2026-07-13T00:00:07Z",
+        );
         assert!(revoke(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:10Z").unwrap());
         assert_eq!(
             inbox_rows(&home, "reviewer")
@@ -770,10 +921,21 @@ mod tests {
         durable_enqueue(&home, "o/r", "feat/x", "rev-a", "2026-07-13T00:00:05Z").unwrap();
         durable_enqueue(&home, "o/r", "feat/x", "rev-c", "2026-07-13T00:00:05Z").unwrap();
 
-        transfer(&home, "o/r", "feat/x", "rev-a", "rev-b", "2026-07-13T00:00:10Z").unwrap();
+        transfer(
+            &home,
+            "o/r",
+            "feat/x",
+            "rev-a",
+            "rev-b",
+            "2026-07-13T00:00:10Z",
+        )
+        .unwrap();
 
         // Old gone + its row superseded.
-        assert!(get(&home, "o/r", "feat/x", "rev-a").is_none(), "old removed");
+        assert!(
+            get(&home, "o/r", "feat/x", "rev-a").is_none(),
+            "old removed"
+        );
         assert!(
             !crate::inbox::storage::nonce_present_actionable(&home, "rev-a", &a.delivery_nonce),
             "old row superseded"
@@ -899,7 +1061,9 @@ mod tests {
             "≤ 1 repair per FIXED_INTERVAL"
         );
         assert_eq!(
-            get(&home, "o/r", "feat/x", "reviewer").unwrap().delivery_nonce,
+            get(&home, "o/r", "feat/x", "reviewer")
+                .unwrap()
+                .delivery_nonce,
             n2,
             "no rotation on the throttled second repair"
         );
