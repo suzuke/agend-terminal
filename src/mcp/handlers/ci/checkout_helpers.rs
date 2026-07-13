@@ -55,6 +55,11 @@ pub(super) fn rollback_response(
 /// success) with an empty/torn marker. Open + `sync_all()` and OBSERVE the result; a
 /// failure aborts the transaction fail-closed. A `cfg(test)` thread-local seam forces
 /// the sync error so the crash/durability rollback path is testable cross-platform.
+///
+/// The handle is opened for WRITE (not read-only): on Windows `sync_all` maps to
+/// `FlushFileBuffers`, which requires `GENERIC_WRITE` and returns ACCESS_DENIED on a
+/// read-only handle (`File::open`). `write(true)` (no truncate) preserves the bytes and
+/// yields a flushable handle on every platform.
 pub(super) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
@@ -62,7 +67,10 @@ pub(super) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
             "test seam: forced marker sync_all failure",
         ));
     }
-    std::fs::File::open(path)?.sync_all()
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 #[cfg(test)]

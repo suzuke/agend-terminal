@@ -600,6 +600,102 @@ fn txn_recover_stale_unreadable_fails_closed() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #2755 R5 (codex REJECT of 7ac7e281 — destructive-recovery gap): a binding written by a
+/// FUTURE schema is PRESENT (`parse_binding_guarded` → None). Recovery must treat it as
+/// possibly-ours and fail closed, NEVER skip it to `Unbound` and destroy a newer daemon's
+/// live worktree ("future ≠ absent").
+#[test]
+fn txn_recover_stale_future_schema_binding_not_removed() {
+    let home = tmp_home("rec-future-binding");
+    let wt = home.join("worktrees").join("agent-b-src");
+    save_journal_at(&home, "m", &wt, Phase::SubmodulesReady, true);
+    let bdir = home.join("runtime").join("agent-b");
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        serde_json::json!({
+            "version": 99_999, // beyond this daemon's schema ⇒ parse_binding_guarded None
+            "agent": "agent-b",
+            "worktree": wt.display().to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
+        removed.set(true);
+        true
+    });
+    assert!(
+        r.is_err(),
+        "future-schema binding ⇒ Uncertain ⇒ fail closed: {r:?}"
+    );
+    assert!(
+        !removed.get(),
+        "a possibly-bound (future-schema) worktree must NOT be removed"
+    );
+    assert!(wt.exists(), "worktree retained");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R5: a CORRUPT (non-JSON) binding.json is present — a torn write during the very
+/// crash-after-bind window item 1 targets. Same fail-closed contract: never remove.
+#[test]
+fn txn_recover_stale_corrupt_binding_not_removed() {
+    let home = tmp_home("rec-corrupt-binding");
+    let wt = home.join("worktrees").join("agent-c-src");
+    save_journal_at(&home, "m", &wt, Phase::SubmodulesReady, true);
+    let bdir = home.join("runtime").join("agent-c");
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(bdir.join("binding.json"), "}{ not valid json").unwrap();
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
+        removed.set(true);
+        true
+    });
+    assert!(
+        r.is_err(),
+        "corrupt binding ⇒ Uncertain ⇒ fail closed: {r:?}"
+    );
+    assert!(
+        !removed.get(),
+        "a possibly-bound (corrupt-binding) worktree must NOT be removed"
+    );
+    assert!(wt.exists(), "worktree retained");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2755 R5: a binding that PARSES but has no usable `worktree` field (future/invalid
+/// shape) is uncertain, not absent — must not authorize removal.
+#[test]
+fn txn_recover_stale_binding_without_worktree_field_not_removed() {
+    let home = tmp_home("rec-noworktree-binding");
+    let wt = home.join("worktrees").join("agent-d-src");
+    save_journal_at(&home, "m", &wt, Phase::SubmodulesReady, true);
+    let bdir = home.join("runtime").join("agent-d");
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::write(
+        bdir.join("binding.json"),
+        serde_json::json!({ "version": 1, "agent": "agent-d" }).to_string(), // no `worktree`
+    )
+    .unwrap();
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", &wt, "/src", fixed_now(), || {
+        removed.set(true);
+        true
+    });
+    assert!(
+        r.is_err(),
+        "no-worktree-field binding ⇒ Uncertain ⇒ fail closed: {r:?}"
+    );
+    assert!(
+        !removed.get(),
+        "worktree must NOT be removed on an unusable binding shape"
+    );
+    assert!(wt.exists(), "worktree retained");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2755 R4 (item 3c): a corrupt record whose worktree can't be removed AND whose
 /// replacement SAVE also fails must leave journal.json still CORRUPT — a durable BLOCKING
 /// record — so the next recovery attempt sees Corrupt, NEVER Absent (never fail-open).

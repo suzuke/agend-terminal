@@ -12,21 +12,31 @@ use std::path::Path;
 /// recovery MUST never delete a still-BOUND worktree (a crash after `bind_full` but
 /// before the Committed journal leaves the binding written yet the journal
 /// non-Committed) — the provision effectively succeeded and must be ADOPTED, not torn
-/// down. `Uncertain` (a binding dir/file exists but is unreadable) fails closed.
+/// down. A binding that is PRESENT but cannot be confidently understood is `Uncertain`
+/// and also fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorktreeBindingState {
     /// A binding maps this exact worktree path — adopt/keep it.
     Bound,
-    /// No binding targets it — safe to reconcile/remove.
+    /// No binding is present for this path — safe to reconcile/remove.
     Unbound,
-    /// A runtime dir/binding could not be read — authority uncertain, fail closed.
+    /// A binding is PRESENT but cannot be confidently understood — a read error, corrupt
+    /// JSON, a FUTURE schema this daemon can't parse, or a record with no usable `worktree`
+    /// field — so it MIGHT target this path. Authority uncertain: fail closed (never remove).
     Uncertain,
 }
 
 /// Scan `runtime/*/binding.json` for a binding whose `worktree` equals `worktree_path`.
-/// A NotFound runtime area or per-agent binding is `Unbound`; any other read error is
-/// `Uncertain` (fail-closed). A corrupt/newer-schema binding that does not match is
-/// simply not this worktree's binding.
+///
+/// A definitive match is [`Bound`](WorktreeBindingState::Bound). A genuinely ABSENT
+/// binding (no `binding.json`, or a NotFound runtime area) does not block removal. But a
+/// binding that is PRESENT yet cannot be confidently understood — a read error, corrupt
+/// JSON, a schema NEWER than this daemon supports (`parse_binding_guarded` → `None`), or a
+/// record missing a usable `worktree` field — is [`Uncertain`](WorktreeBindingState::Uncertain):
+/// a DESTRUCTIVE retention site must never reclaim a worktree a newer daemon may legitimately
+/// own just because this daemon can't parse the binding ("future ≠ absent"; see
+/// [`super::parse_binding_guarded`] / [`super::present_including_future`]). Only a clean scan —
+/// no present-but-unreadable binding AND no match — is [`Unbound`](WorktreeBindingState::Unbound).
 pub(crate) fn worktree_binding_state(home: &Path, worktree_path: &Path) -> WorktreeBindingState {
     let rt = crate::paths::runtime_dir(home);
     let entries = match std::fs::read_dir(&rt) {
@@ -35,28 +45,33 @@ pub(crate) fn worktree_binding_state(home: &Path, worktree_path: &Path) -> Workt
         Err(_) => return WorktreeBindingState::Uncertain,
     };
     let target = worktree_path.to_string_lossy();
+    // A present-but-unreadable binding could be THIS worktree's owner; remember we saw one
+    // and fail closed (Uncertain) at the end unless a definitive Bound match turns up first.
+    let mut uncertain = false;
     for entry in entries {
         let Ok(entry) = entry else {
             return WorktreeBindingState::Uncertain;
         };
         let bp = entry.path().join("binding.json");
         match std::fs::read_to_string(&bp) {
-            Ok(c) => {
-                if parse_binding_guarded(&c)
-                    .and_then(|v| {
-                        v.get("worktree")
-                            .and_then(|w| w.as_str())
-                            .map(str::to_string)
-                    })
-                    .as_deref()
-                    == Some(target.as_ref())
-                {
-                    return WorktreeBindingState::Bound;
-                }
-            }
+            // Corrupt JSON or a newer-than-supported schema ⇒ `None` ⇒ cannot rule out
+            // that it targets us. A well-formed binding for a DIFFERENT worktree IS ruled
+            // out (skip); one with no usable `worktree` field is uncertain.
+            Ok(c) => match parse_binding_guarded(&c) {
+                None => uncertain = true,
+                Some(v) => match v.get("worktree").and_then(|w| w.as_str()) {
+                    Some(w) if w == target.as_ref() => return WorktreeBindingState::Bound,
+                    Some(_) => {}
+                    None => uncertain = true,
+                },
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return WorktreeBindingState::Uncertain,
         }
     }
-    WorktreeBindingState::Unbound
+    if uncertain {
+        WorktreeBindingState::Uncertain
+    } else {
+        WorktreeBindingState::Unbound
+    }
 }
