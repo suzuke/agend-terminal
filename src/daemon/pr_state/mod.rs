@@ -753,6 +753,67 @@ pub(crate) fn is_pr_state_file(path: &Path) -> bool {
     !is_dotfile && path.extension().and_then(|e| e.to_str()) == Some("json")
 }
 
+/// t-…-17 B4 (codex m-…-416): enumerate every LIVE `PrState`'s `{repo, branch}`
+/// identity, read from the DESERIALIZED file CONTENT — NEVER from the lossy/hashed
+/// filename. The per-tick reconciler UNIONs this with
+/// [`crate::daemon::assignment_authority::active_branches`], which discovers a branch
+/// only via its FIRST PARSEABLE authority record: a branch whose authority records are
+/// ALL corrupt is invisible to `active_branches`, so it would VANISH from the workset
+/// and `redrive_reserved` would never run — leaving `authority_unknown` stale-false and
+/// the merge gate OPEN. Rediscovering it here via its readable PrState routes it back
+/// through `redrive_reserved` (→ probe `Unreadable` → SET the fail-closed flag).
+///
+/// Mirrors the scanner's file filtering ([`scanner::scan_and_emit_with`]): only
+/// `*.json`, and the `.emitted-terminal.json` ledger / `.lock` sidecars are skipped
+/// via [`is_pr_state_file`]. A malformed/unreadable PrState is SURFACED
+/// (`tracing::warn!` with the path) — observable, NEVER silently dropped. It is
+/// inherently fail-closed: an unreadable PrState cannot be deserialized, so it can
+/// never be declared merge-ready and cannot contribute an identity here either. Lock-free.
+pub(crate) fn list_state_identities(home: &Path) -> Vec<(String, String)> {
+    let dir = pr_state_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "t-…-17 B4: list_state_identities read_dir failed — reconciler PrState-identity source empty this tick"
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_pr_state_file(&path) {
+            continue; // #2059: skip .emitted-terminal.json ledger + .lock sidecars
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "t-…-17 B4: list_state_identities read failed — malformed/unreadable PrState SURFACED, not discovered this tick (fail-closed: an unreadable PrState is never merge-ready)"
+                );
+                continue;
+            }
+        };
+        match serde_json::from_str::<PrState>(&content) {
+            Ok(state) => out.push((state.repo, state.branch)),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "t-…-17 B4: list_state_identities parse failed — malformed PrState SURFACED, not discovered this tick (fail-closed: an unreadable PrState is never merge-ready)"
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Canonical filename for a (repo, branch) PR state file. Keyed by
 /// branch (not pr_number) because ci_watch — the primary writer —
 /// knows the branch but not the PR number; `pr_number` is filled in

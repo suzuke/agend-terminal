@@ -77,8 +77,26 @@ pub(crate) fn reconcile_all(home: &Path, now: &str) {
 /// targets to WAKE (A3), so the caller emits the self-IPC pointers lock-free. Takes
 /// `now` injected — no unmockable clock inside.
 pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
+    // Workset = dedup UNION of two `(repo,branch)` identity sources (codex m-…-416):
+    //   (a) `store::active_branches` — branches discovered via a PARSEABLE authority
+    //       record. It reads the FIRST parseable record to name a branch, so a branch
+    //       whose records are ALL corrupt is INVISIBLE here → it would VANISH from the
+    //       workset, `redrive_reserved` would never run, `authority_unknown` would stay
+    //       stale-false, and the merge gate would stay OPEN on a sole-corrupt record.
+    //   (b) `pr_state::list_state_identities` — every LIVE PrState's {repo,branch} read
+    //       from file CONTENT (never the lossy filename). This rediscovers an
+    //       all-records-corrupt branch via its readable PrState ⇒ `reconcile_branch` →
+    //       `redrive_reserved` → probe `Unreadable` ⇒ SET `authority_unknown` (fail
+    //       closed). A readable PrState with NO assignments is harmless (probe `Absent`
+    //       ⇒ empty derive ⇒ CLEAR — a no-op that keeps the flag false).
+    // Dedup via a BTreeSet so a branch in BOTH sources is reconciled exactly once
+    // (deterministic order).
+    let mut workset = std::collections::BTreeSet::new();
+    workset.extend(store::active_branches(home));
+    workset.extend(crate::daemon::pr_state::list_state_identities(home));
+
     let mut wakes = Vec::new();
-    for (repo, branch) in store::active_branches(home) {
+    for (repo, branch) in workset {
         wakes.extend(reconcile_branch(home, &repo, &branch, now));
     }
     wakes
