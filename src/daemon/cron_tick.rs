@@ -377,30 +377,31 @@ enum TaskGate {
 /// #1521: read a linked task's current status. Current-status gate (not
 /// ever-done), so a reopened task resumes reminders.
 ///
-/// #1608b/#1614: read the EVENT-SOURCED board via `task_events::replay`, NOT a
-/// `tasks/{id}.json` file — that per-task file is never written (the board lives
-/// in `task_events.jsonl`), so the old probe always returned `NotFound` →
-/// `Missing` → `set_enabled(false)`, permanently self-disabling every
-/// `UntilSuccess` schedule on its first fire. (#1608 fixed only the create/update
-/// validator; this is the matching runtime fix.)
+/// #1608b/#1614: read the EVENT-SOURCED board, NOT a `tasks/{id}.json` file — that
+/// per-task file is never written, so the old probe always self-disabled every
+/// `UntilSuccess` schedule on its first fire.
 ///
-/// A replay ERROR is `ReadError` → fail-open (fire) so a transient log hiccup
-/// never silently drops — OR destructively disables — the reminder. A task
-/// genuinely ABSENT from the (append-only) log is `Missing` (a removed/reset
-/// link); since the task was validated at create-time, this is rare.
+/// #2760 Slice A: resolve the linked task via the STRICT router (project-board
+/// aware; the old default-only `replay(home)` was invisible to a task on a project
+/// board → false `Missing` → destructive disable). Typed policy:
+/// - `Found` + `Done` → `Done` (stamp success + suppress today);
+/// - `Found` + non-terminal → `Pending` (fire);
+/// - proven `NotFound` → `Missing` (a genuinely-absent link → disable + audit,
+///   NOT a silent degrade to Always);
+/// - `Unreadable`/`Ambiguous` → `ReadError` → fail-open (fire, schedule STAYS
+///   enabled) so a transient/unprovable route never destructively disables.
 fn linked_task_gate(home: &Path, task_id: Option<&str>) -> TaskGate {
     let Some(id) = task_id.filter(|s| !s.is_empty()) else {
         // UntilSuccess is validated to have a task at create/update, so a
         // None here means the link was lost — treat as Missing (disable).
         return TaskGate::Missing;
     };
-    match crate::task_events::replay(home) {
+    match crate::tasks::load_routed(home, id) {
+        Ok(rt) if rt.task.status == crate::task_events::TaskStatus::Done => TaskGate::Done,
+        Ok(_) => TaskGate::Pending,
+        Err(crate::tasks::TaskRouteError::NotFound) => TaskGate::Missing,
+        // Unreadable / Ambiguous → cannot prove the task closed OR absent → fail-open.
         Err(_) => TaskGate::ReadError,
-        Ok(state) => match state.tasks.get(&crate::task_events::TaskId(id.to_string())) {
-            None => TaskGate::Missing,
-            Some(rec) if rec.status == crate::task_events::TaskStatus::Done => TaskGate::Done,
-            Some(_) => TaskGate::Pending,
-        },
     }
 }
 

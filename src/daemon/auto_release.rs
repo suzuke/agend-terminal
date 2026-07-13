@@ -640,10 +640,24 @@ enum IntentOutcome {
 
 fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
     let event = intent.event_kind.as_deref().unwrap_or("verdict");
-    let tasks = crate::tasks::list_all(home);
-    let task = tasks.iter().find(|t| t.id == intent.task_id).cloned();
-    let Some(assignee) = task.as_ref().and_then(|t| t.assignee.clone()) else {
-        tracing::info!(task_id = %intent.task_id, event, "auto_release: task missing / no assignee — dropping intent");
+    // #2760 Slice A: resolve the intent's task via the STRICT router (the old
+    // `list_all(home)` saw ONLY the default board). Typed policy — `Found` → continue
+    // the assignee + lease CAS; `Found`/no-assignee OR proven `NotFound` → drop the
+    // intent (`Done`); `Unreadable`/`Ambiguous` → RETAIN for retry (never release OR
+    // drop on an unprovable route).
+    let task = match crate::tasks::load_routed(home, &intent.task_id) {
+        Ok(rt) => rt.task,
+        Err(crate::tasks::TaskRouteError::NotFound) => {
+            tracing::info!(task_id = %intent.task_id, event, "auto_release: task not found on any board — dropping intent");
+            return IntentOutcome::Done;
+        }
+        Err(route_err) => {
+            tracing::info!(task_id = %intent.task_id, event, %route_err, "auto_release: task route unresolved — retaining for retry");
+            return IntentOutcome::Retry;
+        }
+    };
+    let Some(assignee) = task.assignee.clone() else {
+        tracing::info!(task_id = %intent.task_id, event, "auto_release: task has no assignee — dropping intent");
         return IntentOutcome::Done;
     };
     let Some(binding) = crate::binding::read(home, &assignee) else {
@@ -741,7 +755,7 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
             .ok()
             .and_then(|f| f.resolve_instance(&assignee))
             .and_then(|r| r.role);
-        if reviewer_binding_release_bypass(intent, task.as_ref(), &assignee, sender_role.as_deref())
+        if reviewer_binding_release_bypass(intent, Some(&task), &assignee, sender_role.as_deref())
         {
             tracing::info!(agent = %assignee, repo = %repo, branch = %branch, event, ?confidence, role = ?sender_role, "auto_release: reviewer-binding bypass — reviewer verdict + review task terminal, releasing if clean (#2010 2a)");
             true
@@ -758,7 +772,7 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         .get("worktree")
         .and_then(|v| v.as_str())
         .map(|w| !is_worktree_clean(Path::new(w)));
-    let decision = decide_release(task.as_ref(), Some(&binding), worktree_dirty);
+    let decision = decide_release(Some(&task), Some(&binding), worktree_dirty);
     // #P1b (t-…24962-1): on a RELEASABLE branch (PR-terminal, or no-PR + all tasks
     // done), a dirty worktree is stale build/handoff artifacts — a gitignored
     // SESSION-HANDOFF, a build-dirtied submodule — that never self-clears. The old
