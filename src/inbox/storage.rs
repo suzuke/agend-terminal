@@ -610,10 +610,6 @@ pub fn mark_ci_watch_superseded(
 /// holds the per-branch assignment lock, and the nonce is unique per record
 /// generation, so no concurrent writer produces the SAME nonce; a torn/partial
 /// trailing line just fails to parse and is skipped (never a false positive).
-// t-…-17 C8: consumed by `crate::daemon::assignment_authority`'s outbox ops; the
-// dispatch/tick call sites land in later slices, so `-D warnings` sees it as dead
-// until then. DROP this allow when those slices wire the store.
-#[allow(dead_code)]
 pub fn nonce_present_actionable(home: &Path, target: &str, nonce: &str) -> bool {
     let path = inbox_path_resolved(home, target);
     let Ok(content) = std::fs::read_to_string(&path) else {
@@ -636,8 +632,6 @@ pub fn nonce_present_actionable(home: &Path, target: &str, nonce: &str) -> bool 
 }
 
 /// Outcome of [`supersede_by_nonce`].
-// t-…-17 C8: see `nonce_present_actionable` — dead until the store-wiring slices.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NonceSupersedeOutcome {
     /// A row carrying the nonce was found (any state).
@@ -661,8 +655,6 @@ pub struct NonceSupersedeOutcome {
 /// it is already non-actionable), but the returned [`NonceSupersedeOutcome`]
 /// reports `was_read` so revoke can surface a revocation notice for a row the
 /// reviewer had already seen (invariant I21).
-// t-…-17 C8: see `nonce_present_actionable` — dead until the store-wiring slices.
-#[allow(dead_code)]
 pub fn supersede_by_nonce(
     home: &Path,
     target: &str,

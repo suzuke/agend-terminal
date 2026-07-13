@@ -242,6 +242,17 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // per-instance-residual class as ci_watch above, but this store had no
     // teardown cleanup before (PR events would route at a vacant/redeployed slot).
     let _ = crate::daemon::pr_state::cleanup_subscribers_for_instance(home, name);
+    // t-…-17: REVOKE the deleted instance's active reviewer assignments. Once the
+    // durable authority store is LIVE, a ghost reviewer's record would keep the
+    // per-tick reconciler deriving a `reserved_assignments` entry for it, holding
+    // `is_merge_ready` CLOSED forever — the same per-instance-residual class as the
+    // ci_watch / pr_state subscriber cleanups above. Best-effort; supersedes the
+    // reviewer's outbox row (+ a revocation notice if already read).
+    let _ = crate::daemon::assignment_authority::revoke_all_for_target(
+        home,
+        name,
+        &chrono::Utc::now().to_rfc3339(),
+    );
     // #1519: GC the per-instance opencode data dir ($AGEND_HOME/backend-data/
     // opencode/<name> — the per-instance XDG_DATA_HOME holding its isolated
     // session DB + copied auth). No-op for non-opencode instances (the dir was

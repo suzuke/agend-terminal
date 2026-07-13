@@ -31,11 +31,6 @@
 //! APPEND-ONLY: it mints a NEW nonce, enqueues a fresh row, and SUPERSEDES the
 //! stale row by the OLD nonce — it NEVER resets `read_at` in place (I12).
 
-// t-…-17: DROPPED in the slice-4 cleanup commit once the store is wired LIVE. Kept
-// on the intermediate C10/C11/C12 commits so each builds clean while the call sites
-// land incrementally.
-#![allow(dead_code)]
-
 use crate::daemon::pr_state::{MergeState, PrState, ReservedAssignment, ReviewClass};
 use crate::mcp::handlers::comms_gates::ReviewAuthor;
 use std::path::{Path, PathBuf};
