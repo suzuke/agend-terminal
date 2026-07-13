@@ -213,9 +213,6 @@ fn txn_phase_order_and_worktree_existence() {
     for w in order.windows(2) {
         assert!(w[0].rank() < w[1].rank(), "{:?} < {:?}", w[0], w[1]);
     }
-    assert!(!Phase::Prepared.worktree_exists());
-    assert!(Phase::WorktreeAdded.worktree_exists());
-    assert!(Phase::Committed.worktree_exists());
 }
 
 /// save → load round-trips durably (via store::atomic_write).
@@ -341,9 +338,21 @@ fn txn_nonce_distinguishes_attempts() {
 
 use super::checkout_txn::{recover_stale, rollback_failed};
 
-fn save_at_phase(home: &std::path::Path, mangled: &str, phase: Phase) {
-    let mut j = sample_journal();
-    // advance from Prepared up to `phase`
+/// Save a journal at `phase` whose `worktree_path` is `wt`, optionally creating a
+/// real `wt` dir on disk (recovery now decides remove-vs-clear by on-disk
+/// existence, not the phase alone).
+fn save_journal_at(home: &std::path::Path, mangled: &str, wt: &Path, phase: Phase, real: bool) {
+    if real {
+        std::fs::create_dir_all(wt).unwrap();
+    }
+    let mut j = Journal::prepared(
+        "nonce-x",
+        wt.display().to_string(),
+        "/src",
+        "b",
+        false,
+        fixed_now().to_rfc3339(),
+    );
     for p in [
         Phase::WorktreeAdded,
         Phase::MarkerDurable,
@@ -357,14 +366,21 @@ fn save_at_phase(home: &std::path::Path, mangled: &str, phase: Phase) {
     j.save(home, mangled).unwrap();
 }
 
-/// A Committed tombstone left by a crashed cleanup is cleared, and no worktree
-/// removal is attempted (the provision had completed).
+fn write_corrupt_journal(home: &Path, mangled: &str) {
+    let jp = super::checkout_txn::journal_path(home, mangled);
+    std::fs::create_dir_all(jp.parent().unwrap()).unwrap();
+    std::fs::write(&jp, b"{ not valid json").unwrap();
+}
+
+/// A Committed tombstone → cleared, NO worktree removal (the provision completed;
+/// its worktree is valid for reuse).
 #[test]
 fn txn_recover_committed_clears_without_remove() {
     let home = tmp_home("rec-committed");
-    save_at_phase(&home, "m", Phase::Committed);
+    let wt = home.join("wt");
+    save_journal_at(&home, "m", &wt, Phase::Committed, true);
     let removed = std::cell::Cell::new(false);
-    let r = recover_stale(&home, "m", fixed_now(), |_j| {
+    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
         removed.set(true);
         true
     });
@@ -374,46 +390,85 @@ fn txn_recover_committed_clears_without_remove() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A crashed in-flight attempt whose worktree is successfully removed clears.
+/// A crashed non-Committed attempt whose REAL worktree removes → cleared.
 #[test]
 fn txn_recover_inflight_remove_ok_clears() {
     let home = tmp_home("rec-ok");
-    save_at_phase(&home, "m", Phase::WorktreeAdded);
-    let r = recover_stale(&home, "m", fixed_now(), |_j| true);
+    let wt = home.join("wt");
+    save_journal_at(&home, "m", &wt, Phase::WorktreeAdded, true);
+    let r = recover_stale(&home, "m", &wt, fixed_now(), || true);
     assert!(r.is_ok());
     assert!(Journal::load(&home, "m").is_none(), "removed ⇒ cleared");
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A crashed in-flight attempt whose worktree CANNOT be removed retains intent
-/// (armed + backoff) and returns Err so the caller aborts rather than colliding.
+/// A crashed attempt whose REAL worktree CANNOT be removed retains intent and Errs.
 #[test]
 fn txn_recover_inflight_remove_fail_retains_intent() {
     let home = tmp_home("rec-fail");
-    save_at_phase(&home, "m", Phase::SubmodulesReady);
-    let r = recover_stale(&home, "m", fixed_now(), |_j| false);
+    let wt = home.join("wt");
+    save_journal_at(&home, "m", &wt, Phase::SubmodulesReady, true);
+    let r = recover_stale(&home, "m", &wt, fixed_now(), || false);
     assert!(r.is_err(), "remove failed ⇒ Err");
     let retained = Journal::load(&home, "m").expect("journal retained");
-    assert!(retained.rollback_pending, "retained intent armed");
-    assert!(
-        retained.next_attempt_at.is_some(),
-        "backoff deadline persisted"
-    );
+    assert!(retained.rollback_pending && retained.next_attempt_at.is_some());
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A Prepared journal (no worktree materialized) is cleared without a remove.
+/// A non-Committed journal with NO worktree on disk (crashed before/without add) →
+/// cleared, no remove.
 #[test]
-fn txn_recover_prepared_clears_without_remove() {
-    let home = tmp_home("rec-prepared");
-    sample_journal().save(&home, "m").unwrap(); // Prepared
+fn txn_recover_no_worktree_clears_without_remove() {
+    let home = tmp_home("rec-nowt");
+    let wt = home.join("wt"); // NOT created
+    save_journal_at(&home, "m", &wt, Phase::WorktreeAdded, false);
     let removed = std::cell::Cell::new(false);
-    let r = recover_stale(&home, "m", fixed_now(), |_j| {
+    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
         removed.set(true);
         true
     });
     assert!(r.is_ok());
-    assert!(!removed.get(), "Prepared has no worktree ⇒ no remove");
+    assert!(!removed.get(), "no worktree on disk ⇒ no remove");
+    assert!(Journal::load(&home, "m").is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Prepared-with-REAL-worktree (crash after `git worktree add`, before the
+/// WorktreeAdded save): the on-disk worktree is removed even though phase=Prepared.
+#[test]
+fn txn_recover_prepared_with_real_worktree_removes() {
+    let home = tmp_home("rec-prep-wt");
+    let wt = home.join("wt");
+    save_journal_at(&home, "m", &wt, Phase::Prepared, true);
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
+        removed.set(true);
+        true
+    });
+    assert!(r.is_ok());
+    assert!(
+        removed.get(),
+        "Prepared-with-real-worktree ambiguity ⇒ removed"
+    );
+    assert!(Journal::load(&home, "m").is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A CORRUPT (torn) journal + a real worktree → the worktree is removed and the
+/// torn record cleared (treated as a crashed attempt).
+#[test]
+fn txn_recover_corrupt_removes_worktree() {
+    let home = tmp_home("rec-corrupt");
+    let wt = home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    write_corrupt_journal(&home, "m");
+    let removed = std::cell::Cell::new(false);
+    let r = recover_stale(&home, "m", &wt, fixed_now(), || {
+        removed.set(true);
+        true
+    });
+    assert!(r.is_ok());
+    assert!(removed.get(), "corrupt + real worktree ⇒ removed");
     assert!(Journal::load(&home, "m").is_none());
     std::fs::remove_dir_all(&home).ok();
 }
@@ -455,17 +510,28 @@ fn txn_rollback_failed_remove_fail_retains() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// ─── recover_pending_sweep (shared boot+periodic callable — injected closures) ─
+// ─── recover_pending_sweep (shared boot+periodic — injected try_lock/remove) ───
+// try_lock: Some(_) ⇒ path-lock free (crashed, safe to recover); None ⇒ held (a
+// live checkout owns the path — skip).
 
 use super::checkout_txn::recover_pending_sweep;
 
-fn save_pending_journal(
-    home: &std::path::Path,
+fn save_pending(
+    home: &Path,
     mangled: &str,
+    wt: &Path,
     attempts: u32,
     deadline: chrono::DateTime<chrono::Utc>,
 ) {
-    let mut j = sample_journal();
+    std::fs::create_dir_all(wt).unwrap();
+    let mut j = Journal::prepared(
+        "nonce-x",
+        wt.display().to_string(),
+        "/src",
+        "b",
+        false,
+        fixed_now().to_rfc3339(),
+    );
     j.advance(Phase::SubmodulesReady);
     j.rollback_pending = true;
     j.attempts = attempts;
@@ -473,35 +539,50 @@ fn save_pending_journal(
     j.save(home, mangled).unwrap();
 }
 
-/// No transaction area ⇒ sweep resolves nothing.
+/// No transaction area ⇒ nothing.
 #[test]
 fn txn_sweep_empty_area_is_zero() {
     let home = tmp_home("sweep-empty");
-    let n = recover_pending_sweep(&home, fixed_now(), |_| true, |_| {});
+    let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
     assert_eq!(n, 0);
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A DUE pending rollback whose worktree removes is resolved + cleared.
+/// Due + real worktree + lock free ⇒ removed + cleared.
 #[test]
 fn txn_sweep_due_remove_ok_clears() {
     let home = tmp_home("sweep-ok");
-    save_pending_journal(&home, "m", 1, fixed_now() - chrono::Duration::seconds(1));
-    let n = recover_pending_sweep(&home, fixed_now(), |_| true, |_| {});
+    let wt = home.join("wt");
+    save_pending(
+        &home,
+        "m",
+        &wt,
+        1,
+        fixed_now() - chrono::Duration::seconds(1),
+    );
+    let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
     assert_eq!(n, 1);
     assert!(Journal::load(&home, "m").is_none());
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A NOT-yet-due pending rollback is left untouched (backoff respected).
+/// Not-yet-due ⇒ skipped (backoff respected).
 #[test]
 fn txn_sweep_not_due_is_skipped() {
     let home = tmp_home("sweep-notdue");
-    save_pending_journal(&home, "m", 1, fixed_now() + chrono::Duration::seconds(60));
+    let wt = home.join("wt");
+    save_pending(
+        &home,
+        "m",
+        &wt,
+        1,
+        fixed_now() + chrono::Duration::seconds(60),
+    );
     let removed = std::cell::Cell::new(false);
     let n = recover_pending_sweep(
         &home,
         fixed_now(),
+        |_| Some(()),
         |_| {
             removed.set(true);
             true
@@ -509,58 +590,155 @@ fn txn_sweep_not_due_is_skipped() {
         |_| {},
     );
     assert_eq!(n, 0);
-    assert!(!removed.get(), "not-due journal is not touched");
-    assert!(Journal::load(&home, "m").is_some(), "journal retained");
+    assert!(!removed.get());
+    assert!(Journal::load(&home, "m").is_some());
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// A due rollback whose remove FAILS is re-armed (attempts bump) and not cleared.
+/// Due, remove FAILS ⇒ re-armed, not cleared.
 #[test]
 fn txn_sweep_remove_fail_rearms() {
     let home = tmp_home("sweep-fail");
-    save_pending_journal(&home, "m", 0, fixed_now() - chrono::Duration::seconds(1));
-    let n = recover_pending_sweep(&home, fixed_now(), |_| false, |_| {});
+    let wt = home.join("wt");
+    save_pending(
+        &home,
+        "m",
+        &wt,
+        0,
+        fixed_now() - chrono::Duration::seconds(1),
+    );
+    let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| false, |_| {});
     assert_eq!(n, 0);
     let j = Journal::load(&home, "m").expect("retained");
-    assert!(
-        j.rollback_pending && j.attempts >= 1,
-        "re-armed for a later retry"
-    );
+    assert!(j.rollback_pending && j.attempts >= 1);
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// The INTERVENTION audit fires ONCE when a stuck journal crosses the ceiling and
-/// is NOT re-emitted on subsequent sweeps of the same still-stuck journal.
+/// INTERVENTION audit fires ONCE on entering the ceiling; deduped after.
 #[test]
 fn txn_sweep_intervention_audit_deduped() {
     let home = tmp_home("sweep-audit");
-    // attempts=9 ⇒ next arm's backoff hits the ceiling ⇒ flips into intervention.
-    save_pending_journal(&home, "m", 9, fixed_now() - chrono::Duration::seconds(1));
+    let wt = home.join("wt");
+    save_pending(
+        &home,
+        "m",
+        &wt,
+        9,
+        fixed_now() - chrono::Duration::seconds(1),
+    );
     let count = std::cell::Cell::new(0);
     recover_pending_sweep(
         &home,
         fixed_now(),
+        |_| Some(()),
         |_| false,
         |_| count.set(count.get() + 1),
     );
-    assert_eq!(count.get(), 1, "audit once on ENTERING intervention");
-
-    // Make it due again; still stuck + already in intervention ⇒ no re-audit.
+    assert_eq!(count.get(), 1, "audit once on entering intervention");
     let mut j = Journal::load(&home, "m").unwrap();
-    assert!(j.intervention, "now in intervention");
+    assert!(j.intervention);
     j.next_attempt_at = Some((fixed_now() - chrono::Duration::seconds(1)).to_rfc3339());
     j.save(&home, "m").unwrap();
     recover_pending_sweep(
         &home,
         fixed_now(),
+        |_| Some(()),
         |_| false,
         |_| count.set(count.get() + 1),
     );
-    assert_eq!(
-        count.get(),
+    assert_eq!(count.get(), 1, "deduped");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// BLOCKER 2 — sweep-vs-new-generation: the journal's nonce CHANGES under the lock
+/// (a newer checkout re-provisioned this path) ⇒ the sweep skips it, so a NEWER
+/// generation's worktree is never deleted.
+#[test]
+fn txn_sweep_nonce_cas_skips_newer_generation() {
+    let home = tmp_home("sweep-nonce");
+    let wt = home.join("wt");
+    save_pending(
+        &home,
+        "m",
+        &wt,
         1,
-        "deduped — no re-audit while already in intervention"
+        fixed_now() - chrono::Duration::seconds(1),
     );
+    let removed = std::cell::Cell::new(false);
+    let home2 = home.clone();
+    let n = recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |seen| {
+            // Newer generation takes over between the unlocked read and the
+            // under-lock re-read: overwrite with a DIFFERENT nonce.
+            let mut newer = seen.clone();
+            newer.nonce = "NEWER-GEN".into();
+            newer.save(&home2, "m").unwrap();
+            Some(())
+        },
+        |_| {
+            removed.set(true);
+            true
+        },
+        |_| {},
+    );
+    assert_eq!(n, 0, "nonce changed ⇒ skip");
+    assert!(!removed.get(), "NEWER generation's worktree never removed");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// BLOCKER 2 — a HELD path-lock (an active checkout) ⇒ the sweep skips: a live
+/// provision is never disturbed.
+#[test]
+fn txn_sweep_skips_live_locked_checkout() {
+    let home = tmp_home("sweep-locked");
+    let wt = home.join("wt");
+    save_pending(
+        &home,
+        "m",
+        &wt,
+        1,
+        fixed_now() - chrono::Duration::seconds(1),
+    );
+    let removed = std::cell::Cell::new(false);
+    let n = recover_pending_sweep(
+        &home,
+        fixed_now(),
+        |_| None::<()>,
+        |_| {
+            removed.set(true);
+            true
+        },
+        |_| {},
+    );
+    assert_eq!(n, 0);
+    assert!(!removed.get(), "locked (live) checkout not touched");
+    assert!(Journal::load(&home, "m").is_some(), "journal retained");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// BLOCKER 4 — a crashed NON-rollback_pending journal (crashed before arming) is
+/// still recovered: every non-Committed phase with a real worktree is handled.
+#[test]
+fn txn_sweep_recovers_unarmed_crash() {
+    let home = tmp_home("sweep-unarmed");
+    let wt = home.join("wt");
+    save_journal_at(&home, "m", &wt, Phase::WorktreeAdded, true); // rollback_pending=false
+    let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
+    assert_eq!(n, 1, "unarmed crash recovered");
+    assert!(Journal::load(&home, "m").is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A corrupt journal is cleared by the sweep (any orphan worktree ⇒ worktree GC).
+#[test]
+fn txn_sweep_corrupt_cleared() {
+    let home = tmp_home("sweep-corrupt");
+    write_corrupt_journal(&home, "m");
+    let n = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
+    assert_eq!(n, 0);
+    assert!(Journal::load(&home, "m").is_none(), "corrupt cleared");
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -665,15 +843,14 @@ fn mangled_for(instance: &str, source: &Path) -> String {
     )
 }
 
-/// Committed-write-FAILURE seam: force the durable Committed journal write to fail
-/// (its path pre-created as a DIRECTORY so `store::atomic_write`'s rename fails) →
-/// the real checkout ABORTS into rollback (worktree removed) and returns the
-/// structured `commit_failed`, never success.
+/// BLOCKER 1 — a checked PREPARED-save failure is fatal-but-CLEAN: no worktree is
+/// created (no side effect yet), so nothing to roll back. (journal.json
+/// pre-created as a DIR ⇒ the first `store::atomic_write` rename fails.)
 #[test]
-fn checkout_commit_write_failure_rolls_back_2755() {
-    let home = tmp_home("commitfail");
-    let repo = tmp_repo_with_file("commitfail", "readme.txt", "x\n");
-    let instance = "agent-cf";
+fn checkout_prepared_write_failure_fails_clean_2755() {
+    let home = tmp_home("prepfail");
+    let repo = tmp_repo_with_file("prepfail", "readme.txt", "x\n");
+    let instance = "agent-pf";
     let mangled = mangled_for(instance, &repo);
     let jpath = home
         .join("checkout_txn")
@@ -684,6 +861,34 @@ fn checkout_commit_write_failure_rolls_back_2755() {
     let args =
         json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
     let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("journal_write"),
+        "Prepared save failure ⇒ journal_write: {resp}"
+    );
+    assert_eq!(resp["stage"].as_str(), Some("prepared"));
+    assert!(
+        !home.join("worktrees").join(&mangled).exists(),
+        "no worktree created (fatal-but-clean)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// BLOCKER 1 — a COMMITTED-write failure (all earlier phase saves succeed) ABORTS
+/// into rollback: the worktree is removed and the structured `commit_failed`
+/// returned, never success. Uses the checkout_txn `set_fail_committed_save` seam.
+#[test]
+fn checkout_commit_write_failure_rolls_back_2755() {
+    let home = tmp_home("commitfail");
+    let repo = tmp_repo_with_file("commitfail", "readme.txt", "x\n");
+    let instance = "agent-cf";
+    let mangled = mangled_for(instance, &repo);
+    super::checkout_txn::set_fail_committed_save(true);
+    let args =
+        json!({"repository_path": repo.display().to_string(), "branch": "main", "bind": false});
+    let resp = super::checkout::handle_checkout_repo(&home, &args, instance);
+    super::checkout_txn::set_fail_committed_save(false);
     assert_eq!(
         resp["code"].as_str(),
         Some("commit_failed"),
@@ -759,7 +964,16 @@ fn checkout_restart_replays_stale_worktree_2755() {
 fn txn_open_handle_remove_failure_retained_then_recovered() {
     let home = tmp_home("openhandle");
     let mangled = "agent-oh";
-    let mut j = sample_journal();
+    let wt = home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    let mut j = Journal::prepared(
+        "nonce-x",
+        wt.display().to_string(),
+        "/src",
+        "b",
+        false,
+        fixed_now().to_rfc3339(),
+    );
     j.advance(Phase::SubmodulesReady);
     j.save(&home, mangled).unwrap();
     // Handle held open ⇒ remove fails ⇒ intent retained (not cleared).
@@ -770,7 +984,7 @@ fn txn_open_handle_remove_failure_retained_then_recovered() {
     let mut s = Journal::load(&home, mangled).unwrap();
     s.next_attempt_at = Some((fixed_now() - chrono::Duration::seconds(1)).to_rfc3339());
     s.save(&home, mangled).unwrap();
-    let resolved = recover_pending_sweep(&home, fixed_now(), |_| true, |_| {});
+    let resolved = recover_pending_sweep(&home, fixed_now(), |_| Some(()), |_| true, |_| {});
     assert_eq!(resolved, 1, "handle released ⇒ recovered");
     assert!(
         Journal::load(&home, mangled).is_none(),

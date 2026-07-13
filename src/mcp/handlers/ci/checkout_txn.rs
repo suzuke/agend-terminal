@@ -33,6 +33,20 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// Test seam: when set on the current thread, `Journal::save` fails ONLY the
+// `Committed` write, so a real-entry test can exercise the Committed-write-failure
+// abort (earlier phase saves still succeed).
+#[cfg(test)]
+thread_local! {
+    static FAIL_COMMITTED_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: arm/disarm the [`FAIL_COMMITTED_SAVE`] seam for the current thread.
+#[cfg(test)]
+pub(crate) fn set_fail_committed_save(fail: bool) {
+    FAIL_COMMITTED_SAVE.with(|c| c.set(fail));
+}
+
 /// Bumped if the on-disk journal shape changes incompatibly.
 pub(crate) const JOURNAL_SCHEMA_VERSION: u32 = 1;
 
@@ -68,12 +82,6 @@ impl Phase {
             Phase::SubmodulesReady => 3,
             Phase::Committed => 4,
         }
-    }
-
-    /// Has a worktree been created on disk at this phase (⇒ rollback must
-    /// `git worktree remove --force`)? False only at `Prepared`.
-    pub(crate) fn worktree_exists(self) -> bool {
-        self.rank() >= Phase::WorktreeAdded.rank()
     }
 }
 
@@ -174,19 +182,50 @@ impl Journal {
 
     /// Durably persist (temp+fsync+rename+dir-fsync via [`store::atomic_write`]).
     pub(crate) fn save(&self, home: &Path, mangled: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.phase == Phase::Committed && FAIL_COMMITTED_SAVE.with(|c| c.get()) {
+            return Err(anyhow::anyhow!(
+                "test seam: forced Committed journal save failure"
+            ));
+        }
         crate::store::save_atomic(&journal_path(home, mangled), self)
     }
 
-    /// Load the journal for `mangled`, or `None` if absent/unparseable.
+    /// Load the journal for `mangled`, or `None` if absent/corrupt. Production
+    /// recovery uses [`load_typed`] (which distinguishes the two); this Option
+    /// convenience is test-only.
+    #[cfg(test)]
     pub(crate) fn load(home: &Path, mangled: &str) -> Option<Journal> {
-        let bytes = std::fs::read(journal_path(home, mangled)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        match load_typed(home, mangled) {
+            JournalLoad::Loaded(j) => Some(j),
+            JournalLoad::Absent | JournalLoad::Corrupt => None,
+        }
     }
 
     /// Delete the journal (transaction fully resolved — Committed cleanup or
     /// completed rollback). Best-effort.
     pub(crate) fn clear(home: &Path, mangled: &str) {
         let _ = std::fs::remove_file(journal_path(home, mangled));
+    }
+}
+
+/// The result of reading a journal file — recovery must distinguish a genuinely
+/// ABSENT record from a CORRUPT one (a torn/partial write from a crash), since a
+/// corrupt journal must not be silently treated as "nothing to recover".
+pub(crate) enum JournalLoad {
+    Absent,
+    Corrupt,
+    Loaded(Journal),
+}
+
+/// Read the journal for `mangled`, distinguishing Absent / Corrupt / Loaded.
+pub(crate) fn load_typed(home: &Path, mangled: &str) -> JournalLoad {
+    match std::fs::read(journal_path(home, mangled)) {
+        Err(_) => JournalLoad::Absent,
+        Ok(bytes) => match serde_json::from_slice::<Journal>(&bytes) {
+            Ok(j) => JournalLoad::Loaded(j),
+            Err(_) => JournalLoad::Corrupt,
+        },
     }
 }
 
@@ -310,6 +349,26 @@ pub(crate) fn acquire_path_lock(
     })
 }
 
+/// NON-BLOCKING variant for the recovery sweep: `None` when the path-lock is held
+/// (an ACTIVE checkout owns this path — leave its journal alone) instead of
+/// blocking a daemon tick. `Some` only when the lock is free (⇒ any non-Committed
+/// journal here is from a CRASHED, not a live, provision — safe to recover).
+pub(crate) fn try_acquire_path_lock(
+    home: &Path,
+    worktree_dir: &Path,
+    mangled: &str,
+) -> Option<PathLockGuard> {
+    let target = normalize_target(worktree_dir);
+    let flock = crate::store::try_acquire_file_lock(&lock_path(home, &target))
+        .ok()
+        .flatten()?;
+    Some(PathLockGuard {
+        target,
+        mangled: mangled.to_string(),
+        _flock: flock,
+    })
+}
+
 /// Exponential rollback backoff for retry `attempts` (0-based): 2^attempts
 /// seconds, capped at [`INTERVENTION_CEILING_SECS`] so a persistently-stuck
 /// worktree retries forever at the ceiling cadence rather than growing
@@ -353,63 +412,79 @@ pub(crate) fn rollback_failed(
     }
 }
 
-/// Resolve any journal left by a CRASHED prior provisioning of THIS mangled path
-/// (called under the INNER path-lock, before a fresh `git worktree add`).
+/// Called at checkout START, UNDER the freshly-acquired path-lock, to resolve a
+/// journal left by a CRASHED prior attempt at THIS path so the fresh provision (or
+/// idempotent reuse) can proceed without colliding with a stale worktree.
 ///
-/// - No journal → nothing to do.
-/// - `Committed` → a completed attempt whose tombstone wasn't cleared: clear it.
-/// - Any earlier phase WITH a worktree on disk → a crashed in-flight attempt:
-///   roll it back via `remove` (returns true on success) then clear; if `remove`
-///   FAILS, RETAIN intent (armed + exponential backoff persisted) and return
-///   `Err` so the caller aborts rather than colliding with the stale worktree.
-/// - `Prepared` (no worktree materialized) → just clear.
+/// - Absent → nothing to do.
+/// - `Committed` tombstone → leave any (valid) worktree for the caller's reuse;
+///   just drop the stale record.
+/// - Corrupt OR any non-Committed phase → a crashed attempt: remove a real
+///   worktree if one EXISTS at `worktree_dir` (covers the Prepared-with-real-
+///   worktree window — a crash after `git worktree add` but before the
+///   WorktreeAdded save), then clear. If `remove` FAILS, arm+retain the journal
+///   and return `Err` (the sweep retries; the caller aborts rather than collide).
 ///
-/// `remove` is injected so the recovery logic is unit-testable without live git.
+/// `remove` (prod: `git worktree remove --force worktree_dir`) is injected so the
+/// logic is unit-testable without live git.
 pub(crate) fn recover_stale(
     home: &Path,
     mangled: &str,
+    worktree_dir: &Path,
     now: chrono::DateTime<chrono::Utc>,
-    remove: impl Fn(&Journal) -> bool,
+    remove: impl Fn() -> bool,
 ) -> Result<(), String> {
-    let Some(mut j) = Journal::load(home, mangled) else {
-        return Ok(());
+    let existing = match load_typed(home, mangled) {
+        JournalLoad::Absent => return Ok(()),
+        JournalLoad::Corrupt => None, // torn record — treat like a crashed attempt
+        JournalLoad::Loaded(j) => Some(j),
     };
-    if j.phase == Phase::Committed {
+    if matches!(&existing, Some(j) if j.phase == Phase::Committed) {
+        Journal::clear(home, mangled); // completed attempt's tombstone
+        return Ok(());
+    }
+    if !worktree_dir.exists() {
+        Journal::clear(home, mangled); // crashed before/without a worktree on disk
+        return Ok(());
+    }
+    if remove() {
         Journal::clear(home, mangled);
         return Ok(());
     }
-    if !j.phase.worktree_exists() {
-        Journal::clear(home, mangled);
-        return Ok(());
-    }
-    if remove(&j) {
-        Journal::clear(home, mangled);
-        Ok(())
-    } else {
+    if let Some(mut j) = existing {
         j.arm_rollback(now);
         let _ = j.save(home, mangled);
-        Err(format!(
-            "a prior checkout of this path left a worktree that could not be rolled back \
-             (retained for retry; attempts={}{})",
-            j.attempts,
-            if j.intervention { ", INTERVENTION" } else { "" }
-        ))
     }
+    Err(
+        "a prior checkout of this path left a worktree that could not be rolled \
+         back (retained for recovery)"
+            .into(),
+    )
 }
 
-/// Drive every DUE pending rollback across all checkout-transaction journals.
+/// Drive recovery of CRASHED (orphaned) checkout-transaction journals — the ONE
+/// shared callable for boot-repair AND a periodic tick (no dedicated worker; the
+/// caller sets cadence). Race-safe against a concurrent live checkout:
 ///
-/// The ONE shared callable for BOTH boot-repair and a periodic tick (there is no
-/// dedicated worker — the caller decides cadence). For each journal that is
-/// `rollback_pending` and past its `next_attempt_at`, re-attempt the worktree
-/// `remove`: clear on success; otherwise re-arm (exponential backoff) and, the
-/// FIRST time a journal crosses into the INTERVENTION ceiling, emit a deduped
-/// operator-visible `audit` (subsequent sweeps of the same stuck journal do NOT
-/// re-emit). `remove`/`audit` are injected so the sweep is unit-testable without
-/// live git. Returns the count of journals resolved (worktree removed) this pass.
-pub(crate) fn recover_pending_sweep(
+///   1. read the journal (unlocked) for its path + nonce;
+///   2. `try_lock` its EXACT normalized path — SKIP if held (an ACTIVE checkout
+///      owns it; not crashed) so a live provision is never disturbed;
+///   3. RE-READ under the lock and CAS the nonce — SKIP if the record changed
+///      (a NEWER checkout generation took over) so its worktree is never deleted;
+///   4. `Committed` ⇒ clear the tombstone; any other (non-Committed / corrupt-now)
+///      record with a real worktree on disk ⇒ `remove` it (respecting backoff for
+///      an already-armed retry) then clear; on remove failure re-arm backoff and
+///      emit a deduped INTERVENTION `audit`.
+///
+/// Handles EVERY non-Committed phase (not just `rollback_pending`), incl. the
+/// Prepared-with-real-worktree crash window (the on-disk-worktree check, not the
+/// phase, decides whether there is anything to remove). `try_lock`/`remove`/
+/// `audit` are injected so the sweep is unit-testable without live git or flocks.
+/// Returns the count of journals resolved this pass.
+pub(crate) fn recover_pending_sweep<G>(
     home: &Path,
     now: chrono::DateTime<chrono::Utc>,
+    try_lock: impl Fn(&Journal) -> Option<G>,
     remove: impl Fn(&Journal) -> bool,
     mut audit: impl FnMut(&Journal),
 ) -> usize {
@@ -418,21 +493,53 @@ pub(crate) fn recover_pending_sweep(
     };
     let mut resolved = 0;
     for entry in entries.flatten() {
-        // Journal lives at <root>/<mangled>/journal.json; the sibling
-        // <mangled>.lock files load as None and are skipped.
         let Some(mangled) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let Some(mut j) = Journal::load(home, &mangled) else {
+        // (1) Unlocked read for path + nonce. Sibling `<key>.lock` files load as
+        // Absent (skipped); a corrupt record is cleared (any orphaned worktree dir
+        // is left to worktree GC — a torn record has no source repo to drive
+        // `git worktree remove` from).
+        let seen = match load_typed(home, &mangled) {
+            JournalLoad::Loaded(j) => j,
+            JournalLoad::Corrupt => {
+                tracing::warn!(mangled = %mangled, "corrupt checkout-txn journal — clearing");
+                Journal::clear(home, &mangled);
+                continue;
+            }
+            JournalLoad::Absent => continue,
+        };
+        // (2) Acquire the EXACT path-lock; a held lock ⇒ a live checkout ⇒ skip.
+        let Some(_lock) = try_lock(&seen) else {
             continue;
         };
-        if !j.rollback_pending || !j.rollback_due(now) {
+        // (3) Re-read UNDER the lock + nonce CAS.
+        let j = match load_typed(home, &mangled) {
+            JournalLoad::Loaded(j) if j.nonce == seen.nonce => j,
+            JournalLoad::Loaded(_) => continue, // newer generation took over
+            JournalLoad::Corrupt => {
+                Journal::clear(home, &mangled);
+                continue;
+            }
+            JournalLoad::Absent => continue, // cleared concurrently
+        };
+        // (4) Resolve.
+        if j.phase == Phase::Committed {
+            Journal::clear(home, &mangled); // completed attempt's tombstone
             continue;
+        }
+        if !Path::new(&j.worktree_path).exists() {
+            Journal::clear(home, &mangled); // crashed with no worktree on disk
+            continue;
+        }
+        if j.rollback_pending && !j.rollback_due(now) {
+            continue; // backoff pacing for an already-armed stuck retry
         }
         if remove(&j) {
             Journal::clear(home, &mangled);
             resolved += 1;
         } else {
+            let mut j = j;
             let was_intervention = j.intervention;
             j.arm_rollback(now);
             if j.intervention && !was_intervention {
@@ -453,6 +560,12 @@ pub(crate) fn recover_pending_sweep_prod(home: &Path) -> usize {
     recover_pending_sweep(
         home,
         chrono::Utc::now(),
+        |j| {
+            // Non-blocking exact path-lock; None (a live checkout holds it) ⇒ skip.
+            let wt = Path::new(&j.worktree_path);
+            let mangled = wt.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+            try_acquire_path_lock(home, wt, mangled)
+        },
         |j| {
             crate::git_helpers::git_bypass(
                 Path::new(&j.source_repo),

@@ -181,6 +181,55 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     } else {
         None
     };
+    // #2755 INNER provisioning lock — acquired BEFORE the idempotent-reuse check
+    // and any provision so reuse AND fresh provision are both serialized on the
+    // worktree PATH (a reuse must not bypass the lock or the recursive submodule
+    // init). Declared AFTER `_lease_lock` ⇒ drops (releases) INNER-first. Journal +
+    // lock live OUTSIDE the worktree so a rollback `remove --force` can't delete
+    // the recovery record.
+    let worktree_path_str = worktree_dir.display().to_string();
+    let mangled = worktree_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
+        Ok(g) => g,
+        Err(e) => {
+            return json!({
+                "error": format!(
+                    "could not acquire provisioning lock for '{branch}': {}",
+                    redact_paths(&e.to_string())
+                ),
+                "code": "path_lock",
+                "branch": branch,
+            })
+        }
+    };
+    // Revalidate the held lock maps to the EXACT target path before any side effect
+    // (fail-closed; the authority is the guard's normalized path).
+    if !path_lock.guards(&worktree_dir) {
+        return json!({
+            "error": "provisioning lock identity does not match the target worktree path",
+            "code": "path_lock_identity",
+            "branch": branch,
+        });
+    }
+    let txn_now = chrono::Utc::now();
+    // Replay a journal left by a CRASHED prior provision of this path (removes a
+    // stale worktree so a fresh add — or the reuse check below — sees clean state).
+    if let Err(e) =
+        super::checkout_txn::recover_stale(home, &mangled, &worktree_dir, txn_now, || {
+            crate::git_helpers::git_bypass(
+                Path::new(&source_path),
+                &["worktree", "remove", "--force", &worktree_path_str],
+            )
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        })
+    {
+        return json!({"error": redact_paths(&e), "code": "stale_txn_rollback", "branch": branch});
+    }
     if bind {
         // #1882: cross-agent P0-1.5 reject UNDER the lock — another agent holding
         // this branch is refused (mirrors the dispatch path's scan), rather than
@@ -216,6 +265,17 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         path = %wt_str,
                         "repo checkout bind:true idempotent — agent already bound to this branch, returning existing worktree"
                     );
+                    // #2755: a reused worktree may have EMPTY submodules (a prior
+                    // provision predating this fix, or a partial init) — self-heal
+                    // recursively under the held path-lock before returning, else the
+                    // reuse hands back a broken tree. Best-effort: the existing bound
+                    // worktree is still returned if a transient init fails.
+                    if let Err(e) = crate::worktree::init_submodules_strict(&wt) {
+                        tracing::warn!(
+                            path = %wt_str, error = %e,
+                            "#2755 idempotent reuse: recursive submodule init failed (best-effort)"
+                        );
+                    }
                     // #2115: idempotent reuse bypasses worktree::create — force-sync the stale tree to HEAD here too (rationale: sync_worktree_to_head doc).
                     crate::worktree::sync_worktree_to_head(&wt);
                     return json!({
@@ -244,59 +304,21 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
         }
     }
-    // When `bind:true`, omit `--detach` so HEAD lands on the named
-    // branch — subsequent commits write to the right ref without the
-    // extra `git switch` that triggered the #778 chicken-and-egg.
-    let worktree_path_str = worktree_dir.display().to_string();
-    // #2755 INNER provisioning lock + transaction journal (d-20260713024125724636-10).
-    // The branch-lease (`_lease_lock`, OUTER, bind-only) is already held above;
-    // this per-worktree-path flock (bind AND non-bind) serializes two attempts on
-    // the SAME mangled path and releases INNER-first — declared AFTER `_lease_lock`
-    // so it drops first at fn exit. Journal + lock live OUTSIDE the worktree
-    // (home/checkout_txn/…) so a rollback `remove --force` can never delete the
-    // recovery record.
-    let mangled = worktree_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
-    let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
-        Ok(g) => g,
-        Err(e) => {
-            return json!({
-                "error": format!(
-                    "could not acquire provisioning lock for '{branch}': {}",
-                    redact_paths(&e.to_string())
-                ),
-                "code": "path_lock",
-                "branch": branch,
-            })
-        }
-    };
-    // #2755: revalidate the held lock still maps to the EXACT target path we are
-    // about to mutate, BEFORE any side effect (fail-closed; the pattern Slice A
-    // extends to bind_full). The authority is the guard's normalized path.
-    if !path_lock.guards(&worktree_dir) {
-        return json!({
-            "error": "provisioning lock identity does not match the target worktree path",
-            "code": "path_lock_identity",
-            "branch": branch,
-        });
-    }
-    let txn_now = chrono::Utc::now();
-    // Replay a journal left by a CRASHED prior provision of this path so the fresh
-    // `git worktree add` below cannot collide with a stale worktree.
-    if let Err(e) = super::checkout_txn::recover_stale(home, &mangled, txn_now, |_j| {
+    // (INNER path-lock, identity revalidation, and stale-txn recovery were done
+    // ABOVE — before the reuse check. `bind:true` omits `--detach` below so HEAD
+    // lands on the named branch, #778.)
+    // Bounded worktree rollback (LOCAL git via bypass), reused by every failure
+    // path below so each checked-save failure leaves no orphan.
+    let remove_worktree = || {
         crate::git_helpers::git_bypass(
             Path::new(&source_path),
             &["worktree", "remove", "--force", &worktree_path_str],
         )
         .map(|o| o.status.success())
         .unwrap_or(false)
-    }) {
-        return json!({"error": e, "code": "stale_txn_rollback", "branch": branch});
-    }
-    // Prepared: durably journal the intent BEFORE any filesystem side effect.
+    };
+    // Prepared: durably journal the intent BEFORE any filesystem side effect. A
+    // failed save here is fatal-but-clean (no side effect yet).
     let mut journal = super::checkout_txn::Journal::prepared(
         super::checkout_txn::new_nonce(),
         worktree_path_str.clone(),
@@ -305,7 +327,14 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         bind,
         txn_now.to_rfc3339(),
     );
-    let _ = journal.save(home, &mangled);
+    if journal.save(home, &mangled).is_err() {
+        return json!({
+            "error": "could not persist checkout transaction journal",
+            "code": "journal_write",
+            "stage": "prepared",
+            "branch": branch,
+        });
+    }
     let git_args: Vec<&str> = if bind {
         vec!["worktree", "add", &worktree_path_str, branch]
     } else {
@@ -313,25 +342,74 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     };
     match git_bypass(Path::new(&source_path), &git_args) {
         Ok(o) if o.status.success() => {
+            // WorktreeAdded — CHECKED save: the worktree now EXISTS, so a save
+            // failure must roll it back or the durable record under-reports on-disk
+            // state (a crash would then orphan it).
             journal.advance(super::checkout_txn::Phase::WorktreeAdded);
-            let _ = journal.save(home, &mangled);
+            if journal.save(home, &mangled).is_err() {
+                super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                return json!({
+                    "error": "could not persist WorktreeAdded journal, worktree rolled back",
+                    "code": "journal_write",
+                    "stage": "worktree_added",
+                    "branch": branch,
+                });
+            }
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
-            // #1275: write .agend-managed unconditionally so
-            // release_worktree and GC can always clean up.
-            let mut warnings: Vec<String> = Vec::new();
+            // #1275 + #2755: write `.agend-managed` FAIL-CLOSED — a missing marker
+            // breaks release_worktree/GC cleanup, so a write failure rolls back
+            // rather than returning a half-managed worktree.
             let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
-            if let Err(e) = std::fs::write(
+            if std::fs::write(
                 &marker_path,
                 format!(
                     "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
                     chrono::Utc::now().to_rfc3339()
                 ),
-            ) {
-                warnings.push(format!("marker: {e}"));
+            )
+            .is_err()
+            {
+                super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                return json!({
+                    "error": "marker write failed, worktree rolled back",
+                    "code": "marker_failed",
+                    "stage": "marker_durable",
+                    "branch": branch,
+                });
             }
+            crate::store::fsync_parent_dir(&marker_path); // best-effort durability
             journal.advance(super::checkout_txn::Phase::MarkerDurable);
-            let _ = journal.save(home, &mangled);
+            if journal.save(home, &mangled).is_err() {
+                super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                return json!({
+                    "error": "could not persist MarkerDurable journal, worktree rolled back",
+                    "code": "journal_write",
+                    "stage": "marker_durable",
+                    "branch": branch,
+                });
+            }
             // #2755 SubmodulesReady phase: `git worktree add` materializes the
             // superproject (`.gitmodules` + gitlinks) but leaves submodule dirs
             // EMPTY, so a build with path-dependency submodules (e.g.
@@ -347,15 +425,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     &mangled,
                     &mut journal,
                     txn_now,
-                    || {
-                        crate::git_helpers::git_bypass(
-                            Path::new(&source_path),
-                            &["worktree", "remove", "--force", &worktree_path_str],
-                        )
-                        .map(|o| o.status.success())
-                        .unwrap_or(false)
-                    },
-                    || {}, // no binding written before SubmodulesReady
+                    remove_worktree,
+                    || {},
                 );
                 let mut err = json!({
                     "error": format!(
@@ -373,7 +444,22 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 return err;
             }
             journal.advance(super::checkout_txn::Phase::SubmodulesReady);
-            let _ = journal.save(home, &mangled);
+            if journal.save(home, &mangled).is_err() {
+                super::checkout_txn::rollback_failed(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    || {},
+                );
+                return json!({
+                    "error": "could not persist SubmodulesReady journal, worktree rolled back",
+                    "code": "journal_write",
+                    "stage": "submodules_ready",
+                    "branch": branch,
+                });
+            }
             if bind {
                 // #2533: optional caller-supplied task_id — attributes this self-claim
                 // to a task (§3.19.1 reviewer checkout is the common case) so `bind_full`
@@ -405,14 +491,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         &mangled,
                         &mut journal,
                         txn_now,
-                        || {
-                            crate::git_helpers::git_bypass(
-                                Path::new(&source_path),
-                                &["worktree", "remove", "--force", &worktree_path_str],
-                            )
-                            .map(|o| o.status.success())
-                            .unwrap_or(false)
-                        },
+                        remove_worktree,
                         || {},
                     );
                     return json!({
@@ -450,14 +529,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     &mangled,
                     &mut journal,
                     txn_now,
-                    || {
-                        crate::git_helpers::git_bypass(
-                            Path::new(&source_path),
-                            &["worktree", "remove", "--force", &worktree_path_str],
-                        )
-                        .map(|o| o.status.success())
-                        .unwrap_or(false)
-                    },
+                    remove_worktree,
                     || {
                         if bind {
                             crate::binding::unbind(home, instance_name);
@@ -472,9 +544,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             // Committed durable ⇒ transaction resolved; drop the journal tombstone.
             super::checkout_txn::Journal::clear(home, &mangled);
-            if !warnings.is_empty() {
-                resp["warnings"] = json!(warnings);
-            }
             resp
         }
         Ok(o) => {
