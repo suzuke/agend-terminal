@@ -414,6 +414,51 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// B2 (A4 guard) — the FIRST reconcile tick must NOT rotate/supersede a HEALTHY,
+    /// still-actionable (unread) delivery row. `repair_row` gated ONLY on the lease;
+    /// with `next_nudge_at = created_at` the first Unengaged tick would supersede a
+    /// perfectly healthy just-delivered unread row (a spurious re-nudge before the
+    /// reviewer has even read the first). FIX: only a NON-actionable current row is
+    /// repaired; a healthy row merely advances the lease. RED: the nonce rotates and
+    /// the row is superseded on the first tick.
+    #[test]
+    fn b2_first_tick_does_not_rotate_healthy_unread_row() {
+        let home = tmp_home("b2");
+        let rec = mk("o/r", "feat/x", "reviewer", 7, "2026-07-13T00:00:00Z");
+        store::persist(&home, &rec).unwrap();
+        // durable_enqueue makes the row ACTIONABLE (healthy, unread); the record's
+        // next_nudge_at == created_at, so the very first tick is lease-due.
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        let n0 = rec.delivery_nonce.clone();
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &n0),
+            "row is healthy/actionable pre-tick"
+        );
+
+        // One reconcile tick with the lease DUE (Unengaged: no ack, no verdict).
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:01Z");
+
+        let after = store::get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(
+            after.delivery_nonce, n0,
+            "a healthy unread row must NOT be rotated on the first tick"
+        );
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &n0),
+            "a healthy unread row must NOT be superseded (still actionable)"
+        );
+        assert!(
+            wakes.is_empty(),
+            "no nudge/wake fires for a healthy unread row"
+        );
+        // The lease still advanced (a full interval away) so the guard is bounded.
+        assert_ne!(
+            after.next_nudge_at, rec.next_nudge_at,
+            "next_nudge_at advanced past created_at even though no repair fired"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// B4(a) — a CORRUPT authority record must NOT silently DROP its reservation
     /// from the derived `reserved_assignments` set (which would OPEN the reserved
     /// merge gate). The reserved derivation reads records; pre-fix a corrupt record
