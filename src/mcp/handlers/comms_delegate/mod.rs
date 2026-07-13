@@ -599,21 +599,21 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
 #[cfg(test)]
 mod tests;
 
-/// #2760 (frozen-plan d-…-7) — real-entry RED for the t-…-35 live failure.
+/// #2760 Slice A — strict-RESOLUTION unit test (NOT a production dispatch-entry
+/// proof; Slice B owns the true `handle_delegate_task`/`send` production entry and
+/// its ordering/atomicity).
 ///
-/// A project-board task with `review_class=single` was dispatched as
-/// `review_class_unspecified` TWICE, because the merge-authority preflight
-/// (`maybe_auto_bind_lease`, comms_delegate.rs:281) reads the task's durable
-/// `review_class` via `crate::tasks::load_by_id`, which sees ONLY the default
-/// board — a per-project-board task is invisible, so the class resolves absent
-/// and the dispatch fails closed as Unspecified.
+/// Motivating bug (t-…-35): a project-board task with `review_class=single` was
+/// dispatched as `review_class_unspecified` because the merge-authority preflight
+/// read the task's durable `review_class` via the default-only `load_by_id` seam,
+/// invisible to per-project boards.
 ///
-/// This drives the ACTUAL preflight resolver (`resolve_existing_task_review_class`)
-/// fed by the strict router (`crate::tasks::load_routed`), on a task created
-/// through the REAL `tasks::handle` create path routed to a non-default project
-/// board. It is PROVEN-FAILING against the checkpoint stub (load_routed reaches
-/// only the default board) and turns green once `load_routed` resolves project
-/// boards AND the preflight is migrated onto it.
+/// This exercises the STRICT router (`crate::tasks::load_routed`) reading a
+/// project-board task's `review_class` metadata — the task created through the real
+/// `tasks::handle` create path on a non-default board — and feeds it to the pure
+/// `resolve_existing_task_review_class` classifier, proving the strict route
+/// surfaces `single` where the default-only read surfaced absent. It does NOT drive
+/// the production dispatch preflight or its bind/deliver ordering (Slice B).
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod routing_red_2760 {
@@ -650,7 +650,7 @@ mod routing_red_2760 {
     }
 
     #[test]
-    fn project_board_task_review_class_routes_single_not_unspecified_2760() {
+    fn load_routed_resolves_project_board_review_class_single_2760() {
         let home = tmp_home("single");
         // Create the task through the REAL create handler, routed to a NON-DEFAULT
         // project board, carrying the durable `review_class=single` authority.
