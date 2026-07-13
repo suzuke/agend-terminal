@@ -10,6 +10,7 @@
 mod common;
 
 use common::git_isolated;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -41,6 +42,7 @@ fn fake_shim_dir() -> PathBuf {
 /// The real git dir in this environment (control), resolved through the seam on the
 /// live PATH. If this itself can't resolve real git, the harness has no real git —
 /// which is itself the fail-loud contract, so we require it.
+#[cfg(unix)]
 fn real_git_dir() -> PathBuf {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let real = git_isolated::resolve_real_git_in(&path, &git_isolated::shim_dirs())
@@ -48,6 +50,7 @@ fn real_git_dir() -> PathBuf {
     real.parent().unwrap().to_path_buf()
 }
 
+#[cfg(unix)]
 fn join(dirs: &[&PathBuf]) -> OsString {
     std::env::join_paths(dirs.iter().map(|p| p.as_path())).unwrap()
 }
@@ -177,6 +180,72 @@ fn t122_test_fmt_owned_passes_under_simulated_deny_shim() {
         String::from_utf8_lossy(&out.stderr)
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// (task122 RED — runtime fence) the chokepoint REFUSES to run real git against the
+/// ENCLOSING worktree (`CARGO_MANIFEST_DIR`). This is the guard the src-symbol source
+/// invariant CANNOT provide: a direct `git(Path::new(MANIFEST), …)` call must panic
+/// fail-loud, never operate on the host repo.
+#[test]
+#[should_panic(expected = "NOT under the system temp dir")]
+fn t122_rejects_enclosing_worktree_target() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let _ = git_isolated::git(&manifest, &["rev-parse", "--show-toplevel"]);
+}
+
+/// (task122 RED — runtime fence) a non-temp repo dir (the crate `src/`) is refused too;
+/// the fence is "must be UNDER the system temp dir", not merely "not exactly MANIFEST".
+#[test]
+#[should_panic(expected = "NOT under the system temp dir")]
+fn t122_rejects_non_temp_repo_target() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let _ = git_isolated::git(&src, &["status"]);
+}
+
+/// (task122 RED — shell fence) the shell real-git seam is FIXTURE-ONLY: every script
+/// under scripts/ that references scripts/lib/real-git.sh MUST be an audited fixture
+/// script. A NEW (unaudited) consumer fails this LOUD — the shell analogue of the src/
+/// source invariant, closing "future non-fixture shell consumers".
+#[test]
+fn t122_shell_real_git_consumers_are_audited_fixtures_only() {
+    // Audited fixture scripts permitted to source lib/real-git.sh (by file name).
+    const AUDITED: &[&str] = &["test_fmt_owned.sh"];
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().map(|x| x == "sh").unwrap_or(false) {
+                out.push(p);
+            }
+        }
+    }
+    let scripts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts");
+    let mut shs = Vec::new();
+    walk(&scripts, &mut shs);
+    let unaudited: Vec<String> = shs
+        .iter()
+        // the seam definition itself is not a "consumer"
+        .filter(|p| !p.ends_with("lib/real-git.sh"))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("real-git.sh")
+        })
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            !AUDITED.contains(&name)
+        })
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(
+        unaudited.is_empty(),
+        "unaudited shell consumer(s) of lib/real-git.sh — add to the audited fixture allowlist \
+         only after review: {unaudited:?}"
+    );
 }
 
 /// (task122 RED #3) the real-git seam is FIXTURE-ONLY — no production (`src/`)

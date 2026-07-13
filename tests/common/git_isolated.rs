@@ -166,9 +166,39 @@ fn cached_real() -> &'static (PathBuf, OsString) {
     })
 }
 
+/// Fail-loud RUNTIME provenance fence: a fixture repo dir MUST live UNDER the system
+/// temp dir. The seam targets ONLY test-created temp repos (`setup_temp_repo` →
+/// `std::env::temp_dir`) and must NEVER run real git against the enclosing
+/// agend-terminal worktree (`CARGO_MANIFEST_DIR`) or any managed worktree — the src-
+/// symbol source invariant cannot catch a runtime `git(Path::new(MANIFEST), …)` call,
+/// so this closes it AT the chokepoint (task122: "prevents use against the enclosing
+/// repo"). Canonicalizes both sides so the macOS `/var`→`/private/var` symlink and
+/// `.`/symlink path forms cannot defeat the check.
+fn assert_temp_repo(repo_dir: &Path) {
+    let tmp = std::env::temp_dir();
+    let canon_tmp = tmp.canonicalize().unwrap_or(tmp);
+    let canon_repo = repo_dir.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "git_isolated: fixture repo_dir {} cannot be canonicalized ({e}); the real-git \
+             seam targets ONLY test-created temp repos under {}",
+            repo_dir.display(),
+            canon_tmp.display()
+        )
+    });
+    assert!(
+        canon_repo.starts_with(&canon_tmp),
+        "git_isolated: refusing to run real git against {} — it is NOT under the system temp \
+         dir ({}). The fixture seam is fenced to test-created temp repos and must NEVER operate \
+         on the enclosing worktree / CARGO_MANIFEST_DIR (task122 source invariant).",
+        canon_repo.display(),
+        canon_tmp.display(),
+    );
+}
+
 /// Base command: REAL git binary, real-git-first PATH (children inherit it), cwd
 /// pin, agent-session env scrubbed, pinned author/committer.
 fn base_cmd(repo_dir: &Path, args: &[&str]) -> Command {
+    assert_temp_repo(repo_dir);
     let (real, real_path) = cached_real();
     let mut c = Command::new(real);
     c.args(args)
