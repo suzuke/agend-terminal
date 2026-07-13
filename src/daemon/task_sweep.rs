@@ -534,8 +534,16 @@ fn extract_closes_markers(body: &str) -> Vec<String> {
         regex::Regex::new(r"(?m)Closes\s+(t-[0-9]+-[0-9]+(?:-[0-9]+)?)\b")
             .expect("static regex must compile")
     });
+    // #2760 (codex ruling m-…-1154): EXTRACTION (this regex, which finds candidate
+    // `Closes t-…` tokens bounded in prose) is separated from VALIDATION — every
+    // extracted candidate is validated through the single authoritative
+    // `TaskId::parse_canonical` grammar owner, so a task-id's validity is a type
+    // invariant, not a per-site string pattern. (The extraction regex already
+    // matches the canonical shape, so this is behavior-preserving; it makes the
+    // parser the authority.)
     re.captures_iter(body)
-        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .filter_map(|c| c.get(1))
+        .filter_map(|m| crate::task_events::TaskId::parse_canonical(m.as_str()).map(|t| t.0))
         .collect()
 }
 

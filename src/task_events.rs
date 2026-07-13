@@ -80,6 +80,35 @@ impl TaskId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// #2760 (codex ruling m-…-1154): parse `s` as a CANONICAL task id — the
+    /// TYPE-level authority for "is this string a real task id", replacing raw
+    /// `starts_with("t-")` string conventions at the suppression/authority gates
+    /// (dispatch-idle liveness, auto-close). A generated id is `t-<ts>-<pid>-<seq>`
+    /// (see `tasks::handler` create) and the legacy form is `t-<ts>-<seq>` — both
+    /// are `t-` followed by 2 or 3 NUMERIC segments. Anchored full-string (`^…$`),
+    /// so it VALIDATES the whole correlation, never a substring. Returns the typed
+    /// [`TaskId`] on success; `None` for a non-task / query / synthetic correlation
+    /// (which the gates fail-open on). This is the SAME grammar the `task_sweep`
+    /// Closes-marker extractor matches, but here as VALIDATION (not extraction) —
+    /// `task_sweep` extracts candidate tokens, then validates each through this
+    /// single parser, so the grammar has one authoritative owner.
+    pub fn parse_canonical(s: &str) -> Option<TaskId> {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"^t-[0-9]+-[0-9]+(?:-[0-9]+)?$").expect("static regex must compile")
+        });
+        re.is_match(s).then(|| TaskId(s.to_string()))
+    }
+}
+
+impl std::str::FromStr for TaskId {
+    type Err = ();
+    /// Canonical-grammar parse (see [`TaskId::parse_canonical`]). `Err(())` for a
+    /// non-canonical string — the idiomatic entry for `str::parse::<TaskId>()`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        TaskId::parse_canonical(s).ok_or(())
+    }
 }
 
 impl std::fmt::Display for TaskId {

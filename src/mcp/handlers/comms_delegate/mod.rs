@@ -679,4 +679,43 @@ mod routing_red_2760 {
              default-only load_by_id seam returned review_class_unspecified"
         );
     }
+
+    /// #2760: the live t-…93 false-negative reproduction (codex 2026-07-13 16:01Z):
+    /// an EXISTING project-board task with durable `review_class=dual`, dispatched
+    /// with `review_class=dual` (+ `second_reviewer=true`), was refused as
+    /// `review_class_unspecified` because the merge-authority preflight read the
+    /// durable class via the default-only seam (invisible to the project board).
+    /// The strict router surfaces `dual`, so the preflight resolves `Dual` (a
+    /// supplied matching `dual` + second_reviewer are consistency-only, never a
+    /// mismatch). Mirrors the `single` unit for the two-reviewer authority.
+    #[test]
+    fn load_routed_resolves_project_board_review_class_dual_2760() {
+        let home = tmp_home("dual");
+        let created = crate::tasks::handle(
+            &home,
+            "orchestrator",
+            &json!({
+                "action": "create",
+                "title": "impl the feature",
+                "project": "Hack_agend-terminal",
+                "review_class": "dual",
+            }),
+        );
+        let task_id = created["id"]
+            .as_str()
+            .expect("create returns an id")
+            .to_string();
+
+        let class = preflight_review_class(&home, &task_id);
+        // The dispatch supplied review_class="dual" and second_reviewer=true — both
+        // are consistency-evidence against the durable class, not a mismatch.
+        let resolved = resolve_existing_task_review_class(class.as_deref(), Some("dual"), true);
+        assert_eq!(
+            resolved,
+            Ok(ReviewClass::Dual),
+            "t-…93: a project-board task with review_class=dual must route strictly and \
+             the merge-authority preflight must resolve Dual — pre-fix the default-only \
+             seam returned review_class_unspecified despite the durable dual authority"
+        );
+    }
 }
