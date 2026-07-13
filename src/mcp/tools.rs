@@ -996,6 +996,9 @@ mod tests {
             ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "review_class", "comms_delegate.rs maybe_auto_bind_lease → resolve_dispatch_review_class authority/fallback (atomic reject on unresolved) + maybe_auto_create_task create_args seed (#2745)"),
+            ("send", "review_assignment", "comms_gates/dispatch.rs run_dispatch_pre_checks parse → comms_delegate.rs handle_delegate_task validate_review_assignment_marker fail-closed gate (t-…-17)"),
+            ("send", "pr_number", "comms_delegate.rs validate_review_assignment_marker — mandatory nonzero generation identity, atomic reject if missing/zero (t-…-17 B18/B19)"),
+            ("send", "review_author", "comms_gates/dispatch.rs parse_review_author strict typed parse → comms_delegate.rs validate_review_assignment_marker self-review deny (t-…-17)"),
             ("send", "triaged", "comms_gates/triaged_gate.rs pre-check validation + comms.rs handle_send_to_instance/handle_report_result → daemon/discharge_ledger.rs record_discharge (#2537/#2524 P6 PR-1)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
