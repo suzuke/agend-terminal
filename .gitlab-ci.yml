@@ -29,12 +29,16 @@ before_script:
 fmt:
   stage: lint
   script:
-    - cargo fmt --check
+    # task83 (d-46): shared owned-source formatter surface — same script GitHub CI
+    # and scripts/preflight.sh call (owned *.rs, vendor/ excluded, NUL-safe).
+    - scripts/fmt-owned.sh --check
 
 clippy:
   stage: lint
   script:
-    - cargo clippy --all-targets --features tray -- -D warnings
+    # task83: GitHub's explicit OWNED-target clippy (not `--all-targets`, which
+    # drags in the vendored agentic-git bin under our strict `-D warnings`).
+    - cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --tests --examples --features tray -- -D warnings
 
 test:
   stage: test

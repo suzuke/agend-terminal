@@ -73,13 +73,21 @@ jobs:
       - name: Format check
         timeout-minutes: 5
         shell: bash
-        # #2524 P3: the `agentic-git` [[bin]] (Cargo.toml) compiles vendored
-        # submodule source, which `cargo fmt` walks and would flag against our
-        # rustfmt style — but that is upstream code we don't own (it round-trips to
-        # the agentic-git repo), and rustfmt's `ignore` is NOT reliably honored via
-        # `cargo fmt`'s per-target invocation. Format-check our OWN tracked sources
-        # only (git pathspec excludes vendor/); rustfmt reads no config → defaults.
-        run: git ls-files '*.rs' ':!:vendor/**' | xargs rustfmt --edition 2021 --check
+        # task83 (d-46): the owned-source rustfmt boundary now lives in ONE place —
+        # scripts/fmt-owned.sh — so CI, GitLab CI and preflight can't drift apart. It
+        # enumerates `git ls-files -z -- '*.rs' ':!:vendor/**'` (NUL-safe; excludes
+        # the vendored agentic-git submodule that `cargo fmt` would otherwise walk and
+        # reformat) and runs `rustfmt --edition 2021 --check`.
+        run: scripts/fmt-owned.sh --check
+
+      # task83: exercise the owned-fmt boundary contract itself (hermetic recursive-
+      # submodule fixture). Linux-only — one run of the shell contract is enough; the
+      # local file:// submodule fixture is unix-shell-shaped.
+      - name: Owned-fmt boundary test
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        shell: bash
+        run: scripts/test_fmt_owned.sh
 
       # #2524 P3: the agentic-git `[[bin]]` compiles vendored submodule source.
       # `cargo clippy --all-targets` would lint it under agend-terminal's strict

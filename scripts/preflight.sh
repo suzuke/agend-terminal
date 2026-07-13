@@ -7,10 +7,14 @@
 # problems a local check would have caught — Windows-only compile errors,
 # fmt drift, tray-gated failures, and the 750-LOC file_size_invariant.
 #
-# Runs, in order (each is exactly what CI's `check` job runs):
-#   1. cargo fmt --check
-#   2. cargo clippy --all-targets --features tray -- -D warnings
+# Runs, in order — the fmt/clippy surface MATCHES CI's `check` job (task83/d-46):
+#   1. scripts/fmt-owned.sh --check   (owned *.rs, vendor/ excluded — CI's exact surface)
+#   2. cargo clippy <owned targets> --features tray -- -D warnings  (CI's exact targets)
 #   3. cargo test --tests --features tray   (unit + integration + invariants)
+#      NOTE: CI runs these via `nextest`, not `cargo test` — the test SELECTION
+#      matches but the runner differs, and a floating stable toolchain is not
+#      byte-exact over time. "Green here" is a strong pre-check, not a byte-exact
+#      guarantee of CI.
 #   4. Windows cross-check (x86_64-pc-windows-msvc)   <- the keystone
 #
 # Step 4 catches the class that hurts most: Windows-only code
@@ -94,10 +98,10 @@ step() {
     fi
 }
 
-step "fmt --check" \
-    cargo fmt --check
-step "clippy (--all-targets --features tray -D warnings)" \
-    cargo clippy --all-targets --features tray -- -D warnings
+step "fmt --check (owned surface)" \
+    scripts/fmt-owned.sh --check
+step "clippy (owned targets --features tray -D warnings)" \
+    cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --tests --examples --features tray -- -D warnings
 step "test (--tests --features tray: unit + integration + invariants)" \
     cargo test --tests --features tray
 

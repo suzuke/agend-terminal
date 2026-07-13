@@ -59,11 +59,11 @@ done <<<"$refs"
 
 if [ "$ci_parity_needed" = "1" ]; then
     cd "$REPO_ROOT"
-    # DRY: delegate to the canonical preflight (fmt --check + clippy
-    # --all-targets --features tray + `cargo test --tests --features tray`),
-    # `--quick` to skip the slow Windows cross-check (CI's windows-latest is the
-    # backstop for that). Single source of the parity commands → the hook can
-    # never drift from CI / preflight.sh.
+    # DRY: delegate to the canonical preflight — the owned-source formatter
+    # surface (scripts/fmt-owned.sh --check) + the owned-target clippy +
+    # `cargo test --tests --features tray` — with `--quick` to skip the slow
+    # Windows cross-check (CI's windows-latest is the backstop). Single source of
+    # the parity commands → the hook can never drift from CI / preflight.sh.
     if [ -x scripts/preflight.sh ]; then
         echo "pre-push: CI-parity via 'scripts/preflight.sh --quick' (mirrors CI's check job, host-only)…" >&2
         if ! scripts/preflight.sh --quick; then

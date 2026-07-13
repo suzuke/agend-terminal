@@ -133,6 +133,20 @@ git_h -C "$super" add -A >/dev/null 2>&1
     && ok "rustfmt parse failure propagates (non-zero)" \
     || bad "unparseable owned file should make write mode non-zero"
 
+# ── 8. every production fmt caller invokes the shared surface ─────────────────
+# (pre-push converges transitively via preflight, so the direct callers suffice.)
+repo_root="$(cd "$script_dir/.." && pwd)"
+callers_ok=1
+for f in .github/workflows/ci.yml .gitlab-ci.yml scripts/preflight.sh; do
+    if ! grep -q 'fmt-owned\.sh' "$repo_root/$f"; then
+        echo "  (no fmt-owned.sh reference in $f)" >&2
+        callers_ok=0
+    fi
+done
+[ "$callers_ok" -eq 1 ] \
+    && ok "all production fmt callers invoke scripts/fmt-owned.sh" \
+    || bad "a production fmt caller does not invoke the shared surface"
+
 echo
 echo "summary: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
