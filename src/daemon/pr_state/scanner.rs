@@ -567,33 +567,54 @@ pub fn scan_and_emit_with(
         // only assignment→pr_state path; nothing goes pr_state→assignment). It records
         // ONLY records whose stored pr_number matches — NEVER a different generation
         // (no force-bind by branch, no unbound window).
-        if let Some(kind) = crate::daemon::assignment_authority::terminal_kind_of(&snapshot) {
-            if snapshot.pr_number != 0 {
-                match crate::daemon::assignment_authority::record_terminal(
-                    home,
-                    &repo,
-                    &branch,
-                    snapshot.pr_number,
-                    kind,
-                ) {
-                    Ok(n) if n > 0 => tracing::info!(
-                        repo = %repo, branch = %branch, pr = snapshot.pr_number,
-                        tombstoned = n,
-                        "t-…-17 A7: terminal marker recorded + reviewer-assignment records tombstoned"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        repo = %repo, branch = %branch, pr = snapshot.pr_number, error = %e,
-                        "t-…-17 A7: record_terminal failed (reconciler A10a will retry)"
-                    ),
+        // t-…-17 B3: track whether the terminal marker was DURABLY recorded (or there
+        // was no terminal to record). Only then may the pr_state file be removed — a
+        // FAILED record_terminal must RETAIN the file as the retry source, else the
+        // terminal marker (never written) AND the pr_state (deleted) are both lost and
+        // the merged PR's assignment record resurrects (A10a cannot backstop a marker
+        // that was never written).
+        let terminal_recorded = match crate::daemon::assignment_authority::terminal_kind_of(
+            &snapshot,
+        ) {
+            None => true, // no terminal to record ⇒ nothing to lose
+            Some(_) if snapshot.pr_number == 0 => true, // unbound generation: no marker keyed
+            Some(kind) => match crate::daemon::assignment_authority::record_terminal(
+                home,
+                &repo,
+                &branch,
+                snapshot.pr_number,
+                kind,
+            ) {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(
+                            repo = %repo, branch = %branch, pr = snapshot.pr_number,
+                            tombstoned = n,
+                            "t-…-17 A7: terminal marker recorded + reviewer-assignment records tombstoned"
+                        );
+                    }
+                    true
                 }
-            }
-        }
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo, branch = %branch, pr = snapshot.pr_number, error = %e,
+                        "t-…-17 A7/B3: record_terminal FAILED — retaining pr_state as the retry source (fail closed); next scan re-observes the terminal and retries"
+                    );
+                    false
+                }
+            },
+        };
         match result {
-            Ok(Some(ScanAction::Remove)) => {
-                // The durable terminal marker is already recorded above, so removing
-                // the pr_state file here can never lose it (crash-safe ordering).
+            Ok(Some(ScanAction::Remove)) if terminal_recorded => {
+                // The durable terminal marker is already recorded above (or there was
+                // none to record), so removing the pr_state file here can never lose
+                // it (crash-safe ordering).
                 let _ = remove(home, &repo, &branch);
+            }
+            Ok(Some(ScanAction::Remove)) => {
+                // record_terminal FAILED — SKIP the remove (B3 fail closed). The
+                // pr_state file is retained as the retry source; the next scan
+                // re-observes the terminal and record_terminal (idempotent) retries.
             }
             Err(e) => {
                 tracing::warn!(
