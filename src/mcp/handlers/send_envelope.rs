@@ -24,6 +24,8 @@ pub(super) struct SendEnvelope {
     // a null directive reads as absent — daemon reads them by value, not presence)
     pub(super) correlation_id: Option<String>,
     pub(super) reviewed_head: Option<String>,
+    pub(super) report_purpose: Option<String>,
+    pub(super) code_review: Option<Value>,
     pub(super) eta_minutes: Option<u64>,
     pub(super) reporting_cadence: Option<String>,
     pub(super) worktree_binding_required: Option<bool>,
@@ -50,6 +52,8 @@ impl SendEnvelope {
         SendEnvelope {
             correlation_id: args["correlation_id"].as_str().map(String::from),
             reviewed_head: args["reviewed_head"].as_str().map(String::from),
+            report_purpose: args["report_purpose"].as_str().map(String::from),
+            code_review: args.get("code_review").filter(|v| !v.is_null()).cloned(),
             eta_minutes: args["eta_minutes"].as_u64(),
             reporting_cadence: args["reporting_cadence"].as_str().map(String::from),
             worktree_binding_required: args["worktree_binding_required"].as_bool(),
@@ -72,6 +76,8 @@ impl SendEnvelope {
             parent_id,
             correlation_id,
             reviewed_head,
+            report_purpose,
+            code_review,
             eta_minutes,
             reporting_cadence,
             worktree_binding_required,
@@ -93,6 +99,8 @@ impl SendEnvelope {
             "parent_id": parent_id,
             "correlation_id": correlation_id,
             "reviewed_head": reviewed_head,
+            "report_purpose": report_purpose,
+            "code_review": code_review,
             "eta_minutes": eta_minutes,
             "reporting_cadence": reporting_cadence,
             "worktree_binding_required": worktree_binding_required,
@@ -134,6 +142,8 @@ impl SendEnvelope {
             parent_id,
             correlation_id,
             reviewed_head,
+            report_purpose,
+            code_review: _,
             eta_minutes,
             reporting_cadence,
             worktree_binding_required,
@@ -146,6 +156,12 @@ impl SendEnvelope {
             provenance: _,
             branch: _,
         } = self;
+        let report_purpose = report_purpose
+            .as_deref()
+            .and_then(|p| {
+                serde_json::from_value::<crate::review_receipt::ReportPurpose>(json!(p)).ok()
+            })
+            .unwrap_or_default();
         crate::inbox::InboxMessage {
             from: format!("from:{from}"),
             text: text.clone(),
@@ -154,6 +170,10 @@ impl SendEnvelope {
             parent_id: parent_id.clone(),
             correlation_id: correlation_id.clone(),
             reviewed_head: reviewed_head.clone(),
+            report_purpose,
+            // API-down fallback is deliberately inert: it may durably deliver
+            // the report, but only the API sink can construct this proof.
+            validated_code_review: None,
             eta_minutes: eta_minutes.map(|v| v as u32),
             reporting_cadence: reporting_cadence.clone(),
             worktree_binding_required: *worktree_binding_required,
@@ -186,6 +206,12 @@ mod tests {
             parent_id: Some("m-parent".to_string()),
             correlation_id: Some("t-corr".to_string()),
             reviewed_head: Some("deadbeef".to_string()),
+            report_purpose: Some("code_review".to_string()),
+            code_review: Some(json!({
+                "assignment_id": "00000000-0000-0000-0000-000000000001",
+                "verdict": "verified",
+                "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            })),
             eta_minutes: Some(42),
             reporting_cadence: Some("per-pr".to_string()),
             worktree_binding_required: Some(true),
@@ -214,6 +240,8 @@ mod tests {
         assert_eq!(p["parent_id"], "m-parent");
         assert_eq!(p["correlation_id"], "t-corr");
         assert_eq!(p["reviewed_head"], "deadbeef");
+        assert_eq!(p["report_purpose"], "code_review");
+        assert_eq!(p["code_review"]["verdict"], "verified");
         assert_eq!(p["eta_minutes"], 42);
         assert_eq!(p["reporting_cadence"], "per-pr");
         assert_eq!(p["worktree_binding_required"], true);
@@ -243,6 +271,14 @@ mod tests {
         assert_eq!(m.correlation_id.as_deref(), Some("t-corr"));
         // THE fixed gap: reviewed_head must survive into the fallback.
         assert_eq!(m.reviewed_head.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            m.report_purpose,
+            crate::review_receipt::ReportPurpose::CodeReview
+        );
+        assert!(
+            m.validated_code_review.is_none(),
+            "API-down fallback may deliver typed intent but can never mint receipt authority"
+        );
         assert_eq!(m.eta_minutes, Some(42u32));
         assert_eq!(m.reporting_cadence.as_deref(), Some("per-pr"));
         assert_eq!(m.worktree_binding_required, Some(true));

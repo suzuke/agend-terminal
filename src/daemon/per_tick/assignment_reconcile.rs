@@ -10,7 +10,8 @@
 //!   - **A3/A4** nudge + repair: a record classifying `Unengaged` whose FIXED-
 //!     interval lease is due gets an append-only row repair (A4) and a best-effort
 //!     self-IPC WAKE pointer (A3), emitted OUTSIDE all flocks. `Satisfied` /
-//!     `EngagedUnsatisfied` / `EngagedPending` (acked) are TRUE stops — never nudged.
+//!     `EngagedUnsatisfied` is a TRUE stop — never nudged. Generic correlated
+//!     ACK state is not code-review evidence.
 //!   - **A10b** reflection: re-derive `reserved_assignments` on the live `PrState`
 //!     (declarative, convergent across restart).
 //!
@@ -31,13 +32,14 @@
 use super::{PerTickHandler, TickContext};
 use crate::daemon::assignment_authority as store;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// C12 per-tick handler. `new(1)` runs every tick (~10 s); a larger cadence divides
 /// that down. Registered in [`crate::daemon::per_tick::build_default_handlers`].
 pub(crate) struct AssignmentReconcileHandler {
     cadence: u64,
     tick: AtomicU64,
+    legacy_census_done: AtomicBool,
 }
 
 impl AssignmentReconcileHandler {
@@ -45,6 +47,7 @@ impl AssignmentReconcileHandler {
         Self {
             cadence: cadence.max(1),
             tick: AtomicU64::new(0),
+            legacy_census_done: AtomicBool::new(false),
         }
     }
 }
@@ -55,6 +58,9 @@ impl PerTickHandler for AssignmentReconcileHandler {
     }
 
     fn run(&self, ctx: &TickContext<'_>) {
+        if !self.legacy_census_done.swap(true, Ordering::AcqRel) {
+            log_legacy_cutover_census(ctx.home);
+        }
         let n = self.tick.fetch_add(1, Ordering::Relaxed);
         if self.cadence > 1 && !n.is_multiple_of(self.cadence) {
             return;
@@ -62,6 +68,37 @@ impl PerTickHandler for AssignmentReconcileHandler {
         // The ONLY unmockable clock read; the tested core takes `now` injected.
         let now = chrono::Utc::now().to_rfc3339();
         reconcile_all(ctx.home, &now);
+    }
+}
+
+/// One census per daemon process. Enforcement is already fail-closed for these
+/// rows; this makes the required operator action visible and enumerates the
+/// exact generations that must be re-dispatched during rollout.
+fn log_legacy_cutover_census(home: &Path) {
+    match store::legacy_active_assignments_strict(home) {
+        Ok(rows) => {
+            if !rows.is_empty() {
+                tracing::error!(
+                    count = rows.len(),
+                    "task66 cutover: active LegacyAssignments cannot submit code-review receipts; re-dispatch every listed generation"
+                );
+            }
+            for row in rows {
+                tracing::warn!(
+                    assignment_id = %row.assignment_id,
+                    repo = %row.repo,
+                    branch = %row.branch,
+                    pr_number = row.pr_number,
+                    task_id = %row.task_id,
+                    target = %row.target,
+                    "task66 cutover LegacyAssignment: audited re-dispatch required"
+                );
+            }
+        }
+        Err(error) => tracing::error!(
+            error = %error,
+            "task66 cutover: legacy assignment census unreadable; inventory is UNKNOWN and rollout must stop for repair"
+        ),
     }
 }
 

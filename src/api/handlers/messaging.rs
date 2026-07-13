@@ -247,7 +247,12 @@ fn build_message(
             .get("force_meta")
             .and_then(|v| serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()),
         correlation_id: params["correlation_id"].as_str().map(String::from),
+        // Display only. A validated review uses the server-derived exact head;
+        // non-review reports may retain the caller's display value, but no
+        // authorization logic reads it.
         reviewed_head: params["reviewed_head"].as_str().map(String::from),
+        report_purpose: crate::review_receipt::ReportPurpose::LegacyUntyped,
+        validated_code_review: None,
         from: format!("from:{}", vs.from),
         from_id: vs.from_resolved.as_ref().map(|(id, _)| id.full()),
         text: vs.text.to_string(),
@@ -269,6 +274,7 @@ fn build_message(
         pr_number: None,
         terminal: params["terminal"].as_bool(),
         delivery_nonce: params["delivery_nonce"].as_str().map(String::from),
+        review_assignment: None,
     }
 }
 
@@ -428,20 +434,26 @@ fn checkout_branch_if_requested<'a>(
     }
 }
 
-fn process_verdicts(home: &Path, from: &str, msg: &crate::inbox::InboxMessage) {
-    // #2010 2a: enqueue a release intent for ANY terminal verdict (widened from
-    // VERIFIED-only). The sweeper releases the verdict-sender's (reviewer's) own
-    // binding once their review task is terminal, bypassing the open-PR gate —
-    // so a REJECTED/UNVERIFIED reviewer no longer leaks its worktree to the lead's
-    // rework re-dispatch. The verdict KIND is irrelevant to the release path; the
-    // pr_state recording below keys on the actual word.
+fn process_verdicts(home: &Path, msg: &crate::inbox::InboxMessage) -> bool {
+    // task66: the validated receipt is the sole code-review authority. Visible
+    // text, reviewed_head, names and correlation never select these effects.
+    let Some(receipt) = msg.validated_code_review.as_ref() else {
+        return false;
+    };
+    let summary = receipt.summary();
+    // Apply/buffer first. A raced revoke, duplicate receipt/source, or storage
+    // failure must not release a worktree or bridge/close review work.
+    if !crate::daemon::pr_state::record_validated_receipt(home, receipt) {
+        return false;
+    }
     if crate::daemon::auto_release::is_verdict_message(msg) {
-        if let Some(task_id) = msg.correlation_id.as_ref() {
+        {
+            let task_id = &summary.task_id;
             let intent = crate::daemon::auto_release::AutoReleaseIntent {
                 task_id: task_id.clone(),
-                reviewer: from.to_string(),
+                reviewer: summary.reviewer_name.clone(),
                 verdict_msg_id: msg.id.clone(),
-                reviewed_head: msg.reviewed_head.clone(),
+                reviewed_head: Some(summary.reviewed_head.clone()),
                 enqueued_at: chrono::Utc::now().to_rfc3339(),
                 // t-worktree-leak (PR-1) Q1(b): a verdict no longer releases an
                 // OPEN PR's worktree by default — the sweeper gates it through the
@@ -460,47 +472,7 @@ fn process_verdicts(home: &Path, from: &str, msg: &crate::inbox::InboxMessage) {
             }
         }
     }
-    // pr_state verdict recording — independent of the enqueue gate above and
-    // keyed to the actual verdict word. VERIFIED keeps its §4.2 reviewed_head
-    // staleness gate (a head-less VERIFIED must not flip the merge gate);
-    // REJECTED/UNVERIFIED record regardless (UNVERIFIED is evidence-exempt).
-    if msg.kind.as_deref() == Some("report") && msg.correlation_id.is_some() {
-        // #2059: strip the `[report_result] ` wrapper (added by
-        // comms::handle_report_result) via the SHARED helper, so the verdict-word
-        // check sees the bare word — the same strip `is_terminal_verdict_text`
-        // uses, so the two verdict consumers never drift. Without this, the
-        // wrapped real wire text never matched and record_verdict was never
-        // called (the pipeline-wide silence #2059 RCA'd).
-        let text = crate::daemon::auto_release::strip_report_wrapper(&msg.text);
-        let task_id = msg.correlation_id.as_deref().unwrap_or("");
-        if text.starts_with("VERIFIED") {
-            if msg.reviewed_head.is_some() {
-                crate::daemon::pr_state::record_verdict(
-                    home,
-                    task_id,
-                    from,
-                    msg.reviewed_head.as_deref(),
-                    crate::daemon::pr_state::VerdictKind::Verified,
-                );
-            }
-        } else if text.starts_with("REJECTED") {
-            crate::daemon::pr_state::record_verdict(
-                home,
-                task_id,
-                from,
-                msg.reviewed_head.as_deref(),
-                crate::daemon::pr_state::VerdictKind::Rejected { reason: None },
-            );
-        } else if text.starts_with("UNVERIFIED") {
-            crate::daemon::pr_state::record_verdict(
-                home,
-                task_id,
-                from,
-                msg.reviewed_head.as_deref(),
-                crate::daemon::pr_state::VerdictKind::Unverified,
-            );
-        }
-    }
+    true
 }
 
 pub(crate) fn track_dispatch(
@@ -611,11 +583,13 @@ pub(crate) fn track_dispatch(
             // correlation (reviewer verdicts do) RESOLVES the ci-handoff track —
             // the re-nudge stops on this signal, not on inbox read. A task-id
             // correlation simply matches no track (no-op).
-            let _ = crate::daemon::ci_handoff_track::resolve_by_correlation(
-                home,
-                corr,
-                "report_arrived",
-            );
+            if msg.validated_code_review.is_some() {
+                let _ = crate::daemon::ci_handoff_track::resolve_by_correlation(
+                    home,
+                    corr,
+                    "validated_code_review_arrived",
+                );
+            }
             if corr.starts_with("t-") {
                 let _ = crate::tasks::auto_close::auto_close_on_report(
                     home,
@@ -647,8 +621,8 @@ pub(crate) fn track_dispatch(
     }
 }
 
-/// #t-127: bridge a reviewer VERDICT report back to its review TASK + dispatch
-/// sidecar, root-fixing two symptoms with one mechanism:
+/// #t-127/task66: bridge a validated code-review receipt back to its exact review
+/// task + dispatch sidecar, root-fixing two symptoms with one mechanism:
 /// - **ghost review tasks** — VERIFIED verdicts never auto-closed their review
 ///   task (the `auto_close_on_report` call above is gated on `corr.starts_with("t-")`,
 ///   but a verdict's `corr` is `repo@branch`), so they piled up unclosed.
@@ -656,12 +630,9 @@ pub(crate) fn track_dispatch(
 ///   `mark_resolved(repo@branch)` never cleared it and the watchdog kept pinging
 ///   "stuck 30min" after the reviewer had already replied.
 ///
-/// Resolution is dual-path (cheaper + branch-independent — dual-2/GH-diff review
-/// dispatches carry NO branch, so a branch reverse-lookup would structurally miss
-/// them):
-/// - if the report's correlation IS a `t-…` → use it directly (exact);
-/// - else (`repo@branch` / none) → `open_review_dispatch_for_reporter` reverse-looks
-///   the reporter's single OPEN dispatch sidecar (exactly-one fail-safe).
+/// Resolution comes only from the receipt's assignment-bound `task_id`. Reporter
+/// names, correlation strings, visible text, and open-sidecar reverse lookups are
+/// deliberately not authority.
 ///
 /// Then: ANY verdict clears the sidecar (the reviewer responded → not stuck);
 /// only VERIFIED auto-closes the review task (REJECTED/UNVERIFIED stay open for the
@@ -670,30 +641,21 @@ pub(crate) fn track_dispatch(
 /// the task is orthogonal to the pr-state merge gate (the scanner aggregates
 /// verdicts by `reviewed_head`, independent of task lifecycle).
 fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox::InboxMessage) {
-    use crate::mcp::handlers::comms_gates::{detect_verdict, Verdict};
-    // Only ACTUAL verdict reports: a leading VERIFIED/REJECTED/UNVERIFIED token
-    // (§3.12) AND a `reviewed_head` SHA (every reviewer verdict carries it, #1024).
-    let Some(verdict) = detect_verdict(&msg.text) else {
+    let Some(receipt) = msg.validated_code_review.as_ref() else {
         return;
     };
-    if msg.reviewed_head.is_none() {
-        return;
-    }
-    let corr = msg.correlation_id.as_deref().or(msg.task_id.as_deref());
-    let task_id: Option<String> = match corr {
-        Some(c) if c.starts_with("t-") => Some(c.to_string()),
-        _ => crate::daemon::dispatch_idle::open_review_dispatch_for_reporter(home, reporter),
-    };
-    let Some(task_id) = task_id else {
-        return;
-    };
+    let summary = receipt.summary();
+    let task_id = &summary.task_id;
     // Any verdict → the reviewer responded → clear the dispatch sidecar (kills the
     // post-response stuck-nudge), regardless of VERIFIED vs REJECTED.
-    let _ = crate::daemon::dispatch_idle::mark_resolved(home, &task_id);
+    let _ = crate::daemon::dispatch_idle::mark_resolved(home, task_id);
     // Only VERIFIED closes the review task. terminal=true synthesized internally.
-    if matches!(verdict, Verdict::Verified) {
+    if matches!(
+        summary.verdict,
+        crate::review_receipt::ReviewVerdict::Verified
+    ) {
         let _ = crate::tasks::auto_close::auto_close_on_report(
-            home, "report", &task_id, reporter, &msg.text, true,
+            home, "report", task_id, reporter, &msg.text, true,
         );
     }
 }
@@ -716,7 +678,32 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             Ok(id) => id,
             Err(e) => return e,
         };
-    let msg = build_message(params, ctx.home, &vs, &auto_task_id);
+    let mut msg = build_message(params, ctx.home, &vs, &auto_task_id);
+    // A2: pre-stamp the SAME server-owned id that storage will persist. The
+    // authoritative validator derives receipt/source identities from it; the
+    // caller never supplies an exact-once key.
+    let server_message_id = crate::inbox::stamp_message_id(&mut msg);
+    let report_auth = match crate::review_receipt::authorize_report(
+        ctx.home,
+        params,
+        vs.from,
+        vs.from_resolved.as_ref().map(|(id, _)| *id),
+        vs.target,
+        vs.text,
+        &server_message_id,
+    ) {
+        Ok(auth) => auth,
+        Err(error) => {
+            return json!({"ok": false, "error": error, "code": "report_authority_rejected"})
+        }
+    };
+    msg.report_purpose = report_auth.purpose;
+    msg.validated_code_review = report_auth.receipt;
+    if let Some(receipt) = msg.validated_code_review.as_ref() {
+        // Exact server-derived assignment head; top-level reviewed_head remains
+        // a display field and is never read for authorization.
+        msg.reviewed_head = Some(receipt.summary().reviewed_head.clone());
+    }
     if let Err(e) = check_worktree_enforcement(params, ctx.home, vs.target) {
         return e;
     }
@@ -739,8 +726,16 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     crate::inbox::settle_parent_after_successful_send(ctx.home, vs.from, msg.parent_id.as_deref());
     inject_provenance(params, vs.from, vs.target);
     let branch_checked_out = checkout_branch_if_requested(params, ctx.home, vs.target);
-    process_verdicts(ctx.home, vs.from, &msg);
-    track_dispatch(ctx.home, params, vs.from, vs.target, &msg);
+    let receipt_applied = process_verdicts(ctx.home, &msg);
+    if receipt_applied || msg.validated_code_review.is_none() {
+        track_dispatch(ctx.home, params, vs.from, vs.target, &msg);
+    } else {
+        // Preserve ordinary report/dispatch semantics while suppressing every
+        // code-review consumer when the post-delivery assignment recheck raced.
+        let mut inert = msg.clone();
+        inert.validated_code_review = None;
+        track_dispatch(ctx.home, params, vs.from, vs.target, &inert);
+    }
 
     let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
     if let Some(branch) = branch_checked_out {

@@ -110,13 +110,11 @@ fn report_with_correlation_auto_settles_dispatch_row_without_ack_inbox_35896_11(
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #t-78445-3: the SHA-staleness gate must scan `summary + artifacts` for the PR
-/// URL (not `summary` alone). A reviewer whose verdict carries the URL in the
-/// `artifacts` field was FALSE-REJECTED with "no GitHub PR URL" → verdict lost to
-/// fallback (root cause of reviewer4's #2674/#2611 fallbacks). RED on pre-fix code
-/// (gate scanned summary only), GREEN after the shared summary+artifacts scan.
+/// task66: verdict-looking analysis text remains an ordinary report even when a
+/// PR URL appears only in artifacts. No semantic SHA/PR gate may classify it as
+/// a code review.
 #[test]
-fn sha_gate_scans_artifacts_for_pr_url_78445_3() {
+fn analysis_report_with_pr_artifact_does_not_enter_review_gate_2760() {
     let home = std::env::temp_dir().join(format!(
         "agend-78445-3-artifacts-url-{}-{}",
         std::process::id(),
@@ -140,27 +138,21 @@ fn sha_gate_scans_artifacts_for_pr_url_78445_3() {
             "summary": "VERIFIED — looks correct",
             "artifacts": "PR: https://github.com/nonexistent-org-xyz/nonexistent-repo/pull/1",
             "reviewed_head": "abc1234def5678",
+            "report_purpose": "analysis_decision",
         }),
         &sender,
     );
-    // The URL IS present in the envelope (artifacts) → it must NOT be rejected as
-    // missing. (Post-fix the gate then attempts a real fetch which fails for the
-    // fake repo — a DIFFERENT error; the point is the "no URL" false-reject is gone.)
-    let err = result["error"].as_str().unwrap_or("");
     assert!(
-        !err.contains("no GitHub PR URL"),
-        "PR URL in artifacts must NOT be false-rejected as missing: {result}"
+        result.get("error").is_none(),
+        "analysis report must deliver without review inference: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #t-78445-3 companion: a bare `#N` reference with NO full URL in EITHER field is
-/// still rejected (the daemon must not guess the repo — anti-forgery), but the
-/// reject message must be one-shot actionable so a degraded model can fix + resend
-/// instead of looping (the fugu re-enter degradation this bug triggered). No fetch
-/// runs (deterministic).
+/// A bare `#N` plus verdict-looking text also remains ordinary analysis. The
+/// purpose enum, not prose or reviewed_head, selects the review validator.
 #[test]
-fn sha_gate_bare_pr_number_still_rejected_actionable_78445_3() {
+fn analysis_report_with_bare_pr_number_is_not_semantic_review_2760() {
     let home = std::env::temp_dir().join(format!(
         "agend-78445-3-bare-num-{}-{}",
         std::process::id(),
@@ -183,17 +175,13 @@ fn sha_gate_bare_pr_number_still_rejected_actionable_78445_3() {
             "summary": "VERIFIED — PR #2674 looks good",
             "artifacts": "ran: cargo test -> ok",
             "reviewed_head": "abc1234def5678",
+            "report_purpose": "analysis_decision",
         }),
         &sender,
     );
-    let err = result["error"].as_str().unwrap_or("");
     assert!(
-        err.contains("no GitHub PR URL"),
-        "a bare #N with no full URL must still reject: {result}"
-    );
-    assert!(
-        err.contains("PR: https://github.com/<owner>/<repo>/pull/<N>"),
-        "reject must name the exact FULL-URL line to add: {err}"
+        result.get("error").is_none(),
+        "analysis report must not be routed into the old SHA gate: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -238,12 +226,11 @@ fn seed_home(tag: &str, reporter: &str) -> std::path::PathBuf {
     home
 }
 
-/// C9 (T14): an authenticated correlated report from the assignment TARGET drives
-/// the ACK end-to-end through `handle_report_result` — `acked_at` is set, so the
-/// record classifies EngagedPending (a prstate with no verdict). A report from a
-/// DIFFERENT sender does NOT ack the target's record.
+/// task66: an ordinary correlated report from the assignment target must not
+/// write assignment evidence. Only the API-sink validated code-review receipt
+/// can engage or satisfy an assignment.
 #[test]
-fn c9_authenticated_correlated_report_acks_target_t14() {
+fn ordinary_correlated_report_does_not_ack_assignment_2760() {
     let reporter = "reviewer-c9a";
     let home = seed_home("t14", reporter);
     seed_assignment(&home, "feat/x", reporter, 42, "t-x");
@@ -258,8 +245,8 @@ fn c9_authenticated_correlated_report_acks_target_t14() {
 
     let rec = authority::get(&home, "o/r", "feat/x", reporter).expect("assignment present");
     assert!(
-        rec.acked_at.is_some(),
-        "an authenticated correlated report from the target sets acked_at"
+        rec.acked_at.is_none(),
+        "ordinary report must not set acked_at"
     );
     let ps = crate::daemon::pr_state::new_for_branch(
         "o/r",
@@ -269,8 +256,8 @@ fn c9_authenticated_correlated_report_acks_target_t14() {
     );
     assert_eq!(
         authority::classify_assignment(&rec, Some(&ps)),
-        authority::AssignmentEvidence::EngagedPending,
-        "an acked record with no current-head verdict ⇒ EngagedPending"
+        authority::AssignmentEvidence::Unengaged,
+        "ordinary report is not assignment evidence"
     );
     std::fs::remove_dir_all(&home).ok();
 

@@ -586,6 +586,7 @@ pub(crate) mod tests {
             subscribers: vec!["dev".to_string()],
             ci_state: super::super::CiState::Pending,
             verdict_state: super::super::VerdictState::None,
+            validated_review_receipts: Vec::new(),
             merge_state: super::super::MergeState::NotReady,
             draft_state: super::super::DraftState::Ready,
             review_class: super::super::ReviewClass::Single,
