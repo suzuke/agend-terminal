@@ -827,7 +827,13 @@ mod tests {
     /// the given `behind_by` — so `freshness_gate` returns `Fresh` (behind_by==0)
     /// or `Behind` (behind_by>0).
     fn stamp_fresh_tuple(s: &mut super::super::PrState, head: &str, base: &str, behind_by: u64) {
-        let now = chrono::Utc::now().to_rfc3339();
+        // Stamp 1s in the PAST. In production the off-tick populator / gh_poll
+        // writes these timestamps BEFORE the scanner tick reads them, so the gate
+        // sees a positive age. It also keeps the pure-classifier unit tests robust
+        // under the strict `0 <= age <= ttl` gate (they capture the gate's `now`
+        // up front, before this stamp — a same-instant stamp would otherwise read
+        // marginally in the future and fail closed).
+        let now = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         s.observed_head_sha = Some(head.into());
         s.observed_base_sha = Some(base.into());
         s.observed_at = Some(now.clone());
@@ -1232,6 +1238,54 @@ mod tests {
         let mut s = valid(0);
         s.freshness_behind_by = None;
         assert_eq!(freshness_gate(&s, now, 600), FreshnessGate::Suppress);
+    }
+
+    /// #2749 review-fix (codex): the TTL bound is TWO-SIDED — a FUTURE observed_at
+    /// or freshness_checked_at must FAIL CLOSED. The original within_ttl checked
+    /// only `age <= ttl_secs`; a future timestamp yields a NEGATIVE age that
+    /// silently passed, letting a clock-skewed / forged-future stamp read Fresh
+    /// indefinitely. Now `0 <= age <= ttl_secs`. A negative `ttl_secs` yields an
+    /// empty range and can never admit Fresh.
+    #[test]
+    fn freshness_gate_future_timestamp_and_negative_ttl_fail_closed() {
+        let now = chrono::Utc::now();
+        let head = "aaaaaaa";
+        let base = "bbbbbbb";
+        let valid = |behind: u64| {
+            let mut s = new_for_branch("o/r", "b", head, ReviewClass::Single);
+            stamp_fresh_tuple(&mut s, head, base, behind);
+            s
+        };
+        let future = (now + chrono::Duration::seconds(300)).to_rfc3339();
+
+        // Sanity: the un-tampered tuple (stamped in the past) is Fresh at `now`.
+        assert_eq!(freshness_gate(&valid(0), now, 600), FreshnessGate::Fresh);
+
+        // Future observed_at (300s ahead of `now`) ⇒ Suppress (fail closed).
+        let mut s = valid(0);
+        s.observed_at = Some(future.clone());
+        assert_eq!(
+            freshness_gate(&s, now, 600),
+            FreshnessGate::Suppress,
+            "future observed_at must fail closed (was fail-OPEN under `<= ttl`)"
+        );
+
+        // Future freshness_checked_at ⇒ Suppress.
+        let mut s = valid(0);
+        s.freshness_checked_at = Some(future);
+        assert_eq!(
+            freshness_gate(&s, now, 600),
+            FreshnessGate::Suppress,
+            "future freshness_checked_at must fail closed"
+        );
+
+        // Negative ttl ⇒ empty 0..=ttl range ⇒ never Fresh, even for a perfectly
+        // current tuple.
+        assert_eq!(
+            freshness_gate(&valid(0), now, -1),
+            FreshnessGate::Suppress,
+            "negative ttl must never admit Fresh"
+        );
     }
 }
 
