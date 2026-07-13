@@ -156,10 +156,21 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
     // explicit `project` arg override). Single-project → DEFAULT → board == home
     // (byte-identical). Record the task→project mapping in the append-only index
     // so later done/update/claim/activity resolve the board in O(1).
-    let project = args["project"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| super::board_router::resolve_current_project(home, emitter.as_str()));
+    //
+    // #2760: canonicalise the project id to its filesystem-safe SLUG — the project
+    // id IS the slug (board_router doc: the board dir name equals the project id).
+    // `resolve_current_project` already returns a slug, but a raw explicit `project`
+    // arg (e.g. `orgA/projA`) is stored raw in the index while `board_root` slugs
+    // the on-disk dir (`orgA_projA`) — so the STRICT router's index-vs-physical
+    // consistency check reads them as a mismatch (Unreadable) and the parent-project
+    // comparison compares slug-vs-raw. Slugging here makes the index entry, the
+    // board dir, and every later strict route agree. Idempotent on an already-safe id.
+    let project = crate::task_events::project_slug(
+        &args["project"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| super::board_router::resolve_current_project(home, emitter.as_str())),
+    );
     // #2117 P3a: `parent_id` is subtask COMPOSITION ("A is composed of B/C/D").
     // DP4 invariant — a subtask MUST live in its parent's project. Cross-project
     // composition breaks board isolation: `cascade_cancel_children` only replays

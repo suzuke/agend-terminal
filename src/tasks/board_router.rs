@@ -675,7 +675,13 @@ pub(super) fn route_task(
             // board than the id physically occupies is a hard inconsistency — fail
             // closed rather than trust either side.
             if let Some(indexed) = indexed_projects.first() {
-                if *indexed != project {
+                // #2760: compare on the canonical SLUG. The physical `project` is a
+                // board dir name (already slugged); a legacy index entry may hold the
+                // RAW project id (`orgA/projA`) whose board dir is the slug
+                // (`orgA_projA`) — those are the SAME board, not an inconsistency.
+                // Slugging both sides (idempotent on an already-safe id) avoids a
+                // false Unreadable for every raw-index task on a slug-unsafe project.
+                if project_slug(indexed) != project {
                     return Err(TaskRouteError::Unreadable {
                         path: board,
                         cause: format!(
