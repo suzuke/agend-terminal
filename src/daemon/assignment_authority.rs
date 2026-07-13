@@ -1732,6 +1732,58 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// B1 — persisting a NEW record (different `assignment_id`) at a key that ALREADY
+    /// holds a record must RETIRE the prior record's actionable inbox row under the
+    /// same branch lock (atomic revoke-and-replace). Otherwise the old actionable
+    /// `delivery_nonce` row is ORPHANED forever — a stale actionable assignment the
+    /// reviewer can still act on after it was superseded.
+    #[test]
+    fn b1_persist_supersedes_orphaned_prior_row() {
+        let home = tmp_home("b1");
+        let r1 = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+        persist(&home, &r1).unwrap();
+        durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:05Z").unwrap();
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &r1.delivery_nonce),
+            "R1's row is actionable after dispatch"
+        );
+
+        // A NEW dispatch at the SAME (repo,branch,target) with a DIFFERENT id.
+        let r2 = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:01:00Z");
+        assert_ne!(r1.assignment_id, r2.assignment_id, "R2 is a distinct record");
+        persist(&home, &r2).unwrap();
+
+        // R1's orphaned actionable row MUST be retired (superseded ⇒ not actionable).
+        assert!(
+            !crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &r1.delivery_nonce),
+            "R1's prior actionable row is superseded on re-persist (not orphaned)"
+        );
+        // R2 is the stored record.
+        assert_eq!(
+            get(&home, "o/r", "feat/x", "reviewer").unwrap().assignment_id,
+            r2.assignment_id,
+            "R2 is the stored authority record"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// B1 — re-persisting the SAME record (same `assignment_id`) is idempotent and
+    /// must NOT retire its own still-actionable row.
+    #[test]
+    fn b1_persist_same_id_is_idempotent_no_supersede() {
+        let home = tmp_home("b1-idem");
+        let r1 = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+        persist(&home, &r1).unwrap();
+        durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:05Z").unwrap();
+        // Re-persist the identical record (same assignment_id + nonce).
+        persist(&home, &r1).unwrap();
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &r1.delivery_nonce),
+            "same-id re-persist keeps its own actionable row (idempotent, no self-supersede)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// B4(b) — a CORRUPT markers file must NOT be silently read as an EMPTY
     /// (zero-terminals) set. `record_terminal` reads the RETAINED marker set to
     /// append to; if a corrupt file read as default-empty, the subsequent write
