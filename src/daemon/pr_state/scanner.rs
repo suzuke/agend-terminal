@@ -550,41 +550,23 @@ pub fn scan_and_emit_with(
             }
         }
 
-        match result {
-            Ok(Some(ScanAction::Remove)) => {
-                let _ = remove(home, &repo, &branch);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo,
-                    branch = %branch,
-                    error = %e,
-                    "#972 pr_state: post-emit save failed"
-                );
-            }
-            _ => {}
-        }
-        // [C1 / #1842] Record the terminal emit in the persistent ledger AFTER the
-        // flock drops (mirrors the deferred enqueue — keeps file I/O off the
-        // PR-state lock). Done regardless of Saved/Remove: the announce happened.
-        if emitted_terminal {
-            if let Some(k) = &terminal_ledger_key {
-                record_terminal_emitted(home, k);
-            }
-        }
-        // t-…-17 A7 (I18/I19): a terminal PR generation durably records its
-        // pr_number in the reviewer-assignment authority's RETAINED marker set and
-        // CAS-tombstones ONLY records whose stored pr_number matches — NEVER a
-        // different generation (no force-bind by branch, no unbound window). Done
-        // POST-FLOCK (the pr_state flock is released here): `record_terminal` takes
-        // ONLY the assignment lock, so it is assignment-lock-with-no-pr_state-flock —
-        // it can NEVER nest under the pr_state flock, preserving the global
+        // t-…-17 A7 (I18/I19) — CRASH-SAFETY ORDER: durably record the terminal
+        // generation's marker + tombstone BEFORE the pr_state file is removed below.
+        // The marker is what the reconciler's A10a keys on; if the file were removed
+        // FIRST, a crash before this write would lose BOTH — on restart CI recreates
+        // the file NON-terminal (record_ci_result only applies CiObserved), the
+        // terminal is never re-observed, the marker is never written, and the merged
+        // PR's assignment record RESURRECTS forever. With this ordering a crash
+        // between the marker write and the remove leaves the file present, so the
+        // terminal is re-observed next scan and `record_terminal` (idempotent) retries.
+        //
+        // Done POST-FLOCK (the pr_state flock is released here): `record_terminal`
+        // takes ONLY the assignment lock, so it is assignment-lock-with-no-pr_state-
+        // flock — it can NEVER nest under the pr_state flock, preserving the global
         // assignment-OUTER / pr_state-INNER order (record_ci_result's A6 drain is the
-        // only assignment→pr_state path; nothing goes pr_state→assignment). Fires on
-        // every scan tick the snapshot is terminal (idempotent: the marker is not
-        // duplicated and the tombstone is a no-op once done), so it lands reliably
-        // before the eventual file removal; the reconciler's A10a restart-repair
-        // backstops the rare crash between the marker write and the tombstone.
+        // only assignment→pr_state path; nothing goes pr_state→assignment). It records
+        // ONLY records whose stored pr_number matches — NEVER a different generation
+        // (no force-bind by branch, no unbound window).
         if let Some(kind) = crate::daemon::assignment_authority::terminal_kind_of(&snapshot) {
             if snapshot.pr_number != 0 {
                 match crate::daemon::assignment_authority::record_terminal(
@@ -605,6 +587,30 @@ pub fn scan_and_emit_with(
                         "t-…-17 A7: record_terminal failed (reconciler A10a will retry)"
                     ),
                 }
+            }
+        }
+        match result {
+            Ok(Some(ScanAction::Remove)) => {
+                // The durable terminal marker is already recorded above, so removing
+                // the pr_state file here can never lose it (crash-safe ordering).
+                let _ = remove(home, &repo, &branch);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo,
+                    branch = %branch,
+                    error = %e,
+                    "#972 pr_state: post-emit save failed"
+                );
+            }
+            _ => {}
+        }
+        // [C1 / #1842] Record the terminal emit in the persistent ledger AFTER the
+        // flock drops (mirrors the deferred enqueue — keeps file I/O off the
+        // PR-state lock). Done regardless of Saved/Remove: the announce happened.
+        if emitted_terminal {
+            if let Some(k) = &terminal_ledger_key {
+                record_terminal_emitted(home, k);
             }
         }
         // #1888 phase-2: a PR reaching a terminal state (merged / closed)
@@ -2430,6 +2436,40 @@ mod tests {
             "replayed terminal-generation record stays removed after restart (A10a)"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t-…-17 CRASH-SAFETY invariant: the durable terminal MARKER (`record_terminal`)
+    /// MUST be written BEFORE the pr_state file is `remove`d. Otherwise a crash
+    /// between the remove and the marker write loses BOTH — on restart CI recreates
+    /// the file NON-terminal (record_ci_result only applies CiObserved), so the
+    /// terminal is never re-observed, the marker is never written, and the merged
+    /// PR's assignment record RESURRECTS and re-reserves forever (B15/B17). The
+    /// reconciler's A10a cannot backstop a marker that was never written. Source-order
+    /// pin: prod-sliced (test section excluded) + concat-built needles so it can never
+    /// self-satisfy — same shape as the #1617 lock-order pins above.
+    #[test]
+    fn terminal_marker_recorded_before_pr_state_file_removed() {
+        let src = include_str!("scanner.rs");
+        let cfg_test = ["#[cfg(", "test)]"].concat();
+        let prod = match src.find(&cfg_test) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let marker_needle = ["record_", "terminal("].concat();
+        let remove_needle = ["remove(home, ", "&repo, &branch)"].concat();
+        let marker_at = prod
+            .find(&marker_needle)
+            .expect("assignment_authority::record_terminal call present in prod");
+        let remove_at = prod
+            .find(&remove_needle)
+            .expect("pr_state remove(home, &repo, &branch) call present in prod");
+        assert!(
+            marker_at < remove_at,
+            "the durable terminal marker (record_terminal) MUST be written BEFORE the \
+             pr_state file is removed — a crash between them would lose the marker AND \
+             the file, resurrecting the merged PR's assignment record (A10a cannot \
+             backstop a marker that was never written)"
+        );
     }
 }
 
