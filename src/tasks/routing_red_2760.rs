@@ -196,3 +196,155 @@ fn link_branch_to_task_same_branch_is_idempotent_noop_2760() {
         "re-linking the SAME branch is an idempotent no-op"
     );
 }
+
+// ── #2760 item 1: route-local STRICT complete-record proof + locked EOF repair ──
+//
+// The router-only strict reader treats ANY complete (newline-terminated) malformed
+// record — in task_events OR task_index — as `Unreadable` (never a silent skip like
+// the fleet-wide `replay_at`), tolerating ONLY a final unterminated EOF fragment,
+// which it repairs once under the writer lock and then re-reads.
+
+/// Append raw bytes to `path` verbatim (no trailing newline added) — used to inject
+/// a COMPLETE malformed record (with `\n`) or a torn EOF fragment (without `\n`).
+fn append_raw(path: &Path, bytes: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open raw append");
+    write!(f, "{bytes}").expect("raw append");
+}
+
+fn events_log(home: &Path, project: &str) -> PathBuf {
+    board_root(home, project).join("task_events.jsonl")
+}
+
+/// RED: a COMPLETE (newline-terminated) malformed task-event record makes the
+/// board's history unprovable → `Unreadable`. Pre-item-1 the router used the
+/// fleet-wide `replay_at`, which SKIPS the corrupt line (#1988) — so the id still
+/// resolved `Ok`, silently trusting a partial board (the skipped line could have
+/// been the very Created/Cancelled event that decides the route).
+#[test]
+fn route_task_complete_malformed_event_record_is_unreadable_2760() {
+    let home = tmp_home("evt-malformed");
+    seed_task_on_board(&home, "default", "t-2760-evtbad");
+    // A complete (has trailing '\n') non-JSON record mid-log.
+    append_raw(&events_log(&home, "default"), "{not valid json at all\n");
+
+    match load_routed(&home, "t-2760-evtbad") {
+        Err(TaskRouteError::Unreadable { .. }) => {}
+        other => panic!(
+            "a complete-malformed task-event record must fail closed as Unreadable \
+             (never silently skipped), got {other:?}"
+        ),
+    }
+}
+
+/// RED: a valid-JSON record with a `schema_version` newer than supported is a
+/// forward-incompat hazard → `Unreadable` (same as the fleet-wide fail-closed abort,
+/// but surfaced as a typed route error).
+#[test]
+fn route_task_future_schema_event_record_is_unreadable_2760() {
+    let home = tmp_home("evt-future");
+    seed_task_on_board(&home, "default", "t-2760-evtfut");
+    append_raw(
+        &events_log(&home, "default"),
+        "{\"schema_version\":9999,\"seq\":1,\"event\":{}}\n",
+    );
+
+    match load_routed(&home, "t-2760-evtfut") {
+        Err(TaskRouteError::Unreadable { .. }) => {}
+        other => panic!("a future-schema task-event record must be Unreadable, got {other:?}"),
+    }
+}
+
+/// GREEN behaviour: a final unterminated EOF fragment (torn tail from a crash
+/// mid-append) is the ONE tolerable case — repaired under the writer lock, then the
+/// route resolves. The log is left newline-terminated with the fragment gone.
+#[test]
+fn route_task_repairs_final_eof_fragment_then_resolves_2760() {
+    let home = tmp_home("evt-eof");
+    seed_task_on_board(&home, "default", "t-2760-eof");
+    let log = events_log(&home, "default");
+    // A torn tail: non-JSON AND no trailing newline (unterminated).
+    append_raw(&log, "{torn half-written tail no newline");
+    assert!(
+        !std::fs::read_to_string(&log).unwrap().ends_with('\n'),
+        "precondition: log ends in an unterminated fragment"
+    );
+
+    let routed = load_routed(&home, "t-2760-eof")
+        .expect("a torn EOF fragment must be repaired, then the route resolves");
+    assert_eq!(routed.task.id, "t-2760-eof");
+
+    let after = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        after.ends_with('\n') && !after.contains("torn half-written tail"),
+        "the torn fragment must be truncated out of the live log under the lock"
+    );
+}
+
+/// RED: a COMPLETE (newline-terminated) malformed `task_index` record is
+/// `Unreadable` — it could hide a CONFLICTING project entry for the target id, so
+/// tolerating it would let an `Ambiguous` route slip through as unique. Pre-item-1
+/// the index read flagged it advisory and pressed on.
+#[test]
+fn route_task_complete_malformed_index_record_is_unreadable_2760() {
+    let home = tmp_home("idx-malformed");
+    seed_task_on_board(&home, "proj-i", "t-2760-idxbad");
+    super::board_router::record_task_project(&home, "t-2760-idxbad", "proj-i")
+        .expect("record index");
+    // A complete (trailing '\n') non-JSON index record.
+    append_raw(&home.join("task_index.jsonl"), "{not a valid index entry\n");
+
+    match load_routed(&home, "t-2760-idxbad") {
+        Err(TaskRouteError::Unreadable { .. }) => {}
+        other => panic!(
+            "a complete-malformed task_index record must fail closed as Unreadable, got {other:?}"
+        ),
+    }
+}
+
+/// GREEN behaviour: a final unterminated EOF fragment in `task_index.jsonl` is
+/// repaired under the `task_index` lock, then the route resolves.
+#[test]
+fn route_task_repairs_index_eof_fragment_then_resolves_2760() {
+    let home = tmp_home("idx-eof");
+    seed_task_on_board(&home, "proj-ie", "t-2760-idxeof");
+    super::board_router::record_task_project(&home, "t-2760-idxeof", "proj-ie")
+        .expect("record index");
+    let index = home.join("task_index.jsonl");
+    append_raw(&index, "{torn index tail no newline");
+    assert!(!std::fs::read_to_string(&index).unwrap().ends_with('\n'));
+
+    let routed = load_routed(&home, "t-2760-idxeof")
+        .expect("a torn task_index EOF fragment must be repaired, then the route resolves");
+    assert_eq!(routed.task.id, "t-2760-idxeof");
+
+    let after = std::fs::read_to_string(&index).unwrap();
+    assert!(
+        after.ends_with('\n') && !after.contains("torn index tail"),
+        "the torn task_index fragment must be truncated out under the lock"
+    );
+}
+
+/// RED (forcing proof): a lone index entry that names a DIFFERENT board than the id
+/// physically occupies is a hard inconsistency → `Unreadable`, never trusting either
+/// side.
+#[test]
+fn route_task_index_physical_board_mismatch_is_unreadable_2760() {
+    let home = tmp_home("idx-mismatch");
+    seed_task_on_board(&home, "proj-real", "t-2760-mm");
+    // Index points at a board the id does NOT physically occupy.
+    super::board_router::record_task_project(&home, "t-2760-mm", "proj-wrong")
+        .expect("record index");
+
+    match load_routed(&home, "t-2760-mm") {
+        Err(TaskRouteError::Unreadable { .. }) => {}
+        other => panic!(
+            "an index entry naming a different board than the physical location must be \
+             Unreadable, got {other:?}"
+        ),
+    }
+}

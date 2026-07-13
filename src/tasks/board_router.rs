@@ -430,59 +430,150 @@ pub(super) fn enumerate_projects(home: &Path) -> Result<Vec<String>, TaskRouteEr
 
 // ── #2760 strict routed authority ──────────────────────────────────
 
-/// The `task_index.jsonl` signal for one id: the distinct project ids recorded for
-/// it, plus whether any non-empty line was CORRUPT (unparseable). The index is a
-/// CACHE — [`route_task`] proves uniqueness by a physical board scan, NOT by
-/// trusting this — but a corrupt line that could be a hidden entry for the target
-/// is surfaced (never silently skipped) so an *absent* physical scan fails closed
-/// rather than falsely reporting `NotFound`.
-enum IndexSignal {
-    /// The index file exists but a hard I/O error prevented reading it → the route
-    /// cannot be proven → `Unreadable`. A *missing* file is legacy/pre-index, NOT
-    /// this variant.
-    Io(String),
-    Read {
-        /// Distinct `project_id`s the index records for the target id (first-seen
-        /// order). More than one = conflicting entries.
-        projects: Vec<String>,
-        /// A non-empty index line failed to parse — it MIGHT be a hidden entry for
-        /// the target id, so it is not silently ignored where uniqueness depends on
-        /// it (the absent case).
-        corrupt: bool,
-    },
+/// #2760 item 1: outcome of one strict `task_index` scan pass (no repair).
+/// `Fragment` = the file ended in an unterminated, unparseable torn tail — the ONE
+/// repairable case.
+enum IndexScan {
+    /// The DISTINCT project ids the index records for the target id (0, or >1 =
+    /// conflicting), first-seen order.
+    Projects(Vec<String>),
+    Fragment,
 }
 
-/// Read the index signal for `task_id`. A missing index is legacy → `Read{[],false}`;
-/// a hard read failure is `Io`; a non-empty unparseable line sets `corrupt`.
-fn index_signal(home: &Path, task_id: &str) -> IndexSignal {
-    let content = match std::fs::read_to_string(index_path(home)) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return IndexSignal::Read {
-                projects: Vec::new(),
-                corrupt: false,
-            };
+/// #2760 item 1: STRICT `task_index` read for the router. Unlike the advisory read
+/// it replaced (which flagged a corrupt line and pressed on), a COMPLETE
+/// (newline-terminated) malformed record is a hard [`TaskRouteError::Unreadable`]:
+/// it could be a hidden CONFLICTING entry for the target id, so tolerating it would
+/// let an `Ambiguous` route slip through as unique. ONLY a final unterminated EOF
+/// fragment is tolerable — repaired ONCE under the SAME `task_index.jsonl.lock`,
+/// then re-read (a fragment that survives one repair is hard corruption; bounded,
+/// never a repair loop). The index is still a CACHE — [`route_task`] proves
+/// uniqueness by the physical board scan — but its integrity must be provable.
+fn index_projects_strict(home: &Path, task_id: &str) -> Result<Vec<String>, TaskRouteError> {
+    match index_scan_once(home, task_id)? {
+        IndexScan::Projects(p) => Ok(p),
+        IndexScan::Fragment => {
+            repair_index_trailing_fragment(home)?;
+            match index_scan_once(home, task_id)? {
+                IndexScan::Projects(p) => Ok(p),
+                IndexScan::Fragment => Err(TaskRouteError::Unreadable {
+                    path: index_path(home),
+                    cause: "task_index trailing fragment persisted after one repair".to_string(),
+                }),
+            }
         }
-        Err(e) => return IndexSignal::Io(e.to_string()),
+    }
+}
+
+/// One strict scan of `task_index.jsonl` (no repair). A missing index is legacy →
+/// `Projects([])`; a hard read failure or any complete-malformed record →
+/// `Unreadable`; a trailing unparseable fragment → `Fragment`.
+fn index_scan_once(home: &Path, task_id: &str) -> Result<IndexScan, TaskRouteError> {
+    let path = index_path(home);
+    let unreadable = |cause: String| TaskRouteError::Unreadable {
+        path: path.clone(),
+        cause,
     };
-    let mut projects: Vec<String> = Vec::new();
-    let mut corrupt = false;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // A MISSING index is legacy/pre-index — not an error (the physical scan is
+        // the authority); an existing-but-unreadable index fails closed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IndexScan::Projects(Vec::new()))
         }
-        match serde_json::from_str::<IndexEntry>(line) {
+        Err(e) => return Err(unreadable(format!("task_index read failed: {e}"))),
+    };
+    let (complete, fragment) = crate::task_events::split_complete_and_fragment(&content);
+    let mut projects: Vec<String> = Vec::new();
+    for line in complete {
+        let entry = serde_json::from_str::<IndexEntry>(line).map_err(|e| {
+            unreadable(format!(
+                "complete-malformed task_index record (could hide a conflicting entry): {e}"
+            ))
+        })?;
+        if entry.task_id == task_id && !projects.contains(&entry.project_id) {
+            projects.push(entry.project_id);
+        }
+    }
+    if let Some(frag) = fragment {
+        match serde_json::from_str::<IndexEntry>(frag) {
+            // A whole entry missing only its newline — apply it.
             Ok(entry) => {
                 if entry.task_id == task_id && !projects.contains(&entry.project_id) {
                     projects.push(entry.project_id);
                 }
             }
-            // A non-empty line that won't parse — could be a torn/half-written entry
-            // for ANY id (possibly the target). Recorded, not silently dropped.
-            Err(_) => corrupt = true,
+            // A torn tail → repairable.
+            Err(_) => return Ok(IndexScan::Fragment),
         }
     }
-    IndexSignal::Read { projects, corrupt }
+    Ok(IndexScan::Projects(projects))
+}
+
+/// Repair a `task_index.jsonl` torn tail: under the SAME `task_index.jsonl.lock`
+/// [`record_task_project`] holds, re-read, and — only if the file STILL ends in an
+/// unterminated, unparseable fragment — quarantine it and truncate to the last
+/// newline (fsync + durable parent). Mirrors the task_events EOF repair.
+fn repair_index_trailing_fragment(home: &Path) -> Result<(), TaskRouteError> {
+    let path = index_path(home);
+    let unreadable = |cause: String| TaskRouteError::Unreadable {
+        path: path.clone(),
+        cause,
+    };
+    let lock_path = path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| unreadable(format!("acquire task_index lock for EOF repair: {e}")))?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(unreadable(format!("re-read task_index under lock: {e}"))),
+    };
+    if content.is_empty() || content.ends_with('\n') {
+        return Ok(());
+    }
+    let cut = content.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let fragment = &content[cut..];
+    if fragment.trim().is_empty() {
+        return Ok(());
+    }
+    // A valid entry missing only its newline — keep it.
+    if serde_json::from_str::<IndexEntry>(fragment).is_ok() {
+        return Ok(());
+    }
+    quarantine_index_torn_tail(home, fragment);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|e| unreadable(format!("open task_index for truncate: {e}")))?;
+    f.set_len(cut as u64)
+        .map_err(|e| unreadable(format!("truncate task_index torn tail: {e}")))?;
+    f.sync_all()
+        .map_err(|e| unreadable(format!("fsync task_index after truncate: {e}")))?;
+    crate::store::fsync_parent_dir(&path);
+    tracing::warn!(
+        tag = "#2760-index-eof-fragment-repaired",
+        home = %home.display(),
+        bytes = fragment.len(),
+        "router repaired a task_index torn tail (truncated to last newline; quarantined)"
+    );
+    Ok(())
+}
+
+/// Quarantine a `task_index` torn tail under `task_index.recovery/<ts>/` before it
+/// is truncated out of the index.
+fn quarantine_index_torn_tail(home: &Path, fragment: &str) {
+    use std::io::Write;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let dir = home.join("task_index.recovery").join(&ts);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut rf) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("task_index.jsonl"))
+    {
+        let _ = writeln!(rf, "{fragment}");
+        let _ = rf.sync_all();
+    }
 }
 
 /// #2760 STRICT resolution: the ONE board that authoritatively holds `task_id` plus
@@ -509,15 +600,10 @@ pub(super) fn route_task(
     let tid = TaskId(task_id.to_string());
 
     // ── index cache: hard-read + conflict signals (NOT the uniqueness authority) ──
-    let (indexed_projects, index_corrupt) = match index_signal(home, task_id) {
-        IndexSignal::Io(cause) => {
-            return Err(TaskRouteError::Unreadable {
-                path: index_path(home),
-                cause,
-            });
-        }
-        IndexSignal::Read { projects, corrupt } => (projects, corrupt),
-    };
+    // #2760 item 1: STRICT read — a hard I/O error or any complete-malformed record
+    // is `Unreadable`, not an advisory flag (a corrupt line could hide a conflicting
+    // entry for the target id). Only a final EOF fragment is repaired-and-retried.
+    let indexed_projects = index_projects_strict(home, task_id)?;
     if indexed_projects.len() > 1 {
         return Err(TaskRouteError::Ambiguous {
             candidates: indexed_projects,
@@ -526,16 +612,21 @@ pub(super) fn route_task(
     }
 
     // ── authoritative physical scan of default + EVERY project board ──
-    // Enumeration failure (unreadable boards/ dir) → Unreadable; a board that cannot
-    // be replayed → Unreadable even after a hit (the id might ALSO live there).
+    // #2760 item 1: the STRICT router-only replay proves each board's history is
+    // complete — a complete-malformed task-event record is `Unreadable` (never
+    // silently skipped, unlike the fleet-wide `replay_at`), tolerating only a final
+    // EOF fragment (repaired under the writer lock). Enumeration failure (unreadable
+    // boards/ dir) → Unreadable; a board that cannot be replayed → Unreadable even
+    // after a hit (the id might ALSO live there).
     let mut hits: Vec<(String, PathBuf, crate::task_events::TaskRecord)> = Vec::new();
     for project in enumerate_projects(home)? {
         let board = board_root(home, &project);
-        let state =
-            crate::task_events::replay_at(&board).map_err(|e| TaskRouteError::Unreadable {
-                path: board.clone(),
-                cause: e.to_string(),
-            })?;
+        let state = crate::task_events::replay_strict_at(&board).map_err(|e| {
+            TaskRouteError::Unreadable {
+                path: e.path,
+                cause: e.cause,
+            }
+        })?;
         if let Some(record) = state.tasks.get(&tid) {
             hits.push((project, board, record.clone()));
         }
@@ -568,17 +659,15 @@ pub(super) fn route_task(
         }
         None => {
             // Zero physical boards hold the id. If the index CLAIMS it exists (a
-            // parseable entry) OR a corrupt line MIGHT be a hidden entry for it, the
-            // absence is unprovable → Unreadable (indexed-but-absent is NEVER
-            // NotFound/default). Only a clean, entry-free, corruption-free index
-            // yields a definitive NotFound.
-            if !indexed_projects.is_empty() || index_corrupt {
+            // parseable entry), the absence is unprovable → Unreadable
+            // (indexed-but-absent is NEVER NotFound/default). A complete-malformed
+            // index line already failed closed as Unreadable in
+            // `index_projects_strict`, so only a clean, entry-free index reaches the
+            // definitive NotFound here.
+            if !indexed_projects.is_empty() {
                 Err(TaskRouteError::Unreadable {
                     path: index_path(home),
-                    cause: format!(
-                        "task_index claims '{task_id}' exists (or a corrupt line may) but no \
-                         board holds it"
-                    ),
+                    cause: format!("task_index claims '{task_id}' exists but no board holds it"),
                 })
             } else {
                 Err(TaskRouteError::NotFound)
