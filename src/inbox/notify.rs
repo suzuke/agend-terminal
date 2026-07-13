@@ -623,9 +623,6 @@ pub(crate) fn build_pending_pointer(
 /// (`ci_delivery_ledger::deliver_once`, whose closure does the enqueue) can then
 /// WAKE this exact persisted row afterward via [`wake_persisted_pointer`] without
 /// re-reading the inbox to recover the id.
-// Wired by the #2749 2b-GREEN scanner Behind arm (this RED-side helper lands
-// with its failing tests; production consumes it in the next commit).
-#[allow(dead_code)]
 pub fn stamp_message_id(msg: &mut InboxMessage) -> String {
     storage::ensure_msg_id(msg);
     msg.id.clone().unwrap_or_default()
@@ -640,8 +637,6 @@ pub fn stamp_message_id(msg: &mut InboxMessage) -> String {
 /// Best-effort: a dropped wake returns `Err` for the caller to LOG and MUST NOT
 /// invalidate the durable delivery — the recipient still has the row and sees it
 /// on its next drain.
-// Wired by the #2749 2b-GREEN scanner Behind arm.
-#[allow(dead_code)]
 pub fn wake_persisted_pointer(
     home: &Path,
     target: &str,

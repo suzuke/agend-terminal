@@ -140,6 +140,24 @@ pub fn scan_and_emit_with(
         // clobbered. pr-ready and the terminal arms are mutually exclusive per
         // scan (distinct merge_state), so this never coexists with pending_emits.
         let mut pending_ready: Option<(String, crate::inbox::InboxMessage, String)> = None;
+        // #2749: [pr-needs-rebase] notices for a proven-BEHIND merge-ready PR.
+        // Collected under the flock, delivered AFTER it drops through the durable
+        // #2745 ledger. Each carries (recipient, pr_number, head_sha, msg_id, from,
+        // msg): the msg id is PRE-STAMPED (crate::inbox::stamp_message_id) so the
+        // post-flock wake can point at the exact persisted row. The DURABLE ledger
+        // enqueue is a plain storage append (NOT self-IPC); the separate best-effort
+        // pointer WAKE is the self-IPC vector — so the wake runs AFTER the flock is
+        // dropped (#1617 lock-while-blocking class), and a dropped wake never
+        // invalidates the durable row.
+        #[allow(clippy::type_complexity)]
+        let mut pending_needs_rebase: Vec<(
+            String,
+            u64,
+            String,
+            String,
+            String,
+            crate::inbox::InboxMessage,
+        )> = Vec::new();
         // [C1 / #1842] Terminal-event identity for the persistent emit-dedup
         // ledger. Checked lock-free here (before the flock) and recorded
         // post-flock if we emit — so a recreated state file (lingering-CI
@@ -226,12 +244,59 @@ pub fn scan_and_emit_with(
                             );
                             pending_ready = Some((recipient, msg, state.head_sha.clone()));
                         }
-                        gate => {
+                        FreshnessGate::Behind { behind_by } => {
+                            // #2749: PROVEN behind current main — suppress pr-ready
+                            // (ready flag untouched; #2747 stays the hard backstop)
+                            // and durably emit ONE [pr-needs-rebase] per (repo, PR,
+                            // head, recipient) to the DEDUPED {merge authority, PR
+                            // owner}. For a valid Behind tuple observed_base ==
+                            // checked_base, so observed_base_sha is the current-main
+                            // tip. Deferred post-flock like pending_ready.
+                            let main_sha = state
+                                .observed_base_sha
+                                .clone()
+                                .or_else(|| state.freshness_checked_base_sha.clone())
+                                .unwrap_or_default();
+                            let body = format_needs_rebase_body(state, behind_by, &main_sha);
+                            // Dedupe recipients BEFORE the ledger keys (owner ==
+                            // authority ⇒ one notice, not two).
+                            let mut recipients =
+                                vec![resolve_merge_authority(home, state), resolve_author(state)];
+                            recipients.sort();
+                            recipients.dedup();
+                            for recipient in recipients {
+                                let mut msg = build_event_message(
+                                    "pr-needs-rebase",
+                                    &recipient,
+                                    state,
+                                    body.clone(),
+                                );
+                                // Pre-stamp the id so the post-flock wake can point
+                                // at the exact row the ledger closure enqueues.
+                                let id = crate::inbox::stamp_message_id(&mut msg);
+                                let from = msg.from.clone();
+                                pending_needs_rebase.push((
+                                    recipient,
+                                    state.pr_number,
+                                    state.head_sha.clone(),
+                                    id,
+                                    from,
+                                    msg,
+                                ));
+                            }
+                            tracing::info!(
+                                repo = %state.repo,
+                                branch = %state.branch,
+                                head = %state.head_sha,
+                                behind_by,
+                                "#2749 pr_state: [pr-needs-rebase] queued (behind main; deliver after flock drop)"
+                            );
+                        }
+                        FreshnessGate::Suppress => {
                             tracing::debug!(
                                 repo = %state.repo,
                                 branch = %state.branch,
                                 head = %state.head_sha,
-                                ?gate,
                                 "#2749 pr_state: [pr-ready-for-merge] suppressed — latest-main ancestry not proven fresh"
                             );
                         }
@@ -398,6 +463,75 @@ pub fn scan_and_emit_with(
                         s.ready_emitted_for_sha = None;
                     }
                 });
+            }
+        }
+
+        // #2749 (#1617 class): deliver the deferred [pr-needs-rebase] notices
+        // lock-free. deliver_once is at-least-once (enqueue-before-record): a
+        // duplicate key SUPPRESSES, a missing key (fresh head, or a restart without
+        // the record) DELIVERS — so N ticks emit exactly once per (repo, PR, head,
+        // recipient), a head move rekeys, and a restart with the record stays quiet.
+        // The DURABLE enqueue is a plain storage append; the recipient is then WOKEN
+        // by a SEPARATE best-effort canonical pointer (the self-IPC vector) ONLY when
+        // the row is guaranteed persisted (Delivered | RecordFailedAfterEnqueue —
+        // see `wake_after_ledger`). A dropped wake is logged and NEVER invalidates
+        // the durable delivery (the recipient still sees the row on its next drain).
+        for (recipient, pr_number, head_sha, id, from, msg) in pending_needs_rebase {
+            let key = match crate::daemon::ci_delivery_ledger::DeliveryKey::new(
+                &repo,
+                pr_number,
+                &head_sha,
+                &recipient,
+                "pr-needs-rebase",
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        head = %head_sha,
+                        recipient = %recipient,
+                        "#2749 pr_state: [pr-needs-rebase] invalid delivery key — skipping notice"
+                    );
+                    continue;
+                }
+            };
+            let deliver_to = recipient.clone();
+            let result = crate::daemon::ci_delivery_ledger::deliver_once(
+                home,
+                &key,
+                chrono::Utc::now(),
+                // Durable storage append only — NOT self-IPC (the wake below is).
+                || crate::inbox::enqueue(home, &deliver_to, msg),
+            );
+            // Wake the recipient ONLY when the row is durably persisted.
+            if wake_after_ledger(&result) {
+                if let Err(e) = crate::inbox::wake_persisted_pointer(
+                    home,
+                    &recipient,
+                    &id,
+                    "pr-needs-rebase",
+                    &from,
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        recipient = %recipient,
+                        head = %head_sha,
+                        "#2749 pr_state: [pr-needs-rebase] pointer wake dropped — delivery remains durable"
+                    );
+                }
+            }
+            match &result {
+                Ok(outcome) => tracing::info!(
+                    recipient = %recipient,
+                    head = %head_sha,
+                    ?outcome,
+                    "#2749 pr_state: [pr-needs-rebase] ledger delivery"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    recipient = %recipient,
+                    "#2749 pr_state: [pr-needs-rebase] deliver_once failed"
+                ),
             }
         }
 
@@ -778,6 +912,35 @@ fn apply_gh_observations(
     state.last_gh_state = Some(meta.clone());
 }
 
+/// #2749: the [pr-needs-rebase] notice body for a proven-BEHIND merge-ready PR.
+/// Carries the PR ref, the head SHA + the current-main SHA it trails, the
+/// behind-by count, and a reviewer re-stamp checklist — a rebase INVALIDATES the
+/// prior verdict, so ancestry + fresh full CI + fresh exact-head review must all
+/// be re-established at the NEW head before the PR can merge (a stale verdict does
+/// NOT carry across a rebase). `behind_by` and `main_sha` come from the proven
+/// freshness tuple (the gate returned `Behind`), so they are non-zero / non-empty.
+fn format_needs_rebase_body(state: &PrState, behind_by: u64, main_sha: &str) -> String {
+    let pr_id = if state.pr_number > 0 {
+        format!("{}#{}", state.repo, state.pr_number)
+    } else {
+        format!("{}@{}", state.repo, state.branch)
+    };
+    let head_short = &state.head_sha[..8.min(state.head_sha.len())];
+    let main_short = &main_sha[..8.min(main_sha.len())];
+    format!(
+        "[pr-needs-rebase] {pr_id} is BEHIND main by {behind_by} commit(s) — head \
+         {head_short} trails main {main_short}. Merge-ready gating is SUPPRESSED \
+         until the head is rebased onto current main.\n\n\
+         ⚠ Re-stamp checklist (a rebase INVALIDATES the prior verdict):\n\
+         1. Rebase `{branch}` onto latest main and force-push.\n\
+         2. Wait for FRESH full CI green on the rebased head.\n\
+         3. Obtain FRESH exact-head review re-verification (dual for high-risk).\n\
+         4. Do NOT merge on the stale verdict — ancestry ∧ CI ∧ review must all be \
+         at the NEW head.",
+        branch = state.branch,
+    )
+}
+
 fn build_event_message(
     kind: &str,
     _author: &str,
@@ -798,7 +961,6 @@ fn build_event_message(
 /// which the at-least-once ledger tolerates). NO wake on `Suppressed` (a prior tick
 /// already delivered + woke this exact key) or `EnqueueFailed` (no row persisted —
 /// nothing to point at). A wake failure never invalidates the durable delivery.
-#[allow(dead_code)] // wired by the #2749 2b-GREEN post-flock drain
 fn wake_after_ledger(
     res: &Result<
         crate::daemon::ci_delivery_ledger::DeliveryOutcome,
