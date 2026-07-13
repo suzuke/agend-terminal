@@ -109,9 +109,9 @@ fn api_port_published_before_agent_spawn_loop_completes() {
         .args(["--agents", "t3:/bin/sh"])
         .env("AGEND_HOME", &tmp)
         // Pin the stagger so the legacy agents-first ordering takes a
-        // deterministic ~4 s; the C1 reorder makes `api.port` appear
+        // deterministic ~2 s; the C1 reorder makes `api.port` appear
         // independently of this.
-        .env("AGEND_SPAWN_STAGGER_MS", "2000")
+        .env("AGEND_SPAWN_STAGGER_MS", "1000")
         // Disable any background work that could compete for startup time
         // and inflate the legacy budget (false positives), and silence
         // logs going to a real $HOME log dir.
@@ -121,11 +121,10 @@ fn api_port_published_before_agent_spawn_loop_completes() {
         .spawn()
         .expect("spawn agend-terminal daemon");
 
-    // Budget: well below 4 s (legacy wall time with N=3 + 2000 ms stagger)
+    // Budget: well below 2 s (legacy wall time with N=3 + 1000 ms stagger)
     // and well above the C1-reordered actual wall time (~50-200 ms even on
-    // slow CI, which can take up to ~1.6s). Poll cheaply so we don't add
-    // measurement noise.
-    let deadline = start + Duration::from_millis(3000);
+    // slow CI). Poll cheaply so we don't add measurement noise.
+    let deadline = start + Duration::from_millis(1500);
     let mut api_port_path: Option<PathBuf> = None;
     while Instant::now() < deadline {
         if let Some(p) = find_api_port(&tmp) {
