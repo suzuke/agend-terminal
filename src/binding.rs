@@ -15,6 +15,12 @@ use std::sync::{OnceLock, RwLock};
 /// bump; only a non-additive change to an existing field does.
 const BINDING_SCHEMA_VERSION: u64 = 1;
 
+pub(crate) mod release_guard;
+pub(crate) use release_guard::{
+    acquire_agent_mutation_lock, acquire_binding_file_lock, guarded_binding_disk_fresh,
+    snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
+};
+
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
@@ -286,9 +292,9 @@ pub fn bind_full(
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir_all {}: {e}", dir.display()))?;
     let path = dir.join("binding.json");
-    let lock_path = dir.join(".binding.json.lock");
-    let _lock = crate::store::acquire_file_lock(&lock_path)
-        .map_err(|e| format!("acquire_file_lock {}: {e}", lock_path.display()))?;
+    // S1: stable A lives outside runtime; legacy B stays for compatibility. A→B.
+    let _agent_lock = acquire_agent_mutation_lock(home, agent)?;
+    let _binding_lock = acquire_binding_file_lock(home, agent)?;
     // #2158 PR2: read the CURRENT on-disk binding UNDER the lock (the in-memory
     // index can be stale) — drives guard-b + the binding-CHANGE audit.
     let existing: Option<serde_json::Value> = std::fs::read_to_string(&path)

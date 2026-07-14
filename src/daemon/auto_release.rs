@@ -647,10 +647,23 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         tracing::info!(task_id = %intent.task_id, event, "auto_release: task has no assignee — dropping intent");
         return IntentOutcome::Done;
     };
-    let Some(binding) = crate::binding::read(home, &assignee) else {
-        // Already released / never bound → nothing to do (idempotent).
-        tracing::debug!(agent = %assignee, task_id = %intent.task_id, event, "auto_release: agent unbound — dropping intent");
-        return IntentOutcome::Done;
+    let (binding, binding_fingerprint) = match crate::binding::snapshot_guarded_binding(
+        home, &assignee,
+    ) {
+        Ok(crate::binding::GuardedBinding::Absent) => {
+            // Already released / never bound → nothing to do (idempotent).
+            tracing::debug!(agent = %assignee, task_id = %intent.task_id, event, "auto_release: agent unbound — dropping intent");
+            return IntentOutcome::Done;
+        }
+        Ok(crate::binding::GuardedBinding::Opaque(reason)) => {
+            tracing::warn!(agent = %assignee, %reason, "auto_release: opaque binding state — retaining for retry");
+            return IntentOutcome::Retry;
+        }
+        Ok(crate::binding::GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
+        Err(e) => {
+            tracing::warn!(agent = %assignee, error = %e, "auto_release: binding snapshot failed — retaining for retry");
+            return IntentOutcome::Retry;
+        }
     };
 
     // ── must-fix #5: eligibility — only dispatch leases get invariant-release.
@@ -774,53 +787,20 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
     // construction). Byte-identical — `should_release_now` + its equivalence pin.
     let release_now = should_release_now(&decision, releasable, reviewer_bypassed);
     if release_now {
-        // codex gap ②: CAS+release must be ONE atomic critical section under
-        // `.binding.json.lock` — the same lock `bind_full` holds (binding.rs:67)
-        // and the GC path uses (worktree_pool.rs:717). The pre-lock CAS above is
-        // only a cheap early-out; a concurrent bind_full from ANOTHER thread
-        // (MCP handler) could interleave between it and the release. So re-read
-        // + re-validate the FULL lease identity under the lock, then release in
-        // the same section. (`release_full` → `unbind` does NOT take this lock —
-        // binding.rs:119 just removes the file — so no deadlock, mirroring the
-        // pre-PR-1 merge path.)
-        let lock_path = crate::paths::runtime_dir(home)
-            .join(&assignee)
-            .join(".binding.json.lock");
-        let _lock = match crate::store::acquire_file_lock(&lock_path) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(agent = %assignee, error = %e, "auto_release: binding lock failed — retaining for retry");
-                return IntentOutcome::Retry;
-            }
-        };
-        let Some(live) = crate::binding::read(home, &assignee) else {
-            // Unbound under the lock → already released. Nothing to do.
-            return IntentOutcome::Done;
-        };
-        if let Some(snap) = intent.lease.as_ref() {
-            if &LeaseIdentity::from_binding(&assignee, &live) != snap {
-                tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: lease identity changed under lock (re-leased) — skip (TOCTOU CAS)");
-                return IntentOutcome::Done;
-            }
-        }
         let dirty = worktree_dirty.unwrap_or(false);
-        // PR-D·D5: route through the shared `janitor::dispose` Release arm
-        // (== `release_full(home, agent, false)`). The lock/CAS/re-validation above
-        // and the fail-closed retain-on-failure below stay in THIS caller (D5-Q1);
-        // dispose owns only the Release→release_full mechanism binding.
+        // S1: auto-release no longer carries a caller-held binding flock into the
+        // mechanism. It supplies the exact disk generation evaluated above; the
+        // shared release transaction owns A→L→A and the final raw fingerprint CAS.
         let crate::daemon::janitor::DispositionOutcome::Released(outcome) =
-            crate::daemon::janitor::dispose(
-                home,
-                crate::worktree::disposition::Disposition::Release,
-                &assignee,
-                None,
-                || Ok(()),
-            )
+            crate::daemon::janitor::dispose_release_exact(home, &assignee, &binding_fingerprint)
         else {
-            unreachable!("Release disposition yields Released");
+            unreachable!("exact Release disposition yields Released");
         };
         if outcome.released {
             tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, dirty, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
+            IntentOutcome::Done
+        } else if outcome.stale_fingerprint {
+            tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: exact binding fingerprint moved — dropping stale intent");
             IntentOutcome::Done
         } else {
             // #P1b: release_full is FAIL-CLOSED — dirty WIP that could not be

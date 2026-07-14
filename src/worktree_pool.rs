@@ -5,6 +5,48 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseTestPhase {
+    AfterBindingSnapshot,
+    BeforeWorktreeRemove,
+    BeforeNoticeEmit,
+    CheckoutBoundBeforeCommit,
+}
+
+#[cfg(test)]
+pub(crate) mod release_test_seam {
+    use super::ReleaseTestPhase;
+    use std::cell::RefCell;
+
+    type ReleaseHook = Box<dyn Fn(ReleaseTestPhase)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<ReleaseHook>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn(ReleaseTestPhase) + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) fn hit(phase: ReleaseTestPhase) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook(phase);
+            }
+        });
+    }
+}
+
 // #1639: the daemon-internal git wrapper lives in `git_helpers::git_bypass`
 // (the #781-centralized single source for the `AGEND_GIT_BYPASS=1` contract).
 // Call sites below go through it directly rather than a local copy.
@@ -178,6 +220,9 @@ pub struct ReleaseOutcome {
     pub dry_run_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Internal exact-CAS signal for auto-release. Not part of the MCP response.
+    #[serde(skip)]
+    pub(crate) stale_fingerprint: bool,
 }
 
 /// Delete the local branch ref after worktree release, IFF:
@@ -506,28 +551,59 @@ fn resolve_branch_cleanup(
     }
 }
 
-pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
+struct LockedRelease {
+    out: ReleaseOutcome,
+    notices: Vec<crate::worktree::ReleaseNotice>,
+    clear_refusal_marker: Option<PathBuf>,
+    finish_full_release: bool,
+    managed_verified: bool,
+    worktree_absent: bool,
+}
+
+fn idempotent_absent() -> ReleaseOutcome {
+    ReleaseOutcome {
+        released: true,
+        already_released: true,
+        ..ReleaseOutcome::default()
+    }
+}
+
+fn opaque_release(reason: String) -> ReleaseOutcome {
+    ReleaseOutcome {
+        error: Some(format!(
+            "release refused: opaque binding state ({reason}); binding evidence preserved"
+        )),
+        ..ReleaseOutcome::default()
+    }
+}
+
+fn stale_release() -> ReleaseOutcome {
+    ReleaseOutcome {
+        stale_fingerprint: true,
+        error: Some(
+            "release refused: binding fingerprint changed before destructive authority was reacquired"
+                .to_string(),
+        ),
+        ..ReleaseOutcome::default()
+    }
+}
+
+fn release_known_locked(
+    home: &Path,
+    agent: &str,
+    binding: &serde_json::Value,
+    dry_run: bool,
+) -> LockedRelease {
     let mut out = ReleaseOutcome::default();
-
-    let Some(binding) = crate::binding::read(home, agent) else {
-        // #1465: release is idempotent. "No binding" means the release
-        // target state is already reached → report a success no-op rather
-        // than an error, so automated dispatch/release can treat release as
-        // a safe always-succeeds operation. (A genuine cleanup failure WITH
-        // a binding present still returns `released:false` + `error` below —
-        // idempotent success applies ONLY to this nothing-to-do path.)
-        out.released = true;
-        out.already_released = true;
-        return out;
-    };
-
+    let mut notices = Vec::new();
+    let mut clear_refusal_marker = None;
     let wt_path_str = binding["worktree"].as_str().unwrap_or("");
     let mut managed_verified = false;
     let mut worktree_absent = false;
 
     if !wt_path_str.is_empty() {
         let wt_path = Path::new(wt_path_str);
-        let source_repo = source_repo_from_binding(&binding, wt_path);
+        let source_repo = source_repo_from_binding(binding, wt_path);
 
         if dry_run {
             // #t-21: dry_run is observation-only. Classify the worktree with the
@@ -543,7 +619,14 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                     "worktree at {} has no .agend-managed marker — refusing to remove (binding NOT cleared)",
                     wt_path.display()
                 ));
-                return out;
+                return LockedRelease {
+                    out,
+                    notices,
+                    clear_refusal_marker,
+                    finish_full_release: false,
+                    managed_verified,
+                    worktree_absent,
+                };
             } else {
                 managed_verified = true;
             }
@@ -560,8 +643,10 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                 // No caller identity on the background pool-sweep path → None
                 // routes the WIP-preserved notice to the agent's team orchestrator
                 // (fallback: operator inbox) rather than a hardcoded recipient.
-                let preservation =
-                    crate::worktree::preserve_dirty_worktree(home, agent, wt_path, branch, None);
+                let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
+                    home, agent, wt_path, branch, None,
+                );
+                notices.extend(collected);
                 if let Some(reason) = preservation.blocked_reason() {
                     // reviewer4 #2672 fix — FAIL-CLOSED: there IS uncommitted WIP
                     // but it could not be snapshotted (e.g. a contended
@@ -574,9 +659,18 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                          preserved ({reason}); not removing it so the WIP can be recovered. \
                          Commit or stash the changes, then release again."
                     ));
-                    return out;
+                    return LockedRelease {
+                        out,
+                        notices,
+                        clear_refusal_marker,
+                        finish_full_release: false,
+                        managed_verified,
+                        worktree_absent,
+                    };
                 }
             }
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
             match remove_worktree(agent, wt_path, &source_repo) {
                 WorktreeRemoval::Removed => {
                     managed_verified = true;
@@ -585,7 +679,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                     // per-worktree unpreservable-nested-dirt notice marker; clear
                     // it (+ its lock) so a future re-lease of this path re-notifies
                     // from a clean slate. Best-effort.
-                    crate::worktree::clear_nested_refusal_marker(home, wt_path);
+                    clear_refusal_marker = Some(wt_path.to_path_buf());
                 }
                 WorktreeRemoval::AlreadyAbsent => {
                     worktree_absent = true;
@@ -601,7 +695,14 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                     // dry_run classifier above mutates nothing.)
                     clear_binding_state(home, agent);
                     out.binding_removed = true;
-                    return out;
+                    return LockedRelease {
+                        out,
+                        notices,
+                        clear_refusal_marker,
+                        finish_full_release: false,
+                        managed_verified,
+                        worktree_absent,
+                    };
                 }
                 WorktreeRemoval::Failed(err) => {
                     managed_verified = true;
@@ -638,27 +739,227 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         }
     }
 
-    resolve_branch_cleanup(
-        &binding,
+    LockedRelease {
+        out,
+        notices,
+        clear_refusal_marker,
+        finish_full_release: true,
         managed_verified,
         worktree_absent,
-        dry_run,
-        &mut out,
-    );
+    }
+}
 
-    crate::event_log::log(
-        home,
-        "worktree_released_full",
-        agent,
-        &format!(
-            "wt_removed={} binding_removed={} error={}",
-            out.worktree_removed,
-            out.binding_removed,
-            out.error.as_deref().unwrap_or("")
-        ),
-    );
+fn release_full_guarded(
+    home: &Path,
+    agent: &str,
+    dry_run: bool,
+    expected: Option<&crate::binding::BindingFingerprint>,
+) -> ReleaseOutcome {
+    use crate::binding::GuardedBinding;
 
+    let (snapshot, fingerprint) = match crate::binding::snapshot_guarded_binding(home, agent) {
+        Err(e) => return opaque_release(e),
+        Ok(GuardedBinding::Absent) => return idempotent_absent(),
+        Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
+        Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
+    };
+    if expected.is_some_and(|expected| expected != &fingerprint) {
+        return stale_release();
+    }
+    #[cfg(test)]
+    release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
+
+    let branch = snapshot["branch"].as_str().unwrap_or("");
+    if branch.is_empty() {
+        return opaque_release("known binding has no branch lease identity".to_string());
+    }
+    let wt = snapshot["worktree"].as_str().unwrap_or("");
+    let source_repo = source_repo_from_binding(&snapshot, Path::new(wt));
+    let source_repo_str = source_repo.display().to_string();
+    let _branch_lock =
+        match crate::binding::acquire_branch_lease_lock(home, &source_repo_str, branch) {
+            Ok(lock) => lock,
+            Err(e) => return opaque_release(format!("branch lease lock failed: {e}")),
+        };
+    let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, agent) {
+        Ok(lock) => lock,
+        Err(e) => return opaque_release(e),
+    };
+    let _binding_lock = match crate::binding::acquire_binding_file_lock(home, agent) {
+        Ok(lock) => lock,
+        Err(e) => return opaque_release(e),
+    };
+    let current = match crate::binding::guarded_binding_disk_fresh(home, agent) {
+        GuardedBinding::Absent => return idempotent_absent(),
+        GuardedBinding::Opaque(reason) => return opaque_release(reason),
+        GuardedBinding::Known {
+            value,
+            fingerprint: live,
+        } if live == fingerprint => value,
+        GuardedBinding::Known { .. } => return stale_release(),
+    };
+    let mut locked = release_known_locked(home, agent, &current, dry_run);
+    // Explicit drops document the lock boundary: no notice, marker cleanup,
+    // branch cleanup, or release event runs with a flock held.
+    drop(_binding_lock);
+    drop(_agent_lock);
+    drop(_branch_lock);
+
+    for notice in locked.notices.drain(..) {
+        notice.emit(home);
+    }
+    if let Some(path) = locked.clear_refusal_marker.take() {
+        crate::worktree::clear_nested_refusal_marker(home, &path);
+    }
+    if locked.finish_full_release {
+        resolve_branch_cleanup(
+            &current,
+            locked.managed_verified,
+            locked.worktree_absent,
+            dry_run,
+            &mut locked.out,
+        );
+        crate::event_log::log(
+            home,
+            "worktree_released_full",
+            agent,
+            &format!(
+                "wt_removed={} binding_removed={} error={}",
+                locked.out.worktree_removed,
+                locked.out.binding_removed,
+                locked.out.error.as_deref().unwrap_or("")
+            ),
+        );
+    }
+    locked.out
+}
+
+pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
+    release_full_guarded(home, agent, dry_run, None)
+}
+
+pub(crate) fn release_full_exact(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+) -> ReleaseOutcome {
+    release_full_guarded(home, agent, false, Some(expected))
+}
+
+fn release_bound_target_exact_impl(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+    caller_holds_branch_lease: bool,
+    clear_binding_on_remove_failure: bool,
+) -> ReleaseOutcome {
+    use crate::binding::GuardedBinding;
+
+    let snapshot = match crate::binding::snapshot_guarded_binding(home, agent) {
+        Err(e) => return opaque_release(e),
+        Ok(GuardedBinding::Absent) => return idempotent_absent(),
+        Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
+        Ok(GuardedBinding::Known { value, fingerprint }) if &fingerprint == expected => value,
+        Ok(GuardedBinding::Known { .. }) => return stale_release(),
+    };
+    #[cfg(test)]
+    release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
+    let branch = snapshot["branch"].as_str().unwrap_or("");
+    if branch.is_empty() {
+        return opaque_release("known binding has no branch lease identity".to_string());
+    }
+    let branch_lock = if caller_holds_branch_lease {
+        None
+    } else {
+        match crate::binding::acquire_branch_lease_lock(
+            home,
+            &source_repo.display().to_string(),
+            branch,
+        ) {
+            Ok(lock) => Some(lock),
+            Err(e) => return opaque_release(format!("branch lease lock failed: {e}")),
+        }
+    };
+    let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, agent) {
+        Ok(lock) => lock,
+        Err(e) => return opaque_release(e),
+    };
+    let _binding_lock = match crate::binding::acquire_binding_file_lock(home, agent) {
+        Ok(lock) => lock,
+        Err(e) => return opaque_release(e),
+    };
+    let current = match crate::binding::guarded_binding_disk_fresh(home, agent) {
+        GuardedBinding::Absent => return idempotent_absent(),
+        GuardedBinding::Opaque(reason) => return opaque_release(reason),
+        GuardedBinding::Known { value, fingerprint } if &fingerprint == expected => value,
+        GuardedBinding::Known { .. } => return stale_release(),
+    };
+    let target_str = target.display().to_string();
+    if current.get("worktree").and_then(|v| v.as_str()) != Some(target_str.as_str()) {
+        return stale_release();
+    }
+
+    #[cfg(test)]
+    release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
+    let mut out = ReleaseOutcome::default();
+    let mut clear_marker = false;
+    let remove = remove_worktree(agent, target, source_repo);
+    match remove {
+        WorktreeRemoval::Removed => {
+            out.worktree_removed = true;
+            clear_marker = true;
+            clear_binding_state(home, agent);
+            out.binding_removed = true;
+            out.released = true;
+        }
+        WorktreeRemoval::AlreadyAbsent => {
+            clear_binding_state(home, agent);
+            out.binding_removed = true;
+            out.released = true;
+        }
+        WorktreeRemoval::Unmanaged(error) => out.error = Some(error),
+        WorktreeRemoval::Failed(error) => {
+            out.error = Some(error);
+            if clear_binding_on_remove_failure {
+                clear_binding_state(home, agent);
+                out.binding_removed = true;
+            }
+        }
+    }
+    drop(_binding_lock);
+    drop(_agent_lock);
+    drop(branch_lock);
+    if clear_marker {
+        crate::worktree::clear_nested_refusal_marker(home, target);
+    }
     out
+}
+
+/// Exact Known-target release for reverse reconciliation. It acquires the
+/// branch lease itself and leaves the binding intact if removal fails.
+pub(crate) fn release_bound_target_exact(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(home, agent, expected, target, source_repo, false, false)
+}
+
+/// Exact Known-target release for checkout rollback, whose caller already holds
+/// L(repo,branch). Preserves the rollback path's historical partial-unbind
+/// behavior if the worktree removal itself fails.
+pub(crate) fn release_bound_target_exact_under_branch_lock(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(home, agent, expected, target, source_repo, true, true)
 }
 
 /// Pin a worktree (operator override — prevents GC in Phase 4).

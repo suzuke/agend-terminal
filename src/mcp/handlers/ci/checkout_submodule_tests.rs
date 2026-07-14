@@ -1289,6 +1289,87 @@ fn checkout_commit_write_failure_rolls_back_2755() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// S1: checkout's exact rollback and a concurrent manual release may both
+/// snapshot the same binding, but the checkout actor owns L(repo,branch) until
+/// its failed commit is rolled back. The later manual actor must observe Absent
+/// and perform no second transition. Phase channels make the order sleep-free.
+#[cfg(unix)]
+#[test]
+fn checkout_rollback_vs_manual_release_applies_one_transition_s1() {
+    let home = tmp_home("s1-checkout-rollback");
+    let repo = tmp_repo_with_file("s1-checkout-rollback", "readme.txt", "x\n");
+    git_run_ok(&repo, &["branch", "feat/rollback"], false);
+    let instance = "agent-s1-rollback";
+    let args = json!({
+        "repository_path": repo.display().to_string(),
+        "branch": "feat/rollback",
+        "bind": true,
+        "task_id": "T-s1-rollback",
+    });
+
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+    let (commit_tx, commit_rx) = std::sync::mpsc::channel();
+    let checkout_home = home.clone();
+    let checkout = std::thread::spawn(move || {
+        let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+            if phase == crate::worktree_pool::ReleaseTestPhase::CheckoutBoundBeforeCommit {
+                bound_tx.send(()).expect("publish bound checkout phase");
+                commit_rx.recv().expect("resume failed checkout commit");
+            }
+        });
+        super::checkout_txn::set_fail_committed_save(true);
+        let response = super::checkout::handle_checkout_repo(&checkout_home, &args, instance);
+        super::checkout_txn::set_fail_committed_save(false);
+        response
+    });
+
+    bound_rx.recv().expect("checkout bound before commit");
+    let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_home = home.clone();
+    let release = std::thread::spawn(move || {
+        let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+            if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+                snap_tx.send(()).expect("publish manual release snapshot");
+                release_rx.recv().expect("resume manual release");
+            }
+        });
+        crate::worktree_pool::release_full(&release_home, instance, false)
+    });
+    snap_rx
+        .recv()
+        .expect("manual release snapped checkout binding");
+
+    commit_tx
+        .send(())
+        .expect("let checkout exact rollback win under branch lease");
+    let response = checkout.join().expect("checkout thread");
+    assert_eq!(
+        response["code"].as_str(),
+        Some("commit_failed"),
+        "checkout must expose the injected commit failure: {response}"
+    );
+
+    release_tx.send(()).expect("resume losing manual release");
+    let manual = release.join().expect("manual release thread");
+    assert!(
+        manual.already_released && !manual.binding_removed && !manual.worktree_removed,
+        "manual actor must converge on Absent after checkout rollback: {manual:?}"
+    );
+    assert!(
+        crate::binding::read(&home, instance).is_none(),
+        "checkout rollback removes its exact binding once"
+    );
+    let mangled = mangled_for(instance, &repo);
+    assert!(
+        !home.join("worktrees").join(mangled).exists(),
+        "checkout rollback removes its exact worktree once"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// #2755 R3 (marker durability, real entry): a marker CONTENTS fsync failure during
 /// provisioning ABORTS the transaction — the worktree is rolled back and a structured
 /// `marker_fsync_failed` error returned, never a success with a non-durable marker.

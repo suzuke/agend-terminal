@@ -523,6 +523,28 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     if !ws.join(".git").is_file() {
         return Ok(());
     }
+    // S1: a live binding makes reverse reconciliation a release actor. Capture
+    // its exact disk generation now; the guarded transaction below will re-read
+    // it after taking L(repo,branch) and refuse if authority moved meanwhile.
+    let live_fingerprint = match crate::binding::snapshot_guarded_binding(home, agent)? {
+        crate::binding::GuardedBinding::Absent => None,
+        crate::binding::GuardedBinding::Opaque(reason) => {
+            return Err(format!(
+                "reverse_reconcile refused: opaque binding state ({reason})"
+            ))
+        }
+        crate::binding::GuardedBinding::Known { value, fingerprint } => {
+            let bound = value.get("worktree").and_then(|v| v.as_str());
+            let ws_str = ws.display().to_string();
+            if bound != Some(ws_str.as_str()) {
+                return Err(
+                    "reverse_reconcile refused: live binding targets a different worktree"
+                        .to_string(),
+                );
+            }
+            Some(fingerprint)
+        }
+    };
     // Save uncommitted/untracked work BEFORE any destructive step (committed work
     // is already safe in canonical). Fail-closed: backup error → abort, untouched.
     if worktree_has_work_at_risk(&ws) {
@@ -537,17 +559,31 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     // teardown use (git worktree remove --force from the owning repo; branch ref +
     // commits remain in canonical).
     let source_repo = resolve_owning_repo(home, agent, &ws);
-    match remove_worktree(agent, &ws, &source_repo) {
-        WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => {}
-        WorktreeRemoval::Unmanaged(m) => {
-            return Err(format!("reverse_reconcile: {m}"));
+    if let Some(fingerprint) = live_fingerprint {
+        let outcome =
+            super::release_bound_target_exact(home, agent, &fingerprint, &ws, &source_repo);
+        if !outcome.released {
+            return Err(format!(
+                "reverse_reconcile: guarded release failed: {}",
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown release failure")
+            ));
         }
-        WorktreeRemoval::Failed(e) => {
-            return Err(format!("reverse_reconcile: worktree remove failed: {e}"));
+    } else {
+        // No live binding means there is no release transition to serialize; keep
+        // the legacy remove-only path for already-unbound converted workspaces.
+        match remove_worktree(agent, &ws, &source_repo) {
+            WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => {}
+            WorktreeRemoval::Unmanaged(m) => {
+                return Err(format!("reverse_reconcile: {m}"));
+            }
+            WorktreeRemoval::Failed(e) => {
+                return Err(format!("reverse_reconcile: worktree remove failed: {e}"));
+            }
         }
     }
-    // Clear the (B) binding so the next dispatch leases fresh (legacy path).
-    crate::binding::unbind(home, agent);
     // Restore `/workspace/<agent>` as a clean standalone (git-init), matching the
     // pre-(B) state. `git worktree remove` deleted the dir, so recreate it; the
     // next spawn's `ensure_project_root` would also do this, but doing it here

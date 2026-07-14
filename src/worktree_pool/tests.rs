@@ -893,6 +893,296 @@ fn p0x_release_full_happy_path_removes_worktree_and_binding() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// S1 RED: a release that snapshots binding generation A must not tear down a
+/// same-agent generation B installed before destructive authority is reacquired.
+/// The phase seam makes the interleaving deterministic (no sleeps).
+#[test]
+fn release_full_refuses_binding_rewrite_between_snapshot_and_remove_s1() {
+    let home = tmp_home("s1-fingerprint-move");
+    let repo = tmp_repo("s1-fingerprint-move-repo");
+    let lease = lease_bound(&home, &repo, "agent-cas", "feat/cas");
+
+    let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let home_for_release = home.clone();
+    let release_thread = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                snap_tx.send(()).expect("publish snapshot phase");
+                resume_rx.recv().expect("resume release");
+            }
+        });
+        release_full(&home_for_release, "agent-cas", false)
+    });
+
+    snap_rx.recv().expect("release reached snapshot phase");
+    // Same-branch checkout/reuse owns L(repo,branch) while it refreshes binding
+    // metadata. Manual release must wait for that owner, then reject its stale
+    // fingerprint rather than deleting the reused generation.
+    let reuse_lease =
+        crate::binding::acquire_branch_lease_lock(&home, &repo.display().to_string(), "feat/cas")
+            .expect("same-branch reuse lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-cas",
+        "T-generation-b",
+        "feat/cas",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("install generation B");
+    drop(reuse_lease);
+    resume_tx.send(()).expect("resume release after rebind");
+
+    let outcome = release_thread.join().expect("release thread");
+    assert!(
+        !outcome.released,
+        "stale generation A release must refuse generation B: {outcome:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "generation B worktree must survive stale release"
+    );
+    let live = crate::binding::read(&home, "agent-cas").expect("generation B binding survives");
+    assert_eq!(live["task_id"], "T-generation-b");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// S1 RED: two release actors may snapshot the same generation, but only one may
+/// perform the remove+unbind transition. Both threads rendezvous after snapshot,
+/// so the race is deterministic and sleep-free.
+#[test]
+fn concurrent_release_actors_apply_one_transition_s1() {
+    let home = tmp_home("s1-release-once");
+    let repo = tmp_repo("s1-release-once-repo");
+    lease_bound(&home, &repo, "agent-once", "feat/once");
+
+    let rendezvous = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let run = |home: PathBuf, rendezvous: std::sync::Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            let _hook = release_test_seam::install(move |phase| {
+                if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                    rendezvous.wait();
+                }
+            });
+            release_full(&home, "agent-once", false)
+        })
+    };
+    let a = run(home.clone(), rendezvous.clone());
+    let b = run(home.clone(), rendezvous);
+    let outcomes = [a.join().expect("release A"), b.join().expect("release B")];
+
+    assert_eq!(
+        outcomes.iter().filter(|o| o.binding_removed).count(),
+        1,
+        "one generation permits exactly one binding transition: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| o.worktree_removed).count(),
+        1,
+        "one generation permits exactly one worktree removal: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| o.already_released).count(),
+        1,
+        "the losing actor converges as an idempotent no-op: {outcomes:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// S1 RED: reverse reconciliation is another live remove+unbind actor. If it
+/// wins after manual release's snapshot, the manual actor must converge on
+/// Absent instead of applying a second transition to the restored workspace.
+#[test]
+fn reverse_reconcile_vs_release_applies_one_transition_s1() {
+    let home = tmp_home("s1-reverse-release");
+    let repo = tmp_repo("s1-reverse-release-repo");
+    let ws = converted_workspace_with_commit(&home, &repo, "agent-reverse", "feat/reverse");
+    crate::binding::bind_full(
+        &home,
+        "agent-reverse",
+        "T-reverse",
+        "feat/reverse",
+        &ws,
+        &repo,
+        false,
+    )
+    .expect("bind converted workspace");
+
+    let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let home_for_release = home.clone();
+    let release_thread = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                snap_tx.send(()).expect("publish snapshot phase");
+                resume_rx.recv().expect("resume manual release");
+            }
+        });
+        release_full(&home_for_release, "agent-reverse", false)
+    });
+
+    snap_rx.recv().expect("manual release snapped binding");
+    reverse_reconcile(&home, "agent-reverse").expect("reverse reconcile wins");
+    resume_tx.send(()).expect("resume manual release");
+    let manual = release_thread.join().expect("manual release thread");
+
+    assert!(
+        manual.already_released && !manual.binding_removed && !manual.worktree_removed,
+        "losing manual actor must be an Absent no-op, not a second transition: {manual:?}"
+    );
+    assert!(
+        ws.join(".git").is_dir(),
+        "reverse reconcile's restored standalone workspace survives"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// S1 RED: an unreadable/corrupt/future binding is Opaque, never Absent. A
+/// destructive caller must refuse rather than treating ambiguity as an
+/// idempotent success.
+#[test]
+fn release_refuses_opaque_binding_instead_of_treating_it_absent_s1() {
+    let home = tmp_home("s1-opaque-binding");
+    let runtime = crate::paths::runtime_dir(&home).join("agent-opaque");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    std::fs::write(runtime.join("binding.json"), b"{not valid json").expect("opaque binding");
+
+    let outcome = release_full(&home, "agent-opaque", false);
+    assert!(
+        !outcome.released && !outcome.already_released,
+        "Opaque must refuse, never collapse to Absent: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("opaque")),
+        "refusal names opaque binding state: {:?}",
+        outcome.error
+    );
+    assert!(
+        runtime.join("binding.json").exists(),
+        "opaque evidence is preserved byte-for-byte"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn agent_mutation_lock_survives_runtime_directory_deletion_s1() {
+    let home = tmp_home("s1-stable-agent-lock");
+    let runtime = crate::paths::runtime_dir(&home).join("agent-stable");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let path = crate::binding::release_guard::agent_mutation_lock_path(&home, "agent-stable");
+    assert!(
+        !path.starts_with(crate::paths::runtime_dir(&home)),
+        "permanent agent lock must live outside deletable runtime: {}",
+        path.display()
+    );
+
+    let held = crate::binding::acquire_agent_mutation_lock(&home, "agent-stable")
+        .expect("first agent mutation lock");
+    std::fs::remove_dir_all(&runtime).expect("delete runtime while lock held");
+    assert!(path.exists(), "stable lock inode survives runtime deletion");
+    assert!(
+        crate::store::try_acquire_file_lock(&path)
+            .expect("contended lock probe")
+            .is_none(),
+        "second actor still contends on the same inode"
+    );
+    drop(held);
+    assert!(
+        crate::store::try_acquire_file_lock(&path)
+            .expect("released lock probe")
+            .is_some(),
+        "stable lock becomes acquirable after guard drop"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn auto_release_exact_fingerprint_cannot_release_new_generation_s1() {
+    let home = tmp_home("s1-auto-exact");
+    let repo = tmp_repo("s1-auto-exact-repo");
+    let lease = lease_bound(&home, &repo, "agent-auto", "feat/auto-exact");
+    let old =
+        match crate::binding::snapshot_guarded_binding(&home, "agent-auto").expect("snapshot A") {
+            crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+            other => panic!("expected Known A, got {other:?}"),
+        };
+    let branch_lock = crate::binding::acquire_branch_lease_lock(
+        &home,
+        &repo.display().to_string(),
+        "feat/auto-exact",
+    )
+    .expect("branch lease for generation B");
+    crate::binding::bind_full(
+        &home,
+        "agent-auto",
+        "T-generation-b",
+        "feat/auto-exact",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("write generation B");
+    drop(branch_lock);
+
+    let outcome = release_full_exact(&home, "agent-auto", &old);
+    assert!(
+        outcome.stale_fingerprint && !outcome.released,
+        "auto-release A must reject B exactly: {outcome:?}"
+    );
+    assert!(lease.path.exists(), "generation B worktree survives");
+    assert_eq!(
+        crate::binding::read(&home, "agent-auto").expect("generation B binding")["task_id"],
+        "T-generation-b"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn dirty_release_begins_notice_emit_after_all_transaction_flocks_drop_s1() {
+    let home = tmp_home("s1-notice-unlocked");
+    let repo = tmp_repo("s1-notice-unlocked-repo");
+    let lease = lease_bound(&home, &repo, "agent-notice", "feat/notice");
+    std::fs::write(lease.path.join("precious.txt"), b"dirty WIP").expect("dirty WIP");
+
+    let (depth_tx, depth_rx) = std::sync::mpsc::channel();
+    let _hook = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeNoticeEmit {
+            depth_tx
+                .send(crate::sync_audit::flock_depth())
+                .expect("publish notice flock depth");
+        }
+    });
+    let outcome = release_full(&home, "agent-notice", false);
+    assert!(outcome.released, "dirty release succeeds: {outcome:?}");
+    assert_eq!(
+        depth_rx.recv().expect("notice emit observed"),
+        0,
+        "notice dispatch begins after branch + agent + binding flocks drop"
+    );
+    assert_eq!(
+        recovery_refs(&repo, "feat/notice").len(),
+        1,
+        "the observed notice corresponds to a created recovery ref"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// §3.9 regression (#t-21 HIGH #1): `release_full(dry_run=true)` must be
 /// observation-only — the worktree directory AND binding.json must survive.
 /// Pre-fix, `remove_worktree` + `clear_binding_state` ran unconditionally,
