@@ -351,11 +351,12 @@ fn classify_try_lock(
     lock_path: &Path,
     result: Result<(), fs4::TryLockError>,
 ) -> anyhow::Result<bool> {
-    if result.is_err() {
-        return Ok(false);
+    match result {
+        Ok(()) => Ok(true),
+        Err(fs4::TryLockError::WouldBlock) => Ok(false),
+        Err(fs4::TryLockError::Error(error)) => Err(anyhow::Error::new(error)
+            .context(format!("flock try_lock failed on {}", lock_path.display()))),
     }
-    let _ = lock_path;
-    Ok(true)
 }
 
 /// Helper: build a store path from home + filename.
