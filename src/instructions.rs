@@ -1820,4 +1820,62 @@ mod tests {
         generate(&dir, "codex").expect("unmanaged first provision must succeed");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- r8 RED: false-solo + real-entry tests (task-46776) ---
+    //
+    // generate_for_owner at 69d3bf0d materializes AgentContext{peers:[],
+    // team:None} which build_instructions_body reads as "solo agent" and
+    // emits the SOLO-PROFILE paragraph. Managed pane pre-spawn and connect
+    // consume these false instructions before (or instead of) the fleet-
+    // aware rewrite. RED: both tests FAIL at 69d3bf0d.
+
+    #[test]
+    fn r8_managed_pre_spawn_bytes_no_false_solo() {
+        let dir = tmp_dir("r8-presawn-solo");
+        let peers = vec![
+            ("alpha".to_string(), Some("dev".to_string())),
+            ("beta".to_string(), Some("reviewer".to_string())),
+        ];
+        let team_ctx = TeamContext {
+            name: "core",
+            orchestrator: Some("beta"),
+            members: &["alpha".to_string(), "beta".to_string()],
+        };
+        let full_ctx = AgentContext {
+            name: "alpha",
+            role: Some("dev"),
+            fleet_peers: &peers,
+            team: Some(&team_ctx),
+            extra_instructions: None,
+        };
+        generate_with_context(&dir, "codex", Some(&full_ctx)).unwrap();
+        let after_boot = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            !after_boot.contains("SOLO-PROFILE"),
+            "full-context boot must not write solo paragraph"
+        );
+        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        let pre_spawn = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            !pre_spawn.contains("SOLO-PROFILE"),
+            "managed pre-spawn provision must not write false solo paragraph \
+             into shared instructions — the agent reads these before the \
+             post-spawn fleet-aware rewrite"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r8_connect_entry_no_false_solo() {
+        let dir = tmp_dir("r8-connect-solo");
+        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            !content.contains("SOLO-PROFILE"),
+            "connect entry must not write false solo paragraph — connect \
+             has no post-provision rewrite so false solo persists for the \
+             entire session"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
