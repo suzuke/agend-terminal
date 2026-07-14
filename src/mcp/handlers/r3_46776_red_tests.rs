@@ -763,3 +763,148 @@ fn r5_claude_migration_opaque_io_propagates() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// R6 — managed app / connect contextless provision + opaque config reads
+// ---------------------------------------------------------------------------
+
+/// R6-1: `configure_codex_with_home` (via `mcp_config::configure`) with invalid
+/// UTF-8 in `.codex/config.toml` must refuse and preserve bytes.
+///
+/// Currently: `read_to_string().unwrap_or_default()` silently discards the
+/// opaque read error, yielding an empty config with `Absent` identity, which
+/// the function adopts and overwrites. The fix replaces `unwrap_or_default()`
+/// with explicit `NotFound`-only empty and propagation of all other I/O.
+///
+/// RED: FAILS because `unwrap_or_default` swallows invalid UTF-8 and the
+/// function succeeds, overwriting the bytes.
+#[test]
+fn r6_configure_codex_opaque_read_must_refuse_and_preserve() {
+    let dir = tmp_home("r6-codex-utf8");
+    let codex_dir = dir.join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
+    std::fs::write(&config_path, invalid_bytes).unwrap();
+
+    let result = crate::mcp_config::configure(&dir, "codex", Some("alice"));
+
+    assert!(
+        result.is_err(),
+        "R6-1: configure_codex with invalid UTF-8 config.toml must refuse \
+         (opaque read → fail-closed). Got Ok — unwrap_or_default swallowed the error."
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        invalid_bytes,
+        "R6-1: invalid UTF-8 bytes must be preserved byte-for-byte"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R6-2: `configure_grok_with_home` (via `mcp_config::configure`) with invalid
+/// UTF-8 in `.grok/config.toml` must refuse and preserve bytes.
+///
+/// Same defect as R6-1 but in the Grok writer path.
+///
+/// RED: FAILS because `unwrap_or_default` swallows the error.
+#[test]
+fn r6_configure_grok_opaque_read_must_refuse_and_preserve() {
+    let dir = tmp_home("r6-grok-utf8");
+    let grok_dir = dir.join(".grok");
+    std::fs::create_dir_all(&grok_dir).unwrap();
+    let config_path = grok_dir.join("config.toml");
+    let invalid_bytes: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
+    std::fs::write(&config_path, invalid_bytes).unwrap();
+
+    let result = crate::mcp_config::configure(&dir, "grok", Some("alice"));
+
+    assert!(
+        result.is_err(),
+        "R6-2: configure_grok with invalid UTF-8 config.toml must refuse \
+         (opaque read → fail-closed). Got Ok — unwrap_or_default swallowed the error."
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        invalid_bytes,
+        "R6-2: invalid UTF-8 bytes must be preserved byte-for-byte"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R6-3: `instructions::generate` (contextless, the path used by managed-pane
+/// `spawn_and_subscribe` and `connect::run`) with a foreign `.codex/config.toml`
+/// must refuse and preserve foreign bytes.
+///
+/// `generate(wd, cmd)` delegates to `generate_with_context(wd, cmd, None)`.
+/// When `ctx` is `None`: (a) `workspace_provision_preflight` is skipped, and
+/// (b) `mcp_config::configure` receives `instance_name=None`, skipping the
+/// ownership check in `configure_codex_with_home`. A foreign config is silently
+/// overwritten. The managed-pane and connect code paths call this exact
+/// function, so this test proves those paths are broken.
+///
+/// RED: FAILS because contextless provision overwrites foreign bytes.
+#[test]
+fn r6_contextless_provision_overwrites_foreign_codex() {
+    let dir = tmp_home("r6-ctxless-codex");
+    let ws = dir.join("workspace").join("agent");
+    std::fs::create_dir_all(&ws).unwrap();
+    let codex_dir = ws.join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    let foreign = "[mcp_servers.agend-terminal]\ncommand = 'x'\nargs = []\n\n\
+                   [mcp_servers.agend-terminal.env]\nAGEND_HOME = '/h'\n\
+                   AGEND_INSTANCE_NAME = 'bob'\n";
+    std::fs::write(&config_path, foreign).unwrap();
+
+    let result = crate::instructions::generate(&ws, "codex");
+
+    assert!(
+        result.is_err(),
+        "R6-3: contextless generate with foreign .codex/config.toml must refuse. \
+         Got Ok — ctx=None skips preflight and identity check, overwriting foreign bytes. \
+         This is the managed-pane (spawn_and_subscribe) and connect (run) vulnerability."
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        foreign,
+        "R6-3: foreign .codex/config.toml bytes must be preserved"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R6-4: `instructions::generate` (contextless) with a foreign `.grok/config.toml`
+/// must refuse and preserve foreign bytes. Same gap as R6-3 for the Grok writer.
+///
+/// RED: FAILS because contextless provision skips ownership check.
+#[test]
+fn r6_contextless_provision_overwrites_foreign_grok() {
+    let dir = tmp_home("r6-ctxless-grok");
+    let ws = dir.join("workspace").join("agent");
+    std::fs::create_dir_all(&ws).unwrap();
+    let grok_dir = ws.join(".grok");
+    std::fs::create_dir_all(&grok_dir).unwrap();
+    let config_path = grok_dir.join("config.toml");
+    let foreign = "[mcp_servers.agend-terminal]\ncommand = 'x'\nargs = []\n\n\
+                   [mcp_servers.agend-terminal.env]\nAGEND_HOME = '/h'\n\
+                   AGEND_INSTANCE_NAME = 'bob'\n";
+    std::fs::write(&config_path, foreign).unwrap();
+
+    let result = crate::instructions::generate(&ws, "grok");
+
+    assert!(
+        result.is_err(),
+        "R6-4: contextless generate with foreign .grok/config.toml must refuse. \
+         Got Ok — ctx=None skips preflight and identity check, overwriting foreign bytes."
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        foreign,
+        "R6-4: foreign .grok/config.toml bytes must be preserved"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
