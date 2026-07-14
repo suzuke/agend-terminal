@@ -544,3 +544,207 @@ fn r4_migrate_claude_old_rules_failure_propagates() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ===========================================================================
+// R5 RED tests — five new findings from root review at 16b1ce94.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// R5-1 — branch worktree created by this attempt must be cleaned on rollback
+// ---------------------------------------------------------------------------
+
+/// R5-1: When `spawn_single_instance_impl` creates a NEW worktree via the
+/// branch path (worktree::create), `work_dir` changes to the newly created
+/// path. The provenance check `work_dir_preexisted` at line 142 then sees
+/// the newly created dir and treats it as pre-existing → cleanup is skipped
+/// on rollback, leaking the worktree.
+///
+/// RED: FAILS because the provenance check happens AFTER worktree::create
+/// has already created the directory at the new `work_dir` path.
+#[test]
+fn r5_branch_worktree_created_by_attempt_cleaned_on_rollback() {
+    let home = tmp_home("r5-wt-branch");
+    let repo = home.join("workspace").join("agent-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // Create a minimal git repo so worktree::create can work.
+    assert!(std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .args([
+            "-c", "user.name=test",
+            "-c", "user.email=test@test",
+            "commit", "--allow-empty", "-m", "init",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+
+    // Empty fleet → preflight passes.
+    fleet_with_instances(&home, "instances: {}\n");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    crate::store::fail_next_atomic_write_for_test(&fleet_path);
+
+    let wt_path = crate::worktree::worktree_path(&home, "new-agent", "feat/test");
+    assert!(!wt_path.exists(), "precondition: worktree dir must not exist yet");
+
+    let spawn_fn = |_h: &Path, _req: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"ok": true}))
+    };
+
+    let result = crate::mcp::handlers::instance_state::spawn::spawn_single_instance_impl(
+        &home,
+        "spawner",
+        &json!({
+            "name": "new-agent",
+            "backend": "claude",
+            "working_directory": repo.display().to_string(),
+            "branch": "feat/test"
+        }),
+        &spawn_fn,
+    );
+
+    assert!(
+        result.get("error").is_some(),
+        "R5-1 precondition: fleet write must fail. Got: {result}"
+    );
+
+    // The worktree CREATED BY THIS ATTEMPT must be cleaned on rollback.
+    assert!(
+        !wt_path.exists(),
+        "R5-1: branch worktree created by this attempt must be removed on rollback. \
+         work_dir_preexisted is sampled after worktree::create, so the newly created \
+         dir is treated as pre-existing and cleanup is skipped."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// R5-3 — wrong-shape `instances` key must refuse, not become empty
+// ---------------------------------------------------------------------------
+
+/// R5-3a: When fleet.yaml has `instances: [...]` (a YAML sequence, not a
+/// mapping), `load_instances_mapping` must return Err, not silently treat it
+/// as an empty mapping. `as_mapping()` returns None for a list →
+/// `unwrap_or_default()` → empty mapping → "no collision" → fail-open.
+///
+/// RED: FAILS because `as_mapping()` returns None → default empty mapping.
+#[test]
+fn r5_wrong_shape_instances_refuses_collision() {
+    let home = tmp_home("r5-shape-col");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "instances:\n  - alice\n  - bob\n").unwrap();
+
+    let result = crate::fleet::persist::workspace_identity_collision(
+        &home,
+        "any-instance",
+        &home.join("workspace").join("any-instance"),
+    );
+
+    assert!(
+        result.is_some(),
+        "R5-3a: fleet.yaml with wrong-shape instances (list, not mapping) must \
+         refuse collision check, not silently pass as 'no collision'. Got None."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R5-3b: Same wrong-shape bug for boot admission.
+#[test]
+fn r5_wrong_shape_instances_refuses_boot() {
+    let home = tmp_home("r5-shape-boot");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "instances: \"just-a-string\"\n").unwrap();
+
+    let result = crate::fleet::persist::duplicate_identity_owner_before(
+        &home,
+        "any-instance",
+        &home.join("workspace").join("any-instance"),
+    );
+
+    assert!(
+        result.is_some(),
+        "R5-3b: fleet.yaml with wrong-shape instances (scalar, not mapping) must \
+         refuse boot admission, not silently pass. Got None."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// R5-4 — pre-mutation ordering: absent work_dir stays absent on fleet error
+// ---------------------------------------------------------------------------
+
+/// R5-4: `prepare_instructions` creates `work_dir` at line 44 BEFORE
+/// fleet validation at line 62. When fleet.yaml is malformed, the directory
+/// has already been created despite the eventual refusal. A refused
+/// provisioning must not leave any side effects.
+///
+/// RED: FAILS because `create_dir_all(work_dir)` runs before fleet load.
+#[test]
+fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
+    let home = tmp_home("r5-premutate");
+    let ws = home.join("workspace").join("agent");
+    assert!(!ws.exists(), "precondition: work_dir must be absent initially");
+
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "{{invalid yaml!!").unwrap();
+
+    let result = crate::api::handlers::prepare_instructions(&home, "agent", "codex", &ws, None);
+
+    assert!(result.is_err(), "precondition: malformed fleet must refuse");
+    assert!(
+        !ws.exists(),
+        "R5-4: malformed fleet must not create work_dir. \
+         prepare_instructions creates the directory before fleet validation, \
+         leaving a side effect despite the refusal."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// R5-5 — Claude migration: exact NotFound vs opaque I/O
+// ---------------------------------------------------------------------------
+
+/// R5-5: `migrate_claude_old_rules_file` uses `old.exists()` to check
+/// before removal. On opaque I/O (parent not executable → exists() returns
+/// false), the migration is silently skipped instead of propagating the
+/// error.
+///
+/// RED: FAILS because `exists()` returns false for EACCES → skip → Ok.
+#[cfg(unix)]
+#[test]
+fn r5_claude_migration_opaque_io_propagates() {
+    let home = tmp_home("r5-migrate-opaque");
+    let ws = home.join("workspace").join("agent");
+    let rules_dir = ws.join(".claude").join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    std::fs::write(rules_dir.join("agend.md"), "old content").unwrap();
+
+    // Remove execute permission on the rules directory → cannot traverse →
+    // exists() returns false (EACCES), remove_file also fails (EACCES).
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&rules_dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // No fleet.yaml → NotFound fallback. Backend = "claude" triggers migrate.
+    let result = crate::api::handlers::prepare_instructions(&home, "agent", "claude", &ws, None);
+
+    // Restore for cleanup.
+    std::fs::set_permissions(&rules_dir, std::fs::Permissions::from_mode(0o755)).ok();
+
+    assert!(
+        result.is_err(),
+        "R5-5: Claude migration with opaque I/O (EACCES, not NotFound) must \
+         propagate the error, not silently skip via exists(). Got Ok."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
