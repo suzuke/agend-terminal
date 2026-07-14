@@ -524,6 +524,17 @@ pub(crate) fn resolve_delegated(
 /// handoff" eviction: only the unwatching agent's own ci-ready obligation for
 /// this exact repo@branch is cleared, leaving any co-subscriber's track intact.
 pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlation: &str) -> usize {
+    resolve_for_target_correlation_reason(home, agent, correlation, "unwatch")
+}
+
+/// Target/correlation resolver with an explicit audit reason for non-watch
+/// callers (for example a feature-branch channel discharge).
+pub(crate) fn resolve_for_target_correlation_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
         if track.target == agent
@@ -541,7 +552,7 @@ pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlati
                 tag = "#1888-track-resolved",
                 agent = %track.target,
                 correlation = %track.correlation,
-                reason = "unwatch",
+                reason,
                 "ci-handoff track resolved"
             );
         }

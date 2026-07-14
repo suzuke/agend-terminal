@@ -358,10 +358,11 @@ pub(super) fn handle_discharge(home: &Path, args: &Value, instance_name: &str) -
             // Feature handoffs retain the legacy explicit-discharge path; the
             // protected resolver must never infer identity from classless rows.
             (Some(corr), _, Some(crate::inbox::CiHandoffClass::Feature)) => {
-                crate::daemon::ci_handoff_track::resolve_for_target_correlation(
+                crate::daemon::ci_handoff_track::resolve_for_target_correlation_reason(
                     home,
                     instance_name,
                     corr,
+                    "discharge",
                 )
             }
             _ => 0,
