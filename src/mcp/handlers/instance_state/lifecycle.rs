@@ -149,6 +149,13 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     let wd = working_dir
         .clone()
         .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
+    // A workspace-identity conflict makes `cleanup_working_dir` preserve the
+    // foreign instance's tree (byte-preserving refusal + loud audit). Surface it
+    // as a step error too, so the delete reports failure instead of a false
+    // success while B's directory is (correctly) left intact.
+    if let Some(reason) = crate::agent_ops::working_dir_ownership_conflict(&wd, name) {
+        step_errors.push(format!("working_dir cleanup refused: {reason}"));
+    }
     cleanup_working_dir(home, name, &wd);
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,
     // so cleanup_working_dir's best-effort lookup may miss the id path.

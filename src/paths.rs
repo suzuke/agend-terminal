@@ -68,6 +68,38 @@ pub fn workspace_identity(path: &Path) -> String {
     full.to_string_lossy().to_lowercase()
 }
 
+/// Ownership an agend-provisioned artifact (AGENTS.md agend block,
+/// `.codex/config.toml` `AGEND_INSTANCE_NAME` stamp) records for a working
+/// directory. The fail-closed workspace-identity guards read this before a
+/// provision write or a delete cleanup so neither ever clobbers a directory
+/// that belongs to a DIFFERENT instance (the split-brain the incident caused).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DirIdentity {
+    /// No identity artifact present → unowned / legacy → adoptable.
+    Absent,
+    /// The recorded owning instance name.
+    Owner(String),
+    /// An artifact is present but its identity is unparseable → corrupt.
+    Corrupt,
+}
+
+impl DirIdentity {
+    /// Compare against the instance that intends to own the directory. Returns
+    /// `None` when the operation may proceed (`Absent` → adopt, or `Owner` ==
+    /// candidate → same instance / restart); `Some(reason)` when it must be
+    /// refused byte-preservingly (a foreign owner or a corrupt artifact). The
+    /// caller supplies whichever spelling of the candidate name matches the
+    /// artifact (sanitized for AGENTS.md, raw for the `.codex` stamp).
+    pub fn conflict_with(&self, candidate: &str) -> Option<String> {
+        match self {
+            DirIdentity::Absent => None,
+            DirIdentity::Owner(owner) if owner == candidate => None,
+            DirIdentity::Owner(owner) => Some(format!("is owned by instance '{owner}'")),
+            DirIdentity::Corrupt => Some("has a corrupt agend identity stamp".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

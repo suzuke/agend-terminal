@@ -416,6 +416,42 @@ fn strip_leaked_extra_instructions(content: &str, extra: Option<&str>) -> String
     result
 }
 
+/// Read the owning instance recorded inside the agend-managed block of an
+/// existing shared instructions file (AGENTS.md / GEMINI.md). The
+/// workspace-identity guard reads ownership ONLY between the agend markers so
+/// user content outside them can never be mistaken for ownership.
+///
+/// - [`DirIdentity::Absent`] — no agend block present (unowned / legacy → adoptable).
+/// - [`DirIdentity::Owner`] — the recorded owner (a sanitized identifier, matching
+///   what [`build_instructions_body`] writes at the `- **Name**:` line).
+/// - [`DirIdentity::Corrupt`] — a start marker with no end, or a block with no
+///   parseable `Name` line.
+pub(crate) fn agend_block_owner(existing: &str) -> crate::paths::DirIdentity {
+    use crate::paths::DirIdentity;
+    let Some(start) = existing.find(AGEND_BLOCK_START) else {
+        return DirIdentity::Absent;
+    };
+    let rest = &existing[start + AGEND_BLOCK_START.len()..];
+    let block = match rest.find(AGEND_BLOCK_END) {
+        Some(end) => &rest[..end],
+        None => return DirIdentity::Corrupt,
+    };
+    for line in block.lines() {
+        if let Some(after) = line.trim_start().strip_prefix("- **Name**:") {
+            return match after
+                .trim()
+                .strip_prefix('`')
+                .and_then(|s| s.strip_suffix('`'))
+                .filter(|n| !n.is_empty())
+            {
+                Some(n) => DirIdentity::Owner(n.to_string()),
+                None => DirIdentity::Corrupt,
+            };
+        }
+    }
+    DirIdentity::Corrupt
+}
+
 /// Merge an agend-owned block into a user-shared file, preserving all user
 /// content outside the `<!-- agend:start --> ... <!-- agend:end -->` markers.
 /// Creates the file if missing; replaces the existing block in place if present;
@@ -451,10 +487,14 @@ pub(crate) fn merge_agend_block(existing: &str, body: &str) -> String {
 /// Write agent instructions file to the backend-specific path.
 /// Shared files (AGENTS.md, GEMINI.md) use marker-merge; agend-owned files
 /// (.claude/agend.md, .kiro/steering/agend.md) are rewritten in full.
-fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&AgentContext>) {
+fn generate_agent_instructions(
+    working_dir: &Path,
+    command: &str,
+    ctx: Option<&AgentContext>,
+) -> Result<(), String> {
     let backend = match crate::backend::Backend::from_command(command) {
         Some(b) => b,
-        None => return,
+        None => return Ok(()),
     };
     let preset = backend.preset();
     let instr_path = working_dir.join(preset.instructions_path);
@@ -482,6 +522,25 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
 
     let final_content = if preset.instructions_shared {
         let existing = std::fs::read_to_string(&instr_path).unwrap_or_default();
+        // Workspace-identity guard (fail-closed): a shared instructions file
+        // records the owning instance's name inside the agend-managed block.
+        // NEVER overwrite a block owned by a DIFFERENT instance — that is the
+        // split-brain the incident produced. Ownership is read ONLY between the
+        // agend markers; a foreign owner or corrupt block refuses the write with
+        // the existing bytes untouched. An absent block is legacy/unowned → adopt.
+        if let Some(ctx) = ctx {
+            let candidate = sanitize_identifier(ctx.name);
+            if let Some(reason) = agend_block_owner(&existing).conflict_with(&candidate) {
+                tracing::error!(
+                    path = %instr_path.display(), %candidate, %reason,
+                    "provision refused: shared instructions file — bytes preserved"
+                );
+                return Err(format!(
+                    "workspace identity: {} {reason}, refusing to overwrite for '{candidate}'",
+                    instr_path.display()
+                ));
+            }
+        }
         // Strip any prior leaked copies of extra instructions outside the
         // agend markers before merging, so existing duplicates self-heal.
         let cleaned =
@@ -492,6 +551,7 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
     };
 
     let _ = std::fs::write(&instr_path, &final_content);
+    Ok(())
 }
 
 /// Generate MCP config + backend-specific files for the working directory.
@@ -520,8 +580,12 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
     // MCP config for all backends
     crate::mcp_config::configure(working_dir, command, ctx.map(|c| c.name));
 
-    // Agent instructions (identity, role, communication guide)
-    generate_agent_instructions(working_dir, command, ctx);
+    // Agent instructions (identity, role, communication guide). A
+    // workspace-identity refusal preserves the foreign instance's file bytes;
+    // surface it loudly (the incident was a silent last-writer-wins overwrite).
+    if let Err(e) = generate_agent_instructions(working_dir, command, ctx) {
+        tracing::error!(error = %e, "agent instructions provisioning refused (workspace identity)");
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +605,104 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    // --- workspace-identity provision guard (boundary 2, AGENTS.md) ---
+
+    fn codex_ctx(name: &str) -> AgentContext<'_> {
+        AgentContext {
+            name,
+            role: None,
+            fleet_peers: &[],
+            team: None,
+            extra_instructions: None,
+        }
+    }
+
+    #[test]
+    fn agend_block_owner_absent_owner_and_corrupt() {
+        use crate::paths::DirIdentity;
+        // No markers → unowned/legacy → adoptable.
+        assert_eq!(
+            agend_block_owner("# notes\nno agend markers here\n"),
+            DirIdentity::Absent
+        );
+        // Well-formed block → the recorded owner.
+        let file = merge_agend_block(
+            "",
+            &build_instructions_body(Some(&codex_ctx("alice")), None),
+        );
+        assert_eq!(
+            agend_block_owner(&file),
+            DirIdentity::Owner("alice".to_string())
+        );
+        // Markers present but no Name line → corrupt.
+        assert_eq!(
+            agend_block_owner("<!-- agend:start -->\njunk\n<!-- agend:end -->\n"),
+            DirIdentity::Corrupt
+        );
+        // Start marker with no end → corrupt (conservative).
+        assert_eq!(
+            agend_block_owner("<!-- agend:start -->\n- **Name**: `bob`\n"),
+            DirIdentity::Corrupt
+        );
+    }
+
+    #[test]
+    fn generate_agent_instructions_refuses_foreign_agents_md_byte_preserving() {
+        let dir = tmp_dir("prov_foreign");
+        // AGENTS.md owned by a DIFFERENT instance ("bob"), plus user content.
+        let block = merge_agend_block("", &build_instructions_body(Some(&codex_ctx("bob")), None));
+        let foreign = format!("# My project notes\n\n{block}\ntrailing user text\n");
+        let path = dir.join("AGENTS.md");
+        std::fs::write(&path, &foreign).unwrap();
+        // Provisioning as "alice" into bob's directory must REFUSE, bytes intact.
+        let res = generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")));
+        assert!(res.is_err(), "foreign-owned AGENTS.md must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            foreign,
+            "foreign bytes must be preserved untouched"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_agent_instructions_refuses_corrupt_agents_md_byte_preserving() {
+        let dir = tmp_dir("prov_corrupt");
+        let path = dir.join("AGENTS.md");
+        let corrupt = "<!-- agend:start -->\ngarbage, no name line\n<!-- agend:end -->\n";
+        std::fs::write(&path, corrupt).unwrap();
+        let res = generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")));
+        assert!(res.is_err(), "corrupt identity block must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupt,
+            "bytes preserved"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_agent_instructions_adopts_absent_and_refreshes_same_owner() {
+        use crate::paths::DirIdentity;
+        let dir = tmp_dir("prov_same");
+        let path = dir.join("AGENTS.md");
+        // Absent block → adopt (writes).
+        generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")))
+            .expect("adopt absent");
+        assert_eq!(
+            agend_block_owner(&std::fs::read_to_string(&path).unwrap()),
+            DirIdentity::Owner("alice".to_string())
+        );
+        // Same owner → refresh (Ok, still alice).
+        generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")))
+            .expect("refresh same");
+        assert_eq!(
+            agend_block_owner(&std::fs::read_to_string(&path).unwrap()),
+            DirIdentity::Owner("alice".to_string())
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
