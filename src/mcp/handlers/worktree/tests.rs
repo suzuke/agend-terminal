@@ -844,6 +844,65 @@ fn seed_live_rebase_binding(
     repo
 }
 
+fn seed_r5_bound_worktree(
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let repo = home.join("r5-rebase-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    rebase_git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+    rebase_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "add",
+            ".gitignore",
+        ],
+    );
+    rebase_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    let target = home.join("worktrees").join(agent).join(branch);
+    rebase_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            target.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    crate::binding::bind_full(home, agent, "", branch, &target, &repo, true)
+        .expect("seed r5 binding");
+    (repo, target)
+}
+
 fn marker_value(path: &std::path::Path, field: &str) -> String {
     std::fs::read_to_string(path.join(crate::worktree_pool::MANAGED_MARKER))
         .unwrap()
@@ -1225,6 +1284,162 @@ fn r4_rebase_rollback_preserves_newer_binding_generation() {
         binding_value(&home, "agent")["branch"],
         "feature/newer-generation"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_stale_known_rebase_consumes_outer_lifecycle_permit() {
+    let home = tmp_home("r5-stale-known");
+    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-known");
+    std::fs::remove_dir_all(&target).unwrap();
+    let response = handle_bind_self(
+        &home,
+        &json!({
+            "repository_path": repo,
+            "branch": "feature/r5-known",
+            "rebase_mode": true
+        }),
+        &sender_for("agent"),
+    );
+    assert_eq!(response["bound"].as_bool(), Some(true), "{response}");
+    assert!(target.exists(), "stale known repair must re-provision target");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_stale_absent_rebase_consumes_outer_lifecycle_permit() {
+    let home = tmp_home("r5-stale-absent");
+    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-absent");
+    crate::binding::unbind(&home, "agent");
+    let response = handle_bind_self(
+        &home,
+        &json!({
+            "repository_path": repo,
+            "branch": "feature/r5-absent",
+            "rebase_mode": true
+        }),
+        &sender_for("agent"),
+    );
+    assert_eq!(response["bound"].as_bool(), Some(true), "{response}");
+    assert!(target.exists(), "stale absent repair must re-provision target");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_release_first_owns_lifecycle_until_rebase_entry() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+
+    let home = tmp_home("r5-release-first");
+    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-order");
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let resume = Arc::new((Mutex::new(false), Condvar::new()));
+    let release_home = home.clone();
+    let release_entered = entered.clone();
+    let release_resume = resume.clone();
+    let release = thread::spawn(move || {
+        let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+            if phase != crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+                return;
+            }
+            let (flag, cv) = &*release_entered;
+            *flag.lock().unwrap() = true;
+            cv.notify_one();
+            let (done, done_cv) = &*release_resume;
+            let mut done = done.lock().unwrap();
+            while !*done {
+                done = done_cv.wait(done).unwrap();
+            }
+        });
+        handle_release_worktree(&release_home, &json!({"instance":"agent"}), &None)
+    });
+    let (flag, cv) = &*entered;
+    let mut entered = flag.lock().unwrap();
+    while !*entered {
+        entered = cv.wait(entered).unwrap();
+    }
+    drop(entered);
+    let rebase = thread::spawn({
+        let rebase_home = home.clone();
+        let rebase_repo = repo.clone();
+        move || {
+            handle_bind_self(
+                &rebase_home,
+                &json!({
+                    "repository_path": rebase_repo,
+                    "branch": "feature/r5-order",
+                    "rebase_mode": true
+                }),
+                &sender_for("agent"),
+            )
+        }
+    });
+    let rebase_response = rebase.join().unwrap();
+    assert_eq!(
+        rebase_response["code"].as_str(),
+        Some("rebind_repair_blocked"),
+        "rebase must not enter repair while release owns permit: {rebase_response}"
+    );
+    let (done, done_cv) = &*resume;
+    *done.lock().unwrap() = true;
+    done_cv.notify_one();
+    let release_response = release.join().unwrap();
+    assert_eq!(release_response["released"].as_bool(), Some(true), "{release_response}");
+    assert!(!target.exists(), "release owns and completes its transaction");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_full_delete_conflicts_with_live_rebase_permit() {
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::thread;
+
+    let home = tmp_home("r5-delete-conflict");
+    let repo = seed_live_rebase_binding(&home, "agent", "main", &["feature/r5-delete"]);
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let resume = Arc::new(Barrier::new(2));
+    let bind_home = home.clone();
+    let bind_repo = repo.clone();
+    let bind_entered = entered.clone();
+    let bind_resume = resume.clone();
+    let bind = thread::spawn(move || {
+        let _hook = crate::mcp::handlers::dispatch_hook::bind_test_seam::install(move || {
+            let (flag, cv) = &*bind_entered;
+            *flag.lock().unwrap() = true;
+            cv.notify_one();
+            bind_resume.wait();
+            None
+        });
+        handle_bind_self(
+            &bind_home,
+            &json!({
+                "repository_path": bind_repo,
+                "branch": "feature/r5-delete",
+                "rebase_mode": true
+            }),
+            &sender_for("agent"),
+        )
+    });
+    let (flag, cv) = &*entered;
+    let mut entered = flag.lock().unwrap();
+    while !*entered {
+        entered = cv.wait(entered).unwrap();
+    }
+    drop(entered);
+    let delete = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
+        &home, "agent",
+    );
+    assert!(
+        delete
+            .as_ref()
+            .is_err_and(|error| {
+                error.contains("lifecycle transaction") || error.contains("bind/rebase in flight")
+            }),
+        "delete must refuse while rebase owns permit: {delete:?}"
+    );
+    resume.wait();
+    let bind_response = bind.join().unwrap();
+    assert_eq!(bind_response["bound"].as_bool(), Some(true), "{bind_response}");
     std::fs::remove_dir_all(&home).ok();
 }
 
