@@ -755,26 +755,49 @@ fn configure_codex_with_home(
     // strip→append cycles on the same config.toml.
     let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
 
-    // Re-read under the lock. Any existing agend-terminal block is stripped
-    // before we write a fresh one — otherwise a stale binary path from a
-    // prior build (e.g. a worktree that has since been removed) would
-    // silently persist and fail at codex MCP startup with ENOENT.
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    // Re-read under the lock. NotFound → empty (first provision); any other
+    // I/O error (invalid UTF-8, EACCES, EISDIR) → fail-closed, preserving
+    // the opaque bytes instead of silently replacing them.
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            anyhow::bail!(
+                "config read {}: {e} — refusing to overwrite opaque file",
+                config_path.display()
+            );
+        }
+    };
 
     // Workspace-identity guard (fail-closed): refuse to overwrite a config.toml
     // that is stamped for a DIFFERENT instance (or is corrupt). The incident was
     // a last-writer-wins rewrite of a colliding directory's `.codex/config.toml`;
     // this preserves the foreign bytes and errors instead. Absent stamp → adopt.
-    if let Some(cand) = instance_name {
-        if let Some(reason) = codex_config_owner(&existing).conflict_with(cand) {
-            tracing::error!(
-                path = %config_path.display(), instance = %cand, %reason,
-                "provision refused: .codex/config.toml — bytes preserved"
-            );
-            anyhow::bail!(
-                "workspace identity: {} {reason}, refusing to overwrite for '{cand}'",
-                config_path.display()
-            );
+    let identity = codex_config_owner(&existing);
+    match instance_name {
+        Some(cand) => {
+            if let Some(reason) = identity.conflict_with(cand) {
+                tracing::error!(
+                    path = %config_path.display(), instance = %cand, %reason,
+                    "provision refused: .codex/config.toml — bytes preserved"
+                );
+                anyhow::bail!(
+                    "workspace identity: {} {reason}, refusing to overwrite for '{cand}'",
+                    config_path.display()
+                );
+            }
+        }
+        None => {
+            if matches!(
+                identity,
+                crate::paths::DirIdentity::Owner(_) | crate::paths::DirIdentity::Corrupt
+            ) {
+                anyhow::bail!(
+                    "workspace identity: {} has an existing identity stamp but no instance \
+                     name was provided to verify ownership — refusing contextless overwrite",
+                    config_path.display()
+                );
+            }
         }
     }
 
@@ -899,19 +922,43 @@ fn configure_grok_with_home(
 
     let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
 
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    // Workspace-identity guard (fail-closed), same contract as Codex: refuse to
-    // overwrite a config stamped for a different instance (bytes preserved).
-    if let Some(cand) = instance_name {
-        if let Some(reason) = codex_config_owner(&existing).conflict_with(cand) {
-            tracing::error!(
-                path = %config_path.display(), instance = %cand, %reason,
-                "provision refused: .grok/config.toml — bytes preserved"
-            );
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
             anyhow::bail!(
-                "workspace identity: {} {reason}, refusing to overwrite for '{cand}'",
+                "config read {}: {e} — refusing to overwrite opaque file",
                 config_path.display()
             );
+        }
+    };
+    // Workspace-identity guard (fail-closed), same contract as Codex: refuse to
+    // overwrite a config stamped for a different instance (bytes preserved).
+    let identity = codex_config_owner(&existing);
+    match instance_name {
+        Some(cand) => {
+            if let Some(reason) = identity.conflict_with(cand) {
+                tracing::error!(
+                    path = %config_path.display(), instance = %cand, %reason,
+                    "provision refused: .grok/config.toml — bytes preserved"
+                );
+                anyhow::bail!(
+                    "workspace identity: {} {reason}, refusing to overwrite for '{cand}'",
+                    config_path.display()
+                );
+            }
+        }
+        None => {
+            if matches!(
+                identity,
+                crate::paths::DirIdentity::Owner(_) | crate::paths::DirIdentity::Corrupt
+            ) {
+                anyhow::bail!(
+                    "workspace identity: {} has an existing identity stamp but no instance \
+                     name was provided to verify ownership — refusing contextless overwrite",
+                    config_path.display()
+                );
+            }
         }
     }
     // Reuse the same section headers as Codex — Grok's native schema is also
