@@ -230,6 +230,34 @@ fn remove_if_unchanged(
     }
 }
 
+/// Episode-aware delete guard for protected settlement. Matching the durable
+/// episode as well as `sent_at` prevents an old ACK from deleting a re-recorded
+/// track when both writes happen within the same timestamp tick.
+fn remove_if_episode_unchanged(
+    home: &Path,
+    path: &Path,
+    target: &str,
+    correlation: &str,
+    expect_sent_at: &str,
+    expect_episode: &str,
+) -> bool {
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_for(home, target, correlation)) else {
+        return false;
+    };
+    let current = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    match current {
+        Some(t)
+            if t.sent_at == expect_sent_at
+                && t.ci_handoff_episode.as_deref() == Some(expect_episode) =>
+        {
+            std::fs::remove_file(path).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Record (or refresh — a NEW CI pass on the same branch restarts the age
 /// anchor) the pending handoff for `(target, correlation)`.
 #[allow(dead_code)]
@@ -578,12 +606,13 @@ pub(crate) fn resolve_protected_episode(
             && track.correlation == correlation
             && track.ci_handoff_episode.as_deref() == Some(episode)
             && track.ci_handoff_class == Some(crate::inbox::CiHandoffClass::Protected)
-            && remove_if_unchanged(
+            && remove_if_episode_unchanged(
                 home,
                 &path,
                 &track.target,
                 &track.correlation,
                 &track.sent_at,
+                episode,
             )
         {
             resolved += 1;
@@ -629,12 +658,13 @@ pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Ut
         ) {
             continue;
         }
-        if remove_if_unchanged(
+        if remove_if_episode_unchanged(
             home,
             &path,
             &track.target,
             &track.correlation,
             &track.sent_at,
+            episode,
         ) {
             resolved += 1;
             tracing::info!(
