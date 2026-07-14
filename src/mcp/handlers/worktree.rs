@@ -273,9 +273,22 @@ fn handle_release_worktree_force(
         home,
         agent,
         branch,
+        source_repo_hint.as_deref(),
         sender.as_ref().map(|s| s.as_str()),
     ) {
         Ok(o) => {
+            if let Some(error) = o.binding_outcome["error"].as_str() {
+                return json!({
+                    "released": false,
+                    "dir_existed": o.dir_existed,
+                    "dir_removed": o.dir_removed,
+                    "binding_outcome": o.binding_outcome,
+                    "error": error,
+                    "code": "force_release_refused",
+                    "git_metadata_pruned": 0,
+                    "git_metadata_repos": [],
+                });
+            }
             // #826 L2 GC: when the binding-clear path short-circuited on
             // "no binding" (the post-disband state), the
             // `git worktree remove --force` step inside `release_full`
@@ -297,7 +310,7 @@ fn handle_release_worktree_force(
                 "git_metadata_repos": gc.repos_touched,
             })
         }
-        Err(e) => json!({"error": e, "code": "path_outside_pool"}),
+        Err(e) => json!({"error": e, "code": "force_release_refused"}),
     }
 }
 

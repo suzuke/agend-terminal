@@ -795,6 +795,7 @@ impl WipPreservation {
 ///    `git stash create` this captures untracked files; unlike `git stash push` it
 ///    never touches the shared `refs/stash` stack, so two concurrent dirty releases
 ///    can't cross-contaminate.
+#[allow(dead_code)]
 pub(crate) fn preserve_dirty_worktree(
     home: &Path,
     agent: &str,

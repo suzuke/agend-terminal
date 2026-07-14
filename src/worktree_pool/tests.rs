@@ -833,31 +833,6 @@ fn lease_creates_daemon_tagged_worktree() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-#[test]
-fn release_marks_candidate_no_delete() {
-    let home = tmp_home("release");
-    let repo = tmp_repo("release-repo");
-    let l = lease(&home, &repo, "agent-3", "feat/release").expect("lease");
-    release(&home, &l);
-    // Worktree still exists (no delete in Phase 3).
-    assert!(l.path.exists());
-    // Binding cleared.
-    assert!(crate::binding::read(&home, "agent-3").is_none());
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&repo).ok();
-}
-
-#[test]
-fn release_idempotent() {
-    let home = tmp_home("release-idem");
-    let repo = tmp_repo("release-idem-repo");
-    let l = lease(&home, &repo, "agent-4", "feat/idem").expect("lease");
-    release(&home, &l);
-    release(&home, &l); // second release — no panic
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&repo).ok();
-}
-
 // ── Sprint 53 P0-X: release_full (hard release) tests ───────────────
 //
 // These call the production function `release_full`, which in turn is

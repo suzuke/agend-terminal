@@ -157,7 +157,7 @@ pub(crate) fn attempt_safe_rebind_repair(
         // to preserve here), and this repair helper carries no caller identity →
         // None routes any WIP-preserved notice to the agent's team orchestrator
         // (fallback: operator inbox), never a hardcoded recipient.
-        return match rebase_clean_self(home, agent, branch, None) {
+        return match rebase_clean_self(home, agent, branch, None, None) {
             Ok(_) => Ok(RepairAction::StaleStateCleared),
             Err(e) => Err(RepairBlocked::PathUnsafe(e)),
         };

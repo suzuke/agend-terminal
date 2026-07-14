@@ -61,9 +61,14 @@ fn handler_idempotent_no_binding_returns_success_noop() {
 fn seed_force_worktree(home: &std::path::Path, agent: &str, branch: &str) -> std::path::PathBuf {
     let dir = home.join("worktrees").join(agent).join(branch);
     std::fs::create_dir_all(&dir).unwrap();
+    let source_repo = home.join("source-repo");
+    std::fs::create_dir_all(&source_repo).unwrap();
     std::fs::write(
         dir.join(".agend-managed"),
-        format!("agent={agent}\nbranch={branch}\n"),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            source_repo.display()
+        ),
     )
     .unwrap();
     std::fs::write(dir.join("sample.txt"), "leftover").unwrap();
@@ -239,9 +244,13 @@ fn seed_binding_target(
 ) -> std::path::PathBuf {
     let target = home.join("worktrees").join(agent).join(branch);
     std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(source_repo).unwrap();
     std::fs::write(
         target.join(crate::worktree_pool::MANAGED_MARKER),
-        format!("agent={agent}\nbranch={branch}\n"),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            source_repo.display()
+        ),
     )
     .unwrap();
     crate::binding::bind_full(home, agent, "", branch, &target, source_repo, false).unwrap();
@@ -317,6 +326,21 @@ fn s2_force_absent_unmanaged_orphan_refuses_with_operator_route() {
 }
 
 #[test]
+fn s2_force_absent_exact_managed_target_succeeds() {
+    let home = tmp_home("s2-absent-managed");
+    let target = seed_force_worktree(&home, "agent", "feature/managed");
+    let result = handle_release_worktree(
+        &home,
+        &json!({"instance":"agent", "branch":"feature/managed", "force":true}),
+        &None,
+    );
+    assert_eq!(result["released"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["dir_removed"].as_bool(), Some(true), "{result}");
+    assert!(!target.exists(), "exact managed target must be removed");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn s2_force_explicit_repo_disagreement_refuses_without_mutation() {
     let home = tmp_home("s2-repo-disagreement");
     let source = home.join("repo-owner");
@@ -339,6 +363,33 @@ fn s2_force_explicit_repo_disagreement_refuses_without_mutation() {
         "explicit repo disagreement must refuse: {result}"
     );
     assert!(target.exists(), "repo disagreement must not remove target");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn s2_force_canonical_repo_aliases_share_one_branch_lease() {
+    let home = tmp_home("s2-repo-alias");
+    let source = home.join("repo-owner");
+    let alias = home.join("repo-alias");
+    std::fs::create_dir_all(&source).unwrap();
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    let target = seed_binding_target(&home, "agent", "feature/alias", &source);
+    let result = handle_release_worktree(
+        &home,
+        &json!({
+            "instance":"agent",
+            "branch":"feature/alias",
+            "repository_path":alias,
+            "force":true
+        }),
+        &None,
+    );
+    assert_eq!(result["released"].as_bool(), Some(true), "{result}");
+    assert!(
+        !target.exists(),
+        "canonical aliases must resolve one target"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -397,13 +448,10 @@ fn s2_legacy_soft_release_has_no_production_entry_point() {
     );
 }
 
-/// Regression anchor: unlike `force:false` (which refuses to remove a
-/// dir lacking the `.agend-managed` marker), `force:true` cleans it
-/// unconditionally — this is the stale-state recovery semantics the
-/// path exists for, and merging must not accidentally add the marker
-/// check here.
+/// S2 authority anchor: a marker-less orphan is never guessed to be daemon
+/// state. The sanctioned recovery paths are the GC archive or operator channel.
 #[test]
-fn force_deletes_dir_without_marker() {
+fn force_refuses_dir_without_marker() {
     let home = tmp_home("force-no-marker");
     let dir = home.join("worktrees").join("dev").join("feature/x");
     std::fs::create_dir_all(&dir).unwrap();
@@ -417,8 +465,12 @@ fn force_deletes_dir_without_marker() {
         &json!({"instance": "dev", "branch": "feature/x", "force": true}),
         &None,
     );
-    assert_eq!(result["dir_removed"].as_bool(), Some(true), "{result}");
-    assert!(!dir.exists(), "force:true must remove a dir with no marker");
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("GC archive") || error.contains("operator"),
+        "{result}"
+    );
+    assert!(dir.exists(), "marker-less orphan must be preserved");
     std::fs::remove_dir_all(&home).ok();
 }
 

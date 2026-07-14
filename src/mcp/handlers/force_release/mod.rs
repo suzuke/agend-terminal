@@ -25,6 +25,7 @@ use std::path::Path;
 
 mod gc;
 mod repair;
+mod s2;
 
 pub(crate) use gc::prune_git_metadata_for_agent;
 pub(crate) use repair::attempt_safe_rebind_repair;
@@ -59,72 +60,20 @@ pub(super) fn rebase_clean_self(
     home: &Path,
     agent: &str,
     branch: &str,
+    explicit_repo: Option<&Path>,
     sender: Option<&str>,
 ) -> Result<RebaseCleanOutcome, String> {
-    let worktrees_root = home.join("worktrees");
-    let target = worktrees_root.join(agent).join(branch);
-    let safe = target.starts_with(&worktrees_root)
-        && target != worktrees_root
-        && target != worktrees_root.join(agent);
-    if !safe {
-        return Err(format!(
-            "refuses to clean path outside the daemon worktree pool: {}",
-            target.display()
-        ));
+    if branch.is_empty() {
+        return Err("refuses to clean path outside the daemon worktree pool".to_string());
     }
-
-    let dir_existed = target.exists();
-    let mut dir_removed = false;
-    if dir_existed {
-        // #2158-adjacent: force_release is destructive-by-design, but a dirty
-        // worktree's uncommitted WIP should still be recoverable. Snapshot it to
-        // a durable recovery ref before the removal (a clean worktree is a no-op).
-        // reviewer4 #2672 fix — FAIL-CLOSED: if there IS WIP but it could not be
-        // snapshotted (e.g. a contended `index.lock`), refuse to nuke the worktree
-        // so the operator can recover it in place — even force_release must not
-        // silently lose it.
-        if let Some(reason) =
-            crate::worktree::preserve_dirty_worktree(home, agent, &target, branch, sender)
-                .blocked_reason()
-        {
-            return Err(format!(
-                "force_release refused: worktree at {} has uncommitted WIP that could not be \
-                 preserved ({reason}); not removing it so the WIP can be recovered in place",
-                target.display()
-            ));
-        }
-        match std::fs::remove_dir_all(&target) {
-            Ok(()) => {
-                dir_removed = true;
-                tracing::info!(
-                    %agent,
-                    %branch,
-                    path = %target.display(),
-                    "rebase_clean_self: stale worktree dir cleaned"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    %agent,
-                    %branch,
-                    error = %e,
-                    path = %target.display(),
-                    "rebase_clean_self: dir removal failed (will still try binding-clear)"
-                );
-            }
-        }
+    let result = s2::force_release(home, agent, branch, explicit_repo, sender)?;
+    if let Some(error) = result.outcome.error.as_ref() {
+        return Err(error.clone());
     }
-
-    let binding_outcome = crate::worktree_pool::release_full(home, agent, false);
-    // release_full returns early when binding.json is absent (line 244-247
-    // in worktree_pool.rs) — skipping clear_bind_in_flight. In the exact
-    // stale-state recovery case this tool is for (binding gone, dir present),
-    // the in-flight guard would leak and block rebind.
-    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
     Ok(RebaseCleanOutcome {
-        dir_existed,
-        dir_removed,
-        binding_outcome: serde_json::to_value(&binding_outcome).unwrap_or(Value::Null),
+        dir_existed: result.dir_existed,
+        dir_removed: result.dir_removed,
+        binding_outcome: serde_json::to_value(&result.outcome).unwrap_or(Value::Null),
     })
 }
 
@@ -154,9 +103,14 @@ mod tests {
     fn seed_daemon_worktree(home: &Path, agent: &str, branch: &str) -> std::path::PathBuf {
         let dir = home.join("worktrees").join(agent).join(branch);
         std::fs::create_dir_all(&dir).unwrap();
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).unwrap();
         std::fs::write(
             dir.join(".agend-managed"),
-            format!("agent={agent}\nbranch={branch}\n"),
+            format!(
+                "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+                source_repo.display()
+            ),
         )
         .unwrap();
         // Drop a sample file so we can verify recursive cleanup.
@@ -177,7 +131,7 @@ mod tests {
         let home = tmp_home("rebase-clean-existing");
         let dir = seed_daemon_worktree(&home, "dev", "feat/rebase-x");
         assert!(dir.exists());
-        let outcome = rebase_clean_self(&home, "dev", "feat/rebase-x", None)
+        let outcome = rebase_clean_self(&home, "dev", "feat/rebase-x", None, None)
             .expect("clean state in pool must succeed");
         assert!(outcome.dir_existed);
         assert!(outcome.dir_removed);
@@ -194,7 +148,7 @@ mod tests {
         // No prior bind, no stale dir → helper still runs release_full
         // (idempotent) and reports dir_existed=false.
         let home = tmp_home("rebase-clean-idempotent");
-        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed", None)
+        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed", None, None)
             .expect("helper must not error on clean state");
         assert!(!outcome.dir_existed);
         assert!(!outcome.dir_removed);
@@ -216,7 +170,7 @@ mod tests {
         let home = tmp_home("rebase-outside-pool");
         // An empty branch resolves to <home>/worktrees/dev (the
         // agent-level dir) which the safety check rejects.
-        let r = rebase_clean_self(&home, "dev", "", None);
+        let r = rebase_clean_self(&home, "dev", "", None, None);
         assert!(r.is_err(), "empty branch must reject as path-unsafe");
         // A branch with `..` would also escape the pool — but
         // agent_ops::validate_branch already rejects those before this
@@ -229,18 +183,13 @@ mod tests {
     // ── Sprint 60 W1 PR-1: bind_self handler rebase_mode end-to-end ─────
 
     #[test]
-    fn bind_self_rebase_mode_runs_cleanup_before_lease_attempt() {
+    fn bind_self_rebase_mode_refuses_mismatched_binding() {
         // Seed the stale state that drove the Wave 1 PR-2 BYPASS
         // incident: an on-disk worktree dir + binding lingering from a
         // prior bind cycle. Calling handle_bind_self with
-        // rebase_mode=true must clean the dir + binding even though
-        // the lease itself will fail (no fleet.yaml + no real git
-        // repo in this minimal test fixture).
-        //
-        // Observable: post-call, the stale dir is gone AND the
-        // binding is cleared, regardless of the lease error returned.
-        // This proves the rebase_mode wiring runs the cleanup helper
-        // before the dispatch_auto_bind_lease call.
+        // S2: a binding whose recorded worktree identity is stale must not
+        // authorize removal of a different on-disk target. Rebase mode fails
+        // closed and leaves both pieces of evidence intact.
         use crate::mcp::handlers::worktree::handle_bind_self;
         let home = tmp_home("bind-rebase-cleanup");
         let dir = seed_daemon_worktree(&home, "dev", "feat/rebase-bind");
@@ -259,11 +208,10 @@ mod tests {
             &json!({"branch": "feat/rebase-bind", "rebase_mode": true}),
             &crate::identity::Sender::new("dev"),
         );
-        // Cleanup ran regardless of the downstream lease result.
-        assert!(!dir.exists(), "rebase_mode must clean stale dir pre-lease");
+        assert!(dir.exists(), "mismatched binding must preserve stale dir");
         assert!(
-            !runtime.join("binding.json").exists(),
-            "rebase_mode must clear stale binding pre-lease"
+            runtime.join("binding.json").exists(),
+            "mismatched binding must preserve binding evidence"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -340,9 +288,18 @@ mod tests {
             "worktree add failed: {}",
             String::from_utf8_lossy(&add.stderr)
         );
+        std::fs::write(
+            target.join(crate::worktree_pool::MANAGED_MARKER),
+            format!(
+                "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
         std::fs::write(target.join("fr-wip.txt"), b"force-release WIP").unwrap();
 
-        let outcome = rebase_clean_self(&home, agent, branch, None).expect("rebase_clean_self ok");
+        let outcome =
+            rebase_clean_self(&home, agent, branch, None, None).expect("rebase_clean_self ok");
         assert!(
             outcome.dir_existed && outcome.dir_removed,
             "dirty worktree removed by force_release: {outcome:?}"
@@ -408,13 +365,21 @@ mod tests {
         )
         .status
         .success());
+        std::fs::write(
+            target.join(crate::worktree_pool::MANAGED_MARKER),
+            format!(
+                "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
         std::fs::write(target.join("fr-wip.txt"), b"must not vanish").unwrap();
         // Jam the worktree's index so `git add -A` fails during preservation.
         let gitlink = std::fs::read_to_string(target.join(".git")).unwrap();
         let gitdir = gitlink.strip_prefix("gitdir:").unwrap().trim();
         std::fs::write(Path::new(gitdir).join("index.lock"), b"").unwrap();
 
-        let result = rebase_clean_self(&home, agent, branch, None);
+        let result = rebase_clean_self(&home, agent, branch, None, None);
         assert!(
             result.is_err(),
             "force_release must FAIL-CLOSED (Err) when dirty WIP can't be preserved: {result:?}"

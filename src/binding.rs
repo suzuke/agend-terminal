@@ -18,7 +18,7 @@ const BINDING_SCHEMA_VERSION: u64 = 1;
 pub(crate) mod release_guard;
 pub(crate) use release_guard::{
     acquire_agent_mutation_lock, acquire_binding_file_lock, guarded_binding_disk_fresh,
-    snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
+    preflight_guarded_binding, snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
 };
 
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
