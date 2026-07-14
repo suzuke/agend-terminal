@@ -9,6 +9,29 @@ use std::path::Path;
 #[cfg(all(test, unix))]
 use std::cell::RefCell;
 
+/// #1466: record every `repo action=checkout` outcome — success AND every
+/// error path — to the daemon-observable event-log, so a silently-failed
+/// checkout (e.g. the partial-worktree bootstrap race that motivated #1466:
+/// `src/` present but no `.git`) leaves a diagnosable trace. Reuses
+/// `event_log::log` (the same freeform-msg helper as `worktree_released_full`
+/// — no new schema). Best-effort: `event_log::log` is fire-and-forget, so a
+/// logging failure can never affect the checkout result (observability must
+/// not become an availability risk). Logging once at the single wrapper exit
+/// guarantees coverage of all current and future return paths.
+pub(super) fn log_checkout_outcome(home: &Path, args: &Value, instance_name: &str, result: &Value) {
+    let branch = args["branch"].as_str().unwrap_or("HEAD");
+    let source = super::checkout::checkout_source(args).unwrap_or("");
+    let ok = result.get("error").is_none();
+    let mut msg = format!("branch={branch} source={source} ok={ok}");
+    if let Some(err) = result.get("error").and_then(Value::as_str) {
+        msg.push_str(&format!(" err={err}"));
+    }
+    if let Some(path) = result.get("path").and_then(Value::as_str) {
+        msg.push_str(&format!(" path={path}"));
+    }
+    crate::event_log::log(home, "worktree_checkout", instance_name, &msg);
+}
+
 /// #2755 R3 (root + independent review): map a post-`git worktree add`
 /// [`RollbackOutcome`] to the checkout error response, reporting the ACTUAL cleanup
 /// state. `Removed` → the historical "worktree rolled back" text. `RollbackPending`
