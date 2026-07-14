@@ -269,9 +269,8 @@ pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
 /// `FLOCK_DEPTH` thread-local for its lifetime so the self-IPC deadlock guard
 /// (`assert_no_registry_lock_for_self_ipc`) can see the flock tier — holding a
 /// flock across a loopback `api::call`/`enqueue_with_idle_hint` is the #1617
-/// lock-while-blocking deadlock class. On drop the depth decrement runs before
-/// the inner `File`'s drop releases the OS lock; both happen at the same scope
-/// exit, so no self-IPC can observe an inconsistent (depth, lock-held) pair.
+/// lock-while-blocking deadlock class. On drop the OS lock is explicitly
+/// unlocked before the depth decrement; the inner `File` then closes normally.
 ///
 /// `Deref` to `&File` is intentionally NOT provided: every call site holds the
 /// guard purely for RAII (`let _lock = acquire_file_lock(..)?`), so an opaque
@@ -282,6 +281,10 @@ pub struct FileFlockGuard {
 
 impl Drop for FileFlockGuard {
     fn drop(&mut self) {
+        // Explicitly unlock while cloned descriptors may still reference this
+        // open-file description; closing only this `File` does not release the
+        // flock in that case.
+        let _ = fs4::FileExt::unlock(&self._file);
         crate::sync_audit::flock_exited();
     }
 }
@@ -335,12 +338,28 @@ pub fn try_acquire_file_lock(lock_path: &Path) -> anyhow::Result<Option<FileFloc
         .truncate(false)
         .open(lock_path)?;
     // Trait method explicit — same MSRV rationale as `acquire_file_lock`.
-    if fs4::FileExt::try_lock(&f).is_err() {
+    if !classify_try_lock(lock_path, fs4::FileExt::try_lock(&f))? {
         return Ok(None);
     }
     // Bump AFTER the OS lock is held so depth>0 ⟹ lock held.
     crate::sync_audit::flock_entered();
     Ok(Some(FileFlockGuard { _file: f }))
+}
+
+/// Classify one non-blocking flock result for [`try_acquire_file_lock`].
+///
+/// `false` means a peer currently owns the lock; `true` means this file
+/// acquired it. Other errors must remain distinguishable from contention.
+fn classify_try_lock(
+    lock_path: &Path,
+    result: Result<(), fs4::TryLockError>,
+) -> anyhow::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(fs4::TryLockError::WouldBlock) => Ok(false),
+        Err(fs4::TryLockError::Error(error)) => Err(anyhow::Error::new(error)
+            .context(format!("flock try_lock failed on {}", lock_path.display()))),
+    }
 }
 
 /// Helper: build a store path from home + filename.
@@ -742,6 +761,56 @@ mod tests {
             "additional exclusive lock must fail while second guard held"
         );
         drop(guard2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flock_guard_drop_releases_lock_with_cloned_descriptor() {
+        let dir = tmp_dir("flock_clone_drop");
+        let lock_path = dir.join("my.lock");
+        let guard = acquire_file_lock(&lock_path).expect("first lock");
+        let clone = guard._file.try_clone().expect("clone lock descriptor");
+
+        drop(guard);
+        let reacquired = try_acquire_file_lock(&lock_path)
+            .expect("reacquire after guard drop")
+            .expect("guard drop must release lock despite cloned descriptor");
+        drop(reacquired);
+        drop(clone);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn try_lock_classifier_preserves_non_contention_errors() {
+        let dir = tmp_dir("flock-classifier");
+        let lock_path = dir.join("my.lock");
+
+        assert!(
+            !classify_try_lock(&lock_path, Err(fs4::TryLockError::WouldBlock))
+                .expect("WouldBlock is contention"),
+            "WouldBlock must remain the non-blocking contention result"
+        );
+
+        let error = classify_try_lock(
+            &lock_path,
+            Err(fs4::TryLockError::Error(std::io::Error::from_raw_os_error(
+                9,
+            ))),
+        )
+        .expect_err("non-contention flock errors must propagate");
+        assert!(
+            error.to_string().contains(&lock_path.display().to_string()),
+            "flock error must include lock path: {error}"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(9),
+            "flock error must preserve raw errno"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 
