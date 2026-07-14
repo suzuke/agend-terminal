@@ -778,6 +778,341 @@ fn sender_for(name: &str) -> Option<crate::identity::Sender> {
     crate::identity::Sender::new(name)
 }
 
+fn rebase_git(repo: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git command");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn seed_live_rebase_binding(
+    home: &std::path::Path,
+    agent: &str,
+    current_branch: &str,
+    target_branches: &[&str],
+) -> std::path::PathBuf {
+    let repo = home.join("rebase-live-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    rebase_git(&repo, &["init", "-q", "-b", current_branch]);
+    std::fs::write(repo.join(".gitignore"), ".agend-managed\n").unwrap();
+    rebase_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "add",
+            ".gitignore",
+        ],
+    );
+    rebase_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    for branch in target_branches {
+        rebase_git(&repo, &["branch", branch]);
+    }
+    std::fs::write(
+        repo.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent={agent}\nbranch={current_branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    crate::binding::bind_full(home, agent, "", current_branch, &repo, &repo, true)
+        .expect("seed binding");
+    repo
+}
+
+fn marker_value(path: &std::path::Path, field: &str) -> String {
+    std::fs::read_to_string(path.join(crate::worktree_pool::MANAGED_MARKER))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{field}=")).map(str::to_string))
+        .expect("marker field")
+}
+
+fn binding_value(home: &std::path::Path, agent: &str) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(crate::paths::binding_path(home, agent)).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn r3_bind_self_rebase_metadata_only_is_end_to_end() {
+    let home = tmp_home("r3-rebase-metadata-only");
+    let repo = seed_live_rebase_binding(&home, "agent", "main", &[]);
+    let response = handle_bind_self(
+        &home,
+        &json!({"repository_path":repo, "branch":"main", "rebase_mode":true}),
+        &sender_for("agent"),
+    );
+    assert_eq!(response["bound"].as_bool(), Some(true), "{response}");
+    assert_eq!(
+        response["repair_action"].as_str(),
+        Some("metadata_only"),
+        "{response}"
+    );
+    assert_eq!(
+        crate::git_helpers::git_cmd(&repo, &["branch", "--show-current"]).unwrap(),
+        "main"
+    );
+    assert_eq!(marker_value(&repo, "agent"), "agent");
+    assert_eq!(marker_value(&repo, "branch"), "main");
+    assert_eq!(binding_value(&home, "agent")["branch"], "main");
+    assert!(crate::binding::signature_valid(&home, "agent"));
+    assert_eq!(
+        binding_value(&home, "agent")["worktree"],
+        repo.display().to_string()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r3_bind_self_rebase_switched_branch_is_end_to_end() {
+    let home = tmp_home("r3-rebase-switched");
+    let repo = seed_live_rebase_binding(&home, "agent", "main", &["feature/r3"]);
+    let response = handle_bind_self(
+        &home,
+        &json!({"repository_path":repo, "branch":"feature/r3", "rebase_mode":true}),
+        &sender_for("agent"),
+    );
+    assert_eq!(response["bound"].as_bool(), Some(true), "{response}");
+    assert_eq!(
+        response["repair_action"].as_str(),
+        Some("switched_branch"),
+        "{response}"
+    );
+    assert_eq!(
+        crate::git_helpers::git_cmd(&repo, &["branch", "--show-current"]).unwrap(),
+        "feature/r3"
+    );
+    assert_eq!(marker_value(&repo, "agent"), "agent");
+    assert_eq!(marker_value(&repo, "branch"), "feature/r3");
+    assert_eq!(binding_value(&home, "agent")["branch"], "feature/r3");
+    assert!(crate::binding::signature_valid(&home, "agent"));
+    assert_eq!(
+        binding_value(&home, "agent")["worktree"],
+        repo.display().to_string()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r3_concurrent_rebase_has_one_bind_guard_transaction() {
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::thread;
+
+    let home = tmp_home("r3-rebase-concurrent");
+    let repo = seed_live_rebase_binding(&home, "agent", "main", &["feature/a", "feature/b"]);
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let green_barrier = Arc::new(Barrier::new(2));
+    let red_barrier = Arc::new(Barrier::new(3));
+    let hook_home = home.clone();
+    let hook_entered = entered.clone();
+    let green_wait = green_barrier.clone();
+    let red_wait = red_barrier.clone();
+    let _hook = crate::mcp::handlers::force_release::rebase_test_seam::install(move |phase| {
+        if phase != crate::mcp::handlers::force_release::RebaseTestPhase::BeforeRepair {
+            return None;
+        }
+        let (flag, cv) = &*hook_entered;
+        *flag.lock().unwrap() = true;
+        cv.notify_one();
+        if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(&hook_home, "agent") {
+            green_wait.wait();
+        } else {
+            red_wait.wait();
+        }
+        None
+    });
+
+    let first_home = home.clone();
+    let first_repo = repo.clone();
+    let first = thread::spawn(move || {
+        handle_bind_self(
+            &first_home,
+            &json!({"repository_path":first_repo, "branch":"feature/a", "rebase_mode":true}),
+            &sender_for("agent"),
+        )
+    });
+    let (flag, cv) = &*entered;
+    let mut entered_guard = flag.lock().unwrap();
+    while !*entered_guard {
+        entered_guard = cv.wait(entered_guard).unwrap();
+    }
+    drop(entered_guard);
+    let second_home = home.clone();
+    let second_repo = repo.clone();
+    let second = thread::spawn(move || {
+        handle_bind_self(
+            &second_home,
+            &json!({"repository_path":second_repo, "branch":"feature/b", "rebase_mode":true}),
+            &sender_for("agent"),
+        )
+    });
+    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(&home, "agent") {
+        green_barrier.wait();
+    } else {
+        red_barrier.wait();
+    }
+    let first_response = first.join().unwrap();
+    let second_response = second.join().unwrap();
+    let successes = [first_response.clone(), second_response.clone()]
+        .into_iter()
+        .filter(|response| response["bound"].as_bool() == Some(true))
+        .count();
+    assert_eq!(
+        successes, 1,
+        "exactly one concurrent rebase may bind: {first_response} / {second_response}"
+    );
+    assert!(
+        [first_response, second_response]
+            .iter()
+            .any(|response| response["code"].as_str() == Some("rebind_repair_blocked")),
+        "losing rebase must be blocked by BindGuard"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r3_marker_commit_failure_restores_coherent_state() {
+    let home = tmp_home("r3-marker-failure");
+    let repo = seed_live_rebase_binding(&home, "agent", "main", &["feature/fault"]);
+    let _hook = crate::mcp::handlers::force_release::rebase_test_seam::install(|phase| {
+        (phase == crate::mcp::handlers::force_release::RebaseTestPhase::BeforeMarkerCommit)
+            .then(|| "injected marker commit failure".to_string())
+    });
+    let response = handle_bind_self(
+        &home,
+        &json!({"repository_path":repo, "branch":"feature/fault", "rebase_mode":true}),
+        &sender_for("agent"),
+    );
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("injected marker commit failure")),
+        "marker fault must reach the rebase transaction: {response}"
+    );
+    assert_eq!(
+        crate::git_helpers::git_cmd(&repo, &["branch", "--show-current"]).unwrap(),
+        "main"
+    );
+    assert_eq!(marker_value(&repo, "branch"), "main");
+    assert_eq!(binding_value(&home, "agent")["branch"], "main");
+    assert!(crate::binding::signature_valid(&home, "agent"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r3_binding_commit_failure_restores_coherent_state() {
+    let home = tmp_home("r3-binding-failure");
+    let repo = seed_live_rebase_binding(&home, "agent", "main", &["feature/bind-fault"]);
+    let _hook = crate::mcp::handlers::dispatch_hook::bind_test_seam::install(|| {
+        Some("injected binding commit failure".to_string())
+    });
+    let response = handle_bind_self(
+        &home,
+        &json!({"repository_path":repo, "branch":"feature/bind-fault", "rebase_mode":true}),
+        &sender_for("agent"),
+    );
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("injected binding commit failure")),
+        "binding fault must reach the rebase transaction: {response}"
+    );
+    assert_eq!(
+        crate::git_helpers::git_cmd(&repo, &["branch", "--show-current"]).unwrap(),
+        "main"
+    );
+    assert_eq!(marker_value(&repo, "branch"), "main");
+    assert_eq!(binding_value(&home, "agent")["branch"], "main");
+    assert!(crate::binding::signature_valid(&home, "agent"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r3_locked_metadata_cleanup_is_exact_or_fail_closed() {
+    let home = tmp_home("r3-locked-metadata");
+    let repo = home.join("metadata-owner");
+    let target = home.join("worktrees").join("agent").join("feature/locked");
+    std::fs::create_dir_all(&repo).unwrap();
+    rebase_git(&repo, &["init", "-q", "-b", "main"]);
+    rebase_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    rebase_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/locked",
+            target.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=agent\nbranch=feature/locked\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    let metadata_root = repo.join(".git").join("worktrees");
+    let metadata = std::fs::read_dir(&metadata_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("gitdir").exists())
+        .expect("worktree metadata");
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::write(metadata.join("locked"), "r3 test lock\n").unwrap();
+    let response = handle_release_worktree(
+        &home,
+        &json!({"instance":"agent", "branch":"feature/locked", "repository_path":repo, "force":true}),
+        &None,
+    );
+    let metadata_exists = metadata.exists();
+    assert!(
+        (response["released"].as_bool() == Some(true) && !metadata_exists)
+            || (response["released"].as_bool() != Some(true) && metadata_exists),
+        "locked metadata must be removed exactly or fail closed with evidence preserved: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn bind_self_creates_binding_and_worktree() {
     // Gate 1: a successful bind_self produces binding.json + worktree

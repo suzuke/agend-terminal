@@ -32,6 +32,47 @@ pub(crate) enum TargetState {
     Present,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebaseTestPhase {
+    BeforeRepair,
+    BeforeMarkerCommit,
+}
+
+#[cfg(test)]
+pub(crate) mod rebase_test_seam {
+    use super::RebaseTestPhase;
+    use std::sync::Arc;
+
+    type Hook = Arc<dyn Fn(RebaseTestPhase) -> Option<String> + Send + Sync>;
+
+    static HOOK: std::sync::OnceLock<parking_lot::Mutex<Option<Hook>>> = std::sync::OnceLock::new();
+
+    fn hook() -> &'static parking_lot::Mutex<Option<Hook>> {
+        HOOK.get_or_init(|| parking_lot::Mutex::new(None))
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *hook().lock() = None;
+        }
+    }
+
+    pub(crate) fn install(
+        callback: impl Fn(RebaseTestPhase) -> Option<String> + Send + Sync + 'static,
+    ) -> Guard {
+        *hook().lock() = Some(Arc::new(callback));
+        Guard
+    }
+
+    pub(crate) fn hit(phase: RebaseTestPhase) -> Option<String> {
+        let callback = hook().lock().clone();
+        callback.and_then(|callback| callback(phase))
+    }
+}
+
 pub(crate) fn classify_target(path: &Path) -> Result<TargetState, String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => Ok(TargetState::Present),
@@ -346,6 +387,11 @@ pub(crate) fn rebase_repair(
 ) -> Result<super::repair::RepairAction, super::repair::RepairBlocked> {
     use super::repair::{RepairAction, RepairBlocked};
 
+    #[cfg(test)]
+    if let Some(reason) = rebase_test_seam::hit(RebaseTestPhase::BeforeRepair) {
+        return Err(RepairBlocked::PathUnsafe(reason));
+    }
+
     let state = crate::binding::preflight_guarded_binding(home, agent);
     match state {
         GuardedBinding::Opaque(reason) => Err(RepairBlocked::Opaque(reason)),
@@ -594,6 +640,10 @@ fn update_marker_branch(
     }
     if !saw_repo {
         lines.push(format!("source_repo={}", source_repo.display()));
+    }
+    #[cfg(test)]
+    if let Some(reason) = rebase_test_seam::hit(RebaseTestPhase::BeforeMarkerCommit) {
+        return Err(reason);
     }
     std::fs::write(marker, format!("{}\n", lines.join("\n")))
         .map_err(|e| format!("write managed marker: {e}"))

@@ -188,6 +188,34 @@ impl Drop for BindGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod bind_test_seam {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn() -> Option<String>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn() -> Option<String> + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) fn hit() -> Option<String> {
+        HOOK.with(|slot| slot.borrow().as_ref().and_then(|hook| hook()))
+    }
+}
+
 /// Sprint 58 Wave 3 PR-2 (#8): peek whether a `(home, agent)` pair is
 /// currently in the bind-in-flight set. Used by `binding_state` to
 /// report whether a concurrent `dispatch_auto_bind_lease` is active for
@@ -557,15 +585,35 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // #2158 GR1: the only `arm_ci_watch=false` path through this sink is `bind_self`
     // (an agent self-claim → operator notify); dispatch wrappers pass true. So
     // self-claim ⟺ !arm_ci_watch — reuse the dispatch-intent, no task_id heuristic.
-    match crate::binding::bind_full(
-        home,
-        target,
-        task_id,
-        branch,
-        &wt_path,
-        &source_repo,
-        !arm_ci_watch,
-    ) {
+    let bind_result = {
+        #[cfg(test)]
+        if let Some(reason) = bind_test_seam::hit() {
+            Err(reason)
+        } else {
+            crate::binding::bind_full(
+                home,
+                target,
+                task_id,
+                branch,
+                &wt_path,
+                &source_repo,
+                !arm_ci_watch,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            crate::binding::bind_full(
+                home,
+                target,
+                task_id,
+                branch,
+                &wt_path,
+                &source_repo,
+                !arm_ci_watch,
+            )
+        }
+    };
+    match bind_result {
         Ok(()) => tracing::info!(
             %target, %branch, path = %wt_path.display(),
             "dispatch auto-bind OK"
