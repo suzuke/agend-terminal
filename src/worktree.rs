@@ -697,6 +697,52 @@ pub(crate) enum WipPreservation {
     UnpreservableNestedDirty(String),
 }
 
+/// Operator-visible effects produced while classifying/preserving WIP. Release
+/// transactions collect these under their flocks and emit them only after the
+/// branch + agent + binding guards have dropped.
+pub(crate) enum ReleaseNotice {
+    WipPreserved {
+        recipient: String,
+        text: String,
+    },
+    UnpreservableNestedDirty {
+        agent: String,
+        branch: String,
+        wt_path: PathBuf,
+        nested_status: String,
+        sender: Option<String>,
+    },
+}
+
+impl ReleaseNotice {
+    pub(crate) fn emit(self, home: &Path) {
+        #[cfg(test)]
+        crate::worktree_pool::release_test_seam::hit(
+            crate::worktree_pool::ReleaseTestPhase::BeforeNoticeEmit,
+        );
+        match self {
+            ReleaseNotice::WipPreserved { recipient, text } => {
+                let source = crate::inbox::NotifySource::System("release_dirty_wip_preserved");
+                crate::inbox::notify_agent(home, &recipient, &source, &text);
+            }
+            ReleaseNotice::UnpreservableNestedDirty {
+                agent,
+                branch,
+                wt_path,
+                nested_status,
+                sender,
+            } => notify_unpreservable_nested_dirty(
+                home,
+                &agent,
+                &branch,
+                &wt_path,
+                &nested_status,
+                sender.as_deref(),
+            ),
+        }
+    }
+}
+
 impl WipPreservation {
     /// The reason the caller MUST refuse to remove the worktree (fail-closed):
     /// preservation FAILED (`Blocked`) OR the dirt is nested-submodule-internal and
@@ -756,9 +802,26 @@ pub(crate) fn preserve_dirty_worktree(
     branch: &str,
     sender: Option<&str>,
 ) -> WipPreservation {
+    let (outcome, notices) = preserve_dirty_worktree_collect(home, agent, wt_path, branch, sender);
+    for notice in notices {
+        notice.emit(home);
+    }
+    outcome
+}
+
+/// Transaction-facing variant of [`preserve_dirty_worktree`]. It performs the
+/// same snapshot/classification work but returns notice payloads instead of
+/// emitting while the caller's release flocks are held.
+pub(crate) fn preserve_dirty_worktree_collect(
+    home: &Path,
+    agent: &str,
+    wt_path: &Path,
+    branch: &str,
+    sender: Option<&str>,
+) -> (WipPreservation, Vec<ReleaseNotice>) {
     use crate::git_helpers::git_cmd;
     if branch.is_empty() {
-        return WipPreservation::Clean; // unknown branch → nothing to key a recovery ref on
+        return (WipPreservation::Clean, Vec::new()); // unknown branch → nothing to key a recovery ref on
     }
     // Not a LIVE git worktree (a pruned/dangling stale dir — its `.git` gitlink
     // points at a removed gitdir, or there is none) → there is no git WIP to
@@ -769,10 +832,10 @@ pub(crate) fn preserve_dirty_worktree(
     // call sites pass `home/worktrees/...` (outside any repo), so rev-parse can't
     // resolve a spurious ancestor `.git`.
     if git_cmd(wt_path, &["rev-parse", "--git-dir"]).is_err() {
-        return WipPreservation::Clean;
+        return (WipPreservation::Clean, Vec::new());
     }
     if !worktree_has_preservable_wip(wt_path) {
-        return WipPreservation::Clean; // clean / marker-only → zero behaviour change
+        return (WipPreservation::Clean, Vec::new()); // clean / marker-only → zero behaviour change
     }
     // Branch tip tree. Err → Blocked (fail-closed): a repo we can't read HEAD^{tree}
     // from is one we can't safely snapshot, so refuse removal.
@@ -781,9 +844,12 @@ pub(crate) fn preserve_dirty_worktree(
         other => {
             tracing::warn!(agent, branch, ?other,
                 "preserve dirty WIP: HEAD^{{tree}} resolve failed — refusing to remove (fail-closed)");
-            return WipPreservation::Blocked(format!(
-                "`git rev-parse HEAD^{{tree}}` failed: {other:?}"
-            ));
+            return (
+                WipPreservation::Blocked(format!(
+                    "`git rev-parse HEAD^{{tree}}` failed: {other:?}"
+                )),
+                Vec::new(),
+            );
         }
     };
     // LIVE index tree — READ-ONLY. `write-tree` reads the current index and writes
@@ -797,9 +863,12 @@ pub(crate) fn preserve_dirty_worktree(
         other => {
             tracing::warn!(agent, branch, ?other,
                 "preserve dirty WIP: `write-tree` (live index) failed — refusing to remove (fail-closed)");
-            return WipPreservation::Blocked(format!(
-                "`git write-tree` (live index) failed: {other:?}"
-            ));
+            return (
+                WipPreservation::Blocked(format!(
+                    "`git write-tree` (live index) failed: {other:?}"
+                )),
+                Vec::new(),
+            );
         }
     };
     // Working-tree tree via a TEMP index so the LIVE index is byte-untouched.
@@ -808,7 +877,7 @@ pub(crate) fn preserve_dirty_worktree(
         Err(e) => {
             tracing::warn!(agent, branch, error = %e,
                 "preserve dirty WIP: working-tree snapshot failed — refusing to remove (fail-closed)");
-            return WipPreservation::Blocked(e);
+            return (WipPreservation::Blocked(e), Vec::new());
         }
     };
     // Classification (R5 data-safety, 2nd-seat blocker @ fc8481d3): ANY nested-
@@ -828,14 +897,22 @@ pub(crate) fn preserve_dirty_worktree(
     // unmerged live index / snapshot failure keeps its `Blocked` precedence.)
     let nested = enumerate_nested_dirty(wt_path);
     if !nested.is_empty() {
-        notify_unpreservable_nested_dirty(home, agent, branch, wt_path, &nested, sender);
         tracing::warn!(agent, branch,
             "preserve dirty WIP: nested submodule-internal dirt present (unpreservable by a parent ref — sole or mixed with parent dirt) — refusing removal (fail-closed)");
-        return WipPreservation::UnpreservableNestedDirty(
-            "worktree has uncommitted changes inside a nested submodule's working tree \
-             (gitlink unchanged); a parent recovery ref cannot capture them, so removal was \
-             refused to preserve the nested WIP in place"
-                .into(),
+        return (
+            WipPreservation::UnpreservableNestedDirty(
+                "worktree has uncommitted changes inside a nested submodule's working tree \
+                 (gitlink unchanged); a parent recovery ref cannot capture them, so removal was \
+                 refused to preserve the nested WIP in place"
+                    .into(),
+            ),
+            vec![ReleaseNotice::UnpreservableNestedDirty {
+                agent: agent.to_string(),
+                branch: branch.to_string(),
+                wt_path: wt_path.to_path_buf(),
+                nested_status: nested,
+                sender: sender.map(str::to_string),
+            }],
         );
     }
     // PRESERVE. commit-tree needs a committer identity supplied via `-c` so the
@@ -862,9 +939,12 @@ pub(crate) fn preserve_dirty_worktree(
             other => {
                 tracing::warn!(agent, branch, ?other,
                     "preserve dirty WIP: staged-snapshot `commit-tree` failed — refusing to remove (fail-closed)");
-                return WipPreservation::Blocked(format!(
-                    "`git commit-tree` (staged snapshot) failed: {other:?}"
-                ));
+                return (
+                    WipPreservation::Blocked(format!(
+                        "`git commit-tree` (staged snapshot) failed: {other:?}"
+                    )),
+                    Vec::new(),
+                );
             }
         }
     } else {
@@ -896,7 +976,10 @@ pub(crate) fn preserve_dirty_worktree(
                 ?other,
                 "preserve dirty WIP: `commit-tree` failed — refusing to remove (fail-closed)"
             );
-            return WipPreservation::Blocked(format!("`git commit-tree` failed: {other:?}"));
+            return (
+                WipPreservation::Blocked(format!("`git commit-tree` failed: {other:?}")),
+                Vec::new(),
+            );
         }
     };
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -904,13 +987,20 @@ pub(crate) fn preserve_dirty_worktree(
     if let Err(e) = git_cmd(wt_path, &["update-ref", &ref_name, &commit]) {
         tracing::warn!(agent, branch, error = %e,
             "preserve dirty WIP: `update-ref` failed — refusing to remove (fail-closed)");
-        return WipPreservation::Blocked(format!("`git update-ref {ref_name}` failed: {e}"));
+        return (
+            WipPreservation::Blocked(format!("`git update-ref {ref_name}` failed: {e}")),
+            Vec::new(),
+        );
     }
     tracing::info!(agent, branch, %ref_name, dual_parent = parent2.is_some(),
         "preserve dirty WIP: uncommitted worktree changes snapshotted before manual release");
     prune_recovery_refs(wt_path, branch);
-    notify_wip_preserved(home, agent, branch, &ref_name, parent2.is_some(), sender);
-    WipPreservation::Preserved
+    let recipient = wip_notice_recipient(home, agent, sender);
+    let text = wip_preserved_notice(agent, branch, &ref_name, parent2.is_some());
+    (
+        WipPreservation::Preserved,
+        vec![ReleaseNotice::WipPreserved { recipient, text }],
+    )
 }
 
 /// Bound the recovery-ref set for `branch`: keep at most
@@ -1007,23 +1097,6 @@ fn wip_preserved_notice(agent: &str, branch: &str, ref_name: &str, dual_parent: 
          Auto-pruned after {RECOVERY_TTL_DAYS}d / max {RECOVERY_MAX_PER_BRANCH} per branch. \
          #2158-adjacent."
     )
-}
-
-/// Notify the release's CALLER that a dirty worktree's WIP was preserved, with a
-/// one-line recovery command. Recipient + body per the pure helpers above.
-/// Best-effort.
-fn notify_wip_preserved(
-    home: &Path,
-    agent: &str,
-    branch: &str,
-    ref_name: &str,
-    dual_parent: bool,
-    sender: Option<&str>,
-) {
-    let recipient = wip_notice_recipient(home, agent, sender);
-    let text = wip_preserved_notice(agent, branch, ref_name, dual_parent);
-    let source = crate::inbox::NotifySource::System("release_dirty_wip_preserved");
-    crate::inbox::notify_agent(home, &recipient, &source, &text);
 }
 
 /// Monotonic sequence for per-worktree TEMP artifacts (temp index files + atomic

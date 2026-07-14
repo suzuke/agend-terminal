@@ -916,6 +916,12 @@ fn release_full_refuses_binding_rewrite_between_snapshot_and_remove_s1() {
     });
 
     snap_rx.recv().expect("release reached snapshot phase");
+    // Same-branch checkout/reuse owns L(repo,branch) while it refreshes binding
+    // metadata. Manual release must wait for that owner, then reject its stale
+    // fingerprint rather than deleting the reused generation.
+    let reuse_lease =
+        crate::binding::acquire_branch_lease_lock(&home, &repo.display().to_string(), "feat/cas")
+            .expect("same-branch reuse lease");
     crate::binding::bind_full(
         &home,
         "agent-cas",
@@ -926,6 +932,7 @@ fn release_full_refuses_binding_rewrite_between_snapshot_and_remove_s1() {
         false,
     )
     .expect("install generation B");
+    drop(reuse_lease);
     resume_tx.send(()).expect("resume release after rebind");
 
     let outcome = release_thread.join().expect("release thread");
@@ -1067,6 +1074,113 @@ fn release_refuses_opaque_binding_instead_of_treating_it_absent_s1() {
     );
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn agent_mutation_lock_survives_runtime_directory_deletion_s1() {
+    let home = tmp_home("s1-stable-agent-lock");
+    let runtime = crate::paths::runtime_dir(&home).join("agent-stable");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let path = crate::binding::release_guard::agent_mutation_lock_path(&home, "agent-stable");
+    assert!(
+        !path.starts_with(crate::paths::runtime_dir(&home)),
+        "permanent agent lock must live outside deletable runtime: {}",
+        path.display()
+    );
+
+    let held = crate::binding::acquire_agent_mutation_lock(&home, "agent-stable")
+        .expect("first agent mutation lock");
+    std::fs::remove_dir_all(&runtime).expect("delete runtime while lock held");
+    assert!(path.exists(), "stable lock inode survives runtime deletion");
+    assert!(
+        crate::store::try_acquire_file_lock(&path)
+            .expect("contended lock probe")
+            .is_none(),
+        "second actor still contends on the same inode"
+    );
+    drop(held);
+    assert!(
+        crate::store::try_acquire_file_lock(&path)
+            .expect("released lock probe")
+            .is_some(),
+        "stable lock becomes acquirable after guard drop"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn auto_release_exact_fingerprint_cannot_release_new_generation_s1() {
+    let home = tmp_home("s1-auto-exact");
+    let repo = tmp_repo("s1-auto-exact-repo");
+    let lease = lease_bound(&home, &repo, "agent-auto", "feat/auto-exact");
+    let old =
+        match crate::binding::snapshot_guarded_binding(&home, "agent-auto").expect("snapshot A") {
+            crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+            other => panic!("expected Known A, got {other:?}"),
+        };
+    let branch_lock = crate::binding::acquire_branch_lease_lock(
+        &home,
+        &repo.display().to_string(),
+        "feat/auto-exact",
+    )
+    .expect("branch lease for generation B");
+    crate::binding::bind_full(
+        &home,
+        "agent-auto",
+        "T-generation-b",
+        "feat/auto-exact",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("write generation B");
+    drop(branch_lock);
+
+    let outcome = release_full_exact(&home, "agent-auto", &old);
+    assert!(
+        outcome.stale_fingerprint && !outcome.released,
+        "auto-release A must reject B exactly: {outcome:?}"
+    );
+    assert!(lease.path.exists(), "generation B worktree survives");
+    assert_eq!(
+        crate::binding::read(&home, "agent-auto").expect("generation B binding")["task_id"],
+        "T-generation-b"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn dirty_release_begins_notice_emit_after_all_transaction_flocks_drop_s1() {
+    let home = tmp_home("s1-notice-unlocked");
+    let repo = tmp_repo("s1-notice-unlocked-repo");
+    let lease = lease_bound(&home, &repo, "agent-notice", "feat/notice");
+    std::fs::write(lease.path.join("precious.txt"), b"dirty WIP").expect("dirty WIP");
+
+    let (depth_tx, depth_rx) = std::sync::mpsc::channel();
+    let _hook = release_test_seam::install(move |phase| {
+        if phase == ReleaseTestPhase::BeforeNoticeEmit {
+            depth_tx
+                .send(crate::sync_audit::flock_depth())
+                .expect("publish notice flock depth");
+        }
+    });
+    let outcome = release_full(&home, "agent-notice", false);
+    assert!(outcome.released, "dirty release succeeds: {outcome:?}");
+    assert_eq!(
+        depth_rx.recv().expect("notice emit observed"),
+        0,
+        "notice dispatch begins after branch + agent + binding flocks drop"
+    );
+    assert_eq!(
+        recovery_refs(&repo, "feat/notice").len(),
+        1,
+        "the observed notice corresponds to a created recovery ref"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// §3.9 regression (#t-21 HIGH #1): `release_full(dry_run=true)` must be

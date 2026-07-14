@@ -87,6 +87,19 @@ pub(crate) fn dispose(
     }
 }
 
+/// Auto-release variant of the shared Release mechanism. The caller supplies the
+/// exact disk-fresh binding fingerprint it evaluated; the release transaction
+/// refuses if that generation moved before L→A reacquisition.
+pub(crate) fn dispose_release_exact(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+) -> DispositionOutcome {
+    DispositionOutcome::Released(crate::worktree_pool::release_full_exact(
+        home, agent, expected,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
