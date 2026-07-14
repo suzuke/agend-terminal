@@ -489,3 +489,126 @@ fn send_schema_exposes_bind_parameter() {
         serde_json::to_string_pretty(&props).unwrap_or_default()
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// 10. review_assignment omitted bind does not auto-bind
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn review_assignment_omitted_bind_does_not_auto_bind() {
+    use crate::identity::Sender;
+    use crate::mcp::handlers::comms_gates::DispatchPreChecks;
+    use crate::mcp::handlers::comms_gates::ReviewAuthor;
+    use crate::mcp::handlers::review_assignment::validate_review_assignment_marker;
+
+    let home = tmp_home("ra-omit-bind");
+    let sender = Sender::new("lead").unwrap();
+    let args = serde_json::json!({
+        "instance": "reviewer",
+        "task_id": "t-test",
+        "branch": "feat/x",
+        "repository": "owner/repo",
+        "pr_number": 42,
+        "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        // NO bind field — must still not auto-bind
+    });
+    let checks = DispatchPreChecks {
+        force: false,
+        force_reason: None,
+        second_reviewer: false,
+        plan_ack_required: 0,
+        review_assignment: true,
+        review_author: Some(ReviewAuthor::Agent("author".into())),
+        pr_number: Some(42),
+    };
+
+    let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
+    // The validation will fail (no PrState exists), but the error should be about
+    // PrState, not about bind/lease conflict
+    if let Err(e) = &result {
+        let code = e["code"].as_str().unwrap_or("");
+        assert!(
+            !code.contains("lease") && !code.contains("bind"),
+            "omitted bind on review_assignment must not produce a bind/lease error: {e}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 11. checkout expected_head — 41-hex rejected
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_41_hex_rejected() {
+    let home = tmp_home("eh-41hex");
+    let parent = tmp_home("eh-41hex-src");
+    let source = setup_source_repo(&parent, "feat/eh-41hex");
+    // 41 hex chars — invalid
+    let bad = "a".repeat(41);
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/eh-41hex",
+            "bind": true,
+            "expected_head": &bad,
+        }),
+        "eh-agent-41",
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("invalid_expected_head"),
+        "41-hex expected_head must be rejected: {resp}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 12. checkout expected_head — absent target mismatch leaves no branch
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_absent_target_no_branch_created() {
+    let home = tmp_home("eh-absent");
+    let parent = tmp_home("eh-absent-src");
+    let source = setup_source_repo(&parent, "feat/eh-base");
+    let real_sha = get_sha(&source, "main");
+    // Use a different valid SHA that doesn't match main
+    let wrong_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // "feat/eh-absent-new" doesn't exist — expected_head mismatch must prevent creation
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/eh-absent-new",
+            "bind": true,
+            "expected_head": wrong_sha,
+            "from_ref": &real_sha,
+        }),
+        "eh-agent-absent",
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "absent target with mismatched expected_head must fail: {resp}"
+    );
+
+    // Verify branch was NOT created
+    let branch_check = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/feat/eh-absent-new"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git");
+    assert!(
+        !branch_check.status.success(),
+        "branch must NOT be created on expected_head mismatch"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
