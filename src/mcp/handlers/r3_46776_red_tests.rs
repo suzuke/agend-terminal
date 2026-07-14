@@ -332,3 +332,226 @@ fn g5_handle_spawn_rejects_workspace_identity_collision() {
 
     std::fs::remove_dir_all(home_ref).ok();
 }
+
+// ===========================================================================
+// R4 RED tests — three new findings from the root review rejection at 9ea0a6f6.
+// Each test FAILS at the current HEAD because the fix is not yet implemented.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// R4-1 — admission rollback must preserve pre-existing worktree content
+// ---------------------------------------------------------------------------
+
+/// R4-1: When `spawn_single_instance_impl` resolves `working_directory` to a
+/// pre-existing directory (a reused worktree or an occupied workspace) and the
+/// subsequent `add_instance_to_yaml` fails (fleet.yaml write failure in a race
+/// or I/O error), the rollback calls `cleanup_working_dir` which
+/// unconditionally removes dirs under `$AGEND_HOME/worktrees/`. This destroys
+/// state that this attempt did NOT create.
+///
+/// Setup: empty fleet (preflight passes), fleet.yaml made read-only so the
+/// write-back inside `mutate_fleet_yaml` fails → Err triggers rollback on the
+/// pre-existing worktree dir.
+///
+/// RED: FAILS because the rollback path has no provenance tracking — it
+/// removes the pre-existing worktree content via `cleanup_working_dir`.
+#[test]
+fn r4_admission_rollback_preserves_preexisting_worktree() {
+    let home = tmp_home("r4-wt-rollback");
+    let wt_path = crate::worktree::worktree_path(&home, "new-agent", "feat/work");
+    std::fs::create_dir_all(&wt_path).unwrap();
+    std::fs::write(wt_path.join("important.rs"), "// pre-existing content").unwrap();
+
+    // Empty fleet → preflight collision check passes (no colliders).
+    fleet_with_instances(&home, "instances: {}\n");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+
+    // Make fleet.yaml read-only → mutate_fleet_yaml write-back fails → Err.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fleet_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    let spawn_fn = |_h: &Path, _req: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"ok": true}))
+    };
+
+    let result = crate::mcp::handlers::instance_state::spawn::spawn_single_instance_impl(
+        &home,
+        "spawner",
+        &json!({
+            "name": "new-agent",
+            "backend": "claude",
+            "working_directory": wt_path.display().to_string()
+        }),
+        &spawn_fn,
+    );
+
+    // Restore permissions for cleanup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fleet_path, std::fs::Permissions::from_mode(0o644)).ok();
+    }
+
+    // The spawn must be refused (fleet.yaml write failure).
+    assert!(
+        result.get("error").is_some(),
+        "R4-1 precondition: admission must be refused due to fleet.yaml write failure. Got: {result}"
+    );
+
+    // The pre-existing content MUST survive the rollback.
+    assert!(
+        wt_path.join("important.rs").exists(),
+        "R4-1: pre-existing worktree content must survive admission rollback. \
+         cleanup_working_dir must not destroy state it did not create."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// R4-2 — unreadable/malformed fleet must fail-closed on collision & boot
+// ---------------------------------------------------------------------------
+
+/// R4-2a: When fleet.yaml is unreadable (opaque I/O error, not NotFound),
+/// `workspace_identity_collision` must refuse (return Some), not silently pass
+/// the collision check (return None). `load_instances_mapping` currently
+/// converts ALL errors to an empty mapping → "no collision" → fail-open.
+///
+/// RED: FAILS because `load_instances_mapping` returns empty on read error,
+/// and `workspace_identity_collision` finds no collision in the empty mapping.
+#[test]
+fn r4_unreadable_fleet_refuses_runtime_collision() {
+    let home = tmp_home("r4-fleet-unreadable");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    // Make fleet.yaml a directory → opaque read error (IsADirectory), not NotFound.
+    std::fs::create_dir_all(&fleet_path).unwrap();
+
+    let result = crate::fleet::persist::workspace_identity_collision(
+        &home,
+        "any-instance",
+        &home.join("workspace").join("any-instance"),
+    );
+
+    assert!(
+        result.is_some(),
+        "R4-2a: unreadable fleet.yaml must refuse collision check (fail-closed), \
+         not silently pass as 'no collision'. Got None."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R4-2b: When fleet.yaml is unreadable, `duplicate_identity_owner_before`
+/// must also refuse (return Some), not pass the boot admission check.
+///
+/// RED: FAILS for the same reason — `load_instances_mapping` returns empty.
+#[test]
+fn r4_unreadable_fleet_refuses_boot_admission() {
+    let home = tmp_home("r4-fleet-boot");
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::create_dir_all(&fleet_path).unwrap();
+
+    let result = crate::fleet::persist::duplicate_identity_owner_before(
+        &home,
+        "any-instance",
+        &home.join("workspace").join("any-instance"),
+    );
+
+    assert!(
+        result.is_some(),
+        "R4-2b: unreadable fleet.yaml must refuse boot admission (fail-closed), \
+         not silently pass. Got None."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R4-2c: When fleet.yaml is malformed (parse error, not NotFound),
+/// `prepare_instructions` must refuse, not fall back to contextless
+/// provisioning. The `Err(_)` catch-all currently treats parse errors
+/// the same as file-absent.
+///
+/// RED: FAILS because `prepare_instructions` proceeds with provisioning
+/// despite the malformed fleet.yaml.
+#[test]
+fn r4_malformed_fleet_refuses_prepare_instructions() {
+    let home = tmp_home("r4-fleet-malformed");
+    let ws = home.join("workspace").join("agent");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "{{{{invalid yaml nonsense!!!!").unwrap();
+
+    let result = crate::api::handlers::prepare_instructions(&home, "agent", "codex", &ws, None);
+
+    assert!(
+        result.is_err(),
+        "R4-2c: malformed fleet.yaml must refuse prepare_instructions, \
+         not fall back to contextless provisioning. Got Ok."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// R4-3 — ensure_project_root / migrate failures must propagate
+// ---------------------------------------------------------------------------
+
+/// R4-3a: When `ensure_project_root` fails (git init failure because .git is
+/// an invalid regular file), the error must propagate through
+/// `generate_with_context` to `prepare_instructions`. Currently
+/// `ensure_project_root` returns `()` and discards all errors.
+///
+/// RED: FAILS because `ensure_project_root` silently swallows the git init
+/// failure and `generate_with_context` proceeds as if setup succeeded.
+#[test]
+fn r4_ensure_project_root_failure_propagates() {
+    let home = tmp_home("r4-projroot");
+    let ws = home.join("workspace").join("agent");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    // Create an invalid .git file → `git init` will fail because .git already
+    // exists as a regular file with invalid gitlink content.
+    std::fs::write(ws.join(".git"), "invalid content — not a valid gitlink").unwrap();
+
+    // No fleet.yaml → NotFound fallback (legitimate), reaches generate_with_context.
+    let result = crate::api::handlers::prepare_instructions(&home, "agent", "codex", &ws, None);
+
+    assert!(
+        result.is_err(),
+        "R4-3a: ensure_project_root git-init failure must propagate through \
+         generate_with_context to prepare_instructions. Provisioning cannot \
+         report success when ownership/scope setup failed. Got Ok."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R4-3b: When `migrate_claude_old_rules_file` fails (old file is a
+/// directory, so `remove_file` errors), the error must propagate. Currently
+/// `let _ = std::fs::remove_file(...)` silently discards the error.
+///
+/// RED: FAILS because `migrate_claude_old_rules_file` uses `let _ =` to
+/// discard the remove_file error.
+#[test]
+fn r4_migrate_claude_old_rules_failure_propagates() {
+    let home = tmp_home("r4-migrate");
+    let ws = home.join("workspace").join("agent");
+    let old_rules = ws.join(".claude").join("rules").join("agend.md");
+    // Make agend.md a directory → `remove_file` will fail (IsADirectory).
+    std::fs::create_dir_all(&old_rules).unwrap();
+
+    // No fleet.yaml → NotFound fallback. Backend = "claude" triggers migrate.
+    let result = crate::api::handlers::prepare_instructions(&home, "agent", "claude", &ws, None);
+
+    assert!(
+        result.is_err(),
+        "R4-3b: migrate_claude_old_rules_file remove_file failure must propagate. \
+         Stale rules file left behind corrupts agent instructions. Got Ok."
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
