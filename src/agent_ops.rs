@@ -559,58 +559,77 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) -> Optio
                 tracing::info!(dir = %working_dir.display(), "removed workspace");
             }
         } else {
-            // User-provided working directory: only remove agend-generated files
-            let agend_files = [
-                // Claude
-                ".claude/settings.local.json",
-                "mcp-config.json",
-                "claude-settings.json",
-                "statusline.sh",
-                "statusline.json",
-                ".claude/rules/agend.md",
-                // Gemini
-                ".gemini/settings.json",
-                // OpenCode
-                "opencode.json",
-                "instructions/agend.md",
-                // Codex
-                ".codex/config.toml",
-                "AGENTS.md",
-                // Kiro
-                ".kiro/settings/mcp.json",
-                ".kiro/settings/agend-mcp-wrapper.sh",
-                ".kiro/steering/agend.md",
-                ".kiro/agents/agend.json",
-                ".kiro/agents/agend-prompt.md",
-                ".kiro/agents/default.json",
-                ".kiro/prompts/agend.md",
-                ".kiro/settings.json",
-            ];
-            for file in &agend_files {
-                let path = working_dir.join(file);
-                if path.exists() {
-                    let _ = std::fs::remove_file(&path);
+            let worktrees = home.join("worktrees");
+            let under_worktrees = working_dir.starts_with(&worktrees)
+                && match (
+                    dunce::canonicalize(working_dir),
+                    dunce::canonicalize(&worktrees),
+                ) {
+                    (Ok(wd), Ok(wt)) => wd.starts_with(&wt),
+                    _ => false,
+                };
+            if under_worktrees {
+                if crate::worktree_pool::teardown_workspace_worktree(home, name, working_dir) {
+                    // handled (gitlink worktree): removal + registry cleanup done.
+                } else if let Err(e) = std::fs::remove_dir_all(working_dir) {
+                    tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove managed worktree");
+                } else {
+                    tracing::info!(dir = %working_dir.display(), "removed managed worktree");
                 }
-            }
+            } else {
+                // User-provided working directory: only remove agend-generated files
+                let agend_files = [
+                    // Claude
+                    ".claude/settings.local.json",
+                    "mcp-config.json",
+                    "claude-settings.json",
+                    "statusline.sh",
+                    "statusline.json",
+                    ".claude/rules/agend.md",
+                    // Gemini
+                    ".gemini/settings.json",
+                    // OpenCode
+                    "opencode.json",
+                    "instructions/agend.md",
+                    // Codex
+                    ".codex/config.toml",
+                    "AGENTS.md",
+                    // Kiro
+                    ".kiro/settings/mcp.json",
+                    ".kiro/settings/agend-mcp-wrapper.sh",
+                    ".kiro/steering/agend.md",
+                    ".kiro/agents/agend.json",
+                    ".kiro/agents/agend-prompt.md",
+                    ".kiro/agents/default.json",
+                    ".kiro/prompts/agend.md",
+                    ".kiro/settings.json",
+                ];
+                for file in &agend_files {
+                    let path = working_dir.join(file);
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
 
-            // Clean up worktree if exists
-            let wt_dir = working_dir.join(".worktrees").join(name);
-            if wt_dir.exists() {
-                // W1.2: LOCAL best-effort worktree-remove via the bypass+bounded
-                // helper (was a raw UNBOUNDED `.output()` whose result was already
-                // discarded). git_ok adds the LOCAL_GIT_TIMEOUT bound so a stuck
-                // remove can't hang teardown; the bypass env is a no-op in the
-                // daemon's shim-free PATH. Result stays discarded → same effect.
-                let _ = crate::git_helpers::git_ok(
-                    working_dir,
-                    &[
-                        "worktree",
-                        "remove",
-                        "--force",
-                        &wt_dir.display().to_string(),
-                    ],
-                );
-                tracing::info!(dir = %wt_dir.display(), "removed worktree");
+                // Clean up worktree if exists
+                let wt_dir = working_dir.join(".worktrees").join(name);
+                if wt_dir.exists() {
+                    // W1.2: LOCAL best-effort worktree-remove via the bypass+bounded
+                    // helper (was a raw UNBOUNDED `.output()` whose result was already
+                    // discarded). git_ok adds the LOCAL_GIT_TIMEOUT bound so a stuck
+                    // remove can't hang teardown; the bypass env is a no-op in the
+                    // daemon's shim-free PATH. Result stays discarded → same effect.
+                    let _ = crate::git_helpers::git_ok(
+                        working_dir,
+                        &[
+                            "worktree",
+                            "remove",
+                            "--force",
+                            &wt_dir.display().to_string(),
+                        ],
+                    );
+                    tracing::info!(dir = %wt_dir.display(), "removed worktree");
+                }
             }
         }
     }
@@ -658,10 +677,22 @@ pub(crate) fn working_dir_ownership_conflict(working_dir: &Path, name: &str) -> 
         return Some(format!("AGENTS.md {reason}"));
     }
     if let Some(reason) =
+        crate::instructions::agents_md_identity(&working_dir.join(".agents").join("AGENTS.md"))
+            .conflict_with(&crate::instructions::sanitize_identifier(name))
+    {
+        return Some(format!(".agents/AGENTS.md {reason}"));
+    }
+    if let Some(reason) =
         crate::mcp_config::codex_config_identity(&working_dir.join(".codex").join("config.toml"))
             .conflict_with(name)
     {
         return Some(format!(".codex/config.toml {reason}"));
+    }
+    if let Some(reason) =
+        crate::mcp_config::codex_config_identity(&working_dir.join(".grok").join("config.toml"))
+            .conflict_with(name)
+    {
+        return Some(format!(".grok/config.toml {reason}"));
     }
     None
 }

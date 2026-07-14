@@ -97,7 +97,16 @@ pub(crate) fn prepare_instructions(
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
         }
-        Err(_) => crate::instructions::generate(work_dir, command),
+        Err(_) => {
+            let ctx = crate::instructions::AgentContext {
+                name,
+                role: None,
+                fleet_peers: &[],
+                team: None,
+                extra_instructions: None,
+            };
+            crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
+        }
     }
 }
 

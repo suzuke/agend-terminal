@@ -287,6 +287,14 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         Ok(p) => p,
         Err(e) => return json!({"ok": false, "error": format!("{e}")}),
     };
+    if let Some(collider) =
+        crate::fleet::persist::workspace_identity_collision(ctx.home, name, &work_dir)
+    {
+        return json!({"ok": false, "error": format!(
+            "workspace identity collision: '{name}' would share the working directory with existing instance '{collider}' ({})",
+            work_dir.display()
+        )});
+    }
     let size = crossterm::terminal::size().unwrap_or((120, 40));
     let spawn_mode = match params["mode"].as_str() {
         Some("resume") => crate::backend::SpawnMode::Resume,

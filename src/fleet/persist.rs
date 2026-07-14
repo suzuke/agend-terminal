@@ -26,8 +26,14 @@ pub(crate) fn mutate_fleet_yaml(
         return Ok(());
     }
     let _lock = acquire_lock(home)?;
-    let content =
-        std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| default_content.to_string());
+    let content = match std::fs::read_to_string(&fleet_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_content.to_string(),
+        Err(e) => {
+            return Err(anyhow::anyhow!("fleet.yaml read: {e}"))
+                .context("opaque I/O — refusing to default")
+        }
+    };
     let mut doc: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&content).context("Failed to parse fleet.yaml")?;
     let changed = mutate(&mut doc)?;
