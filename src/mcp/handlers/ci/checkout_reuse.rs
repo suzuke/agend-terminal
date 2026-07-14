@@ -24,6 +24,7 @@ pub(super) fn try_reuse_bound_worktree(
     path_lock: PathLockGuard,
     auto_created_branch: bool,
     fetch_attempted: bool,
+    expected_head: Option<&str>,
 ) -> Value {
     let wt_str = wt.display().to_string();
     tracing::info!(
@@ -103,16 +104,51 @@ pub(super) fn try_reuse_bound_worktree(
             "branch": branch,
         });
     }
+    if let Some(expected) = expected_head {
+        let actual_worktree =
+            crate::git_helpers::git_cmd(&wt, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let actual_worktree = actual_worktree.trim().to_string();
+        if !actual_worktree.eq_ignore_ascii_case(expected) {
+            return json!({
+                "error": format!(
+                    "expected_head {expected} does not match bound worktree HEAD {actual_worktree}"
+                ),
+                "code": "expected_head_drift",
+                "expected_head": expected,
+                "actual_head": actual_worktree,
+                "branch": branch,
+            });
+        }
+        let actual_branch = crate::git_helpers::git_cmd(
+            source_canonical,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .unwrap_or_default();
+        let actual_branch = actual_branch.trim().to_string();
+        if !actual_branch.eq_ignore_ascii_case(expected) {
+            return json!({
+                "error": format!(
+                    "expected_head {expected} does not match branch HEAD {actual_branch}"
+                ),
+                "code": "expected_head_drift",
+                "expected_head": expected,
+                "actual_head": actual_branch,
+                "branch": branch,
+            });
+        }
+    }
     // #2755 R3 (B1): sync to the FINAL HEAD FIRST (an externally advanced branch may
     // change/add gitlinks), THEN strict recursive init, THEN verify EXACT gitlink commits
     // — any sync/init/verify failure returns NO success (fail closed), never a bound:true
     // over a broken tree.
-    if let Err(e) = crate::worktree::sync_worktree_to_head_strict(&wt) {
-        return json!({
-            "error": format!("reuse: sync to HEAD failed: {}", redact_paths(&e)),
-            "code": "reuse_sync_failed",
-            "branch": branch,
-        });
+    if expected_head.is_none() {
+        if let Err(e) = crate::worktree::sync_worktree_to_head_strict(&wt) {
+            return json!({
+                "error": format!("reuse: sync to HEAD failed: {}", redact_paths(&e)),
+                "code": "reuse_sync_failed",
+                "branch": branch,
+            });
+        }
     }
     if let Err(e) = crate::worktree::init_submodules_strict(&wt) {
         return json!({
@@ -130,6 +166,39 @@ pub(super) fn try_reuse_bound_worktree(
             "code": "reuse_gitlink_mismatch",
             "branch": branch,
         });
+    }
+    if let Some(expected) = expected_head {
+        let actual_worktree =
+            crate::git_helpers::git_cmd(&wt, &["rev-parse", "HEAD"]).unwrap_or_default();
+        let actual_worktree = actual_worktree.trim().to_string();
+        let actual_branch = crate::git_helpers::git_cmd(
+            source_canonical,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .unwrap_or_default();
+        let actual_branch = actual_branch.trim().to_string();
+        if !actual_worktree.eq_ignore_ascii_case(expected) {
+            return json!({
+                "error": format!(
+                    "expected_head {expected} does not match bound worktree HEAD {actual_worktree}"
+                ),
+                "code": "expected_head_drift",
+                "expected_head": expected,
+                "actual_head": actual_worktree,
+                "branch": branch,
+            });
+        }
+        if !actual_branch.eq_ignore_ascii_case(expected) {
+            return json!({
+                "error": format!(
+                    "expected_head {expected} does not match branch HEAD {actual_branch}"
+                ),
+                "code": "expected_head_drift",
+                "expected_head": expected,
+                "actual_head": actual_branch,
+                "branch": branch,
+            });
+        }
     }
     json!({
         "path": wt_str,

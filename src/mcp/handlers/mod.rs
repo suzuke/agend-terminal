@@ -6,6 +6,9 @@ pub(crate) mod ci;
 mod comms;
 #[cfg(test)]
 pub(crate) use comms::build_report_text;
+// #6: re-export so ci/review_workspace_tests can reach the validation function.
+#[cfg(test)]
+pub(crate) use comms::review_assignment;
 pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;

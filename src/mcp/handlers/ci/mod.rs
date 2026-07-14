@@ -145,3 +145,10 @@ mod exact_head_merge_tests;
 #[path = "checkout_submodule_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod checkout_submodule_tests;
+
+// #6: review subject/workspace decoupling — expected_head checkout precondition,
+// review_assignment bind rejection, send schema bind exposure.
+#[cfg(test)]
+#[path = "review_workspace_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_workspace_tests;

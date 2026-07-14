@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 // #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
 // keep this handler under the LOC ceiling (call sites below are unchanged).
-use super::checkout_helpers::{rollback_response, sync_marker_contents};
+use super::checkout_helpers::{rollback_response, sync_marker_contents, validate_expected_head};
 
 /// #2755 structured redaction: replace absolute filesystem paths (and Windows
 /// drive paths) in an error string RETURNED over the wire with `<path>`. The
@@ -37,31 +37,8 @@ pub(crate) fn checkout_source(args: &Value) -> Option<&str> {
 
 pub(crate) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let result = handle_checkout_repo_inner(home, args, instance_name);
-    log_checkout_outcome(home, args, instance_name, &result);
+    super::checkout_helpers::log_checkout_outcome(home, args, instance_name, &result);
     result
-}
-
-/// #1466: record every `repo action=checkout` outcome — success AND every
-/// error path — to the daemon-observable event-log, so a silently-failed
-/// checkout (e.g. the partial-worktree bootstrap race that motivated #1466:
-/// `src/` present but no `.git`) leaves a diagnosable trace. Reuses
-/// `event_log::log` (the same freeform-msg helper as `worktree_released_full`
-/// — no new schema). Best-effort: `event_log::log` is fire-and-forget, so a
-/// logging failure can never affect the checkout result (observability must
-/// not become an availability risk). Logging once at the single wrapper exit
-/// guarantees coverage of all current and future return paths.
-fn log_checkout_outcome(home: &Path, args: &Value, instance_name: &str, result: &Value) {
-    let branch = args["branch"].as_str().unwrap_or("HEAD");
-    let source = checkout_source(args).unwrap_or("");
-    let ok = result.get("error").is_none();
-    let mut msg = format!("branch={branch} source={source} ok={ok}");
-    if let Some(err) = result.get("error").and_then(Value::as_str) {
-        msg.push_str(&format!(" err={err}"));
-    }
-    if let Some(path) = result.get("path").and_then(Value::as_str) {
-        msg.push_str(&format!(" path={path}"));
-    }
-    crate::event_log::log(home, "worktree_checkout", instance_name, &msg);
 }
 
 fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) -> Value {
@@ -122,7 +99,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         instance_name,
         source.replace(['/', '\\', ':'], "_").replace('~', "")
     ));
-    std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     // #2158 PR1: resolve + validate the source repo path fail-closed (absolute or
     // known agent name only; canonicalize; reject system dirs). Extracted to
     // `source_resolve` — keeps this oversized handler under the file_size ceiling
@@ -132,6 +108,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             Ok(pair) => pair,
             Err(e) => return e,
         };
+    if let Some(e) = validate_expected_head(args, &source_path, branch) {
+        return e;
+    }
+    let expected_ref = super::checkout_helpers::expected_creation_ref(args, &source_path, branch);
+    std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     // #780: auto-create branch from `from_ref` when bind:true + branch
     // missing locally. #781 Piece 6 extracts the decision tree into
     // `dispatch_hook::ensure_branch_exists` so the same logic services
@@ -150,11 +131,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         // "main" → "origin/main", byte-identical to the prior literal.
         let default_base = format!("origin/{}", crate::git_helpers::default_branch(src));
         let from_ref = args["from_ref"].as_str().unwrap_or(&default_base);
+        let creation_ref = expected_ref.as_deref().unwrap_or(from_ref);
         match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
             home,
             src,
             branch,
-            from_ref,
+            creation_ref,
             instance_name,
         ) {
             Ok((created, fetched)) => {
@@ -291,7 +273,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     // lock transfer, CAS re-read, canonical daemon-managed provenance, then
                     // sync-to-final-HEAD → strict init → gitlink verify) lives in the sibling
                     // `checkout_reuse` module to keep this handler under the LOC ceiling.
-                    return super::checkout_reuse::try_reuse_bound_worktree(
+                    let mut reuse_resp = super::checkout_reuse::try_reuse_bound_worktree(
                         home,
                         instance_name,
                         branch,
@@ -301,7 +283,24 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         path_lock,
                         auto_created_branch,
                         fetch_attempted,
+                        args["expected_head"].as_str(),
                     );
+                    // #6: echo expected_head/actual_head on idempotent reuse —
+                    // re-read the actual HEAD from the worktree rather than
+                    // echoing the expected value (the worktree may have diverged).
+                    if let Some(expected) = args["expected_head"].as_str() {
+                        if reuse_resp.get("error").is_some() {
+                            return reuse_resp;
+                        }
+                        let wt_path = reuse_resp["path"].as_str().unwrap_or(&worktree_path_str);
+                        let actual =
+                            crate::git_helpers::git_cmd(Path::new(wt_path), &["rev-parse", "HEAD"])
+                                .unwrap_or_default();
+                        let actual = actual.trim();
+                        reuse_resp["actual_head"] = json!(actual);
+                        reuse_resp["expected_head"] = json!(expected);
+                    }
+                    return reuse_resp;
                 }
                 let existing_task_id = existing
                     .get("task_id")
@@ -549,6 +548,24 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     branch,
                 );
             }
+            if let Some(expected) = args["expected_head"].as_str() {
+                if let Some(err) = super::checkout_helpers::rollback_if_expected_head_drift(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    Path::new(&source_path),
+                    branch,
+                    expected,
+                    Path::new(&worktree_path_str),
+                    true,
+                    auto_created_branch,
+                    "submodules_ready",
+                ) {
+                    return err;
+                }
+            }
             let mut bound_fingerprint = None;
             if bind {
                 // #2533: optional caller-supplied task_id — attributes this self-claim
@@ -679,6 +696,20 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             // Committed durable ⇒ transaction resolved; drop the journal tombstone.
             super::checkout_txn::Journal::clear(home, &mangled);
+            // #6: echo expected_head/actual_head only when the caller supplied it
+            // (omitted → no new fields, byte-compatible with pre-#6 callers).
+            // Re-read the actual HEAD from the provisioned worktree rather than
+            // echoing the expected value — the worktree is the ground truth.
+            if let Some(expected) = args["expected_head"].as_str() {
+                let actual = crate::git_helpers::git_cmd(
+                    Path::new(&worktree_path_str),
+                    &["rev-parse", "HEAD"],
+                )
+                .unwrap_or_default();
+                let actual = actual.trim();
+                resp["actual_head"] = json!(actual);
+                resp["expected_head"] = json!(expected);
+            }
             resp
         }
         Ok(o) => {

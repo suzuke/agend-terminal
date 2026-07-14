@@ -26,7 +26,9 @@ use super::super::dispatch_hook;
 use super::super::send_envelope::SendEnvelope;
 use super::super::{err_needs_identity, is_ok_result, require_instance};
 
-mod review_assignment;
+// #6: pub(crate) so ci/review_workspace_tests.rs can drive the validation
+// function directly (RED-first test for bind/worktree_binding_required rejection).
+pub(crate) mod review_assignment;
 
 /// Sprint 55 P0-C — true when the caller passed `bind: false`.
 pub(in crate::mcp::handlers) fn dispatch_should_skip_auto_bind(args: &Value) -> bool {
@@ -559,8 +561,10 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         None
     };
 
-    if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
-        return e;
+    if !checks.review_assignment {
+        if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
+            return e;
+        }
     }
 
     // t-…-17 C11: the marker path delivers via the DURABLE outbox store (A1→A2→A3),
