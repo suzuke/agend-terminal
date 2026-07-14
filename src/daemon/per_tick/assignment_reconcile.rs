@@ -147,22 +147,58 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Vec<Str
     store::tombstone_terminal_matches(home, repo, branch);
 
     let mut wakes = Vec::new();
+    // Load PrState ONCE per branch (shared across all records on this branch).
+    let raw_prstate = crate::daemon::pr_state::load(home, repo, branch);
     for record in store::list_active(home, repo, branch) {
         // A2: recover a Pending row (idempotent; nonce-dedup handles a crash-window
         // duplicate). Unconditional — even an acked record's row must be durable.
         if record.row == store::RowState::Pending {
             let _ = store::durable_enqueue(home, repo, branch, &record.target, now);
         }
+        // P0: retire assignments whose PrState subject has advanced past the
+        // assignment's snapshot. A head or PR-number contradiction means the
+        // assignment's review target no longer exists on this branch — nudging it
+        // is pointless. Absent/corrupt PrState (load returns None) is not proof
+        // of obsolescence, so the assignment is preserved (fail-closed).
+        // Head comparison is exact == on String (C3: no prefix, no normalization).
+        if let Some(ref state) = raw_prstate {
+            let head_contradicts = record
+                .reviewed_head
+                .as_deref()
+                .is_some_and(|rh| rh != state.head_sha);
+            let pr_contradicts = state.pr_number != record.pr_number;
+            if head_contradicts || pr_contradicts {
+                if store::retire_if_id_matches(
+                    home,
+                    repo,
+                    branch,
+                    &record.target,
+                    record.assignment_id,
+                    now,
+                )
+                .unwrap_or(false)
+                {
+                    tracing::info!(
+                        assignment_id = %record.assignment_id,
+                        target = %record.target,
+                        repo = %repo,
+                        branch = %branch,
+                        "assignment retired: PrState contradicts subject"
+                    );
+                }
+                continue;
+            }
+        }
         // Classify against the LIVE pr_state for THIS record's generation (its
         // pr_number). A pr_state for a different generation, or none, ⇒ Unengaged.
-        let prstate = crate::daemon::pr_state::load(home, repo, branch)
+        let prstate = raw_prstate
+            .as_ref()
             .filter(|p| p.pr_number == record.pr_number);
         // A3/A4: ONLY Unengaged is nudge/repair-eligible. `repair_row` self-gates on
         // the FIXED-interval lease (returns false when not due) and advances it, so
         // two ticks in one interval fire at most once (I12) — the wake follows only
         // an actual repair.
-        if store::classify_assignment(&record, prstate.as_ref())
-            == store::AssignmentEvidence::Unengaged
+        if store::classify_assignment(&record, prstate) == store::AssignmentEvidence::Unengaged
             && store::repair_row(home, repo, branch, &record.target, now).unwrap_or(false)
         {
             wakes.push(record.target.clone());
@@ -758,6 +794,582 @@ mod tests {
             n0,
             "the registered handler's run() repaired the lease-due Unengaged record"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─── P0: obsolete review assignment retirement tests ───────────────
+
+    /// Create an assignment with an explicit `reviewed_head`. The standard `mk`
+    /// creates a legacy row (reviewed_head = None); these tests exercise the
+    /// head-advance retirement path which requires a non-None reviewed_head.
+    fn mk_with_head(
+        repo: &str,
+        branch: &str,
+        target: &str,
+        pr: u64,
+        head: &str,
+        created: &str,
+    ) -> ActiveAssignment {
+        let mut rec = mk(repo, branch, target, pr, created);
+        rec.reviewed_head = Some(head.to_string());
+        rec
+    }
+
+    /// P0-1: PrState head has advanced past the assignment's reviewed_head and no
+    /// receipt exists. The assignment is obsolete and must be retired (removed from
+    /// the authority store), with no subsequent nudge.
+    #[test]
+    fn head_advance_no_receipt_retires() {
+        let home = tmp_home("p0-1");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // PrState head has advanced to "sha-new" (assignment was for "sha-old").
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(wakes.is_empty(), "no nudge after retirement");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "assignment must be retired when PrState head contradicts reviewed_head"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P0-2: PrState head has advanced and an old REJECTED receipt exists on the
+    /// PrState. The head contradiction still retires the assignment — a stale
+    /// receipt does not preserve a stale assignment.
+    #[test]
+    fn head_advance_with_rejected_receipt_retires() {
+        let home = tmp_home("p0-2");
+        let instance_id = crate::types::InstanceId::new();
+        let reviewed_head = "a".repeat(40); // full 40-hex SHA
+        let rec = store::ActiveAssignment::new_pending_typed(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            instance_id,
+            7,
+            &reviewed_head,
+            crate::review_receipt::ReviewSlot::Primary,
+            "lead",
+            "t-rev-1",
+            ReviewClass::Dual,
+            ReviewAuthor::External("octocat".into()),
+            "Please review PR",
+            None,
+            None,
+            "2026-07-13T00:00:00Z",
+        );
+        let assignment_id = rec.assignment_id;
+        store::persist(&home, &rec).unwrap();
+
+        // PrState at a NEW head, with a REJECTED receipt for the OLD head.
+        let new_head = "b".repeat(40);
+        let mut s = pr_state::new_for_branch("o/r", "feat/x", &new_head, ReviewClass::Dual);
+        s.pr_number = 7;
+        s.merge_state = MergeState::NotReady;
+        s.validated_review_receipts = vec![crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "r-1".into(),
+            source_id: "s-1".into(),
+            evidence_digest: "c".repeat(64),
+            assignment_id,
+            reviewer_instance_id: instance_id,
+            reviewer_name: "reviewer".into(),
+            repo: "o/r".into(),
+            pr_number: 7,
+            branch: "feat/x".into(),
+            task_id: "t-rev-1".into(),
+            reviewed_head: reviewed_head.clone(),
+            review_class: ReviewClass::Dual,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Rejected,
+        }];
+        pr_state::save(&home, &s).unwrap();
+
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(wakes.is_empty(), "no nudge after retirement");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "head-advanced assignment retires even with an old REJECTED receipt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P0-3: PrState pr_number differs from the assignment's pr_number (a new PR
+    /// was opened on the same branch). The assignment is for a dead generation and
+    /// must be retired.
+    #[test]
+    fn pr_number_mismatch_retires() {
+        let home = tmp_home("p0-3");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            5,
+            "sha-a",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // PrState is for a DIFFERENT PR number (new generation on same branch).
+        open_prstate(&home, "o/r", "feat/x", 6, "sha-a");
+
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(
+            wakes.is_empty(),
+            "no nudge for a dead-generation assignment"
+        );
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "assignment must be retired when PrState pr_number contradicts"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P0-4: PrState head matches the assignment's reviewed_head and the assignment
+    /// is Unengaged. Normal nudge behavior must be preserved — no retirement.
+    #[test]
+    fn same_head_unengaged_still_nudges() {
+        let home = tmp_home("p0-4");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-same",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        let n0 = rec.delivery_nonce.clone();
+        // Mark the row read so repair_row will actually fire.
+        mark_row_read(&home, "reviewer", &n0, "2026-07-13T00:00:00Z");
+        // PrState head matches the assignment's reviewed_head — no contradiction.
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-same");
+
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:01Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "assignment preserved when head matches"
+        );
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "Unengaged nudge still fires when head matches"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P0-5: ABA guard — an assignment replaced by a new assignment_id between the
+    /// lock-free list_active scan and the CAS retire must be preserved. The retire
+    /// is a CAS no-op on the new id.
+    #[test]
+    fn replacement_assignment_preserved_aba() {
+        let home = tmp_home("p0-5");
+        // Create assignment B (the replacement) with reviewed_head matching PrState.
+        let rec_b = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-new",
+            "2026-07-13T00:01:00Z",
+        );
+        store::persist(&home, &rec_b).unwrap();
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        // A stale CAS retire with a different (old) assignment_id must be a no-op.
+        let stale_id = uuid::Uuid::new_v4();
+        let retired = store::retire_if_id_matches(
+            &home,
+            "o/r",
+            "feat/x",
+            "reviewer",
+            stale_id,
+            "2026-07-13T00:02:00Z",
+        )
+        .unwrap();
+        assert!(!retired, "CAS no-op: stale id does not remove replacement");
+        let got = store::get(&home, "o/r", "feat/x", "reviewer").unwrap();
+        assert_eq!(
+            got.assignment_id, rec_b.assignment_id,
+            "replacement assignment preserved with its own id"
+        );
+
+        // Reconcile also leaves B alone (head matches).
+        reconcile_all_collect(&home, "2026-07-13T00:03:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "reconcile preserves replacement assignment whose head matches PrState"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P0-6: no PrState file exists (never observed by the scanner). The assignment
+    /// must be preserved — absent PrState is not proof of obsolescence.
+    #[test]
+    fn absent_prstate_no_retire() {
+        let home = tmp_home("p0-6");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // NO PrState file — the branch was never observed.
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "assignment preserved when no PrState exists"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C1: a corrupt (unparseable) PrState file is treated as absent by
+    /// `pr_state::load` (returns None). The assignment must be preserved — a
+    /// corrupt PrState is not proof of obsolescence (fail-closed).
+    #[test]
+    fn c1_corrupt_prstate_preserves_assignment() {
+        let home = tmp_home("p0-c1");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // Write a CORRUPT PrState file.
+        let ps_dir = pr_state::pr_state_dir(&home);
+        std::fs::create_dir_all(&ps_dir).unwrap();
+        std::fs::write(
+            ps_dir.join(pr_state::pr_state_filename("o/r", "feat/x")),
+            b"{ not valid prstate json",
+        )
+        .unwrap();
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "corrupt PrState must not cause retirement (fail-closed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C2: PrState head matches the assignment's reviewed_head and the assignment
+    /// is EngagedUnsatisfied (a REJECTED receipt exists at the current head). The
+    /// assignment is neither retired (head matches) nor nudged (EngagedUnsatisfied
+    /// is a TRUE stop). This is a GREEN test — EngagedUnsatisfied non-nudge behavior
+    /// is already implemented; this test pins it in the retirement context.
+    #[test]
+    fn c2_current_head_engaged_unsatisfied_not_retired() {
+        let home = tmp_home("p0-c2");
+        let instance_id = crate::types::InstanceId::new();
+        let head = "a".repeat(40);
+        let rec = store::ActiveAssignment::new_pending_typed(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            instance_id,
+            7,
+            &head,
+            crate::review_receipt::ReviewSlot::Primary,
+            "lead",
+            "t-rev-1",
+            ReviewClass::Dual,
+            ReviewAuthor::External("octocat".into()),
+            "Please review PR",
+            None,
+            None,
+            "2026-07-13T00:00:00Z",
+        );
+        let assignment_id = rec.assignment_id;
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+
+        // PrState at the SAME head with a REJECTED receipt — EngagedUnsatisfied.
+        let mut s = pr_state::new_for_branch("o/r", "feat/x", &head, ReviewClass::Dual);
+        s.pr_number = 7;
+        s.merge_state = MergeState::NotReady;
+        s.validated_review_receipts = vec![crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "r-1".into(),
+            source_id: "s-1".into(),
+            evidence_digest: "c".repeat(64),
+            assignment_id,
+            reviewer_instance_id: instance_id,
+            reviewer_name: "reviewer".into(),
+            repo: "o/r".into(),
+            pr_number: 7,
+            branch: "feat/x".into(),
+            task_id: "t-rev-1".into(),
+            reviewed_head: head.clone(),
+            review_class: ReviewClass::Dual,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Rejected,
+        }];
+        pr_state::save(&home, &s).unwrap();
+
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "EngagedUnsatisfied at current head must NOT be retired"
+        );
+        assert!(
+            wakes.is_empty(),
+            "EngagedUnsatisfied is a TRUE stop — no nudge"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C3: head comparison must be exact full-SHA byte-for-byte — no prefix matching,
+    /// no normalization, no case folding. Two SHAs that share a prefix but differ in
+    /// the last byte must trigger retirement.
+    #[test]
+    fn c3_head_sha_exact_byte_comparison() {
+        let home = tmp_home("p0-c3");
+        // Assignment reviewed_head differs from PrState head only in the last byte.
+        let assignment_head = format!("{}0", "a".repeat(39));
+        let prstate_head = format!("{}1", "a".repeat(39));
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            &assignment_head,
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        open_prstate(&home, "o/r", "feat/x", 7, &prstate_head);
+
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "a single-byte difference in full SHA must trigger retirement (exact comparison)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─── Durability failpoint tests ───────────────────────────────────
+
+    /// D1: inbox persistence failure preserves authority. If the strict
+    /// supersede cannot durably retract the stale inbox row, the authority
+    /// record must survive so the reconciler retries on the next tick.
+    #[cfg(unix)]
+    #[test]
+    fn d1_supersede_persistence_failure_preserves_authority() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("d1-persist-fail");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        // Make the inbox directory read-only so the strict supersede write fails.
+        let inbox_dir = home.join("inbox");
+        let original_perms = std::fs::metadata(&inbox_dir).unwrap().permissions();
+        std::fs::set_permissions(&inbox_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+
+        // Restore permissions before assertions (cleanup on panic).
+        std::fs::set_permissions(&inbox_dir, original_perms).unwrap();
+
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "authority MUST survive when inbox supersede fails (fail-closed)"
+        );
+        assert!(
+            wakes.is_empty(),
+            "no nudge — the head contradiction still prevents nudging"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// D2: interruption after durable supersede converges on retry. If the
+    /// inbox row is already superseded (from a prior interrupted retire) but
+    /// the authority was not deleted, a second retire call must converge:
+    /// the idempotent supersede is a no-op, and the authority is removed.
+    #[test]
+    fn d2_interruption_after_supersede_converges_on_retry() {
+        let home = tmp_home("d2-converge");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        let expected_id = rec.assignment_id;
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+
+        // Simulate a prior interrupted retire: supersede the inbox row manually
+        // but leave the authority intact.
+        let successor = format!("retired-{}", expected_id);
+        crate::inbox::storage::supersede_by_nonce_strict(
+            &home,
+            "reviewer",
+            &rec.delivery_nonce,
+            &successor,
+        )
+        .expect("manual supersede must succeed");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "authority is still present (simulated crash before delete)"
+        );
+
+        // Now PrState head advances — reconcile should converge and delete.
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+        let wakes = reconcile_all_collect(&home, "2026-07-13T00:02:00Z");
+
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "retry after interrupted supersede must converge and delete authority"
+        );
+        assert!(wakes.is_empty(), "no nudge after retirement");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// D3: after retire, the old delivery nonce inbox row is non-actionable
+    /// (superseded_by is set or row was already read). Verifies the
+    /// supersede-before-delete ordering actually retracts the stale row.
+    #[test]
+    fn d3_old_nonce_non_actionable_after_retire() {
+        let home = tmp_home("d3-nonce");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        let old_nonce = rec.delivery_nonce.clone();
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        assert!(
+            crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &old_nonce),
+            "old nonce must be actionable before retire"
+        );
+
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+
+        assert!(
+            !crate::inbox::storage::nonce_present_actionable(&home, "reviewer", &old_nonce),
+            "old nonce must be non-actionable after retire (superseded)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// D4: revocation notice is deterministic and idempotent. When the
+    /// reviewer has already read the assignment inbox row, a revocation
+    /// notice is enqueued exactly once per retire cycle. A second reconcile
+    /// tick (after convergence deletes the authority) enqueues no duplicate.
+    #[test]
+    fn d4_revocation_notice_idempotent() {
+        let home = tmp_home("d4-notice");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        // Mark the inbox row as READ so the retire path enqueues a revocation notice.
+        mark_row_read(
+            &home,
+            "reviewer",
+            &rec.delivery_nonce,
+            "2026-07-13T00:00:30Z",
+        );
+
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        // First reconcile: retires the assignment and enqueues revocation notice.
+        reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(
+            store::get(&home, "o/r", "feat/x", "reviewer").is_none(),
+            "authority retired on first tick"
+        );
+
+        let inbox_content =
+            std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
+        let notice_count = inbox_content
+            .lines()
+            .filter(|l| l.contains("review-assignment-revoked"))
+            .count();
+        assert_eq!(
+            notice_count, 1,
+            "exactly one revocation notice after first retire"
+        );
+
+        // Second reconcile: authority is gone, no duplicate notice.
+        reconcile_all_collect(&home, "2026-07-13T00:02:00Z");
+        let inbox_content2 =
+            std::fs::read_to_string(home.join("inbox").join("reviewer.jsonl")).unwrap_or_default();
+        let notice_count2 = inbox_content2
+            .lines()
+            .filter(|l| l.contains("review-assignment-revoked"))
+            .count();
+        assert_eq!(
+            notice_count2, 1,
+            "no duplicate revocation notice after second tick"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// D5: after retire, a stale delivery nonce cannot wake the reviewer.
+    /// Even if the nonce somehow survived in a pending state, the reconciler
+    /// must not produce a wake for a retired assignment.
+    #[test]
+    fn d5_retired_assignment_no_stale_wake() {
+        let home = tmp_home("d5-no-wake");
+        let rec = mk_with_head(
+            "o/r",
+            "feat/x",
+            "reviewer",
+            7,
+            "sha-old",
+            "2026-07-13T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
+        open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
+
+        // First tick retires.
+        let wakes1 = reconcile_all_collect(&home, "2026-07-13T00:01:00Z");
+        assert!(wakes1.is_empty(), "no wake on retirement tick");
+
+        // Second tick: authority gone, no residual wake.
+        let wakes2 = reconcile_all_collect(&home, "2026-07-13T00:02:00Z");
+        assert!(wakes2.is_empty(), "no stale wake after authority removed");
         std::fs::remove_dir_all(&home).ok();
     }
 }

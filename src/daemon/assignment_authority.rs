@@ -405,6 +405,19 @@ fn remove_if_assignment_matches(path: &Path, expect: uuid::Uuid) -> bool {
     }
 }
 
+/// Strict variant of [`remove_if_assignment_matches`]: propagates `remove_file`
+/// errors so the caller can fail closed when durable delete confirmation matters.
+fn remove_if_assignment_matches_strict(path: &Path, expect: uuid::Uuid) -> anyhow::Result<bool> {
+    match read_record(path) {
+        Ok(Some(r)) if r.assignment_id == expect => {
+            std::fs::remove_file(path)
+                .map_err(|e| anyhow::anyhow!("remove assignment {}: {e}", path.display()))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 // ─────────────────────────── time helpers (clock-injected) ───────────────────────────
 
 fn parse_ts(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -934,6 +947,42 @@ pub(crate) fn revoke(
 ) -> anyhow::Result<bool> {
     let _lock = lock_branch(home, repo, branch)?;
     revoke_under_lock(home, repo, branch, target, now)
+}
+
+/// P0: CAS-retire an assignment ONLY if its on-disk `assignment_id` still equals
+/// `expected_id`. Used by the reconciler to retire obsolete assignments whose
+/// PrState subject has advanced past the assignment's snapshot. The CAS guard
+/// prevents a stale retire from removing a replacement assignment that arrived
+/// between the lock-free `list_active` scan and this locked mutation. Supersedes
+/// the delivery nonce and enqueues a revocation notice when the row had been read.
+pub(crate) fn retire_if_id_matches(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    expected_id: uuid::Uuid,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    let record = match read_record(&path) {
+        Ok(Some(r)) if r.assignment_id == expected_id => r,
+        _ => return Ok(false), // absent, corrupt, or replaced — no-op
+    };
+    let removed = remove_if_assignment_matches(&path, expected_id);
+    if removed {
+        let successor = format!("retired-{}", expected_id);
+        let outcome = crate::inbox::storage::supersede_by_nonce(
+            home,
+            target,
+            &record.delivery_nonce,
+            &successor,
+        );
+        if outcome.was_read {
+            crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
+        }
+    }
+    Ok(removed)
 }
 
 /// The revoke body WITHOUT acquiring the branch lock — the caller MUST already
