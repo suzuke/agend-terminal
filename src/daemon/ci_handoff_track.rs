@@ -232,6 +232,7 @@ fn remove_if_unchanged(
 
 /// Record (or refresh — a NEW CI pass on the same branch restarts the age
 /// anchor) the pending handoff for `(target, correlation)`.
+#[allow(dead_code)]
 pub(crate) fn record(
     home: &Path,
     target: &str,
