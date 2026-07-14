@@ -10,6 +10,7 @@ pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
 mod force_release;
+pub(crate) use force_release::{classify_target, prune_exact_git_metadata, TargetState};
 pub(crate) mod instance;
 mod instance_metadata;
 mod instance_queries;

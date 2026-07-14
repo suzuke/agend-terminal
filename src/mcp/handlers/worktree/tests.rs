@@ -95,9 +95,11 @@ fn force_cleans_existing_dir() {
 #[test]
 fn force_idempotent_on_missing_dir() {
     let home = tmp_home("force-idempotent");
+    let source = home.join("source-repo");
+    std::fs::create_dir_all(&source).unwrap();
     let result = handle_release_worktree(
         &home,
-        &json!({"instance": "dev", "branch": "feature/never-existed", "force": true}),
+        &json!({"instance": "dev", "branch": "feature/never-existed", "repository_path": source, "force": true}),
         &None,
     );
     assert_eq!(result["released"].as_bool(), Some(true), "{result}");

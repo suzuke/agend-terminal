@@ -93,7 +93,13 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     // release (that defeated the entire point of `rebase_mode`).
     let mut repair_action = None;
     if args["rebase_mode"].as_bool().unwrap_or(false) {
-        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair(home, agent, branch) {
+        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair(
+            home,
+            agent,
+            branch,
+            source_repo_path.as_deref(),
+            sender.as_ref().map(|s| s.as_str()),
+        ) {
             Ok(action) => repair_action = Some(action),
             Err(reason) => {
                 return json!({
@@ -197,15 +203,9 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
 }
 
 /// `release_worktree(force:true)` (#2548 PR-2) — absorbed from the former
-/// standalone `force_release_worktree` MCP tool. Cleans a stale daemon-
-/// managed worktree directory directly via
-/// `<home>/worktrees/<agent>/<branch>/`, bypassing the `.agend-managed`
-/// marker check the `force:false` path enforces — intentional: this path
-/// exists specifically for stale-state recovery where a directory survives
-/// after its binding is already gone (see `rebase_clean_self`'s docs), and
-/// the marker check would block exactly that recovery. Requires `branch`
-/// (the `force:false` path derives it from the binding; here there may be
-/// no binding left to read).
+/// standalone `force_release_worktree` MCP tool. Runs the guarded S2
+/// transaction for a stale managed target or an exact-owner metadata entry;
+/// markerless, opaque, ambiguous, and ownerless state is preserved.
 ///
 /// AUDIT2-002: since this path deletes disk state without the marker safety
 /// net, restrict callers to the target's own agent or its team orchestrator.
@@ -289,25 +289,13 @@ fn handle_release_worktree_force(
                     "git_metadata_repos": [],
                 });
             }
-            // #826 L2 GC: when the binding-clear path short-circuited on
-            // "no binding" (the post-disband state), the
-            // `git worktree remove --force` step inside `release_full`
-            // never ran. Run it now against any source repos that still
-            // hold `.git/worktrees/<meta-dir>/` metadata for our target
-            // worktree path.
-            let gc = crate::mcp::handlers::force_release::prune_git_metadata_for_agent(
-                home,
-                agent,
-                branch,
-                source_repo_hint.as_deref(),
-            );
             json!({
                 "released": true,
                 "dir_existed": o.dir_existed,
                 "dir_removed": o.dir_removed,
                 "binding_outcome": o.binding_outcome,
-                "git_metadata_pruned": gc.pruned_count,
-                "git_metadata_repos": gc.repos_touched,
+                "git_metadata_pruned": o.git_metadata_pruned,
+                "git_metadata_repos": o.git_metadata_repos,
             })
         }
         Err(e) => json!({"error": e, "code": "force_release_refused"}),

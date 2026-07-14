@@ -4,7 +4,7 @@
 //! the Sprint 59 Wave 1 PR-2 BYPASS incident + PR-4 (C)-path stall); #2548
 //! PR-2 folded that tool into `release_worktree(force:true)`
 //! (`mcp/handlers/worktree.rs`), which is now the sole caller of
-//! [`rebase_clean_self`] + [`prune_git_metadata_for_agent`] for that path.
+//! [`rebase_clean_self`] and the exact-owner metadata arm for that path.
 //! [`attempt_safe_rebind_repair`] remains `bind_self(rebase_mode=true)`'s
 //! safe-repair-first helper — unaffected by the #2548 fold-in.
 //!
@@ -27,8 +27,9 @@ mod gc;
 mod repair;
 mod s2;
 
-pub(crate) use gc::prune_git_metadata_for_agent;
+pub(crate) use gc::prune_exact_git_metadata;
 pub(crate) use repair::attempt_safe_rebind_repair;
+pub(crate) use s2::{classify_target, TargetState};
 
 /// Outcome of a rebase-clean operation.
 #[derive(Debug)]
@@ -36,21 +37,14 @@ pub(super) struct RebaseCleanOutcome {
     pub(super) dir_existed: bool,
     pub(super) dir_removed: bool,
     pub(super) binding_outcome: Value,
+    pub(super) git_metadata_pruned: usize,
+    pub(super) git_metadata_repos: Vec<String>,
 }
 
-/// Sprint 60 W1 PR-1: cleanup helper for the EXPLICIT, operator-callable
-/// `force_release_worktree` tool (destructive by design — see its docstring).
-///
-/// #2496: no longer used by `bind_self(rebase_mode=true)` — that path now
-/// tries [`attempt_safe_rebind_repair`] FIRST and fails closed rather than
-/// silently landing here (this function's fallthrough to `release_full` is
-/// exactly the "as destructive as `release_worktree`" behavior #2496 reported).
-///
-/// Validates path safety against the daemon worktree pool, removes
-/// the stale on-disk dir if present, and clears any lingering binding
-/// state via `release_full`. Returns `Err` only on path-safety
-/// violation; all other failures are fail-open with tracing::warn so
-/// partial recovery is preserved.
+/// Guarded cleanup helper for the explicit force release tool. It delegates
+/// every destructive step to the S2 transaction, which resolves one canonical
+/// owner, acquires `L(repo,branch) -> A -> B`, and fails closed on opaque or
+/// mismatched state.
 ///
 /// Caller invariant: `agent` and `branch` must be pre-validated by
 /// `agent::validate_name` + `agent_ops::validate_branch` respectively.
@@ -74,6 +68,8 @@ pub(super) fn rebase_clean_self(
         dir_existed: result.dir_existed,
         dir_removed: result.dir_removed,
         binding_outcome: serde_json::to_value(&result.outcome).unwrap_or(Value::Null),
+        git_metadata_pruned: result.git_metadata_pruned,
+        git_metadata_repos: result.git_metadata_repos,
     })
 }
 
@@ -148,7 +144,9 @@ mod tests {
         // No prior bind, no stale dir → helper still runs release_full
         // (idempotent) and reports dir_existed=false.
         let home = tmp_home("rebase-clean-idempotent");
-        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed", None, None)
+        let source = home.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed", Some(&source), None)
             .expect("helper must not error on clean state");
         assert!(!outcome.dir_existed);
         assert!(!outcome.dir_removed);

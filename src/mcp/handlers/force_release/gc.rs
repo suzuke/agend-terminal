@@ -1,19 +1,18 @@
-//! #826 L2 GC helpers for `force_release_worktree`. Extracted from
+//! Exact-owner metadata cleanup for `force_release_worktree`. Extracted from
 //! `mod.rs` to keep the parent file under the `tests/file_size_invariant.rs`
 //! 750-LOC ceiling.
 //!
 //! When `force_release_worktree` runs after `full_delete_instance`
 //! (PR #834 / #828 cascade) the agent's daemon binding is already
 //! gone. `worktree_pool::release_full` then early-returns on "no
-//! binding" before its own `git worktree remove --force` step — so
-//! the working tree dir gets wiped but `<source>/.git/worktrees/<meta>/`
-//! metadata persists in the source repo. This module runs the missing
-//! `git worktree remove --force` against the source repo using the
-//! same `AGEND_GIT_BYPASS=1` env that the operator's manual recovery
-//! command used.
+//! binding" before its own `git worktree remove --force` step. The production
+//! path now prunes only the exact proven owner inside the S2 transaction; the
+//! old agent-wide discovery helper below is test-only compatibility coverage.
 
+#[cfg(test)]
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 /// #826 L2 GC outcome: count + list of source repos where the
 /// `git worktree remove --force` (and `git worktree prune` fallback)
@@ -23,6 +22,79 @@ use std::path::{Path, PathBuf};
 pub(crate) struct GcOutcome {
     pub(crate) pruned_count: usize,
     pub(crate) repos_touched: Vec<String>,
+}
+
+/// Remove metadata for one already-proven `(source_repo, target)` pair.
+/// Unlike the legacy agent-wide discovery helper below, this function never
+/// enumerates candidate repositories and is called while S2 holds
+/// `L(repo,branch) -> A -> B`.
+pub(crate) fn prune_exact_git_metadata(
+    source_repo: &Path,
+    target: &Path,
+    agent: &str,
+    branch: &str,
+) -> GcOutcome {
+    let mut outcome = GcOutcome::default();
+    for entry in list_worktrees_bypass_shim(source_repo) {
+        if !paths_match(&entry.path, target) {
+            continue;
+        }
+        let removed = crate::git_helpers::git_bypass(
+            source_repo,
+            &["worktree", "remove", "--force", &entry.path],
+        );
+        let pruned = match removed {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                tracing::warn!(
+                    agent = %agent,
+                    branch = %branch,
+                    repo = %source_repo.display(),
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "S2 exact metadata remove failed; falling back to exact metadata directory removal"
+                );
+                remove_exact_metadata_dir(source_repo, target)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent,
+                    branch = %branch,
+                    repo = %source_repo.display(),
+                    error = %e,
+                    "S2 exact metadata remove spawn failed"
+                );
+                false
+            }
+        };
+        if pruned {
+            outcome.pruned_count = 1;
+            outcome
+                .repos_touched
+                .push(source_repo.display().to_string());
+        }
+        break;
+    }
+    outcome
+}
+
+fn remove_exact_metadata_dir(source_repo: &Path, target: &Path) -> bool {
+    let metadata_root = source_repo.join(".git").join("worktrees");
+    let Ok(entries) = std::fs::read_dir(metadata_root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(worktree_path) = std::fs::read_to_string(dir.join("worktree")) else {
+            continue;
+        };
+        if paths_match(worktree_path.trim(), target) {
+            return std::fs::remove_dir_all(dir).is_ok();
+        }
+    }
+    false
 }
 
 /// #826 L2: enumerate source repos that may still hold
@@ -48,6 +120,8 @@ pub(crate) struct GcOutcome {
 /// `git worktree remove --force <path>` against the source repo's
 /// cwd. AGEND_GIT_BYPASS=1 is set on every git invocation to bypass
 /// the daemon shim per the operator-confirmed manual recovery command.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn prune_git_metadata_for_agent(
     home: &Path,
     agent: &str,
@@ -158,6 +232,8 @@ fn list_worktrees_bypass_shim(repo_root: &Path) -> Vec<crate::worktree_cleanup::
 /// 1. Sibling daemon-managed worktrees' `.git` pointer files
 ///    (`gitdir: <source>/.git/worktrees/<name>`).
 /// 2. `crate::teams::list_all` team `source_repo` fields.
+#[cfg(test)]
+#[allow(dead_code)]
 fn discover_source_repo_candidates(home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     // Source 1: walk sibling daemon worktrees' .git pointers.
@@ -184,6 +260,8 @@ fn discover_source_repo_candidates(home: &Path) -> Vec<PathBuf> {
 /// `.git` pointer files. For each found, parse the
 /// `gitdir: <source>/.git/worktrees/<name>` line and derive the
 /// source repo (strip `.git/worktrees/<name>` suffix).
+#[cfg(test)]
+#[allow(dead_code)]
 fn collect_source_repos_from_worktree_tree(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -463,9 +541,11 @@ mod tests {
         // repos_touched: []. The response shape still includes the
         // fields (audit contract).
         let home = tmp_home("826_c3_response_shape");
+        let source = home.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
         let result = handle_release_worktree(
             &home,
-            &json!({"instance": "dev826c3", "branch": "feat/826", "force": true}),
+            &json!({"instance": "dev826c3", "branch": "feat/826", "repository_path": source, "force": true}),
             &None,
         );
         assert_eq!(result["git_metadata_pruned"], 0, "got: {result}");

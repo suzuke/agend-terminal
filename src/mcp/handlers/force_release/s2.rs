@@ -19,6 +19,32 @@ pub(crate) struct ForceReleaseResult {
     pub(crate) outcome: ReleaseOutcome,
     pub(crate) dir_existed: bool,
     pub(crate) dir_removed: bool,
+    pub(crate) git_metadata_pruned: usize,
+    pub(crate) git_metadata_repos: Vec<String>,
+}
+
+/// Disk-fresh target classification. `Path::exists()` is deliberately not
+/// used by destructive callers: permission errors, dangling symlinks, and
+/// non-directory entries must remain opaque rather than becoming Absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetState {
+    Absent,
+    Present,
+}
+
+pub(crate) fn classify_target(path: &Path) -> Result<TargetState, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(TargetState::Present),
+        Ok(_) => Err(format!(
+            "force release refused: opaque target metadata at {}",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetState::Absent),
+        Err(e) => Err(format!(
+            "force release refused: opaque target metadata at {}: {e}",
+            path.display()
+        )),
+    }
 }
 
 /// Resolve and execute the force/rebase transaction.  The branch lease is
@@ -46,26 +72,47 @@ pub(crate) fn force_release(
                     "force release refused: binding branch '{bound_branch}' does not match requested '{branch}'; binding preserved"
                 ));
             }
-            let identity = resolve_known_identity(home, agent, branch, &value, explicit_repo)?;
+            let worktree = value["worktree"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "force release refused: known binding has no worktree".to_string()
+                })?;
+            let target_state = classify_target(&worktree)?;
+            let identity = resolve_known_identity(
+                home,
+                agent,
+                branch,
+                &value,
+                explicit_repo,
+                matches!(target_state, TargetState::Present),
+            )?;
             (Some(identity), Some(fingerprint))
         }
         GuardedBinding::Absent => {
             let target = crate::worktree::worktree_path(home, agent, branch);
-            // A missing target is already at the desired state.  This is also
-            // the sanctioned GC-metadata path; no destructive identity proof is
-            // needed because there is no directory to remove.
-            if !target.exists() {
-                return Ok(ForceReleaseResult {
-                    outcome: ReleaseOutcome {
-                        released: true,
-                        already_released: true,
-                        ..ReleaseOutcome::default()
-                    },
-                    dir_existed: false,
-                    dir_removed: false,
-                });
-            }
-            let identity = resolve_absent_identity(home, agent, branch, &target, explicit_repo)?;
+            let target_state = classify_target(&target)?;
+            let identity = match target_state {
+                TargetState::Present => {
+                    resolve_absent_identity(home, agent, branch, &target, explicit_repo, true)?
+                }
+                TargetState::Absent => {
+                    let Some(explicit_repo) = explicit_repo else {
+                        return Err(
+                            "force release refused: absent target has no explicit or proven owning repository; use the GC archive or operator channel".to_string(),
+                        );
+                    };
+                    resolve_absent_identity(
+                        home,
+                        agent,
+                        branch,
+                        &target,
+                        Some(explicit_repo),
+                        false,
+                    )?
+                }
+            };
             (Some(identity), None)
         }
     };
@@ -78,7 +125,7 @@ pub(crate) fn force_release(
     )
     .map_err(|e| format!("force release branch lease lock failed: {e}"))?;
 
-    let dir_existed = identity.worktree.exists();
+    let dir_existed = matches!(classify_target(&identity.worktree)?, TargetState::Present);
     let outcome = match expected.as_ref() {
         Some(expected) => {
             crate::worktree_pool::release_bound_target_exact_under_branch_lock_for_force(
@@ -93,17 +140,24 @@ pub(crate) fn force_release(
         None => crate::worktree_pool::release_absent_target_under_branch_lock(
             home,
             agent,
+            branch,
             &identity.worktree,
             &identity.source_repo,
             sender,
         ),
     };
     let dir_removed = outcome.worktree_removed
-        || (dir_existed && !identity.worktree.exists() && outcome.error.is_none());
+        || (dir_existed
+            && matches!(classify_target(&identity.worktree), Ok(TargetState::Absent))
+            && outcome.error.is_none());
+    let git_metadata_pruned = outcome.git_metadata_pruned;
+    let git_metadata_repos = outcome.git_metadata_repos.clone();
     Ok(ForceReleaseResult {
         outcome,
         dir_existed,
         dir_removed,
+        git_metadata_pruned,
+        git_metadata_repos,
     })
 }
 
@@ -113,6 +167,7 @@ fn resolve_known_identity(
     branch: &str,
     binding: &Value,
     explicit_repo: Option<&Path>,
+    require_marker: bool,
 ) -> Result<ManagedTargetIdentity, String> {
     let worktree = binding["worktree"]
         .as_str()
@@ -127,7 +182,7 @@ fn resolve_known_identity(
         &worktree,
         binding_repo.map(Path::new),
         explicit_repo,
-        worktree.exists(),
+        require_marker,
     )
 }
 
@@ -137,8 +192,17 @@ fn resolve_absent_identity(
     branch: &str,
     worktree: &Path,
     explicit_repo: Option<&Path>,
+    require_marker: bool,
 ) -> Result<ManagedTargetIdentity, String> {
-    resolve_identity(home, agent, branch, worktree, None, explicit_repo, true)
+    resolve_identity(
+        home,
+        agent,
+        branch,
+        worktree,
+        None,
+        explicit_repo,
+        require_marker,
+    )
 }
 
 fn resolve_identity(
@@ -267,4 +331,270 @@ fn worktree_owner_from_git(worktree: &Path) -> Result<Option<PathBuf>, String> {
         .parent()
         .ok_or_else(|| "force release refused: malformed git worktree owner".to_string())?;
     Ok(Some(source.to_path_buf()))
+}
+
+/// Guarded repair used by the live `bind_self(rebase_mode=true)` entry point.
+/// Every metadata catch-up or `git switch` is performed only after the same
+/// disk-fresh Known/Absent read, canonical `L(repo,branch)` lease, A/B locks,
+/// fingerprint CAS, and marker/owner revalidation as force release.
+pub(crate) fn rebase_repair(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    explicit_repo: Option<&Path>,
+    sender: Option<&str>,
+) -> Result<super::repair::RepairAction, super::repair::RepairBlocked> {
+    use super::repair::{RepairAction, RepairBlocked};
+
+    let state = crate::binding::preflight_guarded_binding(home, agent);
+    match state {
+        GuardedBinding::Opaque(reason) => Err(RepairBlocked::Opaque(reason)),
+        GuardedBinding::Absent => {
+            let target = crate::worktree::worktree_path(home, agent, branch);
+            let target_state = classify_target(&target).map_err(RepairBlocked::TargetOpaque)?;
+            if matches!(target_state, TargetState::Absent) && explicit_repo.is_none() {
+                // No destructive mutation is needed for a genuinely fresh
+                // bind. The subsequent dispatch owns branch provisioning.
+                return Ok(RepairAction::NoOp);
+            }
+            let identity = if matches!(target_state, TargetState::Present) {
+                resolve_absent_identity(home, agent, branch, &target, explicit_repo, true)
+            } else {
+                let repo = explicit_repo.ok_or_else(|| {
+                    "absent target has no explicit or proven owning repository".to_string()
+                });
+                repo.and_then(|repo| {
+                    resolve_absent_identity(home, agent, branch, &target, Some(repo), false)
+                })
+            }
+            .map_err(|e| RepairBlocked::PathUnsafe(e.to_string()))?;
+            let _lease = crate::binding::acquire_branch_lease_lock(
+                home,
+                &identity.source_repo.display().to_string(),
+                branch,
+            )
+            .map_err(|e| RepairBlocked::PathUnsafe(e.to_string()))?;
+            let outcome = crate::worktree_pool::release_absent_target_under_branch_lock(
+                home,
+                agent,
+                branch,
+                &identity.worktree,
+                &identity.source_repo,
+                sender,
+            );
+            if let Some(error) = outcome.error {
+                return Err(RepairBlocked::PathUnsafe(error));
+            }
+            if matches!(target_state, TargetState::Present) {
+                Ok(RepairAction::StaleStateCleared)
+            } else {
+                Ok(RepairAction::NoOp)
+            }
+        }
+        GuardedBinding::Known { value, fingerprint } => {
+            let recorded_branch = value["branch"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| RepairBlocked::Opaque("known binding has no branch".to_string()))?;
+            let worktree = value["worktree"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    RepairBlocked::Opaque("known binding has no worktree".to_string())
+                })?;
+            let target_state = classify_target(&worktree).map_err(RepairBlocked::TargetOpaque)?;
+            let binding_repo = value["source_repo"].as_str().filter(|s| !s.is_empty());
+            if matches!(target_state, TargetState::Absent) {
+                if recorded_branch != branch {
+                    if let Some(blocked) = super::repair::reject_if_branch_has_dependents(
+                        home,
+                        agent,
+                        recorded_branch,
+                        branch,
+                    ) {
+                        return Err(blocked);
+                    }
+                    return Err(RepairBlocked::BindingChanged);
+                }
+                let identity = resolve_identity(
+                    home,
+                    agent,
+                    recorded_branch,
+                    &worktree,
+                    binding_repo.map(Path::new),
+                    explicit_repo,
+                    false,
+                )
+                .map_err(|e| RepairBlocked::PathUnsafe(e.to_string()))?;
+                let _lease = crate::binding::acquire_branch_lease_lock(
+                    home,
+                    &identity.source_repo.display().to_string(),
+                    branch,
+                )
+                .map_err(|e| RepairBlocked::PathUnsafe(e.to_string()))?;
+                let outcome =
+                    crate::worktree_pool::release_bound_target_exact_under_branch_lock_for_force(
+                        home,
+                        agent,
+                        &fingerprint,
+                        &worktree,
+                        &identity.source_repo,
+                        sender,
+                    );
+                if let Some(error) = outcome.error {
+                    return Err(RepairBlocked::PathUnsafe(error));
+                }
+                return Ok(RepairAction::StaleStateCleared);
+            }
+
+            let actual_before = current_branch(&worktree)?;
+            let identity = resolve_identity(
+                home,
+                agent,
+                &actual_before,
+                &worktree,
+                binding_repo.map(Path::new),
+                explicit_repo,
+                true,
+            )
+            .map_err(|e| RepairBlocked::PathUnsafe(e.to_string()))?;
+            let _lease = crate::binding::acquire_branch_lease_lock(
+                home,
+                &identity.source_repo.display().to_string(),
+                branch,
+            )
+            .map_err(|e| RepairBlocked::PathUnsafe(e.to_string()))?;
+            let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, agent)
+                .map_err(RepairBlocked::PathUnsafe)?;
+            let _binding_lock = crate::binding::acquire_binding_file_lock(home, agent)
+                .map_err(RepairBlocked::PathUnsafe)?;
+            let current = match crate::binding::guarded_binding_disk_fresh(home, agent) {
+                GuardedBinding::Known {
+                    value,
+                    fingerprint: live,
+                } if live == fingerprint
+                    && value["worktree"].as_str() == Some(worktree.to_string_lossy().as_ref()) =>
+                {
+                    value
+                }
+                GuardedBinding::Opaque(reason) => return Err(RepairBlocked::Opaque(reason)),
+                GuardedBinding::Absent | GuardedBinding::Known { .. } => {
+                    return Err(RepairBlocked::BindingChanged)
+                }
+            };
+            let actual = current_branch(&worktree)?;
+            if actual != actual_before {
+                return Err(RepairBlocked::BindingChanged);
+            }
+            resolve_identity(
+                home,
+                agent,
+                &actual,
+                &worktree,
+                current["source_repo"].as_str().map(Path::new),
+                Some(&identity.source_repo),
+                true,
+            )
+            .map_err(RepairBlocked::PathUnsafe)?;
+            if crate::worktree::has_uncommitted_changes(&worktree) {
+                return Err(RepairBlocked::Dirty);
+            }
+            if let Some(other) = crate::binding::scan_existing_branch_binding(
+                home,
+                &identity.source_repo.display().to_string(),
+                branch,
+                agent,
+            ) {
+                return Err(RepairBlocked::OtherAgentHoldsBranch(other));
+            }
+            if let Some(blocked) =
+                super::repair::reject_if_branch_has_dependents(home, agent, recorded_branch, branch)
+            {
+                return Err(blocked);
+            }
+            if actual != recorded_branch {
+                if let Some(blocked) =
+                    super::repair::reject_if_branch_has_dependents(home, agent, &actual, branch)
+                {
+                    return Err(blocked);
+                }
+            }
+            if actual == branch {
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(_lease);
+                return Ok(RepairAction::MetadataOnly);
+            }
+            use crate::git_helpers::{git_cmd, GitError};
+            match git_cmd(&worktree, &["switch", branch]) {
+                Ok(_) => {
+                    update_marker_branch(&worktree, agent, branch, &identity.source_repo)
+                        .map_err(RepairBlocked::SwitchFailed)?;
+                }
+                Err(GitError::NonZero { stderr, .. }) => {
+                    return Err(RepairBlocked::SwitchFailed(stderr))
+                }
+                Err(GitError::Spawn(e)) => return Err(RepairBlocked::SwitchFailed(e.to_string())),
+            }
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(_lease);
+            Ok(RepairAction::SwitchedBranch)
+        }
+    }
+}
+
+fn current_branch(worktree: &Path) -> Result<String, super::repair::RepairBlocked> {
+    crate::git_helpers::git_cmd(worktree, &["branch", "--show-current"])
+        .map_err(|e| super::repair::RepairBlocked::SwitchFailed(e.to_string()))
+        .and_then(|branch| {
+            if branch.is_empty() {
+                Err(super::repair::RepairBlocked::SwitchFailed(
+                    "worktree has no current branch".to_string(),
+                ))
+            } else {
+                Ok(branch)
+            }
+        })
+}
+
+fn update_marker_branch(
+    worktree: &Path,
+    agent: &str,
+    branch: &str,
+    source_repo: &Path,
+) -> Result<(), String> {
+    let marker = worktree.join(crate::worktree_pool::MANAGED_MARKER);
+    let body = std::fs::read_to_string(&marker)
+        .map_err(|e| format!("read managed marker {}: {e}", marker.display()))?;
+    let mut lines = Vec::new();
+    let mut saw_agent = false;
+    let mut saw_branch = false;
+    let mut saw_repo = false;
+    for line in body.lines() {
+        if line.starts_with("agent=") {
+            lines.push(format!("agent={agent}"));
+            saw_agent = true;
+        } else if line.starts_with("branch=") {
+            lines.push(format!("branch={branch}"));
+            saw_branch = true;
+        } else if line.starts_with("source_repo=") {
+            lines.push(format!("source_repo={}", source_repo.display()));
+            saw_repo = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !saw_agent {
+        lines.push(format!("agent={agent}"));
+    }
+    if !saw_branch {
+        lines.push(format!("branch={branch}"));
+    }
+    if !saw_repo {
+        lines.push(format!("source_repo={}", source_repo.display()));
+    }
+    std::fs::write(marker, format!("{}\n", lines.join("\n")))
+        .map_err(|e| format!("write managed marker: {e}"))
 }

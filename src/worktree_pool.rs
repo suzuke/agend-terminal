@@ -180,6 +180,12 @@ pub struct ReleaseOutcome {
     /// Internal exact-CAS signal for auto-release. Not part of the MCP response.
     #[serde(skip)]
     pub(crate) stale_fingerprint: bool,
+    /// Exact S2 absent-arm metadata cleanup, surfaced only by the force
+    /// handler after the transaction; ordinary release responses skip it.
+    #[serde(skip)]
+    pub(crate) git_metadata_pruned: usize,
+    #[serde(skip)]
+    pub(crate) git_metadata_repos: Vec<String>,
 }
 
 /// Delete the local branch ref after worktree release, IFF:
@@ -413,13 +419,28 @@ fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> Path
 }
 
 fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeRemoval {
-    if !wt_path.exists() {
-        tracing::info!(agent, path = %wt_path.display(),
-            "release: worktree path already absent — pruning registry + clearing binding");
-        if !source_repo.as_os_str().is_empty() {
-            let _ = crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"]);
+    match std::fs::symlink_metadata(wt_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(agent, path = %wt_path.display(),
+                "release: worktree path already absent — pruning registry + clearing binding");
+            if !source_repo.as_os_str().is_empty() {
+                let _ = crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"]);
+            }
+            return WorktreeRemoval::AlreadyAbsent;
         }
-        return WorktreeRemoval::AlreadyAbsent;
+        Err(e) => {
+            return WorktreeRemoval::Failed(format!(
+                "opaque worktree target metadata at {}: {e}",
+                wt_path.display()
+            ))
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return WorktreeRemoval::Failed(format!(
+                "opaque worktree target metadata at {}",
+                wt_path.display()
+            ))
+        }
+        Ok(_) => {}
     }
     if !is_daemon_managed(wt_path) {
         tracing::warn!(agent, path = %wt_path.display(),
@@ -447,7 +468,10 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
             tracing::warn!(agent, error = %stderr, path = %wt_path.display(),
                 "git worktree remove failed — falling back to remove_dir_all");
             let _ = std::fs::remove_dir_all(wt_path);
-            if !wt_path.exists() {
+            if matches!(
+                std::fs::symlink_metadata(wt_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 if !source_repo.as_os_str().is_empty() {
                     if let Err(e) =
                         crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"])
@@ -860,7 +884,20 @@ fn release_bound_target_exact_impl(
     if current.get("worktree").and_then(|v| v.as_str()) != Some(target_str.as_str()) {
         return stale_release();
     }
-    if require_force_identity && target.exists() {
+    let force_target_state = if require_force_identity {
+        match crate::mcp::handlers::classify_target(target) {
+            Ok(state) => Some(state),
+            Err(reason) => return opaque_release(reason),
+        }
+    } else {
+        None
+    };
+    if require_force_identity
+        && matches!(
+            force_target_state,
+            Some(crate::mcp::handlers::TargetState::Present)
+        )
+    {
         if crate::binding::managed_marker_agent(target).as_deref() != Some(agent) {
             return opaque_release(format!(
                 "managed marker agent does not exactly equal target '{agent}'"
@@ -876,10 +913,41 @@ fn release_bound_target_exact_impl(
         }
     }
 
+    if require_force_identity
+        && matches!(
+            force_target_state,
+            Some(crate::mcp::handlers::TargetState::Absent)
+        )
+    {
+        let metadata = crate::mcp::handlers::prune_exact_git_metadata(
+            source_repo,
+            target,
+            agent,
+            current["branch"].as_str().unwrap_or(""),
+        );
+        let mut out = ReleaseOutcome {
+            git_metadata_pruned: metadata.pruned_count,
+            git_metadata_repos: metadata.repos_touched,
+            ..ReleaseOutcome::default()
+        };
+        clear_binding_state(home, agent);
+        out.binding_removed = true;
+        out.released = true;
+        drop(_binding_lock);
+        drop(_agent_lock);
+        drop(branch_lock);
+        return out;
+    }
+
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
     let mut notices = Vec::new();
-    if require_force_identity && target.exists() {
+    if require_force_identity
+        && matches!(
+            force_target_state,
+            Some(crate::mcp::handlers::TargetState::Present)
+        )
+    {
         let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
             home,
             agent,
@@ -1015,6 +1083,7 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
 pub(crate) fn release_absent_target_under_branch_lock(
     home: &Path,
     agent: &str,
+    branch: &str,
     target: &Path,
     source_repo: &Path,
     sender: Option<&str>,
@@ -1032,17 +1101,41 @@ pub(crate) fn release_absent_target_under_branch_lock(
         crate::binding::GuardedBinding::Opaque(reason) => return opaque_release(reason),
         crate::binding::GuardedBinding::Known { .. } => return stale_release(),
     }
-    if target.exists()
+    #[cfg(test)]
+    release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
+    match crate::binding::guarded_binding_disk_fresh(home, agent) {
+        crate::binding::GuardedBinding::Absent => {}
+        crate::binding::GuardedBinding::Opaque(reason) => return opaque_release(reason),
+        crate::binding::GuardedBinding::Known { .. } => return stale_release(),
+    }
+    let target_state = match crate::mcp::handlers::classify_target(target) {
+        Ok(state) => state,
+        Err(reason) => return opaque_release(reason),
+    };
+    if matches!(target_state, crate::mcp::handlers::TargetState::Present)
         && (crate::binding::managed_marker_agent(target).as_deref() != Some(agent)
+            || marker_branch(target).as_deref() != Some(branch)
             || !target_source_repo_matches(target, source_repo))
     {
         return opaque_release(
-            "managed target identity changed or owning repository is ambiguous".to_string(),
+            "managed target identity changed, marker branch drifted, or owning repository is ambiguous"
+                .to_string(),
         );
     }
     let mut out = ReleaseOutcome::default();
     let mut notices = Vec::new();
-    if target.exists() {
+    if matches!(target_state, crate::mcp::handlers::TargetState::Absent) {
+        let metadata =
+            crate::mcp::handlers::prune_exact_git_metadata(source_repo, target, agent, branch);
+        out.git_metadata_pruned = metadata.pruned_count;
+        out.git_metadata_repos = metadata.repos_touched;
+        out.released = true;
+        out.already_released = true;
+        drop(_binding_lock);
+        drop(_agent_lock);
+        return out;
+    }
+    if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
         let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
             home,
             agent,
