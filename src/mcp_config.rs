@@ -683,6 +683,54 @@ fn configure_opencode(working_dir: &Path, instance_name: Option<&str>) -> Result
 const CODEX_MCP_HEADER: &str = "[mcp_servers.agend-terminal]";
 const CODEX_MCP_ENV_HEADER: &str = "[mcp_servers.agend-terminal.env]";
 
+/// Read the owning instance stamped as `AGEND_INSTANCE_NAME` in an existing
+/// `.codex/config.toml` (or grok config). The workspace-identity guard uses
+/// this to refuse overwriting a config that belongs to a DIFFERENT instance.
+///
+/// - [`DirIdentity::Absent`] — no `AGEND_INSTANCE_NAME` stamp (unowned → adoptable).
+/// - [`DirIdentity::Owner`] — the recorded owner (the raw instance name).
+/// - [`DirIdentity::Corrupt`] — a stamp line is present but its value is unparseable.
+pub(crate) fn codex_config_owner(existing: &str) -> crate::paths::DirIdentity {
+    use crate::paths::DirIdentity;
+    let Some(line) = existing
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("AGEND_INSTANCE_NAME"))
+    else {
+        return DirIdentity::Absent;
+    };
+    match line
+        .split_once('=')
+        .map(|(_, v)| v.trim())
+        .and_then(decode_toml_string)
+    {
+        Some(name) if !name.is_empty() => DirIdentity::Owner(name),
+        _ => DirIdentity::Corrupt,
+    }
+}
+
+/// Fail-closed identity read of a codex/grok `config.toml` at `path`: a genuine
+/// `NotFound` is [`DirIdentity::Absent`] (adoptable); any OTHER I/O failure is
+/// [`DirIdentity::Unreadable`] (a conflict). A readable file is parsed by
+/// [`codex_config_owner`].
+pub(crate) fn codex_config_identity(path: &Path) -> crate::paths::DirIdentity {
+    crate::paths::classify_identity_read(std::fs::read_to_string(path), codex_config_owner)
+}
+
+/// Decode a single-line TOML string value (the inverse of [`toml_string_value`]):
+/// a single-quoted literal is taken verbatim; a double-quoted basic string has
+/// its `\\` and `\"` escapes unwound. Returns `None` for any other shape.
+fn decode_toml_string(v: &str) -> Option<String> {
+    let v = v.trim();
+    if let Some(inner) = v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return Some(inner.to_string());
+    }
+    if let Some(inner) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"));
+    }
+    None
+}
+
 fn configure_codex(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     configure_codex_with_home(working_dir, &home_path(), instance_name)
 }
@@ -707,11 +755,52 @@ fn configure_codex_with_home(
     // strip→append cycles on the same config.toml.
     let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
 
-    // Re-read under the lock. Any existing agend-terminal block is stripped
-    // before we write a fresh one — otherwise a stale binary path from a
-    // prior build (e.g. a worktree that has since been removed) would
-    // silently persist and fail at codex MCP startup with ENOENT.
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    // Re-read under the lock. NotFound → empty (first provision); any other
+    // I/O error (invalid UTF-8, EACCES, EISDIR) → fail-closed, preserving
+    // the opaque bytes instead of silently replacing them.
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            anyhow::bail!(
+                "config read {}: {e} — refusing to overwrite opaque file",
+                config_path.display()
+            );
+        }
+    };
+
+    // Workspace-identity guard (fail-closed): refuse to overwrite a config.toml
+    // that is stamped for a DIFFERENT instance (or is corrupt). The incident was
+    // a last-writer-wins rewrite of a colliding directory's `.codex/config.toml`;
+    // this preserves the foreign bytes and errors instead. Absent stamp → adopt.
+    let identity = codex_config_owner(&existing);
+    match instance_name {
+        Some(cand) => {
+            if let Some(reason) = identity.conflict_with(cand) {
+                tracing::error!(
+                    path = %config_path.display(), instance = %cand, %reason,
+                    "provision refused: .codex/config.toml — bytes preserved"
+                );
+                anyhow::bail!(
+                    "workspace identity: {} {reason}, refusing to overwrite for '{cand}'",
+                    config_path.display()
+                );
+            }
+        }
+        None => {
+            if matches!(
+                identity,
+                crate::paths::DirIdentity::Owner(_) | crate::paths::DirIdentity::Corrupt
+            ) {
+                anyhow::bail!(
+                    "workspace identity: {} has an existing identity stamp but no instance \
+                     name was provided to verify ownership — refusing contextless overwrite",
+                    config_path.display()
+                );
+            }
+        }
+    }
+
     let mut stripped = strip_agend_mcp_sections(&existing);
     // Normalize to exactly one trailing newline on non-empty content so the
     // next `\n` we emit produces a single blank-line separator.
@@ -833,7 +922,45 @@ fn configure_grok_with_home(
 
     let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
 
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            anyhow::bail!(
+                "config read {}: {e} — refusing to overwrite opaque file",
+                config_path.display()
+            );
+        }
+    };
+    // Workspace-identity guard (fail-closed), same contract as Codex: refuse to
+    // overwrite a config stamped for a different instance (bytes preserved).
+    let identity = codex_config_owner(&existing);
+    match instance_name {
+        Some(cand) => {
+            if let Some(reason) = identity.conflict_with(cand) {
+                tracing::error!(
+                    path = %config_path.display(), instance = %cand, %reason,
+                    "provision refused: .grok/config.toml — bytes preserved"
+                );
+                anyhow::bail!(
+                    "workspace identity: {} {reason}, refusing to overwrite for '{cand}'",
+                    config_path.display()
+                );
+            }
+        }
+        None => {
+            if matches!(
+                identity,
+                crate::paths::DirIdentity::Owner(_) | crate::paths::DirIdentity::Corrupt
+            ) {
+                anyhow::bail!(
+                    "workspace identity: {} has an existing identity stamp but no instance \
+                     name was provided to verify ownership — refusing contextless overwrite",
+                    config_path.display()
+                );
+            }
+        }
+    }
     // Reuse the same section headers as Codex — Grok's native schema is also
     // `[mcp_servers.<name>]` (+ optional `.env` subtable).
     let mut stripped = strip_agend_mcp_sections(&existing);
@@ -881,9 +1008,15 @@ AGEND_HOME = {home_lit}
 }
 
 /// Detect backend from command name and configure MCP.
-pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>) {
-    let backend = crate::backend::Backend::from_command(command);
-    let result = match backend {
+pub fn configure(
+    working_dir: &Path,
+    command: &str,
+    instance_name: Option<&str>,
+) -> anyhow::Result<()> {
+    // Propagate any backend configure error to the caller (generate_with_context)
+    // so a provisioning failure ABORTS the spawn instead of being logged and
+    // discarded — the discard let an agent start against half-written config.
+    match crate::backend::Backend::from_command(command) {
         Some(crate::backend::Backend::ClaudeCode) => configure_claude(working_dir, instance_name),
         Some(crate::backend::Backend::KiroCli) => configure_kiro(working_dir, instance_name),
         Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
@@ -892,12 +1025,8 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
         Some(crate::backend::Backend::Grok) => configure_grok(working_dir, instance_name),
         // Non-preset backends (Shell, Raw) have no MCP wiring.
         Some(crate::backend::Backend::Shell) | Some(crate::backend::Backend::Raw(_)) | None => {
-            return
+            Ok(())
         }
-    };
-
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "failed to configure MCP");
     }
 }
 
@@ -925,6 +1054,75 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    // --- workspace-identity provision guard (boundary 2, .codex/config.toml) ---
+
+    #[test]
+    fn codex_config_owner_absent_owner_and_corrupt() {
+        use crate::paths::DirIdentity;
+        assert_eq!(codex_config_owner("command = 'x'\n"), DirIdentity::Absent);
+        assert_eq!(
+            codex_config_owner("AGEND_INSTANCE_NAME = 'bob'\n"),
+            DirIdentity::Owner("bob".to_string())
+        );
+        assert_eq!(
+            codex_config_owner("AGEND_INSTANCE_NAME = \"bob\"\n"),
+            DirIdentity::Owner("bob".to_string())
+        );
+        assert_eq!(
+            codex_config_owner("AGEND_INSTANCE_NAME =\n"),
+            DirIdentity::Corrupt
+        );
+    }
+
+    #[test]
+    fn codex_config_identity_unreadable_on_invalid_utf8_but_notfound_is_absent() {
+        use crate::paths::DirIdentity;
+        let dir = tmp_dir("codex_unreadable");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, [0xFFu8, 0xFE]).unwrap(); // invalid UTF-8
+                                                        // Opaque read error → fail-closed Unreadable, not Absent.
+        assert_eq!(codex_config_identity(&path), DirIdentity::Unreadable);
+        assert_eq!(
+            codex_config_identity(&dir.join("missing.toml")),
+            DirIdentity::Absent
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn configure_codex_refuses_foreign_stamp_byte_preserving() {
+        let dir = tmp_dir("codex_foreign");
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let path = codex_dir.join("config.toml");
+        let foreign = "[mcp_servers.agend-terminal]\ncommand = 'x'\nargs = []\n\n[mcp_servers.agend-terminal.env]\nAGEND_HOME = '/h'\nAGEND_INSTANCE_NAME = 'bob'\n";
+        std::fs::write(&path, foreign).unwrap();
+        let res = configure_codex_with_home(&dir, "/fake/home", Some("alice"));
+        assert!(res.is_err(), "foreign .codex stamp must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            foreign,
+            "foreign bytes preserved"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn configure_codex_adopts_absent_and_same_owner() {
+        use crate::paths::DirIdentity;
+        let dir = tmp_dir("codex_same");
+        // Absent stamp → adopt.
+        configure_codex_with_home(&dir, "/fake/home", Some("alice")).expect("adopt absent");
+        let path = dir.join(".codex").join("config.toml");
+        assert_eq!(
+            codex_config_owner(&std::fs::read_to_string(&path).unwrap()),
+            DirIdentity::Owner("alice".to_string())
+        );
+        // Same owner → refresh Ok.
+        configure_codex_with_home(&dir, "/fake/home", Some("alice")).expect("refresh same");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1204,7 +1402,7 @@ mod tests {
     #[test]
     fn configure_dispatches_opencode() {
         let dir = tmp_dir("dispatch_oc");
-        configure(&dir, "opencode", None);
+        configure(&dir, "opencode", None).expect("provision");
         assert!(dir.join("opencode.json").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1263,7 +1461,7 @@ mod tests {
     #[test]
     fn configure_dispatches_agy_writes_agents_mcp() {
         let dir = tmp_dir("dispatch_agy");
-        configure(&dir, "agy", Some("agy-1"));
+        configure(&dir, "agy", Some("agy-1")).expect("provision");
 
         let cfg = dir.join(".agents").join("mcp_config.json");
         assert!(
@@ -1302,7 +1500,7 @@ mod tests {
     #[test]
     fn configure_unknown_backend_no_crash() {
         let dir = tmp_dir("dispatch_unknown");
-        configure(&dir, "unknown-tool", None);
+        configure(&dir, "unknown-tool", None).expect("provision");
         // Should not create any config files
         assert!(!dir.join("opencode.json").exists());
         assert!(!dir.join(".gemini").exists());

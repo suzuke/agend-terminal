@@ -212,6 +212,12 @@ mod instance_964_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_mcp_core_surface;
 
+// #46776 r3: real-entry RED tests for the 6 findings from the dual-review
+// rejection at 3d442d0a. Same sibling-file precedent as instance_964_tests.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod r3_46776_red_tests;
+
 // Re-homed here (not in ci/mod.rs / dispatch_hook/mod.rs) to keep those
 // KNOWN_OVERSIZED handler files under their file_size_invariant ceilings —
 // same precedent as instance_964_tests above. The tests reach the handlers'

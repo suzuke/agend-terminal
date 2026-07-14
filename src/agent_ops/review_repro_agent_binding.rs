@@ -58,7 +58,7 @@ fn cleanup_working_dir_does_not_follow_symlink_out_of_workspace_agent_binding() 
         "test invariant: precious file must exist before cleanup"
     );
 
-    cleanup_working_dir(&home, "victim-agent", &working_dir);
+    let _ = cleanup_working_dir(&home, "victim-agent", &working_dir);
 
     let survived = victim.join("data/precious.txt").exists();
     std::fs::remove_dir_all(&base).ok();

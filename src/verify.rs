@@ -376,7 +376,7 @@ fn test_instructions(home: &Path) -> TestResult {
     let test_dir = home.join("verify-instructions");
     std::fs::create_dir_all(&test_dir).ok();
 
-    instructions::generate(&test_dir, "claude");
+    let _ = instructions::generate(&test_dir, "claude");
     // Canonical Claude instructions path is `.claude/agend.md` (see
     // `backend.rs` preset `instructions_path`). The legacy
     // `.claude/rules/agend.md` location is intentionally migrated away /
@@ -390,7 +390,7 @@ fn test_instructions(home: &Path) -> TestResult {
             .all(|p| c.contains(p))
     };
 
-    instructions::generate(&test_dir, "kiro-cli");
+    let _ = instructions::generate(&test_dir, "kiro-cli");
     let kiro_ok = test_dir
         .join(".kiro")
         .join("steering")
@@ -500,7 +500,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     std::fs::create_dir_all(&test_dir).ok();
 
     // 1. Instructions
-    crate::instructions::generate(&test_dir, preset.command);
+    let _ = crate::instructions::generate(&test_dir, preset.command);
     let instr_ok = test_dir.join(preset.instructions_path).exists() && {
         let c =
             std::fs::read_to_string(test_dir.join(preset.instructions_path)).unwrap_or_default();

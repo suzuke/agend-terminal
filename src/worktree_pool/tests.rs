@@ -80,7 +80,7 @@ fn cleanup_working_dir_managed_worktree_removes_via_git_no_orphan() {
         "baseline: main + the agent worktree are registered"
     );
 
-    crate::agent_ops::cleanup_working_dir(&home, "devw", &wt);
+    let _ = crate::agent_ops::cleanup_working_dir(&home, "devw", &wt);
 
     assert!(!wt.exists(), "worktree dir must be removed");
     let after = worktree_list(&repo);
@@ -118,7 +118,7 @@ fn cleanup_working_dir_dirty_worktree_backs_up_before_remove() {
     let wt = managed_workspace_worktree(&home, &repo, "devd", "feat/p0d");
     std::fs::write(wt.join("WIP.txt"), "unsaved work").unwrap();
 
-    crate::agent_ops::cleanup_working_dir(&home, "devd", &wt);
+    let _ = crate::agent_ops::cleanup_working_dir(&home, "devd", &wt);
 
     assert!(!wt.exists(), "worktree removed");
     let backup = backup_dir_for(&home, "devd").expect("backup dir created");
@@ -152,7 +152,7 @@ fn cleanup_working_dir_committed_orphan_backs_up_before_remove() {
         .output()
         .expect("git remote add");
 
-    crate::agent_ops::cleanup_working_dir(&home, "devo", &wt);
+    let _ = crate::agent_ops::cleanup_working_dir(&home, "devo", &wt);
 
     assert!(!wt.exists(), "worktree removed");
     assert!(
@@ -218,7 +218,7 @@ fn teardown_standalone_clone_declines_byte_identical() {
     // Helper declines (not a worktree).
     assert!(!teardown_workspace_worktree(&home, "devs", &ws));
     // Public path still removes the whole dir (byte-identical pre-(B)).
-    crate::agent_ops::cleanup_working_dir(&home, "devs", &ws);
+    let _ = crate::agent_ops::cleanup_working_dir(&home, "devs", &ws);
     assert!(!ws.exists(), "standalone workspace dir removed as before");
     assert!(
         backup_dir_for(&home, "devs").is_none(),

@@ -691,7 +691,7 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // teardown semantics that cleaned `home/workspace/<inst>` directly.
         let default_subdir = crate::paths::workspace_dir(home).join(inst);
         if default_subdir.exists() {
-            crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
+            let _ = crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
         }
     }
     // Sprint 54 P1-5: best-effort rmdir of the custom-directory parent.

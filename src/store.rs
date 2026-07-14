@@ -320,6 +320,22 @@ pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<FileFlockGuard> {
     Ok(FileFlockGuard { _file: f })
 }
 
+/// Acquire the single workspace-identity lock for `working_dir` (keyed by its
+/// canonical identity, under `home/.locks/`). BOTH provision and delete take
+/// this lock across their read-decide-write / read-decide-remove so the identity
+/// check and the mutation it authorizes are atomic against a concurrent
+/// provision or delete of the same directory (fail-closed vs check/write and
+/// check/remove races). `acquire_file_lock` creates the `.locks` parent.
+pub fn acquire_workspace_identity_lock(
+    home: &Path,
+    working_dir: &Path,
+) -> anyhow::Result<FileFlockGuard> {
+    acquire_file_lock(&crate::paths::workspace_identity_lock_path(
+        home,
+        working_dir,
+    ))
+}
+
 /// Non-blocking variant of [`acquire_file_lock`]: `Ok(None)` when the lock is
 /// currently held elsewhere, instead of blocking until it frees. Same
 /// `FLOCK_DEPTH` contract as the blocking form (the #1629 chokepoint extends

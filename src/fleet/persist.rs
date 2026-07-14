@@ -22,12 +22,34 @@ pub(crate) fn mutate_fleet_yaml(
     mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<bool>,
 ) -> Result<()> {
     let fleet_path = fleet_yaml_path(home);
-    if default_content.is_empty() && !fleet_path.exists() {
-        return Ok(());
-    }
     let _lock = acquire_lock(home)?;
-    let content =
-        std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| default_content.to_string());
+    let content = match fleet_path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if default_content.is_empty() {
+                return Ok(());
+            }
+            default_content.to_string()
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("fleet.yaml metadata: {e}"))
+                .context("opaque I/O — refusing to default");
+        }
+        Ok(_) => match std::fs::read_to_string(&fleet_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow::anyhow!(
+                    "fleet.yaml at {}: dangling symlink — filesystem evidence exists \
+                     but target is missing, refusing to overwrite with defaults",
+                    fleet_path.display()
+                ))
+                .context("opaque I/O — refusing to default");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("fleet.yaml read: {e}"))
+                    .context("opaque I/O — refusing to default")
+            }
+        },
+    };
     let mut doc: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&content).context("Failed to parse fleet.yaml")?;
     let changed = mutate(&mut doc)?;
@@ -55,8 +77,8 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
 
+        // 1. Apply every insert/merge first.
         let mut conflicts: Vec<super::merge::FieldConflict> = Vec::new();
-
         for (name, config) in entries {
             let key = serde_yaml_ng::Value::String(name.to_string());
             if let Some(serde_yaml_ng::Value::Mapping(existing)) = instances.get_mut(&key) {
@@ -70,7 +92,6 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 tracing::info!(%name, "added new instance to fleet.yaml");
             }
         }
-
         if !conflicts.is_empty() {
             let mut diff_lines: Vec<String> = Vec::with_capacity(conflicts.len());
             for c in &conflicts {
@@ -82,8 +103,144 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 diff_lines.join("\n")
             ));
         }
+
+        // 2. Whole-registry workspace-identity uniqueness (fail-closed, ATOMIC
+        // under the fleet lock held by mutate_fleet_yaml). Runs for EVERY affected
+        // instance — a NEW insert OR a merge that CHANGED `working_directory` — so
+        // the existing-key merge path can no longer slip a colliding update past
+        // admission (root finding 5). An instance must not resolve to the same
+        // canonical working directory as any OTHER — including an explicit path
+        // equal to another's DEFAULT, or a symlink/case-only/nonexistent alias
+        // (see paths::workspace_identity). This is the split-brain incident guard.
+        for (name, _) in entries {
+            let key = serde_yaml_ng::Value::String(name.to_string());
+            let explicit = instances
+                .get(&key)
+                .and_then(|v| v.get("working_directory"))
+                .and_then(|x| x.as_str());
+            let candidate_wd = crate::paths::effective_working_dir(home, name, explicit);
+            if let Some(collider) =
+                find_workspace_identity_collision(home, instances, name, &candidate_wd)
+            {
+                return Err(anyhow::anyhow!(
+                    "workspace identity collision: instance '{name}' would resolve to the same \
+                     canonical working directory as existing instance '{collider}' ({}). Refusing \
+                     to admit a duplicate workspace identity (fail-closed).",
+                    candidate_wd.display()
+                ));
+            }
+        }
         Ok(true)
     })
+}
+
+/// Return the name of an existing instance whose EFFECTIVE working directory shares
+/// `candidate_wd`'s canonical identity ([`crate::paths::workspace_identity`]), else `None`.
+/// Excludes `candidate_name` itself (a same-name merge/update is not a duplicate). Read-only
+/// over the parsed fleet mapping; the caller holds the fleet lock, so this is atomic w.r.t.
+/// concurrent admissions.
+fn expand_tilde(path: &Path) -> std::path::PathBuf {
+    super::resolve::expand_tilde_path(&path.to_string_lossy())
+}
+
+fn find_workspace_identity_collision(
+    home: &Path,
+    instances: &serde_yaml_ng::Mapping,
+    candidate_name: &str,
+    candidate_wd: &Path,
+) -> Option<String> {
+    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
+    for (k, v) in instances {
+        let Some(existing_name) = k.as_str() else {
+            continue;
+        };
+        if existing_name == candidate_name {
+            continue;
+        }
+        let explicit = v.get("working_directory").and_then(|x| x.as_str());
+        let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
+        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id {
+            return Some(existing_name.to_string());
+        }
+    }
+    None
+}
+
+/// Read-only load of the parsed `instances` mapping from fleet.yaml.
+/// Missing file → empty mapping (legitimate first-run).
+/// Opaque I/O, parse error, or wrong-shape `instances` → `Err` (fail-closed).
+fn load_instances_mapping(home: &Path) -> Result<serde_yaml_ng::Mapping> {
+    let fleet_path = fleet_yaml_path(home);
+    let c = match std::fs::read_to_string(&fleet_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_yaml_ng::Mapping::new());
+        }
+        Err(e) => {
+            anyhow::bail!("fleet.yaml read: {}: {e}", fleet_path.display());
+        }
+    };
+    let doc =
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&c).with_context(|| "fleet.yaml parse")?;
+    match doc.get("instances") {
+        None => Ok(serde_yaml_ng::Mapping::new()),
+        Some(v) => v.as_mapping().cloned().ok_or_else(|| {
+            anyhow::anyhow!("fleet.yaml: `instances` is not a mapping (wrong shape — refusing)")
+        }),
+    }
+}
+
+/// Read-only workspace-identity collision preflight: returns a DIFFERENT existing
+/// instance sharing `name`'s canonical identity at `candidate_wd`, else `None`.
+/// The create path uses this to refuse BEFORE creating any worktree/directory
+/// (root finding 2 — no partial filesystem/git state on refusal); the atomic
+/// `add_instances_to_yaml` remains the race-safe authority.
+pub fn workspace_identity_collision(
+    home: &Path,
+    name: &str,
+    candidate_wd: &Path,
+) -> Option<String> {
+    match load_instances_mapping(home) {
+        Ok(mapping) => find_workspace_identity_collision(home, &mapping, name, candidate_wd),
+        Err(e) => Some(format!("fleet unreadable — refusing collision check: {e}")),
+    }
+}
+
+/// Boot/spawn admission for a PRE-EXISTING duplicate fleet (root finding 5): if
+/// another instance shares `name`'s canonical workspace identity and sorts
+/// EARLIER, return that earlier owner's name — the caller must then SKIP booting
+/// `name`. The lexicographically-first instance in an identity group is the
+/// single deterministic owner that boots; the rest defer. `None` = `name` is
+/// unique or is itself the owner → boot it. The create path prevents NEW
+/// duplicates, so this only fires for a legacy / hand-corrupted fleet.yaml.
+pub fn duplicate_identity_owner_before(
+    home: &Path,
+    name: &str,
+    candidate_wd: &Path,
+) -> Option<String> {
+    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
+    let mapping = match load_instances_mapping(home) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("fleet unreadable — refusing boot admission: {e}")),
+    };
+    let mut earliest: Option<String> = None;
+    for (k, v) in &mapping {
+        let Some(existing_name) = k.as_str() else {
+            continue;
+        };
+        // Only an EARLIER-sorting instance can preempt this boot.
+        if existing_name >= name {
+            continue;
+        }
+        let explicit = v.get("working_directory").and_then(|x| x.as_str());
+        let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
+        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id
+            && earliest.as_deref().is_none_or(|e| existing_name < e)
+        {
+            earliest = Some(existing_name.to_string());
+        }
+    }
+    earliest
 }
 
 pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
@@ -609,6 +766,67 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn merge_adding_colliding_working_directory_is_refused_whole_registry() {
+        // finding 5: a MERGE that ADDS a working_directory (previously default →
+        // absent) pointing at another instance's identity is refused by the
+        // whole-registry post-pass. The pre-fix scan ran ONLY on the new-key
+        // branch, so this existing-key merge slipped a colliding update past.
+        let home = tmp_home("merge-add-collide");
+        add_instance_to_yaml(&home, "alice", &InstanceYamlEntry::default()).unwrap();
+        add_instance_to_yaml(&home, "bob", &InstanceYamlEntry::default()).unwrap();
+        let alice_default = crate::paths::workspace_dir(&home)
+            .join("alice")
+            .display()
+            .to_string();
+        let err = add_instance_to_yaml(
+            &home,
+            "bob",
+            &InstanceYamlEntry {
+                working_directory: Some(alice_default),
+                ..Default::default()
+            },
+        )
+        .expect_err("a merge that repoints bob onto alice's workspace must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace identity collision"),
+            "collision error: {msg}"
+        );
+        assert!(
+            msg.contains("bob") && msg.contains("alice"),
+            "refusal names both instances: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn duplicate_identity_owner_before_admits_only_the_earliest() {
+        // finding 5: a PRE-EXISTING duplicate fleet.yaml (two instances at ONE
+        // workspace — legacy / hand-edited) boots only the lexicographically-first
+        // "owner"; later ones defer. This is the boot/spawn admission helper.
+        let home = tmp_home("dup-owner");
+        let shared = home.join("shared-ws");
+        // Hand-write a corrupt fleet the create path would never admit. Single-
+        // quoted YAML keeps the (possibly backslashed) path literal cross-platform.
+        let yaml = format!(
+            "instances:\n  alice:\n    working_directory: '{p}'\n  bob:\n    working_directory: '{p}'\n",
+            p = shared.display()
+        );
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+        // bob (later) defers to the earlier owner alice.
+        assert_eq!(
+            duplicate_identity_owner_before(&home, "bob", &shared).as_deref(),
+            Some("alice")
+        );
+        // alice (earliest in its identity group) is the owner → boots.
+        assert_eq!(
+            duplicate_identity_owner_before(&home, "alice", &shared),
+            None
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// §3.9 (MED-3): a channels-only (plural) fleet must persist a telegram
     /// supergroup migration. Pre-fix, `update_channel_telegram_group_id` only
     /// handled the singular `channel:` form and returned a silent `Ok(false)`
@@ -668,6 +886,367 @@ mod tests {
             "MED-3: no telegram channel → no group_id written, got:\n{after}"
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Admission guard (workspace-identity): a NEW instance whose EXPLICIT working_directory
+    /// equals another instance's DEFAULT (`<home>/workspace/<name>`) is refused fail-closed,
+    /// and the structured refusal NAMES BOTH instances.
+    #[test]
+    fn add_instance_refuses_explicit_colliding_with_another_default() {
+        let home = tmp_home("collide-default");
+        // beta with NO explicit working_directory → default <home>/workspace/beta.
+        add_instance_to_yaml(&home, "beta", &InstanceYamlEntry::default()).unwrap();
+        let beta_default = crate::paths::workspace_dir(&home)
+            .join("beta")
+            .display()
+            .to_string();
+        let err = add_instance_to_yaml(
+            &home,
+            "alpha",
+            &InstanceYamlEntry {
+                working_directory: Some(beta_default),
+                ..Default::default()
+            },
+        )
+        .expect_err("explicit-vs-default collision must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "refusal must name BOTH instances: {msg}"
+        );
+        assert!(
+            msg.contains("workspace identity collision"),
+            "structured refusal expected: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Admission guard: two instances with the SAME explicit working_directory refuse.
+    #[test]
+    fn add_instance_refuses_duplicate_explicit_working_directory() {
+        let home = tmp_home("collide-explicit");
+        let shared = home.join("shared-ws").display().to_string();
+        add_instance_to_yaml(
+            &home,
+            "beta",
+            &InstanceYamlEntry {
+                working_directory: Some(shared.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = add_instance_to_yaml(
+            &home,
+            "alpha",
+            &InstanceYamlEntry {
+                working_directory: Some(shared),
+                ..Default::default()
+            },
+        )
+        .expect_err("duplicate explicit working_directory must be refused");
+        assert!(
+            err.to_string().contains("alpha") && err.to_string().contains("beta"),
+            "refusal must name both: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Admission guard: a symlinked-parent alias of another instance's dir is refused
+    /// (nonexistent leaf; deepest-existing-ancestor canonicalization resolves the symlink).
+    #[cfg(unix)]
+    #[test]
+    fn add_instance_refuses_symlinked_parent_alias() {
+        use std::os::unix::fs::symlink;
+        let home = tmp_home("collide-symlink");
+        let real = home.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, home.join("link")).unwrap();
+        add_instance_to_yaml(
+            &home,
+            "beta",
+            &InstanceYamlEntry {
+                working_directory: Some(real.join("ws").display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // alpha targets the SAME dir via the symlinked parent (leaf "ws" doesn't exist).
+        let err = add_instance_to_yaml(
+            &home,
+            "alpha",
+            &InstanceYamlEntry {
+                working_directory: Some(home.join("link").join("ws").display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("symlinked-parent alias must be refused");
+        assert!(
+            err.to_string().contains("alpha") && err.to_string().contains("beta"),
+            "refusal must name both: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Admission guard: a case-only alias of another instance's dir is refused (conservative
+    /// case-fold), on case-sensitive and case-insensitive filesystems alike.
+    #[test]
+    fn add_instance_refuses_case_only_alias() {
+        let home = tmp_home("collide-case");
+        add_instance_to_yaml(
+            &home,
+            "beta",
+            &InstanceYamlEntry {
+                working_directory: Some(home.join("ws").display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = add_instance_to_yaml(
+            &home,
+            "alpha",
+            &InstanceYamlEntry {
+                working_directory: Some(home.join("WS").display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("case-only alias must be refused");
+        assert!(
+            err.to_string().contains("alpha") && err.to_string().contains("beta"),
+            "refusal must name both: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Admission guard is ATOMIC: two concurrent creates targeting the SAME working directory
+    /// admit EXACTLY ONE (the fleet lock serializes check-and-insert); the other refuses.
+    #[test]
+    fn add_instance_concurrent_creates_admit_exactly_one() {
+        let home = tmp_home("collide-concurrent");
+        let shared = home.join("race-ws").display().to_string();
+        let (h1, h2) = (home.clone(), home.clone());
+        let (s1, s2) = (shared.clone(), shared.clone());
+        let t1 = std::thread::spawn(move || {
+            add_instance_to_yaml(
+                &h1,
+                "one",
+                &InstanceYamlEntry {
+                    working_directory: Some(s1),
+                    ..Default::default()
+                },
+            )
+        });
+        let t2 = std::thread::spawn(move || {
+            add_instance_to_yaml(
+                &h2,
+                "two",
+                &InstanceYamlEntry {
+                    working_directory: Some(s2),
+                    ..Default::default()
+                },
+            )
+        });
+        let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+        assert_eq!(
+            r1.is_ok() as u8 + r2.is_ok() as u8,
+            1,
+            "exactly one concurrent create may win the shared workspace: r1={r1:?} r2={r2:?}"
+        );
+        // And fleet.yaml persisted exactly one of them.
+        let names = crate::fleet::FleetConfig::load(&fleet_yaml_path(&home))
+            .unwrap()
+            .instance_names();
+        let persisted = names.iter().filter(|n| *n == "one" || *n == "two").count();
+        assert_eq!(persisted, 1, "exactly one instance must persist: {names:?}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression: distinct working directories (two DEFAULTS) are ADMITTED — the identity
+    /// guard must not over-refuse legitimate non-colliding instances.
+    #[test]
+    fn add_instance_allows_distinct_working_directories() {
+        let home = tmp_home("distinct");
+        add_instance_to_yaml(&home, "beta", &InstanceYamlEntry::default()).unwrap();
+        add_instance_to_yaml(&home, "alpha", &InstanceYamlEntry::default())
+            .expect("distinct default workspaces must be admitted");
+        let names = crate::fleet::FleetConfig::load(&fleet_yaml_path(&home))
+            .unwrap()
+            .instance_names();
+        assert!(
+            names.contains(&"alpha".to_string()) && names.contains(&"beta".to_string()),
+            "both distinct instances must persist: {names:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- root review r8 RED: 2 deterministic failures (task-46776) ---
+
+    #[test]
+    fn root_review_tilde_and_expanded_workspace_identity_collide() {
+        let home = tmp_home("tilde-collide");
+        let unique = format!("agend-tilde-test-{}", std::process::id());
+        let tilde_path = format!("~/{unique}");
+        let expanded = crate::fleet::resolve::expand_tilde_path(&tilde_path);
+
+        add_instance_to_yaml(
+            &home,
+            "alice",
+            &InstanceYamlEntry {
+                working_directory: Some(tilde_path),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = add_instance_to_yaml(
+            &home,
+            "bob",
+            &InstanceYamlEntry {
+                working_directory: Some(expanded.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("tilde and expanded paths must collide as the same workspace identity");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace identity collision"),
+            "expected collision refusal: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_review_dangling_fleet_symlink_is_opaque_not_first_run() {
+        use std::os::unix::fs::symlink;
+        let home = tmp_home("dangling-symlink");
+        let fleet_path = super::fleet_yaml_path(&home);
+        symlink("/nonexistent/fleet.yaml", &fleet_path).unwrap();
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "symlink entry must exist"
+        );
+        assert!(
+            !fleet_path.exists(),
+            "symlink target must NOT exist (dangling)"
+        );
+
+        let err = add_instance_to_yaml(&home, "alpha", &InstanceYamlEntry::default())
+            .expect_err("dangling fleet.yaml symlink must be refused as opaque evidence");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dangling") || msg.contains("opaque") || msg.contains("refusing"),
+            "structured refusal expected: {msg}"
+        );
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "dangling symlink must not be removed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- root review r9 RED: 2 deterministic failures (task-46776) ---
+
+    #[test]
+    fn root_review_r9_boot_tilde_and_expanded_duplicate_deferred() {
+        let home = tmp_home("r10-tilde-boot");
+        let unique = format!("agend-r10-tilde-boot-{}", std::process::id());
+        let tilde_path = format!("~/{unique}");
+        let expanded = crate::fleet::resolve::expand_tilde_path(&tilde_path);
+
+        let yaml = format!(
+            "instances:\n  alice:\n    working_directory: '{tilde_path}'\n  bob:\n    working_directory: '{}'\n",
+            expanded.display()
+        );
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+
+        let result = duplicate_identity_owner_before(&home, "bob", &expanded);
+        assert_eq!(
+            result.as_deref(),
+            Some("alice"),
+            "boot admission must detect tilde-vs-expanded duplicate: \
+             alice owns ~/{u} which is the same directory as {e}, \
+             but duplicate_identity_owner_before does not normalize tilde \
+             so the identity comparison misses the collision",
+            u = unique,
+            e = expanded.display(),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_review_r9_remove_dangling_fleet_symlink_is_not_silent_success() {
+        use std::os::unix::fs::symlink;
+        let home = tmp_home("r10-dangling-rm");
+        let fleet_path = super::fleet_yaml_path(&home);
+        symlink("/nonexistent/fleet.yaml", &fleet_path).unwrap();
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "symlink entry must exist"
+        );
+        assert!(
+            !fleet_path.exists(),
+            "symlink target must NOT exist (dangling)"
+        );
+
+        let result = remove_instance_from_yaml(&home, "alpha");
+        assert!(
+            result.is_err(),
+            "remove_instance on a dangling fleet.yaml symlink must refuse, \
+             not silently return Ok — the empty-default fast path \
+             (default_content.is_empty() && !fleet_path.exists()) bypasses \
+             the post-lock dangling-symlink guard because .exists() follows \
+             symlinks and returns false for dangling targets"
+        );
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "dangling symlink must not be removed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- root review r10 RED: 2 deterministic failures (task-46776 r11) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn root_review_r10_opaque_fleet_metadata_must_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("r11-opaque-meta");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let fleet_path = super::fleet_yaml_path(&home);
+        assert!(
+            fleet_path.symlink_metadata().is_err(),
+            "precondition: metadata must be inaccessible"
+        );
+
+        let result = remove_instance_from_yaml(&home, "alpha");
+
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "mutate_fleet_yaml must fail closed when fleet.yaml metadata is \
+             opaque (PermissionDenied), not silently return Ok — the fast \
+             path treats all symlink_metadata errors as 'absent'"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn root_review_r10_absent_fleet_removal_must_acquire_lock() {
+        let home = tmp_home("r11-lock-absent");
+        let lock_path = home.join(".fleet.yaml.lock");
+        assert!(!lock_path.exists(), "precondition: no lock file");
+
+        remove_instance_from_yaml(&home, "alpha").unwrap();
+
+        assert!(
+            lock_path.exists(),
+            "the fleet lock must be acquired even when fleet.yaml is absent \
+             and default_content is empty — the absence decision must be \
+             made under the lock for atomicity. The current fast path \
+             bypasses acquire_lock entirely."
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

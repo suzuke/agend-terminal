@@ -40,8 +40,7 @@ pub(crate) fn prepare_instructions(
     command: &str,
     work_dir: &Path,
     explicit_role: Option<&str>,
-) {
-    std::fs::create_dir_all(work_dir).ok();
+) -> Result<(), String> {
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     // Look up team membership so agend.md can split collaborators (team
     // members) from the rest of the fleet. Owned here so we can hand out
@@ -54,8 +53,16 @@ pub(crate) fn prepare_instructions(
             orchestrator: t.orchestrator.as_deref(),
             members: t.members.as_slice(),
         });
+    // Fleet validation BEFORE create_dir_all: a refused provisioning must
+    // not leave any side effects (no directory created for a malformed fleet).
     match crate::fleet::FleetConfig::load(&fleet_path) {
         Ok(fleet) => {
+            std::fs::create_dir_all(work_dir).map_err(|e| {
+                format!(
+                    "prepare_instructions: create {} failed: {e}",
+                    work_dir.display()
+                )
+            })?;
             let peers: Vec<(String, Option<String>)> = fleet
                 .instances
                 .iter()
@@ -80,20 +87,33 @@ pub(crate) fn prepare_instructions(
                 team: team_ctx.as_ref(),
                 extra_instructions: extra_instr.as_deref(),
             };
-            crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
+            crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
         }
-        Err(_) if explicit_role.is_some() => {
-            let ctx = crate::instructions::AgentContext {
-                name,
-                role: explicit_role,
-                fleet_peers: &[],
-                team: team_ctx.as_ref(),
-                extra_instructions: None,
-            };
-            crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
-        }
-        Err(_) => {
-            crate::instructions::generate(work_dir, command);
+        Err(e) => {
+            // Distinguish genuine NotFound from opaque IO / malformed content.
+            // exists() conflates EACCES with NotFound (both return false);
+            // metadata() preserves the actual error kind.
+            match std::fs::metadata(&fleet_path) {
+                Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(work_dir).map_err(|e2| {
+                        format!(
+                            "prepare_instructions: create {} failed: {e2}",
+                            work_dir.display()
+                        )
+                    })?;
+                    let ctx = crate::instructions::AgentContext {
+                        name,
+                        role: explicit_role,
+                        fleet_peers: &[],
+                        team: team_ctx.as_ref(),
+                        extra_instructions: None,
+                    };
+                    crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
+                }
+                _ => Err(format!(
+                    "fleet.yaml unreadable/malformed — refusing provisioning: {e}"
+                )),
+            }
         }
     }
 }

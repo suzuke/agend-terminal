@@ -501,92 +501,136 @@ pub fn ensure_not_protected_json(branch: &str) -> Result<(), serde_json::Value> 
 /// The copy in `mcp/handlers.rs` drifted to 14 entries on 2026-04-14 and
 /// is missing the 5 Kiro paths: `.kiro/agents/{agend.json,agend-prompt.md,
 /// default.json}`, `.kiro/prompts/agend.md`, `.kiro/settings.json`.
-pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
-    let workspaces = crate::paths::workspace_dir(home);
-
-    // If under $AGEND_HOME/workspace/, remove the whole directory.
-    // CR-2026-06-14 (security): a purely LEXICAL `starts_with` lets a symlink
-    // under workspace/ whose real target is ELSEWHERE take this whole-dir
-    // `remove_dir_all` and follow the symlink out of the workspace, destroying
-    // real user data. Require the path to ALSO resolve canonically inside the
-    // canonicalized workspace root (canonicalize BOTH so a symlinked
-    // $AGEND_HOME — e.g. macOS /tmp→/private/tmp — still matches).
-    let under_workspace = working_dir.starts_with(&workspaces)
-        && match (
-            dunce::canonicalize(working_dir),
-            dunce::canonicalize(&workspaces),
-        ) {
-            (Ok(wd), Ok(ws)) => wd.starts_with(&ws),
-            _ => false,
-        };
-    if under_workspace {
-        // #2234 Phase 0: under cure-(B) the workspace dir IS a daemon-managed
-        // canonical worktree (its `.git` is a gitlink FILE). A bare
-        // remove_dir_all would destroy uncommitted/unpushed work AND orphan the
-        // worktree registration in the canonical repo. Route a worktree through
-        // `git worktree remove --force` (work-at-risk backed up first). A
-        // standalone clone / plain dir (the pre-(B) state) returns false here →
-        // the byte-identical remove_dir_all below still runs.
-        if crate::worktree_pool::teardown_workspace_worktree(home, name, working_dir) {
-            // handled (gitlink worktree): removal + registry cleanup done.
-        } else if let Err(e) = std::fs::remove_dir_all(working_dir) {
-            tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
-        } else {
-            tracing::info!(dir = %working_dir.display(), "removed workspace");
-        }
+pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) -> Option<String> {
+    // Workspace-identity guard (fail-closed): before removing anything under
+    // `working_dir`, refuse if the directory's on-disk identity belongs to a
+    // DIFFERENT instance (or is corrupt/unreadable). Deleting instance A must
+    // never wipe a directory that identity artifacts (AGENTS.md block / `.codex`
+    // stamp) say belongs to instance B — preserve the tree and emit a loud audit.
+    // Metadata keyed by A's own name (the tail below) is still cleaned; only the
+    // shared working directory is preserved.
+    //
+    // Held under the workspace-identity lock so the ownership CHECK and the
+    // REMOVAL are atomic against a concurrent provision/delete of the same
+    // directory. The SINGLE returned verdict is what `full_delete_instance`
+    // reports — it does NOT probe a second (unlocked) time. A lock-acquire
+    // failure is itself fail-closed: refuse and preserve.
+    let id_lock = crate::store::acquire_workspace_identity_lock(home, working_dir);
+    let conflict = match &id_lock {
+        Ok(_) => working_dir_ownership_conflict(working_dir, name),
+        Err(e) => Some(format!("could not acquire workspace-identity lock: {e}")),
+    };
+    if let Some(reason) = &conflict {
+        tracing::error!(
+            dir = %working_dir.display(), name, %reason,
+            "cleanup refused: working directory identity belongs to a different instance — tree preserved"
+        );
     } else {
-        // User-provided working directory: only remove agend-generated files
-        let agend_files = [
-            // Claude
-            ".claude/settings.local.json",
-            "mcp-config.json",
-            "claude-settings.json",
-            "statusline.sh",
-            "statusline.json",
-            ".claude/rules/agend.md",
-            // Gemini
-            ".gemini/settings.json",
-            // OpenCode
-            "opencode.json",
-            "instructions/agend.md",
-            // Codex
-            ".codex/config.toml",
-            "AGENTS.md",
-            // Kiro
-            ".kiro/settings/mcp.json",
-            ".kiro/settings/agend-mcp-wrapper.sh",
-            ".kiro/steering/agend.md",
-            ".kiro/agents/agend.json",
-            ".kiro/agents/agend-prompt.md",
-            ".kiro/agents/default.json",
-            ".kiro/prompts/agend.md",
-            ".kiro/settings.json",
-        ];
-        for file in &agend_files {
-            let path = working_dir.join(file);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+        let workspaces = crate::paths::workspace_dir(home);
 
-        // Clean up worktree if exists
-        let wt_dir = working_dir.join(".worktrees").join(name);
-        if wt_dir.exists() {
-            // W1.2: LOCAL best-effort worktree-remove via the bypass+bounded
-            // helper (was a raw UNBOUNDED `.output()` whose result was already
-            // discarded). git_ok adds the LOCAL_GIT_TIMEOUT bound so a stuck
-            // remove can't hang teardown; the bypass env is a no-op in the
-            // daemon's shim-free PATH. Result stays discarded → same effect.
-            let _ = crate::git_helpers::git_ok(
-                working_dir,
-                &[
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &wt_dir.display().to_string(),
-                ],
-            );
-            tracing::info!(dir = %wt_dir.display(), "removed worktree");
+        // If under $AGEND_HOME/workspace/, remove the whole directory.
+        // CR-2026-06-14 (security): a purely LEXICAL `starts_with` lets a symlink
+        // under workspace/ whose real target is ELSEWHERE take this whole-dir
+        // `remove_dir_all` and follow the symlink out of the workspace, destroying
+        // real user data. Require the path to ALSO resolve canonically inside the
+        // canonicalized workspace root (canonicalize BOTH so a symlinked
+        // $AGEND_HOME — e.g. macOS /tmp→/private/tmp — still matches).
+        let under_workspace = working_dir.starts_with(&workspaces)
+            && match (
+                dunce::canonicalize(working_dir),
+                dunce::canonicalize(&workspaces),
+            ) {
+                (Ok(wd), Ok(ws)) => wd.starts_with(&ws),
+                _ => false,
+            };
+        if under_workspace {
+            // #2234 Phase 0: under cure-(B) the workspace dir IS a daemon-managed
+            // canonical worktree (its `.git` is a gitlink FILE). A bare
+            // remove_dir_all would destroy uncommitted/unpushed work AND orphan the
+            // worktree registration in the canonical repo. Route a worktree through
+            // `git worktree remove --force` (work-at-risk backed up first). A
+            // standalone clone / plain dir (the pre-(B) state) returns false here →
+            // the byte-identical remove_dir_all below still runs.
+            if crate::worktree_pool::teardown_workspace_worktree(home, name, working_dir) {
+                // handled (gitlink worktree): removal + registry cleanup done.
+            } else if let Err(e) = std::fs::remove_dir_all(working_dir) {
+                tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
+            } else {
+                tracing::info!(dir = %working_dir.display(), "removed workspace");
+            }
+        } else {
+            let worktrees = home.join("worktrees");
+            let under_worktrees = working_dir.starts_with(&worktrees)
+                && match (
+                    dunce::canonicalize(working_dir),
+                    dunce::canonicalize(&worktrees),
+                ) {
+                    (Ok(wd), Ok(wt)) => wd.starts_with(&wt),
+                    _ => false,
+                };
+            if under_worktrees {
+                if crate::worktree_pool::teardown_workspace_worktree(home, name, working_dir) {
+                    // handled (gitlink worktree): removal + registry cleanup done.
+                } else if let Err(e) = std::fs::remove_dir_all(working_dir) {
+                    tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove managed worktree");
+                } else {
+                    tracing::info!(dir = %working_dir.display(), "removed managed worktree");
+                }
+            } else {
+                // User-provided working directory: only remove agend-generated files
+                let agend_files = [
+                    // Claude
+                    ".claude/settings.local.json",
+                    "mcp-config.json",
+                    "claude-settings.json",
+                    "statusline.sh",
+                    "statusline.json",
+                    ".claude/rules/agend.md",
+                    // Gemini
+                    ".gemini/settings.json",
+                    // OpenCode
+                    "opencode.json",
+                    "instructions/agend.md",
+                    // Codex
+                    ".codex/config.toml",
+                    "AGENTS.md",
+                    // Kiro
+                    ".kiro/settings/mcp.json",
+                    ".kiro/settings/agend-mcp-wrapper.sh",
+                    ".kiro/steering/agend.md",
+                    ".kiro/agents/agend.json",
+                    ".kiro/agents/agend-prompt.md",
+                    ".kiro/agents/default.json",
+                    ".kiro/prompts/agend.md",
+                    ".kiro/settings.json",
+                ];
+                for file in &agend_files {
+                    let path = working_dir.join(file);
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+
+                // Clean up worktree if exists
+                let wt_dir = working_dir.join(".worktrees").join(name);
+                if wt_dir.exists() {
+                    // W1.2: LOCAL best-effort worktree-remove via the bypass+bounded
+                    // helper (was a raw UNBOUNDED `.output()` whose result was already
+                    // discarded). git_ok adds the LOCAL_GIT_TIMEOUT bound so a stuck
+                    // remove can't hang teardown; the bypass env is a no-op in the
+                    // daemon's shim-free PATH. Result stays discarded → same effect.
+                    let _ = crate::git_helpers::git_ok(
+                        working_dir,
+                        &[
+                            "worktree",
+                            "remove",
+                            "--force",
+                            &wt_dir.display().to_string(),
+                        ],
+                    );
+                    tracing::info!(dir = %wt_dir.display(), "removed worktree");
+                }
+            }
         }
     }
 
@@ -612,6 +656,53 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
     // working_dir, so it lives outside both cleanup branches above. Never
     // touches the real workspace — only the managed symlink/junction.
     crate::agy_workspace::remove_link(home, name);
+
+    conflict
+}
+
+/// Whether `working_dir`'s on-disk identity artifacts name an instance OTHER
+/// than `name` (or are corrupt) — in which case the caller must NOT remove the
+/// tree. Returns `Some(reason)` to refuse (foreign owner / corrupt artifact),
+/// `None` to proceed (no identity artifact, or the directory belongs to `name`).
+/// Checks the AGENTS.md agend block (which records the SANITIZED identifier) and
+/// the `.codex/config.toml` `AGEND_INSTANCE_NAME` stamp (which records the RAW
+/// name) — the two durable identity artifacts the collision incident involved.
+pub(crate) fn working_dir_ownership_conflict(working_dir: &Path, name: &str) -> Option<String> {
+    // Fail-closed: `agents_md_identity` / `codex_config_identity` return
+    // `Unreadable` (→ a conflict) for any non-`NotFound` I/O error, so an
+    // unreadable artifact refuses the delete rather than being read as absent.
+    if let Some(reason) = crate::instructions::agents_md_identity(&working_dir.join("AGENTS.md"))
+        .conflict_with(&crate::instructions::sanitize_identifier(name))
+    {
+        return Some(format!("AGENTS.md {reason}"));
+    }
+    if let Some(reason) =
+        crate::instructions::agents_md_identity(&working_dir.join(".agents").join("AGENTS.md"))
+            .conflict_with(&crate::instructions::sanitize_identifier(name))
+    {
+        return Some(format!(".agents/AGENTS.md {reason}"));
+    }
+    if let Some(reason) =
+        crate::mcp_config::codex_config_identity(&working_dir.join(".codex").join("config.toml"))
+            .conflict_with(name)
+    {
+        return Some(format!(".codex/config.toml {reason}"));
+    }
+    if let Some(reason) =
+        crate::mcp_config::codex_config_identity(&working_dir.join(".grok").join("config.toml"))
+            .conflict_with(name)
+    {
+        return Some(format!(".grok/config.toml {reason}"));
+    }
+    for artifact in &[".claude/agend.md", ".kiro/steering/agend.md"] {
+        let path = working_dir.join(artifact);
+        if let Some(reason) = crate::instructions::nonshared_instructions_identity(&path)
+            .conflict_with(&crate::instructions::sanitize_identifier(name))
+        {
+            return Some(format!("{artifact} {reason}"));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,7 +1425,7 @@ mod tests {
         let ws = home.join("workspace/agent1");
         std::fs::create_dir_all(&ws).ok();
         std::fs::write(ws.join("f.txt"), "x").ok();
-        cleanup_working_dir(&home, "agent1", &ws);
+        let _ = cleanup_working_dir(&home, "agent1", &ws);
         assert!(!ws.exists());
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1345,11 +1436,142 @@ mod tests {
         let ud = tmp_home("cu_proj");
         std::fs::write(ud.join("main.rs"), "fn main(){}").ok();
         std::fs::write(ud.join("opencode.json"), "{}").ok();
-        cleanup_working_dir(&home, "a", &ud);
+        let _ = cleanup_working_dir(&home, "a", &ud);
         assert!(ud.join("main.rs").exists());
         assert!(!ud.join("opencode.json").exists());
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&ud).ok();
+    }
+
+    // --- workspace-identity delete guard (boundary 3) ---
+
+    fn seed_agents_owned_by(dir: &Path, owner: &str) {
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            format!(
+                "<!-- agend:start -->\n## Identity\n\n- **Name**: `{owner}`\n<!-- agend:end -->\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_foreign_identity_tree() {
+        let home = tmp_home("cw_foreign");
+        let ws = home.join("workspace/alice"); // "alice" is being deleted...
+        std::fs::create_dir_all(&ws).unwrap();
+        seed_agents_owned_by(&ws, "bob"); // ...but the directory belongs to "bob".
+        std::fs::write(ws.join("keep.txt"), "b").unwrap();
+        assert!(
+            cleanup_working_dir(&home, "alice", &ws).is_some(),
+            "foreign-owned dir must be refused (Some verdict)"
+        );
+        assert!(ws.exists(), "foreign-owned tree must be preserved");
+        assert!(
+            ws.join("AGENTS.md").exists(),
+            "bob's identity file preserved"
+        );
+        assert!(
+            ws.join("keep.txt").exists(),
+            "foreign tree contents preserved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_removes_same_identity_tree() {
+        let home = tmp_home("cw_same");
+        let ws = home.join("workspace/alice");
+        std::fs::create_dir_all(&ws).unwrap();
+        seed_agents_owned_by(&ws, "alice"); // dir belongs to the instance being deleted
+        assert!(
+            cleanup_working_dir(&home, "alice", &ws).is_none(),
+            "same-identity dir cleans (None verdict)"
+        );
+        assert!(!ws.exists(), "same-identity tree must be removed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_removes_unowned_tree_normally() {
+        let home = tmp_home("cw_absent");
+        let ws = home.join("workspace/alice");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("f.txt"), "x").unwrap(); // no identity artifact
+        assert!(
+            cleanup_working_dir(&home, "alice", &ws).is_none(),
+            "unowned dir cleans (None verdict)"
+        );
+        assert!(!ws.exists(), "unowned tree cleans normally");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn ownership_conflict_detects_foreign_codex_stamp() {
+        let home = tmp_home("wdoc_codex");
+        let ws = home.join("workspace/alice");
+        std::fs::create_dir_all(ws.join(".codex")).unwrap();
+        std::fs::write(
+            ws.join(".codex").join("config.toml"),
+            "AGEND_INSTANCE_NAME = 'bob'\n",
+        )
+        .unwrap();
+        assert!(
+            working_dir_ownership_conflict(&ws, "alice").is_some(),
+            "foreign .codex stamp is a conflict"
+        );
+        assert!(
+            working_dir_ownership_conflict(&ws, "bob").is_none(),
+            "same owner is not a conflict"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_refuses_unreadable_identity_tree() {
+        // Fail-closed: an UNREADABLE identity artifact (opaque I/O ≠ NotFound)
+        // must refuse the delete — never be read as "absent" and wipe the tree.
+        let home = tmp_home("cw_unreadable");
+        let ws = home.join("workspace/alice");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), [0xFFu8, 0xFE]).unwrap(); // invalid UTF-8
+        assert!(
+            cleanup_working_dir(&home, "alice", &ws).is_some(),
+            "unreadable identity must refuse (Some verdict)"
+        );
+        assert!(ws.exists(), "tree preserved on unreadable identity");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn workspace_identity_lock_is_mutually_exclusive_provision_vs_delete() {
+        // Provision (generate_with_context) and delete (cleanup_working_dir) BOTH
+        // acquire store::acquire_workspace_identity_lock(home, wd) for the same
+        // directory. Prove it is mutually exclusive so a check+write can never
+        // interleave with a check+remove of that directory (root finding 4).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let home = tmp_home("wsid_lock");
+        let wd = home.join("workspace/shared");
+        let in_critical = Arc::new(AtomicBool::new(false));
+        let held = crate::store::acquire_workspace_identity_lock(&home, &wd).expect("first lock");
+        in_critical.store(true, Ordering::SeqCst);
+        let (h2, w2, ic2) = (home.clone(), wd.clone(), in_critical.clone());
+        let t = std::thread::spawn(move || {
+            // Blocks until the main thread releases `held` (mutual exclusion).
+            let _g = crate::store::acquire_workspace_identity_lock(&h2, &w2).expect("second lock");
+            assert!(
+                !ic2.load(Ordering::SeqCst),
+                "acquired the workspace-identity lock while another holder was still in its \
+                 critical section — the lock is NOT mutually exclusive"
+            );
+        });
+        // Give the spawned thread time to reach (and block on) the acquire.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        in_critical.store(false, Ordering::SeqCst);
+        drop(held);
+        t.join().expect("second acquirer thread");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -1359,7 +1581,7 @@ mod tests {
         std::fs::create_dir_all(&ws).ok();
         std::fs::create_dir_all(home.join("metadata")).ok();
         std::fs::write(home.join("metadata/a.json"), "{}").ok();
-        cleanup_working_dir(&home, "a", &ws);
+        let _ = cleanup_working_dir(&home, "a", &ws);
         assert!(!home.join("metadata/a.json").exists());
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1414,7 +1636,7 @@ mod tests {
         }
         std::fs::write(ud.join("user-code.rs"), "fn main(){}").ok();
 
-        cleanup_working_dir(&home, "drift19", &ud);
+        let _ = cleanup_working_dir(&home, "drift19", &ud);
 
         // All 19 must be gone, user decoy preserved.
         for rel in &canonical {
@@ -1450,7 +1672,7 @@ mod tests {
             }
             std::fs::write(&p, "x").ok();
 
-            cleanup_working_dir(&home, "drift1", &ud);
+            let _ = cleanup_working_dir(&home, "drift1", &ud);
 
             assert!(!p.exists(), "Kiro drift entry not removed: {rel}");
 

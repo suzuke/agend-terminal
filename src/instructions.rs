@@ -5,10 +5,12 @@ use std::path::Path;
 /// via `--append-system-prompt-file .claude/agend.md`, so keeping the old file
 /// around would cause Claude to auto-load stale content as a rule on top of
 /// the flag-provided version.
-fn migrate_claude_old_rules_file(working_dir: &Path) {
+fn migrate_claude_old_rules_file(working_dir: &Path) -> Result<(), String> {
     let old = working_dir.join(".claude").join("rules").join("agend.md");
-    if old.exists() {
-        let _ = std::fs::remove_file(&old);
+    match std::fs::remove_file(&old) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("migrate: cannot remove old {}: {e}", old.display())),
     }
 }
 
@@ -60,30 +62,29 @@ mcp-config.json
 /// here instead of walking up to `$HOME`. No-op if `dir` already lives inside
 /// a git work tree (we never create nested repos). On a fresh init, also drops
 /// a minimal `.gitignore` for agend runtime artifacts.
-pub(crate) fn ensure_project_root(dir: &Path) {
+pub(crate) fn ensure_project_root(dir: &Path) -> Result<(), String> {
     if !dir.exists() {
-        return;
+        return Ok(());
     }
-    // W1.2: cwd=dir replaces `-C dir`; git_ok = spawn-and-exit-0 (bypass env +
-    // local timeout + process-group kill bundled). Local rev-parse.
     let inside = crate::git_helpers::git_ok(dir, &["rev-parse", "--is-inside-work-tree"]);
     if inside {
-        return;
+        return Ok(());
     }
 
-    // #2071: an un-redirected child in app mode inherits the TUI's TTY and `git
-    // init`'s hints/warnings garble the ratatui frame. git_ok runs git via
-    // git_bypass, which CAPTURES stdout/stderr (pipes — never the inherited TTY),
-    // so the explicit Stdio::null is no longer needed; we only read the exit
-    // status. W1.2: cwd=dir replaces `-C dir`.
     let init_ok = crate::git_helpers::git_ok(dir, &["init", "--quiet"]);
-
-    if init_ok {
-        let ignore_path = dir.join(".gitignore");
-        if !ignore_path.exists() {
-            let _ = std::fs::write(&ignore_path, AGEND_GITIGNORE);
-        }
+    if !init_ok {
+        return Err(format!(
+            "ensure_project_root: git init failed in {}",
+            dir.display()
+        ));
     }
+
+    let ignore_path = dir.join(".gitignore");
+    if !ignore_path.exists() {
+        std::fs::write(&ignore_path, AGEND_GITIGNORE)
+            .map_err(|e| format!("ensure_project_root: .gitignore write: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Markers for agend-owned block inside user-shared instructions files
@@ -416,6 +417,82 @@ fn strip_leaked_extra_instructions(content: &str, extra: Option<&str>) -> String
     result
 }
 
+/// Read the owning instance recorded inside the agend-managed block of an
+/// existing shared instructions file (AGENTS.md / GEMINI.md). The
+/// workspace-identity guard reads ownership ONLY between the agend markers so
+/// user content outside them can never be mistaken for ownership.
+///
+/// - [`DirIdentity::Absent`] — no agend block present (unowned / legacy → adoptable).
+/// - [`DirIdentity::Owner`] — the recorded owner (a sanitized identifier, matching
+///   what [`build_instructions_body`] writes at the `- **Name**:` line).
+/// - [`DirIdentity::Corrupt`] — a start marker with no end, or a block with no
+///   parseable `Name` line.
+pub(crate) fn agend_block_owner(existing: &str) -> crate::paths::DirIdentity {
+    use crate::paths::DirIdentity;
+    let Some(start) = existing.find(AGEND_BLOCK_START) else {
+        return DirIdentity::Absent;
+    };
+    let rest = &existing[start + AGEND_BLOCK_START.len()..];
+    let block = match rest.find(AGEND_BLOCK_END) {
+        Some(end) => &rest[..end],
+        None => return DirIdentity::Corrupt,
+    };
+    for line in block.lines() {
+        if let Some(after) = line.trim_start().strip_prefix("- **Name**:") {
+            return match after
+                .trim()
+                .strip_prefix('`')
+                .and_then(|s| s.strip_suffix('`'))
+                .filter(|n| !n.is_empty())
+            {
+                Some(n) => DirIdentity::Owner(n.to_string()),
+                None => DirIdentity::Corrupt,
+            };
+        }
+    }
+    DirIdentity::Corrupt
+}
+
+/// Fail-closed identity read of a shared instructions file at `path`: a genuine
+/// `NotFound` is [`DirIdentity::Absent`] (adoptable); any OTHER I/O failure —
+/// permission denied, invalid UTF-8, a directory in place of the file — is
+/// [`DirIdentity::Unreadable`] (a conflict — we must not overwrite/delete a
+/// directory whose ownership we cannot verify). A readable file is parsed by
+/// [`agend_block_owner`].
+pub(crate) fn agents_md_identity(path: &Path) -> crate::paths::DirIdentity {
+    crate::paths::classify_identity_read(std::fs::read_to_string(path), agend_block_owner)
+}
+
+/// Parse owner identity from a non-shared instruction file (.claude/agend.md,
+/// .kiro/steering/agend.md). These are fully rewritten by agend, so the Name
+/// line appears directly in the content (no agend markers). A file with no
+/// Name line is adoptable (legacy or non-agend content).
+fn nonshared_instructions_owner(content: &str) -> crate::paths::DirIdentity {
+    use crate::paths::DirIdentity;
+    for line in content.lines() {
+        if let Some(after) = line.trim_start().strip_prefix("- **Name**:") {
+            return match after
+                .trim()
+                .strip_prefix('`')
+                .and_then(|s| s.strip_suffix('`'))
+                .filter(|n| !n.is_empty())
+            {
+                Some(n) => DirIdentity::Owner(n.to_string()),
+                None => DirIdentity::Corrupt,
+            };
+        }
+    }
+    DirIdentity::Absent
+}
+
+/// Fail-closed identity read of a non-shared instruction file.
+pub(crate) fn nonshared_instructions_identity(path: &Path) -> crate::paths::DirIdentity {
+    crate::paths::classify_identity_read(
+        std::fs::read_to_string(path),
+        nonshared_instructions_owner,
+    )
+}
+
 /// Merge an agend-owned block into a user-shared file, preserving all user
 /// content outside the `<!-- agend:start --> ... <!-- agend:end -->` markers.
 /// Creates the file if missing; replaces the existing block in place if present;
@@ -451,22 +528,43 @@ pub(crate) fn merge_agend_block(existing: &str, body: &str) -> String {
 /// Write agent instructions file to the backend-specific path.
 /// Shared files (AGENTS.md, GEMINI.md) use marker-merge; agend-owned files
 /// (.claude/agend.md, .kiro/steering/agend.md) are rewritten in full.
-fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&AgentContext>) {
+fn generate_agent_instructions(
+    working_dir: &Path,
+    command: &str,
+    ctx: Option<&AgentContext>,
+    owner: Option<&str>,
+) -> Result<(), String> {
     let backend = match crate::backend::Backend::from_command(command) {
         Some(b) => b,
-        None => return,
+        None => return Ok(()),
     };
     let preset = backend.preset();
     let instr_path = working_dir.join(preset.instructions_path);
 
     if let Some(parent) = instr_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("provision: create dir {} failed: {e}", parent.display()))?;
     }
 
     let home = crate::home_dir();
     let proto = crate::protocol::protocol_path(&home);
     let proto_str = proto.display().to_string();
     let body = build_instructions_body(ctx, Some(&proto_str));
+
+    // Preserve durable owner stamp even without full fleet context:
+    // write ONLY the Name identity line so the next provision sees
+    // Owner(name) not Corrupt. No team/peers/solo claims emitted.
+    let body = match (ctx, owner) {
+        (None, Some(name)) => {
+            let safe = sanitize_identifier(name);
+            body.replacen(
+                "## Communication",
+                &format!("## Identity\n\n- **Name**: `{safe}`\n\n## Communication"),
+                1,
+            )
+        }
+        _ => body,
+    };
 
     // Include fleet.yaml `instructions:` inside the managed block so
     // shared files (AGENTS.md) don't duplicate it on each refresh (#1405).
@@ -481,7 +579,35 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
     };
 
     let final_content = if preset.instructions_shared {
-        let existing = std::fs::read_to_string(&instr_path).unwrap_or_default();
+        // Fail-closed read: a genuine NotFound is an empty (adoptable) file, but
+        // any OTHER I/O error (permission denied, invalid UTF-8, a directory in
+        // place of the file) must NOT be collapsed to "empty" and overwritten.
+        let existing = match std::fs::read_to_string(&instr_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(format!(
+                    "provision: could not read {} to verify ownership: {e}",
+                    instr_path.display()
+                ));
+            }
+        };
+        // Workspace-identity guard (fail-closed, defense-in-depth under the
+        // provision lock held by generate_with_context — the PRIMARY gate is the
+        // preflight there). Never overwrite a block owned by a DIFFERENT instance.
+        if let Some(ctx) = ctx {
+            let candidate = sanitize_identifier(ctx.name);
+            if let Some(reason) = agend_block_owner(&existing).conflict_with(&candidate) {
+                tracing::error!(
+                    path = %instr_path.display(), %candidate, %reason,
+                    "provision refused: shared instructions file — bytes preserved"
+                );
+                return Err(format!(
+                    "workspace identity: {} {reason}, refusing to overwrite for '{candidate}'",
+                    instr_path.display()
+                ));
+            }
+        }
         // Strip any prior leaked copies of extra instructions outside the
         // agend markers before merging, so existing duplicates self-heal.
         let cleaned =
@@ -491,37 +617,130 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
         body
     };
 
-    let _ = std::fs::write(&instr_path, &final_content);
+    std::fs::write(&instr_path, &final_content)
+        .map_err(|e| format!("provision: write {} failed: {e}", instr_path.display()))?;
+    Ok(())
 }
 
-/// Generate MCP config + backend-specific files for the working directory.
-/// Generate MCP config + backend-specific files + agent instructions.
-pub fn generate(working_dir: &Path, command: &str) {
-    generate_with_context(working_dir, command, None);
+/// Generate MCP config + backend-specific files + agent instructions. Returns
+/// `Err` (so the caller ABORTS the spawn) when provisioning is refused — a
+/// workspace-identity conflict or an I/O failure — so an agent never starts
+/// against partially or foreign-provisioned state.
+pub fn generate(working_dir: &Path, command: &str) -> Result<(), String> {
+    generate_with_context(working_dir, command, None)
 }
 
-/// Generate with fleet context (name, role, peers).
-pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&AgentContext>) {
+/// Pre-spawn provision for callers that know the instance name but have no
+/// full fleet context (e.g. `spawn_and_subscribe` on managed restart,
+/// `connect::run`). Runs the identity preflight and passes the owner
+/// through to every artifact writer so r6's opaque-owner guard accepts
+/// same-owner restarts.
+pub fn generate_for_owner(working_dir: &Path, command: &str, owner: &str) -> Result<(), String> {
     let backend = crate::backend::Backend::from_command(command);
+    let home = crate::home_dir();
 
+    let _id_lock = crate::store::acquire_workspace_identity_lock(&home, working_dir)
+        .map_err(|e| format!("provision: could not acquire workspace-identity lock: {e}"))?;
+
+    workspace_provision_preflight(working_dir, backend.as_ref(), owner)?;
+
+    if backend.is_some() {
+        ensure_project_root(working_dir)?;
+    }
+    if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
+        migrate_claude_old_rules_file(working_dir)?;
+    }
+    crate::mcp_config::configure(working_dir, command, Some(owner))
+        .map_err(|e| format!("provision: MCP config: {e}"))?;
+    generate_agent_instructions(working_dir, command, None, Some(owner))?;
+    Ok(())
+}
+
+/// Generate with fleet context (name, role, peers). Fail-closed:
+/// 1. take the SINGLE workspace-identity lock for this directory, held across
+///    the preflight AND every write, so the check and the writes are atomic vs a
+///    concurrent provision/delete of the same directory;
+/// 2. PREFLIGHT the identity of every artifact we are about to write, BEFORE any
+///    filesystem/project-root mutation — refuse (`Err`) on a foreign/corrupt/
+///    unreadable owner, leaving the directory byte-for-byte untouched;
+/// 3. only then mutate: project-root scoping, MCP config, instructions — each
+///    propagating its own I/O error so nothing is silently discarded.
+pub fn generate_with_context(
+    working_dir: &Path,
+    command: &str,
+    ctx: Option<&AgentContext>,
+) -> Result<(), String> {
+    let backend = crate::backend::Backend::from_command(command);
+    let home = crate::home_dir();
+
+    // (1) One workspace-identity lock across preflight + writes. A lock-acquire
+    // failure is itself fail-closed — refuse rather than provision unguarded.
+    let _id_lock = crate::store::acquire_workspace_identity_lock(&home, working_dir)
+        .map_err(|e| format!("provision: could not acquire workspace-identity lock: {e}"))?;
+
+    // (2) Preflight BEFORE any mutation, so a refusal leaves the dir untouched.
+    if let Some(ctx) = ctx {
+        workspace_provision_preflight(working_dir, backend.as_ref(), ctx.name)?;
+    }
+
+    // (3) Mutations, under the lock, only after a clean preflight.
     // Scope Gemini/Codex project-root discovery to this dir so the hierarchical
     // GEMINI.md / AGENTS.md search doesn't walk up into the user's $HOME.
     if backend.is_some() {
-        ensure_project_root(working_dir);
+        ensure_project_root(working_dir)?;
     }
-
-    // Backend-specific setup (non-MCP).
-    // Codex trust-prompt handling is via CLI flag + dismiss_patterns — see
-    // `src/backend.rs`. We deliberately do not write to `~/.codex/config.toml`.
     if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
-        migrate_claude_old_rules_file(working_dir);
+        migrate_claude_old_rules_file(working_dir)?;
     }
+    crate::mcp_config::configure(working_dir, command, ctx.map(|c| c.name))
+        .map_err(|e| format!("provision: MCP config: {e}"))?;
+    generate_agent_instructions(working_dir, command, ctx, ctx.map(|c| c.name))?;
+    Ok(())
+}
 
-    // MCP config for all backends
-    crate::mcp_config::configure(working_dir, command, ctx.map(|c| c.name));
-
-    // Agent instructions (identity, role, communication guide)
-    generate_agent_instructions(working_dir, command, ctx);
+/// Refuse (`Err`) to provision `working_dir` for `name` when an artifact we would
+/// write already carries a DIFFERENT instance's identity (or is corrupt/
+/// unreadable). Read-only; runs under the workspace-identity lock BEFORE any
+/// mutation, so a refusal leaves the directory untouched. Covers the incident
+/// artifacts: the shared instructions file (AGENTS.md/GEMINI.md) and the
+/// codex/grok `AGEND_INSTANCE_NAME` config stamp.
+fn workspace_provision_preflight(
+    working_dir: &Path,
+    backend: Option<&crate::backend::Backend>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(backend) = backend else {
+        return Ok(());
+    };
+    let preset = backend.preset();
+    let path = working_dir.join(preset.instructions_path);
+    if preset.instructions_shared {
+        if let Some(reason) = agents_md_identity(&path).conflict_with(&sanitize_identifier(name)) {
+            tracing::error!(path = %path.display(), instance = %name, %reason,
+                "provision refused (preflight): shared instructions file — bytes untouched");
+            return Err(format!("workspace identity: {} {reason}", path.display()));
+        }
+    } else if let Some(reason) =
+        nonshared_instructions_identity(&path).conflict_with(&sanitize_identifier(name))
+    {
+        tracing::error!(path = %path.display(), instance = %name, %reason,
+            "provision refused (preflight): non-shared instructions file — bytes untouched");
+        return Err(format!("workspace identity: {} {reason}", path.display()));
+    }
+    let config = match backend {
+        crate::backend::Backend::Codex => Some(working_dir.join(".codex").join("config.toml")),
+        crate::backend::Backend::Grok => Some(working_dir.join(".grok").join("config.toml")),
+        _ => None,
+    };
+    if let Some(config) = config {
+        if let Some(reason) = crate::mcp_config::codex_config_identity(&config).conflict_with(name)
+        {
+            tracing::error!(path = %config.display(), instance = %name, %reason,
+                "provision refused (preflight): config.toml — bytes untouched");
+            return Err(format!("workspace identity: {} {reason}", config.display()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -543,10 +762,148 @@ mod tests {
         dir
     }
 
+    // --- workspace-identity provision guard (boundary 2, AGENTS.md) ---
+
+    fn codex_ctx(name: &str) -> AgentContext<'_> {
+        AgentContext {
+            name,
+            role: None,
+            fleet_peers: &[],
+            team: None,
+            extra_instructions: None,
+        }
+    }
+
+    #[test]
+    fn agents_md_identity_unreadable_on_invalid_utf8_but_notfound_is_absent() {
+        use crate::paths::DirIdentity;
+        let dir = tmp_dir("unreadable_id");
+        let path = dir.join("AGENTS.md");
+        std::fs::write(&path, [0xFFu8, 0xFE, 0x00]).unwrap(); // invalid UTF-8
+                                                              // An opaque read error is fail-closed Unreadable — NOT collapsed to Absent.
+        assert_eq!(agents_md_identity(&path), DirIdentity::Unreadable);
+        // A genuine NotFound stays Absent (adoptable).
+        assert_eq!(
+            agents_md_identity(&dir.join("missing.md")),
+            DirIdentity::Absent
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_agent_instructions_refuses_unreadable_agents_md_byte_preserving() {
+        let dir = tmp_dir("prov_unreadable");
+        let path = dir.join("AGENTS.md");
+        let bytes = [0xFFu8, 0xFE, 0x00];
+        std::fs::write(&path, bytes).unwrap();
+        // Provisioning must REFUSE an unreadable identity artifact (fail-closed),
+        // never collapse the read error to "empty" and overwrite it.
+        let res =
+            generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"));
+        assert!(
+            res.is_err(),
+            "unreadable AGENTS.md must refuse, not overwrite"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "bytes preserved untouched"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agend_block_owner_absent_owner_and_corrupt() {
+        use crate::paths::DirIdentity;
+        // No markers → unowned/legacy → adoptable.
+        assert_eq!(
+            agend_block_owner("# notes\nno agend markers here\n"),
+            DirIdentity::Absent
+        );
+        // Well-formed block → the recorded owner.
+        let file = merge_agend_block(
+            "",
+            &build_instructions_body(Some(&codex_ctx("alice")), None),
+        );
+        assert_eq!(
+            agend_block_owner(&file),
+            DirIdentity::Owner("alice".to_string())
+        );
+        // Markers present but no Name line → corrupt.
+        assert_eq!(
+            agend_block_owner("<!-- agend:start -->\njunk\n<!-- agend:end -->\n"),
+            DirIdentity::Corrupt
+        );
+        // Start marker with no end → corrupt (conservative).
+        assert_eq!(
+            agend_block_owner("<!-- agend:start -->\n- **Name**: `bob`\n"),
+            DirIdentity::Corrupt
+        );
+    }
+
+    #[test]
+    fn generate_agent_instructions_refuses_foreign_agents_md_byte_preserving() {
+        let dir = tmp_dir("prov_foreign");
+        // AGENTS.md owned by a DIFFERENT instance ("bob"), plus user content.
+        let block = merge_agend_block("", &build_instructions_body(Some(&codex_ctx("bob")), None));
+        let foreign = format!("# My project notes\n\n{block}\ntrailing user text\n");
+        let path = dir.join("AGENTS.md");
+        std::fs::write(&path, &foreign).unwrap();
+        // Provisioning as "alice" into bob's directory must REFUSE, bytes intact.
+        let res =
+            generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"));
+        assert!(res.is_err(), "foreign-owned AGENTS.md must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            foreign,
+            "foreign bytes must be preserved untouched"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_agent_instructions_refuses_corrupt_agents_md_byte_preserving() {
+        let dir = tmp_dir("prov_corrupt");
+        let path = dir.join("AGENTS.md");
+        let corrupt = "<!-- agend:start -->\ngarbage, no name line\n<!-- agend:end -->\n";
+        std::fs::write(&path, corrupt).unwrap();
+        let res =
+            generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"));
+        assert!(res.is_err(), "corrupt identity block must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupt,
+            "bytes preserved"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_agent_instructions_adopts_absent_and_refreshes_same_owner() {
+        use crate::paths::DirIdentity;
+        let dir = tmp_dir("prov_same");
+        let path = dir.join("AGENTS.md");
+        // Absent block → adopt (writes).
+        generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"))
+            .expect("adopt absent");
+        assert_eq!(
+            agend_block_owner(&std::fs::read_to_string(&path).unwrap()),
+            DirIdentity::Owner("alice".to_string())
+        );
+        // Same owner → refresh (Ok, still alice).
+        generate_agent_instructions(&dir, "codex", Some(&codex_ctx("alice")), Some("alice"))
+            .expect("refresh same");
+        assert_eq!(
+            agend_block_owner(&std::fs::read_to_string(&path).unwrap()),
+            DirIdentity::Owner("alice".to_string())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn generate_claude_writes_instructions_and_mcp_config() {
         let dir = tmp_dir("gen_claude");
-        generate(&dir, "claude");
+        generate(&dir, "claude").expect("provision");
         assert!(dir.join(".claude").join("agend.md").exists());
         assert!(dir.join("mcp-config.json").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -555,7 +912,7 @@ mod tests {
     #[test]
     fn generate_unknown_backend_no_crash() {
         let dir = tmp_dir("gen_unknown");
-        generate(&dir, "unknown-tool");
+        generate(&dir, "unknown-tool").expect("provision");
         assert!(std::fs::read_dir(&dir).unwrap().count() == 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -574,7 +931,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        generate_with_context(&dir, "claude", Some(&ctx));
+        generate_with_context(&dir, "claude", Some(&ctx)).expect("provision");
         let path = dir.join(".claude").join("agend.md");
         assert!(path.exists(), "missing agend.md at {}", path.display());
         let content = std::fs::read_to_string(&path).unwrap();
@@ -594,7 +951,7 @@ mod tests {
         let stale = dir.join(".claude").join("rules").join("agend.md");
         std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
         std::fs::write(&stale, "# old content from pre-migration agend").unwrap();
-        generate(&dir, "claude");
+        generate(&dir, "claude").expect("provision");
         assert!(
             !stale.exists(),
             "stale .claude/rules/agend.md was not removed"
@@ -612,7 +969,7 @@ mod tests {
         let user_rule = dir.join(".claude").join("rules").join("my-rule.md");
         std::fs::create_dir_all(user_rule.parent().unwrap()).unwrap();
         std::fs::write(&user_rule, "user-owned rule").unwrap();
-        generate(&dir, "claude");
+        generate(&dir, "claude").expect("provision");
         assert!(
             user_rule.exists(),
             "migration must not touch user's other .claude/rules/*.md files"
@@ -662,7 +1019,7 @@ mod tests {
         let dir = tmp_dir("gen_codex_preserve");
         let user_content = "# Existing project AGENTS\n\nImportant user rules.\n";
         std::fs::write(dir.join("AGENTS.md"), user_content).unwrap();
-        generate(&dir, "codex");
+        generate(&dir, "codex").expect("provision");
         let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             after.contains("Important user rules."),
@@ -677,9 +1034,9 @@ mod tests {
     fn generate_shared_file_is_idempotent_across_spawns() {
         let dir = tmp_dir("gen_shared_idempotent");
         std::fs::write(dir.join("AGENTS.md"), "# user head\n").unwrap();
-        generate(&dir, "codex");
+        generate(&dir, "codex").expect("provision");
         let once = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        generate(&dir, "codex");
+        generate(&dir, "codex").expect("provision");
         let twice = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         // Compare with protocol path lines stripped — the path is
         // home_dir()-derived and can vary across parallel tests.
@@ -700,7 +1057,7 @@ mod tests {
     #[test]
     fn ensure_project_root_inits_fresh_dir_with_gitignore() {
         let dir = tmp_dir("ensure_root_fresh");
-        ensure_project_root(&dir);
+        ensure_project_root(&dir).unwrap();
         assert!(dir.join(".git").exists(), "missing .git after init");
         let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(ignore.contains("mcp-config.json"));
@@ -717,7 +1074,7 @@ mod tests {
             .status();
         let inner = outer.join("subdir");
         std::fs::create_dir_all(&inner).unwrap();
-        ensure_project_root(&inner);
+        ensure_project_root(&inner).unwrap();
         assert!(
             !inner.join(".git").exists(),
             "should not create nested .git inside an existing repo"
@@ -734,7 +1091,7 @@ mod tests {
         let dir = tmp_dir("ensure_root_user_ignore");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".gitignore"), "my-custom-rule\n").unwrap();
-        ensure_project_root(&dir);
+        ensure_project_root(&dir).unwrap();
         let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert_eq!(
             ignore, "my-custom-rule\n",
@@ -748,7 +1105,7 @@ mod tests {
         // #1580: git-init on generate() is backend-agnostic — was pinned on
         // gemini; re-pointed to agy (gemini-cli's successor) after retirement.
         let dir = tmp_dir("gen_agy_stops_here");
-        generate(&dir, "agy");
+        generate(&dir, "agy").expect("provision");
         assert!(
             dir.join(".git").exists(),
             "working_dir should be a git repo after generate() for agy"
@@ -1065,7 +1422,7 @@ mod tests {
     #[test]
     fn generate_kiro_instructions_basic() {
         let dir = tmp_dir("gen_kiro_instr");
-        generate(&dir, "kiro-cli");
+        generate(&dir, "kiro-cli").expect("provision");
         let path = dir.join(".kiro").join("steering").join("agend.md");
         assert!(path.exists(), "missing kiro agend.md");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1175,7 +1532,7 @@ mod tests {
         for backend_cmd in ["claude", "kiro-cli", "codex"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
-            generate(&work, backend_cmd);
+            generate(&work, backend_cmd).expect("provision");
             let backend = crate::backend::Backend::from_command(backend_cmd).unwrap();
             let preset = backend.preset();
             let instr_path = work.join(preset.instructions_path);
@@ -1200,7 +1557,7 @@ mod tests {
         for backend_cmd in ["claude", "kiro-cli", "codex"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
-            generate(&work, backend_cmd);
+            generate(&work, backend_cmd).expect("provision");
             let backend = crate::backend::Backend::from_command(backend_cmd).unwrap();
             let preset = backend.preset();
             let instr_path = work.join(preset.instructions_path);
@@ -1235,7 +1592,7 @@ mod tests {
         for backend_cmd in ["claude", "kiro-cli", "codex", "opencode"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
-            generate(&work, backend_cmd);
+            generate(&work, backend_cmd).expect("provision");
             let backend = crate::backend::Backend::from_command(backend_cmd)
                 .unwrap_or_else(|| panic!("backend `{backend_cmd}` must resolve"));
             let preset = backend.preset();
@@ -1413,7 +1770,7 @@ mod tests {
             team: None,
             extra_instructions: Some(extra),
         };
-        generate_with_context(&dir, "claude", Some(&ctx));
+        generate_with_context(&dir, "claude", Some(&ctx)).expect("provision");
         let content =
             std::fs::read_to_string(dir.join(".kiro/steering/agend.md")).unwrap_or_default();
         // Claude uses .kiro/steering/agend.md — check if extra is appended
@@ -1445,7 +1802,7 @@ mod tests {
             team: None,
             extra_instructions: None, // No file → no append
         };
-        generate_with_context(&dir, "claude", Some(&ctx));
+        generate_with_context(&dir, "claude", Some(&ctx)).expect("provision");
         // Should not panic — just generates without extra.
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1463,5 +1820,174 @@ mod tests {
         );
         // Canonicalize would resolve the ./ but the join is correct.
         assert!(resolved.starts_with("/home/user/project"));
+    }
+
+    // --- r7 RED: managed caller identity-guard tests (task-46776) ---
+    //
+    // These tests assert the CORRECT (post-fix) behavior and FAIL at the
+    // r6 HEAD 1a1368b5 because generate_for_owner delegates to the
+    // contextless generate(), which either refuses same-owner restarts
+    // (r6 opaque-config guard) or skips the shared instructions check.
+
+    fn seed_agents_md(dir: &std::path::Path, owner: &str) {
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            format!(
+                "<!-- agend:start -->\n## Identity\n\n- **Name**: `{owner}`\n<!-- agend:end -->\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn r7_managed_same_owner_restart_succeeds() {
+        let dir = tmp_dir("r7-same-owner");
+        generate_with_context(&dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
+        generate_for_owner(&dir, "codex", "alpha")
+            .expect("same-owner managed restart must succeed — r6 contextless path refuses this");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r7_foreign_shared_instructions_refuses_preserves_bytes() {
+        let dir = tmp_dir("r7-foreign-agents");
+        seed_agents_md(&dir, "alpha");
+        let original = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        let result = generate_for_owner(&dir, "codex", "beta");
+        assert!(
+            result.is_err(),
+            "must refuse foreign AGENTS.md identity before spawn"
+        );
+        let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert_eq!(original, after, "AGENTS.md bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r7_foreign_config_refuses_preserves_bytes() {
+        let dir = tmp_dir("r7-foreign-config");
+        generate_with_context(&dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
+        let config_path = dir.join(".codex").join("config.toml");
+        let original = std::fs::read_to_string(&config_path).unwrap();
+        let result = generate_for_owner(&dir, "codex", "beta");
+        assert!(
+            result.is_err(),
+            "must refuse foreign config identity before spawn"
+        );
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(original, after, "config.toml bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r7_unmanaged_first_provision_succeeds() {
+        let dir = tmp_dir("r7-unmanaged");
+        generate(&dir, "codex").expect("unmanaged first provision must succeed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- r8 RED: false-solo + real-entry tests (task-46776) ---
+    //
+    // generate_for_owner at 69d3bf0d materializes AgentContext{peers:[],
+    // team:None} which build_instructions_body reads as "solo agent" and
+    // emits the SOLO-PROFILE paragraph. Managed pane pre-spawn and connect
+    // consume these false instructions before (or instead of) the fleet-
+    // aware rewrite. RED: both tests FAIL at 69d3bf0d.
+
+    #[test]
+    fn r8_managed_pre_spawn_bytes_no_false_solo() {
+        let dir = tmp_dir("r8-presawn-solo");
+        let peers = vec![
+            ("alpha".to_string(), Some("dev".to_string())),
+            ("beta".to_string(), Some("reviewer".to_string())),
+        ];
+        let team_ctx = TeamContext {
+            name: "core",
+            orchestrator: Some("beta"),
+            members: &["alpha".to_string(), "beta".to_string()],
+        };
+        let full_ctx = AgentContext {
+            name: "alpha",
+            role: Some("dev"),
+            fleet_peers: &peers,
+            team: Some(&team_ctx),
+            extra_instructions: None,
+        };
+        generate_with_context(&dir, "codex", Some(&full_ctx)).unwrap();
+        let after_boot = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            !after_boot.contains("SOLO-PROFILE"),
+            "full-context boot must not write solo paragraph"
+        );
+        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        let pre_spawn = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            !pre_spawn.contains("SOLO-PROFILE"),
+            "managed pre-spawn provision must not write false solo paragraph \
+             into shared instructions — the agent reads these before the \
+             post-spawn fleet-aware rewrite"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r8_connect_entry_no_false_solo() {
+        let dir = tmp_dir("r8-connect-solo");
+        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            !content.contains("SOLO-PROFILE"),
+            "connect entry must not write false solo paragraph — connect \
+             has no post-provision rewrite so false solo persists for the \
+             entire session"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- root review r8 RED: 4 deterministic failures (task-46776) ---
+
+    #[test]
+    fn root_review_r8_repeated_owner_only_provision_stays_restartable() {
+        let dir = tmp_dir("r9-repeat-owner");
+        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            content.contains("- **Name**: `alpha`"),
+            "owner-only provision must write durable owner stamp — got:\n{content}"
+        );
+        generate_for_owner(&dir, "codex", "alpha")
+            .expect("repeated same-owner provision must succeed (idempotent)");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn root_review_nonshared_backend_foreign_owner_is_not_overwritten() {
+        // Claude
+        let dir = tmp_dir("r9-nonshared-claude");
+        generate_with_context(&dir, "claude", Some(&codex_ctx("alpha"))).unwrap();
+        let claude_path = dir.join(".claude").join("agend.md");
+        let original = std::fs::read_to_string(&claude_path).unwrap();
+        let result = generate_for_owner(&dir, "claude", "beta");
+        assert!(
+            result.is_err(),
+            "Claude: must refuse foreign non-shared identity before provision"
+        );
+        let after = std::fs::read_to_string(&claude_path).unwrap();
+        assert_eq!(original, after, "Claude: bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Kiro
+        let dir = tmp_dir("r9-nonshared-kiro");
+        generate_with_context(&dir, "kiro-cli", Some(&codex_ctx("alpha"))).unwrap();
+        let kiro_path = dir.join(".kiro").join("steering").join("agend.md");
+        let original = std::fs::read_to_string(&kiro_path).unwrap();
+        let result = generate_for_owner(&dir, "kiro-cli", "beta");
+        assert!(
+            result.is_err(),
+            "Kiro: must refuse foreign non-shared identity before provision"
+        );
+        let after = std::fs::read_to_string(&kiro_path).unwrap();
+        assert_eq!(original, after, "Kiro: bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

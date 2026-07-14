@@ -186,7 +186,14 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     let mut spawned: Vec<(String, String)> = Vec::new();
     let size = crossterm::terminal::size().unwrap_or((120, 40));
     for (inst_name, backend, work_dir) in &planned {
-        super::prepare_instructions(ctx.home, inst_name, backend, work_dir, None);
+        // #46776 fail-closed: skip (do not spawn) a member whose provisioning is
+        // refused — a workspace-identity conflict or I/O failure — rather than
+        // fork it against foreign or half-written provisioned state.
+        if let Err(e) = super::prepare_instructions(ctx.home, inst_name, backend, work_dir, None) {
+            tracing::error!(agent = %inst_name, error = %e,
+                "team spawn: provisioning refused — skipping member");
+            continue;
+        }
         // #900: resolve the just-written fleet.yaml entry so any
         // operator-supplied `env:` (or `defaults.env`) reaches the
         // spawned process. The entry is in fleet.yaml at this point

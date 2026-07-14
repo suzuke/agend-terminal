@@ -116,7 +116,12 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
             team: None,
             extra_instructions: extra_instructions.as_deref(),
         };
-        crate::instructions::generate_with_context(dir, &resolved.backend_command, Some(&ctx));
+        if let Err(e) =
+            crate::instructions::generate_with_context(dir, &resolved.backend_command, Some(&ctx))
+        {
+            tracing::error!(instance = name, error = %e, "provisioning refused; skipping instance boot");
+            return None;
+        }
     }
 
     let mut args = resolved.args;
@@ -151,28 +156,38 @@ mod tests {
     #[test]
     fn resolve_routes_model_through_capability_chokepoint_2744() {
         let dir = tmp_dir("model-chokepoint-2744");
+        let d1 = dir.join("shell-seat");
+        let d2 = dir.join("wrapper-seat");
+        let d3 = dir.join("dedupe-seat");
+        let d4 = dir.join("delim-seat");
+        for d in [&d1, &d2, &d3, &d4] {
+            std::fs::create_dir_all(d).unwrap();
+        }
         let yaml = format!(
             "instances:\n\
              \x20\x20shell-seat:\n\
              \x20\x20\x20\x20backend: shell\n\
              \x20\x20\x20\x20model: legacy\n\
-             \x20\x20\x20\x20working_directory: {d}\n\
+             \x20\x20\x20\x20working_directory: {d1}\n\
              \x20\x20wrapper-seat:\n\
              \x20\x20\x20\x20backend: opencode\n\
              \x20\x20\x20\x20command: /opt/wrap/run-agent\n\
              \x20\x20\x20\x20model: opus\n\
-             \x20\x20\x20\x20working_directory: {d}\n\
+             \x20\x20\x20\x20working_directory: {d2}\n\
              \x20\x20dedupe-seat:\n\
              \x20\x20\x20\x20backend: claude\n\
              \x20\x20\x20\x20model: fleet-loser\n\
              \x20\x20\x20\x20args: [\"--model\", \"pinned\"]\n\
-             \x20\x20\x20\x20working_directory: {d}\n\
+             \x20\x20\x20\x20working_directory: {d3}\n\
              \x20\x20delim-seat:\n\
              \x20\x20\x20\x20backend: claude\n\
              \x20\x20\x20\x20model: fleet-model\n\
              \x20\x20\x20\x20args: [\"--\", \"payload\"]\n\
-             \x20\x20\x20\x20working_directory: {d}\n",
-            d = dir.display()
+             \x20\x20\x20\x20working_directory: {d4}\n",
+            d1 = d1.display(),
+            d2 = d2.display(),
+            d3 = d3.display(),
+            d4 = d4.display(),
         );
         let config: FleetConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         let defs = resolve(&config, &dir, &dir);

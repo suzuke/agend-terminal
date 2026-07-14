@@ -1710,6 +1710,24 @@ fn spawn_and_register_agent(
         );
         return Ok(());
     }
+
+    // #46776 fail-closed (root finding 5): whole-registry uniqueness admission at
+    // BOOT/spawn. A pre-existing duplicate fleet.yaml (legacy / hand-edited — the
+    // create path now prevents new ones) must not boot two instances into one
+    // workspace. If an EARLIER-sorting instance shares this instance's canonical
+    // workspace identity, THAT instance is the single deterministic owner that
+    // boots; skip this one with a loud audit rather than resurrect a split-brain.
+    let boot_wd = working_dir
+        .clone()
+        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(name));
+    if let Some(owner) = crate::fleet::duplicate_identity_owner_before(home, name, &boot_wd) {
+        tracing::error!(
+            agent = %name, %owner,
+            "skipping boot spawn — duplicate workspace identity; earlier instance owns it (fail-closed)"
+        );
+        return Ok(());
+    }
+
     configs.lock().insert(
         name.clone(),
         AgentConfig {

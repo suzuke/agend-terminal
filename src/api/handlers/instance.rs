@@ -287,6 +287,14 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         Ok(p) => p,
         Err(e) => return json!({"ok": false, "error": format!("{e}")}),
     };
+    if let Some(collider) =
+        crate::fleet::persist::workspace_identity_collision(ctx.home, name, &work_dir)
+    {
+        return json!({"ok": false, "error": format!(
+            "workspace identity collision: '{name}' would share the working directory with existing instance '{collider}' ({})",
+            work_dir.display()
+        )});
+    }
     let size = crossterm::terminal::size().unwrap_or((120, 40));
     let spawn_mode = match params["mode"].as_str() {
         Some("resume") => crate::backend::SpawnMode::Resume,
@@ -300,7 +308,13 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
+    // #46776 fail-closed: a workspace-identity refusal (or provisioning I/O
+    // failure) must ABORT the spawn — never fork an agent against foreign or
+    // half-written provisioned state.
+    if let Err(e) = super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role) {
+        tracing::error!(agent = %name, error = %e, "SPAWN aborted: provisioning refused");
+        return json!({"ok": false, "error": format!("provisioning refused: {e}")});
+    }
 
     // #900 hybrid (b)+(c): env precedence is params.env > fleet.yaml
     // resolved env > none. `params.env` lets the SPAWN caller pass an
