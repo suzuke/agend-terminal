@@ -25,7 +25,7 @@
 use std::path::Path;
 
 const BIN_NAME: &str = "agentic-git";
-const BIN_PATH: &str = "vendor/agentic-git/crates/agentic-git/src/main.rs";
+const BIN_PATH: &str = "src/bin/agentic-git.rs";
 
 /// The body of the `[[bin]]` table whose `name = "<BIN_NAME>"`, or `None` if no
 /// such target is declared. A `[[bin]]` table runs until the next top-level `[`.
@@ -83,6 +83,10 @@ fn agentic_git_bin_target_is_declared_with_windows_safe_test_false() {
          without this `cargo nextest` on Windows breaks. Those tests run in \
          agentic-git's own CI. Found block:\n{block}"
     );
+    assert!(
+        !BIN_PATH.starts_with("vendor/"),
+        "the parent Cargo target must never point beneath vendor"
+    );
 }
 
 /// Regression-proof (RED-first): the parser + guard MUST fire when the `[[bin]]`
@@ -106,8 +110,12 @@ fn checker_fires_on_missing_target_or_test_flag() {
     let block = agentic_git_bin_block(NO_TEST_FALSE)
         .expect("the [[bin]] block must be found even without test=false");
     assert!(
-        has_kv(&block, "path", &format!("\"{BIN_PATH}\"")),
-        "path guard must still recognize the vendored path"
+        has_kv(
+            &block,
+            "path",
+            "\"vendor/agentic-git/crates/agentic-git/src/main.rs\""
+        ),
+        "path guard must still recognize the legacy path in this negative fixture"
     );
     assert!(
         !has_kv(&block, "test", "false"),

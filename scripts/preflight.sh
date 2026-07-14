@@ -9,7 +9,7 @@
 #
 # Runs, in order — the fmt/clippy surface MATCHES CI's `check` job (task83/d-46):
 #   1. scripts/fmt-owned.sh --check   (owned *.rs, vendor/ excluded — CI's exact surface)
-#   2. cargo clippy <owned targets> --features tray -- -D warnings  (CI's exact targets)
+#   2. cargo clippy <owned targets + agentic-git wrapper> --features tray -- -D warnings  (CI's exact targets)
 #   3. cargo test --tests --features tray   (unit + integration + invariants)
 #      NOTE: CI runs these via `nextest`, not `cargo test` — the test SELECTION
 #      matches but the runner differs, and a floating stable toolchain is not
@@ -101,7 +101,7 @@ step() {
 step "fmt --check (owned surface)" \
     scripts/fmt-owned.sh --check
 step "clippy (owned targets --features tray -D warnings)" \
-    cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --tests --examples --features tray -- -D warnings
+    cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
 step "test (--tests --features tray: unit + integration + invariants)" \
     cargo test --tests --features tray
 

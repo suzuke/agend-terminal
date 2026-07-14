@@ -3,9 +3,8 @@
 # d-20260713150435301072-46).
 #
 # "Owned" = tracked *.rs EXCLUDING vendor/** — the vendored agentic-git submodule
-# round-trips to its OWN repo/CI and must never be reformatted to our style. Plain
-# `cargo fmt` walks that submodule's sources (the [[bin]] compiles them) and would
-# flag/rewrite upstream code; this git pathspec never does. Every fmt caller —
+# round-trips to its OWN repo/CI. The parent wrapper keeps plain `cargo fmt` scoped
+# to parent-owned sources; this pathspec remains the explicit boundary. Every fmt caller —
 # GitHub CI, GitLab CI, scripts/preflight.sh (and pre-push via preflight) — invokes
 # THIS one script, so the owned-source boundary is defined in exactly one place.
 #

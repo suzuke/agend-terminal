@@ -36,9 +36,9 @@ fmt:
 clippy:
   stage: lint
   script:
-    # task83: GitHub's explicit OWNED-target clippy (not `--all-targets`, which
-    # drags in the vendored agentic-git bin under our strict `-D warnings`).
-    - cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --tests --examples --features tray -- -D warnings
+    # Keep GitLab aligned with GitHub: the first-party agentic-git wrapper is
+    # part of the strict target set.
+    - cargo clippy --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
 
 test:
   stage: test
