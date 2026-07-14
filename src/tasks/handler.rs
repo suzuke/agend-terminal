@@ -1383,6 +1383,8 @@ fn handle_update(
         // each may self-IPC or take other locks — runs AFTER the flock drops,
         // #1629). The fingerprint match guarantees the `board` local still names the
         // appended board, so the cascade + read-back below use it safely.
+        #[cfg(test)]
+        super::fire_before_mutation_commit_hook_for_test();
         let checked = routed.with_revalidated_board(home, |board| {
             crate::task_events::append_batch_checked_at(board, &emitter, pending_events, |state| {
                 update_batch_precondition(
