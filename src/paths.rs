@@ -148,13 +148,17 @@ mod tests {
         let base = tmp("tail"); // exists
         let deep = base.join("a").join("b").join("c"); // a/b/c do not exist
         let id = workspace_identity(&deep);
-        let expected = format!(
-            "{}/a/b/c",
-            base.canonicalize()
-                .unwrap()
-                .to_string_lossy()
-                .to_lowercase()
-        );
+        // Build the expectation with the platform's OWN separator (`join`, the same
+        // way `workspace_identity` re-appends the remainder). A hardcoded "/a/b/c"
+        // only matches on Unix and fails on Windows, where the remainder is `\a\b\c`.
+        let expected = base
+            .canonicalize()
+            .unwrap()
+            .join("a")
+            .join("b")
+            .join("c")
+            .to_string_lossy()
+            .to_lowercase();
         assert_eq!(id, expected);
         std::fs::remove_dir_all(&base).ok();
     }
