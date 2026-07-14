@@ -122,7 +122,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         instance_name,
         source.replace(['/', '\\', ':'], "_").replace('~', "")
     ));
-    std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     // #2158 PR1: resolve + validate the source repo path fail-closed (absolute or
     // known agent name only; canonicalize; reject system dirs). Extracted to
     // `source_resolve` — keeps this oversized handler under the file_size ceiling
@@ -135,6 +134,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     if let Some(e) = validate_expected_head(args, &source_path, branch) {
         return e;
     }
+    let expected_ref = super::checkout_helpers::expected_creation_ref(args, &source_path, branch);
+    std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     // #780: auto-create branch from `from_ref` when bind:true + branch
     // missing locally. #781 Piece 6 extracts the decision tree into
     // `dispatch_hook::ensure_branch_exists` so the same logic services
@@ -153,11 +154,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         // "main" → "origin/main", byte-identical to the prior literal.
         let default_base = format!("origin/{}", crate::git_helpers::default_branch(src));
         let from_ref = args["from_ref"].as_str().unwrap_or(&default_base);
+        let creation_ref = expected_ref.as_deref().unwrap_or(from_ref);
         match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
             home,
             src,
             branch,
-            from_ref,
+            creation_ref,
             instance_name,
         ) {
             Ok((created, fetched)) => {
@@ -304,11 +306,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         path_lock,
                         auto_created_branch,
                         fetch_attempted,
+                        args["expected_head"].as_str(),
                     );
                     // #6: echo expected_head/actual_head on idempotent reuse —
                     // re-read the actual HEAD from the worktree rather than
                     // echoing the expected value (the worktree may have diverged).
                     if let Some(expected) = args["expected_head"].as_str() {
+                        if reuse_resp.get("error").is_some() {
+                            return reuse_resp;
+                        }
                         let wt_path = reuse_resp["path"].as_str().unwrap_or(&worktree_path_str);
                         let actual =
                             crate::git_helpers::git_cmd(Path::new(wt_path), &["rev-parse", "HEAD"])
@@ -564,6 +570,24 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     "submodules_ready",
                     branch,
                 );
+            }
+            if let Some(expected) = args["expected_head"].as_str() {
+                if let Some(err) = super::checkout_helpers::rollback_if_expected_head_drift(
+                    home,
+                    &mangled,
+                    &mut journal,
+                    txn_now,
+                    remove_worktree,
+                    Path::new(&source_path),
+                    branch,
+                    expected,
+                    Path::new(&worktree_path_str),
+                    true,
+                    auto_created_branch,
+                    "submodules_ready",
+                ) {
+                    return err;
+                }
             }
             let mut bound_fingerprint = None;
             if bind {

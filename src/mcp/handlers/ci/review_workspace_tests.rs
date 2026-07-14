@@ -78,6 +78,78 @@ fn get_sha(repo: &Path, refspec: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[cfg(unix)]
+fn commit_tree(repo: &Path, parent: &str, message: &str) -> String {
+    let tree = get_sha(repo, &format!("{parent}^{{tree}}"));
+    let out = std::process::Command::new("git")
+        .args(["commit-tree", &tree, "-p", parent])
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .arg("-m")
+        .arg(message)
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git commit-tree");
+    assert!(out.status.success(), "commit-tree failed: {:?}", out);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[cfg(unix)]
+fn advance_ref(repo: &Path, branch: &str, message: &str) -> String {
+    let parent = get_sha(repo, branch);
+    let next = commit_tree(repo, &parent, message);
+    let out = std::process::Command::new("git")
+        .args([
+            "update-ref",
+            &format!("refs/heads/{branch}"),
+            &next,
+            &parent,
+        ])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git update-ref");
+    assert!(out.status.success(), "update-ref failed: {:?}", out);
+    next
+}
+
+#[cfg(unix)]
+fn remove_origin(repo: &Path) {
+    let out = std::process::Command::new("git")
+        .args(["remote", "remove", "origin"])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git remote remove");
+    assert!(out.status.success(), "remote remove failed: {:?}", out);
+}
+
+#[cfg(unix)]
+fn seed_origin_view(repo: &Path, branch: &str, sha: &str) {
+    let out = std::process::Command::new("git")
+        .args(["update-ref", &format!("refs/remotes/origin/{branch}"), sha])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git update-ref remote view");
+    assert!(out.status.success(), "remote view seed failed: {:?}", out);
+}
+
+#[cfg(unix)]
+fn derived_worktree(home: &Path, instance: &str, source: &Path) -> std::path::PathBuf {
+    home.join("worktrees").join(format!(
+        "{instance}-{}",
+        source
+            .display()
+            .to_string()
+            .replace(['/', '\\', ':'], "_")
+            .replace('~', "")
+    ))
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // 1. checkout expected_head — fresh branch, match
 // ══════════════════════════════════════════════════════════════════════
@@ -607,6 +679,159 @@ fn checkout_expected_head_absent_target_no_branch_created() {
     assert!(
         !branch_check.status.success(),
         "branch must NOT be created on expected_head mismatch"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 13. expected_head drift after precheck — fresh provision rolls back
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_drift_after_precheck_rolls_back_fresh() {
+    let home = tmp_home("eh-drift-fresh");
+    let parent = tmp_home("eh-drift-fresh-src");
+    let source = setup_source_repo(&parent, "feat/eh-drift-fresh");
+    remove_origin(&source);
+    let expected = get_sha(&source, "feat/eh-drift-fresh");
+    let source_for_hook = source.clone();
+    let _hook = super::checkout_helpers::install_expected_head_validation_hook(move || {
+        advance_ref(
+            &source_for_hook,
+            "feat/eh-drift-fresh",
+            "drift after precheck",
+        );
+    });
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/eh-drift-fresh",
+            "bind": true,
+            "expected_head": &expected,
+        }),
+        "eh-agent-drift-fresh",
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("expected_head_drift"),
+        "post-precheck branch movement must refuse: {resp}"
+    );
+    assert_eq!(resp["expected_head"].as_str(), Some(expected.as_str()));
+    assert_ne!(resp["actual_head"].as_str(), Some(expected.as_str()));
+    assert!(
+        crate::binding::read(&home, "eh-agent-drift-fresh").is_none(),
+        "drift refusal must not bind"
+    );
+    assert!(
+        !derived_worktree(&home, "eh-agent-drift-fresh", &source).exists(),
+        "drift refusal must roll back the fresh worktree"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 14. expected_head drift after precheck — absent branch pins creation
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_absent_branch_pins_movable_from_ref() {
+    let home = tmp_home("eh-drift-absent");
+    let parent = tmp_home("eh-drift-absent-src");
+    let source = setup_source_repo(&parent, "feat/eh-drift-base");
+    remove_origin(&source);
+    let expected = get_sha(&source, "main");
+    seed_origin_view(&source, "main", &expected);
+    let source_for_hook = source.clone();
+    let _hook = super::checkout_helpers::install_expected_head_validation_hook(move || {
+        advance_ref(&source_for_hook, "main", "movable from_ref after precheck");
+    });
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/eh-drift-absent",
+            "bind": true,
+            "from_ref": "main",
+            "expected_head": &expected,
+        }),
+        "eh-agent-drift-absent",
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "pinned creation should succeed from the expected commit: {resp}"
+    );
+    assert_eq!(resp["actual_head"].as_str(), Some(expected.as_str()));
+    assert_eq!(get_sha(&source, "feat/eh-drift-absent"), expected);
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 15. reuse refuses a bound worktree whose HEAD is not expected
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_reuse_worktree_mismatch_refuses_without_sync() {
+    let home = tmp_home("eh-reuse-drift");
+    let parent = tmp_home("eh-reuse-drift-src");
+    let source = setup_source_repo(&parent, "feat/eh-reuse-drift");
+    remove_origin(&source);
+    let expected = get_sha(&source, "feat/eh-reuse-drift");
+    let first = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/eh-reuse-drift",
+            "bind": true,
+            "expected_head": &expected,
+        }),
+        "eh-agent-reuse-drift",
+    );
+    assert!(
+        first.get("error").is_none(),
+        "initial checkout failed: {first}"
+    );
+    let wt = std::path::PathBuf::from(first["path"].as_str().expect("worktree path"));
+    let next = commit_tree(&source, &expected, "detached worktree drift");
+    let out = std::process::Command::new("git")
+        .args(["checkout", "--detach", &next])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("detach worktree");
+    assert!(out.status.success(), "detach failed: {:?}", out);
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/eh-reuse-drift",
+            "bind": true,
+            "expected_head": &expected,
+        }),
+        "eh-agent-reuse-drift",
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("expected_head_drift"),
+        "reuse must refuse a mismatched bound worktree: {resp}"
+    );
+    assert_eq!(resp["actual_head"].as_str(), Some(next.as_str()));
+    assert_eq!(
+        get_sha(&wt, "HEAD"),
+        next,
+        "refusal must not sync the worktree"
     );
 
     std::fs::remove_dir_all(&home).ok();
