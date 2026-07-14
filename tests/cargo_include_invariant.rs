@@ -378,9 +378,7 @@ fn mock_invariant_fires_when_build_provenance_removed_from_include() {
     let globs = compile_globs(&mock_patterns);
     let violations = scan_production_violations(&globs);
     assert!(
-        violations
-            .iter()
-            .any(|v| v.contains("build/provenance.rs")),
+        violations.iter().any(|v| v.contains("build/provenance.rs")),
         "mock-mutate dropping `build/provenance.rs` must surface the \
          build.rs include!() path — cargo-package publish-blocker repro. \
          Got violations:\n{}",
