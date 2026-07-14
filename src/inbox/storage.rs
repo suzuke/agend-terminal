@@ -884,6 +884,12 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                         // superseded obligations are retired (marked read) but never
                         // returned — unchanged from the pre-#1940 behavior. Covers an
                         // in-flight `delivering` row too (a newer message obsoleted it).
+                        if msg.delivering_at.is_some() {
+                            if let Some(identity) = protected_settlement_identity(&msg, name) {
+                                settlement_intents.push(identity);
+                            }
+                            msg.delivering_at = None;
+                        }
                         msg.read_at = Some(now.clone());
                         changed = true;
                         all_messages.push(msg);
