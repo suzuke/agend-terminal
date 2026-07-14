@@ -1201,6 +1201,50 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // --- root review r10 RED: 2 deterministic failures (task-46776 r11) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn root_review_r10_opaque_fleet_metadata_must_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tmp_home("r11-opaque-meta");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let fleet_path = super::fleet_yaml_path(&home);
+        assert!(
+            fleet_path.symlink_metadata().is_err(),
+            "precondition: metadata must be inaccessible"
+        );
+
+        let result = remove_instance_from_yaml(&home, "alpha");
+
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "mutate_fleet_yaml must fail closed when fleet.yaml metadata is \
+             opaque (PermissionDenied), not silently return Ok — the fast \
+             path treats all symlink_metadata errors as 'absent'"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn root_review_r10_absent_fleet_removal_must_acquire_lock() {
+        let home = tmp_home("r11-lock-absent");
+        let lock_path = home.join(".fleet.yaml.lock");
+        assert!(!lock_path.exists(), "precondition: no lock file");
+
+        remove_instance_from_yaml(&home, "alpha").unwrap();
+
+        assert!(
+            lock_path.exists(),
+            "the fleet lock must be acquired even when fleet.yaml is absent \
+             and default_content is empty — the absence decision must be \
+             made under the lock for atomicity. The current fast path \
+             bypasses acquire_lock entirely."
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]
