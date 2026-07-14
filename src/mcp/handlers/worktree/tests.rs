@@ -1302,7 +1302,10 @@ fn r5_stale_known_rebase_consumes_outer_lifecycle_permit() {
         &sender_for("agent"),
     );
     assert_eq!(response["bound"].as_bool(), Some(true), "{response}");
-    assert!(target.exists(), "stale known repair must re-provision target");
+    assert!(
+        target.exists(),
+        "stale known repair must re-provision target"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -1321,7 +1324,10 @@ fn r5_stale_absent_rebase_consumes_outer_lifecycle_permit() {
         &sender_for("agent"),
     );
     assert_eq!(response["bound"].as_bool(), Some(true), "{response}");
-    assert!(target.exists(), "stale absent repair must re-provision target");
+    assert!(
+        target.exists(),
+        "stale absent repair must re-provision target"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -1384,8 +1390,15 @@ fn r5_release_first_owns_lifecycle_until_rebase_entry() {
     *done.lock().unwrap() = true;
     done_cv.notify_one();
     let release_response = release.join().unwrap();
-    assert_eq!(release_response["released"].as_bool(), Some(true), "{release_response}");
-    assert!(!target.exists(), "release owns and completes its transaction");
+    assert_eq!(
+        release_response["released"].as_bool(),
+        Some(true),
+        "{release_response}"
+    );
+    assert!(
+        !target.exists(),
+        "release owns and completes its transaction"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -1426,20 +1439,133 @@ fn r5_full_delete_conflicts_with_live_rebase_permit() {
         entered = cv.wait(entered).unwrap();
     }
     drop(entered);
-    let delete = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
-        &home, "agent",
-    );
+    let delete =
+        crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(&home, "agent");
     assert!(
-        delete
-            .as_ref()
-            .is_err_and(|error| {
-                error.contains("lifecycle transaction") || error.contains("bind/rebase in flight")
-            }),
+        delete.as_ref().is_err_and(|error| {
+            error.contains("lifecycle transaction") || error.contains("bind/rebase in flight")
+        }),
         "delete must refuse while rebase owns permit: {delete:?}"
     );
     resume.wait();
     let bind_response = bind.join().unwrap();
-    assert_eq!(bind_response["bound"].as_bool(), Some(true), "{bind_response}");
+    assert_eq!(
+        bind_response["bound"].as_bool(),
+        Some(true),
+        "{bind_response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_reverse_reconcile_conflicts_with_live_bind_entry() {
+    let home = tmp_home("r5-reverse-conflict");
+    let repo = home.join("reverse-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    rebase_git(&repo, &["init", "-q", "-b", "main"]);
+    rebase_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    let workspace = crate::paths::workspace_dir(&home).join("agent");
+    std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+    rebase_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/r5-reverse",
+            workspace.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        workspace.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=agent\nbranch=feature/r5-reverse\n",
+    )
+    .unwrap();
+    crate::binding::bind_full(
+        &home,
+        "agent",
+        "",
+        "feature/r5-reverse",
+        &workspace,
+        &repo,
+        false,
+    )
+    .unwrap();
+    let guard = crate::mcp::handlers::dispatch_hook::acquire_bind_guard(&home, "agent")
+        .expect("bind permit");
+    let result = crate::worktree_pool::reverse_reconcile(&home, "agent");
+    assert!(
+        result.as_ref().is_err_and(|error| {
+            error.contains("lifecycle") || error.contains("bind/rebase in flight")
+        }),
+        "reverse reconcile must refuse while bind owns lifecycle permit: {result:?}"
+    );
+    drop(guard);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_force_reclaim_conflicts_with_live_bind_entry() {
+    let home = tmp_home("r5-force-reclaim-conflict");
+    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-reclaim");
+    let candidate = crate::worktree_pool::GcCandidate {
+        path: target.clone(),
+        agent: "agent".to_string(),
+        reason: "r5 lifecycle conflict".to_string(),
+        kind: crate::worktree_pool::GcKind::ForceReclaim,
+    };
+    let guard = crate::mcp::handlers::dispatch_hook::acquire_bind_guard(&home, "agent")
+        .expect("bind permit");
+    let outcome = crate::daemon::retention::worktrees::maybe_remove_candidate(&home, &candidate);
+    assert!(
+        matches!(
+            outcome,
+            crate::daemon::retention::worktrees::RemovalOutcome::Skipped { .. }
+        ),
+        "force reclaim must refuse while bind owns lifecycle permit: {outcome:?}"
+    );
+    assert!(target.exists(), "live worktree must remain in place");
+    drop(guard);
+    let _ = repo;
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn r5_orphan_reconcile_conflicts_with_live_bind_entry() {
+    let home = tmp_home("r5-orphan-conflict");
+    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-orphan");
+    let binding_path = crate::paths::binding_path(&home, "agent");
+    let mut binding: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding_path).unwrap()).unwrap();
+    binding["issued_at"] = serde_json::json!("2020-01-01T00:00:00Z");
+    std::fs::write(&binding_path, binding.to_string()).unwrap();
+    let guard = crate::mcp::handlers::dispatch_hook::acquire_bind_guard(&home, "agent")
+        .expect("bind permit");
+    crate::binding::reconcile_orphans(&home);
+    assert!(
+        binding_path.exists(),
+        "startup orphan reconciliation must not clear authority while bind is active"
+    );
+    assert!(
+        target.exists(),
+        "orphan reconciliation must not remove worktree"
+    );
+    drop(guard);
+    let _ = repo;
     std::fs::remove_dir_all(&home).ok();
 }
 
