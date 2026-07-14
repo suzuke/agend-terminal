@@ -22,7 +22,8 @@ pub mod storage;
 
 // Types
 pub use message::{
-    BroadcastContext, ForceMeta, InboxMessage, MessageStatus, NotifySource, ReplyTargetContext,
+    BroadcastContext, CiHandoffClass, ForceMeta, InboxMessage, MessageStatus, NotifySource,
+    ReplyTargetContext,
 };
 
 // Disk health

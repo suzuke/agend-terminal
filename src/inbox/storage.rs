@@ -272,6 +272,72 @@ fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> an
     Ok(f(&path))
 }
 
+/// Exact row state used by the CI-handoff crash reconciler. Missing and
+/// ambiguous evidence are distinct from a processed row and both fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedHandoffRowState {
+    Missing,
+    Pending,
+    Processed,
+    Ambiguous,
+}
+
+/// Probe one target inbox under its flock for exactly one protected ci-ready
+/// row carrying the requested correlation + episode. The lock is released
+/// before the caller attempts to delete the separate handoff track.
+pub(crate) fn protected_handoff_row_state(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+) -> ProtectedHandoffRowState {
+    let Ok(state) = with_inbox_lock(home, target, |path| {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return ProtectedHandoffRowState::Missing;
+        };
+        let mut matches = 0usize;
+        let mut processed = false;
+        for msg in parse_inbox_messages(&content) {
+            if msg.kind.as_deref() != Some("ci-ready-for-action")
+                || msg.correlation_id.as_deref() != Some(correlation)
+                || msg.ci_handoff_episode.as_deref() != Some(episode)
+                || msg.ci_handoff_class != Some(super::message::CiHandoffClass::Protected)
+            {
+                continue;
+            }
+            matches += 1;
+            processed = msg.read_at.is_some() && msg.delivering_at.is_none();
+        }
+        match (matches, processed) {
+            (0, _) => ProtectedHandoffRowState::Missing,
+            (1, true) => ProtectedHandoffRowState::Processed,
+            (1, false) => ProtectedHandoffRowState::Pending,
+            (_, _) => ProtectedHandoffRowState::Ambiguous,
+        }
+    }) else {
+        return ProtectedHandoffRowState::Missing;
+    };
+    state
+}
+
+/// Return the exact protected CI-handoff identity carried by a row. Settlement
+/// callers invoke the resolver only after their inbox lock is released.
+fn protected_settlement_identity(
+    msg: &InboxMessage,
+    target: &str,
+) -> Option<(String, String, String)> {
+    if msg.kind.as_deref() != Some("ci-ready-for-action")
+        || msg.ci_handoff_class != Some(super::message::CiHandoffClass::Protected)
+    {
+        return None;
+    }
+    Some((
+        target.to_string(),
+        msg.correlation_id.clone()?,
+        msg.ci_handoff_episode.clone()?,
+    ))
+}
+
 /// Parse an inbox JSONL body into successfully-deserialized [`InboxMessage`]s,
 /// skipping blank / unparseable / forward-schema rows. The READ-ONLY counterpart
 /// to the read-modify-write rewriters (`drain` / `sweep_expired` / `clear_compact`
@@ -783,153 +849,160 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     }
 
     // Phase 1 (locked): run a byte-capped drain.
-    // Returns (messages_to_return, newly_delivered_subset).
-    let (to_return, newly_delivered_msgs) = match with_inbox_lock(home, name, |path| {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return (Vec::new(), Vec::new()),
-        };
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut all_messages: Vec<InboxMessage> = Vec::new();
-        // CR-2026-06-14: forward-schema rows we can't parse but must NOT delete
-        // on rewrite — preserved as raw lines and re-emitted verbatim.
-        let mut preserved_forward: Vec<String> = Vec::new();
-        let mut batch: Vec<InboxMessage> = Vec::new(); // returned this drain
-        let mut newly_delivered: Vec<InboxMessage> = Vec::new(); // #2299: just delivered (now `delivering`)
-        let mut budget_used = 0usize;
-        let mut budget_closed = false; // (d): once closed, remaining stay unread
-        let mut changed = false;
-
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            // AUDIT3-005: parse-or-preserve — a forward-schema row (newer daemon) AND
-            // an unparseable line (torn enqueue / corruption) are preserved verbatim
-            // (re-emitted below), never silently dropped on the rewrite.
-            let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
-                continue;
+    // Returns (messages_to_return, newly_delivered_subset, settlement intents).
+    let (to_return, newly_delivered_msgs, settlement_intents) =
+        match with_inbox_lock(home, name, |path| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return (Vec::new(), Vec::new(), Vec::new()),
             };
-            if msg.read_at.is_none() {
-                if msg.superseded_by.is_some() {
-                    // superseded obligations are retired (marked read) but never
-                    // returned — unchanged from the pre-#1940 behavior. Covers an
-                    // in-flight `delivering` row too (a newer message obsoleted it).
-                    msg.read_at = Some(now.clone());
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut all_messages: Vec<InboxMessage> = Vec::new();
+            // CR-2026-06-14: forward-schema rows we can't parse but must NOT delete
+            // on rewrite — preserved as raw lines and re-emitted verbatim.
+            let mut preserved_forward: Vec<String> = Vec::new();
+            let mut batch: Vec<InboxMessage> = Vec::new(); // returned this drain
+            let mut newly_delivered: Vec<InboxMessage> = Vec::new(); // #2299: just delivered (now `delivering`)
+            let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
+            let mut budget_used = 0usize;
+            let mut budget_closed = false; // (d): once closed, remaining stay unread
+            let mut changed = false;
+
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // AUDIT3-005: parse-or-preserve — a forward-schema row (newer daemon) AND
+                // an unparseable line (torn enqueue / corruption) are preserved verbatim
+                // (re-emitted below), never silently dropped on the rewrite.
+                let Some(mut msg) = parse_or_preserve_line(line, &mut preserved_forward) else {
+                    continue;
+                };
+                if msg.read_at.is_none() {
+                    if msg.superseded_by.is_some() {
+                        // superseded obligations are retired (marked read) but never
+                        // returned — unchanged from the pre-#1940 behavior. Covers an
+                        // in-flight `delivering` row too (a newer message obsoleted it).
+                        msg.read_at = Some(now.clone());
+                        changed = true;
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    if msg.delivering_at.is_some() {
+                        // #2299 (A) implicit ack: a PRIOR `delivering` batch the agent
+                        // already received. Its re-drain confirms consumption → mark
+                        // PROCESSED (read_at), never return again (no double-deliver).
+                        // A turn that died instead never reaches here; the reclaim-TTL
+                        // sweep resets it to unread for re-delivery.
+                        if let Some(identity) = protected_settlement_identity(&msg, name) {
+                            settlement_intents.push(identity);
+                        }
+                        msg.read_at = Some(now.clone());
+                        msg.delivering_at = None;
+                        changed = true;
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    if budget_closed {
+                        // (d): budget already hit — leave this (and the rest) UNREAD.
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    let sz = serde_json::to_string(&msg)
+                        .map(|s| s.len())
+                        .unwrap_or(line.len());
+                    // Always take ≥1 message (progress); otherwise only while the
+                    // running batch stays under budget. A message is never split.
+                    if !batch.is_empty() && budget_used + sz > DRAIN_BATCH_BUDGET_BYTES {
+                        budget_closed = true;
+                        all_messages.push(msg);
+                        continue;
+                    }
+                    budget_used += sz;
+                    if auto_ack_on_drain_kind(&msg) {
+                        // Fire-and-forget notifications have no blocked sender and no
+                        // required reply. Return them to the agent once, but settle them
+                        // immediately so daemon restarts cannot resurrect completed
+                        // PR/CI/status chatter through the delivering reclaim path.
+                        msg.read_at = Some(now.clone());
+                    } else {
+                        // #2299: unread → DELIVERING (not processed). read_at stays None
+                        // until the agent acks (explicit `inbox ack` / implicit next-drain)
+                        // or the reclaim-TTL resets it. A turn dying after this drain leaves
+                        // the row `delivering` → reclaimed → re-delivered (no silent loss).
+                        msg.delivering_at = Some(now.clone());
+                    }
                     changed = true;
+                    // #1888: a `ci-ready-for-action` handoff just transitioned to
+                    // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
+                    // this trace PROVED the read-state coupling; Phase-2 the watchdog
+                    // scans the `ci_handoff_track` sidecar instead, so this no longer
+                    // blinds anything — the trace stays as the delivery-vs-resolution
+                    // timeline marker. Unchanged in effect.
+                    if msg.kind.as_deref() == Some("ci-ready-for-action") {
+                        let age_at_read_secs = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+                            .ok()
+                            .map(|t| {
+                                chrono::Utc::now()
+                                    .signed_duration_since(t.with_timezone(&chrono::Utc))
+                                    .num_seconds()
+                            })
+                            .unwrap_or(-1);
+                        // info!-level so it lands in the production daemon.log (default
+                        // filter is `agend_terminal=info`); rare — only a
+                        // ci-ready-for-action message transitioning to delivering on a drain.
+                        tracing::info!(
+                            tag = "#1888-ciready-read",
+                            agent = %name,
+                            correlation = msg.correlation_id.as_deref().unwrap_or("<none>"),
+                            age_at_read_secs,
+                            "ci-ready-for-action handoff marked delivering on drain"
+                        );
+                    }
+                    batch.push(msg.clone());
+                    newly_delivered.push(msg.clone());
                     all_messages.push(msg);
-                    continue;
-                }
-                if msg.delivering_at.is_some() {
-                    // #2299 (A) implicit ack: a PRIOR `delivering` batch the agent
-                    // already received. Its re-drain confirms consumption → mark
-                    // PROCESSED (read_at), never return again (no double-deliver).
-                    // A turn that died instead never reaches here; the reclaim-TTL
-                    // sweep resets it to unread for re-delivery.
-                    msg.read_at = Some(now.clone());
-                    changed = true;
-                    all_messages.push(msg);
-                    continue;
-                }
-                if budget_closed {
-                    // (d): budget already hit — leave this (and the rest) UNREAD.
-                    all_messages.push(msg);
-                    continue;
-                }
-                let sz = serde_json::to_string(&msg)
-                    .map(|s| s.len())
-                    .unwrap_or(line.len());
-                // Always take ≥1 message (progress); otherwise only while the
-                // running batch stays under budget. A message is never split.
-                if !batch.is_empty() && budget_used + sz > DRAIN_BATCH_BUDGET_BYTES {
-                    budget_closed = true;
-                    all_messages.push(msg);
-                    continue;
-                }
-                budget_used += sz;
-                if auto_ack_on_drain_kind(&msg) {
-                    // Fire-and-forget notifications have no blocked sender and no
-                    // required reply. Return them to the agent once, but settle them
-                    // immediately so daemon restarts cannot resurrect completed
-                    // PR/CI/status chatter through the delivering reclaim path.
-                    msg.read_at = Some(now.clone());
                 } else {
-                    // #2299: unread → DELIVERING (not processed). read_at stays None
-                    // until the agent acks (explicit `inbox ack` / implicit next-drain)
-                    // or the reclaim-TTL resets it. A turn dying after this drain leaves
-                    // the row `delivering` → reclaimed → re-delivered (no silent loss).
-                    msg.delivering_at = Some(now.clone());
+                    all_messages.push(msg);
                 }
-                changed = true;
-                // #1888: a `ci-ready-for-action` handoff just transitioned to
-                // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
-                // this trace PROVED the read-state coupling; Phase-2 the watchdog
-                // scans the `ci_handoff_track` sidecar instead, so this no longer
-                // blinds anything — the trace stays as the delivery-vs-resolution
-                // timeline marker. Unchanged in effect.
-                if msg.kind.as_deref() == Some("ci-ready-for-action") {
-                    let age_at_read_secs = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-                        .ok()
-                        .map(|t| {
-                            chrono::Utc::now()
-                                .signed_duration_since(t.with_timezone(&chrono::Utc))
-                                .num_seconds()
-                        })
-                        .unwrap_or(-1);
-                    // info!-level so it lands in the production daemon.log (default
-                    // filter is `agend_terminal=info`); rare — only a
-                    // ci-ready-for-action message transitioning to delivering on a drain.
-                    tracing::info!(
-                        tag = "#1888-ciready-read",
-                        agent = %name,
-                        correlation = msg.correlation_id.as_deref().unwrap_or("<none>"),
-                        age_at_read_secs,
-                        "ci-ready-for-action handoff marked delivering on drain"
-                    );
-                }
-                batch.push(msg.clone());
-                newly_delivered.push(msg.clone());
-                all_messages.push(msg);
-            } else {
-                all_messages.push(msg);
             }
-        }
 
-        if changed {
-            let write_tmp = path.with_extension("jsonl.tmp");
-            let result = (|| -> anyhow::Result<()> {
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&write_tmp)?;
-                for m in &all_messages {
-                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+            if changed {
+                let write_tmp = path.with_extension("jsonl.tmp");
+                let result = (|| -> anyhow::Result<()> {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&write_tmp)?;
+                    for m in &all_messages {
+                        writeln!(f, "{}", serde_json::to_string(m)?)?;
+                    }
+                    // CR-2026-06-14: re-emit preserved forward-schema rows verbatim so
+                    // a downgrade never destroys a message a newer daemon wrote.
+                    for raw in &preserved_forward {
+                        writeln!(f, "{raw}")?;
+                    }
+                    f.sync_all()?;
+                    std::fs::rename(&write_tmp, path)?;
+                    crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "inbox drain write-back failed");
+                    settlement_intents.clear();
                 }
-                // CR-2026-06-14: re-emit preserved forward-schema rows verbatim so
-                // a downgrade never destroys a message a newer daemon wrote.
-                for raw in &preserved_forward {
-                    writeln!(f, "{raw}")?;
-                }
-                f.sync_all()?;
-                std::fs::rename(&write_tmp, path)?;
-                crate::store::fsync_parent_dir(path); // AUDIT2-015: durable rename
-                Ok(())
-            })();
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "inbox drain write-back failed");
             }
-        }
 
-        (batch, newly_delivered)
-    }) {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!(error = %e, "inbox drain lock failed");
-            return Vec::new();
-        }
-    };
+            (batch, newly_delivered, settlement_intents)
+        }) {
+            Ok(triple) => triple,
+            Err(e) => {
+                tracing::warn!(error = %e, "inbox drain lock failed");
+                return Vec::new();
+            }
+        };
 
     // Phase 2 (unlocked): side effects only for messages newly read THIS drain
     // (empty on a snapshot re-serve — those already ran on the original drain).
@@ -937,6 +1010,16 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         if let Some(ref id) = msg.id {
             crate::daemon::notification_dedup::global().mark_consumed(name, id);
         }
+    }
+
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "ack_protected",
+        );
     }
 
     if let Some(channel_msg) = newly_delivered_msgs
@@ -1010,15 +1093,16 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
     if !path.exists() {
         return 0;
     }
-    with_inbox_lock(home, name, |path| {
+    let (acked, settlement_intents) = with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return 0,
+            Err(_) => return (0, Vec::new()),
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut acked = 0usize;
+        let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         let mut changed = false;
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -1031,7 +1115,11 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             // Only an in-flight `delivering` row is ackable. Match on id when given.
             let is_target = msg_id.is_none_or(|id| msg.id.as_deref() == Some(id));
             if is_target && msg.read_at.is_none() && msg.delivering_at.is_some() {
+                if let Some(identity) = protected_settlement_identity(&msg, name) {
+                    settlement_intents.push(identity);
+                }
                 msg.read_at = Some(now.clone());
+                msg.delivering_at = None;
                 acked += 1;
                 changed = true;
             }
@@ -1058,15 +1146,25 @@ pub fn ack(home: &Path, name: &str, msg_id: Option<&str>) -> usize {
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox ack write-back failed");
-                return 0;
+                return (0, Vec::new());
             }
         }
-        acked
+        (acked, settlement_intents)
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox ack lock failed");
-        0
-    })
+        (0, Vec::new())
+    });
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "ack_protected",
+        );
+    }
+    acked
 }
 
 /// #2622 PR-2: settle the single row `msg_id` to `read` regardless of its
@@ -1081,15 +1179,16 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
     if !path.exists() {
         return false;
     }
-    with_inbox_lock(home, name, |path| {
+    let (settled, settlement_intents) = with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(_) => return (false, Vec::new()),
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut settled = false;
+        let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -1099,6 +1198,12 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
                 continue;
             };
             if msg.id.as_deref() == Some(msg_id) && msg.read_at.is_none() {
+                if msg.delivering_at.is_some() {
+                    if let Some(identity) = protected_settlement_identity(&msg, name) {
+                        settlement_intents.push(identity);
+                    }
+                    msg.delivering_at = None;
+                }
                 msg.read_at = Some(now.clone());
                 settled = true;
             }
@@ -1125,15 +1230,25 @@ pub fn settle_read_by_id(home: &Path, name: &str, msg_id: &str) -> bool {
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox settle_read_by_id write-back failed");
-                return false;
+                return (false, Vec::new());
             }
         }
-        settled
+        (settled, settlement_intents)
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox settle_read_by_id lock failed");
-        false
-    })
+        (false, Vec::new())
+    });
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "discharge",
+        );
+    }
+    settled
 }
 
 /// Session-reset settle: stamp `read_at` on ALL `delivering` rows for `name`,
@@ -1182,15 +1297,16 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
     if !path.exists() {
         return 0;
     }
-    with_inbox_lock(home, name, |path| {
+    let (acked, settlement_intents) = with_inbox_lock(home, name, |path| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return 0,
+            Err(_) => return (0, Vec::new()),
         };
         let now = chrono::Utc::now().to_rfc3339();
         let mut all: Vec<InboxMessage> = Vec::new();
         let mut preserved_forward: Vec<String> = Vec::new();
         let mut acked = 0usize;
+        let mut settlement_intents: Vec<(String, String, String)> = Vec::new();
         let mut changed = false;
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -1206,7 +1322,11 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
                 .as_deref()
                 .is_some_and(|tid| tid == correlation_id);
             if task_matches && msg.read_at.is_none() && msg.delivering_at.is_some() {
+                if let Some(identity) = protected_settlement_identity(&msg, name) {
+                    settlement_intents.push(identity);
+                }
                 msg.read_at = Some(now.clone());
+                msg.delivering_at = None;
                 acked += 1;
                 changed = true;
             }
@@ -1233,7 +1353,7 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
             })();
             if let Err(e) = r {
                 tracing::warn!(error = %e, "inbox ack_by_correlation write-back failed");
-                return 0;
+                return (0, Vec::new());
             }
         }
         if acked > 0 {
@@ -1244,12 +1364,22 @@ pub fn ack_by_correlation(home: &Path, name: &str, correlation_id: &str) -> usiz
                 "send+ack_inbox: settled delivering rows by correlation_id"
             );
         }
-        acked
+        (acked, settlement_intents)
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "inbox ack_by_correlation lock failed");
-        0
-    })
+        (0, Vec::new())
+    });
+    for (target, correlation, episode) in settlement_intents {
+        crate::daemon::ci_handoff_track::resolve_protected_episode(
+            home,
+            &target,
+            &correlation,
+            &episode,
+            "ack_protected",
+        );
+    }
+    acked
 }
 
 /// One bounded line in a [`ClearCompactResult`] — a COMPACT projection of an

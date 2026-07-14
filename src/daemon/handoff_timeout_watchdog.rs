@@ -140,6 +140,10 @@ pub(crate) fn scan_and_emit_with<F, G>(
     // #1888 phase-2: backstop sweep BEFORE the scan — an expired track must
     // neither re-nudge nor escalate this tick.
     let _ = crate::daemon::ci_handoff_track::sweep_expired(home, now);
+    // Crash recovery: a process may have persisted the ci-ready row and then
+    // died before the explicit ACK resolver ran. Reconcile only exact,
+    // processed protected rows after the bounded grace period.
+    let _ = crate::daemon::ci_handoff_track::reconcile_processed(home, now);
     let tracks = crate::daemon::ci_handoff_track::list(home);
     // #1598-mirror: collect every (target, correlation) key still backed by a
     // pending TRACK this tick, so the trailing `retain` can reap
