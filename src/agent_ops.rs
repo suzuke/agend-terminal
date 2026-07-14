@@ -694,6 +694,14 @@ pub(crate) fn working_dir_ownership_conflict(working_dir: &Path, name: &str) -> 
     {
         return Some(format!(".grok/config.toml {reason}"));
     }
+    for artifact in &[".claude/agend.md", ".kiro/steering/agend.md"] {
+        let path = working_dir.join(artifact);
+        if let Some(reason) = crate::instructions::nonshared_instructions_identity(&path)
+            .conflict_with(&crate::instructions::sanitize_identifier(name))
+        {
+            return Some(format!("{artifact} {reason}"));
+        }
+    }
     None
 }
 

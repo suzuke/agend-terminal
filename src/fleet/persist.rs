@@ -26,9 +26,20 @@ pub(crate) fn mutate_fleet_yaml(
         return Ok(());
     }
     let _lock = acquire_lock(home)?;
+    let link_entry_exists = fleet_path.symlink_metadata().is_ok();
     let content = match std::fs::read_to_string(&fleet_path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_content.to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !link_entry_exists => {
+            default_content.to_string()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::anyhow!(
+                "fleet.yaml at {}: dangling symlink — filesystem evidence exists \
+                 but target is missing, refusing to overwrite with defaults",
+                fleet_path.display()
+            ))
+            .context("opaque I/O — refusing to default");
+        }
         Err(e) => {
             return Err(anyhow::anyhow!("fleet.yaml read: {e}"))
                 .context("opaque I/O — refusing to default")
@@ -123,13 +134,17 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
 /// Excludes `candidate_name` itself (a same-name merge/update is not a duplicate). Read-only
 /// over the parsed fleet mapping; the caller holds the fleet lock, so this is atomic w.r.t.
 /// concurrent admissions.
+fn expand_tilde(path: &Path) -> std::path::PathBuf {
+    super::resolve::expand_tilde_path(&path.to_string_lossy())
+}
+
 fn find_workspace_identity_collision(
     home: &Path,
     instances: &serde_yaml_ng::Mapping,
     candidate_name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    let candidate_id = crate::paths::workspace_identity(candidate_wd);
+    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
     for (k, v) in instances {
         let Some(existing_name) = k.as_str() else {
             continue;
@@ -139,7 +154,7 @@ fn find_workspace_identity_collision(
         }
         let explicit = v.get("working_directory").and_then(|x| x.as_str());
         let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
-        if crate::paths::workspace_identity(&existing_wd) == candidate_id {
+        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id {
             return Some(existing_name.to_string());
         }
     }
@@ -1106,7 +1121,10 @@ mod tests {
             fleet_path.symlink_metadata().is_ok(),
             "symlink entry must exist"
         );
-        assert!(!fleet_path.exists(), "symlink target must NOT exist (dangling)");
+        assert!(
+            !fleet_path.exists(),
+            "symlink target must NOT exist (dangling)"
+        );
 
         let err = add_instance_to_yaml(&home, "alpha", &InstanceYamlEntry::default())
             .expect_err("dangling fleet.yaml symlink must be refused as opaque evidence");
