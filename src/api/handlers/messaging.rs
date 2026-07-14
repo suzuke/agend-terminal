@@ -673,15 +673,10 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = check_quota_gate(ctx.registry, ctx.home, params, vs.target) {
         return e;
     }
-    let auto_task_id =
-        match auto_create_task_if_needed(params, ctx.home, vs.from, vs.target, vs.text) {
-            Ok(id) => id,
-            Err(e) => return e,
-        };
-    let mut msg = build_message(params, ctx.home, &vs, &auto_task_id);
-    // A2: pre-stamp the SAME server-owned id that storage will persist. The
-    // authoritative validator derives receipt/source identities from it; the
-    // caller never supplies an exact-once key.
+    // Build message with auto_task_id=None so all rejection-capable preflights
+    // run before any side effects. The task is created only after authorize_report
+    // and check_worktree_enforcement pass.
+    let mut msg = build_message(params, ctx.home, &vs, &None);
     let server_message_id = crate::inbox::stamp_message_id(&mut msg);
     let report_auth = match crate::review_receipt::authorize_report(
         ctx.home,
@@ -700,12 +695,19 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     msg.report_purpose = report_auth.purpose;
     msg.validated_code_review = report_auth.receipt;
     if let Some(receipt) = msg.validated_code_review.as_ref() {
-        // Exact server-derived assignment head; top-level reviewed_head remains
-        // a display field and is never read for authorization.
         msg.reviewed_head = Some(receipt.summary().reviewed_head.clone());
     }
     if let Err(e) = check_worktree_enforcement(params, ctx.home, vs.target) {
         return e;
+    }
+    // All preflights passed — now create the auto-task (side effect).
+    let auto_task_id =
+        match auto_create_task_if_needed(params, ctx.home, vs.from, vs.target, vs.text) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+    if let Some(ref tid) = auto_task_id {
+        msg.task_id = Some(tid.clone());
     }
     // #bughunt2: a failed enqueue (disk read-only / I/O) must surface as a real
     // failure — never report ok:true for a silently-dropped message. Return
