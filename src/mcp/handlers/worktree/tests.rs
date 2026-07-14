@@ -440,6 +440,151 @@ fn s2_force_racing_new_generation_preserves_new_binding_and_target() {
 }
 
 #[test]
+fn s2_rebase_live_opaque_binding_refuses_without_overwrite() {
+    let home = tmp_home("s2-rebase-opaque-live");
+    let source = home.join("repo-rebase-opaque");
+    let target = seed_binding_target(&home, "agent", "feature/rebase-opaque", &source);
+    crate::binding::unbind(&home, "agent");
+    write_raw_binding(&home, "agent", "{ definitely not json");
+    let result = handle_bind_self(
+        &home,
+        &json!({
+            "branch":"feature/rebase-opaque",
+            "repository_path":source,
+            "rebase_mode":true
+        }),
+        &crate::identity::Sender::new("agent"),
+    );
+    assert_eq!(
+        result["code"].as_str(),
+        Some("rebind_repair_blocked"),
+        "{result}"
+    );
+    assert!(target.exists(), "opaque live target must be preserved");
+    assert_eq!(
+        std::fs::read_to_string(crate::paths::binding_path(&home, "agent")).unwrap(),
+        "{ definitely not json"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_force_absent_metadata_race_refuses_new_binding() {
+    let home = tmp_home("s2-absent-metadata-race");
+    let source = home.join("repo-absent-race");
+    std::fs::create_dir_all(&source).unwrap();
+    let replacement = serde_json::json!({
+        "version": 1,
+        "agent":"agent",
+        "task_id":"new",
+        "branch":"feature/absent-race",
+        "worktree":home.join("worktrees/agent/feature/absent-race").display().to_string(),
+        "source_repo":source.display().to_string(),
+        "issued_at":"2099-01-01T00:00:00Z"
+    });
+    let hook_home = home.clone();
+    let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+        if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+            write_raw_binding(
+                &hook_home,
+                "agent",
+                &serde_json::to_string(&replacement).unwrap(),
+            );
+        }
+    });
+    let result = handle_release_worktree(
+        &home,
+        &json!({
+            "instance":"agent",
+            "branch":"feature/absent-race",
+            "repository_path":source,
+            "force":true
+        }),
+        &None,
+    );
+    assert!(
+        result["error"].is_string(),
+        "new bind must win absent race: {result}"
+    );
+    assert!(crate::binding::read(&home, "agent").is_some());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_force_absent_marker_branch_drift_refuses() {
+    let home = tmp_home("s2-absent-marker-branch-drift");
+    let source = home.join("repo-marker-drift");
+    std::fs::create_dir_all(&source).unwrap();
+    let target = home.join("worktrees/agent/feature/marker-drift");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=agent\nbranch=feature/marker-drift\nsource_repo={}\n",
+            source.display()
+        ),
+    )
+    .unwrap();
+    let hook_target = target.clone();
+    let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+        if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+            std::fs::write(
+                hook_target.join(crate::worktree_pool::MANAGED_MARKER),
+                "agent=agent\nbranch=feature/drifted\nsource_repo=/wrong\n",
+            )
+            .unwrap();
+        }
+    });
+    let result = handle_release_worktree(
+        &home,
+        &json!({
+            "instance":"agent",
+            "branch":"feature/marker-drift",
+            "repository_path":source,
+            "force":true
+        }),
+        &None,
+    );
+    assert!(
+        result["error"].is_string(),
+        "marker drift must refuse: {result}"
+    );
+    assert!(target.exists(), "marker drift must preserve target");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn s2_force_opaque_target_metadata_refuses() {
+    let home = tmp_home("s2-opaque-target");
+    let source = home.join("repo-opaque-target");
+    std::fs::create_dir_all(&source).unwrap();
+    let target = home.join("worktrees/agent/feature/opaque-target");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("missing-target", &target).unwrap();
+    let result = handle_release_worktree(
+        &home,
+        &json!({
+            "instance":"agent",
+            "branch":"feature/opaque-target",
+            "repository_path":source,
+            "force":true
+        }),
+        &None,
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("opaque target"),
+        "typed opaque target refusal: {result}"
+    );
+    assert!(
+        target.symlink_metadata().is_ok(),
+        "opaque target must be preserved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn s2_legacy_soft_release_has_no_production_entry_point() {
     let source = include_str!("../../../worktree_pool.rs");
     assert!(
