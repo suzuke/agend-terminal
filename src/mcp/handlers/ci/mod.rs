@@ -152,3 +152,8 @@ mod checkout_submodule_tests;
 #[path = "review_workspace_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_workspace_tests;
+
+#[cfg(test)]
+#[path = "watch_status_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod watch_status_tests;
