@@ -22,29 +22,33 @@ pub(crate) fn mutate_fleet_yaml(
     mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<bool>,
 ) -> Result<()> {
     let fleet_path = fleet_yaml_path(home);
-    if default_content.is_empty() && !fleet_path.exists() && fleet_path.symlink_metadata().is_err()
-    {
-        return Ok(());
-    }
     let _lock = acquire_lock(home)?;
-    let link_entry_exists = fleet_path.symlink_metadata().is_ok();
-    let content = match std::fs::read_to_string(&fleet_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !link_entry_exists => {
+    let content = match fleet_path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if default_content.is_empty() {
+                return Ok(());
+            }
             default_content.to_string()
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "fleet.yaml at {}: dangling symlink — filesystem evidence exists \
-                 but target is missing, refusing to overwrite with defaults",
-                fleet_path.display()
-            ))
-            .context("opaque I/O — refusing to default");
-        }
         Err(e) => {
-            return Err(anyhow::anyhow!("fleet.yaml read: {e}"))
-                .context("opaque I/O — refusing to default")
+            return Err(anyhow::anyhow!("fleet.yaml metadata: {e}"))
+                .context("opaque I/O — refusing to default");
         }
+        Ok(_) => match std::fs::read_to_string(&fleet_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow::anyhow!(
+                    "fleet.yaml at {}: dangling symlink — filesystem evidence exists \
+                     but target is missing, refusing to overwrite with defaults",
+                    fleet_path.display()
+                ))
+                .context("opaque I/O — refusing to default");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("fleet.yaml read: {e}"))
+                    .context("opaque I/O — refusing to default")
+            }
+        },
     };
     let mut doc: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&content).context("Failed to parse fleet.yaml")?;
