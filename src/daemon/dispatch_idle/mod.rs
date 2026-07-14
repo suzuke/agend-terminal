@@ -719,43 +719,6 @@ pub(crate) fn mark_resolved(home: &Path, correlation_id: &str) -> Option<String>
     first_deleted
 }
 
-/// #t-127: resolve the single OPEN dispatch sidecar TARGETING `reporter` to its
-/// review-task id (the sidecar's `t-…` `correlation_id`). Bridges a reviewer
-/// VERDICT report — keyed on `repo@branch`, NOT the task id — back to the review
-/// task + its sidecar, which are both `t-…`-keyed (so `mark_resolved(repo@branch)`
-/// and the `corr.starts_with("t-")` auto-close gate both miss them).
-///
-/// EXACTLY-ONE fail-safe: returns `None` if 0 or >1 candidates, so a reporter
-/// with concurrent reviews never mis-closes the WRONG task (mis-closing another's
-/// task is worse than leaving a ghost). The #1866 clear-on-handoff retire keeps
-/// this ≤1 open per (dispatcher, target) in the common case, so the single-match
-/// path is the norm. Only `Pending`/`Exceeded` sidecars with a `t-` correlation
-/// count.
-pub(crate) fn open_review_dispatch_for_reporter(home: &Path, reporter: &str) -> Option<String> {
-    if reporter.is_empty() {
-        return None;
-    }
-    let mut candidates: Vec<String> = list_pending(home)
-        .into_iter()
-        .filter(|d| {
-            d.target == reporter
-                && matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
-                && d.correlation_id
-                    .as_deref()
-                    .map(|c| c.starts_with("t-"))
-                    .unwrap_or(false)
-        })
-        .filter_map(|d| d.correlation_id)
-        .collect();
-    candidates.sort();
-    candidates.dedup();
-    if candidates.len() == 1 {
-        candidates.pop()
-    } else {
-        None
-    }
-}
-
 /// #1047: reset the timer on a pending sidecar when the dispatchee sends
 /// a non-report message (kind=update/query) with matching correlation_id.
 /// The sidecar stays live (future silence still fires), but the threshold

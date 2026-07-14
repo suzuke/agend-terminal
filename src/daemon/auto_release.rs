@@ -494,30 +494,17 @@ pub(crate) fn strip_report_wrapper(text: &str) -> &str {
 /// The three terminal review verdicts. A reviewer's report opens with exactly
 /// one of these (§3.12 / #1666 §3.3). True iff `text` (the message body, with or
 /// without the `[report_result] ` wrapper) begins with one of them.
+#[cfg(test)]
 pub(crate) fn is_terminal_verdict_text(text: &str) -> bool {
     let t = strip_report_wrapper(text);
     t.starts_with("VERIFIED") || t.starts_with("REJECTED") || t.starts_with("UNVERIFIED")
 }
 
-/// Predicate helper used by the `handle_send` hook to decide whether the
-/// message represents an actionable terminal verdict that should enqueue a
-/// release intent. Pulled out so the unit test can assert the matching
-/// contract without spinning up the full handler stack.
-///
-/// #2010 2a: widened from `VERIFIED`-only to ALL THREE terminal verdicts. A
-/// REJECTED / UNVERIFIED reviewer holds the same kind of worktree binding (from
-/// a worktree-align inspection) and must be able to release it the same way once
-/// their review task is terminal — pre-fix the non-VERIFIED cases never even
-/// enqueued an intent, so `releasable_by_invariant`'s open-PR gate held the
-/// reviewer's binding to PR-terminal (the lease-conflict the lead re-dispatch
-/// then hit). The `reviewed_head` gate is kept: we only ever release a binding
-/// tied to an actually-reviewed head (UNVERIFIED that couldn't run/cite carries
-/// no head and never worktree-aligned, so there is no binding to leak).
+/// Code-review release authority is a server-validated receipt, never visible
+/// text, reviewed_head, a name, or a correlation string. `process_verdicts`
+/// calls this only after PR-state ingestion accepted the receipt exactly once.
 pub(crate) fn is_verdict_message(msg: &crate::inbox::InboxMessage) -> bool {
-    msg.kind.as_deref() == Some("report")
-        && is_terminal_verdict_text(&msg.text)
-        && msg.reviewed_head.is_some()
-        && msg.correlation_id.is_some()
+    msg.kind.as_deref() == Some("report") && msg.validated_code_review.is_some()
 }
 
 pub(crate) struct AutoReleaseTracker {
@@ -1032,19 +1019,22 @@ mod tests {
         }
     }
 
-    /// VERIFIED report with reviewed_head + correlation_id matches.
+    /// A report carrying the server-validated receipt matches; visible text is
+    /// irrelevant to release authority after validation.
     #[test]
     fn verdict_send_pattern_matches_canonical_verdict() {
         let mut msg = canonical_verdict_message();
         assert!(is_verdict_message(&msg), "canonical verdict must match");
-        // Surrounding whitespace tolerated via trim_start.
+        // A later display-text rewrite cannot revoke the typed authority.
         msg.text = "   VERIFIED — all green".into();
-        assert!(is_verdict_message(&msg), "leading whitespace tolerated");
+        assert!(
+            is_verdict_message(&msg),
+            "visible text is display-only here"
+        );
     }
 
-    /// #2010 2a: REJECTED and UNVERIFIED reports (with reviewed_head +
-    /// correlation) NOW match — the gate was widened from VERIFIED-only so the
-    /// non-VERIFIED reviewer's binding also gets a release intent.
+    /// All visible verdict spellings remain release-eligible only because the
+    /// same validated receipt is present, not because their words are parsed.
     #[test]
     fn all_terminal_verdicts_match_2010() {
         let base = canonical_verdict_message();
@@ -1083,15 +1073,17 @@ mod tests {
         assert!(!is_terminal_verdict_text("just a plain message"));
     }
 
-    /// Non-verdict text, non-report kinds, or missing reviewed_head /
-    /// correlation_id still skip detection — the widening (2010 2a) only added
-    /// the two extra verdict WORDS, not a relaxation of the other gates.
+    /// Only kind=report plus a validated receipt selects release. Prose,
+    /// reviewed_head, and correlation_id do not participate.
     #[test]
     fn non_verdict_kinds_skip_detection() {
         let base = canonical_verdict_message();
         let mut m = base.clone();
         m.text = "looks good to me, merging".into();
-        assert!(!is_verdict_message(&m), "non-verdict prose must not match");
+        assert!(
+            is_verdict_message(&m),
+            "receipt, not prose, is authoritative"
+        );
         m = base.clone();
         m.kind = Some("task".into());
         assert!(!is_verdict_message(&m), "kind=task must not match");
@@ -1102,15 +1094,20 @@ mod tests {
         m.text = "REJECTED — r1 needed".into();
         m.reviewed_head = None;
         assert!(
-            !is_verdict_message(&m),
-            "missing reviewed_head must not match even for a terminal verdict"
+            is_verdict_message(&m),
+            "top-level reviewed_head is display-only"
         );
         m = base.clone();
         m.text = "UNVERIFIED — re-run CI".into();
         m.correlation_id = None;
         assert!(
+            is_verdict_message(&m),
+            "receipt carries the exact task; correlation is routing/display only"
+        );
+        m.validated_code_review = None;
+        assert!(
             !is_verdict_message(&m),
-            "missing correlation_id must not match"
+            "missing validated receipt must not match"
         );
     }
 
@@ -1562,7 +1559,7 @@ mod tests {
     }
 
     fn canonical_verdict_message() -> crate::inbox::InboxMessage {
-        crate::inbox::InboxMessage {
+        let mut msg = crate::inbox::InboxMessage {
             id: Some("m-verdict-1".into()),
             task_id: Some("t-x".into()),
             correlation_id: Some("t-x".into()),
@@ -1572,7 +1569,28 @@ mod tests {
             kind: Some("report".into()),
             timestamp: "2026-05-17T00:00:00Z".into(),
             ..Default::default()
-        }
+        };
+        msg.report_purpose = crate::review_receipt::ReportPurpose::CodeReview;
+        msg.validated_code_review =
+            Some(crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+                crate::review_receipt::ReviewReceiptSummary {
+                    receipt_id: "review-receipt:m-verdict-1".into(),
+                    source_id: "m-verdict-1".into(),
+                    evidence_digest: "a".repeat(64),
+                    assignment_id: uuid::Uuid::new_v4(),
+                    reviewer_instance_id: crate::types::InstanceId::new(),
+                    reviewer_name: "reviewer-1".into(),
+                    repo: "owner/repo".into(),
+                    pr_number: 1,
+                    branch: "feat/x".into(),
+                    task_id: "t-x".into(),
+                    reviewed_head: "deadbeef".into(),
+                    review_class: crate::daemon::pr_state::ReviewClass::Single,
+                    slot: crate::review_receipt::ReviewSlot::Primary,
+                    verdict: crate::review_receipt::ReviewVerdict::Verified,
+                },
+            ));
+        msg
     }
 
     // ── t-worktree-leak (PR-1): release-invariant tests ──

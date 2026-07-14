@@ -4,12 +4,37 @@ use super::super::gh_poll::tests::MockGhPoller;
 use super::super::gh_poll::{GhPrMetadata, GhPrState};
 use super::super::{
     freshness_gate, load, new_for_branch, save, CiState, FreshnessGate, MergeState, ReviewClass,
-    VerdictState,
 };
 use super::scan_and_emit_with;
 
 fn empty_registry() -> crate::agent::AgentRegistry {
     std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn add_typed_receipt(
+    state: &mut super::super::PrState,
+    verdict: crate::review_receipt::ReviewVerdict,
+) {
+    let source_id = format!("scanner-test-source-{}", uuid::Uuid::new_v4());
+    super::super::apply_receipt_to_state(
+        state,
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: format!("review-receipt:{source_id}"),
+            source_id,
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "r".into(),
+            repo: state.repo.clone(),
+            pr_number: state.pr_number,
+            branch: state.branch.clone(),
+            task_id: "t-scanner-review".into(),
+            reviewed_head: state.head_sha.clone(),
+            review_class: state.review_class,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict,
+        },
+    );
 }
 
 /// #2749 test helper: an otherwise fully MergeReady PR (CI green + VERIFIED
@@ -22,10 +47,7 @@ fn merge_ready_state(repo: &str, branch: &str, head: &str, pr: u64) -> super::su
         sha: head.into(),
         observed_at: chrono::Utc::now().to_rfc3339(),
     };
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("r".into(), head.into())],
-    };
-    s.merge_state = MergeState::MergeReady;
+    add_typed_receipt(&mut s, crate::review_receipt::ReviewVerdict::Verified);
     s
 }
 
@@ -86,11 +108,7 @@ fn scan_evicts_ci_handoff_track_for_rejected_pr() {
 
     let mut s = new_for_branch("o/r", "b", "abcdef0", ReviewClass::Single);
     s.pr_number = 42;
-    s.verdict_state = VerdictState::Rejected {
-        reviewer: "r".into(),
-        reviewed_head: "abcdef0".into(),
-        reason: None,
-    };
+    add_typed_receipt(&mut s, crate::review_receipt::ReviewVerdict::Rejected);
     save(&home, &s).unwrap();
     crate::daemon::ci_handoff_track::record(
         &home,
@@ -124,11 +142,7 @@ fn scan_keeps_ci_handoff_track_for_verified_pr() {
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
 
-    let mut s = new_for_branch("o/r", "b", "abcdef1", ReviewClass::Single);
-    s.pr_number = 43;
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("r".into(), "abcdef1".into())],
-    };
+    let s = merge_ready_state("o/r", "b", "abcdef1", 43);
     save(&home, &s).unwrap();
     crate::daemon::ci_handoff_track::record(
         &home,
@@ -284,17 +298,8 @@ fn merge_ready_without_freshness_tuple_suppresses_pr_ready() {
     std::fs::create_dir_all(&home).unwrap();
 
     let head = "abcdef0";
-    let mut s = new_for_branch("o/r", "b", head, ReviewClass::Single);
-    s.pr_number = 77;
-    // Drive is_merge_ready → MergeReady: CI green at head + VERIFIED at head.
-    s.ci_state = CiState::Green {
-        sha: head.into(),
-        observed_at: chrono::Utc::now().to_rfc3339(),
-    };
-    s.verdict_state = VerdictState::Verified {
-        reviewers: vec![("r".into(), head.into())],
-    };
-    s.merge_state = MergeState::MergeReady;
+    // Drive is_merge_ready → MergeReady with a server-validated receipt.
+    let s = merge_ready_state("o/r", "b", head, 77);
     // Freshness tuple left UNKNOWN (all None) — the fail-closed case.
     assert!(
         s.freshness_checked_head_sha.is_none()

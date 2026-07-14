@@ -92,6 +92,18 @@ pub struct InboxMessage {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_head: Option<String>,
+    /// task66: typed report purpose. Missing durable rows deserialize only as
+    /// LegacyUntyped, which is ordinary task-report data with zero code-review
+    /// authority.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::review_receipt::ReportPurpose::is_legacy"
+    )]
+    pub report_purpose: crate::review_receipt::ReportPurpose,
+    /// Constructed only by the authoritative API sink after validating the
+    /// active assignment. API-down fallback and caller JSON never populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_code_review: Option<crate::review_receipt::ValidatedCodeReviewReceipt>,
     /// Inbound media attachments (additive). Channel adapters download media
     /// to a local path before enqueue. Empty for text-only messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -155,6 +167,10 @@ pub struct InboxMessage {
     /// assignment id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_nonce: Option<String>,
+    /// Typed subject delivered by the reviewer-assignment authority store.
+    /// Legacy assignment rows omit it and cannot later authorize a receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_assignment: Option<crate::review_receipt::ReviewAssignmentEnvelope>,
 }
 
 /// Reply-to correlation context for a quoted bot message (resolved from the

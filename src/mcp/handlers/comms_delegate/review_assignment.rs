@@ -22,7 +22,8 @@ use std::path::Path;
 ///
 /// Order is load-bearing (fail-closed):
 ///   (a) explicit non-empty `task_id` + non-empty `branch` + nonzero `pr_number`
-///       (generation identity; B18) — else reject BEFORE resolving anything;
+///       + exact full `reviewed_head` (generation identity) — else reject BEFORE
+///       resolving anything;
 ///   (b) provider-neutral repo resolve (fail-closed, no default);
 ///   (c) source-repo → EXACTLY-ONE team, and sender == that team's SOLE CURRENT
 ///       orchestrator (live fleet; NO operator-allow);
@@ -60,6 +61,13 @@ pub(super) fn validate_review_assignment_marker(
                 "code": "review_assignment_missing_pr_number",
             }))
         }
+    }
+    let reviewed_head = args["reviewed_head"].as_str().unwrap_or("");
+    if !crate::review_receipt::is_full_head(reviewed_head) {
+        return Err(json!({
+            "error": "review_assignment requires `reviewed_head` as an exact full 40/64-hex SHA",
+            "code": "review_assignment_missing_exact_head",
+        }));
     }
     // `review_author` is a MANDATORY audited principal on a review_assignment (codex
     // ruling): the reviewer must be told WHOSE code they are auditing, and the
@@ -121,6 +129,42 @@ pub(super) fn validate_review_assignment_marker(
             }));
         }
     }
+    // Bind the dispatch to the currently observed PR subject before any bind,
+    // assignment-store, or inbox side effect. Missing/corrupt state, a stale
+    // head, wrong PR, or unresolved/mismatched review class all fail closed.
+    let branch = args["branch"].as_str().unwrap_or_default();
+    let pr_number = checks.pr_number.unwrap_or_default();
+    let state =
+        crate::review_receipt::load_pr_state_strict(home, &repo_slug, branch).map_err(|error| {
+            json!({
+                "error": format!("review_assignment exact subject rejected: {error}"),
+                "code": "review_assignment_subject_unavailable",
+            })
+        })?;
+    let task_id = args["task_id"].as_str().unwrap_or_default();
+    let task_review_class = crate::tasks::load_routed(home, task_id)
+        .ok()
+        .and_then(|routed| {
+            routed
+                .task
+                .metadata
+                .get("review_class")
+                .and_then(|value| value.as_str())
+                .map(|value| ReviewClass::parse_fail_closed(Some(value)))
+        })
+        .unwrap_or(ReviewClass::Unresolved);
+    if state.repo != repo_slug
+        || state.branch != branch
+        || state.pr_number != pr_number
+        || state.head_sha != reviewed_head
+        || matches!(task_review_class, ReviewClass::Unresolved)
+        || state.review_class != task_review_class
+    {
+        return Err(json!({
+            "error": "review_assignment subject must exactly match the active PR and task review class",
+            "code": "review_assignment_subject_mismatch",
+        }));
+    }
     // The validated, canonical `owner/repo` slug is returned so the store dispatch
     // (A1) keys the record on the SAME lockstep form the ACL matched (I25) — no
     // second resolve (which could redrift or re-run a git subprocess).
@@ -155,12 +199,8 @@ pub(super) fn dispatch_review_assignment_via_store(
     let branch = args["branch"].as_str().unwrap_or_default();
     let task_id = args["task_id"].as_str().unwrap_or_default();
     let pr_number = checks.pr_number.unwrap_or(0);
-    // The record's `review_class` is authority METADATA (the gate/classifier read the
-    // PrState's class, never this) — resolve it from the task's DURABLE metadata (the
-    // same authority `maybe_auto_bind_lease` already validated and armed); an untagged
-    // task degrades to `Unresolved` (harmless: metadata-only).
-    // #2760: read via the STRICT router (project-board aware). A route error degrades
-    // to `Unresolved` — harmless here (metadata-only), matching the untagged case.
+    // The marker gate has already proved this exact routed task metadata matches
+    // the current PR state; re-read it only to populate the durable assignment.
     let review_class = crate::tasks::load_routed(home, task_id)
         .ok()
         .and_then(|rt| {
@@ -170,7 +210,7 @@ pub(super) fn dispatch_review_assignment_via_store(
                 .and_then(|v| v.as_str())
                 .map(|s| ReviewClass::parse_fail_closed(Some(s)))
         })
-        .unwrap_or(ReviewClass::Unresolved);
+        .expect("marker gate requires resolvable task review_class");
     // `review_author` is MANDATORY on the marker path: the gate
     // (`validate_review_assignment_marker`) fail-closes on an absent author BEFORE
     // this A1 wiring runs, so it is guaranteed present here. NO sentinel principal is
@@ -179,12 +219,31 @@ pub(super) fn dispatch_review_assignment_via_store(
         .review_author
         .clone()
         .expect("marker gate enforces review_author present before store dispatch");
+    let target_instance_id = match crate::fleet::resolve_uuid(home, target) {
+        Some(id) => id,
+        None => {
+            return json!({
+                "ok": false,
+                "error": "review_assignment target has no stable InstanceId",
+                "code": "review_assignment_target_identity_missing",
+            })
+        }
+    };
+    let reviewed_head = args["reviewed_head"].as_str().unwrap_or_default();
+    let slot = if checks.second_reviewer {
+        crate::review_receipt::ReviewSlot::Secondary
+    } else {
+        crate::review_receipt::ReviewSlot::Primary
+    };
     let now = chrono::Utc::now().to_rfc3339();
-    let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending(
+    let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
         repo_slug,
         branch,
         target,
+        target_instance_id,
         pr_number,
+        reviewed_head,
+        slot,
         sender.as_str(),
         task_id,
         review_class,
@@ -219,6 +278,9 @@ pub(super) fn dispatch_review_assignment_via_store(
         "review_assignment": true,
         "assignment_id": record.assignment_id.to_string(),
         "pr_number": pr_number,
+        "reviewed_head": reviewed_head,
+        "target_instance_id": target_instance_id.full(),
+        "review_slot": slot,
     });
     // Dispatch tracking / UX parity with the legacy path (task_id is explicit).
     let ctx = DeliveryCtx {

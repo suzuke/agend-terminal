@@ -178,8 +178,65 @@ mod review_assignment_marker_tests {
     /// git subprocess (lockstep with the dispatch side, which uses the same
     /// canonicalizer on the explicit `repository` arg).
     fn seed_fleet(home: &std::path::Path, teams_yaml: &str) {
-        let yaml = format!("instances:\n  lead:\n    backend: claude\n{teams_yaml}");
+        let yaml = format!(
+            "instances:\n  lead:\n    backend: claude\n    id: 11111111-1111-4111-8111-111111111111\n  reviewer:\n    backend: claude\n    id: 22222222-2222-4222-8222-222222222222\n{teams_yaml}"
+        );
         std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    const EXACT_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn seed_exact_subject(home: &std::path::Path) {
+        let event = crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-rev-1".into()),
+            title: "review task".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(crate::task_events::InstanceName("system:test".into())),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat/x".into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        };
+        crate::task_events::append(
+            home,
+            &crate::task_events::InstanceName("system:test".into()),
+            event,
+        )
+        .unwrap();
+        let meta = crate::tasks::handle(
+            home,
+            "system:test",
+            &json!({
+                "action": "metadata_set",
+                "id": "t-rev-1",
+                "metadata_key": "review_class",
+                "metadata_value": "dual"
+            }),
+        );
+        assert!(meta.get("error").is_none(), "seed task metadata: {meta}");
+
+        let mut state = crate::daemon::pr_state::new_for_branch(
+            "owner/repo",
+            "feat/x",
+            EXACT_HEAD,
+            crate::daemon::pr_state::ReviewClass::Dual,
+        );
+        state.pr_number = 42;
+        let dir = crate::daemon::pr_state::pr_state_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::daemon::pr_state::pr_state_filename(
+                "owner/repo",
+                "feat/x",
+            )),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
     }
 
     fn marker_checks(
@@ -205,6 +262,7 @@ mod review_assignment_marker_tests {
             "branch": "feat/x",
             "repository": repo,
             "pr_number": pr_number,
+            "reviewed_head": EXACT_HEAD,
         })
     }
 
@@ -216,6 +274,7 @@ mod review_assignment_marker_tests {
             &home,
             "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
         );
+        seed_exact_subject(&home);
         let sender = Sender::new("lead").unwrap();
         validate_review_assignment_marker(
             &home,
@@ -225,6 +284,52 @@ mod review_assignment_marker_tests {
             &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42)),
         )
         .expect("sole-orchestrator dispatch must pass the marker gate");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task66_assignment_rejects_short_or_stale_exact_head_2760() {
+        let home = tmp_home("task66-head-mismatch");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        seed_exact_subject(&home);
+        let sender = Sender::new("lead").unwrap();
+        let checks = marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42));
+
+        let mut short = marker_args("owner/repo", 42);
+        short["reviewed_head"] = json!("aaaaaaaa");
+        let err = validate_review_assignment_marker(&home, &sender, "reviewer", &short, &checks)
+            .expect_err("a SHA prefix is never an assignment subject");
+        assert_eq!(err["code"], "review_assignment_missing_exact_head", "{err}");
+
+        let mut stale = marker_args("owner/repo", 42);
+        stale["reviewed_head"] = json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let err = validate_review_assignment_marker(&home, &sender, "reviewer", &stale, &checks)
+            .expect_err("a different full head is still the wrong generation");
+        assert_eq!(err["code"], "review_assignment_subject_mismatch", "{err}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task66_assignment_rejects_pr_generation_mismatch_2760() {
+        let home = tmp_home("task66-pr-mismatch");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        seed_exact_subject(&home);
+        let sender = Sender::new("lead").unwrap();
+        let err = validate_review_assignment_marker(
+            &home,
+            &sender,
+            "reviewer",
+            &marker_args("owner/repo", 43),
+            &marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(43)),
+        )
+        .expect_err("the PR number is part of the immutable review generation");
+        assert_eq!(err["code"], "review_assignment_subject_mismatch", "{err}");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -323,6 +428,7 @@ mod review_assignment_marker_tests {
             &home,
             "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
         );
+        seed_exact_subject(&home);
         let sender = Sender::new("lead").unwrap();
         validate_review_assignment_marker(
             &home,
@@ -347,6 +453,7 @@ mod review_assignment_marker_tests {
             &home,
             "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n      - lead2\n    source_repo: owner/repo\n",
         );
+        seed_exact_subject(&home);
         let lead = Sender::new("lead").unwrap();
         let lead2 = Sender::new("lead2").unwrap();
         let args = marker_args("owner/repo", 42);
@@ -415,6 +522,7 @@ mod review_assignment_marker_tests {
                 "branch": "feat/x",
                 "repository": "owner/repo",
                 "pr_number": 42,
+                "reviewed_head": EXACT_HEAD,
             }),
             &sender,
         );
@@ -519,6 +627,7 @@ mod review_assignment_marker_tests {
                 "branch": "feat/x",
                 "repository": "owner/repo",
                 "pr_number": 42,
+                "reviewed_head": EXACT_HEAD,
             }),
             &sender,
         );
@@ -556,6 +665,11 @@ mod review_assignment_marker_tests {
         use super::super::review_assignment::dispatch_review_assignment_via_store;
         use super::super::ComposedDelegate;
         let home = tmp_home("c11-store");
+        seed_fleet(
+            &home,
+            "teams:\n  edge:\n    orchestrator: lead\n    members:\n      - lead\n    source_repo: owner/repo\n",
+        );
+        seed_exact_subject(&home);
         let sender = Sender::new("lead").unwrap();
         let args = marker_args("owner/repo", 42); // task_id t-rev-1, branch feat/x
         let checks = marker_checks(Some(ReviewAuthor::External("octocat".into())), Some(42));
@@ -585,6 +699,15 @@ mod review_assignment_marker_tests {
         assert_eq!(rec.sender, "lead");
         assert_eq!(rec.task_id, "t-rev-1");
         assert_eq!(rec.review_author, ReviewAuthor::External("octocat".into()));
+        assert_eq!(rec.reviewed_head.as_deref(), Some(EXACT_HEAD));
+        assert_eq!(
+            rec.review_slot,
+            Some(crate::review_receipt::ReviewSlot::Primary)
+        );
+        assert_eq!(
+            rec.target_instance_id.map(|id| id.full()).as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
         // A2: the reviewer's actionable outbox row carries the record's nonce, and the
         // record advanced to Persisted (delivered by the store, not deliver_delegate).
         assert!(
@@ -597,6 +720,20 @@ mod review_assignment_marker_tests {
         );
         assert_eq!(out["review_assignment"], true, "{out}");
         assert_eq!(out["pr_number"], 42, "{out}");
+        let rows = crate::inbox::drain(&home, "reviewer");
+        let envelope = rows
+            .iter()
+            .find_map(|row| row.review_assignment.as_ref())
+            .expect("typed assignment envelope delivered to reviewer");
+        assert_eq!(envelope.assignment_id, rec.assignment_id);
+        assert_eq!(envelope.reviewed_head, EXACT_HEAD);
+        assert_eq!(envelope.pr_number, 42);
+        assert_eq!(envelope.task_id, "t-rev-1");
+        assert_eq!(
+            envelope.review_class,
+            crate::daemon::pr_state::ReviewClass::Dual
+        );
+        assert_eq!(envelope.slot, crate::review_receipt::ReviewSlot::Primary);
         std::fs::remove_dir_all(&home).ok();
     }
 }

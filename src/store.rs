@@ -110,6 +110,23 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
 /// multiple agend-terminal CLIs) also receive distinct tmp paths.
 static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(test)]
+static FAIL_NEXT_ATOMIC_WRITE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+
+/// Deterministic path-scoped test seam for callers that must prove their
+/// pre-save side effects survive an atomic persistence failure. Production
+/// builds contain neither the registry nor the branch below.
+#[cfg(test)]
+pub(crate) fn fail_next_atomic_write_for_test(path: &Path) {
+    FAIL_NEXT_ATOMIC_WRITE
+        .get_or_init(Default::default)
+        .lock()
+        .expect("atomic-write failure registry")
+        .insert(path.to_path_buf());
+}
+
 /// #965 RAII guard that unlinks the temp file if [`atomic_write`] fails
 /// before the rename succeeds. Without this, every failed atomic_write
 /// (disk full, fsync error, permission denied between create and rename)
@@ -163,6 +180,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_ATOMIC_WRITE
+        .get_or_init(Default::default)
+        .lock()
+        .expect("atomic-write failure registry")
+        .remove(path)
+    {
+        anyhow::bail!("forced atomic_write failure for {}", path.display());
     }
     let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -695,26 +721,27 @@ mod tests {
 
     #[test]
     fn test_acquire_file_lock_is_exclusive_same_process() {
-        // On the same process, a second lock on a different File
-        // handle for the same path blocks; try_lock should refuse.
-        // Explicit trait method (see comment in acquire_file_lock).
+        // Exercise the production non-blocking wrapper with fresh handles.
         let dir = tmp_dir("flock");
         let lock_path = dir.join("my.lock");
         let guard = acquire_file_lock(&lock_path).expect("first lock");
-
-        let second = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .expect("open");
         assert!(
-            fs4::FileExt::try_lock(&second).is_err(),
+            try_acquire_file_lock(&lock_path)
+                .expect("contended try lock")
+                .is_none(),
             "second exclusive lock must fail while first held"
         );
         drop(guard);
-        // After drop, second can acquire.
-        assert!(fs4::FileExt::try_lock(&second).is_ok());
+        let guard2 = try_acquire_file_lock(&lock_path)
+            .expect("acquire after first drop")
+            .expect("lock must be available after first drop");
+        assert!(
+            try_acquire_file_lock(&lock_path)
+                .expect("second contended try lock")
+                .is_none(),
+            "additional exclusive lock must fail while second guard held"
+        );
+        drop(guard2);
         fs::remove_dir_all(&dir).ok();
     }
 

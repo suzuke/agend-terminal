@@ -1608,6 +1608,8 @@ fn seed_drained_blocker(home: &std::path::Path, target: &str, kind: &str, corr: 
         force_meta: None,
         correlation_id: Some(corr.to_string()),
         reviewed_head: None,
+        report_purpose: Default::default(),
+        validated_code_review: None,
         from: "from:fixup-lead".to_string(),
         text: format!("seeded blocker {kind}"),
         kind: Some(kind.to_string()),
@@ -1627,6 +1629,7 @@ fn seed_drained_blocker(home: &std::path::Path, target: &str, kind: &str, corr: 
         pr_number: None,
         terminal: None,
         delivery_nonce: None,
+        review_assignment: None,
     };
     crate::inbox::enqueue(home, target, msg).expect("seed blocker");
 }
@@ -1706,6 +1709,8 @@ fn b3_codex_report_keeps_absorption_when_blocker_undrained() {
         force_meta: None,
         correlation_id: Some("corr-b3".to_string()),
         reviewed_head: None,
+        report_purpose: Default::default(),
+        validated_code_review: None,
         from: "from:fixup-lead".to_string(),
         text: "undrained query".to_string(),
         kind: Some("query".to_string()),
@@ -1725,6 +1730,7 @@ fn b3_codex_report_keeps_absorption_when_blocker_undrained() {
         pr_number: None,
         terminal: None,
         delivery_nonce: None,
+        review_assignment: None,
     };
     msg.read_at = None;
     crate::inbox::enqueue(&home_path, "codex-agent", msg).expect("seed");
@@ -2339,7 +2345,7 @@ fn verdict_report_msg(corr: &str, reviewed_head: &str) -> crate::inbox::InboxMes
 }
 
 #[test]
-fn short_sha_verdict_flips_merge_ready_via_real_ingestion_2079() {
+fn short_sha_text_without_typed_receipt_is_inert_2760() {
     use crate::daemon::pr_state;
     let home = tmp_home("2079-shortsha-flip");
     let _ = std::fs::remove_dir_all(&home);
@@ -2356,38 +2362,34 @@ fn short_sha_verdict_flips_merge_ready_via_real_ingestion_2079() {
         pr_state::ReviewClass::Single,
     );
 
-    // Reviewer's report carries the ABBREVIATED head — real ingestion entry.
-    process_verdicts(
+    // A legacy raw report carries an abbreviated head and verdict-looking text.
+    assert!(!process_verdicts(
         &home,
-        "fixup-reviewer",
         &verdict_report_msg("owner/repo@feat/x", SHORT_HEAD_2079),
-    );
+    ));
 
     let state = pr_state::load(&home, "owner/repo", "feat/x").expect("state exists");
     assert!(
-        pr_state::is_merge_ready(&state),
-        "#2079: a VERIFIED carrying a 7-char reviewed_head must flip merge-ready against the \
-             full canonical head_sha (prefix-match), not silently buffer; state={state:?}"
+        !pr_state::is_merge_ready(&state),
+        "task66: verdict-looking text and a SHA prefix must have zero merge authority; state={state:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn short_sha_verdict_before_ci_drains_from_buffer_2079() {
+fn short_sha_text_without_receipt_never_enters_buffer_2760() {
     use crate::daemon::pr_state;
     let home = tmp_home("2079-shortsha-buffer");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
 
-    // Verdict arrives FIRST (no pr-state yet) with a short head → buffered.
-    process_verdicts(
+    // Verdict-looking legacy text arrives first; it must not enter any buffer.
+    assert!(!process_verdicts(
         &home,
-        "fixup-reviewer",
         &verdict_report_msg("owner/repo@feat/x", SHORT_HEAD_2079),
-    );
+    ));
 
-    // Then CI observes the branch at the FULL head → drain must prefix-match
-    // the buffered short verdict and replay it onto the new state.
+    // Later CI observation cannot upgrade the old raw text into authority.
     pr_state::record_ci_result(
         &home,
         "owner/repo",
@@ -2400,9 +2402,8 @@ fn short_sha_verdict_before_ci_drains_from_buffer_2079() {
 
     let state = pr_state::load(&home, "owner/repo", "feat/x").expect("state exists");
     assert!(
-        pr_state::is_merge_ready(&state),
-        "#2079: a short-SHA verdict buffered BEFORE CI must drain (prefix-match) when the full \
-             head is observed and flip merge-ready; state={state:?}"
+        !pr_state::is_merge_ready(&state),
+        "task66: a legacy raw report must never replay as typed receipt evidence; state={state:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -2455,10 +2456,37 @@ fn sidecar_present(home: &std::path::Path, task_id: &str) -> bool {
         .any(|d| d.correlation_id.as_deref() == Some(task_id))
 }
 
-fn t127_verdict(verdict_text: &str, corr: &str) -> crate::inbox::InboxMessage {
-    crate::inbox::InboxMessage::new_system("system:reviewer", "report", verdict_text)
+fn t127_verdict(verdict_text: &str, task_id: &str, corr: &str) -> crate::inbox::InboxMessage {
+    let verdict = if verdict_text.starts_with("VERIFIED") {
+        crate::review_receipt::ReviewVerdict::Verified
+    } else if verdict_text.starts_with("REJECTED") {
+        crate::review_receipt::ReviewVerdict::Rejected
+    } else {
+        crate::review_receipt::ReviewVerdict::Unverified
+    };
+    let mut msg = crate::inbox::InboxMessage::new_system("system:reviewer", "report", verdict_text)
         .with_correlation_id(corr.to_string())
-        .with_reviewed_head("7e1d4228bea3cf7fe2d72aab66015297308b48bc".to_string())
+        .with_reviewed_head("7e1d4228bea3cf7fe2d72aab66015297308b48bc".to_string());
+    msg.report_purpose = crate::review_receipt::ReportPurpose::CodeReview;
+    msg.validated_code_review = Some(crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+        crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: format!("review-receipt:{task_id}"),
+            source_id: format!("m-{task_id}"),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "reviewer".into(),
+            repo: "owner/repo".into(),
+            pr_number: 1,
+            branch: "feat/x".into(),
+            task_id: task_id.into(),
+            reviewed_head: "7e1d4228bea3cf7fe2d72aab66015297308b48bc".into(),
+            review_class: crate::daemon::pr_state::ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict,
+        },
+    ));
+    msg
 }
 
 fn record_review_dispatch(home: &std::path::Path, dispatcher: &str, reviewer: &str, tid: &str) {
@@ -2487,7 +2515,7 @@ fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED looks good", "t-rev-1"),
+        &t127_verdict("VERIFIED looks good", "t-rev-1", "t-rev-1"),
     );
 
     assert_eq!(
@@ -2502,10 +2530,8 @@ fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// Case (b) dual-2: verdict carries `repo@branch` (NO task id; GH-diff review
-/// dispatches have no branch on the task either). The bridge must reverse-look
-/// the reporter's single open dispatch sidecar to reach the task. (RED pre-fix:
-/// `auto_close` is gated on `corr.starts_with("t-")` → repo@branch never closes.)
+/// Case (b) dual-2: display correlation may still be `repo@branch`, but the
+/// validated receipt carries the exact task id and no reverse lookup is needed.
 #[test]
 fn verdict_dual2_repobranch_verified_bridges_via_reverse_lookup_t127() {
     let home = tmp_home("t127-dual2");
@@ -2518,17 +2544,17 @@ fn verdict_dual2_repobranch_verified_bridges_via_reverse_lookup_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED diff clean", "owner/repo@feat/x"),
+        &t127_verdict("VERIFIED diff clean", "t-rev-2", "owner/repo@feat/x"),
     );
 
     assert_eq!(
         task_status_of(&home, "t-rev-2"),
         Some(crate::task_events::TaskStatus::Done),
-        "dual-2 VERIFIED (corr=repo@branch) must bridge via reverse-lookup and close the task"
+        "dual-2 VERIFIED must bridge through the receipt's exact task id"
     );
     assert!(
         !sidecar_present(&home, "t-rev-2"),
-        "sidecar must be cleared via the reverse-lookup bridge"
+        "sidecar must be cleared via the typed receipt bridge"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -2547,7 +2573,7 @@ fn verdict_rejected_clears_sidecar_but_keeps_task_open_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("REJECTED found a bug", "owner/repo@feat/x"),
+        &t127_verdict("REJECTED found a bug", "t-rev-3", "owner/repo@feat/x"),
     );
 
     assert!(
@@ -2562,11 +2588,10 @@ fn verdict_rejected_clears_sidecar_but_keeps_task_open_t127() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// Exactly-one fail-safe: a reporter with MULTIPLE open dispatches (from distinct
-/// dispatchers, so #1866 handoff-retire doesn't collapse them) → ambiguous → the
-/// bridge skips (mis-closing the wrong task is worse than a lingering ghost).
+/// Verdict-looking legacy text cannot trigger the old reporter-name reverse
+/// lookup, even when multiple open review dispatches exist.
 #[test]
-fn verdict_reverse_lookup_skips_when_reporter_has_multiple_open_dispatches_t127() {
+fn legacy_verdict_text_never_reverse_looks_up_review_task_2760() {
     let home = tmp_home("t127-multi");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
@@ -2579,22 +2604,24 @@ fn verdict_reverse_lookup_skips_when_reporter_has_multiple_open_dispatches_t127(
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED ok", "owner/repo@feat/x"),
+        &crate::inbox::InboxMessage::new_system("system:reviewer", "report", "VERIFIED ok")
+            .with_correlation_id("owner/repo@feat/x")
+            .with_reviewed_head("7e1d4228bea3cf7fe2d72aab66015297308b48bc"),
     );
 
     assert_eq!(
         task_status_of(&home, "t-rev-a"),
         Some(crate::task_events::TaskStatus::Claimed),
-        "ambiguous reverse-lookup must NOT close t-rev-a"
+        "legacy text must NOT close t-rev-a"
     );
     assert_eq!(
         task_status_of(&home, "t-rev-b"),
         Some(crate::task_events::TaskStatus::Claimed),
-        "ambiguous reverse-lookup must NOT close t-rev-b"
+        "legacy text must NOT close t-rev-b"
     );
     assert!(
         sidecar_present(&home, "t-rev-a") && sidecar_present(&home, "t-rev-b"),
-        "ambiguous → both sidecars remain (fail-safe: no mis-close)"
+        "legacy text leaves both sidecars unchanged"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -2635,5 +2662,380 @@ fn terminal_report_projects_result_via_track_dispatch() {
         Some(report),
         "F1(real): terminal report via track_dispatch must persist `result` (was null)"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #2760 / task66 production-entry RED: a design/analysis verdict is an ordinary
+/// report even when its visible text begins with `VERIFIED` and it carries a
+/// display-only `reviewed_head`. Drive the exact wrapper emitted by
+/// `handle_report_result` through the authoritative API SEND handler and prove it
+/// cannot rewrite an already-REJECTED PR state.
+#[test]
+fn analysis_decision_verified_is_not_a_code_review_receipt_2760() {
+    use crate::daemon::pr_state;
+
+    const HEAD: &str = "a4b05610c581f2fca319d619b314b2d326c8d012";
+    let home = tmp_home("2760-analysis-no-pr-authority");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    write_fixup_fleet(&home, &["fixup-lead", "analysis-reviewer"]);
+
+    pr_state::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/rejected",
+        HEAD,
+        pr_state::CiConclusion::Green,
+        vec!["fixup-lead".to_string()],
+        pr_state::ReviewClass::Single,
+    );
+    pr_state::record_verdict(
+        &home,
+        "t-code-review",
+        "code-reviewer",
+        Some(HEAD),
+        pr_state::VerdictKind::Rejected {
+            reason: Some("unsafe"),
+        },
+    );
+    let state_path = pr_state::pr_state_dir(&home)
+        .join(pr_state::pr_state_filename("owner/repo", "fix/rejected"));
+    let before = std::fs::read(&state_path).expect("seeded rejected PR state");
+
+    let text = crate::mcp::handlers::build_report_text(
+        "VERIFIED — the containment design is sound\n\n### Evidence\nran: source audit → complete",
+        Some("t-analysis"),
+        None,
+    );
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "analysis-reviewer",
+            "target": "fixup-lead",
+            "text": text,
+            "kind": "report",
+            "correlation_id": "t-analysis",
+            "reviewed_head": HEAD,
+            "report_purpose": "analysis_decision",
+            "terminal": true,
+        }),
+        &ctx,
+    );
+    assert_eq!(
+        result["ok"], true,
+        "analysis report must still deliver: {result}"
+    );
+
+    let after = std::fs::read(&state_path).expect("PR state still exists");
+    assert_eq!(
+        after, before,
+        "AnalysisDecision is not code-review authority; PR state must be byte-identical"
+    );
+    assert!(
+        !home.join("auto_release_queue").exists(),
+        "analysis report must not enqueue code-review auto-release"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+const RECEIPT_HEAD_2760: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn write_typed_review_fleet(
+    home: &std::path::Path,
+    reviewer_id: crate::types::InstanceId,
+    lead_id: crate::types::InstanceId,
+) {
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(home),
+        format!(
+            "instances:\n  fixup-lead:\n    backend: claude\n    id: {}\n  typed-reviewer:\n    backend: claude\n    id: {}\nteams:\n  fixup:\n    members: [fixup-lead, typed-reviewer]\n    orchestrator: fixup-lead\n",
+            lead_id.full(),
+            reviewer_id.full(),
+        ),
+    )
+    .unwrap();
+}
+
+fn seed_typed_review_subject(
+    home: &std::path::Path,
+    assigned_id: crate::types::InstanceId,
+) -> crate::daemon::assignment_authority::ActiveAssignment {
+    use crate::daemon::pr_state;
+    pr_state::record_ci_result(
+        home,
+        "owner/repo",
+        "fix/typed",
+        RECEIPT_HEAD_2760,
+        pr_state::CiConclusion::Green,
+        vec!["fixup-lead".into()],
+        pr_state::ReviewClass::Single,
+    );
+    pr_state::with_pr_state(home, "owner/repo", "fix/typed", |state| {
+        state.pr_number = 2769;
+    })
+    .unwrap();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/typed",
+        "typed-reviewer",
+        assigned_id,
+        2769,
+        RECEIPT_HEAD_2760,
+        crate::review_receipt::ReviewSlot::Primary,
+        "fixup-lead",
+        "t-code-review-2760",
+        pr_state::ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review exact head",
+        None,
+        None,
+        "2026-07-14T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(home, &assignment).unwrap();
+    assignment
+}
+
+fn typed_review_params(assignment_id: uuid::Uuid, verdict: &str, text_token: &str) -> Value {
+    json!({
+        "from": "typed-reviewer",
+        "target": "fixup-lead",
+        "text": crate::mcp::handlers::build_report_text(
+            &format!("{text_token} — exact review\n\n### Evidence\nran: cargo test → passed"),
+            Some("t-code-review-2760"),
+            None,
+        ),
+        "kind": "report",
+        "correlation_id": "t-code-review-2760",
+        "reviewed_head": "display-only-caller-value",
+        "report_purpose": "code_review",
+        "code_review": {
+            "assignment_id": assignment_id,
+            "verdict": verdict,
+            "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    })
+}
+
+/// Positive production entry plus A2/exact-once replay: the authenticated API
+/// sink assigns the message/source/receipt identities, applies only the exact
+/// assignment subject, and a replay of that durable receipt is inert.
+#[test]
+fn exact_typed_receipt_applies_once_with_server_owned_ids_2760() {
+    let home = tmp_home("2760-typed-positive");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+
+    let result = handle_send(
+        &typed_review_params(assignment.assignment_id, "verified", "VERIFIED"),
+        &test_ctx(&home),
+    );
+    assert_eq!(result["ok"], true, "typed review must deliver: {result}");
+
+    let mut delivered = crate::inbox::drain(&home, "fixup-lead");
+    assert_eq!(delivered.len(), 1, "one durable report row");
+    let msg = delivered.pop().unwrap();
+    let receipt = msg
+        .validated_code_review
+        .as_ref()
+        .expect("API sink attached private validated receipt")
+        .summary();
+    assert_eq!(msg.id.as_deref(), Some(receipt.source_id.as_str()));
+    assert_eq!(
+        receipt.receipt_id,
+        format!("review-receipt:{}", receipt.source_id),
+        "caller cannot choose the exact-once identity"
+    );
+    assert_eq!(receipt.assignment_id, assignment.assignment_id);
+    assert_eq!(receipt.reviewer_instance_id, reviewer_id);
+    assert_eq!(receipt.reviewed_head, RECEIPT_HEAD_2760);
+    assert_eq!(msg.reviewed_head.as_deref(), Some(RECEIPT_HEAD_2760));
+
+    let state = crate::daemon::pr_state::load(&home, "owner/repo", "fix/typed").unwrap();
+    assert_eq!(state.validated_review_receipts.len(), 1);
+    assert!(crate::daemon::pr_state::is_merge_ready(&state));
+    assert!(home.join("auto_release_queue").exists());
+
+    let state_path = crate::daemon::pr_state::pr_state_dir(&home).join(
+        crate::daemon::pr_state::pr_state_filename("owner/repo", "fix/typed"),
+    );
+    let before_replay = std::fs::read(&state_path).unwrap();
+    assert!(
+        !process_verdicts(&home, &msg),
+        "same source/receipt replays once"
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), before_replay);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn typed_unverified_is_evidence_block_exempt_but_still_assignment_bound_2760() {
+    let home = tmp_home("2760-typed-unverified");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    let mut params = typed_review_params(assignment.assignment_id, "unverified", "UNVERIFIED");
+    params["text"] = json!(crate::mcp::handlers::build_report_text(
+        "UNVERIFIED — claimed but unproven",
+        Some("t-code-review-2760"),
+        None,
+    ));
+
+    let result = handle_send(&params, &test_ctx(&home));
+    assert_eq!(
+        result["ok"], true,
+        "UNVERIFIED is evidence-exempt: {result}"
+    );
+    let state = crate::daemon::pr_state::load(&home, "owner/repo", "fix/typed").unwrap();
+    assert_eq!(state.validated_review_receipts.len(), 1);
+    assert_eq!(
+        state.validated_review_receipts[0].verdict,
+        crate::review_receipt::ReviewVerdict::Unverified
+    );
+    assert!(!crate::daemon::pr_state::is_merge_ready(&state));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Missing/foreign assignment, same-name identity ABA, legacy schema, and
+/// revoked generation all reject before delivery. These are distinct
+/// authorization failures but share the same production API entry and
+/// zero-store postcondition.
+#[test]
+fn forged_foreign_aba_and_revoked_assignments_fail_before_delivery_2760() {
+    for case in ["missing", "foreign", "aba", "legacy_schema", "revoked"] {
+        let home = tmp_home(&format!("2760-auth-{case}"));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let live_id = crate::types::InstanceId::new();
+        write_typed_review_fleet(&home, live_id, crate::types::InstanceId::new());
+        let assignment_id = if case == "missing" {
+            uuid::Uuid::new_v4()
+        } else {
+            let assigned_id = if matches!(case, "foreign" | "aba") {
+                crate::types::InstanceId::new()
+            } else {
+                live_id
+            };
+            let mut assignment = seed_typed_review_subject(&home, assigned_id);
+            if case == "foreign" {
+                assignment.target = "another-reviewer".into();
+                crate::daemon::assignment_authority::revoke(
+                    &home,
+                    "owner/repo",
+                    "fix/typed",
+                    "typed-reviewer",
+                    "2026-07-14T00:00:01Z",
+                )
+                .unwrap();
+                crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+            }
+            if case == "legacy_schema" {
+                assignment.schema_version = 1;
+                crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+            }
+            if case == "revoked" {
+                crate::daemon::assignment_authority::revoke(
+                    &home,
+                    "owner/repo",
+                    "fix/typed",
+                    "typed-reviewer",
+                    "2026-07-14T00:00:01Z",
+                )
+                .unwrap();
+            }
+            assignment.assignment_id
+        };
+        let result = handle_send(
+            &typed_review_params(assignment_id, "verified", "VERIFIED"),
+            &test_ctx(&home),
+        );
+        assert_eq!(result["ok"], false, "{case} must reject: {result}");
+        assert_eq!(
+            result["code"], "report_authority_rejected",
+            "{case}: {result}"
+        );
+        assert_eq!(
+            crate::inbox::unread_count(&home, "fixup-lead").0,
+            0,
+            "{case}"
+        );
+        assert!(!home.join("auto_release_queue").exists(), "{case}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// The external request contains only assignment_id, explicit enum, and evidence
+/// digest. Every caller attempt to assert receipt/subject/slot/source fields is
+/// rejected by the deny-unknown typed object before delivery.
+#[test]
+fn caller_cannot_smuggle_receipt_or_subject_authority_2760() {
+    let home = tmp_home("2760-smuggle");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    for (field, value) in [
+        ("receipt_id", json!("caller-receipt")),
+        ("source_id", json!("caller-source")),
+        ("repo", json!("other/repo")),
+        ("pr_number", json!(1)),
+        ("task_id", json!("t-other")),
+        ("reviewed_head", json!("b".repeat(40))),
+        ("review_class", json!("dual")),
+        ("slot", json!("secondary")),
+    ] {
+        let mut params = typed_review_params(assignment.assignment_id, "verified", "VERIFIED");
+        params["code_review"][field] = value;
+        let result = handle_send(&params, &test_ctx(&home));
+        assert_eq!(
+            result["ok"], false,
+            "smuggled {field} must reject: {result}"
+        );
+    }
+    assert_eq!(crate::inbox::unread_count(&home, "fixup-lead").0, 0);
+    let state = crate::daemon::pr_state::load(&home, "owner/repo", "fix/typed").unwrap();
+    assert!(state.validated_review_receipts.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Typed enum/text disagreement is rejected for all three verdicts; receipt
+/// fields under a non-code purpose and text-only code reviews fail closed too.
+#[test]
+fn purpose_and_verdict_shape_mismatches_reject_before_delivery_2760() {
+    let home = tmp_home("2760-verdict-mismatch");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let reviewer_id = crate::types::InstanceId::new();
+    write_typed_review_fleet(&home, reviewer_id, crate::types::InstanceId::new());
+    let assignment = seed_typed_review_subject(&home, reviewer_id);
+    for (typed, visible) in [
+        ("verified", "REJECTED"),
+        ("rejected", "UNVERIFIED"),
+        ("unverified", "VERIFIED"),
+    ] {
+        let result = handle_send(
+            &typed_review_params(assignment.assignment_id, typed, visible),
+            &test_ctx(&home),
+        );
+        assert_eq!(result["ok"], false, "{typed}/{visible}: {result}");
+    }
+
+    let mut non_code = typed_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    non_code["report_purpose"] = json!("analysis_decision");
+    assert_eq!(handle_send(&non_code, &test_ctx(&home))["ok"], false);
+
+    let mut no_enum = typed_review_params(assignment.assignment_id, "verified", "VERIFIED");
+    no_enum["code_review"]
+        .as_object_mut()
+        .unwrap()
+        .remove("verdict");
+    assert_eq!(handle_send(&no_enum, &test_ctx(&home))["ok"], false);
+    assert_eq!(crate::inbox::unread_count(&home, "fixup-lead").0, 0);
     std::fs::remove_dir_all(&home).ok();
 }

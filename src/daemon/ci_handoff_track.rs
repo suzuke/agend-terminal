@@ -663,6 +663,36 @@ mod tests {
         p
     }
 
+    fn typed_review_report(task_id: &str) -> crate::inbox::InboxMessage {
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "gapfix-dev",
+            "report",
+            "VERIFIED\n\n### Evidence\nran: cargo test --all-targets → passed",
+        )
+        .with_correlation_id(task_id.to_string());
+        msg.report_purpose = crate::review_receipt::ReportPurpose::CodeReview;
+        msg.validated_code_review =
+            Some(crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+                crate::review_receipt::ReviewReceiptSummary {
+                    receipt_id: "review-receipt:m-ci-handoff-test".into(),
+                    source_id: "m-ci-handoff-test".into(),
+                    evidence_digest: "a".repeat(64),
+                    assignment_id: uuid::Uuid::new_v4(),
+                    reviewer_instance_id: crate::types::InstanceId::new(),
+                    reviewer_name: "gapfix-dev".into(),
+                    repo: "owner/repo".into(),
+                    pr_number: 1,
+                    branch: "branch".into(),
+                    task_id: task_id.into(),
+                    reviewed_head: "a".repeat(40),
+                    review_class: crate::daemon::pr_state::ReviewClass::Single,
+                    slot: crate::review_receipt::ReviewSlot::Primary,
+                    verdict: crate::review_receipt::ReviewVerdict::Verified,
+                },
+            ));
+        msg
+    }
+
     #[test]
     fn record_list_roundtrip_and_refresh() {
         let home = tmp_home("roundtrip");
@@ -968,23 +998,12 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// §3.9 real-entry regression: drives `messaging::track_dispatch` (the
-    /// actual report-arrival chokepoint `handle_send` wires into), not
-    /// `resolve_by_correlation` in isolation — proves the real wiring, not
-    /// just the matching logic. (Lives here, not in `messaging.rs`'s own
-    /// test module, because that file is LOC-grandfathered and this test
-    /// only needs `track_dispatch` to be `pub(crate)`.)
-    ///
-    /// Live bug (task metadata): a standard fleet `kind=report` carries
-    /// `correlation_id=t-...` (Sprint 58 W4 PR-1), but the ci-handoff track
-    /// recorded `correlation=owner/repo@branch` and `resolve_by_correlation`
-    /// matched only that field — so an ordinary reviewer report (`gapfix-dev`
-    /// reporting on #2633 with `correlation_id=t-...67777-10`) matched no
-    /// track at all (dead code) and the target ate ~95 phantom re-nudges at
-    /// 2-min cadence until a daemon restart cleared the state.
+    /// task66: a task/analysis report can carry the same task correlation as a
+    /// review assignment, but correlation alone is not review authority. The
+    /// real `track_dispatch` entry point must leave the CI handoff intact.
     #[test]
-    fn standard_report_task_id_correlation_resolves_ci_handoff_track_2412() {
-        let home = tmp_home("2412-taskid-wiring");
+    fn ordinary_report_task_id_correlation_does_not_resolve_ci_handoff_2760() {
+        let home = tmp_home("2760-untyped-taskid-wiring");
         let task_id = "t-20260622133030757281-1";
         record(
             &home,
@@ -1007,9 +1026,39 @@ mod tests {
         );
 
         assert!(
+            !list(&home).is_empty(),
+            "task66: an ordinary report's task correlation must not resolve a \
+             code-review CI handoff without a validated receipt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// task66 positive sibling: the same real entry point still resolves the
+    /// handoff when the API sink has attached a validated typed receipt.
+    #[test]
+    fn validated_review_receipt_resolves_ci_handoff_2760() {
+        let home = tmp_home("2760-typed-taskid-wiring");
+        let task_id = "t-20260622133030757281-1";
+        record(
+            &home,
+            "gapfix-dev",
+            "owner/repo@branch",
+            "2026-06-10T00:00:00Z",
+            None,
+            Some(task_id),
+        );
+
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &serde_json::json!({}),
+            "gapfix-dev",
+            "lead",
+            &typed_review_report(task_id),
+        );
+
+        assert!(
             list(&home).is_empty(),
-            "#2412: a standard kind=report carrying the dispatch's task_id must \
-             resolve the ci-handoff track through the real track_dispatch wiring"
+            "task66: a validated typed receipt resolves the correlated CI handoff"
         );
         std::fs::remove_dir_all(&home).ok();
     }
