@@ -590,14 +590,24 @@ pub fn generate(working_dir: &Path, command: &str) -> Result<(), String> {
 /// through to every artifact writer so r6's opaque-owner guard accepts
 /// same-owner restarts.
 pub fn generate_for_owner(working_dir: &Path, command: &str, owner: &str) -> Result<(), String> {
-    let ctx = AgentContext {
-        name: owner,
-        role: None,
-        fleet_peers: &[],
-        team: None,
-        extra_instructions: None,
-    };
-    generate_with_context(working_dir, command, Some(&ctx))
+    let backend = crate::backend::Backend::from_command(command);
+    let home = crate::home_dir();
+
+    let _id_lock = crate::store::acquire_workspace_identity_lock(&home, working_dir)
+        .map_err(|e| format!("provision: could not acquire workspace-identity lock: {e}"))?;
+
+    workspace_provision_preflight(working_dir, backend.as_ref(), owner)?;
+
+    if backend.is_some() {
+        ensure_project_root(working_dir)?;
+    }
+    if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
+        migrate_claude_old_rules_file(working_dir)?;
+    }
+    crate::mcp_config::configure(working_dir, command, Some(owner))
+        .map_err(|e| format!("provision: MCP config: {e}"))?;
+    generate_agent_instructions(working_dir, command, None)?;
+    Ok(())
 }
 
 /// Generate with fleet context (name, role, peers). Fail-closed:
