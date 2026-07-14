@@ -1888,4 +1888,51 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- root review r8 RED: 4 deterministic failures (task-46776) ---
+
+    #[test]
+    fn root_review_r8_repeated_owner_only_provision_stays_restartable() {
+        let dir = tmp_dir("r9-repeat-owner");
+        generate_for_owner(&dir, "codex", "alpha").unwrap();
+        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            content.contains("- **Name**: `alpha`"),
+            "owner-only provision must write durable owner stamp — got:\n{content}"
+        );
+        generate_for_owner(&dir, "codex", "alpha")
+            .expect("repeated same-owner provision must succeed (idempotent)");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn root_review_nonshared_backend_foreign_owner_is_not_overwritten() {
+        // Claude
+        let dir = tmp_dir("r9-nonshared-claude");
+        generate_with_context(&dir, "claude", Some(&codex_ctx("alpha"))).unwrap();
+        let claude_path = dir.join(".claude").join("agend.md");
+        let original = std::fs::read_to_string(&claude_path).unwrap();
+        let result = generate_for_owner(&dir, "claude", "beta");
+        assert!(
+            result.is_err(),
+            "Claude: must refuse foreign non-shared identity before provision"
+        );
+        let after = std::fs::read_to_string(&claude_path).unwrap();
+        assert_eq!(original, after, "Claude: bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Kiro
+        let dir = tmp_dir("r9-nonshared-kiro");
+        generate_with_context(&dir, "kiro-cli", Some(&codex_ctx("alpha"))).unwrap();
+        let kiro_path = dir.join(".kiro").join("steering").join("agend.md");
+        let original = std::fs::read_to_string(&kiro_path).unwrap();
+        let result = generate_for_owner(&dir, "kiro-cli", "beta");
+        assert!(
+            result.is_err(),
+            "Kiro: must refuse foreign non-shared identity before provision"
+        );
+        let after = std::fs::read_to_string(&kiro_path).unwrap();
+        assert_eq!(original, after, "Kiro: bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

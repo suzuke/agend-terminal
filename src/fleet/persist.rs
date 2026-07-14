@@ -1058,6 +1058,69 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // --- root review r8 RED: 2 deterministic failures (task-46776) ---
+
+    #[test]
+    fn root_review_tilde_and_expanded_workspace_identity_collide() {
+        let home = tmp_home("tilde-collide");
+        let unique = format!("agend-tilde-test-{}", std::process::id());
+        let tilde_path = format!("~/{unique}");
+        let expanded = crate::fleet::resolve::expand_tilde_path(&tilde_path);
+
+        add_instance_to_yaml(
+            &home,
+            "alice",
+            &InstanceYamlEntry {
+                working_directory: Some(tilde_path),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = add_instance_to_yaml(
+            &home,
+            "bob",
+            &InstanceYamlEntry {
+                working_directory: Some(expanded.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("tilde and expanded paths must collide as the same workspace identity");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace identity collision"),
+            "expected collision refusal: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_review_dangling_fleet_symlink_is_opaque_not_first_run() {
+        use std::os::unix::fs::symlink;
+        let home = tmp_home("dangling-symlink");
+        let fleet_path = super::fleet_yaml_path(&home);
+        symlink("/nonexistent/fleet.yaml", &fleet_path).unwrap();
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "symlink entry must exist"
+        );
+        assert!(!fleet_path.exists(), "symlink target must NOT exist (dangling)");
+
+        let err = add_instance_to_yaml(&home, "alpha", &InstanceYamlEntry::default())
+            .expect_err("dangling fleet.yaml symlink must be refused as opaque evidence");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dangling") || msg.contains("opaque") || msg.contains("refusing"),
+            "structured refusal expected: {msg}"
+        );
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "dangling symlink must not be removed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]
