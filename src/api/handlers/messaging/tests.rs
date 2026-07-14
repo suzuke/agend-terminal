@@ -3039,3 +3039,43 @@ fn purpose_and_verdict_shape_mismatches_reject_before_delivery_2760() {
     assert_eq!(crate::inbox::unread_count(&home, "fixup-lead").0, 0);
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Late-validation atomicity: `kind=task` carrying report-only fields
+/// (`report_purpose`) must be rejected BEFORE `auto_create_task_if_needed`
+/// runs — zero task/inbox side effects.
+#[test]
+fn report_fields_on_kind_task_rejected_without_leaked_task() {
+    let home = tmp_home("prevalidation-atomicity");
+    write_fixup_fleet(&home, &["fixup-lead", "fixup-dev"]);
+    let ctx = test_ctx(&home);
+    let result = handle_send(
+        &json!({
+            "from": "fixup-lead",
+            "target": "fixup-dev",
+            "text": "test task with illegal report fields",
+            "kind": "task",
+            "report_purpose": "code_review",
+        }),
+        &ctx,
+    );
+    assert_eq!(result["ok"], false, "must reject: {result}");
+    assert_eq!(
+        result["code"].as_str(),
+        Some("report_authority_rejected"),
+        "error code: {result}"
+    );
+    // The critical invariant: no task must have been created as a side effect.
+    let board = crate::task_events::replay(&home).unwrap_or_default();
+    assert!(
+        board.tasks.is_empty(),
+        "rejected send must not leak a task — found {} task(s) on board",
+        board.tasks.len()
+    );
+    // No inbox message delivered either.
+    assert_eq!(
+        crate::inbox::unread_count(&home, "fixup-dev").0,
+        0,
+        "rejected send must not deliver an inbox message"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
