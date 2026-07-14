@@ -762,6 +762,22 @@ mod tests {
     }
 
     #[test]
+    fn flock_guard_drop_releases_lock_with_cloned_descriptor() {
+        let dir = tmp_dir("flock_clone_drop");
+        let lock_path = dir.join("my.lock");
+        let guard = acquire_file_lock(&lock_path).expect("first lock");
+        let clone = guard._file.try_clone().expect("clone lock descriptor");
+
+        drop(guard);
+        let reacquired = try_acquire_file_lock(&lock_path)
+            .expect("reacquire after guard drop")
+            .expect("guard drop must release lock despite cloned descriptor");
+        drop(reacquired);
+        drop(clone);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn try_lock_classifier_preserves_non_contention_errors() {
         let dir = tmp_dir("flock-classifier");
         let lock_path = dir.join("my.lock");
