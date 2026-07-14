@@ -269,9 +269,8 @@ pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
 /// `FLOCK_DEPTH` thread-local for its lifetime so the self-IPC deadlock guard
 /// (`assert_no_registry_lock_for_self_ipc`) can see the flock tier — holding a
 /// flock across a loopback `api::call`/`enqueue_with_idle_hint` is the #1617
-/// lock-while-blocking deadlock class. On drop the depth decrement runs before
-/// the inner `File`'s drop releases the OS lock; both happen at the same scope
-/// exit, so no self-IPC can observe an inconsistent (depth, lock-held) pair.
+/// lock-while-blocking deadlock class. On drop the OS lock is explicitly
+/// unlocked before the depth decrement; the inner `File` then closes normally.
 ///
 /// `Deref` to `&File` is intentionally NOT provided: every call site holds the
 /// guard purely for RAII (`let _lock = acquire_file_lock(..)?`), so an opaque
@@ -282,6 +281,10 @@ pub struct FileFlockGuard {
 
 impl Drop for FileFlockGuard {
     fn drop(&mut self) {
+        // Explicitly unlock while cloned descriptors may still reference this
+        // open-file description; closing only this `File` does not release the
+        // flock in that case.
+        let _ = fs4::FileExt::unlock(&self._file);
         crate::sync_audit::flock_exited();
     }
 }
