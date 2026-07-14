@@ -738,11 +738,8 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         let pinned_sha = "a".repeat(40);
-        let filename = crate::daemon::ci_watch::watch_filename_exact_head(
-            "o/r",
-            "main",
-            &pinned_sha,
-        );
+        let filename =
+            crate::daemon::ci_watch::watch_filename_exact_head("o/r", "main", &pinned_sha);
         write_sidecar(
             &home,
             &filename,
@@ -757,7 +754,11 @@ mod tests {
             }),
         );
 
-        let resp = handle_status_ci(&home, &json!({"repository": "o/r", "branch": "main"}), "agent-a");
+        let resp = handle_status_ci(
+            &home,
+            &json!({"repository": "o/r", "branch": "main"}),
+            "agent-a",
+        );
         let watches = resp["watches"].as_array().unwrap();
         assert_eq!(watches.len(), 1);
         assert_eq!(
@@ -792,7 +793,11 @@ mod tests {
             }),
         );
 
-        let resp = handle_status_ci(&home, &json!({"repository": "o/r", "branch": "feat/x"}), "agent-b");
+        let resp = handle_status_ci(
+            &home,
+            &json!({"repository": "o/r", "branch": "feat/x"}),
+            "agent-b",
+        );
         let watches = resp["watches"].as_array().unwrap();
         assert_eq!(watches.len(), 1);
         assert!(
@@ -813,11 +818,8 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         let pinned_sha = "b".repeat(40);
-        let filename = crate::daemon::ci_watch::watch_filename_exact_head(
-            "o/r",
-            "main",
-            &pinned_sha,
-        );
+        let filename =
+            crate::daemon::ci_watch::watch_filename_exact_head("o/r", "main", &pinned_sha);
         write_sidecar(
             &home,
             &filename,
@@ -832,7 +834,11 @@ mod tests {
             }),
         );
 
-        let resp = handle_status_ci(&home, &json!({"repository": "o/r", "branch": "main"}), "agent-c");
+        let resp = handle_status_ci(
+            &home,
+            &json!({"repository": "o/r", "branch": "main"}),
+            "agent-c",
+        );
         let watches = resp["watches"].as_array().unwrap();
         assert_eq!(watches.len(), 1);
         assert!(
