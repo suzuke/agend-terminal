@@ -571,6 +571,8 @@ fn r5_branch_worktree_created_by_attempt_cleaned_on_rollback() {
     assert!(std::process::Command::new("git")
         .args(["init", "--quiet"])
         .current_dir(&repo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .unwrap()
         .success());
@@ -586,6 +588,8 @@ fn r5_branch_worktree_created_by_attempt_cleaned_on_rollback() {
             "init",
         ])
         .current_dir(&repo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .unwrap()
         .success());
