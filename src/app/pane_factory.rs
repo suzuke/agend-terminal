@@ -275,8 +275,13 @@ fn spawn_and_subscribe(
 )> {
     // Generate MCP config for agent backends
     if Backend::from_command(command).is_some() {
-        crate::instructions::generate(work_dir, command)
-            .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
+        match identity {
+            SpawnIdentity::Managed => {
+                crate::instructions::generate_for_owner(work_dir, command, name)
+            }
+            SpawnIdentity::UnmanagedLocalShell => crate::instructions::generate(work_dir, command),
+        }
+        .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
 
     // #1083: install skills for TUI-spawned panes (app mode).

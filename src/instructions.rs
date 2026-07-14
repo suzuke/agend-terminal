@@ -589,8 +589,15 @@ pub fn generate(working_dir: &Path, command: &str) -> Result<(), String> {
 /// `connect::run`). Runs the identity preflight and passes the owner
 /// through to every artifact writer so r6's opaque-owner guard accepts
 /// same-owner restarts.
-pub fn generate_for_owner(working_dir: &Path, command: &str, _owner: &str) -> Result<(), String> {
-    generate(working_dir, command)
+pub fn generate_for_owner(working_dir: &Path, command: &str, owner: &str) -> Result<(), String> {
+    let ctx = AgentContext {
+        name: owner,
+        role: None,
+        fleet_peers: &[],
+        team: None,
+        extra_instructions: None,
+    };
+    generate_with_context(working_dir, command, Some(&ctx))
 }
 
 /// Generate with fleet context (name, role, peers). Fail-closed:
