@@ -944,6 +944,131 @@ fn release_full_refuses_binding_rewrite_between_snapshot_and_remove_s1() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// S1 RED: two release actors may snapshot the same generation, but only one may
+/// perform the remove+unbind transition. Both threads rendezvous after snapshot,
+/// so the race is deterministic and sleep-free.
+#[test]
+fn concurrent_release_actors_apply_one_transition_s1() {
+    let home = tmp_home("s1-release-once");
+    let repo = tmp_repo("s1-release-once-repo");
+    lease_bound(&home, &repo, "agent-once", "feat/once");
+
+    let rendezvous = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let run = |home: PathBuf, rendezvous: std::sync::Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            let _hook = release_test_seam::install(move |phase| {
+                if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                    rendezvous.wait();
+                }
+            });
+            release_full(&home, "agent-once", false)
+        })
+    };
+    let a = run(home.clone(), rendezvous.clone());
+    let b = run(home.clone(), rendezvous);
+    let outcomes = [a.join().expect("release A"), b.join().expect("release B")];
+
+    assert_eq!(
+        outcomes.iter().filter(|o| o.binding_removed).count(),
+        1,
+        "one generation permits exactly one binding transition: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| o.worktree_removed).count(),
+        1,
+        "one generation permits exactly one worktree removal: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| o.already_released).count(),
+        1,
+        "the losing actor converges as an idempotent no-op: {outcomes:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// S1 RED: reverse reconciliation is another live remove+unbind actor. If it
+/// wins after manual release's snapshot, the manual actor must converge on
+/// Absent instead of applying a second transition to the restored workspace.
+#[test]
+fn reverse_reconcile_vs_release_applies_one_transition_s1() {
+    let home = tmp_home("s1-reverse-release");
+    let repo = tmp_repo("s1-reverse-release-repo");
+    let ws = converted_workspace_with_commit(&home, &repo, "agent-reverse", "feat/reverse");
+    crate::binding::bind_full(
+        &home,
+        "agent-reverse",
+        "T-reverse",
+        "feat/reverse",
+        &ws,
+        &repo,
+        false,
+    )
+    .expect("bind converted workspace");
+
+    let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let home_for_release = home.clone();
+    let release_thread = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                snap_tx.send(()).expect("publish snapshot phase");
+                resume_rx.recv().expect("resume manual release");
+            }
+        });
+        release_full(&home_for_release, "agent-reverse", false)
+    });
+
+    snap_rx.recv().expect("manual release snapped binding");
+    reverse_reconcile(&home, "agent-reverse").expect("reverse reconcile wins");
+    resume_tx.send(()).expect("resume manual release");
+    let manual = release_thread.join().expect("manual release thread");
+
+    assert!(
+        manual.already_released && !manual.binding_removed && !manual.worktree_removed,
+        "losing manual actor must be an Absent no-op, not a second transition: {manual:?}"
+    );
+    assert!(
+        ws.join(".git").is_dir(),
+        "reverse reconcile's restored standalone workspace survives"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// S1 RED: an unreadable/corrupt/future binding is Opaque, never Absent. A
+/// destructive caller must refuse rather than treating ambiguity as an
+/// idempotent success.
+#[test]
+fn release_refuses_opaque_binding_instead_of_treating_it_absent_s1() {
+    let home = tmp_home("s1-opaque-binding");
+    let runtime = crate::paths::runtime_dir(&home).join("agent-opaque");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    std::fs::write(runtime.join("binding.json"), b"{not valid json").expect("opaque binding");
+
+    let outcome = release_full(&home, "agent-opaque", false);
+    assert!(
+        !outcome.released && !outcome.already_released,
+        "Opaque must refuse, never collapse to Absent: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("opaque")),
+        "refusal names opaque binding state: {:?}",
+        outcome.error
+    );
+    assert!(
+        runtime.join("binding.json").exists(),
+        "opaque evidence is preserved byte-for-byte"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// §3.9 regression (#t-21 HIGH #1): `release_full(dry_run=true)` must be
 /// observation-only — the worktree directory AND binding.json must survive.
 /// Pre-fix, `remove_worktree` + `clear_binding_state` ran unconditionally,
