@@ -223,6 +223,180 @@ fn force_preserves_other_agents() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// ── S2 force/rebase authority matrix (RED-first) ─────────────────────
+
+fn write_raw_binding(home: &std::path::Path, agent: &str, body: &str) {
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("binding.json"), body).unwrap();
+}
+
+fn seed_binding_target(
+    home: &std::path::Path,
+    agent: &str,
+    branch: &str,
+    source_repo: &std::path::Path,
+) -> std::path::PathBuf {
+    let target = home.join("worktrees").join(agent).join(branch);
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join(crate::worktree_pool::MANAGED_MARKER),
+        format!("agent={agent}\nbranch={branch}\n"),
+    )
+    .unwrap();
+    crate::binding::bind_full(home, agent, "", branch, &target, source_repo, false).unwrap();
+    target
+}
+
+#[test]
+fn s2_force_known_branch_mismatch_refuses_without_mutation() {
+    let home = tmp_home("s2-known-mismatch");
+    let source = home.join("repo-a");
+    std::fs::create_dir_all(&source).unwrap();
+    let target = seed_binding_target(&home, "agent", "feature/live", &source);
+    let before = std::fs::read_to_string(crate::paths::binding_path(&home, "agent")).unwrap();
+    let result = handle_release_worktree(
+        &home,
+        &json!({"instance":"agent", "branch":"feature/other", "force":true}),
+        &None,
+    );
+    assert!(
+        result["error"].is_string(),
+        "mismatched known binding must refuse: {result}"
+    );
+    assert!(target.exists(), "mismatch must not remove target");
+    assert_eq!(
+        std::fs::read_to_string(crate::paths::binding_path(&home, "agent")).unwrap(),
+        before,
+        "mismatch must preserve binding evidence"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_force_opaque_binding_refuses_without_mutation() {
+    let home = tmp_home("s2-opaque");
+    let target = seed_force_worktree(&home, "agent", "feature/opaque");
+    write_raw_binding(&home, "agent", "{ definitely not json");
+    let result = handle_release_worktree(
+        &home,
+        &json!({"instance":"agent", "branch":"feature/opaque", "force":true}),
+        &None,
+    );
+    assert!(
+        result["error"].is_string(),
+        "opaque binding must refuse: {result}"
+    );
+    assert!(target.exists(), "opaque state must not remove target");
+    assert_eq!(
+        std::fs::read_to_string(crate::paths::binding_path(&home, "agent")).unwrap(),
+        "{ definitely not json"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_force_absent_unmanaged_orphan_refuses_with_operator_route() {
+    let home = tmp_home("s2-absent-unmanaged");
+    let target = home.join("worktrees").join("agent").join("feature/orphan");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("important.txt"), "operator data").unwrap();
+    let result = handle_release_worktree(
+        &home,
+        &json!({"instance":"agent", "branch":"feature/orphan", "force":true}),
+        &None,
+    );
+    let error = result["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("GC archive") || error.contains("operator"),
+        "refusal must name sanctioned recovery channel: {result}"
+    );
+    assert!(target.exists(), "unmanaged orphan must be preserved");
+    assert!(target.join("important.txt").exists());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_force_explicit_repo_disagreement_refuses_without_mutation() {
+    let home = tmp_home("s2-repo-disagreement");
+    let source = home.join("repo-owner");
+    let other = home.join("repo-explicit");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let target = seed_binding_target(&home, "agent", "feature/owned", &source);
+    let result = handle_release_worktree(
+        &home,
+        &json!({
+            "instance":"agent",
+            "branch":"feature/owned",
+            "repository_path":other,
+            "force":true
+        }),
+        &None,
+    );
+    assert!(
+        result["error"].is_string(),
+        "explicit repo disagreement must refuse: {result}"
+    );
+    assert!(target.exists(), "repo disagreement must not remove target");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_force_racing_new_generation_preserves_new_binding_and_target() {
+    let home = tmp_home("s2-generation-race");
+    let source = home.join("repo-race");
+    std::fs::create_dir_all(&source).unwrap();
+    let target = seed_binding_target(&home, "agent", "feature/race", &source);
+    let replacement = serde_json::json!({
+        "version": 1,
+        "agent":"agent",
+        "task_id":"new",
+        "branch":"feature/race",
+        "worktree":target.display().to_string(),
+        "source_repo":source.display().to_string(),
+        "issued_at":"2099-01-01T00:00:00Z"
+    });
+    let hook_home = home.clone();
+    let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+        if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
+            write_raw_binding(
+                &hook_home,
+                "agent",
+                &serde_json::to_string(&replacement).unwrap(),
+            );
+        }
+    });
+    let result = handle_release_worktree(
+        &home,
+        &json!({"instance":"agent", "branch":"feature/race", "force":true}),
+        &None,
+    );
+    assert!(
+        result["error"].is_string(),
+        "new generation must win the race: {result}"
+    );
+    assert!(
+        target.exists(),
+        "new generation race must not remove target"
+    );
+    let live: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(crate::paths::binding_path(&home, "agent")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(live["task_id"], "new");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn s2_legacy_soft_release_has_no_production_entry_point() {
+    let source = include_str!("../../../worktree_pool.rs");
+    assert!(
+        !source.contains("pub fn release("),
+        "legacy soft release must be deleted; force/rebase must use guarded transaction"
+    );
+}
+
 /// Regression anchor: unlike `force:false` (which refuses to remove a
 /// dir lacking the `.agend-managed` marker), `force:true` cleans it
 /// unconditionally — this is the stale-state recovery semantics the
