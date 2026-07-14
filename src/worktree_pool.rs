@@ -506,7 +506,6 @@ pub(crate) use workspace::{
 
 fn clear_binding_state(home: &Path, agent: &str) {
     crate::binding::unbind(home, agent);
-    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
 }
 
 fn resolve_branch_cleanup(
@@ -738,6 +737,15 @@ fn release_full_guarded(
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
+    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+        return ReleaseOutcome {
+            error: Some(format!(
+                "release refused: bind/rebase in flight for agent '{agent}'"
+            )),
+            ..ReleaseOutcome::default()
+        };
+    }
+
     let (snapshot, fingerprint) = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
         Ok(GuardedBinding::Absent) => return idempotent_absent(),
@@ -841,6 +849,15 @@ fn release_bound_target_exact_impl(
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
+    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+        return ReleaseOutcome {
+            error: Some(format!(
+                "release refused: bind/rebase in flight for agent '{agent}'"
+            )),
+            ..ReleaseOutcome::default()
+        };
+    }
+
     let snapshot = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
         Ok(GuardedBinding::Absent) => return idempotent_absent(),
@@ -930,6 +947,15 @@ fn release_bound_target_exact_impl(
             git_metadata_repos: metadata.repos_touched,
             ..ReleaseOutcome::default()
         };
+        if let crate::mcp::handlers::ExactMetadataState::Opaque(reason) = &metadata.state {
+            out.error = Some(format!(
+                "exact git metadata enumeration opaque; binding preserved: {reason}"
+            ));
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            return out;
+        }
         if metadata.matched && metadata.pruned_count == 0 {
             out.error = Some(
                 "exact git worktree metadata matched but could not be removed; binding preserved"
@@ -1098,6 +1124,14 @@ pub(crate) fn release_absent_target_under_branch_lock(
     source_repo: &Path,
     sender: Option<&str>,
 ) -> ReleaseOutcome {
+    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+        return ReleaseOutcome {
+            error: Some(format!(
+                "release refused: bind/rebase in flight for agent '{agent}'"
+            )),
+            ..ReleaseOutcome::default()
+        };
+    }
     let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, agent) {
         Ok(lock) => lock,
         Err(e) => return opaque_release(e),
@@ -1139,6 +1173,14 @@ pub(crate) fn release_absent_target_under_branch_lock(
             crate::mcp::handlers::prune_exact_git_metadata(source_repo, target, agent, branch);
         out.git_metadata_pruned = metadata.pruned_count;
         out.git_metadata_repos = metadata.repos_touched;
+        if let crate::mcp::handlers::ExactMetadataState::Opaque(reason) = &metadata.state {
+            out.error = Some(format!(
+                "exact git metadata enumeration opaque; state preserved: {reason}"
+            ));
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return out;
+        }
         if metadata.matched && metadata.pruned_count == 0 {
             out.error = Some(
                 "exact git worktree metadata matched but could not be removed; state preserved"

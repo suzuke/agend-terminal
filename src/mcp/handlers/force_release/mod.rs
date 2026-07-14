@@ -24,12 +24,17 @@ use serde_json::Value;
 use std::path::Path;
 
 mod gc;
+#[cfg(test)]
+mod gc_legacy;
 mod repair;
 mod s2;
 
 #[cfg(test)]
 pub(crate) use gc::gc_test_seam;
-pub(crate) use gc::prune_exact_git_metadata;
+pub(crate) use gc::{prune_exact_git_metadata, ExactMetadataState};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use gc_legacy::prune_git_metadata_for_agent;
 pub(crate) use repair::attempt_safe_rebind_repair_with_continuation;
 pub(crate) use s2::{classify_target, TargetState};
 #[cfg(test)]

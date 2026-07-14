@@ -46,6 +46,7 @@ pub(crate) struct RebaseContinuation {
     pub(crate) marker_body: Vec<u8>,
     pub(crate) binding_body: Vec<u8>,
     pub(crate) binding_signature: Option<Vec<u8>>,
+    pub(crate) binding_fingerprint: crate::binding::BindingFingerprint,
 }
 
 impl RebaseContinuation {
@@ -58,6 +59,27 @@ impl RebaseContinuation {
         .map_err(|e| format!("rollback branch lease lock failed: {e}"))?;
         let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, agent)?;
         let _binding_lock = crate::binding::acquire_binding_file_lock(home, agent)?;
+        let live = crate::binding::guarded_binding_disk_fresh(home, agent);
+        match live {
+            crate::binding::GuardedBinding::Known { fingerprint, .. }
+                if fingerprint == self.binding_fingerprint => {}
+            crate::binding::GuardedBinding::Known { .. } => {
+                return Err(
+                    "rollback refused: binding generation advanced while rebase was in flight"
+                        .to_string(),
+                )
+            }
+            crate::binding::GuardedBinding::Absent => {
+                return Err(
+                    "rollback refused: binding disappeared while rebase was in flight".to_string(),
+                )
+            }
+            crate::binding::GuardedBinding::Opaque(reason) => {
+                return Err(format!(
+                    "rollback refused: binding became opaque while rebase was in flight: {reason}"
+                ))
+            }
+        }
         let current = crate::git_helpers::git_cmd(&self.worktree, &["branch", "--show-current"])
             .map_err(|e| format!("rollback read current branch failed: {e}"))?;
         if current != self.previous_branch {

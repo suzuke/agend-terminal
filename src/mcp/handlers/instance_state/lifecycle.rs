@@ -67,6 +67,11 @@ fn remove_empty_dir_tree(dir: &Path) {
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
+    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, name) {
+        return Err(format!(
+            "delete refused: bind/rebase in flight for agent '{name}'"
+        ));
+    }
     // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
     // held until this fn returns (after workspace cleanup + the residual audit
     // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
@@ -292,7 +297,6 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // binding (blocking a same-name re-bind) AND tripped the residual audit below
     // → the whole teardown returned Err despite otherwise succeeding.
     crate::binding::unbind(home, name);
-    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, name);
     // #1907: `unbind` drops binding.json + its HMAC sidecar but leaves the now-empty
     // `runtime/<name>/` dir + its `.binding.json.lock` flock behind. Remove the whole
     // dir so teardown is fully clean (the residual audit below now checks it). Safe:

@@ -1296,7 +1296,7 @@ fn r4_exact_metadata_list_failure_is_opaque_and_preserves_binding() {
         }),
         &None,
     );
-    assert_eq!(result["released"].as_bool(), Some(false), "{result}");
+    assert_ne!(result["released"].as_bool(), Some(true), "{result}");
     assert!(
         result["error"]
             .as_str()

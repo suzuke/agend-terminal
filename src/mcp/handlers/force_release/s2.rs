@@ -98,6 +98,11 @@ pub(crate) fn force_release(
     explicit_repo: Option<&Path>,
     sender: Option<&str>,
 ) -> Result<ForceReleaseResult, String> {
+    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+        return Err(format!(
+            "force release refused: bind/rebase in flight for agent '{agent}'"
+        ));
+    }
     let state = crate::binding::preflight_guarded_binding(home, agent);
     let (identity, expected) = match state {
         GuardedBinding::Opaque(reason) => {
@@ -634,6 +639,7 @@ pub(crate) fn rebase_repair(
                     marker_body,
                     binding_body,
                     binding_signature,
+                    binding_fingerprint: fingerprint,
                 }),
             })
         }

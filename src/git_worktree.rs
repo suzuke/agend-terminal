@@ -101,6 +101,21 @@ pub(crate) fn list_porcelain(repo: &Path) -> std::io::Result<Vec<(PathBuf, Optio
     Ok(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Exact-owner variant: a non-zero `git worktree list` result is an opaque
+/// metadata read failure, never an empty repository. Destructive callers use
+/// this to preserve binding/evidence instead of treating unreadable metadata
+/// as `ExactNone`.
+pub(crate) fn list_porcelain_exact(repo: &Path) -> std::io::Result<Vec<(PathBuf, Option<String>)>> {
+    let out = crate::git_helpers::git_bypass(repo, &LIST_PORCELAIN_ARGS)?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// `git worktree remove --force <wt_path>`.
 ///
 /// `source_repo` empty → [`git_helpers::git_bypass_no_cwd`] (no `current_dir`;
