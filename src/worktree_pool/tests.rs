@@ -4289,3 +4289,163 @@ fn pr_merge_status_unknown_without_github_remote_keeps_branch_red7() {
 
     std::fs::remove_dir_all(&repo).ok();
 }
+
+// ── r6: lifecycle permit drop race and concurrency controls ───────────
+
+/// r6 RED: when a `LifecyclePermit` is cloned and both the original and the
+/// clone drop on separate threads, the active-permits map entry must be cleaned
+/// so that a new permit can be acquired for the same agent afterward.
+///
+/// At 059e543f the outer wrapper checks `Arc::strong_count` in `Drop` which
+/// races when two clones drop concurrently — one thread can see count=2,
+/// the other also sees count=2, and neither cleans the entry.
+#[test]
+fn r6_permit_concurrent_clone_drop_leaves_map_reusable() {
+    use crate::mcp::handlers::dispatch_hook::{
+        lifecycle_is_active, LifecycleOperation, LifecyclePermit,
+    };
+    use std::path::Path;
+
+    let home = Path::new("/tmp/agend-r6-permit-drop");
+    let agent = "agent-r6-drop";
+
+    let permit = LifecyclePermit::acquire(home, agent, LifecycleOperation::Release)
+        .expect("initial acquire");
+    assert!(
+        lifecycle_is_active(home, agent),
+        "permit must register in active map"
+    );
+
+    // Clone and drop both on separate threads simultaneously.
+    let clone = permit.clone();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b1 = barrier.clone();
+    let t1 = std::thread::spawn(move || {
+        b1.wait();
+        drop(permit);
+    });
+    let b2 = barrier.clone();
+    let t2 = std::thread::spawn(move || {
+        b2.wait();
+        drop(clone);
+    });
+    t1.join().expect("t1");
+    t2.join().expect("t2");
+
+    // After both drops, the map entry MUST be gone.
+    assert!(
+        !lifecycle_is_active(home, agent),
+        "active map entry leaked after concurrent clone drops"
+    );
+
+    // A new permit for the same agent must be acquirable.
+    let permit2 = LifecyclePermit::acquire(home, agent, LifecycleOperation::Bind);
+    assert!(
+        permit2.is_ok(),
+        "second acquire after concurrent drops must succeed: {:?}",
+        permit2.err()
+    );
+    drop(permit2);
+}
+
+/// r6 RED: two release actors racing for the same agent — the second must be
+/// refused BEFORE reaching snapshot (no barrier, no sleep, no rendezvous).
+#[test]
+fn r6_release_release_first_actor_owns_second_refuses_before_snapshot() {
+    let home = tmp_home("r6-release-release");
+    let repo = tmp_repo("r6-release-release-repo");
+    let _l = lease_bound(&home, &repo, "agent-rr", "feat/rr");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+    let home_a = home.clone();
+    let actor_a = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                entered_tx.send(()).expect("signal entered");
+                resume_rx.recv().expect("wait for resume");
+            }
+        });
+        release_full(&home_a, "agent-rr", false)
+    });
+
+    // Wait until actor A holds the permit and is inside the transaction.
+    entered_rx.recv().expect("actor A entered transaction");
+
+    // Actor B: must be refused immediately by the lifecycle permit.
+    let outcome_b = release_full(&home, "agent-rr", false);
+    assert!(
+        outcome_b.error.as_deref().is_some_and(|e| e.contains("lifecycle transaction already in flight")
+            || e.contains("lifecycle permit")),
+        "actor B must be refused before snapshot, got: {:?}",
+        outcome_b
+    );
+    assert!(
+        !outcome_b.released && !outcome_b.binding_removed,
+        "refused actor B must not have touched anything: {outcome_b:?}"
+    );
+
+    // Let actor A finish.
+    resume_tx.send(()).expect("resume actor A");
+    let outcome_a = actor_a.join().expect("actor A thread");
+    assert!(
+        outcome_a.released,
+        "actor A must complete the transition: {outcome_a:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// r6 RED: reverse reconcile vs release — whichever acquires the permit first
+/// wins; the other is refused before any mutation. No barrier needed.
+#[test]
+fn r6_reverse_release_start_orders_serialize_without_barrier() {
+    let home = tmp_home("r6-reverse-order");
+    let repo = tmp_repo("r6-reverse-order-repo");
+    let ws = converted_workspace_with_commit(&home, &repo, "agent-rv", "feat/rv");
+    crate::binding::bind_full(&home, "agent-rv", "T-rv", "feat/rv", &ws, &repo, false)
+        .expect("bind converted workspace");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+    let home_release = home.clone();
+    let release_thread = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                entered_tx.send(()).expect("signal entered");
+                resume_rx.recv().expect("wait for resume");
+            }
+        });
+        release_full(&home_release, "agent-rv", false)
+    });
+
+    // Wait until release holds the permit and is inside the transaction.
+    entered_rx.recv().expect("release entered transaction");
+
+    // reverse_reconcile must be refused because the release actor holds the permit.
+    let rv_result = reverse_reconcile(&home, "agent-rv");
+    assert!(
+        rv_result.is_err(),
+        "reverse_reconcile must fail when release holds permit, got: {rv_result:?}"
+    );
+    let err = rv_result.unwrap_err();
+    assert!(
+        err.contains("lifecycle transaction already in flight")
+            || err.contains("refused"),
+        "error must mention permit conflict: {err}"
+    );
+
+    // Let release finish.
+    resume_tx.send(()).expect("resume release");
+    let release_outcome = release_thread.join().expect("release thread");
+    assert!(
+        release_outcome.released,
+        "release must complete: {release_outcome:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
