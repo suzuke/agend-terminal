@@ -1496,4 +1496,164 @@ mod tests {
         assert!(remaining.iter().all(|(_, t)| t.correlation == "o/r@b2"));
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── task167 RED-first R1-R15: protected-main episode settlement ────────
+    fn protected_message(agent: &str, correlation: &str, episode: &str) -> crate::inbox::InboxMessage {
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:ci", "ci-ready-for-action", format!("[ci-ready-for-action] {correlation}"),
+        ).with_correlation_id(correlation.to_string());
+        msg.ci_handoff_episode = Some(episode.to_string());
+        msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Protected);
+        msg.text = format!("{agent}:{correlation}");
+        msg
+    }
+    fn seed_protected(home: &Path, agent: &str, correlation: &str, episode: &str) {
+        crate::inbox::enqueue(home, agent, protected_message(agent, correlation, episode)).unwrap();
+        assert!(record_with_identity(home, agent, correlation, "2026-06-10T00:00:00Z", Some("HEAD"), None,
+            Some(episode), Some(crate::inbox::CiHandoffClass::Protected)));
+    }
+
+    #[test]
+    fn r1_episode_and_class_round_trip() {
+        let home = tmp_home("r1-identity");
+        assert!(record_with_identity(&home, "reviewer", "o/r@main", "2026-06-10T00:00:00Z", None, None,
+            Some("ep-1"), Some(crate::inbox::CiHandoffClass::Protected)));
+        let track = &list(&home)[0].1;
+        assert_eq!(track.ci_handoff_episode.as_deref(), Some("ep-1"));
+        assert_eq!(track.ci_handoff_class, Some(crate::inbox::CiHandoffClass::Protected));
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r2_resolver_requires_exact_episode() {
+        let home = tmp_home("r2-exact");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-old", "ack_protected"), 0);
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r3_old_ack_after_rerecord_preserves_new_episode() {
+        let home = tmp_home("r3-rerecord");
+        assert!(record_with_identity(&home, "reviewer", "o/r@main", "2026-06-10T00:00:00Z", None, None, Some("old"), Some(crate::inbox::CiHandoffClass::Protected)));
+        assert!(record_with_identity(&home, "reviewer", "o/r@main", "2026-06-10T01:00:00Z", None, None, Some("new"), Some(crate::inbox::CiHandoffClass::Protected)));
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "o/r@main", "old", "ack_protected"), 0);
+        assert_eq!(list(&home)[0].1.ci_handoff_episode.as_deref(), Some("new"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r4_target_isolation() {
+        let home = tmp_home("r4-target");
+        seed_protected(&home, "a", "o/r@main", "ep-a");
+        seed_protected(&home, "b", "o/r@main", "ep-b");
+        assert_eq!(resolve_protected_episode(&home, "a", "o/r@main", "ep-a", "ack_protected"), 1);
+        assert_eq!(list(&home)[0].1.target, "b");
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r5_cross_repo_correlation_isolation() {
+        let home = tmp_home("r5-repo");
+        seed_protected(&home, "reviewer", "one/r@main", "ep-1");
+        seed_protected(&home, "reviewer", "two/r@main", "ep-2");
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "one/r@main", "ep-1", "ack_protected"), 1);
+        assert_eq!(list(&home)[0].1.correlation, "two/r@main");
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r6_legacy_classless_track_fails_closed() {
+        let home = tmp_home("r6-legacy");
+        record(&home, "reviewer", "o/r@main", "2026-06-10T00:00:00Z", None, None);
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r7_feature_class_fails_closed_for_protected_settlement() {
+        let home = tmp_home("r7-feature");
+        assert!(record_with_identity(&home, "reviewer", "o/r@feature", "2026-06-10T00:00:00Z", None, None, Some("ep-1"), Some(crate::inbox::CiHandoffClass::Feature)));
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "o/r@feature", "ep-1", "ack_protected"), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r8_explicit_single_ack_settles_exact_protected_track() {
+        let home = tmp_home("r8-single");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r9_explicit_batch_ack_settles_all_exact_rows() {
+        let home = tmp_home("r9-batch");
+        seed_protected(&home, "reviewer", "o/r@a", "ep-a");
+        seed_protected(&home, "reviewer", "o/r@b", "ep-b");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 2);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r10_implicit_next_drain_ack_settles_prior_batch() {
+        let home = tmp_home("r10-implicit");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::drain(&home, "reviewer");
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r11_new_delivery_does_not_resolve_track() {
+        let home = tmp_home("r11-new-delivery");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        assert_eq!(crate::inbox::drain(&home, "reviewer").len(), 1);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r12_reconciler_resolves_processed_row_after_grace() {
+        let home = tmp_home("r12-reconcile");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::ack(&home, "reviewer", None);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r13_reconciler_missing_row_fails_closed() {
+        let home = tmp_home("r13-missing");
+        assert!(record_with_identity(&home, "reviewer", "o/r@main", "2026-06-10T00:00:00Z", None, None, Some("ep-1"), Some(crate::inbox::CiHandoffClass::Protected)));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r14_reconciler_ambiguous_rows_fails_closed() {
+        let home = tmp_home("r14-ambiguous");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        let mut duplicate = protected_message("reviewer", "o/r@main", "ep-1");
+        duplicate.id = Some("duplicate".into());
+        crate::inbox::enqueue(&home, "reviewer", duplicate).unwrap();
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::ack(&home, "reviewer", None);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r15_repeated_ack_and_resolution_are_idempotent() {
+        let home = tmp_home("r15-idempotent");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 1);
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 0);
+        assert!(list(&home).is_empty());
+        assert_eq!(resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"), 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
