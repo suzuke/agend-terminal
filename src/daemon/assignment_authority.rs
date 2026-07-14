@@ -953,8 +953,13 @@ pub(crate) fn revoke(
 /// `expected_id`. Used by the reconciler to retire obsolete assignments whose
 /// PrState subject has advanced past the assignment's snapshot. The CAS guard
 /// prevents a stale retire from removing a replacement assignment that arrived
-/// between the lock-free `list_active` scan and this locked mutation. Supersedes
-/// the delivery nonce and enqueues a revocation notice when the row had been read.
+/// between the lock-free `list_active` scan and this locked mutation.
+///
+/// Ordering invariant: the stale inbox row (and any revocation notice) must be
+/// durably superseded BEFORE the authority record is deleted. A persistence
+/// failure at any point preserves the authority — fail closed. Retry after
+/// interruption converges: supersede is idempotent on an already-superseded
+/// row, so re-running after a crash between supersede and delete is safe.
 pub(crate) fn retire_if_id_matches(
     home: &Path,
     repo: &str,
@@ -969,19 +974,27 @@ pub(crate) fn retire_if_id_matches(
         Ok(Some(r)) if r.assignment_id == expected_id => r,
         _ => return Ok(false), // absent, corrupt, or replaced — no-op
     };
-    let removed = remove_if_assignment_matches(&path, expected_id);
-    if removed {
-        let successor = format!("retired-{}", expected_id);
-        let outcome = crate::inbox::storage::supersede_by_nonce(
-            home,
-            target,
-            &record.delivery_nonce,
-            &successor,
-        );
-        if outcome.was_read {
-            crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
-        }
+
+    // Step 1: durably supersede the stale inbox row. If this fails the
+    // authority stays intact — the reviewer may still pick it up, which is
+    // strictly better than a dangling actionable row with no authority.
+    let successor = format!("retired-{}", expected_id);
+    let outcome = crate::inbox::storage::supersede_by_nonce_strict(
+        home,
+        target,
+        &record.delivery_nonce,
+        &successor,
+    )?;
+
+    // Step 2: if the reviewer had already read the assignment, enqueue a
+    // deterministic revocation notice so they learn it was retracted.
+    if outcome.was_read {
+        crate::inbox::storage::enqueue(home, target, build_revocation_notice(&record, now))?;
     }
+
+    // Step 3: NOW safe to delete the authority — the stale inbox state has
+    // been durably superseded (or was already non-actionable).
+    let removed = remove_if_assignment_matches_strict(&path, expected_id)?;
     Ok(removed)
 }
 
