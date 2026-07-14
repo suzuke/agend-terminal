@@ -1023,13 +1023,20 @@ fn aliased_manual_and_auto_release_share_one_lifecycle_transaction_s2() {
 
     resume_tx.send(()).expect("resume manual release");
     let manual = manual.join().expect("manual release thread");
-    assert!(manual.released && manual.binding_removed, "manual: {manual:?}");
+    assert!(
+        manual.released && manual.binding_removed,
+        "manual: {manual:?}"
+    );
 
     let events = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
     assert_eq!(
         events.matches("worktree_released_full").count(),
         1,
         "one aliased release transaction must emit one terminal event: {events}"
+    );
+    assert!(
+        events.contains("operation=Release provenance=manual"),
+        "terminal release event must preserve manual provenance: {events}"
     );
 
     std::fs::remove_dir_all(&home).ok();

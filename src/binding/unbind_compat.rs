@@ -10,5 +10,5 @@ pub fn unbind(home: &std::path::Path, agent: &str) {
     ) else {
         return;
     };
-    super::unbind_with_permit(home, agent, &permit);
+    let _ = super::unbind_with_permit(home, agent, &permit);
 }
