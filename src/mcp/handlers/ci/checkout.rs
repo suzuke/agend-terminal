@@ -175,6 +175,31 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
         }
     }
+    // #6: optional exact-head precondition. When provided, resolve the branch
+    // HEAD and compare; mismatch returns a structured error with zero mutation.
+    // Omitted expected_head preserves all current behavior byte-identically.
+    if let Some(expected) = args["expected_head"].as_str() {
+        let is_full_hex = expected.len() >= 40
+            && expected.len() <= 64
+            && expected.chars().all(|c| c.is_ascii_hexdigit());
+        if !is_full_hex {
+            return json!({
+                "error": format!("expected_head must be a full 40/64-hex SHA, got '{expected}'"),
+                "code": "invalid_expected_head",
+            });
+        }
+        let actual = crate::git_helpers::git_cmd(Path::new(&source_path), &["rev-parse", branch])
+            .unwrap_or_default();
+        let actual = actual.trim();
+        if !actual.eq_ignore_ascii_case(expected) {
+            return json!({
+                "error": format!("expected_head {expected} does not match branch HEAD {actual}"),
+                "code": "expected_head_mismatch",
+                "expected_head": expected,
+                "actual_head": actual,
+            });
+        }
+    }
     // #1494: idempotent bind. If THIS agent already holds a binding on the SAME
     // branch with a live worktree (provisioned by the dispatch pre-build hook or a
     // prior `repo checkout`), the `git worktree add` below would fail "is already
@@ -291,7 +316,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     // lock transfer, CAS re-read, canonical daemon-managed provenance, then
                     // sync-to-final-HEAD → strict init → gitlink verify) lives in the sibling
                     // `checkout_reuse` module to keep this handler under the LOC ceiling.
-                    return super::checkout_reuse::try_reuse_bound_worktree(
+                    let mut reuse_resp = super::checkout_reuse::try_reuse_bound_worktree(
                         home,
                         instance_name,
                         branch,
@@ -302,6 +327,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         auto_created_branch,
                         fetch_attempted,
                     );
+                    // #6: echo expected_head/actual_head on idempotent reuse
+                    // (validation already passed above).
+                    if let Some(expected) = args["expected_head"].as_str() {
+                        reuse_resp["expected_head"] = json!(expected);
+                        reuse_resp["actual_head"] = json!(expected);
+                    }
+                    return reuse_resp;
                 }
                 let existing_task_id = existing
                     .get("task_id")
@@ -679,6 +711,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             // Committed durable ⇒ transaction resolved; drop the journal tombstone.
             super::checkout_txn::Journal::clear(home, &mangled);
+            // #6: echo expected_head/actual_head only when the caller supplied it
+            // (omitted → no new fields, byte-compatible with pre-#6 callers).
+            if let Some(expected) = args["expected_head"].as_str() {
+                resp["expected_head"] = json!(expected);
+                resp["actual_head"] = json!(expected); // they matched (validated above)
+            }
             resp
         }
         Ok(o) => {

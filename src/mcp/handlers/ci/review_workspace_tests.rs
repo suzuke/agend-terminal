@@ -6,6 +6,7 @@
 //!   3. `send` schema `bind` parameter exposure (test 9)
 
 use serde_json::json;
+#[cfg(unix)]
 use std::path::Path;
 
 // ── Fixtures (reuse the ci/tests.rs pattern) ─────────────────────────

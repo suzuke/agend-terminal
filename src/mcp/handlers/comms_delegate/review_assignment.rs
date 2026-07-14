@@ -31,13 +31,35 @@ use std::path::Path;
 ///       same-namespace self-review; `External(login)` is a distinct principal and
 ///       is NEVER string-compared to the agent target. (sender == target is already
 ///       rejected upstream in `resolve_delegate`.)
-pub(super) fn validate_review_assignment_marker(
+// #6: pub(crate) so ci/review_workspace_tests can drive bind rejection tests.
+pub(crate) fn validate_review_assignment_marker(
     home: &Path,
     sender: &Sender,
     target: &str,
     args: &Value,
     checks: &DispatchPreChecks,
 ) -> Result<String, Value> {
+    // #6: review_assignment must not bind the reviewer to the implementer's branch.
+    // Workspace provisioning is a separate concern — reviewers get isolated worktrees
+    // via `repo checkout` instead.
+    if args.get("bind").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(json!({
+            "error": "review_assignment must not bind the reviewer to the subject branch \
+                      — use an isolated review branch via repo checkout instead",
+            "code": "review_assignment_bind_rejected",
+        }));
+    }
+    if args
+        .get("worktree_binding_required")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return Err(json!({
+            "error": "review_assignment does not support worktree_binding_required \
+                      — reviewer workspace provisioning is separate",
+            "code": "review_assignment_worktree_binding_rejected",
+        }));
+    }
     // (a) mandatory explicit generation-bound identifiers.
     if args["task_id"].as_str().unwrap_or("").is_empty() {
         return Err(json!({

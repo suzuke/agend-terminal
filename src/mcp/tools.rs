@@ -76,6 +76,7 @@ pub(crate) fn def_send() -> Value {
             "branch": {"type": "string"},
             "eta_minutes": {"type": "integer", "description": "Expected completion time in minutes"},
             "reporting_cadence": {"type": "string", "enum": ["per-pr", "wave-end", "both"], "description": "When implementer should report back"},
+            "bind": {"type": "boolean", "description": "#6: set false to skip auto-bind when dispatching with a branch. Default: auto-bind when branch is present."},
             "worktree_binding_required": {"type": "boolean", "description": "Whether target must bind to a worktree before starting"},
             "expect_reply_within_secs": {"type": "integer", "description": "Opt-in dispatch-idle watchdog (PR1). When set on a kind=task/query send, the daemon records a pending-dispatch sidecar and fires `dispatch_idle_threshold_exceeded` to the dispatcher's inbox if the matching kind=report (correlation_id-keyed) hasn't arrived within this many seconds. Default unset = no tracking (cross-team-safe). Fixup-team dispatches inherit a 10-min default automatically; other teams must opt in explicitly."},
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "#931/#2502: when dispatching kind=task with a `branch`, set this to the agent or agents that should receive `[ci-ready-for-action]` after CI passes on that branch. The daemon's auto-armed ci-watch carries the chain target(s) so the handoff fires without a manual follow-up `ci action=watch next_after_ci=…`. Example: lead dispatches dev with `next_after_ci=[reviewer-a, reviewer-b]` — both reviewers are auto-notified when dev's PR goes green."},
@@ -383,6 +384,7 @@ pub(crate) fn def_repo() -> Value {
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
             "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."},
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
+            "expected_head": {"type": "string", "description": "#6: optional exact full-SHA precondition. When provided, the branch HEAD must equal this value; mismatch returns structured error with zero mutation. Omitted preserves current behavior."},
             "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
             "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. The handler always read this field, but it was never declared here — an MCP client validating against this schema had no way to send it, so force=true silently never reached the daemon (#2539)."},
             "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."}
@@ -1004,6 +1006,7 @@ mod tests {
             ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "review_class", "comms_delegate.rs maybe_auto_bind_lease → resolve_dispatch_review_class authority/fallback (atomic reject on unresolved) + maybe_auto_create_task create_args seed (#2745)"),
+            ("send", "bind", "comms_delegate/mod.rs dispatch_should_skip_auto_bind → skip auto-bind when false (#6 d-4)"),
             ("send", "review_assignment", "comms_gates/dispatch.rs run_dispatch_pre_checks parse → comms_delegate.rs handle_delegate_task validate_review_assignment_marker fail-closed gate (t-…-17)"),
             ("send", "pr_number", "comms_delegate.rs validate_review_assignment_marker — mandatory nonzero generation identity, atomic reject if missing/zero (t-…-17 B18/B19)"),
             ("send", "review_author", "comms_gates/dispatch.rs parse_review_author strict typed parse → comms_delegate.rs validate_review_assignment_marker self-review deny (t-…-17)"),
@@ -1121,6 +1124,7 @@ mod tests {
             ("repo", "audit_reason", "ci/mod.rs cleanup_merged audit"),
             ("repo", "from_ref", "ci/mod.rs checkout auto-create base"),
             ("repo", "task_id", "ci/checkout.rs checkout bind:true → binding::bind_full task_id linkage (#2533)"),
+            ("repo", "expected_head", "ci/checkout.rs checkout bind:true full-SHA precondition — mismatch returns structured error with zero mutation (#6 d-4)"),
             ("repo", "force", "ci/merge.rs handle_merge_repo — CI/base-staleness fail-closed gate bypass (#2539)"),
             ("repo", "force_reason", "ci/merge.rs handle_merge_repo — required non-empty when force=true, audit-logged (#2539)"),
             // ── bind_self ──
