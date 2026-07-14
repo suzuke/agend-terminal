@@ -492,6 +492,7 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
 }
 
 mod workspace;
+pub(crate) use workspace::prepare_workspace_worktree_with_permit;
 #[allow(unused_imports)]
 pub use workspace::{
     checkout_workspace_branch, detach_workspace_to_holding, prepare_workspace_worktree,
@@ -504,8 +505,12 @@ pub(crate) use workspace::{
     worktree_common_dir_matches, worktree_has_work_at_risk,
 };
 
-fn clear_binding_state(home: &Path, agent: &str) {
-    crate::binding::unbind(home, agent);
+fn clear_binding_state(
+    home: &Path,
+    agent: &str,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) {
+    crate::binding::unbind_with_permit(home, agent, permit);
 }
 
 fn resolve_branch_cleanup(
@@ -573,6 +578,7 @@ fn release_known_locked(
     agent: &str,
     binding: &serde_json::Value,
     dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> LockedRelease {
     let mut out = ReleaseOutcome::default();
     let mut notices = Vec::new();
@@ -673,7 +679,7 @@ fn release_known_locked(
                     // worktree-protection refusal must not also skip binding
                     // cleanup. (This arm is already the non-dry_run path; the
                     // dry_run classifier above mutates nothing.)
-                    clear_binding_state(home, agent);
+                    clear_binding_state(home, agent, permit);
                     out.binding_removed = true;
                     return LockedRelease {
                         out,
@@ -708,7 +714,7 @@ fn release_known_locked(
         ));
         out.released = true;
     } else {
-        clear_binding_state(home, agent);
+        clear_binding_state(home, agent, permit);
         out.binding_removed = true;
         // #1465 guardrail: only report `released` when no cleanup step failed.
         // A `WorktreeRemoval::Failed` set `out.error` above — idempotent success
@@ -733,14 +739,15 @@ fn release_full_guarded(
     home: &Path,
     agent: &str,
     dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
-    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+    if !permit.authorizes(home, agent) {
         return ReleaseOutcome {
             error: Some(format!(
-                "release refused: bind/rebase in flight for agent '{agent}'"
+                "release refused: lifecycle permit is not valid for agent '{agent}'"
             )),
             ..ReleaseOutcome::default()
         };
@@ -787,7 +794,7 @@ fn release_full_guarded(
         } if live == fingerprint => value,
         GuardedBinding::Known { .. } => return stale_release(),
     };
-    let mut locked = release_known_locked(home, agent, &current, dry_run);
+    let mut locked = release_known_locked(home, agent, &current, dry_run, permit);
     // Explicit drops document the lock boundary: no notice, marker cleanup,
     // branch cleanup, or release event runs with a flock held.
     drop(_binding_lock);
@@ -824,7 +831,29 @@ fn release_full_guarded(
 }
 
 pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, None)
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
+    release_full_guarded(home, agent, dry_run, &permit, None)
+}
+
+pub(crate) fn release_full_with_permit(
+    home: &Path,
+    agent: &str,
+    dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_full_guarded(home, agent, dry_run, permit, None)
 }
 
 pub(crate) fn release_full_exact(
@@ -832,7 +861,20 @@ pub(crate) fn release_full_exact(
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, false, Some(expected))
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
+    release_full_guarded(home, agent, false, &permit, Some(expected))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -846,13 +888,14 @@ fn release_bound_target_exact_impl(
     clear_binding_on_remove_failure: bool,
     require_force_identity: bool,
     sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
 
-    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+    if !permit.authorizes(home, agent) {
         return ReleaseOutcome {
             error: Some(format!(
-                "release refused: bind/rebase in flight for agent '{agent}'"
+                "release refused: lifecycle permit is not valid for agent '{agent}'"
             )),
             ..ReleaseOutcome::default()
         };
@@ -966,7 +1009,7 @@ fn release_bound_target_exact_impl(
             drop(branch_lock);
             return out;
         }
-        clear_binding_state(home, agent);
+        clear_binding_state(home, agent, permit);
         out.binding_removed = true;
         out.released = true;
         drop(_binding_lock);
@@ -1014,12 +1057,12 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
             clear_marker = true;
-            clear_binding_state(home, agent);
+            clear_binding_state(home, agent, permit);
             out.binding_removed = true;
             out.released = true;
         }
         WorktreeRemoval::AlreadyAbsent => {
-            clear_binding_state(home, agent);
+            clear_binding_state(home, agent, permit);
             out.binding_removed = true;
             out.released = true;
         }
@@ -1027,7 +1070,7 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Failed(error) => {
             out.error = Some(error);
             if clear_binding_on_remove_failure {
-                clear_binding_state(home, agent);
+                clear_binding_state(home, agent, permit);
                 out.binding_removed = true;
             }
         }
@@ -1053,6 +1096,19 @@ pub(crate) fn release_bound_target_exact(
     target: &Path,
     source_repo: &Path,
 ) -> ReleaseOutcome {
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
     release_bound_target_exact_impl(
         home,
         agent,
@@ -1063,6 +1119,31 @@ pub(crate) fn release_bound_target_exact(
         false,
         false,
         None,
+        &permit,
+    )
+}
+
+/// Exact Known-target release when an outer lifecycle transaction already owns
+/// the permit (workspace reverse reconciliation and other composite callers).
+pub(crate) fn release_bound_target_exact_with_permit(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        false,
+        false,
+        false,
+        None,
+        permit,
     )
 }
 
@@ -1076,6 +1157,19 @@ pub(crate) fn release_bound_target_exact_under_branch_lock(
     target: &Path,
     source_repo: &Path,
 ) -> ReleaseOutcome {
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
     release_bound_target_exact_impl(
         home,
         agent,
@@ -1086,6 +1180,31 @@ pub(crate) fn release_bound_target_exact_under_branch_lock(
         true,
         false,
         None,
+        &permit,
+    )
+}
+
+/// Exact Known-target release for checkout rollback when the outer bind
+/// transaction already owns the lifecycle permit and branch lease.
+pub(crate) fn release_bound_target_exact_under_branch_lock_with_permit(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        true,
+        true,
+        false,
+        None,
+        permit,
     )
 }
 
@@ -1099,6 +1218,7 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
     target: &Path,
     source_repo: &Path,
     sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> ReleaseOutcome {
     release_bound_target_exact_impl(
         home,
@@ -1110,6 +1230,7 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
         false,
         true,
         sender,
+        permit,
     )
 }
 
@@ -1123,11 +1244,12 @@ pub(crate) fn release_absent_target_under_branch_lock(
     target: &Path,
     source_repo: &Path,
     sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> ReleaseOutcome {
-    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
+    if !permit.authorizes(home, agent) {
         return ReleaseOutcome {
             error: Some(format!(
-                "release refused: bind/rebase in flight for agent '{agent}'"
+                "release refused: lifecycle permit is not valid for agent '{agent}'"
             )),
             ..ReleaseOutcome::default()
         };

@@ -98,11 +98,12 @@ pub(crate) fn force_release(
     explicit_repo: Option<&Path>,
     sender: Option<&str>,
 ) -> Result<ForceReleaseResult, String> {
-    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent) {
-        return Err(format!(
-            "force release refused: bind/rebase in flight for agent '{agent}'"
-        ));
-    }
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .map_err(|error| format!("force release refused: {error}"))?;
     let state = crate::binding::preflight_guarded_binding(home, agent);
     let (identity, expected) = match state {
         GuardedBinding::Opaque(reason) => {
@@ -180,6 +181,7 @@ pub(crate) fn force_release(
                 &identity.worktree,
                 &identity.source_repo,
                 sender,
+                &permit,
             )
         }
         None => crate::worktree_pool::release_absent_target_under_branch_lock(
@@ -189,6 +191,7 @@ pub(crate) fn force_release(
             &identity.worktree,
             &identity.source_repo,
             sender,
+            &permit,
         ),
     };
     let dir_removed = outcome.worktree_removed
@@ -388,6 +391,7 @@ pub(crate) fn rebase_repair(
     branch: &str,
     explicit_repo: Option<&Path>,
     sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> Result<super::repair::RepairResult, super::repair::RepairBlocked> {
     use super::repair::{RebaseContinuation, RepairAction, RepairBlocked, RepairResult};
 
@@ -431,6 +435,7 @@ pub(crate) fn rebase_repair(
                 &identity.worktree,
                 &identity.source_repo,
                 sender,
+                permit,
             );
             if let Some(error) = outcome.error {
                 return Err(RepairBlocked::PathUnsafe(error));
@@ -493,6 +498,7 @@ pub(crate) fn rebase_repair(
                         &worktree,
                         &identity.source_repo,
                         sender,
+                        permit,
                     );
                 if let Some(error) = outcome.error {
                     return Err(RepairBlocked::PathUnsafe(error));

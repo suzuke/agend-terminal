@@ -92,7 +92,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     let mut continuation = None;
     let mut preheld_guard = None;
     if rebase_mode {
-        let guard = match crate::mcp::handlers::dispatch_hook::acquire_bind_guard(home, agent) {
+        let guard = match crate::mcp::handlers::dispatch_hook::acquire_rebase_guard(home, agent) {
             Ok(guard) => guard,
             Err(reason) => {
                 return json!({
@@ -101,12 +101,14 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
                 });
             }
         };
-        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair_with_continuation(
+        let permit = guard.permit();
+        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair_with_permit(
             home,
             agent,
             branch,
             source_repo_path.as_deref(),
             sender.as_ref().map(|s| s.as_str()),
+            &permit,
         ) {
             Ok(result) => {
                 repair_action = Some(result.action);
@@ -130,6 +132,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             repo_arg,
             source_repo_path.as_deref(),
             guard,
+            continuation.is_some(),
         )
     } else {
         crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
@@ -217,6 +220,20 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
     }
 
     crate::validate_name_or_err!(agent);
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return json!({
+                "released": false,
+                "error": format!("release refused: bind/rebase in flight; {error}"),
+                "code": "lifecycle_conflict"
+            })
+        }
+    };
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     // #789: clean empty init commits before removal (best-effort).
     if !dry_run {
@@ -226,7 +243,7 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
             let _ = crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
         }
     }
-    let outcome = crate::worktree_pool::release_full(home, agent, dry_run);
+    let outcome = crate::worktree_pool::release_full_with_permit(home, agent, dry_run, &permit);
     serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}))
 }
 

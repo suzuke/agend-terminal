@@ -22,8 +22,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain_preheld(
     repo: Option<&str>,
     source_repo_override: Option<&Path>,
     guard: BindGuard,
+    rebase_continuation: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
-    PREHELD_DISPATCH.with(|slot| *slot.borrow_mut() = Some((guard, true)));
+    PREHELD_DISPATCH.with(|slot| *slot.borrow_mut() = Some((guard, rebase_continuation)));
     super::dispatch_auto_bind_lease_with_source_and_chain(
         home,
         target,

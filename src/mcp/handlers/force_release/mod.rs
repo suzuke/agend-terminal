@@ -35,7 +35,9 @@ pub(crate) use gc::{prune_exact_git_metadata, ExactMetadataState};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use gc_legacy::prune_git_metadata_for_agent;
+#[allow(unused_imports)]
 pub(crate) use repair::attempt_safe_rebind_repair_with_continuation;
+pub(crate) use repair::attempt_safe_rebind_repair_with_permit;
 pub(crate) use s2::{classify_target, TargetState};
 #[cfg(test)]
 pub(crate) use s2::{rebase_test_seam, RebaseTestPhase};

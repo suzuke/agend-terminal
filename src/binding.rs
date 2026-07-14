@@ -20,7 +20,11 @@ pub(crate) use release_guard::{
     acquire_agent_mutation_lock, acquire_binding_file_lock, guarded_binding_disk_fresh,
     preflight_guarded_binding, snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
 };
-
+mod signature;
+pub(crate) use signature::signature_valid;
+mod unbind_compat;
+#[allow(unused_imports)]
+pub use unbind_compat::unbind;
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
@@ -569,28 +573,15 @@ fn out_of_dispatch_notify_recipient(home: &Path, agent: &str) -> Option<String> 
 fn binding_sig_path(dir: &Path) -> PathBuf {
     dir.join("binding.json.sig")
 }
-
-/// Diagnostic: does `runtime/<agent>/binding.json.sig` verify against the
-/// **on-disk** binding body? Same sidecar + `integrity_core::verify` as the
-/// shim (`agentic-git` `read_binding`). Passes the tag raw (call-site parity
-/// with the shim); `integrity_core` owns tag parsing/whitespace policy
-/// (`tag_to_hex` trims). Missing/malformed/mismatched → `false`. Does **not**
-/// alter [`read`] / auth paths — observability only (`binding_state`).
-pub(crate) fn signature_valid(home: &Path, agent: &str) -> bool {
-    let dir = crate::paths::runtime_dir(home).join(agent);
-    let body = match std::fs::read(dir.join("binding.json")) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    let tag = match std::fs::read_to_string(binding_sig_path(&dir)) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    agentic_git_core::integrity_core::verify(home, &body, &tag).is_ok()
-}
-
-/// Clear a binding for an agent (task completed/released).
-pub fn unbind(home: &Path, agent: &str) {
+pub(crate) fn unbind_with_permit(
+    home: &Path,
+    agent: &str,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) {
+    if !permit.authorizes(home, agent) {
+        tracing::warn!(agent, "unbind refused: invalid lifecycle permit");
+        return;
+    }
     let dir = crate::paths::runtime_dir(home).join(agent);
     // #2158 PR2 (ii): audit the release/clear side of binding-change detection with
     // caller process context (read the prior branch before removal). Only logs when
@@ -900,7 +891,10 @@ mod shim_install;
 pub use shim_install::symlink_shim;
 
 /// Clear orphan bindings (agents no longer in registry).
-/// Called at daemon startup.
+/// Called at daemon startup, after the singleton `.daemon.lock` is acquired by
+/// normal bootstrap/app/handoff paths. This is a source-pinned pre-agent
+/// exemption from the per-agent lifecycle permit: no competing daemon writer
+/// can enter until bootstrap releases that singleton lock.
 pub fn reconcile_orphans(home: &Path) {
     let runtime_dir = crate::paths::runtime_dir(home);
     if !runtime_dir.exists() {
@@ -910,6 +904,11 @@ pub fn reconcile_orphans(home: &Path) {
         for entry in entries.flatten() {
             let binding_path = entry.path().join("binding.json");
             if binding_path.exists() {
+                let entry_path = entry.path();
+                let agent_name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
                 // Check if binding is stale (issued_at > 24h ago).
                 if let Ok(content) = std::fs::read_to_string(&binding_path) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -919,11 +918,6 @@ pub fn reconcile_orphans(home: &Path) {
                                     .signed_duration_since(dt.with_timezone(&chrono::Utc));
                                 if age > chrono::Duration::hours(24) {
                                     // #693: check heartbeat — if agent is still active, don't delete
-                                    let entry_path = entry.path();
-                                    let agent_name = entry_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("");
                                     let hb =
                                         crate::daemon::heartbeat_pair::snapshot_for(agent_name);
                                     let hb_age_ms = crate::daemon::heartbeat_pair::now_ms()
@@ -2495,6 +2489,5 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 }
-
 #[cfg(test)]
 mod review_repro_agent_binding;

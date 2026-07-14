@@ -67,11 +67,12 @@ fn remove_empty_dir_tree(dir: &Path) {
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
-    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, name) {
-        return Err(format!(
-            "delete refused: bind/rebase in flight for agent '{name}'"
-        ));
-    }
+    let lifecycle_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        name,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    )
+    .map_err(|error| format!("delete refused: {error}"))?;
     // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
     // held until this fn returns (after workspace cleanup + the residual audit
     // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
@@ -279,7 +280,7 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // also clears the binding itself on success, so the unbind below is a
     // defensive idempotent no-op for the bound-agent case (still needed for the
     // never-bound / partial-state cases).
-    let _ = crate::worktree_pool::release_full(home, name, false);
+    let _ = crate::worktree_pool::release_full_with_permit(home, name, false, &lifecycle_permit);
     // release_full removes the leaf worktree `worktrees/<name>/<branch>/`; drop the
     // now-empty agent dir `worktrees/<name>/` too so the audit below reads clean.
     // #1907: a slash-containing branch (e.g. `feat/x`) nests intermediate dirs
@@ -296,7 +297,7 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // ran bind_self / repo checkout) without a prior release both leaked the
     // binding (blocking a same-name re-bind) AND tripped the residual audit below
     // → the whole teardown returned Err despite otherwise succeeding.
-    crate::binding::unbind(home, name);
+    crate::binding::unbind_with_permit(home, name, &lifecycle_permit);
     // #1907: `unbind` drops binding.json + its HMAC sidecar but leaves the now-empty
     // `runtime/<name>/` dir + its `.binding.json.lock` flock behind. Remove the whole
     // dir so teardown is fully clean (the residual audit below now checks it). Safe:

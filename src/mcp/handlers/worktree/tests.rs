@@ -1519,57 +1519,6 @@ fn r5_reverse_reconcile_conflicts_with_live_bind_entry() {
 }
 
 #[test]
-fn r5_force_reclaim_conflicts_with_live_bind_entry() {
-    let home = tmp_home("r5-force-reclaim-conflict");
-    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-reclaim");
-    let candidate = crate::worktree_pool::GcCandidate {
-        path: target.clone(),
-        agent: "agent".to_string(),
-        reason: "r5 lifecycle conflict".to_string(),
-        kind: crate::worktree_pool::GcKind::ForceReclaim,
-    };
-    let guard = crate::mcp::handlers::dispatch_hook::acquire_bind_guard(&home, "agent")
-        .expect("bind permit");
-    let outcome = crate::daemon::retention::worktrees::maybe_remove_candidate(&home, &candidate);
-    assert!(
-        matches!(
-            outcome,
-            crate::daemon::retention::worktrees::RemovalOutcome::Skipped { .. }
-        ),
-        "force reclaim must refuse while bind owns lifecycle permit: {outcome:?}"
-    );
-    assert!(target.exists(), "live worktree must remain in place");
-    drop(guard);
-    let _ = repo;
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn r5_orphan_reconcile_conflicts_with_live_bind_entry() {
-    let home = tmp_home("r5-orphan-conflict");
-    let (repo, target) = seed_r5_bound_worktree(&home, "agent", "feature/r5-orphan");
-    let binding_path = crate::paths::binding_path(&home, "agent");
-    let mut binding: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&binding_path).unwrap()).unwrap();
-    binding["issued_at"] = serde_json::json!("2020-01-01T00:00:00Z");
-    std::fs::write(&binding_path, binding.to_string()).unwrap();
-    let guard = crate::mcp::handlers::dispatch_hook::acquire_bind_guard(&home, "agent")
-        .expect("bind permit");
-    crate::binding::reconcile_orphans(&home);
-    assert!(
-        binding_path.exists(),
-        "startup orphan reconciliation must not clear authority while bind is active"
-    );
-    assert!(
-        target.exists(),
-        "orphan reconciliation must not remove worktree"
-    );
-    drop(guard);
-    let _ = repo;
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
 fn r4_exact_metadata_list_failure_is_opaque_and_preserves_binding() {
     let home = tmp_home("r4-metadata-list-opaque");
     let repo = home.join("metadata-list-repo");

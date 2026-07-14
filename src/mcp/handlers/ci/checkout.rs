@@ -80,16 +80,37 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // (review pool, operator triage) that materialize a detached-HEAD
     // inspection worktree without claiming it.
     let bind = args["bind"].as_bool().unwrap_or(false);
-    if bind {
-        if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
-            return e;
-        }
-    }
     if bind && instance_name.is_empty() {
         return json!({
             "error": "bind=true requires AGEND_INSTANCE_NAME — anonymous callers cannot claim a worktree",
             "code": "needs_identity"
         });
+    }
+    // The bind transaction owns the per-agent lifecycle authority before any
+    // provisioning preflight. Keep this permit through branch locking,
+    // bind_full, commit, and exact rollback so checkout cannot race release or
+    // rebase at the release→bind gap.
+    let lifecycle_permit = if bind {
+        match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+            home,
+            instance_name,
+            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+        ) {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                return json!({
+                    "error": format!("checkout bind refused: {error}"),
+                    "code": "lifecycle_conflict",
+                });
+            }
+        }
+    } else {
+        None
+    };
+    if bind {
+        if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
+            return e;
+        }
     }
     // Windows-safe path mangling: also collapse `\` (path separator) and
     // `:` (drive letter) so a source like `C:\Users\runner\...` doesn't
@@ -631,12 +652,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     || {
                         if let Some(fingerprint) = fingerprint {
                             let released =
-                                crate::worktree_pool::release_bound_target_exact_under_branch_lock(
+                                crate::worktree_pool::release_bound_target_exact_under_branch_lock_with_permit(
                                     home,
                                     instance_name,
                                     fingerprint,
                                     &worktree_dir,
                                     &source_canonical,
+                                    lifecycle_permit
+                                        .as_ref()
+                                        .expect("bind permit held for checkout rollback"),
                                 );
                             released.released
                         } else {

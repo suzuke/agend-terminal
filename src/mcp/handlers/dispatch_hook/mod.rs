@@ -2,12 +2,12 @@
 //!
 //! Extracted from comms.rs to stay under 700 LOC file size invariant.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod branch_start_point;
 mod from_ref;
+mod lifecycle_permit;
 mod live_binding;
 mod provider_neutral_slug;
 mod rebase_dispatch;
@@ -16,6 +16,9 @@ pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
 // repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
+pub(crate) use lifecycle_permit::{
+    is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
+};
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
@@ -150,45 +153,13 @@ pub enum ErrorCode {
     BindFailed,
 }
 
-/// Sprint 55 P0-B EC11: per-agent in-flight guard scoped to the daemon's
-/// `home` directory. Prevents concurrent `dispatch_auto_bind_lease` calls
-/// for the same agent from interleaving `binding.json` writes / lease
-/// state in the same daemon process. Keying by `(home, agent)` ensures
-/// parallel test runs (each with its own temp home) don't collide with
-/// each other while production single-home daemons retain the per-agent
-/// guarantee. RAII via `BindGuard` ensures the entry is removed even on
-/// early-return error paths.
-fn bind_in_flight_set() -> &'static parking_lot::Mutex<HashSet<(String, String)>> {
-    static SET: std::sync::OnceLock<parking_lot::Mutex<HashSet<(String, String)>>> =
-        std::sync::OnceLock::new();
-    SET.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
-}
-
-pub(crate) struct BindGuard {
-    key: (String, String),
-}
-
-impl BindGuard {
-    fn try_acquire(home: &Path, agent: &str) -> Result<Self, String> {
-        let key = (home.display().to_string(), agent.to_string());
-        let mut g = bind_in_flight_set().lock();
-        if !g.insert(key.clone()) {
-            return Err(format!(
-                "bind already in-flight for agent '{agent}' — concurrent dispatch_auto_bind_lease blocked"
-            ));
-        }
-        Ok(BindGuard { key })
-    }
-}
-
+#[allow(dead_code)]
 pub(crate) fn acquire_bind_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
     BindGuard::try_acquire(home, target)
 }
 
-impl Drop for BindGuard {
-    fn drop(&mut self) {
-        bind_in_flight_set().lock().remove(&self.key);
-    }
+pub(crate) fn acquire_rebase_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
+    BindGuard::acquire_rebase(home, target)
 }
 
 #[cfg(test)]
@@ -224,8 +195,7 @@ pub(crate) mod bind_test_seam {
 /// report whether a concurrent `dispatch_auto_bind_lease` is active for
 /// the agent — operator-facing introspection for race-condition debug.
 pub(crate) fn is_bind_in_flight(home: &Path, agent: &str) -> bool {
-    let key = (home.display().to_string(), agent.to_string());
-    bind_in_flight_set().lock().contains(&key)
+    lifecycle_is_active(home, agent)
 }
 
 /// Legacy compatibility hook. Bind lifecycle ownership is RAII-only: release
@@ -398,6 +368,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             raw: None,
         })?,
     };
+    let lifecycle_permit = _guard.permit();
     let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|f| f.resolve_instance(target));
@@ -569,8 +540,14 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     } else if workspace_b {
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
         // backed up before --force) → in-place checkout. Encapsulated helper.
-        crate::worktree_pool::prepare_workspace_worktree(home, target, &source_repo, branch)
-            .map_err(|m| lease_err(m.contains("E4.5"), m))?
+        crate::worktree_pool::prepare_workspace_worktree_with_permit(
+            home,
+            target,
+            &source_repo,
+            branch,
+            &lifecycle_permit,
+        )
+        .map_err(|m| lease_err(m.contains("E4.5"), m))?
     } else {
         // Legacy: lease a fresh per-branch worktree. Lease errors REJECT (Q2 §3.3).
         // #D+H: lease returns a TYPED `LeaseError` — classify by variant, not string.

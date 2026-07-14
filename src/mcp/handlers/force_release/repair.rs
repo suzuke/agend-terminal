@@ -213,7 +213,21 @@ pub(crate) fn attempt_safe_rebind_repair_with_continuation(
     explicit_repo: Option<&Path>,
     sender: Option<&str>,
 ) -> Result<RepairResult, RepairBlocked> {
-    super::s2::rebase_repair(home, agent, branch, explicit_repo, sender)
+    let guard = crate::mcp::handlers::dispatch_hook::acquire_rebase_guard(home, agent)
+        .map_err(RepairBlocked::PathUnsafe)?;
+    let permit = guard.permit();
+    attempt_safe_rebind_repair_with_permit(home, agent, branch, explicit_repo, sender, &permit)
+}
+
+pub(crate) fn attempt_safe_rebind_repair_with_permit(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    explicit_repo: Option<&Path>,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Result<RepairResult, RepairBlocked> {
+    super::s2::rebase_repair(home, agent, branch, explicit_repo, sender, permit)
 }
 
 /// `Some(blocked)` iff `candidate` is a real branch being abandoned (non-empty
