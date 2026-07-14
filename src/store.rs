@@ -335,12 +335,27 @@ pub fn try_acquire_file_lock(lock_path: &Path) -> anyhow::Result<Option<FileFloc
         .truncate(false)
         .open(lock_path)?;
     // Trait method explicit — same MSRV rationale as `acquire_file_lock`.
-    if fs4::FileExt::try_lock(&f).is_err() {
+    if !classify_try_lock(lock_path, fs4::FileExt::try_lock(&f))? {
         return Ok(None);
     }
     // Bump AFTER the OS lock is held so depth>0 ⟹ lock held.
     crate::sync_audit::flock_entered();
     Ok(Some(FileFlockGuard { _file: f }))
+}
+
+/// Classify one non-blocking flock result for [`try_acquire_file_lock`].
+///
+/// `false` means a peer currently owns the lock; `true` means this file
+/// acquired it. Other errors must remain distinguishable from contention.
+fn classify_try_lock(
+    lock_path: &Path,
+    result: Result<(), fs4::TryLockError>,
+) -> anyhow::Result<bool> {
+    if result.is_err() {
+        return Ok(false);
+    }
+    let _ = lock_path;
+    Ok(true)
 }
 
 /// Helper: build a store path from home + filename.
@@ -742,6 +757,40 @@ mod tests {
             "additional exclusive lock must fail while second guard held"
         );
         drop(guard2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn try_lock_classifier_preserves_non_contention_errors() {
+        let dir = tmp_dir("flock-classifier");
+        let lock_path = dir.join("my.lock");
+
+        assert!(
+            !classify_try_lock(&lock_path, Err(fs4::TryLockError::WouldBlock))
+                .expect("WouldBlock is contention"),
+            "WouldBlock must remain the non-blocking contention result"
+        );
+
+        let error = classify_try_lock(
+            &lock_path,
+            Err(fs4::TryLockError::Error(std::io::Error::from_raw_os_error(
+                9,
+            ))),
+        )
+        .expect_err("non-contention flock errors must propagate");
+        assert!(
+            error.to_string().contains(&lock_path.display().to_string()),
+            "flock error must include lock path: {error}"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(9),
+            "flock error must preserve raw errno"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 
