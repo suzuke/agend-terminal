@@ -561,8 +561,10 @@ pub(crate) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         None
     };
 
-    if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
-        return e;
+    if !checks.review_assignment {
+        if let Err(e) = maybe_auto_bind_lease(home, args, target, composed.second_reviewer) {
+            return e;
+        }
     }
 
     // t-…-17 C11: the marker path delivers via the DURABLE outbox store (A1→A2→A3),

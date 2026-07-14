@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 // #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
 // keep this handler under the LOC ceiling (call sites below are unchanged).
-use super::checkout_helpers::{rollback_response, sync_marker_contents};
+use super::checkout_helpers::{rollback_response, sync_marker_contents, validate_expected_head};
 
 /// #2755 structured redaction: replace absolute filesystem paths (and Windows
 /// drive paths) in an error string RETURNED over the wire with `<path>`. The
@@ -132,6 +132,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             Ok(pair) => pair,
             Err(e) => return e,
         };
+    if let Some(e) = validate_expected_head(args, &source_path, branch) {
+        return e;
+    }
     // #780: auto-create branch from `from_ref` when bind:true + branch
     // missing locally. #781 Piece 6 extracts the decision tree into
     // `dispatch_hook::ensure_branch_exists` so the same logic services
@@ -173,31 +176,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 }
                 return e;
             }
-        }
-    }
-    // #6: optional exact-head precondition. When provided, resolve the branch
-    // HEAD and compare; mismatch returns a structured error with zero mutation.
-    // Omitted expected_head preserves all current behavior byte-identically.
-    if let Some(expected) = args["expected_head"].as_str() {
-        let is_full_hex = expected.len() >= 40
-            && expected.len() <= 64
-            && expected.chars().all(|c| c.is_ascii_hexdigit());
-        if !is_full_hex {
-            return json!({
-                "error": format!("expected_head must be a full 40/64-hex SHA, got '{expected}'"),
-                "code": "invalid_expected_head",
-            });
-        }
-        let actual = crate::git_helpers::git_cmd(Path::new(&source_path), &["rev-parse", branch])
-            .unwrap_or_default();
-        let actual = actual.trim();
-        if !actual.eq_ignore_ascii_case(expected) {
-            return json!({
-                "error": format!("expected_head {expected} does not match branch HEAD {actual}"),
-                "code": "expected_head_mismatch",
-                "expected_head": expected,
-                "actual_head": actual,
-            });
         }
     }
     // #1494: idempotent bind. If THIS agent already holds a binding on the SAME
@@ -327,11 +305,17 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         auto_created_branch,
                         fetch_attempted,
                     );
-                    // #6: echo expected_head/actual_head on idempotent reuse
-                    // (validation already passed above).
+                    // #6: echo expected_head/actual_head on idempotent reuse —
+                    // re-read the actual HEAD from the worktree rather than
+                    // echoing the expected value (the worktree may have diverged).
                     if let Some(expected) = args["expected_head"].as_str() {
+                        let wt_path = reuse_resp["path"].as_str().unwrap_or(&worktree_path_str);
+                        let actual =
+                            crate::git_helpers::git_cmd(Path::new(wt_path), &["rev-parse", "HEAD"])
+                                .unwrap_or_default();
+                        let actual = actual.trim();
+                        reuse_resp["actual_head"] = json!(actual);
                         reuse_resp["expected_head"] = json!(expected);
-                        reuse_resp["actual_head"] = json!(expected);
                     }
                     return reuse_resp;
                 }
@@ -713,9 +697,17 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             super::checkout_txn::Journal::clear(home, &mangled);
             // #6: echo expected_head/actual_head only when the caller supplied it
             // (omitted → no new fields, byte-compatible with pre-#6 callers).
+            // Re-read the actual HEAD from the provisioned worktree rather than
+            // echoing the expected value — the worktree is the ground truth.
             if let Some(expected) = args["expected_head"].as_str() {
+                let actual = crate::git_helpers::git_cmd(
+                    Path::new(&worktree_path_str),
+                    &["rev-parse", "HEAD"],
+                )
+                .unwrap_or_default();
+                let actual = actual.trim();
+                resp["actual_head"] = json!(actual);
                 resp["expected_head"] = json!(expected);
-                resp["actual_head"] = json!(expected); // they matched (validated above)
             }
             resp
         }

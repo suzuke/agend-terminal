@@ -83,3 +83,57 @@ thread_local! {
 pub(super) fn set_fail_marker_sync(fail: bool) {
     FAIL_MARKER_SYNC.with(|c| c.set(fail));
 }
+
+/// #6: optional exact-head precondition — BEFORE any branch creation so a
+/// mismatch returns a structured error with zero mutation.
+pub(super) fn validate_expected_head(
+    args: &Value,
+    source_path: &str,
+    branch: &str,
+) -> Option<Value> {
+    let expected = args["expected_head"].as_str()?;
+    let is_full_hex = (expected.len() == 40 || expected.len() == 64)
+        && expected.chars().all(|c| c.is_ascii_hexdigit());
+    if !is_full_hex {
+        return Some(json!({
+            "error": format!("expected_head must be a full 40/64-hex SHA, got '{expected}'"),
+            "code": "invalid_expected_head",
+        }));
+    }
+    let src = Path::new(source_path);
+    let verify = crate::git_helpers::git_cmd(
+        src,
+        &["rev-parse", "--verify", &format!("{expected}^{{commit}}")],
+    );
+    if verify.is_err() {
+        return Some(json!({
+            "error": format!(
+                "expected_head {expected} does not exist as a commit in the repository"
+            ),
+            "code": "expected_head_mismatch",
+            "expected_head": expected,
+            "actual_head": "",
+        }));
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_exists = crate::git_helpers::git_cmd(src, &["rev-parse", "--verify", &branch_ref]);
+    let actual = if let Ok(sha) = branch_exists {
+        sha.trim().to_string()
+    } else {
+        let default_base = format!("origin/{}", crate::git_helpers::default_branch(src));
+        let from_ref = args["from_ref"].as_str().unwrap_or(&default_base);
+        crate::git_helpers::git_cmd(src, &["rev-parse", from_ref])
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Some(json!({
+            "error": format!("expected_head {expected} does not match branch HEAD {actual}"),
+            "code": "expected_head_mismatch",
+            "expected_head": expected,
+            "actual_head": actual,
+        }));
+    }
+    None
+}
