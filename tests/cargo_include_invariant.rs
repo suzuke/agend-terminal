@@ -16,9 +16,10 @@
 //! `d-20260507062618667443-1` (silent-drop systematic ledger entry #5).
 //!
 //! ## What it checks
-//! For every production `include_str!` / `include_bytes!` macro literal
-//! in `src/**/*.rs`, the resolved absolute-from-repo-root path must be
-//! covered by at least one glob pattern in `[package].include`.
+//! For every production `include_str!` / `include_bytes!` / `include!`
+//! macro literal in `src/**/*.rs` and `build.rs`, the resolved
+//! absolute-from-repo-root path must be covered by at least one glob
+//! pattern in `[package].include`.
 //!
 //! Test-only macros (inside `#[cfg(test)]` modules, in test-only files
 //! declared via `#[cfg(test)] mod NAME;` from a parent, or in test
@@ -81,10 +82,10 @@ fn attrs_contain_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// Collects every `include_str!("…")` / `include_bytes!("…")` literal
-/// reachable from production code in a single source file. Items
-/// inside `#[cfg(test)]` modules are pruned at the visitor level
-/// (the visitor never recurses into them).
+/// Collects every `include_str!("…")` / `include_bytes!("…")` /
+/// `include!("…")` literal reachable from production code in a single
+/// source file. Items inside `#[cfg(test)]` modules are pruned at the
+/// visitor level (the visitor never recurses into them).
 struct ProductionMacroCollector {
     /// (literal_path_as_written, source_file) pairs. Source file is
     /// captured by the caller before invoking the visitor.
@@ -118,7 +119,7 @@ impl<'ast> Visit<'ast> for ProductionMacroCollector {
             return;
         };
         let name = seg.ident.to_string();
-        if name != "include_str" && name != "include_bytes" {
+        if name != "include_str" && name != "include_bytes" && name != "include" {
             return;
         }
         if let Ok(lit) = syn::parse2::<syn::LitStr>(m.tokens.clone()) {
@@ -285,7 +286,14 @@ fn scan_production_violations(globs: &[glob::Pattern]) -> Vec<String> {
     let src_root = Path::new(SRC_DIR);
     let mut violations = Vec::new();
     let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
-    for src in rs_files_under(src_root) {
+
+    let mut sources: Vec<PathBuf> = rs_files_under(src_root);
+    let build_rs = PathBuf::from("build.rs");
+    if build_rs.exists() {
+        sources.push(build_rs);
+    }
+
+    for src in sources {
         if is_test_only_file(&src) {
             continue;
         }
@@ -307,7 +315,7 @@ fn scan_production_violations(globs: &[glob::Pattern]) -> Vec<String> {
             let covered = globs.iter().any(|g| g.matches(&resolved_str));
             if !covered {
                 violations.push(format!(
-                    "{}: include_(str|bytes)!({:?}) -> resolved {:?} not in [package].include",
+                    "{}: include_(str|bytes|!)({:?}) -> resolved {:?} not in [package].include",
                     src.display(),
                     literal,
                     resolved_str
@@ -356,6 +364,23 @@ fn mock_invariant_fires_when_assets_hooks_removed_from_include() {
         bash_present && ps_present,
         "mock-mutate dropping `assets/hooks/*` must surface BOTH hook paths \
          (bash + ps1) — empirical regression-proof for #505 publish-blocker. \
+         Got violations:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn mock_invariant_fires_when_build_provenance_removed_from_include() {
+    let mock_patterns: Vec<String> = read_cargo_include()
+        .into_iter()
+        .filter(|p| p != "build/provenance.rs")
+        .collect();
+    let globs = compile_globs(&mock_patterns);
+    let violations = scan_production_violations(&globs);
+    assert!(
+        violations.iter().any(|v| v.contains("build/provenance.rs")),
+        "mock-mutate dropping `build/provenance.rs` must surface the \
+         build.rs include!() path — cargo-package publish-blocker repro. \
          Got violations:\n{}",
         violations.join("\n")
     );
