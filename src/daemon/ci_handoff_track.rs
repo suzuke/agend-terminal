@@ -284,6 +284,7 @@ pub(crate) fn record(
 /// Record a track with the durable row identity. Returns `true` only after the
 /// JSON track is atomically persisted; callers can keep the CI notification
 /// cursor retryable if this write fails.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_with_identity(
     home: &Path,
     target: &str,
