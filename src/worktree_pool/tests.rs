@@ -4408,15 +4408,13 @@ fn pr_merge_status_unknown_without_github_remote_keeps_branch_red7() {
 
 // ── r6: lifecycle permit drop race and concurrency controls ───────────
 
-/// r6 RED: when a `LifecyclePermit` is cloned and both the original and the
-/// clone drop on separate threads, the active-permits map entry must be cleaned
-/// so that a new permit can be acquired for the same agent afterward.
-///
-/// At 059e543f the outer wrapper checks `Arc::strong_count` in `Drop` which
-/// races when two clones drop concurrently — one thread can see count=2,
-/// the other also sees count=2, and neither cleans the entry.
+/// r6: when a `LifecyclePermit` is moved to another thread and dropped there,
+/// the RAII guard must still clean the active-permits map so that a new permit
+/// can be acquired for the same agent afterward. LifecyclePermit is non-Clone
+/// (r6 removed the Arc<PermitLease> indirection); this test verifies the
+/// cross-thread Drop path that the direct RAII guard must handle.
 #[test]
-fn r6_permit_concurrent_clone_drop_leaves_map_reusable() {
+fn r6_permit_cross_thread_drop_cleans_active_map() {
     use crate::mcp::handlers::dispatch_hook::{
         lifecycle_is_active, LifecycleOperation, LifecyclePermit,
     };
@@ -4560,6 +4558,179 @@ fn r6_reverse_release_start_orders_serialize_without_barrier() {
     assert!(
         release_outcome.released,
         "release must complete: {release_outcome:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ── post-incident proof slice: reverse ordering + recovery ref integrity ──
+
+/// Reverse-first lifecycle ordering: reverse_reconcile acquires the permit
+/// first, then release is refused. Complements the release-first variant
+/// `r6_reverse_release_start_orders_serialize_without_barrier` above.
+/// The permit mechanism is symmetric by construction (`acquire` checks
+/// `contains_key` regardless of operation), but exercising both orderings
+/// closes the test matrix claimed by the doc-string "whichever acquires
+/// first wins."
+#[test]
+fn r6_reverse_first_then_release_refused() {
+    let home = tmp_home("r6-reverse-first");
+    let repo = tmp_repo("r6-reverse-first-repo");
+    let ws = converted_workspace_with_commit(&home, &repo, "agent-rf", "feat/rf");
+    crate::binding::bind_full(&home, "agent-rf", "T-rf", "feat/rf", &ws, &repo, false)
+        .expect("bind converted workspace");
+
+    use crate::mcp::handlers::dispatch_hook::{
+        lifecycle_is_active, LifecycleOperation, LifecyclePermit,
+    };
+
+    // Simulate reverse_reconcile holding the permit. We acquire directly
+    // (same path as reverse_reconcile's entry) rather than calling
+    // reverse_reconcile itself, because we need the permit held across the
+    // release_full call without a test seam inside reverse_reconcile.
+    let permit = LifecyclePermit::acquire(&home, "agent-rf", LifecycleOperation::Release)
+        .expect("reverse_reconcile-shaped acquire");
+    assert!(
+        lifecycle_is_active(&home, "agent-rf"),
+        "permit must be active"
+    );
+
+    // release_full must be refused — reverse_reconcile owns the permit.
+    let outcome = release_full(&home, "agent-rf", false);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("lifecycle transaction already in flight")),
+        "release must be refused when reverse_reconcile holds permit: {outcome:?}"
+    );
+    assert!(
+        !outcome.released && !outcome.binding_removed,
+        "refused release must not have touched anything: {outcome:?}"
+    );
+
+    // Drop the permit — release_full must now succeed.
+    drop(permit);
+    assert!(
+        !lifecycle_is_active(&home, "agent-rf"),
+        "permit cleaned after drop"
+    );
+    let outcome2 = release_full(&home, "agent-rf", false);
+    assert!(
+        outcome2.released,
+        "release must succeed after permit released: {outcome2:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Post-incident proof: when two release actors race on a dirty worktree,
+/// the lifecycle permit ensures exactly one recovery ref is created and it
+/// contains the intended dirty WIP — not a half-removed tree with spurious
+/// tracked-file deletions. This is the exact scenario from the 20:26:14
+/// incident where manual + auto release collided pre-r6.
+#[test]
+fn r6_dirty_recovery_ref_integrity_under_concurrent_release() {
+    let home = tmp_home("r6-dirty-integrity");
+    let repo = tmp_repo("r6-dirty-integrity-repo");
+    let l = lease_bound(&home, &repo, "agent-di", "feat/dirty-int");
+
+    // Seed tracked content and dirty the worktree.
+    std::fs::write(l.path.join("important.txt"), b"original\n").unwrap();
+    git_in(&l.path, &["add", "important.txt"]);
+    git_in(
+        &l.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+    std::fs::write(l.path.join("important.txt"), b"original\nwip-edit\n").unwrap();
+    std::fs::write(l.path.join("new-wip.txt"), b"untracked wip").unwrap();
+    assert!(
+        crate::worktree::has_uncommitted_changes(&l.path),
+        "precondition: worktree dirty"
+    );
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+    // Actor A (simulating manual release): acquires permit, pauses inside
+    // the transaction after binding snapshot.
+    let home_a = home.clone();
+    let actor_a = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                entered_tx.send(()).expect("signal entered");
+                resume_rx.recv().expect("wait for resume");
+            }
+        });
+        release_full(&home_a, "agent-di", false)
+    });
+
+    // Wait for actor A to be inside the transaction (holding the permit).
+    entered_rx.recv().expect("actor A entered transaction");
+
+    // Actor B (simulating auto release): must be refused by the permit.
+    let outcome_b = release_full(&home, "agent-di", false);
+    assert!(
+        outcome_b
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("lifecycle transaction already in flight")),
+        "actor B (auto release) must be refused by permit: {outcome_b:?}"
+    );
+    assert!(
+        !outcome_b.released,
+        "refused actor B must not release: {outcome_b:?}"
+    );
+
+    // Let actor A complete the release.
+    resume_tx.send(()).expect("resume actor A");
+    let outcome_a = actor_a.join().expect("actor A thread");
+    assert!(
+        outcome_a.released,
+        "actor A must complete the release: {outcome_a:?}"
+    );
+
+    // Exactly one recovery ref must exist (actor A's preserve_dirty).
+    let refs = recovery_refs(&repo, "feat/dirty-int");
+    assert_eq!(
+        refs.len(),
+        1,
+        "exactly one recovery ref (no duplicate from actor B): {refs:?}"
+    );
+
+    // The recovery ref must contain the intended dirty WIP, NOT a
+    // half-removed tree with spurious deletions.
+    let files = ls_tree_names(&repo, &refs[0]);
+    assert!(
+        files.contains("important.txt"),
+        "tracked file must be present in recovery ref (not deleted): {files}"
+    );
+    assert!(
+        files.contains("new-wip.txt"),
+        "untracked WIP must be captured in recovery ref: {files}"
+    );
+
+    // Verify the tracked file contains the WIP edit, not a deletion.
+    let show = std::process::Command::new("git")
+        .args(["show", &format!("{}:important.txt", refs[0])])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git show");
+    let content = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        content.contains("wip-edit"),
+        "recovery ref must contain the WIP modification, not a half-removed snapshot: {content}"
     );
 
     std::fs::remove_dir_all(&home).ok();
