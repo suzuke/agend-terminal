@@ -1139,6 +1139,67 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // --- root review r9 RED: 2 deterministic failures (task-46776) ---
+
+    #[test]
+    fn root_review_r9_boot_tilde_and_expanded_duplicate_deferred() {
+        let home = tmp_home("r10-tilde-boot");
+        let unique = format!("agend-r10-tilde-boot-{}", std::process::id());
+        let tilde_path = format!("~/{unique}");
+        let expanded = crate::fleet::resolve::expand_tilde_path(&tilde_path);
+
+        let yaml = format!(
+            "instances:\n  alice:\n    working_directory: '{tilde_path}'\n  bob:\n    working_directory: '{}'\n",
+            expanded.display()
+        );
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+
+        let result = duplicate_identity_owner_before(&home, "bob", &expanded);
+        assert_eq!(
+            result.as_deref(),
+            Some("alice"),
+            "boot admission must detect tilde-vs-expanded duplicate: \
+             alice owns ~/{u} which is the same directory as {e}, \
+             but duplicate_identity_owner_before does not normalize tilde \
+             so the identity comparison misses the collision",
+            u = unique,
+            e = expanded.display(),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_review_r9_remove_dangling_fleet_symlink_is_not_silent_success() {
+        use std::os::unix::fs::symlink;
+        let home = tmp_home("r10-dangling-rm");
+        let fleet_path = super::fleet_yaml_path(&home);
+        symlink("/nonexistent/fleet.yaml", &fleet_path).unwrap();
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "symlink entry must exist"
+        );
+        assert!(
+            !fleet_path.exists(),
+            "symlink target must NOT exist (dangling)"
+        );
+
+        let result = remove_instance_from_yaml(&home, "alpha");
+        assert!(
+            result.is_err(),
+            "remove_instance on a dangling fleet.yaml symlink must refuse, \
+             not silently return Ok — the empty-default fast path \
+             (default_content.is_empty() && !fleet_path.exists()) bypasses \
+             the post-lock dangling-symlink guard because .exists() follows \
+             symlinks and returns false for dangling targets"
+        );
+        assert!(
+            fleet_path.symlink_metadata().is_ok(),
+            "dangling symlink must not be removed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]
