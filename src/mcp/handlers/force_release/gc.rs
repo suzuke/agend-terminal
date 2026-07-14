@@ -23,6 +23,34 @@ pub(crate) struct GcOutcome {
     pub(crate) pruned_count: usize,
     pub(crate) repos_touched: Vec<String>,
     pub(crate) matched: bool,
+    #[cfg(test)]
+    pub(crate) opaque: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) mod gc_test_seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn Fn() -> Option<String>>>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn() -> Option<String> + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) fn hit() -> Option<String> {
+        HOOK.with(|slot| slot.borrow().as_ref().and_then(|hook| hook()))
+    }
 }
 
 /// Remove metadata for one already-proven `(source_repo, target)` pair.
@@ -36,6 +64,11 @@ pub(crate) fn prune_exact_git_metadata(
     branch: &str,
 ) -> GcOutcome {
     let mut outcome = GcOutcome::default();
+    #[cfg(test)]
+    if let Some(reason) = gc_test_seam::hit() {
+        outcome.opaque = Some(reason);
+        return outcome;
+    }
     for entry in list_worktrees_bypass_shim(source_repo) {
         if !paths_match(&entry.path, target) {
             continue;

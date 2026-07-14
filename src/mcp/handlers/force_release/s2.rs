@@ -68,11 +68,6 @@ pub(crate) mod rebase_test_seam {
     }
 
     pub(crate) fn hit(phase: RebaseTestPhase) -> Option<String> {
-        if let Some(reason) =
-            LOCAL_HOOK.with(|slot| slot.borrow().as_ref().and_then(|callback| callback(phase)))
-        {
-            return Some(reason);
-        }
         LOCAL_HOOK.with(|slot| slot.borrow().as_ref().and_then(|callback| callback(phase)))
     }
 }
