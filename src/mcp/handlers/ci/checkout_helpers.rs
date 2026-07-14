@@ -6,7 +6,7 @@ use super::checkout_txn::RollbackOutcome;
 use serde_json::{json, Value};
 use std::path::Path;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::cell::RefCell;
 
 /// #2755 R3 (root + independent review): map a post-`git worktree add`
@@ -87,16 +87,16 @@ pub(super) fn set_fail_marker_sync(fail: bool) {
     FAIL_MARKER_SYNC.with(|c| c.set(fail));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static AFTER_EXPECTED_HEAD_VALIDATION: RefCell<Option<Box<dyn Fn()>>> =
         const { RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) struct ExpectedHeadValidationHookGuard;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for ExpectedHeadValidationHookGuard {
     fn drop(&mut self) {
         AFTER_EXPECTED_HEAD_VALIDATION.with(|slot| *slot.borrow_mut() = None);
@@ -105,7 +105,7 @@ impl Drop for ExpectedHeadValidationHookGuard {
 
 /// Test-only seam used to deterministically move a ref after the precondition
 /// check and before provisioning begins.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn install_expected_head_validation_hook(
     hook: impl Fn() + 'static,
 ) -> ExpectedHeadValidationHookGuard {
@@ -113,7 +113,7 @@ pub(super) fn install_expected_head_validation_hook(
     ExpectedHeadValidationHookGuard
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn hit_expected_head_validation_hook() {
     AFTER_EXPECTED_HEAD_VALIDATION.with(|slot| {
         if let Some(hook) = slot.borrow().as_ref() {
@@ -173,7 +173,7 @@ pub(super) fn validate_expected_head(
             "actual_head": actual,
         }));
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     hit_expected_head_validation_hook();
     None
 }
