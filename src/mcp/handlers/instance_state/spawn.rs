@@ -118,6 +118,7 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         )});
     }
 
+    let mut worktree_created_by_attempt = false;
     if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
         if !validate_branch(branch) {
             return json!({"error": format!("invalid branch name '{branch}'")});
@@ -136,10 +137,12 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         // `$AGEND_HOME/worktrees/<agent>/<branch>/` resolves correctly.
         if let Some(info) = crate::worktree::create(home, &wd, name, Some(branch)) {
             work_dir = info.path.display().to_string();
+            worktree_created_by_attempt =
+                info.provenance == crate::worktree::WorktreeProvenance::CreatedByThisAttempt;
         }
     }
 
-    let work_dir_preexisted = std::path::Path::new(&work_dir).exists();
+    let work_dir_preexisted = !worktree_created_by_attempt && std::path::Path::new(&work_dir).exists();
     std::fs::create_dir_all(&work_dir).ok();
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);

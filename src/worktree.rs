@@ -27,6 +27,16 @@ pub fn worktree_path(home: &Path, agent: &str, branch: &str) -> PathBuf {
     home.join("worktrees").join(agent).join(branch)
 }
 
+/// Whether [`create`] freshly provisioned the worktree or reused an existing one.
+/// The spawn rollback path uses this to decide whether cleanup should remove the
+/// directory: a `CreatedByThisAttempt` worktree is this call's responsibility;
+/// a `Reused` one predates it and must survive a rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeProvenance {
+    CreatedByThisAttempt,
+    Reused,
+}
+
 /// Info about a created worktree.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -37,6 +47,8 @@ pub struct WorktreeInfo {
     pub source_repo: PathBuf,
     /// Branch name.
     pub branch: String,
+    /// Whether this call created the worktree or reused a pre-existing one.
+    pub provenance: WorktreeProvenance,
 }
 
 /// Check if a directory is a git repo (has .git).
@@ -175,6 +187,7 @@ pub fn create(
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
                         branch,
+                        provenance: WorktreeProvenance::Reused,
                     });
                 }
                 Err(e) => {
@@ -205,6 +218,7 @@ pub fn create(
             path: wt_dir,
             source_repo: repo_dir.to_path_buf(),
             branch,
+            provenance: WorktreeProvenance::Reused,
         });
     }
 
@@ -258,6 +272,7 @@ pub fn create(
                 path: wt_dir,
                 source_repo: repo_dir.to_path_buf(),
                 branch,
+                provenance: WorktreeProvenance::CreatedByThisAttempt,
             })
         }
         // #781 Piece 2 (Bug B): the prior `o.status.code() == Some(128)` gate was
@@ -297,6 +312,7 @@ pub fn create(
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
                         branch,
+                        provenance: WorktreeProvenance::CreatedByThisAttempt,
                     })
                 }
                 Err(GitError::NonZero { stderr, .. }) => {

@@ -148,21 +148,28 @@ fn find_workspace_identity_collision(
 
 /// Read-only load of the parsed `instances` mapping from fleet.yaml.
 /// Missing file → empty mapping (legitimate first-run).
-/// Opaque I/O or parse error → `Err` (callers must refuse — fail-closed).
+/// Opaque I/O, parse error, or wrong-shape `instances` → `Err` (fail-closed).
 fn load_instances_mapping(home: &Path) -> Result<serde_yaml_ng::Mapping> {
     let fleet_path = fleet_yaml_path(home);
-    if !fleet_path.exists() {
-        return Ok(serde_yaml_ng::Mapping::new());
-    }
-    let c = std::fs::read_to_string(&fleet_path)
-        .with_context(|| format!("fleet.yaml read: {}", fleet_path.display()))?;
+    let c = match std::fs::read_to_string(&fleet_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_yaml_ng::Mapping::new());
+        }
+        Err(e) => {
+            anyhow::bail!("fleet.yaml read: {}: {e}", fleet_path.display());
+        }
+    };
     let doc =
         serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&c).with_context(|| "fleet.yaml parse")?;
-    Ok(doc
-        .get("instances")
-        .and_then(|v| v.as_mapping())
-        .cloned()
-        .unwrap_or_default())
+    match doc.get("instances") {
+        None => Ok(serde_yaml_ng::Mapping::new()),
+        Some(v) => v.as_mapping().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "fleet.yaml: `instances` is not a mapping (wrong shape — refusing)"
+            )
+        }),
+    }
 }
 
 /// Read-only workspace-identity collision preflight: returns a DIFFERENT existing

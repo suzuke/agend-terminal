@@ -7,11 +7,11 @@ use std::path::Path;
 /// the flag-provided version.
 fn migrate_claude_old_rules_file(working_dir: &Path) -> Result<(), String> {
     let old = working_dir.join(".claude").join("rules").join("agend.md");
-    if old.exists() {
-        std::fs::remove_file(&old)
-            .map_err(|e| format!("migrate: cannot remove old {}: {e}", old.display()))?;
+    match std::fs::remove_file(&old) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("migrate: cannot remove old {}: {e}", old.display())),
     }
-    Ok(())
 }
 
 /// Context for generating agent instructions.
