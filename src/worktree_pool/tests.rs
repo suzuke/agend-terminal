@@ -893,6 +893,57 @@ fn p0x_release_full_happy_path_removes_worktree_and_binding() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// S1 RED: a release that snapshots binding generation A must not tear down a
+/// same-agent generation B installed before destructive authority is reacquired.
+/// The phase seam makes the interleaving deterministic (no sleeps).
+#[test]
+fn release_full_refuses_binding_rewrite_between_snapshot_and_remove_s1() {
+    let home = tmp_home("s1-fingerprint-move");
+    let repo = tmp_repo("s1-fingerprint-move-repo");
+    let lease = lease_bound(&home, &repo, "agent-cas", "feat/cas");
+
+    let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let home_for_release = home.clone();
+    let release_thread = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                snap_tx.send(()).expect("publish snapshot phase");
+                resume_rx.recv().expect("resume release");
+            }
+        });
+        release_full(&home_for_release, "agent-cas", false)
+    });
+
+    snap_rx.recv().expect("release reached snapshot phase");
+    crate::binding::bind_full(
+        &home,
+        "agent-cas",
+        "T-generation-b",
+        "feat/cas",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("install generation B");
+    resume_tx.send(()).expect("resume release after rebind");
+
+    let outcome = release_thread.join().expect("release thread");
+    assert!(
+        !outcome.released,
+        "stale generation A release must refuse generation B: {outcome:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "generation B worktree must survive stale release"
+    );
+    let live = crate::binding::read(&home, "agent-cas").expect("generation B binding survives");
+    assert_eq!(live["task_id"], "T-generation-b");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// §3.9 regression (#t-21 HIGH #1): `release_full(dry_run=true)` must be
 /// observation-only — the worktree directory AND binding.json must survive.
 /// Pre-fix, `remove_worktree` + `clear_binding_state` ran unconditionally,

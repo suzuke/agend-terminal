@@ -5,6 +5,44 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseTestPhase {
+    AfterBindingSnapshot,
+    BeforeWorktreeRemove,
+}
+
+#[cfg(test)]
+pub(crate) mod release_test_seam {
+    use super::ReleaseTestPhase;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn Fn(ReleaseTestPhase)>>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn(ReleaseTestPhase) + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(super) fn hit(phase: ReleaseTestPhase) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook(phase);
+            }
+        });
+    }
+}
+
 // #1639: the daemon-internal git wrapper lives in `git_helpers::git_bypass`
 // (the #781-centralized single source for the `AGEND_GIT_BYPASS=1` contract).
 // Call sites below go through it directly rather than a local copy.
@@ -520,6 +558,8 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
         out.already_released = true;
         return out;
     };
+    #[cfg(test)]
+    release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
 
     let wt_path_str = binding["worktree"].as_str().unwrap_or("");
     let mut managed_verified = false;
@@ -577,6 +617,8 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
                     return out;
                 }
             }
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
             match remove_worktree(agent, wt_path, &source_repo) {
                 WorktreeRemoval::Removed => {
                     managed_verified = true;
