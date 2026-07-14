@@ -961,9 +961,15 @@ AGEND_HOME = {home_lit}
 }
 
 /// Detect backend from command name and configure MCP.
-pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>) {
-    let backend = crate::backend::Backend::from_command(command);
-    let result = match backend {
+pub fn configure(
+    working_dir: &Path,
+    command: &str,
+    instance_name: Option<&str>,
+) -> anyhow::Result<()> {
+    // Propagate any backend configure error to the caller (generate_with_context)
+    // so a provisioning failure ABORTS the spawn instead of being logged and
+    // discarded — the discard let an agent start against half-written config.
+    match crate::backend::Backend::from_command(command) {
         Some(crate::backend::Backend::ClaudeCode) => configure_claude(working_dir, instance_name),
         Some(crate::backend::Backend::KiroCli) => configure_kiro(working_dir, instance_name),
         Some(crate::backend::Backend::Agy) => configure_agy(working_dir, instance_name),
@@ -972,12 +978,8 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
         Some(crate::backend::Backend::Grok) => configure_grok(working_dir, instance_name),
         // Non-preset backends (Shell, Raw) have no MCP wiring.
         Some(crate::backend::Backend::Shell) | Some(crate::backend::Backend::Raw(_)) | None => {
-            return
+            Ok(())
         }
-    };
-
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "failed to configure MCP");
     }
 }
 
@@ -1025,6 +1027,21 @@ mod tests {
             codex_config_owner("AGEND_INSTANCE_NAME =\n"),
             DirIdentity::Corrupt
         );
+    }
+
+    #[test]
+    fn codex_config_identity_unreadable_on_invalid_utf8_but_notfound_is_absent() {
+        use crate::paths::DirIdentity;
+        let dir = tmp_dir("codex_unreadable");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, [0xFFu8, 0xFE]).unwrap(); // invalid UTF-8
+                                                        // Opaque read error → fail-closed Unreadable, not Absent.
+        assert_eq!(codex_config_identity(&path), DirIdentity::Unreadable);
+        assert_eq!(
+            codex_config_identity(&dir.join("missing.toml")),
+            DirIdentity::Absent
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1338,7 +1355,7 @@ mod tests {
     #[test]
     fn configure_dispatches_opencode() {
         let dir = tmp_dir("dispatch_oc");
-        configure(&dir, "opencode", None);
+        configure(&dir, "opencode", None).expect("provision");
         assert!(dir.join("opencode.json").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1397,7 +1414,7 @@ mod tests {
     #[test]
     fn configure_dispatches_agy_writes_agents_mcp() {
         let dir = tmp_dir("dispatch_agy");
-        configure(&dir, "agy", Some("agy-1"));
+        configure(&dir, "agy", Some("agy-1")).expect("provision");
 
         let cfg = dir.join(".agents").join("mcp_config.json");
         assert!(
@@ -1436,7 +1453,7 @@ mod tests {
     #[test]
     fn configure_unknown_backend_no_crash() {
         let dir = tmp_dir("dispatch_unknown");
-        configure(&dir, "unknown-tool", None);
+        configure(&dir, "unknown-tool", None).expect("provision");
         // Should not create any config files
         assert!(!dir.join("opencode.json").exists());
         assert!(!dir.join(".gemini").exists());

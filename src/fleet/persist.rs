@@ -55,8 +55,8 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
 
+        // 1. Apply every insert/merge first.
         let mut conflicts: Vec<super::merge::FieldConflict> = Vec::new();
-
         for (name, config) in entries {
             let key = serde_yaml_ng::Value::String(name.to_string());
             if let Some(serde_yaml_ng::Value::Mapping(existing)) = instances.get_mut(&key) {
@@ -65,34 +65,11 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                     Err(conflict) => conflicts.push(conflict),
                 }
             } else {
-                // Workspace-identity uniqueness (fail-closed, ATOMIC under the fleet lock
-                // held by mutate_fleet_yaml): a NEW instance must not resolve to the same
-                // canonical working directory as any existing one — including an explicit
-                // path equal to another instance's DEFAULT, or a symlink/case-only/
-                // nonexistent alias of it (see paths::workspace_identity). This is the
-                // incident guard: two instances sharing a workspace produced split-brain
-                // identity when project provisioning rewrote it last-writer-wins.
-                let candidate_wd = crate::paths::effective_working_dir(
-                    home,
-                    name,
-                    config.working_directory.as_deref(),
-                );
-                if let Some(collider) =
-                    find_workspace_identity_collision(home, instances, name, &candidate_wd)
-                {
-                    return Err(anyhow::anyhow!(
-                        "workspace identity collision: new instance '{name}' would resolve to the \
-                         same canonical working directory as existing instance '{collider}' ({}). \
-                         Refusing to admit a duplicate workspace identity (fail-closed).",
-                        candidate_wd.display()
-                    ));
-                }
                 let inst = super::merge::build_instance_mapping(config);
                 instances.insert(key, serde_yaml_ng::Value::Mapping(inst));
                 tracing::info!(%name, "added new instance to fleet.yaml");
             }
         }
-
         if !conflicts.is_empty() {
             let mut diff_lines: Vec<String> = Vec::with_capacity(conflicts.len());
             for c in &conflicts {
@@ -103,6 +80,33 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 conflicts.len(),
                 diff_lines.join("\n")
             ));
+        }
+
+        // 2. Whole-registry workspace-identity uniqueness (fail-closed, ATOMIC
+        // under the fleet lock held by mutate_fleet_yaml). Runs for EVERY affected
+        // instance — a NEW insert OR a merge that CHANGED `working_directory` — so
+        // the existing-key merge path can no longer slip a colliding update past
+        // admission (root finding 5). An instance must not resolve to the same
+        // canonical working directory as any OTHER — including an explicit path
+        // equal to another's DEFAULT, or a symlink/case-only/nonexistent alias
+        // (see paths::workspace_identity). This is the split-brain incident guard.
+        for (name, _) in entries {
+            let key = serde_yaml_ng::Value::String(name.to_string());
+            let explicit = instances
+                .get(&key)
+                .and_then(|v| v.get("working_directory"))
+                .and_then(|x| x.as_str());
+            let candidate_wd = crate::paths::effective_working_dir(home, name, explicit);
+            if let Some(collider) =
+                find_workspace_identity_collision(home, instances, name, &candidate_wd)
+            {
+                return Err(anyhow::anyhow!(
+                    "workspace identity collision: instance '{name}' would resolve to the same \
+                     canonical working directory as existing instance '{collider}' ({}). Refusing \
+                     to admit a duplicate workspace identity (fail-closed).",
+                    candidate_wd.display()
+                ));
+            }
         }
         Ok(true)
     })
@@ -134,6 +138,63 @@ fn find_workspace_identity_collision(
         }
     }
     None
+}
+
+/// Read-only load of the parsed `instances` mapping from fleet.yaml (empty if the
+/// file is missing/unparseable). Best-effort — callers use it for a preflight;
+/// the atomic `add_instances_to_yaml` under the fleet lock stays the authority.
+fn load_instances_mapping(home: &Path) -> serde_yaml_ng::Mapping {
+    std::fs::read_to_string(fleet_yaml_path(home))
+        .ok()
+        .and_then(|c| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&c).ok())
+        .and_then(|doc| doc.get("instances").and_then(|v| v.as_mapping()).cloned())
+        .unwrap_or_default()
+}
+
+/// Read-only workspace-identity collision preflight: returns a DIFFERENT existing
+/// instance sharing `name`'s canonical identity at `candidate_wd`, else `None`.
+/// The create path uses this to refuse BEFORE creating any worktree/directory
+/// (root finding 2 — no partial filesystem/git state on refusal); the atomic
+/// `add_instances_to_yaml` remains the race-safe authority.
+pub fn workspace_identity_collision(
+    home: &Path,
+    name: &str,
+    candidate_wd: &Path,
+) -> Option<String> {
+    find_workspace_identity_collision(home, &load_instances_mapping(home), name, candidate_wd)
+}
+
+/// Boot/spawn admission for a PRE-EXISTING duplicate fleet (root finding 5): if
+/// another instance shares `name`'s canonical workspace identity and sorts
+/// EARLIER, return that earlier owner's name — the caller must then SKIP booting
+/// `name`. The lexicographically-first instance in an identity group is the
+/// single deterministic owner that boots; the rest defer. `None` = `name` is
+/// unique or is itself the owner → boot it. The create path prevents NEW
+/// duplicates, so this only fires for a legacy / hand-corrupted fleet.yaml.
+pub fn duplicate_identity_owner_before(
+    home: &Path,
+    name: &str,
+    candidate_wd: &Path,
+) -> Option<String> {
+    let candidate_id = crate::paths::workspace_identity(candidate_wd);
+    let mut earliest: Option<String> = None;
+    for (k, v) in &load_instances_mapping(home) {
+        let Some(existing_name) = k.as_str() else {
+            continue;
+        };
+        // Only an EARLIER-sorting instance can preempt this boot.
+        if existing_name >= name {
+            continue;
+        }
+        let explicit = v.get("working_directory").and_then(|x| x.as_str());
+        let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
+        if crate::paths::workspace_identity(&existing_wd) == candidate_id
+            && earliest.as_deref().is_none_or(|e| existing_name < e)
+        {
+            earliest = Some(existing_name.to_string());
+        }
+    }
+    earliest
 }
 
 pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
@@ -657,6 +718,67 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn merge_adding_colliding_working_directory_is_refused_whole_registry() {
+        // finding 5: a MERGE that ADDS a working_directory (previously default →
+        // absent) pointing at another instance's identity is refused by the
+        // whole-registry post-pass. The pre-fix scan ran ONLY on the new-key
+        // branch, so this existing-key merge slipped a colliding update past.
+        let home = tmp_home("merge-add-collide");
+        add_instance_to_yaml(&home, "alice", &InstanceYamlEntry::default()).unwrap();
+        add_instance_to_yaml(&home, "bob", &InstanceYamlEntry::default()).unwrap();
+        let alice_default = crate::paths::workspace_dir(&home)
+            .join("alice")
+            .display()
+            .to_string();
+        let err = add_instance_to_yaml(
+            &home,
+            "bob",
+            &InstanceYamlEntry {
+                working_directory: Some(alice_default),
+                ..Default::default()
+            },
+        )
+        .expect_err("a merge that repoints bob onto alice's workspace must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace identity collision"),
+            "collision error: {msg}"
+        );
+        assert!(
+            msg.contains("bob") && msg.contains("alice"),
+            "refusal names both instances: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn duplicate_identity_owner_before_admits_only_the_earliest() {
+        // finding 5: a PRE-EXISTING duplicate fleet.yaml (two instances at ONE
+        // workspace — legacy / hand-edited) boots only the lexicographically-first
+        // "owner"; later ones defer. This is the boot/spawn admission helper.
+        let home = tmp_home("dup-owner");
+        let shared = home.join("shared-ws");
+        // Hand-write a corrupt fleet the create path would never admit. Single-
+        // quoted YAML keeps the (possibly backslashed) path literal cross-platform.
+        let yaml = format!(
+            "instances:\n  alice:\n    working_directory: '{p}'\n  bob:\n    working_directory: '{p}'\n",
+            p = shared.display()
+        );
+        std::fs::write(fleet_yaml_path(&home), yaml).unwrap();
+        // bob (later) defers to the earlier owner alice.
+        assert_eq!(
+            duplicate_identity_owner_before(&home, "bob", &shared).as_deref(),
+            Some("alice")
+        );
+        // alice (earliest in its identity group) is the owner → boots.
+        assert_eq!(
+            duplicate_identity_owner_before(&home, "alice", &shared),
+            None
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// §3.9 (MED-3): a channels-only (plural) fleet must persist a telegram

@@ -275,7 +275,8 @@ fn spawn_and_subscribe(
 )> {
     // Generate MCP config for agent backends
     if Backend::from_command(command).is_some() {
-        crate::instructions::generate(work_dir, command);
+        crate::instructions::generate(work_dir, command)
+            .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
 
     // #1083: install skills for TUI-spawned panes (app mode).
@@ -812,7 +813,16 @@ pub(super) fn run_attach(
                         team: team_ctx.as_ref(),
                         extra_instructions: extra_instructions.as_deref(),
                     };
-                    crate::instructions::generate_with_context(&work_dir, &command, Some(&ctx));
+                    if let Err(e) =
+                        crate::instructions::generate_with_context(&work_dir, &command, Some(&ctx))
+                    {
+                        tracing::error!(agent = %deduped_name, error = %e, "provisioning refused; not attaching");
+                        return AttachOutcome::Failed {
+                            pane_id,
+                            name: deduped_name,
+                            err: format!("provisioning refused: {e}"),
+                        };
+                    }
                     finish_attach(
                         registry,
                         pane_id,
@@ -1091,7 +1101,8 @@ pub(super) fn create_pane_from_resolved(
 
     // Overwrite basic instructions with fleet-aware version
     if let Some(ref wd) = pane.working_dir {
-        crate::instructions::generate_with_context(wd, &resolved.backend_command, Some(&ctx));
+        crate::instructions::generate_with_context(wd, &resolved.backend_command, Some(&ctx))
+            .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
     pane.fleet_instance_name = Some(fleet_name.to_string());
     Ok(pane)

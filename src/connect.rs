@@ -76,7 +76,8 @@ pub fn run(
     std::fs::create_dir_all(&work_dir)?;
 
     // 6. Generate MCP config
-    crate::instructions::generate(&work_dir, &command);
+    crate::instructions::generate(&work_dir, &command)
+        .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     tracing::info!(dir = %work_dir.display(), "MCP config written");
 
     // 7. Register with daemon

@@ -40,8 +40,13 @@ pub(crate) fn prepare_instructions(
     command: &str,
     work_dir: &Path,
     explicit_role: Option<&str>,
-) {
-    std::fs::create_dir_all(work_dir).ok();
+) -> Result<(), String> {
+    std::fs::create_dir_all(work_dir).map_err(|e| {
+        format!(
+            "prepare_instructions: create {} failed: {e}",
+            work_dir.display()
+        )
+    })?;
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     // Look up team membership so agend.md can split collaborators (team
     // members) from the rest of the fleet. Owned here so we can hand out
@@ -80,7 +85,7 @@ pub(crate) fn prepare_instructions(
                 team: team_ctx.as_ref(),
                 extra_instructions: extra_instr.as_deref(),
             };
-            crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
+            crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
         }
         Err(_) if explicit_role.is_some() => {
             let ctx = crate::instructions::AgentContext {
@@ -90,11 +95,9 @@ pub(crate) fn prepare_instructions(
                 team: team_ctx.as_ref(),
                 extra_instructions: None,
             };
-            crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
+            crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
         }
-        Err(_) => {
-            crate::instructions::generate(work_dir, command);
-        }
+        Err(_) => crate::instructions::generate(work_dir, command),
     }
 }
 

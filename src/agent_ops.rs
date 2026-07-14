@@ -1489,6 +1489,53 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_refuses_unreadable_identity_tree() {
+        // Fail-closed: an UNREADABLE identity artifact (opaque I/O ≠ NotFound)
+        // must refuse the delete — never be read as "absent" and wipe the tree.
+        let home = tmp_home("cw_unreadable");
+        let ws = home.join("workspace/alice");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), [0xFFu8, 0xFE]).unwrap(); // invalid UTF-8
+        assert!(
+            cleanup_working_dir(&home, "alice", &ws).is_some(),
+            "unreadable identity must refuse (Some verdict)"
+        );
+        assert!(ws.exists(), "tree preserved on unreadable identity");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn workspace_identity_lock_is_mutually_exclusive_provision_vs_delete() {
+        // Provision (generate_with_context) and delete (cleanup_working_dir) BOTH
+        // acquire store::acquire_workspace_identity_lock(home, wd) for the same
+        // directory. Prove it is mutually exclusive so a check+write can never
+        // interleave with a check+remove of that directory (root finding 4).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let home = tmp_home("wsid_lock");
+        let wd = home.join("workspace/shared");
+        let in_critical = Arc::new(AtomicBool::new(false));
+        let held = crate::store::acquire_workspace_identity_lock(&home, &wd).expect("first lock");
+        in_critical.store(true, Ordering::SeqCst);
+        let (h2, w2, ic2) = (home.clone(), wd.clone(), in_critical.clone());
+        let t = std::thread::spawn(move || {
+            // Blocks until the main thread releases `held` (mutual exclusion).
+            let _g = crate::store::acquire_workspace_identity_lock(&h2, &w2).expect("second lock");
+            assert!(
+                !ic2.load(Ordering::SeqCst),
+                "acquired the workspace-identity lock while another holder was still in its \
+                 critical section — the lock is NOT mutually exclusive"
+            );
+        });
+        // Give the spawned thread time to reach (and block on) the acquire.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        in_critical.store(false, Ordering::SeqCst);
+        drop(held);
+        t.join().expect("second acquirer thread");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn cleanup_metadata() {
         let home = tmp_home("cms");
         let ws = home.join("workspace/a");

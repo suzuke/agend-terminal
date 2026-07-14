@@ -8,9 +8,10 @@ pub use watchdog::WatchdogConfig;
 
 #[allow(unused_imports)]
 pub use persist::{
-    add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, migrate_teams_json_to_yaml,
-    remove_instance_from_yaml, remove_instances_from_yaml, remove_team_from_yaml,
-    update_channel_telegram_group_id, update_instance_field, update_team_in_yaml, TeamWriteOutcome,
+    add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, duplicate_identity_owner_before,
+    migrate_teams_json_to_yaml, remove_instance_from_yaml, remove_instances_from_yaml,
+    remove_team_from_yaml, update_channel_telegram_group_id, update_instance_field,
+    update_team_in_yaml, workspace_identity_collision, TeamWriteOutcome,
 };
 
 use crate::backend::Backend;

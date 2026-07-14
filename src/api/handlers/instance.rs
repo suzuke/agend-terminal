@@ -300,7 +300,13 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
+    // #46776 fail-closed: a workspace-identity refusal (or provisioning I/O
+    // failure) must ABORT the spawn — never fork an agent against foreign or
+    // half-written provisioned state.
+    if let Err(e) = super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role) {
+        tracing::error!(agent = %name, error = %e, "SPAWN aborted: provisioning refused");
+        return json!({"ok": false, "error": format!("provisioning refused: {e}")});
+    }
 
     // #900 hybrid (b)+(c): env precedence is params.env > fleet.yaml
     // resolved env > none. `params.env` lets the SPAWN caller pass an

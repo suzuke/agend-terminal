@@ -97,6 +97,27 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
                 .to_string()
         });
 
+    // #46776 fail-closed (root finding 2): refuse a colliding workspace identity
+    // BEFORE creating any worktree or directory, so a refusal leaves NO partial
+    // filesystem/git state. Compute the INTENDED final working directory (the
+    // branch worktree path when a branch is set — computed, NOT created) and
+    // preflight it against the registry. The atomic add_instance_to_yaml below
+    // stays the race-safe authority (with rollback on the rare racing refusal).
+    let intended_wd = match args.get("branch").and_then(|v| v.as_str()) {
+        Some(branch) if validate_branch(branch) => {
+            crate::worktree::worktree_path(home, name, branch)
+        }
+        _ => std::path::PathBuf::from(&work_dir),
+    };
+    if let Some(collider) = crate::fleet::workspace_identity_collision(home, name, &intended_wd) {
+        return json!({"error": format!(
+            "workspace identity collision: '{name}' would resolve to the same working directory as \
+             existing instance '{collider}' ({}); refusing before creating any worktree/directory \
+             (fail-closed).",
+            intended_wd.display()
+        )});
+    }
+
     if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
         if !validate_branch(branch) {
             return json!({"error": format!("invalid branch name '{branch}'")});
@@ -198,6 +219,12 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         ..Default::default()
     };
     if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
+        // #46776 finding 2: roll back the worktree/dir created above so a refused
+        // admission (a race that slipped past the preflight, or a merge conflict)
+        // leaves NO partial filesystem/git state. The dir is not yet provisioned
+        // (no AGENTS.md/.codex identity), so cleanup finds no foreign owner.
+        let _ =
+            crate::agent_ops::cleanup_working_dir(home, name, &std::path::PathBuf::from(&work_dir));
         return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});
     }
 

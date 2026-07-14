@@ -116,7 +116,12 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
             team: None,
             extra_instructions: extra_instructions.as_deref(),
         };
-        crate::instructions::generate_with_context(dir, &resolved.backend_command, Some(&ctx));
+        if let Err(e) =
+            crate::instructions::generate_with_context(dir, &resolved.backend_command, Some(&ctx))
+        {
+            tracing::error!(instance = name, error = %e, "provisioning refused; skipping instance boot");
+            return None;
+        }
     }
 
     let mut args = resolved.args;
