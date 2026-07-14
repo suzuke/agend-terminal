@@ -16,6 +16,9 @@ default-run = "agend-terminal"
 include = [
     "src/**/*.rs",
     "build.rs",
+    # `build.rs` does `include!("build/provenance.rs")` — the packaged tarball
+    # must contain this file or the verify build fails.
+    "build/provenance.rs",
     "assets/windows/*",
     # `src/binding.rs` does `include_str!("../assets/hooks/prepare-commit-msg")`
     # + `.../prepare-commit-msg.ps1` (Sprint 53 #446 Phase 1 trailer hook).
