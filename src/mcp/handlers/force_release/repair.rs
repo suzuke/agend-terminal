@@ -5,7 +5,6 @@
 //! `src/mcp/handlers` 750-LOC handler invariant (`tests/file_size_invariant.rs`)
 //! — same reason `gc.rs` is its own file.
 
-use super::rebase_clean_self;
 use std::path::Path;
 
 /// What (if anything) [`attempt_safe_rebind_repair`] changed. The issue's
@@ -34,15 +33,102 @@ pub(crate) enum RepairAction {
     SwitchedBranch,
 }
 
+pub(crate) struct RepairResult {
+    pub(crate) action: RepairAction,
+    pub(crate) continuation: Option<RebaseContinuation>,
+}
+
+pub(crate) struct RebaseContinuation {
+    pub(crate) worktree: std::path::PathBuf,
+    pub(crate) source_repo: std::path::PathBuf,
+    pub(crate) requested_branch: String,
+    pub(crate) previous_branch: String,
+    pub(crate) marker_body: Vec<u8>,
+    pub(crate) binding_body: Vec<u8>,
+    pub(crate) binding_signature: Option<Vec<u8>>,
+    pub(crate) binding_fingerprint: crate::binding::BindingFingerprint,
+}
+
+impl RebaseContinuation {
+    pub(crate) fn rollback(&self, home: &Path, agent: &str) -> Result<(), String> {
+        let _lease = crate::binding::acquire_branch_lease_lock(
+            home,
+            &self.source_repo.display().to_string(),
+            &self.requested_branch,
+        )
+        .map_err(|e| format!("rollback branch lease lock failed: {e}"))?;
+        let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, agent)?;
+        let _binding_lock = crate::binding::acquire_binding_file_lock(home, agent)?;
+        let live = crate::binding::guarded_binding_disk_fresh(home, agent);
+        match live {
+            crate::binding::GuardedBinding::Known { fingerprint, .. }
+                if fingerprint == self.binding_fingerprint => {}
+            crate::binding::GuardedBinding::Known { .. } => {
+                return Err(
+                    "rollback refused: binding generation advanced while rebase was in flight"
+                        .to_string(),
+                )
+            }
+            crate::binding::GuardedBinding::Absent => {
+                return Err(
+                    "rollback refused: binding disappeared while rebase was in flight".to_string(),
+                )
+            }
+            crate::binding::GuardedBinding::Opaque(reason) => {
+                return Err(format!(
+                    "rollback refused: binding became opaque while rebase was in flight: {reason}"
+                ))
+            }
+        }
+        let current = crate::git_helpers::git_cmd(&self.worktree, &["branch", "--show-current"])
+            .map_err(|e| format!("rollback read current branch failed: {e}"))?;
+        if current != self.previous_branch {
+            crate::git_helpers::git_cmd(&self.worktree, &["switch", &self.previous_branch])
+                .map_err(|e| format!("rollback git switch failed: {e}"))?;
+        }
+        std::fs::write(
+            self.worktree.join(crate::worktree_pool::MANAGED_MARKER),
+            &self.marker_body,
+        )
+        .map_err(|e| format!("rollback marker write failed: {e}"))?;
+        crate::store::atomic_write(&crate::paths::binding_path(home, agent), &self.binding_body)
+            .map_err(|e| format!("rollback binding write failed: {e}"))?;
+        let restored_binding = serde_json::from_slice(&self.binding_body)
+            .map_err(|e| format!("rollback binding parse failed: {e}"))?;
+        crate::binding::refresh_cached(home, agent, restored_binding);
+        let signature = crate::paths::runtime_dir(home)
+            .join(agent)
+            .join("binding.json.sig");
+        match &self.binding_signature {
+            Some(body) => crate::store::atomic_write(&signature, body)
+                .map_err(|e| format!("rollback binding signature write failed: {e}"))?,
+            None => {
+                let _ = std::fs::remove_file(signature);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RepairResult {
+    pub(crate) fn no_continuation(action: RepairAction) -> Self {
+        Self {
+            action,
+            continuation: None,
+        }
+    }
+}
+
 /// Why [`attempt_safe_rebind_repair`] refused to repair. The acceptance
 /// criteria requires fail-closed behavior with a clear, specific reason —
 /// callers MUST surface this as a blocked error, never silently fall through
 /// to a destructive release.
 #[derive(Debug, Clone)]
 pub(crate) enum RepairBlocked {
+    Opaque(String),
+    TargetOpaque(String),
+    BindingChanged,
     Dirty,
-    NotDaemonManaged,
-    MarkerAgentMismatch(String),
     OtherAgentHoldsBranch(String),
     ActiveCiWatch,
     ActiveTask,
@@ -56,17 +142,10 @@ pub(crate) enum RepairBlocked {
 impl std::fmt::Display for RepairBlocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RepairBlocked::Opaque(e) => write!(f, "opaque binding state: {e}"),
+            RepairBlocked::TargetOpaque(e) => write!(f, "opaque target state: {e}"),
+            RepairBlocked::BindingChanged => write!(f, "binding changed during guarded repair"),
             RepairBlocked::Dirty => write!(f, "worktree has uncommitted changes"),
-            RepairBlocked::NotDaemonManaged => {
-                write!(
-                    f,
-                    "worktree is not daemon-managed (.agend-managed marker missing)"
-                )
-            }
-            RepairBlocked::MarkerAgentMismatch(a) => write!(
-                f,
-                "worktree's .agend-managed marker belongs to a different agent ('{a}')"
-            ),
             RepairBlocked::OtherAgentHoldsBranch(a) => {
                 write!(f, "branch is already held by another agent ('{a}')")
             }
@@ -104,114 +183,51 @@ impl std::fmt::Display for RepairBlocked {
 /// [`RepairAction::NoOp`] when there's no existing binding at all — nothing
 /// live to protect, the caller's normal bind proceeds as a fresh first-bind.
 ///
-/// [`RepairAction::StaleStateCleared`] when a binding exists but its recorded
-/// worktree is dead (missing, or not a git repo) — there's no LIVE protected
-/// worktree here, so falling back to the legacy [`rebase_clean_self`] cleanup
-/// (clear the corrupt binding + any leftover dir at the pre-#2496 path
-/// formula) is safe; this is the ORIGINAL incident-recovery purpose
-/// `rebase_mode` shipped for, and it's preserved unchanged.
+/// [`RepairAction::StaleStateCleared`] when a binding or exact managed target
+/// is stale and the guarded transaction clears it without touching unrelated
+/// worktrees.
 ///
-/// Every other case — dirty, unmanaged, marker-agent mismatch, the requested
+/// Every other case — dirty, marker-agent mismatch, the requested
 /// branch already held by another agent, an active CI watch or task still
 /// tied to the worktree's CURRENT (about-to-be-abandoned) branch, or the
 /// `git switch` itself failing — returns [`RepairBlocked`]. Callers MUST
 /// treat this as fail-closed and must NOT fall through to a destructive
 /// release: these are all cases where a LIVE worktree WAS found but touching
 /// it isn't safe.
+#[allow(dead_code)]
 pub(crate) fn attempt_safe_rebind_repair(
     home: &Path,
     agent: &str,
     branch: &str,
+    explicit_repo: Option<&Path>,
+    sender: Option<&str>,
 ) -> Result<RepairAction, RepairBlocked> {
-    let Some(binding) = crate::binding::read(home, agent) else {
-        return Ok(RepairAction::NoOp);
-    };
-    // codex-reviewer (PR #2523 review): the recorded binding branch can have
-    // its own live dependents (CI watch / task) INDEPENDENT of the worktree's
-    // actual branch — a "double-stale" binding (binding.branch=A, worktree
-    // actually on B, requested C) must not silently abandon A's tracking just
-    // because the mutation touches B→C. Preflight EVERY branch this call is
-    // about to abandon — recorded_branch always, actual_branch too once known
-    // — BEFORE any mutation (switch or the destructive fallback below).
-    let recorded_branch = binding
-        .get("branch")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    attempt_safe_rebind_repair_with_continuation(home, agent, branch, explicit_repo, sender)
+        .map(|result| result.action)
+}
 
-    let wt_str = binding
-        .get("worktree")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let worktree = Path::new(wt_str);
-    if wt_str.is_empty() || !worktree.exists() || !crate::worktree::is_git_repo(worktree) {
-        // No LIVE worktree at the recorded path — nothing to protect from
-        // mutation, but the binding we're about to CLEAR can still be the
-        // only thing tracking `recorded_branch` for a live CI watch/task.
-        if let Some(blocked) =
-            reject_if_branch_has_dependents(home, agent, &recorded_branch, branch)
-        {
-            return Err(blocked);
-        }
-        // Stale-state cleanup: the recorded worktree is already GONE (no live WIP
-        // to preserve here), and this repair helper carries no caller identity →
-        // None routes any WIP-preserved notice to the agent's team orchestrator
-        // (fallback: operator inbox), never a hardcoded recipient.
-        return match rebase_clean_self(home, agent, branch, None) {
-            Ok(_) => Ok(RepairAction::StaleStateCleared),
-            Err(e) => Err(RepairBlocked::PathUnsafe(e)),
-        };
-    }
-    if !crate::worktree_pool::is_daemon_managed(worktree) {
-        return Err(RepairBlocked::NotDaemonManaged);
-    }
-    if let Some(marker_agent) = crate::binding::managed_marker_agent(worktree) {
-        if marker_agent != agent {
-            return Err(RepairBlocked::MarkerAgentMismatch(marker_agent));
-        }
-    }
-    if crate::worktree::has_uncommitted_changes(worktree) {
-        return Err(RepairBlocked::Dirty);
-    }
-    let source_repo_str = binding
-        .get("source_repo")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if let Some(other) =
-        crate::binding::scan_existing_branch_binding(home, source_repo_str, branch, agent)
-    {
-        return Err(RepairBlocked::OtherAgentHoldsBranch(other));
-    }
-    let actual_branch =
-        crate::git_helpers::git_cmd(worktree, &["branch", "--show-current"]).unwrap_or_default();
+pub(crate) fn attempt_safe_rebind_repair_with_continuation(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    explicit_repo: Option<&Path>,
+    sender: Option<&str>,
+) -> Result<RepairResult, RepairBlocked> {
+    let guard = crate::mcp::handlers::dispatch_hook::acquire_rebase_guard(home, agent)
+        .map_err(RepairBlocked::PathUnsafe)?;
+    let permit = guard.permit();
+    attempt_safe_rebind_repair_with_permit(home, agent, branch, explicit_repo, sender, permit)
+}
 
-    // Preflight BOTH candidate abandoned branches before any mutation —
-    // recorded_branch (the binding we're about to overwrite) and, if it
-    // differs, actual_branch (the branch the switch below would move away
-    // from). Order doesn't matter: either blocking either one must happen
-    // strictly before the `git switch` call.
-    if let Some(blocked) = reject_if_branch_has_dependents(home, agent, &recorded_branch, branch) {
-        return Err(blocked);
-    }
-    if actual_branch != recorded_branch {
-        if let Some(blocked) = reject_if_branch_has_dependents(home, agent, &actual_branch, branch)
-        {
-            return Err(blocked);
-        }
-    }
-
-    if actual_branch == branch {
-        return Ok(RepairAction::MetadataOnly);
-    }
-    // Plain `git switch` — NOT `worktree::checkout_branch` (that falls back
-    // to `git switch -c`, silently CREATING a branch; a repair path must
-    // never do that as a side effect).
-    use crate::git_helpers::{git_cmd, GitError};
-    match git_cmd(worktree, &["switch", branch]) {
-        Ok(_) => Ok(RepairAction::SwitchedBranch),
-        Err(GitError::NonZero { stderr, .. }) => Err(RepairBlocked::SwitchFailed(stderr)),
-        Err(GitError::Spawn(e)) => Err(RepairBlocked::SwitchFailed(e.to_string())),
-    }
+pub(crate) fn attempt_safe_rebind_repair_with_permit(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    explicit_repo: Option<&Path>,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Result<RepairResult, RepairBlocked> {
+    super::s2::rebase_repair(home, agent, branch, explicit_repo, sender, permit)
 }
 
 /// `Some(blocked)` iff `candidate` is a real branch being abandoned (non-empty
@@ -219,7 +235,7 @@ pub(crate) fn attempt_safe_rebind_repair(
 /// dependent (this agent's CI watch, or any active task linked to it).
 /// `target` itself is never checked — it's where we're going, not what's
 /// being abandoned.
-fn reject_if_branch_has_dependents(
+pub(crate) fn reject_if_branch_has_dependents(
     home: &Path,
     agent: &str,
     candidate: &str,
@@ -303,10 +319,13 @@ mod tests {
             .ok();
     }
 
-    fn write_managed_marker(worktree: &Path, agent: &str) {
+    fn write_managed_marker(worktree: &Path, agent: &str, branch: &str, source_repo: &Path) {
         std::fs::write(
             worktree.join(crate::worktree_pool::MANAGED_MARKER),
-            format!("agent={agent}\nbranch=irrelevant\n"),
+            format!(
+                "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+                source_repo.display()
+            ),
         )
         .unwrap();
     }
@@ -320,14 +339,14 @@ mod tests {
     fn attempt_safe_rebind_repair_finds_real_worktree_via_binding_metadata_only_2496() {
         let home = tmp_home("2496-repair-metadata-only");
         let wt = tmp_git_repo(&home, "agentA");
-        write_managed_marker(&wt, "agentA");
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
+        write_managed_marker(&wt, "agentA", "main", &src);
         crate::binding::bind_full(&home, "agentA", "", "feat/x", &wt, &src, false)
             .expect("first bind ok");
         // Worktree is genuinely on `main` right now (never switched) —
         // request the branch it's ALREADY on.
-        let result = attempt_safe_rebind_repair(&home, "agentA", "main");
+        let result = attempt_safe_rebind_repair(&home, "agentA", "main", Some(&src), None);
         assert!(
             matches!(result, Ok(RepairAction::MetadataOnly)),
             "expected MetadataOnly, got {result:?}"
@@ -348,9 +367,9 @@ mod tests {
     fn attempt_safe_rebind_repair_switches_branch_in_place_when_clean_2496() {
         let home = tmp_home("2496-repair-switch");
         let wt = tmp_git_repo(&home, "agentA");
-        write_managed_marker(&wt, "agentA");
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
+        write_managed_marker(&wt, "agentA", "main", &src);
         crate::binding::bind_full(&home, "agentA", "", "main", &wt, &src, false)
             .expect("first bind ok");
         // `feat/y` must already exist as a local ref — the repair's plain
@@ -363,7 +382,7 @@ mod tests {
             .output()
             .ok();
 
-        let result = attempt_safe_rebind_repair(&home, "agentA", "feat/y");
+        let result = attempt_safe_rebind_repair(&home, "agentA", "feat/y", Some(&src), None);
         assert!(
             matches!(result, Ok(RepairAction::SwitchedBranch)),
             "expected SwitchedBranch, got {result:?}"
@@ -388,9 +407,9 @@ mod tests {
     fn attempt_safe_rebind_repair_blocks_on_recorded_branch_dependent_before_switching_2496() {
         let home = tmp_home("2496-repair-double-stale");
         let wt = tmp_git_repo(&home, "agentA");
-        write_managed_marker(&wt, "agentA");
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
+        write_managed_marker(&wt, "agentA", "B", &src);
         // binding.branch = "A".
         crate::binding::bind_full(&home, "agentA", "", "A", &wt, &src, false)
             .expect("first bind ok");
@@ -408,7 +427,7 @@ mod tests {
             }),
         );
 
-        let result = attempt_safe_rebind_repair(&home, "agentA", "C");
+        let result = attempt_safe_rebind_repair(&home, "agentA", "C", Some(&src), None);
         assert!(
             matches!(result, Err(RepairBlocked::ActiveTask)),
             "expected ActiveTask block on the recorded branch A, got {result:?}"
@@ -431,9 +450,9 @@ mod tests {
     ) {
         let home = tmp_home("2496-repair-dead-with-dependent");
         let wt = tmp_git_repo(&home, "agentA");
-        write_managed_marker(&wt, "agentA");
         let src = home.join("src");
         std::fs::create_dir_all(&src).unwrap();
+        write_managed_marker(&wt, "agentA", "main", &src);
         crate::binding::bind_full(&home, "agentA", "", "A", &wt, &src, false)
             .expect("first bind ok");
         // Worktree is now GONE — the incident-recovery scenario.
@@ -449,7 +468,7 @@ mod tests {
             }),
         );
 
-        let result = attempt_safe_rebind_repair(&home, "agentA", "C");
+        let result = attempt_safe_rebind_repair(&home, "agentA", "C", Some(&src), None);
         assert!(
             matches!(result, Err(RepairBlocked::ActiveTask)),
             "expected ActiveTask block, got {result:?}"

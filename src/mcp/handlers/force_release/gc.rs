@@ -1,222 +1,178 @@
-//! #826 L2 GC helpers for `force_release_worktree`. Extracted from
+//! Exact-owner metadata cleanup for `force_release_worktree`. Extracted from
 //! `mod.rs` to keep the parent file under the `tests/file_size_invariant.rs`
 //! 750-LOC ceiling.
 //!
 //! When `force_release_worktree` runs after `full_delete_instance`
 //! (PR #834 / #828 cascade) the agent's daemon binding is already
 //! gone. `worktree_pool::release_full` then early-returns on "no
-//! binding" before its own `git worktree remove --force` step — so
-//! the working tree dir gets wiped but `<source>/.git/worktrees/<meta>/`
-//! metadata persists in the source repo. This module runs the missing
-//! `git worktree remove --force` against the source repo using the
-//! same `AGEND_GIT_BYPASS=1` env that the operator's manual recovery
-//! command used.
+//! binding" before its own `git worktree remove --force` step. The production
+//! path now prunes only the exact proven owner inside the S2 transaction; the
+//! old agent-wide discovery helper lives in `gc_legacy` test-only coverage.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 /// #826 L2 GC outcome: count + list of source repos where the
 /// `git worktree remove --force` (and `git worktree prune` fallback)
 /// step actually pruned a metadata entry for the target agent's
 /// worktree path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum ExactMetadataState {
+    #[default]
+    ExactNone,
+    ExactMatch,
+    Opaque(String),
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct GcOutcome {
     pub(crate) pruned_count: usize,
     pub(crate) repos_touched: Vec<String>,
+    pub(crate) matched: bool,
+    pub(crate) state: ExactMetadataState,
 }
 
-/// #826 L2: enumerate source repos that may still hold
-/// `.git/worktrees/<meta-dir>/` metadata pointing at the daemon-
-/// managed worktree path `<home>/worktrees/<agent>/<branch>/`, and
-/// run `git worktree remove --force` per matching entry. Idempotent
-/// — re-running on already-pruned metadata is a no-op (returns
-/// `GcOutcome::default()` with `pruned_count: 0`).
-///
-/// Source-repo discovery:
-/// 1. If `source_repo_hint` is supplied (operator's fast path) →
-///    use it as the single candidate.
-/// 2. Else → enumerate via two sources:
-///    - Walk `<home>/worktrees/*/<...>/.git` pointer files from
-///      sibling agents (the daemon's worktree convention writes a
-///      `.git` file containing `gitdir: <source>/.git/worktrees/<name>`).
-///    - Read `crate::teams::list_all(home)` and collect each
-///      team's `source_repo` field.
-///
-/// For each candidate source repo, run `git worktree list
-/// --porcelain` (via the local `list_worktrees_bypass_shim`) to find
-/// entries whose path matches the target. For each match, run
-/// `git worktree remove --force <path>` against the source repo's
-/// cwd. AGEND_GIT_BYPASS=1 is set on every git invocation to bypass
-/// the daemon shim per the operator-confirmed manual recovery command.
-pub(crate) fn prune_git_metadata_for_agent(
-    home: &Path,
+#[cfg(test)]
+pub(crate) mod gc_test_seam {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn() -> Option<String>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn() -> Option<String> + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) fn hit() -> Option<String> {
+        HOOK.with(|slot| slot.borrow().as_ref().and_then(|hook| hook()))
+    }
+}
+
+/// Remove metadata for one already-proven `(source_repo, target)` pair.
+/// Unlike the legacy agent-wide discovery helper below, this function never
+/// enumerates candidate repositories and is called while S2 holds
+/// `L(repo,branch) -> A -> B`.
+pub(crate) fn prune_exact_git_metadata(
+    source_repo: &Path,
+    target: &Path,
     agent: &str,
     branch: &str,
-    source_repo_hint: Option<&Path>,
 ) -> GcOutcome {
-    let target_path = home.join("worktrees").join(agent).join(branch);
-    let candidates: Vec<PathBuf> = match source_repo_hint {
-        Some(p) => vec![p.to_path_buf()],
-        None => discover_source_repo_candidates(home),
-    };
-
     let mut outcome = GcOutcome::default();
-    let mut seen = HashSet::new();
-    for repo in candidates {
-        // Dedupe candidates (sibling enumeration may report the
-        // same repo via multiple agents).
-        if !seen.insert(repo.clone()) {
+    // A caller may provide a pre-existing, non-git source directory while
+    // force-releasing an already-absent target.  There cannot be worktree
+    // metadata to enumerate in that case, so this is the typed ExactNone
+    // state rather than an opaque enumeration failure.  Any existing git
+    // directory still goes through the exact, fail-closed listing below.
+    match std::fs::symlink_metadata(source_repo.join(".git")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return outcome,
+        Err(error) => {
+            outcome.state = ExactMetadataState::Opaque(error.to_string());
+            return outcome;
+        }
+    }
+    #[cfg(test)]
+    if let Some(reason) = gc_test_seam::hit() {
+        outcome.state = ExactMetadataState::Opaque(reason);
+        return outcome;
+    }
+    let entries = match crate::git_worktree::list_porcelain_exact(source_repo) {
+        Ok(entries) => entries,
+        Err(error) => {
+            outcome.state = ExactMetadataState::Opaque(error.to_string());
+            return outcome;
+        }
+    };
+    for (entry_path, _branch_name) in entries {
+        let entry_path = entry_path.display().to_string();
+        if !paths_match(&entry_path, target) {
             continue;
         }
-        if !repo.exists() {
-            continue;
-        }
-        let entries = list_worktrees_bypass_shim(&repo);
-        for entry in entries {
-            if !paths_match(&entry.path, &target_path) {
-                continue;
-            }
-            // Found a matching metadata entry — prune it.
-            // #1899: bounded via git_bypass (LOCAL 60s).
-            let removed = crate::git_helpers::git_bypass(
-                &repo,
-                &["worktree", "remove", "--force", &entry.path],
-            );
-            let pruned = match removed {
-                Ok(o) if o.status.success() => true,
-                Ok(o) => {
-                    // Fallback: when the worktree dir is already
-                    // gone but `git worktree remove` errors (e.g.,
-                    // "not a worktree"), run `git worktree prune`
-                    // to clean stale metadata.
-                    tracing::warn!(
-                        agent = %agent,
-                        branch = %branch,
-                        repo = %repo.display(),
-                        stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                        "#826 L2: git worktree remove failed; falling back to prune"
-                    );
-                    // #1899: bounded via git_bypass (LOCAL 60s).
-                    let prune = crate::git_helpers::git_bypass(&repo, &["worktree", "prune"]);
-                    matches!(prune, Ok(p) if p.status.success())
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        agent = %agent,
-                        branch = %branch,
-                        repo = %repo.display(),
-                        error = %e,
-                        "#826 L2: git worktree remove spawn failed"
-                    );
-                    false
-                }
-            };
-            if pruned {
-                outcome.pruned_count += 1;
-                let repo_str = repo.display().to_string();
-                if !outcome.repos_touched.contains(&repo_str) {
-                    outcome.repos_touched.push(repo_str);
-                }
-                tracing::info!(
+        outcome.matched = true;
+        outcome.state = ExactMetadataState::ExactMatch;
+        let removed = crate::git_helpers::git_bypass(
+            source_repo,
+            &["worktree", "remove", "--force", &entry_path],
+        );
+        let pruned = match removed {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                tracing::warn!(
                     agent = %agent,
                     branch = %branch,
-                    repo = %repo.display(),
-                    path = %entry.path,
-                    "#826 L2: pruned stale .git/worktrees/ metadata"
+                    repo = %source_repo.display(),
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "S2 exact metadata remove failed; falling back to exact metadata directory removal"
                 );
+                remove_exact_metadata_dir(source_repo, target)
             }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent,
+                    branch = %branch,
+                    repo = %source_repo.display(),
+                    error = %e,
+                    "S2 exact metadata remove spawn failed"
+                );
+                false
+            }
+        };
+        if pruned {
+            outcome.pruned_count = 1;
+            outcome
+                .repos_touched
+                .push(source_repo.display().to_string());
         }
+        break;
     }
     outcome
 }
 
-/// #826 L2 fork of `crate::worktree_cleanup::list_worktrees` — #2550 W2
-/// converged both onto the shared `git_worktree::list_porcelain` core
-/// (always bypass-enabled via `git_helpers::git_bypass`; mirrors the
-/// `release_full` precedent at src/worktree_pool.rs:311), keeping this
-/// site's own main/master exclusion + `WorktreeEntry` conversion as a thin
-/// caller-specific layer on top (unchanged from the pre-#2550 fork).
-fn list_worktrees_bypass_shim(repo_root: &Path) -> Vec<crate::worktree_cleanup::WorktreeEntry> {
-    crate::git_worktree::list_porcelain(repo_root)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(path, branch)| {
-            let branch = branch?;
-            if branch == "main" || branch == "master" {
-                return None;
-            }
-            Some(crate::worktree_cleanup::WorktreeEntry {
-                path: path.display().to_string(),
-                branch,
-            })
-        })
-        .collect()
-}
-
-/// #826 L2: best-effort source-repo enumeration when the operator
-/// didn't supply a `source_repo` arg. Two sources, deduped by caller:
-/// 1. Sibling daemon-managed worktrees' `.git` pointer files
-///    (`gitdir: <source>/.git/worktrees/<name>`).
-/// 2. `crate::teams::list_all` team `source_repo` fields.
-fn discover_source_repo_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    // Source 1: walk sibling daemon worktrees' .git pointers.
-    let worktrees_root = home.join("worktrees");
-    if let Ok(agents) = std::fs::read_dir(&worktrees_root) {
-        for agent_entry in agents.flatten() {
-            let agent_dir = agent_entry.path();
-            if !agent_dir.is_dir() {
-                continue;
-            }
-            collect_source_repos_from_worktree_tree(&agent_dir, &mut out);
-        }
-    }
-    // Source 2: team-level source_repo from fleet.yaml.
-    for team in crate::teams::list_all(home) {
-        if let Some(repo) = team.source_repo {
-            out.push(repo);
-        }
-    }
-    out
-}
-
-/// Recursively walk a daemon-managed worktree subtree looking for
-/// `.git` pointer files. For each found, parse the
-/// `gitdir: <source>/.git/worktrees/<name>` line and derive the
-/// source repo (strip `.git/worktrees/<name>` suffix).
-fn collect_source_repos_from_worktree_tree(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn remove_exact_metadata_dir(source_repo: &Path, target: &Path) -> bool {
+    let metadata_root = source_repo.join(".git").join("worktrees");
+    let Ok(entries) = std::fs::read_dir(metadata_root) else {
+        return false;
     };
     for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            collect_source_repos_from_worktree_tree(&p, out);
+        let dir = entry.path();
+        if !dir.is_dir() {
             continue;
         }
-        if p.file_name().and_then(|n| n.to_str()) != Some(".git") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&p) else {
+        let Ok(gitdir) = std::fs::read_to_string(dir.join("gitdir")) else {
             continue;
         };
-        let Some(gitdir) = content
-            .lines()
-            .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
-        else {
-            continue;
+        let gitdir = PathBuf::from(gitdir.trim());
+        let worktree_path = if gitdir.is_absolute() {
+            gitdir
+        } else {
+            source_repo.join(gitdir)
         };
-        // `gitdir` points at `<source>/.git/worktrees/<name>` — walk
-        // up two parents to reach `<source>`.
-        let path = PathBuf::from(gitdir);
-        if let Some(source) = path
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-        {
-            out.push(source.to_path_buf());
+        let worktree_path = if worktree_path.file_name().is_some_and(|name| name == ".git") {
+            worktree_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or(worktree_path)
+        } else {
+            worktree_path
+        };
+        if paths_match(&worktree_path.display().to_string(), target) {
+            return std::fs::remove_dir_all(dir).is_ok();
         }
     }
+    false
 }
 
 /// Compare a `git worktree list --porcelain` path string against the
@@ -235,7 +191,7 @@ fn collect_source_repos_from_worktree_tree(dir: &Path, out: &mut Vec<PathBuf>) {
 ///    as `/var/...`. Equality after canonicalize-of-parent handles
 ///    this when parents exist; when neither parent canonicalizes,
 ///    fall back to the macOS prefix normalization.
-fn paths_match(entry_path: &str, target: &Path) -> bool {
+pub(super) fn paths_match(entry_path: &str, target: &Path) -> bool {
     let entry = PathBuf::from(entry_path);
     let entry_norm = canonicalize_via_parent(&entry);
     let target_norm = canonicalize_via_parent(target);
@@ -463,9 +419,11 @@ mod tests {
         // repos_touched: []. The response shape still includes the
         // fields (audit contract).
         let home = tmp_home("826_c3_response_shape");
+        let source = home.join("source-repo");
+        std::fs::create_dir_all(&source).unwrap();
         let result = handle_release_worktree(
             &home,
-            &json!({"instance": "dev826c3", "branch": "feat/826", "force": true}),
+            &json!({"instance": "dev826c3", "branch": "feat/826", "repository_path": source, "force": true}),
             &None,
         );
         assert_eq!(result["git_metadata_pruned"], 0, "got: {result}");

@@ -75,3 +75,9 @@ pub(crate) fn worktree_binding_state(home: &Path, worktree_path: &Path) -> Workt
         WorktreeBindingState::Unbound
     }
 }
+
+pub(crate) fn refresh_cached(home: &Path, agent: &str, value: serde_json::Value) {
+    if let Ok(mut map) = super::binding_index().write() {
+        map.insert(super::index_key(home, agent), value);
+    }
+}

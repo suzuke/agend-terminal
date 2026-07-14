@@ -131,7 +131,8 @@ pub fn lease(
     let _ = std::fs::write(
         &marker,
         format!(
-            "agent={agent}\nbranch={branch}\nleased_at={}\n",
+            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+            source_repo.display(),
             chrono::Utc::now().to_rfc3339()
         ),
     );
@@ -141,50 +142,6 @@ pub fn lease(
         branch: branch.to_string(),
         path: info.path,
     })
-}
-
-/// Release a lease — marks worktree as GC candidate (does NOT delete, Phase 4).
-/// Writes `released_at` timestamp for grace period calculation.
-pub fn release(home: &Path, lease: &WorktreeLease) {
-    // #worktree-git-3: hold the SAME per-agent binding lock that
-    // create()/bind_full/gc use, so the unbind + marker read-modify-write is
-    // atomic against a concurrent bind or GC pass. Without it, a racing rewrite
-    // (or a crash between read and write) can drop `released_at` from the
-    // marker, which reclassifies the worktree from the clean-release grace path
-    // into the force-reclaim backstop — changing the deletion semantics.
-    // Best-effort: an unobtainable lock must not block the release (matches the
-    // prior unlocked behaviour, only safer). Scoped so the lock is dropped
-    // before the event-log write (no nested flock).
-    let lock_path = crate::paths::runtime_dir(home)
-        .join(&lease.agent)
-        .join(".binding.json.lock");
-    {
-        let _lock = crate::store::acquire_file_lock(&lock_path);
-        // Clear binding (task done).
-        crate::binding::unbind(home, &lease.agent);
-        // Write released_at into the managed marker for GC grace calculation.
-        let marker = lease.path.join(MANAGED_MARKER);
-        if let Ok(mut content) = std::fs::read_to_string(&marker) {
-            content.push_str(&format!(
-                "released_at={}\n",
-                chrono::Utc::now().to_rfc3339()
-            ));
-            if let Err(e) = crate::store::atomic_write(&marker, content.as_bytes()) {
-                tracing::warn!(
-                    agent = %lease.agent,
-                    path = %marker.display(),
-                    error = %e,
-                    "release: failed to persist released_at into managed marker"
-                );
-            }
-        }
-    }
-    crate::event_log::log(
-        home,
-        "worktree_lease_released",
-        &lease.agent,
-        &format!("branch={} path={}", lease.branch, lease.path.display()),
-    );
 }
 
 /// Check if a worktree is daemon-managed (has .agend-managed marker).
@@ -223,6 +180,12 @@ pub struct ReleaseOutcome {
     /// Internal exact-CAS signal for auto-release. Not part of the MCP response.
     #[serde(skip)]
     pub(crate) stale_fingerprint: bool,
+    /// Exact S2 absent-arm metadata cleanup, surfaced only by the force
+    /// handler after the transaction; ordinary release responses skip it.
+    #[serde(skip)]
+    pub(crate) git_metadata_pruned: usize,
+    #[serde(skip)]
+    pub(crate) git_metadata_repos: Vec<String>,
 }
 
 /// Delete the local branch ref after worktree release, IFF:
@@ -456,13 +419,28 @@ fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> Path
 }
 
 fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeRemoval {
-    if !wt_path.exists() {
-        tracing::info!(agent, path = %wt_path.display(),
-            "release: worktree path already absent — pruning registry + clearing binding");
-        if !source_repo.as_os_str().is_empty() {
-            let _ = crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"]);
+    match std::fs::symlink_metadata(wt_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(agent, path = %wt_path.display(),
+                "release: worktree path already absent — pruning registry + clearing binding");
+            if !source_repo.as_os_str().is_empty() {
+                let _ = crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"]);
+            }
+            return WorktreeRemoval::AlreadyAbsent;
         }
-        return WorktreeRemoval::AlreadyAbsent;
+        Err(e) => {
+            return WorktreeRemoval::Failed(format!(
+                "opaque worktree target metadata at {}: {e}",
+                wt_path.display()
+            ))
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return WorktreeRemoval::Failed(format!(
+                "opaque worktree target metadata at {}",
+                wt_path.display()
+            ))
+        }
+        Ok(_) => {}
     }
     if !is_daemon_managed(wt_path) {
         tracing::warn!(agent, path = %wt_path.display(),
@@ -490,7 +468,10 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
             tracing::warn!(agent, error = %stderr, path = %wt_path.display(),
                 "git worktree remove failed — falling back to remove_dir_all");
             let _ = std::fs::remove_dir_all(wt_path);
-            if !wt_path.exists() {
+            if matches!(
+                std::fs::symlink_metadata(wt_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 if !source_repo.as_os_str().is_empty() {
                     if let Err(e) =
                         crate::git_helpers::git_bypass(source_repo, &["worktree", "prune"])
@@ -511,6 +492,7 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
 }
 
 mod workspace;
+pub(crate) use workspace::prepare_workspace_worktree_with_permit;
 #[allow(unused_imports)]
 pub use workspace::{
     checkout_workspace_branch, detach_workspace_to_holding, prepare_workspace_worktree,
@@ -523,9 +505,12 @@ pub(crate) use workspace::{
     worktree_common_dir_matches, worktree_has_work_at_risk,
 };
 
-fn clear_binding_state(home: &Path, agent: &str) {
-    crate::binding::unbind(home, agent);
-    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
+fn clear_binding_state(
+    home: &Path,
+    agent: &str,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) {
+    crate::binding::unbind_with_permit(home, agent, permit);
 }
 
 fn resolve_branch_cleanup(
@@ -593,6 +578,7 @@ fn release_known_locked(
     agent: &str,
     binding: &serde_json::Value,
     dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> LockedRelease {
     let mut out = ReleaseOutcome::default();
     let mut notices = Vec::new();
@@ -693,7 +679,7 @@ fn release_known_locked(
                     // worktree-protection refusal must not also skip binding
                     // cleanup. (This arm is already the non-dry_run path; the
                     // dry_run classifier above mutates nothing.)
-                    clear_binding_state(home, agent);
+                    clear_binding_state(home, agent, permit);
                     out.binding_removed = true;
                     return LockedRelease {
                         out,
@@ -728,7 +714,7 @@ fn release_known_locked(
         ));
         out.released = true;
     } else {
-        clear_binding_state(home, agent);
+        clear_binding_state(home, agent, permit);
         out.binding_removed = true;
         // #1465 guardrail: only report `released` when no cleanup step failed.
         // A `WorktreeRemoval::Failed` set `out.error` above — idempotent success
@@ -753,9 +739,19 @@ fn release_full_guarded(
     home: &Path,
     agent: &str,
     dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
     expected: Option<&crate::binding::BindingFingerprint>,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
+
+    if !permit.authorizes(home, agent) {
+        return ReleaseOutcome {
+            error: Some(format!(
+                "release refused: lifecycle permit is not valid for agent '{agent}'"
+            )),
+            ..ReleaseOutcome::default()
+        };
+    }
 
     let (snapshot, fingerprint) = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
@@ -798,7 +794,7 @@ fn release_full_guarded(
         } if live == fingerprint => value,
         GuardedBinding::Known { .. } => return stale_release(),
     };
-    let mut locked = release_known_locked(home, agent, &current, dry_run);
+    let mut locked = release_known_locked(home, agent, &current, dry_run, permit);
     // Explicit drops document the lock boundary: no notice, marker cleanup,
     // branch cleanup, or release event runs with a flock held.
     drop(_binding_lock);
@@ -835,7 +831,29 @@ fn release_full_guarded(
 }
 
 pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
-    release_full_guarded(home, agent, dry_run, None)
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
+    release_full_guarded(home, agent, dry_run, &permit, None)
+}
+
+pub(crate) fn release_full_with_permit(
+    home: &Path,
+    agent: &str,
+    dry_run: bool,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_full_guarded(home, agent, dry_run, permit, None)
 }
 
 pub(crate) fn release_full_exact(
@@ -843,9 +861,23 @@ pub(crate) fn release_full_exact(
     agent: &str,
     expected: &crate::binding::BindingFingerprint,
 ) -> ReleaseOutcome {
-    release_full_guarded(home, agent, false, Some(expected))
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
+    release_full_guarded(home, agent, false, &permit, Some(expected))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn release_bound_target_exact_impl(
     home: &Path,
     agent: &str,
@@ -854,8 +886,20 @@ fn release_bound_target_exact_impl(
     source_repo: &Path,
     caller_holds_branch_lease: bool,
     clear_binding_on_remove_failure: bool,
+    require_force_identity: bool,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
 ) -> ReleaseOutcome {
     use crate::binding::GuardedBinding;
+
+    if !permit.authorizes(home, agent) {
+        return ReleaseOutcome {
+            error: Some(format!(
+                "release refused: lifecycle permit is not valid for agent '{agent}'"
+            )),
+            ..ReleaseOutcome::default()
+        };
+    }
 
     let snapshot = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
@@ -900,9 +944,112 @@ fn release_bound_target_exact_impl(
     if current.get("worktree").and_then(|v| v.as_str()) != Some(target_str.as_str()) {
         return stale_release();
     }
+    let force_target_state = if require_force_identity {
+        match crate::mcp::handlers::classify_target(target) {
+            Ok(state) => Some(state),
+            Err(reason) => return opaque_release(reason),
+        }
+    } else {
+        None
+    };
+    if require_force_identity
+        && matches!(
+            force_target_state,
+            Some(crate::mcp::handlers::TargetState::Present)
+        )
+    {
+        if crate::binding::managed_marker_agent(target).as_deref() != Some(agent) {
+            return opaque_release(format!(
+                "managed marker agent does not exactly equal target '{agent}'"
+            ));
+        }
+        if marker_branch(target).as_deref() != current.get("branch").and_then(|v| v.as_str()) {
+            return opaque_release("managed marker branch does not match binding".to_string());
+        }
+        if !target_source_repo_matches(target, source_repo) {
+            return opaque_release(
+                "managed target owning repository changed or is ambiguous".to_string(),
+            );
+        }
+    }
+
+    if require_force_identity
+        && matches!(
+            force_target_state,
+            Some(crate::mcp::handlers::TargetState::Absent)
+        )
+    {
+        let metadata = crate::mcp::handlers::prune_exact_git_metadata(
+            source_repo,
+            target,
+            agent,
+            current["branch"].as_str().unwrap_or(""),
+        );
+        let mut out = ReleaseOutcome {
+            git_metadata_pruned: metadata.pruned_count,
+            git_metadata_repos: metadata.repos_touched,
+            ..ReleaseOutcome::default()
+        };
+        if let crate::mcp::handlers::ExactMetadataState::Opaque(reason) = &metadata.state {
+            out.error = Some(format!(
+                "exact git metadata enumeration opaque; binding preserved: {reason}"
+            ));
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            return out;
+        }
+        if metadata.matched && metadata.pruned_count == 0 {
+            out.error = Some(
+                "exact git worktree metadata matched but could not be removed; binding preserved"
+                    .to_string(),
+            );
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            return out;
+        }
+        clear_binding_state(home, agent, permit);
+        out.binding_removed = true;
+        out.released = true;
+        drop(_binding_lock);
+        drop(_agent_lock);
+        drop(branch_lock);
+        return out;
+    }
 
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
+    let mut notices = Vec::new();
+    if require_force_identity
+        && matches!(
+            force_target_state,
+            Some(crate::mcp::handlers::TargetState::Present)
+        )
+    {
+        let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
+            home,
+            agent,
+            target,
+            current["branch"].as_str().unwrap_or(""),
+            sender,
+        );
+        notices = collected;
+        if let Some(reason) = preservation.blocked_reason() {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            for notice in notices {
+                notice.emit(home);
+            }
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "force release refused: worktree WIP could not be preserved ({reason}); not removing it"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+    }
     let mut out = ReleaseOutcome::default();
     let mut clear_marker = false;
     let remove = remove_worktree(agent, target, source_repo);
@@ -910,12 +1057,12 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
             clear_marker = true;
-            clear_binding_state(home, agent);
+            clear_binding_state(home, agent, permit);
             out.binding_removed = true;
             out.released = true;
         }
         WorktreeRemoval::AlreadyAbsent => {
-            clear_binding_state(home, agent);
+            clear_binding_state(home, agent, permit);
             out.binding_removed = true;
             out.released = true;
         }
@@ -923,7 +1070,7 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Failed(error) => {
             out.error = Some(error);
             if clear_binding_on_remove_failure {
-                clear_binding_state(home, agent);
+                clear_binding_state(home, agent, permit);
                 out.binding_removed = true;
             }
         }
@@ -933,6 +1080,9 @@ fn release_bound_target_exact_impl(
     drop(branch_lock);
     if clear_marker {
         crate::worktree::clear_nested_refusal_marker(home, target);
+    }
+    for notice in notices {
+        notice.emit(home);
     }
     out
 }
@@ -946,7 +1096,55 @@ pub(crate) fn release_bound_target_exact(
     target: &Path,
     source_repo: &Path,
 ) -> ReleaseOutcome {
-    release_bound_target_exact_impl(home, agent, expected, target, source_repo, false, false)
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        false,
+        false,
+        false,
+        None,
+        &permit,
+    )
+}
+
+/// Exact Known-target release when an outer lifecycle transaction already owns
+/// the permit (workspace reverse reconciliation and other composite callers).
+pub(crate) fn release_bound_target_exact_with_permit(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        false,
+        false,
+        false,
+        None,
+        permit,
+    )
 }
 
 /// Exact Known-target release for checkout rollback, whose caller already holds
@@ -959,7 +1157,258 @@ pub(crate) fn release_bound_target_exact_under_branch_lock(
     target: &Path,
     source_repo: &Path,
 ) -> ReleaseOutcome {
-    release_bound_target_exact_impl(home, agent, expected, target, source_repo, true, true)
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return ReleaseOutcome {
+                error: Some(format!("release refused: {error}")),
+                ..ReleaseOutcome::default()
+            }
+        }
+    };
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        true,
+        true,
+        false,
+        None,
+        &permit,
+    )
+}
+
+/// Exact Known-target release for checkout rollback when the outer bind
+/// transaction already owns the lifecycle permit and branch lease.
+pub(crate) fn release_bound_target_exact_under_branch_lock_with_permit(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        true,
+        true,
+        false,
+        None,
+        permit,
+    )
+}
+
+/// Exact Known-target release used by S2 force/rebase.  The caller owns
+/// `L(repo,branch)`; this path re-reads A/B and revalidates the marker and
+/// owning-repository evidence before removing anything.
+pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
+    home: &Path,
+    agent: &str,
+    expected: &crate::binding::BindingFingerprint,
+    target: &Path,
+    source_repo: &Path,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    release_bound_target_exact_impl(
+        home,
+        agent,
+        expected,
+        target,
+        source_repo,
+        true,
+        false,
+        true,
+        sender,
+        permit,
+    )
+}
+
+/// Absent-binding arm of the S2 force transaction.  The branch lease is held
+/// by the caller; A/B are acquired here and the binding is re-read as truly
+/// absent before the managed target is removed.
+pub(crate) fn release_absent_target_under_branch_lock(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    target: &Path,
+    source_repo: &Path,
+    sender: Option<&str>,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> ReleaseOutcome {
+    if !permit.authorizes(home, agent) {
+        return ReleaseOutcome {
+            error: Some(format!(
+                "release refused: lifecycle permit is not valid for agent '{agent}'"
+            )),
+            ..ReleaseOutcome::default()
+        };
+    }
+    let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, agent) {
+        Ok(lock) => lock,
+        Err(e) => return opaque_release(e),
+    };
+    let _binding_lock = match crate::binding::acquire_binding_file_lock(home, agent) {
+        Ok(lock) => lock,
+        Err(e) => return opaque_release(e),
+    };
+    match crate::binding::guarded_binding_disk_fresh(home, agent) {
+        crate::binding::GuardedBinding::Absent => {}
+        crate::binding::GuardedBinding::Opaque(reason) => return opaque_release(reason),
+        crate::binding::GuardedBinding::Known { .. } => return stale_release(),
+    }
+    #[cfg(test)]
+    release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
+    match crate::binding::guarded_binding_disk_fresh(home, agent) {
+        crate::binding::GuardedBinding::Absent => {}
+        crate::binding::GuardedBinding::Opaque(reason) => return opaque_release(reason),
+        crate::binding::GuardedBinding::Known { .. } => return stale_release(),
+    }
+    let target_state = match crate::mcp::handlers::classify_target(target) {
+        Ok(state) => state,
+        Err(reason) => return opaque_release(reason),
+    };
+    if matches!(target_state, crate::mcp::handlers::TargetState::Present)
+        && (crate::binding::managed_marker_agent(target).as_deref() != Some(agent)
+            || marker_branch(target).as_deref() != Some(branch)
+            || !target_source_repo_matches(target, source_repo))
+    {
+        return opaque_release(
+            "managed target identity changed, marker branch drifted, or owning repository is ambiguous"
+                .to_string(),
+        );
+    }
+    let mut out = ReleaseOutcome::default();
+    let mut notices = Vec::new();
+    if matches!(target_state, crate::mcp::handlers::TargetState::Absent) {
+        let metadata =
+            crate::mcp::handlers::prune_exact_git_metadata(source_repo, target, agent, branch);
+        out.git_metadata_pruned = metadata.pruned_count;
+        out.git_metadata_repos = metadata.repos_touched;
+        if let crate::mcp::handlers::ExactMetadataState::Opaque(reason) = &metadata.state {
+            out.error = Some(format!(
+                "exact git metadata enumeration opaque; state preserved: {reason}"
+            ));
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return out;
+        }
+        if metadata.matched && metadata.pruned_count == 0 {
+            out.error = Some(
+                "exact git worktree metadata matched but could not be removed; state preserved"
+                    .to_string(),
+            );
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return out;
+        }
+        out.released = true;
+        out.already_released = true;
+        drop(_binding_lock);
+        drop(_agent_lock);
+        return out;
+    }
+    if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
+        let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
+            home,
+            agent,
+            target,
+            marker_branch(target).as_deref().unwrap_or(""),
+            sender,
+        );
+        notices = collected;
+        if let Some(reason) = preservation.blocked_reason() {
+            drop(_binding_lock);
+            drop(_agent_lock);
+            for notice in notices {
+                notice.emit(home);
+            }
+            return ReleaseOutcome {
+                error: Some(format!(
+                    "force release refused: worktree WIP could not be preserved ({reason}); not removing it"
+                )),
+                ..ReleaseOutcome::default()
+            };
+        }
+    }
+    match remove_worktree(agent, target, source_repo) {
+        WorktreeRemoval::Removed => {
+            out.released = true;
+            out.already_released = true;
+            out.worktree_removed = true;
+        }
+        WorktreeRemoval::AlreadyAbsent => {
+            out.released = true;
+            out.already_released = true;
+        }
+        WorktreeRemoval::Unmanaged(error) | WorktreeRemoval::Failed(error) => {
+            out.error = Some(error)
+        }
+    }
+    drop(_binding_lock);
+    drop(_agent_lock);
+    for notice in notices {
+        notice.emit(home);
+    }
+    out
+}
+
+fn marker_branch(worktree: &Path) -> Option<String> {
+    std::fs::read_to_string(worktree.join(MANAGED_MARKER))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("branch="))
+        .map(|s| s.trim().to_string())
+}
+
+fn marker_source_repo(worktree: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(worktree.join(MANAGED_MARKER))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("source_repo="))
+        .map(|s| PathBuf::from(s.trim()))
+}
+
+fn git_pointer_source_repo(worktree: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))?;
+    let gitdir = PathBuf::from(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        worktree.join(gitdir)
+    };
+    let canonical = gitdir.canonicalize().ok()?;
+    let worktrees = canonical.parent()?;
+    if worktrees.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
+        return None;
+    }
+    Some(worktrees.parent()?.parent()?.to_path_buf())
+}
+
+fn target_source_repo_matches(worktree: &Path, source_repo: &Path) -> bool {
+    let source = source_repo.canonicalize().ok();
+    let Some(source) = source else { return false };
+    let marker = marker_source_repo(worktree).and_then(|p| p.canonicalize().ok());
+    let pointer = git_pointer_source_repo(worktree).and_then(|p| p.canonicalize().ok());
+    match (marker, pointer) {
+        (Some(marker), Some(pointer)) => marker == source && pointer == source,
+        (Some(marker), None) => marker == source,
+        (None, Some(pointer)) => pointer == source,
+        (None, None) => false,
+    }
 }
 
 /// Pin a worktree (operator override — prevents GC in Phase 4).

@@ -2,21 +2,23 @@
 //!
 //! Extracted from comms.rs to stay under 700 LOC file size invariant.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod branch_start_point;
 mod from_ref;
+mod lifecycle_permit;
 mod live_binding;
-// S2 r2 (#2746): provider-neutral binding-origin slug for the binding_state
-// current_binding projection (GitHub + Bitbucket + GitLab), sibling for LOC
-// relief. Watch-storage canonicalization stays GitHub-only in this file.
 mod provider_neutral_slug;
+mod rebase_dispatch;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
+pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
 // repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
+pub(crate) use lifecycle_permit::{
+    is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
+};
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
@@ -151,40 +153,40 @@ pub enum ErrorCode {
     BindFailed,
 }
 
-/// Sprint 55 P0-B EC11: per-agent in-flight guard scoped to the daemon's
-/// `home` directory. Prevents concurrent `dispatch_auto_bind_lease` calls
-/// for the same agent from interleaving `binding.json` writes / lease
-/// state in the same daemon process. Keying by `(home, agent)` ensures
-/// parallel test runs (each with its own temp home) don't collide with
-/// each other while production single-home daemons retain the per-agent
-/// guarantee. RAII via `BindGuard` ensures the entry is removed even on
-/// early-return error paths.
-fn bind_in_flight_set() -> &'static parking_lot::Mutex<HashSet<(String, String)>> {
-    static SET: std::sync::OnceLock<parking_lot::Mutex<HashSet<(String, String)>>> =
-        std::sync::OnceLock::new();
-    SET.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
+#[allow(dead_code)]
+pub(crate) fn acquire_bind_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
+    BindGuard::try_acquire(home, target)
 }
 
-struct BindGuard {
-    key: (String, String),
+pub(crate) fn acquire_rebase_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
+    BindGuard::acquire_rebase(home, target)
 }
 
-impl BindGuard {
-    fn try_acquire(home: &Path, agent: &str) -> Result<Self, String> {
-        let key = (home.display().to_string(), agent.to_string());
-        let mut g = bind_in_flight_set().lock();
-        if !g.insert(key.clone()) {
-            return Err(format!(
-                "bind already in-flight for agent '{agent}' — concurrent dispatch_auto_bind_lease blocked"
-            ));
-        }
-        Ok(BindGuard { key })
+#[cfg(test)]
+pub(crate) mod bind_test_seam {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn() -> Option<String>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
     }
-}
 
-impl Drop for BindGuard {
-    fn drop(&mut self) {
-        bind_in_flight_set().lock().remove(&self.key);
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn() -> Option<String> + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) fn hit() -> Option<String> {
+        HOOK.with(|slot| slot.borrow().as_ref().and_then(|hook| hook()))
     }
 }
 
@@ -193,28 +195,14 @@ impl Drop for BindGuard {
 /// report whether a concurrent `dispatch_auto_bind_lease` is active for
 /// the agent — operator-facing introspection for race-condition debug.
 pub(crate) fn is_bind_in_flight(home: &Path, agent: &str) -> bool {
-    let key = (home.display().to_string(), agent.to_string());
-    bind_in_flight_set().lock().contains(&key)
+    lifecycle_is_active(home, agent)
 }
 
-/// Sprint 58 Wave 3 PR-2 (#9): defensively remove an `(home, agent)`
-/// entry from the bind-in-flight set. The `BindGuard::drop` impl
-/// already does this on every normal exit path, but a panic between
-/// `try_acquire` and the implicit `Drop` can in theory leak an entry,
-/// blocking re-bind. `release_full` calls this as a safety net so a
-/// hard release truly leaves no stale daemon-side state at any layer.
+/// Legacy compatibility hook. Bind lifecycle ownership is RAII-only: release
+/// and delete paths must never clear a live guard out from under a continuation.
+#[allow(dead_code)]
 pub(crate) fn clear_bind_in_flight(home: &Path, agent: &str) {
-    let key = (home.display().to_string(), agent.to_string());
-    let removed = bind_in_flight_set().lock().remove(&key);
-    if removed {
-        tracing::warn!(
-            %agent,
-            home = %home.display(),
-            "release_full cleared a stale bind-in-flight entry — \
-             a prior dispatch_auto_bind_lease panicked between guard \
-             acquisition and drop. Investigate logs for the panic."
-        );
-    }
+    tracing::debug!(%agent, home = %home.display(), "ignored legacy bind-in-flight clear; RAII guard owns lifecycle");
 }
 
 /// Sprint 53 P0-1+P0-2: auto-bind + lease worktree + watch_ci on delegate_task dispatch.
@@ -369,14 +357,18 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // empty (the arm must still fire for it).
     arm_ci_watch: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let _guard = BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
-        message: msg,
-        code: ErrorCode::BindInFlight,
-        stage: Stage::WorktreeLeaseConflict,
-        fetch_attempted: false,
-        raw: None,
-    })?;
-
+    let (preheld_guard, rebase_continuation) = rebase_dispatch::take_preheld_dispatch();
+    let _guard = match preheld_guard {
+        Some(guard) => guard,
+        None => BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
+            message: msg,
+            code: ErrorCode::BindInFlight,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: None,
+        })?,
+    };
+    let lifecycle_permit = _guard.permit();
     let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|f| f.resolve_instance(target));
@@ -451,7 +443,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let mut reuse_live_worktree: Option<PathBuf> = None; // #2158 partial-skip (set below)
     if let Some(existing) = crate::binding::read(home, target) {
         if let Some(existing_branch) = existing.get("branch").and_then(|v| v.as_str()) {
-            if existing_branch != branch {
+            if existing_branch != branch && !rebase_continuation {
                 return Err(DispatchError {
                     message: format!(
                         "agent '{target}' already bound to branch '{existing_branch}' — \
@@ -469,6 +461,16 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             reuse_live_worktree =
                 live_binding::live_binding_worktree_to_reuse(&existing, &source_repo_str);
         }
+    }
+
+    if rebase_continuation && reuse_live_worktree.is_none() {
+        return Err(DispatchError {
+            message: "rebase continuation requires the exact live bound worktree".to_string(),
+            code: ErrorCode::LeaseConflict,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: None,
+        });
     }
 
     // #781 Piece 6: ensure branch exists in `source_repo` BEFORE the
@@ -538,8 +540,14 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     } else if workspace_b {
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
         // backed up before --force) → in-place checkout. Encapsulated helper.
-        crate::worktree_pool::prepare_workspace_worktree(home, target, &source_repo, branch)
-            .map_err(|m| lease_err(m.contains("E4.5"), m))?
+        crate::worktree_pool::prepare_workspace_worktree_with_permit(
+            home,
+            target,
+            &source_repo,
+            branch,
+            lifecycle_permit,
+        )
+        .map_err(|m| lease_err(m.contains("E4.5"), m))?
     } else {
         // Legacy: lease a fresh per-branch worktree. Lease errors REJECT (Q2 §3.3).
         // #D+H: lease returns a TYPED `LeaseError` — classify by variant, not string.
@@ -557,15 +565,35 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // #2158 GR1: the only `arm_ci_watch=false` path through this sink is `bind_self`
     // (an agent self-claim → operator notify); dispatch wrappers pass true. So
     // self-claim ⟺ !arm_ci_watch — reuse the dispatch-intent, no task_id heuristic.
-    match crate::binding::bind_full(
-        home,
-        target,
-        task_id,
-        branch,
-        &wt_path,
-        &source_repo,
-        !arm_ci_watch,
-    ) {
+    let bind_result = {
+        #[cfg(test)]
+        if let Some(reason) = bind_test_seam::hit() {
+            Err(reason)
+        } else {
+            crate::binding::bind_full(
+                home,
+                target,
+                task_id,
+                branch,
+                &wt_path,
+                &source_repo,
+                !arm_ci_watch,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            crate::binding::bind_full(
+                home,
+                target,
+                task_id,
+                branch,
+                &wt_path,
+                &source_repo,
+                !arm_ci_watch,
+            )
+        }
+    };
+    match bind_result {
         Ok(()) => tracing::info!(
             %target, %branch, path = %wt_path.display(),
             "dispatch auto-bind OK"

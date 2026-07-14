@@ -127,3 +127,11 @@ pub(crate) fn snapshot_guarded_binding(home: &Path, agent: &str) -> Result<Guard
     let _binding = acquire_binding_file_lock(home, agent)?;
     Ok(guarded_binding_disk_fresh(home, agent))
 }
+
+/// Read-only force/rebase preflight.  This intentionally takes no flock: S2
+/// resolves the canonical source repository first, then acquires
+/// `L(repo,branch) -> A -> B`; the transaction entry points re-read and
+/// validate the binding under those locks before mutation.
+pub(crate) fn preflight_guarded_binding(home: &Path, agent: &str) -> GuardedBinding {
+    guarded_binding_disk_fresh(home, agent)
+}

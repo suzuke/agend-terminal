@@ -83,18 +83,38 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         }
     }
 
-    // #2496: rebase_mode tries a SAFE same-agent repair FIRST — reads the
-    // agent's actual bound worktree and either finds it already on `branch`
-    // (metadata-only, no mutation) or in-place `git switch`es a clean
-    // worktree to it. Any condition that isn't safe (dirty, not
-    // daemon-managed, held by another agent, an active CI watch/task on the
-    // branch being abandoned, or the switch itself failing) is a fail-closed
-    // BLOCKED error — no more silent fallthrough to a full destructive
-    // release (that defeated the entire point of `rebase_mode`).
+    let task_id = args["task_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let rebase_mode = args["rebase_mode"].as_bool().unwrap_or(false);
     let mut repair_action = None;
-    if args["rebase_mode"].as_bool().unwrap_or(false) {
-        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair(home, agent, branch) {
-            Ok(action) => repair_action = Some(action),
+    let mut continuation = None;
+    let mut preheld_guard = None;
+    if rebase_mode {
+        let guard = match crate::mcp::handlers::dispatch_hook::acquire_rebase_guard(home, agent) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                return json!({
+                    "error": format!("rebase_mode repair blocked: {reason}"),
+                    "code": "rebind_repair_blocked"
+                });
+            }
+        };
+        let permit = guard.permit();
+        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair_with_permit(
+            home,
+            agent,
+            branch,
+            source_repo_path.as_deref(),
+            sender.as_ref().map(|s| s.as_str()),
+            permit,
+        ) {
+            Ok(result) => {
+                repair_action = Some(result.action);
+                continuation = result.continuation;
+                preheld_guard = Some(guard);
+            }
             Err(reason) => {
                 return json!({
                     "error": format!("rebase_mode repair blocked: {reason}"),
@@ -103,19 +123,28 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             }
         }
     }
-
-    let task_id = args["task_id"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("");
-    match crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
-        home,
-        agent,
-        task_id,
-        branch,
-        repo_arg,
-        source_repo_path.as_deref(),
-    ) {
+    let dispatch_result = if let Some(guard) = preheld_guard {
+        crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain_preheld(
+            home,
+            agent,
+            task_id,
+            branch,
+            repo_arg,
+            source_repo_path.as_deref(),
+            guard,
+            continuation.is_some(),
+        )
+    } else {
+        crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
+            home,
+            agent,
+            task_id,
+            branch,
+            repo_arg,
+            source_repo_path.as_deref(),
+        )
+    };
+    match dispatch_result {
         Ok(_outcome) => {
             // Successful bind: read back the worktree path from the binding
             // we just wrote so the response reflects authoritative state.
@@ -142,6 +171,14 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             resp
         }
         Err(err) => {
+            if let Some(repair) = continuation.as_ref() {
+                if let Err(rollback_error) = repair.rollback(home, agent) {
+                    return json!({
+                        "error": format!("{}; rollback failed: {rollback_error}", err.message),
+                        "code": "lease_failed"
+                    });
+                }
+            }
             // Map `DispatchError` to the pre-#781 string-code response shape, but
             // dispatch on the TYPED `err.code` — NOT message substrings
             // (smells#2 Pattern-A / de2eb8 finding #1). The old
@@ -183,6 +220,20 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
     }
 
     crate::validate_name_or_err!(agent);
+    let permit = match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => {
+            return json!({
+                "released": false,
+                "error": format!("release refused: bind/rebase in flight; {error}"),
+                "code": "lifecycle_conflict"
+            })
+        }
+    };
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     // #789: clean empty init commits before removal (best-effort).
     if !dry_run {
@@ -192,20 +243,14 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
             let _ = crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
         }
     }
-    let outcome = crate::worktree_pool::release_full(home, agent, dry_run);
+    let outcome = crate::worktree_pool::release_full_with_permit(home, agent, dry_run, &permit);
     serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}))
 }
 
 /// `release_worktree(force:true)` (#2548 PR-2) — absorbed from the former
-/// standalone `force_release_worktree` MCP tool. Cleans a stale daemon-
-/// managed worktree directory directly via
-/// `<home>/worktrees/<agent>/<branch>/`, bypassing the `.agend-managed`
-/// marker check the `force:false` path enforces — intentional: this path
-/// exists specifically for stale-state recovery where a directory survives
-/// after its binding is already gone (see `rebase_clean_self`'s docs), and
-/// the marker check would block exactly that recovery. Requires `branch`
-/// (the `force:false` path derives it from the binding; here there may be
-/// no binding left to read).
+/// standalone `force_release_worktree` MCP tool. Runs the guarded S2
+/// transaction for a stale managed target or an exact-owner metadata entry;
+/// markerless, opaque, ambiguous, and ownerless state is preserved.
 ///
 /// AUDIT2-002: since this path deletes disk state without the marker safety
 /// net, restrict callers to the target's own agent or its team orchestrator.
@@ -273,31 +318,32 @@ fn handle_release_worktree_force(
         home,
         agent,
         branch,
+        source_repo_hint.as_deref(),
         sender.as_ref().map(|s| s.as_str()),
     ) {
         Ok(o) => {
-            // #826 L2 GC: when the binding-clear path short-circuited on
-            // "no binding" (the post-disband state), the
-            // `git worktree remove --force` step inside `release_full`
-            // never ran. Run it now against any source repos that still
-            // hold `.git/worktrees/<meta-dir>/` metadata for our target
-            // worktree path.
-            let gc = crate::mcp::handlers::force_release::prune_git_metadata_for_agent(
-                home,
-                agent,
-                branch,
-                source_repo_hint.as_deref(),
-            );
+            if let Some(error) = o.binding_outcome["error"].as_str() {
+                return json!({
+                    "released": false,
+                    "dir_existed": o.dir_existed,
+                    "dir_removed": o.dir_removed,
+                    "binding_outcome": o.binding_outcome,
+                    "error": error,
+                    "code": "force_release_refused",
+                    "git_metadata_pruned": 0,
+                    "git_metadata_repos": [],
+                });
+            }
             json!({
                 "released": true,
                 "dir_existed": o.dir_existed,
                 "dir_removed": o.dir_removed,
                 "binding_outcome": o.binding_outcome,
-                "git_metadata_pruned": gc.pruned_count,
-                "git_metadata_repos": gc.repos_touched,
+                "git_metadata_pruned": o.git_metadata_pruned,
+                "git_metadata_repos": o.git_metadata_repos,
             })
         }
-        Err(e) => json!({"error": e, "code": "path_outside_pool"}),
+        Err(e) => json!({"error": e, "code": "force_release_refused"}),
     }
 }
 
