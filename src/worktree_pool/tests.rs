@@ -1043,6 +1043,41 @@ fn aliased_manual_and_auto_release_share_one_lifecycle_transaction_s2() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+#[test]
+fn unbind_reports_absent_and_failed_removal_truthfully() {
+    let absent_home = tmp_home("unbind-absent-outcome");
+    let absent_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &absent_home,
+        "agent-absent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    )
+    .expect("absent permit");
+    assert_eq!(
+        crate::binding::unbind_with_permit(&absent_home, "agent-absent", &absent_permit),
+        crate::binding::BindingRemoval::Absent
+    );
+    drop(absent_permit);
+    std::fs::remove_dir_all(&absent_home).ok();
+
+    let failed_home = tmp_home("unbind-failed-outcome");
+    let binding_path = crate::paths::runtime_dir(&failed_home)
+        .join("agent-failed")
+        .join("binding.json");
+    std::fs::create_dir_all(&binding_path).expect("binding path directory");
+    let failed_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &failed_home,
+        "agent-failed",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    )
+    .expect("failed permit");
+    assert!(matches!(
+        crate::binding::unbind_with_permit(&failed_home, "agent-failed", &failed_permit),
+        crate::binding::BindingRemoval::Failed(_)
+    ));
+    drop(failed_permit);
+    std::fs::remove_dir_all(&failed_home).ok();
+}
+
 /// S1 RED: reverse reconciliation is another lifecycle actor. The lifecycle
 /// permit ensures that when release holds the permit, reverse_reconcile is
 /// refused before any mutation — and vice versa.

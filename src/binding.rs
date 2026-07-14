@@ -22,6 +22,8 @@ pub(crate) use release_guard::{
 };
 mod signature;
 pub(crate) use signature::signature_valid;
+mod unbind;
+pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;
 #[allow(unused_imports)]
 pub use unbind_compat::unbind;
@@ -572,82 +574,6 @@ fn out_of_dispatch_notify_recipient(home: &Path, agent: &str) -> Option<String> 
 /// the same `binding.json.sig` name (it cannot import this — separate binary).
 fn binding_sig_path(dir: &Path) -> PathBuf {
     dir.join("binding.json.sig")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BindingRemoval {
-    Removed,
-    Absent,
-    Failed(String),
-}
-
-fn clear_binding_index(home: &Path, agent: &str) {
-    if let Ok(mut map) = binding_index().write() {
-        map.remove(&index_key(home, agent));
-        if let Ok(canonical) = std::fs::canonicalize(home) {
-            map.remove(&index_key(&canonical, agent));
-        }
-    }
-}
-
-pub(crate) fn unbind_with_permit(
-    home: &Path,
-    agent: &str,
-    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
-) -> BindingRemoval {
-    if !permit.authorizes(home, agent) {
-        tracing::warn!(agent, "unbind refused: invalid lifecycle permit");
-        return BindingRemoval::Failed("invalid lifecycle permit".to_string());
-    }
-    let dir = crate::paths::runtime_dir(home).join(agent);
-    let binding_path = dir.join("binding.json");
-    // #2158 PR2 (ii): audit the release/clear side of binding-change detection with
-    // caller process context (read the prior branch before removal). Only logs when
-    // a binding actually existed (a no-op unbind stays silent).
-    let prev_branch = std::fs::read_to_string(&binding_path)
-        .ok()
-        .and_then(|c| parse_binding_guarded(&c))
-        .and_then(|v| v.get("branch").and_then(|b| b.as_str()).map(String::from));
-    match std::fs::remove_file(&binding_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            clear_binding_index(home, agent);
-            return BindingRemoval::Absent;
-        }
-        Err(error) => {
-            return BindingRemoval::Failed(format!(
-                "remove binding {}: {error}",
-                binding_path.display()
-            ));
-        }
-    }
-    // The authoritative binding file is gone; invalidate both lexical and
-    // canonical cache keys even if a best-effort sidecar cleanup later fails.
-    clear_binding_index(home, agent);
-    // #1651: drop the HMAC sidecar too, so a stale signature can't linger.
-    for path in [binding_sig_path(&dir), dir.join(OUT_OF_DISPATCH_SIDECAR)] {
-        if let Err(error) = std::fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return BindingRemoval::Failed(format!("remove {}: {error}", path.display()));
-            }
-        }
-    }
-    if let Some(prev_branch) = prev_branch {
-        crate::event_log::log(
-            home,
-            "binding_released",
-            agent,
-            &format!(
-                "prev_branch={prev_branch}; {}",
-                crate::event_log::caller_process_context()
-            ),
-        );
-    }
-    // bug-audit Rank6: clear the out-of-dispatch notify latch so a release resets
-    // it — a later real re-claim of the same branch re-surfaces instead of being
-    // silently swallowed as "already notified". Scoped to release, so the
-    // per-(agent,branch) intra-cycle fire-once dedup is preserved.
-    BindingRemoval::Removed
 }
 
 // #1688 (codex): there is intentionally NO startup "re-sign unsigned bindings"
@@ -1577,41 +1503,6 @@ mod tests {
             "unbind must clear index entry"
         );
         std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn unbind_reports_absent_and_failed_removal_truthfully() {
-        let absent_home = tmp_home("unbind-absent-outcome");
-        let absent_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-            &absent_home,
-            "agent-absent",
-            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
-        )
-        .expect("absent permit");
-        assert_eq!(
-            unbind_with_permit(&absent_home, "agent-absent", &absent_permit),
-            BindingRemoval::Absent
-        );
-        drop(absent_permit);
-        std::fs::remove_dir_all(&absent_home).ok();
-
-        let failed_home = tmp_home("unbind-failed-outcome");
-        let binding_path = crate::paths::runtime_dir(&failed_home)
-            .join("agent-failed")
-            .join("binding.json");
-        std::fs::create_dir_all(&binding_path).expect("binding path directory");
-        let failed_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-            &failed_home,
-            "agent-failed",
-            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
-        )
-        .expect("failed permit");
-        assert!(matches!(
-            unbind_with_permit(&failed_home, "agent-failed", &failed_permit),
-            BindingRemoval::Failed(_)
-        ));
-        drop(failed_permit);
-        std::fs::remove_dir_all(&failed_home).ok();
     }
 
     #[test]
