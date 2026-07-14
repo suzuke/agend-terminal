@@ -2524,7 +2524,7 @@ fn p0_ack_owner_reassignment_laundering() {
     // Reassign ownership from "worker" to "reviewer-a" (the acker).
     handle(
         &home,
-        "lead",
+        "worker",
         &serde_json::json!({"action": "update", "id": id, "assignee": "reviewer-a"}),
     );
     let rec = read_task_record(&home, &id).expect("record");

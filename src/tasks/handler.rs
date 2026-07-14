@@ -961,6 +961,86 @@ fn handle_done(
 /// Pure decision logic over the supplied `state` (no `api::call` — #1629-safe to
 /// run under the lock) and a directly-testable seam.
 #[allow(clippy::too_many_arguments)]
+fn validate_plan_ack_under_lock(
+    fresh: &crate::task_events::TaskRecord,
+    task_id: &str,
+) -> Result<(), String> {
+    let required_val = fresh.metadata.get("plan_ack_required");
+    let required = match required_val {
+        None => return Ok(()),
+        Some(v) => match v.as_u64() {
+            Some(0) => return Ok(()),
+            Some(n) => n,
+            None => {
+                return Err(format!(
+                    "plan_ack_required is malformed (not a valid integer) — \
+                     refusing in_progress fail-closed (task {task_id})"
+                ))
+            }
+        },
+    };
+    // Plan shape: must be a meaningful value (trimmed non-empty string, or
+    // non-empty array/object). Null, blank, empty containers, and bare
+    // scalars (numbers, booleans) are not plans.
+    match fresh.metadata.get("plan") {
+        None => {
+            return Err(format!(
+                "plan_ack_required={required} but no plan is set (task {task_id})"
+            ))
+        }
+        Some(v) => {
+            let meaningful = match v {
+                serde_json::Value::String(s) => !s.trim().is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(o) => !o.is_empty(),
+                _ => false,
+            };
+            if !meaningful {
+                return Err(format!(
+                    "plan content is empty or not a meaningful value — \
+                     refusing in_progress (task {task_id})"
+                ));
+            }
+        }
+    }
+    // Ack vector: each element must be a unique non-empty string that is NOT
+    // the current owner. Malformed/duplicate/self elements are rejected
+    // without normalization.
+    let owner_name = fresh.owner.as_ref().map(|o| o.0.as_str());
+    let ack_arr = fresh
+        .metadata
+        .get("plan_acks")
+        .and_then(|v| v.as_array());
+    let mut unique_valid: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if let Some(arr) = ack_arr {
+        for elem in arr {
+            let s = match elem.as_str() {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(format!(
+                        "plan_acks contains a non-string or empty element — \
+                         refusing in_progress (task {task_id})"
+                    ))
+                }
+            };
+            if owner_name == Some(s) {
+                return Err(format!(
+                    "plan_acks contains the current owner '{s}' — \
+                     self-ack is not valid (task {task_id})"
+                ));
+            }
+            unique_valid.insert(s);
+        }
+    }
+    if (unique_valid.len() as u64) < required {
+        return Err(format!(
+            "plan-ack pending: {}/{required} valid unique acks (task {task_id})",
+            unique_valid.len()
+        ));
+    }
+    Ok(())
+}
+
 fn update_batch_precondition(
     state: &crate::task_events::TaskBoardState,
     home: &Path,
@@ -1007,6 +1087,12 @@ fn update_batch_precondition(
         return Err(format!(
             "task '{upd_id}' owner changed since read; event attribution would be stale (retry)"
         ));
+    }
+    // (4) Plan-ack fresh gate: validate plan shape, ack vector integrity, and
+    //     count UNDER THE LOCK. The out-of-lock check (handle_update lines
+    //     1153-1176) is a fast-reject; this is the authoritative chokepoint.
+    if target_status == Some(crate::task_events::TaskStatus::InProgress) {
+        validate_plan_ack_under_lock(fresh, upd_id)?;
     }
     Ok(())
 }
@@ -1794,8 +1880,18 @@ fn metadata_write_outcome(
             if !is_gov_author {
                 return deny_counter("only the task creator (created_by) may raise it");
             }
-            if matches!(record.status, TaskStatus::Backlog | TaskStatus::Open) {
-                return deny_counter("may only be raised after the assignee has claimed the task");
+            match record.status {
+                TaskStatus::Claimed => {}
+                TaskStatus::Backlog | TaskStatus::Open => {
+                    return deny_counter(
+                        "may only be raised after the assignee has claimed the task",
+                    );
+                }
+                _ => {
+                    return deny_counter(
+                        "may not be raised after work has started (in_progress or later)",
+                    );
+                }
             }
             let current = record
                 .metadata
