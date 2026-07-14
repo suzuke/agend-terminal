@@ -584,6 +584,15 @@ pub fn generate(working_dir: &Path, command: &str) -> Result<(), String> {
     generate_with_context(working_dir, command, None)
 }
 
+/// Pre-spawn provision for callers that know the instance name but have no
+/// full fleet context (e.g. `spawn_and_subscribe` on managed restart,
+/// `connect::run`). Runs the identity preflight and passes the owner
+/// through to every artifact writer so r6's opaque-owner guard accepts
+/// same-owner restarts.
+pub fn generate_for_owner(working_dir: &Path, command: &str, _owner: &str) -> Result<(), String> {
+    generate(working_dir, command)
+}
+
 /// Generate with fleet context (name, role, peers). Fail-closed:
 /// 1. take the SINGLE workspace-identity lock for this directory, held across
 ///    the preflight AND every write, so the check and the writes are atomic vs a
@@ -1739,5 +1748,69 @@ mod tests {
         );
         // Canonicalize would resolve the ./ but the join is correct.
         assert!(resolved.starts_with("/home/user/project"));
+    }
+
+    // --- r7 RED: managed caller identity-guard tests (task-46776) ---
+    //
+    // These tests assert the CORRECT (post-fix) behavior and FAIL at the
+    // r6 HEAD 1a1368b5 because generate_for_owner delegates to the
+    // contextless generate(), which either refuses same-owner restarts
+    // (r6 opaque-config guard) or skips the shared instructions check.
+
+    fn seed_agents_md(dir: &std::path::Path, owner: &str) {
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            format!(
+                "<!-- agend:start -->\n## Identity\n\n- **Name**: `{owner}`\n<!-- agend:end -->\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn r7_managed_same_owner_restart_succeeds() {
+        let dir = tmp_dir("r7-same-owner");
+        generate_with_context(&dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
+        generate_for_owner(&dir, "codex", "alpha")
+            .expect("same-owner managed restart must succeed — r6 contextless path refuses this");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r7_foreign_shared_instructions_refuses_preserves_bytes() {
+        let dir = tmp_dir("r7-foreign-agents");
+        seed_agents_md(&dir, "alpha");
+        let original = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        let result = generate_for_owner(&dir, "codex", "beta");
+        assert!(
+            result.is_err(),
+            "must refuse foreign AGENTS.md identity before spawn"
+        );
+        let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert_eq!(original, after, "AGENTS.md bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r7_foreign_config_refuses_preserves_bytes() {
+        let dir = tmp_dir("r7-foreign-config");
+        generate_with_context(&dir, "codex", Some(&codex_ctx("alpha"))).unwrap();
+        let config_path = dir.join(".codex").join("config.toml");
+        let original = std::fs::read_to_string(&config_path).unwrap();
+        let result = generate_for_owner(&dir, "codex", "beta");
+        assert!(
+            result.is_err(),
+            "must refuse foreign config identity before spawn"
+        );
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(original, after, "config.toml bytes must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r7_unmanaged_first_provision_succeeds() {
+        let dir = tmp_dir("r7-unmanaged");
+        generate(&dir, "codex").expect("unmanaged first provision must succeed");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
