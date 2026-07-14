@@ -1007,10 +1007,7 @@ fn validate_plan_ack_under_lock(
     // the current owner. Malformed/duplicate/self elements are rejected
     // without normalization.
     let owner_name = fresh.owner.as_ref().map(|o| o.0.as_str());
-    let ack_arr = fresh
-        .metadata
-        .get("plan_acks")
-        .and_then(|v| v.as_array());
+    let ack_arr = fresh.metadata.get("plan_acks").and_then(|v| v.as_array());
     let mut unique_valid: std::collections::HashSet<&str> = std::collections::HashSet::new();
     if let Some(arr) = ack_arr {
         for elem in arr {

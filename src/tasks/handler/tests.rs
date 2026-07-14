@@ -2520,7 +2520,11 @@ fn p0_ack_owner_reassignment_laundering() {
         "reviewer-a",
         &serde_json::json!({"action": "ack_plan", "id": id}),
     );
-    assert_eq!(gov_plan_acks_len(&home, &id), 1, "precondition: 1 ack from reviewer-a");
+    assert_eq!(
+        gov_plan_acks_len(&home, &id),
+        1,
+        "precondition: 1 ack from reviewer-a"
+    );
     // Reassign ownership from "worker" to "reviewer-a" (the acker).
     handle(
         &home,
