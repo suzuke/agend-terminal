@@ -73,22 +73,31 @@ pub fn workspace_identity(path: &Path) -> String {
 /// directory. The fail-closed workspace-identity guards read this before a
 /// provision write or a delete cleanup so neither ever clobbers a directory
 /// that belongs to a DIFFERENT instance (the split-brain the incident caused).
+///
+/// The read layer distinguishes a genuine `NotFound` (→ [`DirIdentity::Absent`],
+/// adoptable) from any OTHER I/O failure — permission denied, invalid UTF-8, a
+/// directory where a file is expected — which becomes [`DirIdentity::Unreadable`]
+/// and is treated as a conflict (fail-closed: we must NOT overwrite or delete a
+/// directory whose identity we could not verify).
 #[derive(Debug, PartialEq, Eq)]
 pub enum DirIdentity {
-    /// No identity artifact present → unowned / legacy → adoptable.
+    /// The artifact is genuinely `NotFound` → unowned / legacy → adoptable.
     Absent,
     /// The recorded owning instance name.
     Owner(String),
     /// An artifact is present but its identity is unparseable → corrupt.
     Corrupt,
+    /// The artifact exists but could not be read (opaque I/O error) → we cannot
+    /// verify ownership, so we must refuse (never treat as absent).
+    Unreadable,
 }
 
 impl DirIdentity {
     /// Compare against the instance that intends to own the directory. Returns
     /// `None` when the operation may proceed (`Absent` → adopt, or `Owner` ==
     /// candidate → same instance / restart); `Some(reason)` when it must be
-    /// refused byte-preservingly (a foreign owner or a corrupt artifact). The
-    /// caller supplies whichever spelling of the candidate name matches the
+    /// refused (a foreign owner, a corrupt artifact, or an unreadable artifact).
+    /// The caller supplies whichever spelling of the candidate name matches the
     /// artifact (sanitized for AGENTS.md, raw for the `.codex` stamp).
     pub fn conflict_with(&self, candidate: &str) -> Option<String> {
         match self {
@@ -96,8 +105,51 @@ impl DirIdentity {
             DirIdentity::Owner(owner) if owner == candidate => None,
             DirIdentity::Owner(owner) => Some(format!("is owned by instance '{owner}'")),
             DirIdentity::Corrupt => Some("has a corrupt agend identity stamp".to_string()),
+            DirIdentity::Unreadable => {
+                Some("could not be read to verify ownership (fail-closed)".to_string())
+            }
         }
     }
+}
+
+/// Map a `read_to_string` result for an identity artifact onto the fail-closed
+/// [`DirIdentity`] I/O states, distinguishing a genuine `NotFound` (absent →
+/// adoptable) from any opaque I/O failure (unreadable → refuse). The `parse`
+/// closure classifies successfully-read content into `Absent`/`Owner`/`Corrupt`.
+pub fn classify_identity_read(
+    read: std::io::Result<String>,
+    parse: impl FnOnce(&str) -> DirIdentity,
+) -> DirIdentity {
+    match read {
+        Ok(s) => parse(&s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirIdentity::Absent,
+        Err(_) => DirIdentity::Unreadable,
+    }
+}
+
+/// `<home>/.locks/wsid-<hash>.lock` — the single workspace-identity lock for a
+/// working directory, keyed by its canonical [`workspace_identity`]. Provision
+/// and delete both take THIS lock across their read-decide-write / read-decide-
+/// remove so an identity check and the mutation it authorizes are atomic against
+/// a concurrent provision/delete of the same directory. Keyed by identity (not
+/// the raw path) so symlink/case aliases of one directory share one lock; placed
+/// under `home` so it exists even when the working directory itself does not yet.
+pub fn workspace_identity_lock_path(home: &Path, working_dir: &Path) -> PathBuf {
+    let digest = fnv1a_hex(&workspace_identity(working_dir));
+    home.join(".locks").join(format!("wsid-{digest}.lock"))
+}
+
+/// Deterministic 64-bit FNV-1a of `s` as lowercase hex. Deterministic across
+/// processes (unlike `DefaultHasher`), so the same identity always maps to the
+/// same lock file. Collision-resistance is not security-critical here — a hash
+/// collision only over-serializes two distinct identities onto one lock.
+fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]

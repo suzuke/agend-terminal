@@ -166,7 +166,7 @@ fn cleanup_agend_workspace_removes_entire_dir() {
     std::fs::write(ws.join("somefile.txt"), "data").ok();
     std::fs::write(ws.join("opencode.json"), "{}").ok();
 
-    cleanup_working_dir(&home, "test-agent", &ws);
+    let _ = cleanup_working_dir(&home, "test-agent", &ws);
     assert!(!ws.exists(), "workspace dir should be fully removed");
     std::fs::remove_dir_all(&home).ok();
 }
@@ -183,7 +183,7 @@ fn cleanup_user_dir_only_removes_agend_files() {
     std::fs::create_dir_all(user_dir.join(".claude")).ok();
     std::fs::write(user_dir.join(".claude/settings.local.json"), "{}").ok();
 
-    cleanup_working_dir(&home, "agent1", &user_dir);
+    let _ = cleanup_working_dir(&home, "agent1", &user_dir);
 
     // User file preserved
     assert!(user_dir.join("main.rs").exists(), "user file must survive");
@@ -205,7 +205,7 @@ fn cleanup_removes_metadata() {
     std::fs::create_dir_all(home.join("metadata")).ok();
     std::fs::write(home.join("metadata/agent1.json"), "{}").ok();
 
-    cleanup_working_dir(&home, "agent1", &ws);
+    let _ = cleanup_working_dir(&home, "agent1", &ws);
 
     assert!(!home.join("metadata/agent1.json").exists());
     std::fs::remove_dir_all(&home).ok();

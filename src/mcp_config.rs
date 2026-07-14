@@ -709,6 +709,14 @@ pub(crate) fn codex_config_owner(existing: &str) -> crate::paths::DirIdentity {
     }
 }
 
+/// Fail-closed identity read of a codex/grok `config.toml` at `path`: a genuine
+/// `NotFound` is [`DirIdentity::Absent`] (adoptable); any OTHER I/O failure is
+/// [`DirIdentity::Unreadable`] (a conflict). A readable file is parsed by
+/// [`codex_config_owner`].
+pub(crate) fn codex_config_identity(path: &Path) -> crate::paths::DirIdentity {
+    crate::paths::classify_identity_read(std::fs::read_to_string(path), codex_config_owner)
+}
+
 /// Decode a single-line TOML string value (the inverse of [`toml_string_value`]):
 /// a single-quoted literal is taken verbatim; a double-quoted basic string has
 /// its `\\` and `\"` escapes unwound. Returns `None` for any other shape.

@@ -452,6 +452,16 @@ pub(crate) fn agend_block_owner(existing: &str) -> crate::paths::DirIdentity {
     DirIdentity::Corrupt
 }
 
+/// Fail-closed identity read of a shared instructions file at `path`: a genuine
+/// `NotFound` is [`DirIdentity::Absent`] (adoptable); any OTHER I/O failure —
+/// permission denied, invalid UTF-8, a directory in place of the file — is
+/// [`DirIdentity::Unreadable`] (a conflict — we must not overwrite/delete a
+/// directory whose ownership we cannot verify). A readable file is parsed by
+/// [`agend_block_owner`].
+pub(crate) fn agents_md_identity(path: &Path) -> crate::paths::DirIdentity {
+    crate::paths::classify_identity_read(std::fs::read_to_string(path), agend_block_owner)
+}
+
 /// Merge an agend-owned block into a user-shared file, preserving all user
 /// content outside the `<!-- agend:start --> ... <!-- agend:end -->` markers.
 /// Creates the file if missing; replaces the existing block in place if present;
