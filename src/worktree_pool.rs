@@ -930,6 +930,16 @@ fn release_bound_target_exact_impl(
             git_metadata_repos: metadata.repos_touched,
             ..ReleaseOutcome::default()
         };
+        if metadata.matched && metadata.pruned_count == 0 {
+            out.error = Some(
+                "exact git worktree metadata matched but could not be removed; binding preserved"
+                    .to_string(),
+            );
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            return out;
+        }
         clear_binding_state(home, agent);
         out.binding_removed = true;
         out.released = true;
@@ -1129,6 +1139,15 @@ pub(crate) fn release_absent_target_under_branch_lock(
             crate::mcp::handlers::prune_exact_git_metadata(source_repo, target, agent, branch);
         out.git_metadata_pruned = metadata.pruned_count;
         out.git_metadata_repos = metadata.repos_touched;
+        if metadata.matched && metadata.pruned_count == 0 {
+            out.error = Some(
+                "exact git worktree metadata matched but could not be removed; state preserved"
+                    .to_string(),
+            );
+            drop(_binding_lock);
+            drop(_agent_lock);
+            return out;
+        }
         out.released = true;
         out.already_released = true;
         drop(_binding_lock);

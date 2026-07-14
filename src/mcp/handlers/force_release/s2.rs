@@ -40,36 +40,40 @@ pub(crate) enum RebaseTestPhase {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 pub(crate) mod rebase_test_seam {
     use super::RebaseTestPhase;
+    use std::cell::RefCell;
     use std::sync::Arc;
 
     type Hook = Arc<dyn Fn(RebaseTestPhase) -> Option<String> + Send + Sync>;
 
-    static HOOK: std::sync::OnceLock<parking_lot::Mutex<Option<Hook>>> = std::sync::OnceLock::new();
-
-    fn hook() -> &'static parking_lot::Mutex<Option<Hook>> {
-        HOOK.get_or_init(|| parking_lot::Mutex::new(None))
+    thread_local! {
+        static LOCAL_HOOK: RefCell<Option<Hook>> = RefCell::new(None);
     }
 
     pub(crate) struct Guard;
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            *hook().lock() = None;
+            LOCAL_HOOK.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
     pub(crate) fn install(
         callback: impl Fn(RebaseTestPhase) -> Option<String> + Send + Sync + 'static,
     ) -> Guard {
-        *hook().lock() = Some(Arc::new(callback));
+        LOCAL_HOOK.with(|slot| *slot.borrow_mut() = Some(Arc::new(callback)));
         Guard
     }
 
     pub(crate) fn hit(phase: RebaseTestPhase) -> Option<String> {
-        let callback = hook().lock().clone();
-        callback.and_then(|callback| callback(phase))
+        if let Some(reason) =
+            LOCAL_HOOK.with(|slot| slot.borrow().as_ref().and_then(|callback| callback(phase)))
+        {
+            return Some(reason);
+        }
+        LOCAL_HOOK.with(|slot| slot.borrow().as_ref().and_then(|callback| callback(phase)))
     }
 }
 
@@ -384,8 +388,8 @@ pub(crate) fn rebase_repair(
     branch: &str,
     explicit_repo: Option<&Path>,
     sender: Option<&str>,
-) -> Result<super::repair::RepairAction, super::repair::RepairBlocked> {
-    use super::repair::{RepairAction, RepairBlocked};
+) -> Result<super::repair::RepairResult, super::repair::RepairBlocked> {
+    use super::repair::{RebaseContinuation, RepairAction, RepairBlocked, RepairResult};
 
     #[cfg(test)]
     if let Some(reason) = rebase_test_seam::hit(RebaseTestPhase::BeforeRepair) {
@@ -401,7 +405,7 @@ pub(crate) fn rebase_repair(
             if matches!(target_state, TargetState::Absent) && explicit_repo.is_none() {
                 // No destructive mutation is needed for a genuinely fresh
                 // bind. The subsequent dispatch owns branch provisioning.
-                return Ok(RepairAction::NoOp);
+                return Ok(RepairResult::no_continuation(RepairAction::NoOp));
             }
             let identity = if matches!(target_state, TargetState::Present) {
                 resolve_absent_identity(home, agent, branch, &target, explicit_repo, true)
@@ -432,9 +436,11 @@ pub(crate) fn rebase_repair(
                 return Err(RepairBlocked::PathUnsafe(error));
             }
             if matches!(target_state, TargetState::Present) {
-                Ok(RepairAction::StaleStateCleared)
+                Ok(RepairResult::no_continuation(
+                    RepairAction::StaleStateCleared,
+                ))
             } else {
-                Ok(RepairAction::NoOp)
+                Ok(RepairResult::no_continuation(RepairAction::NoOp))
             }
         }
         GuardedBinding::Known { value, fingerprint } => {
@@ -491,7 +497,9 @@ pub(crate) fn rebase_repair(
                 if let Some(error) = outcome.error {
                     return Err(RepairBlocked::PathUnsafe(error));
                 }
-                return Ok(RepairAction::StaleStateCleared);
+                return Ok(RepairResult::no_continuation(
+                    RepairAction::StaleStateCleared,
+                ));
             }
 
             let actual_before = current_branch(&worktree)?;
@@ -570,13 +578,48 @@ pub(crate) fn rebase_repair(
                 drop(_binding_lock);
                 drop(_agent_lock);
                 drop(_lease);
-                return Ok(RepairAction::MetadataOnly);
+                return Ok(RepairResult::no_continuation(RepairAction::MetadataOnly));
             }
+            let marker_body = std::fs::read(worktree.join(crate::worktree_pool::MANAGED_MARKER))
+                .map_err(|e| {
+                    RepairBlocked::SwitchFailed(format!("read marker before switch: {e}"))
+                })?;
+            let binding_body =
+                std::fs::read(crate::paths::binding_path(home, agent)).map_err(|e| {
+                    RepairBlocked::SwitchFailed(format!("read binding before switch: {e}"))
+                })?;
+            let binding_signature = std::fs::read(
+                crate::paths::runtime_dir(home)
+                    .join(agent)
+                    .join("binding.json.sig"),
+            )
+            .ok();
             use crate::git_helpers::{git_cmd, GitError};
             match git_cmd(&worktree, &["switch", branch]) {
                 Ok(_) => {
-                    update_marker_branch(&worktree, agent, branch, &identity.source_repo)
-                        .map_err(RepairBlocked::SwitchFailed)?;
+                    if let Err(error) =
+                        update_marker_branch(&worktree, agent, branch, &identity.source_repo)
+                    {
+                        let restore = git_cmd(&worktree, &["switch", &actual_before])
+                            .map(|_| ())
+                            .map_err(|e| format!("restore branch after marker failure: {e}"));
+                        let marker_restore = std::fs::write(
+                            worktree.join(crate::worktree_pool::MANAGED_MARKER),
+                            &marker_body,
+                        )
+                        .map_err(|e| format!("restore marker after marker failure: {e}"));
+                        if let Err(restore_error) = restore {
+                            return Err(RepairBlocked::SwitchFailed(format!(
+                                "{error}; {restore_error}"
+                            )));
+                        }
+                        if let Err(restore_error) = marker_restore {
+                            return Err(RepairBlocked::SwitchFailed(format!(
+                                "{error}; {restore_error}"
+                            )));
+                        }
+                        return Err(RepairBlocked::SwitchFailed(error));
+                    }
                 }
                 Err(GitError::NonZero { stderr, .. }) => {
                     return Err(RepairBlocked::SwitchFailed(stderr))
@@ -586,7 +629,18 @@ pub(crate) fn rebase_repair(
             drop(_binding_lock);
             drop(_agent_lock);
             drop(_lease);
-            Ok(RepairAction::SwitchedBranch)
+            Ok(RepairResult {
+                action: RepairAction::SwitchedBranch,
+                continuation: Some(RebaseContinuation {
+                    worktree,
+                    source_repo: identity.source_repo,
+                    requested_branch: branch.to_string(),
+                    previous_branch: actual_before,
+                    marker_body,
+                    binding_body,
+                    binding_signature,
+                }),
+            })
         }
     }
 }

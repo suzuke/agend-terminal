@@ -83,24 +83,36 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         }
     }
 
-    // #2496: rebase_mode tries a SAFE same-agent repair FIRST — reads the
-    // agent's actual bound worktree and either finds it already on `branch`
-    // (metadata-only, no mutation) or in-place `git switch`es a clean
-    // worktree to it. Any condition that isn't safe (dirty, not
-    // daemon-managed, held by another agent, an active CI watch/task on the
-    // branch being abandoned, or the switch itself failing) is a fail-closed
-    // BLOCKED error — no more silent fallthrough to a full destructive
-    // release (that defeated the entire point of `rebase_mode`).
+    let task_id = args["task_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let rebase_mode = args["rebase_mode"].as_bool().unwrap_or(false);
     let mut repair_action = None;
-    if args["rebase_mode"].as_bool().unwrap_or(false) {
-        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair(
+    let mut continuation = None;
+    let mut preheld_guard = None;
+    if rebase_mode {
+        let guard = match crate::mcp::handlers::dispatch_hook::acquire_bind_guard(home, agent) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                return json!({
+                    "error": format!("rebase_mode repair blocked: {reason}"),
+                    "code": "rebind_repair_blocked"
+                });
+            }
+        };
+        match crate::mcp::handlers::force_release::attempt_safe_rebind_repair_with_continuation(
             home,
             agent,
             branch,
             source_repo_path.as_deref(),
             sender.as_ref().map(|s| s.as_str()),
         ) {
-            Ok(action) => repair_action = Some(action),
+            Ok(result) => {
+                repair_action = Some(result.action);
+                continuation = result.continuation;
+                preheld_guard = Some(guard);
+            }
             Err(reason) => {
                 return json!({
                     "error": format!("rebase_mode repair blocked: {reason}"),
@@ -109,19 +121,27 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             }
         }
     }
-
-    let task_id = args["task_id"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("");
-    match crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
-        home,
-        agent,
-        task_id,
-        branch,
-        repo_arg,
-        source_repo_path.as_deref(),
-    ) {
+    let dispatch_result = if let Some(guard) = preheld_guard {
+        crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source_and_chain_preheld(
+            home,
+            agent,
+            task_id,
+            branch,
+            repo_arg,
+            source_repo_path.as_deref(),
+            guard,
+        )
+    } else {
+        crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
+            home,
+            agent,
+            task_id,
+            branch,
+            repo_arg,
+            source_repo_path.as_deref(),
+        )
+    };
+    match dispatch_result {
         Ok(_outcome) => {
             // Successful bind: read back the worktree path from the binding
             // we just wrote so the response reflects authoritative state.
@@ -148,6 +168,14 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             resp
         }
         Err(err) => {
+            if let Some(repair) = continuation.as_ref() {
+                if let Err(rollback_error) = repair.rollback(home, agent) {
+                    return json!({
+                        "error": format!("{}; rollback failed: {rollback_error}", err.message),
+                        "code": "lease_failed"
+                    });
+                }
+            }
             // Map `DispatchError` to the pre-#781 string-code response shape, but
             // dispatch on the TYPED `err.code` — NOT message substrings
             // (smells#2 Pattern-A / de2eb8 finding #1). The old

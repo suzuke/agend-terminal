@@ -919,36 +919,35 @@ fn r3_bind_self_rebase_switched_branch_is_end_to_end() {
 
 #[test]
 fn r3_concurrent_rebase_has_one_bind_guard_transaction() {
-    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier, Condvar, Mutex,
+    };
     use std::thread;
 
     let home = tmp_home("r3-rebase-concurrent");
     let repo = seed_live_rebase_binding(&home, "agent", "main", &["feature/a", "feature/b"]);
     let entered = Arc::new((Mutex::new(false), Condvar::new()));
     let green_barrier = Arc::new(Barrier::new(2));
-    let red_barrier = Arc::new(Barrier::new(3));
-    let hook_home = home.clone();
-    let hook_entered = entered.clone();
-    let green_wait = green_barrier.clone();
-    let red_wait = red_barrier.clone();
-    let _hook = crate::mcp::handlers::force_release::rebase_test_seam::install(move |phase| {
-        if phase != crate::mcp::handlers::force_release::RebaseTestPhase::BeforeRepair {
-            return None;
-        }
-        let (flag, cv) = &*hook_entered;
-        *flag.lock().unwrap() = true;
-        cv.notify_one();
-        if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(&hook_home, "agent") {
-            green_wait.wait();
-        } else {
-            red_wait.wait();
-        }
-        None
-    });
-
+    let first_callback = Arc::new(AtomicBool::new(true));
     let first_home = home.clone();
     let first_repo = repo.clone();
+    let first_entered = entered.clone();
+    let first_green = green_barrier.clone();
+    let first_callback_gate = first_callback.clone();
     let first = thread::spawn(move || {
+        let _hook = crate::mcp::handlers::force_release::rebase_test_seam::install(move |phase| {
+            if phase != crate::mcp::handlers::force_release::RebaseTestPhase::BeforeRepair {
+                return None;
+            }
+            let (flag, cv) = &*first_entered;
+            *flag.lock().unwrap() = true;
+            cv.notify_one();
+            if first_callback_gate.swap(false, Ordering::SeqCst) {
+                first_green.wait();
+            }
+            None
+        });
         handle_bind_self(
             &first_home,
             &json!({"repository_path":first_repo, "branch":"feature/a", "rebase_mode":true}),
@@ -963,18 +962,29 @@ fn r3_concurrent_rebase_has_one_bind_guard_transaction() {
     drop(entered_guard);
     let second_home = home.clone();
     let second_repo = repo.clone();
+    let second_entered = entered.clone();
+    let second_green = green_barrier.clone();
+    let second_callback_gate = first_callback.clone();
     let second = thread::spawn(move || {
+        let _hook = crate::mcp::handlers::force_release::rebase_test_seam::install(move |phase| {
+            if phase != crate::mcp::handlers::force_release::RebaseTestPhase::BeforeRepair {
+                return None;
+            }
+            let (flag, cv) = &*second_entered;
+            *flag.lock().unwrap() = true;
+            cv.notify_one();
+            if second_callback_gate.swap(false, Ordering::SeqCst) {
+                second_green.wait();
+            }
+            None
+        });
         handle_bind_self(
             &second_home,
             &json!({"repository_path":second_repo, "branch":"feature/b", "rebase_mode":true}),
             &sender_for("agent"),
         )
     });
-    if crate::mcp::handlers::dispatch_hook::is_bind_in_flight(&home, "agent") {
-        green_barrier.wait();
-    } else {
-        red_barrier.wait();
-    }
+    green_barrier.wait();
     let first_response = first.join().unwrap();
     let second_response = second.join().unwrap();
     let successes = [first_response.clone(), second_response.clone()]

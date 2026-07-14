@@ -788,7 +788,7 @@ pub fn is_agent_in_managed_worktree(home: &Path, agent: &str) -> bool {
 /// #2755 R4: binding-adoption query for checkout recovery, extracted to the
 /// `worktree_state` submodule; re-exported for the stable `crate::binding` path.
 mod worktree_state;
-pub(crate) use worktree_state::{worktree_binding_state, WorktreeBindingState};
+pub(crate) use worktree_state::{refresh_cached, worktree_binding_state, WorktreeBindingState};
 
 /// Install the prepare-commit-msg hook into a worktree via core.hooksPath.
 /// Points to `$AGEND_HOME/hooks/` unified directory.

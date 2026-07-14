@@ -33,6 +33,70 @@ pub(crate) enum RepairAction {
     SwitchedBranch,
 }
 
+pub(crate) struct RepairResult {
+    pub(crate) action: RepairAction,
+    pub(crate) continuation: Option<RebaseContinuation>,
+}
+
+pub(crate) struct RebaseContinuation {
+    pub(crate) worktree: std::path::PathBuf,
+    pub(crate) source_repo: std::path::PathBuf,
+    pub(crate) requested_branch: String,
+    pub(crate) previous_branch: String,
+    pub(crate) marker_body: Vec<u8>,
+    pub(crate) binding_body: Vec<u8>,
+    pub(crate) binding_signature: Option<Vec<u8>>,
+}
+
+impl RebaseContinuation {
+    pub(crate) fn rollback(&self, home: &Path, agent: &str) -> Result<(), String> {
+        let _lease = crate::binding::acquire_branch_lease_lock(
+            home,
+            &self.source_repo.display().to_string(),
+            &self.requested_branch,
+        )
+        .map_err(|e| format!("rollback branch lease lock failed: {e}"))?;
+        let _agent_lock = crate::binding::acquire_agent_mutation_lock(home, agent)?;
+        let _binding_lock = crate::binding::acquire_binding_file_lock(home, agent)?;
+        let current = crate::git_helpers::git_cmd(&self.worktree, &["branch", "--show-current"])
+            .map_err(|e| format!("rollback read current branch failed: {e}"))?;
+        if current != self.previous_branch {
+            crate::git_helpers::git_cmd(&self.worktree, &["switch", &self.previous_branch])
+                .map_err(|e| format!("rollback git switch failed: {e}"))?;
+        }
+        std::fs::write(
+            self.worktree.join(crate::worktree_pool::MANAGED_MARKER),
+            &self.marker_body,
+        )
+        .map_err(|e| format!("rollback marker write failed: {e}"))?;
+        crate::store::atomic_write(&crate::paths::binding_path(home, agent), &self.binding_body)
+            .map_err(|e| format!("rollback binding write failed: {e}"))?;
+        let restored_binding = serde_json::from_slice(&self.binding_body)
+            .map_err(|e| format!("rollback binding parse failed: {e}"))?;
+        crate::binding::refresh_cached(home, agent, restored_binding);
+        let signature = crate::paths::runtime_dir(home)
+            .join(agent)
+            .join("binding.json.sig");
+        match &self.binding_signature {
+            Some(body) => crate::store::atomic_write(&signature, body)
+                .map_err(|e| format!("rollback binding signature write failed: {e}"))?,
+            None => {
+                let _ = std::fs::remove_file(signature);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RepairResult {
+    pub(crate) fn no_continuation(action: RepairAction) -> Self {
+        Self {
+            action,
+            continuation: None,
+        }
+    }
+}
+
 /// Why [`attempt_safe_rebind_repair`] refused to repair. The acceptance
 /// criteria requires fail-closed behavior with a clear, specific reason —
 /// callers MUST surface this as a blocked error, never silently fall through
@@ -108,6 +172,7 @@ impl std::fmt::Display for RepairBlocked {
 /// treat this as fail-closed and must NOT fall through to a destructive
 /// release: these are all cases where a LIVE worktree WAS found but touching
 /// it isn't safe.
+#[allow(dead_code)]
 pub(crate) fn attempt_safe_rebind_repair(
     home: &Path,
     agent: &str,
@@ -115,6 +180,17 @@ pub(crate) fn attempt_safe_rebind_repair(
     explicit_repo: Option<&Path>,
     sender: Option<&str>,
 ) -> Result<RepairAction, RepairBlocked> {
+    attempt_safe_rebind_repair_with_continuation(home, agent, branch, explicit_repo, sender)
+        .map(|result| result.action)
+}
+
+pub(crate) fn attempt_safe_rebind_repair_with_continuation(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    explicit_repo: Option<&Path>,
+    sender: Option<&str>,
+) -> Result<RepairResult, RepairBlocked> {
     super::s2::rebase_repair(home, agent, branch, explicit_repo, sender)
 }
 

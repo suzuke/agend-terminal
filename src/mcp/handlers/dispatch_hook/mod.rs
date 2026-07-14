@@ -9,12 +9,11 @@ mod auto_watch;
 mod branch_start_point;
 mod from_ref;
 mod live_binding;
-// S2 r2 (#2746): provider-neutral binding-origin slug for the binding_state
-// current_binding projection (GitHub + Bitbucket + GitLab), sibling for LOC
-// relief. Watch-storage canonicalization stays GitHub-only in this file.
 mod provider_neutral_slug;
+mod rebase_dispatch;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
+pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
 // repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
@@ -165,7 +164,7 @@ fn bind_in_flight_set() -> &'static parking_lot::Mutex<HashSet<(String, String)>
     SET.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
 }
 
-struct BindGuard {
+pub(crate) struct BindGuard {
     key: (String, String),
 }
 
@@ -180,6 +179,10 @@ impl BindGuard {
         }
         Ok(BindGuard { key })
     }
+}
+
+pub(crate) fn acquire_bind_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
+    BindGuard::try_acquire(home, target)
 }
 
 impl Drop for BindGuard {
@@ -397,14 +400,17 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // empty (the arm must still fire for it).
     arm_ci_watch: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let _guard = BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
-        message: msg,
-        code: ErrorCode::BindInFlight,
-        stage: Stage::WorktreeLeaseConflict,
-        fetch_attempted: false,
-        raw: None,
-    })?;
-
+    let (preheld_guard, rebase_continuation) = rebase_dispatch::take_preheld_dispatch();
+    let _guard = match preheld_guard {
+        Some(guard) => guard,
+        None => BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
+            message: msg,
+            code: ErrorCode::BindInFlight,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: None,
+        })?,
+    };
     let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|f| f.resolve_instance(target));
@@ -479,7 +485,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     let mut reuse_live_worktree: Option<PathBuf> = None; // #2158 partial-skip (set below)
     if let Some(existing) = crate::binding::read(home, target) {
         if let Some(existing_branch) = existing.get("branch").and_then(|v| v.as_str()) {
-            if existing_branch != branch {
+            if existing_branch != branch && !rebase_continuation {
                 return Err(DispatchError {
                     message: format!(
                         "agent '{target}' already bound to branch '{existing_branch}' — \
@@ -497,6 +503,16 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             reuse_live_worktree =
                 live_binding::live_binding_worktree_to_reuse(&existing, &source_repo_str);
         }
+    }
+
+    if rebase_continuation && reuse_live_worktree.is_none() {
+        return Err(DispatchError {
+            message: "rebase continuation requires the exact live bound worktree".to_string(),
+            code: ErrorCode::LeaseConflict,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: None,
+        });
     }
 
     // #781 Piece 6: ensure branch exists in `source_repo` BEFORE the

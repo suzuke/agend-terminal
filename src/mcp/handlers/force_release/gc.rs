@@ -22,6 +22,7 @@ use std::path::PathBuf;
 pub(crate) struct GcOutcome {
     pub(crate) pruned_count: usize,
     pub(crate) repos_touched: Vec<String>,
+    pub(crate) matched: bool,
 }
 
 /// Remove metadata for one already-proven `(source_repo, target)` pair.
@@ -39,6 +40,7 @@ pub(crate) fn prune_exact_git_metadata(
         if !paths_match(&entry.path, target) {
             continue;
         }
+        outcome.matched = true;
         let removed = crate::git_helpers::git_bypass(
             source_repo,
             &["worktree", "remove", "--force", &entry.path],
@@ -87,10 +89,24 @@ fn remove_exact_metadata_dir(source_repo: &Path, target: &Path) -> bool {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(worktree_path) = std::fs::read_to_string(dir.join("worktree")) else {
+        let Ok(gitdir) = std::fs::read_to_string(dir.join("gitdir")) else {
             continue;
         };
-        if paths_match(worktree_path.trim(), target) {
+        let gitdir = PathBuf::from(gitdir.trim());
+        let worktree_path = if gitdir.is_absolute() {
+            gitdir
+        } else {
+            source_repo.join(gitdir)
+        };
+        let worktree_path = if worktree_path.file_name().is_some_and(|name| name == ".git") {
+            worktree_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or(worktree_path)
+        } else {
+            worktree_path
+        };
+        if paths_match(&worktree_path.display().to_string(), target) {
             return std::fs::remove_dir_all(dir).is_ok();
         }
     }
@@ -150,6 +166,7 @@ pub(crate) fn prune_git_metadata_for_agent(
             if !paths_match(&entry.path, &target_path) {
                 continue;
             }
+            outcome.matched = true;
             // Found a matching metadata entry — prune it.
             // #1899: bounded via git_bypass (LOCAL 60s).
             let removed = crate::git_helpers::git_bypass(

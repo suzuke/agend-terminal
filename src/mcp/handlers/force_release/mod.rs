@@ -28,7 +28,7 @@ mod repair;
 mod s2;
 
 pub(crate) use gc::prune_exact_git_metadata;
-pub(crate) use repair::attempt_safe_rebind_repair;
+pub(crate) use repair::attempt_safe_rebind_repair_with_continuation;
 pub(crate) use s2::{classify_target, TargetState};
 #[cfg(test)]
 pub(crate) use s2::{rebase_test_seam, RebaseTestPhase};
