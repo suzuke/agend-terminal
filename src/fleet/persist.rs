@@ -22,7 +22,8 @@ pub(crate) fn mutate_fleet_yaml(
     mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<bool>,
 ) -> Result<()> {
     let fleet_path = fleet_yaml_path(home);
-    if default_content.is_empty() && !fleet_path.exists() {
+    if default_content.is_empty() && !fleet_path.exists() && fleet_path.symlink_metadata().is_err()
+    {
         return Ok(());
     }
     let _lock = acquire_lock(home)?;
@@ -213,7 +214,7 @@ pub fn duplicate_identity_owner_before(
     name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    let candidate_id = crate::paths::workspace_identity(candidate_wd);
+    let candidate_id = crate::paths::workspace_identity(&expand_tilde(candidate_wd));
     let mapping = match load_instances_mapping(home) {
         Ok(m) => m,
         Err(e) => return Some(format!("fleet unreadable — refusing boot admission: {e}")),
@@ -229,7 +230,7 @@ pub fn duplicate_identity_owner_before(
         }
         let explicit = v.get("working_directory").and_then(|x| x.as_str());
         let existing_wd = crate::paths::effective_working_dir(home, existing_name, explicit);
-        if crate::paths::workspace_identity(&existing_wd) == candidate_id
+        if crate::paths::workspace_identity(&expand_tilde(&existing_wd)) == candidate_id
             && earliest.as_deref().is_none_or(|e| existing_name < e)
         {
             earliest = Some(existing_name.to_string());
