@@ -165,9 +165,7 @@ fn load_instances_mapping(home: &Path) -> Result<serde_yaml_ng::Mapping> {
     match doc.get("instances") {
         None => Ok(serde_yaml_ng::Mapping::new()),
         Some(v) => v.as_mapping().cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "fleet.yaml: `instances` is not a mapping (wrong shape — refusing)"
-            )
+            anyhow::anyhow!("fleet.yaml: `instances` is not a mapping (wrong shape — refusing)")
         }),
     }
 }

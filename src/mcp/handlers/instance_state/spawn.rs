@@ -142,7 +142,8 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         }
     }
 
-    let work_dir_preexisted = !worktree_created_by_attempt && std::path::Path::new(&work_dir).exists();
+    let work_dir_preexisted =
+        !worktree_created_by_attempt && std::path::Path::new(&work_dir).exists();
     std::fs::create_dir_all(&work_dir).ok();
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);

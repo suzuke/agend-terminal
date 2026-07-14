@@ -576,9 +576,14 @@ fn r5_branch_worktree_created_by_attempt_cleaned_on_rollback() {
         .success());
     assert!(std::process::Command::new("git")
         .args([
-            "-c", "user.name=test",
-            "-c", "user.email=test@test",
-            "commit", "--allow-empty", "-m", "init",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
         ])
         .current_dir(&repo)
         .status()
@@ -591,7 +596,10 @@ fn r5_branch_worktree_created_by_attempt_cleaned_on_rollback() {
     crate::store::fail_next_atomic_write_for_test(&fleet_path);
 
     let wt_path = crate::worktree::worktree_path(&home, "new-agent", "feat/test");
-    assert!(!wt_path.exists(), "precondition: worktree dir must not exist yet");
+    assert!(
+        !wt_path.exists(),
+        "precondition: worktree dir must not exist yet"
+    );
 
     let spawn_fn = |_h: &Path, _req: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
         Ok(json!({"ok": true}))
@@ -692,7 +700,10 @@ fn r5_wrong_shape_instances_refuses_boot() {
 fn r5_absent_workdir_stays_absent_on_malformed_fleet() {
     let home = tmp_home("r5-premutate");
     let ws = home.join("workspace").join("agent");
-    assert!(!ws.exists(), "precondition: work_dir must be absent initially");
+    assert!(
+        !ws.exists(),
+        "precondition: work_dir must be absent initially"
+    );
 
     let fleet_path = crate::fleet::fleet_yaml_path(&home);
     std::fs::write(&fleet_path, "{{invalid yaml!!").unwrap();
