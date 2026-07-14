@@ -545,7 +545,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             target,
             &source_repo,
             branch,
-            &lifecycle_permit,
+            lifecycle_permit,
         )
         .map_err(|m| lease_err(m.contains("E4.5"), m))?
     } else {

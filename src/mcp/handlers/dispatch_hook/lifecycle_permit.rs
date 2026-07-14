@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LifecycleOperation {
@@ -17,12 +17,6 @@ pub(crate) enum LifecycleOperation {
     Rebase,
     Release,
     Delete,
-}
-
-#[derive(Debug)]
-struct PermitLease {
-    key: (String, String),
-    token: u64,
 }
 
 fn active_permits() -> &'static Mutex<HashMap<(String, String), u64>> {
@@ -36,8 +30,12 @@ fn next_token() -> u64 {
 }
 
 /// Exclusive lifecycle authority for one `(home, agent)` pair.
+///
+/// Non-Clone RAII guard: `Drop` removes the active-map entry exactly once.
+/// Nested helpers take `&LifecyclePermit` — no cloning needed.
 pub(crate) struct LifecyclePermit {
-    lease: Arc<PermitLease>,
+    key: (String, String),
+    token: u64,
     pub(crate) operation: LifecycleOperation,
 }
 
@@ -45,28 +43,16 @@ impl std::fmt::Debug for LifecyclePermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecyclePermit")
             .field("operation", &self.operation)
-            .field("key", &self.lease.key)
+            .field("key", &self.key)
             .finish()
-    }
-}
-
-impl Clone for LifecyclePermit {
-    fn clone(&self) -> Self {
-        Self {
-            lease: Arc::clone(&self.lease),
-            operation: self.operation,
-        }
     }
 }
 
 impl Drop for LifecyclePermit {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.lease) != 1 {
-            return;
-        }
         let mut active = active_permits().lock();
-        if active.get(&self.lease.key) == Some(&self.lease.token) {
-            active.remove(&self.lease.key);
+        if active.get(&self.key) == Some(&self.token) {
+            active.remove(&self.key);
         }
     }
 }
@@ -87,14 +73,15 @@ impl LifecyclePermit {
         }
         active.insert(key.clone(), token);
         Ok(Self {
-            lease: Arc::new(PermitLease { key, token }),
+            key,
+            token,
             operation,
         })
     }
 
     pub(crate) fn authorizes(&self, home: &Path, agent: &str) -> bool {
         let key = (home.display().to_string(), agent.to_string());
-        active_permits().lock().get(&key) == Some(&self.lease.token)
+        active_permits().lock().get(&key) == Some(&self.token)
     }
 }
 
@@ -121,8 +108,8 @@ impl BindGuard {
             .map(|permit| Self { permit })
     }
 
-    pub(crate) fn permit(&self) -> LifecyclePermit {
-        self.permit.clone()
+    pub(crate) fn permit(&self) -> &LifecyclePermit {
+        &self.permit
     }
 }
 

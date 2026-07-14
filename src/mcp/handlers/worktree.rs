@@ -108,7 +108,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             branch,
             source_repo_path.as_deref(),
             sender.as_ref().map(|s| s.as_str()),
-            &permit,
+            permit,
         ) {
             Ok(result) => {
                 repair_action = Some(result.action);

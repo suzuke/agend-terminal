@@ -216,7 +216,7 @@ pub(crate) fn attempt_safe_rebind_repair_with_continuation(
     let guard = crate::mcp::handlers::dispatch_hook::acquire_rebase_guard(home, agent)
         .map_err(RepairBlocked::PathUnsafe)?;
     let permit = guard.permit();
-    attempt_safe_rebind_repair_with_permit(home, agent, branch, explicit_repo, sender, &permit)
+    attempt_safe_rebind_repair_with_permit(home, agent, branch, explicit_repo, sender, permit)
 }
 
 pub(crate) fn attempt_safe_rebind_repair_with_permit(

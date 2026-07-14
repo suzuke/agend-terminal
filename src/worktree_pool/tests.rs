@@ -926,53 +926,68 @@ fn release_full_refuses_binding_rewrite_between_snapshot_and_remove_s1() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// S1 RED: two release actors may snapshot the same generation, but only one may
-/// perform the remove+unbind transition. Both threads rendezvous after snapshot,
-/// so the race is deterministic and sleep-free.
+/// S1 RED: two release actors compete for the same agent. The lifecycle permit
+/// ensures the second actor is refused BEFORE snapshot, so only one transition
+/// occurs. No barrier is needed — the serialization is enforced at the permit
+/// acquisition step, not at the snapshot step.
+///
+/// Updated for #2780 r6: the original S1 test used a barrier that required both
+/// actors to reach AfterBindingSnapshot, but the lifecycle permit correctly
+/// rejects actor B before it ever reaches the snapshot phase.
 #[test]
 fn concurrent_release_actors_apply_one_transition_s1() {
     let home = tmp_home("s1-release-once");
     let repo = tmp_repo("s1-release-once-repo");
     lease_bound(&home, &repo, "agent-once", "feat/once");
 
-    let rendezvous = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let run = |home: PathBuf, rendezvous: std::sync::Arc<std::sync::Barrier>| {
-        std::thread::spawn(move || {
-            let _hook = release_test_seam::install(move |phase| {
-                if phase == ReleaseTestPhase::AfterBindingSnapshot {
-                    rendezvous.wait();
-                }
-            });
-            release_full(&home, "agent-once", false)
-        })
-    };
-    let a = run(home.clone(), rendezvous.clone());
-    let b = run(home.clone(), rendezvous);
-    let outcomes = [a.join().expect("release A"), b.join().expect("release B")];
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
 
-    assert_eq!(
-        outcomes.iter().filter(|o| o.binding_removed).count(),
-        1,
-        "one generation permits exactly one binding transition: {outcomes:?}"
+    // Actor A: acquires permit, pauses inside the transaction at AfterBindingSnapshot.
+    let home_a = home.clone();
+    let a = std::thread::spawn(move || {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                entered_tx.send(()).expect("signal entered");
+                resume_rx.recv().expect("wait for resume");
+            }
+        });
+        release_full(&home_a, "agent-once", false)
+    });
+
+    // Wait for A to be inside the transaction.
+    entered_rx.recv().expect("actor A entered transaction");
+
+    // Actor B: must be refused immediately by the lifecycle permit.
+    let outcome_b = release_full(&home, "agent-once", false);
+    assert!(
+        outcome_b
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("lifecycle transaction already in flight")),
+        "actor B refused by permit before snapshot: {outcome_b:?}"
     );
-    assert_eq!(
-        outcomes.iter().filter(|o| o.worktree_removed).count(),
-        1,
-        "one generation permits exactly one worktree removal: {outcomes:?}"
-    );
-    assert_eq!(
-        outcomes.iter().filter(|o| o.already_released).count(),
-        1,
-        "the losing actor converges as an idempotent no-op: {outcomes:?}"
+
+    // Let A complete.
+    resume_tx.send(()).expect("resume actor A");
+    let outcome_a = a.join().expect("release A");
+
+    assert!(
+        outcome_a.released && outcome_a.binding_removed,
+        "actor A must complete the single transition: {outcome_a:?}"
     );
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
 
-/// S1 RED: reverse reconciliation is another live remove+unbind actor. If it
-/// wins after manual release's snapshot, the manual actor must converge on
-/// Absent instead of applying a second transition to the restored workspace.
+/// S1 RED: reverse reconciliation is another lifecycle actor. The lifecycle
+/// permit ensures that when release holds the permit, reverse_reconcile is
+/// refused before any mutation — and vice versa.
+///
+/// Updated for #2780 r6: the original S1 test assumed reverse_reconcile could
+/// race past release's snapshot, but the lifecycle permit now serializes them
+/// at the entry point. The second actor to attempt acquisition is refused.
 #[test]
 fn reverse_reconcile_vs_release_applies_one_transition_s1() {
     let home = tmp_home("s1-reverse-release");
@@ -989,31 +1004,35 @@ fn reverse_reconcile_vs_release_applies_one_transition_s1() {
     )
     .expect("bind converted workspace");
 
-    let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let home_for_release = home.clone();
     let release_thread = std::thread::spawn(move || {
         let _hook = release_test_seam::install(move |phase| {
             if phase == ReleaseTestPhase::AfterBindingSnapshot {
-                snap_tx.send(()).expect("publish snapshot phase");
+                entered_tx.send(()).expect("signal entered");
                 resume_rx.recv().expect("resume manual release");
             }
         });
         release_full(&home_for_release, "agent-reverse", false)
     });
 
-    snap_rx.recv().expect("manual release snapped binding");
-    reverse_reconcile(&home, "agent-reverse").expect("reverse reconcile wins");
+    // Wait until release holds the permit and is inside the transaction.
+    entered_rx.recv().expect("release entered transaction");
+
+    // reverse_reconcile must be refused — release owns the permit.
+    let rv_result = reverse_reconcile(&home, "agent-reverse");
+    assert!(
+        rv_result.is_err(),
+        "reverse_reconcile must fail when release holds permit, got: {rv_result:?}"
+    );
+
+    // Let release complete its transition.
     resume_tx.send(()).expect("resume manual release");
     let manual = release_thread.join().expect("manual release thread");
-
     assert!(
-        manual.already_released && !manual.binding_removed && !manual.worktree_removed,
-        "losing manual actor must be an Absent no-op, not a second transition: {manual:?}"
-    );
-    assert!(
-        ws.join(".git").is_dir(),
-        "reverse reconcile's restored standalone workspace survives"
+        manual.released && manual.binding_removed,
+        "release must complete the single transition: {manual:?}"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -4309,6 +4328,7 @@ fn r6_permit_concurrent_clone_drop_leaves_map_reusable() {
     let home = Path::new("/tmp/agend-r6-permit-drop");
     let agent = "agent-r6-drop";
 
+    // Acquire, verify registration, drop on another thread, verify cleanup.
     let permit = LifecyclePermit::acquire(home, agent, LifecycleOperation::Release)
         .expect("initial acquire");
     assert!(
@@ -4316,36 +4336,33 @@ fn r6_permit_concurrent_clone_drop_leaves_map_reusable() {
         "permit must register in active map"
     );
 
-    // Clone and drop both on separate threads simultaneously.
-    let clone = permit.clone();
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let b1 = barrier.clone();
-    let t1 = std::thread::spawn(move || {
-        b1.wait();
-        drop(permit);
-    });
-    let b2 = barrier.clone();
-    let t2 = std::thread::spawn(move || {
-        b2.wait();
-        drop(clone);
-    });
-    t1.join().expect("t1");
-    t2.join().expect("t2");
+    // Drop on a different thread — the RAII guard must still clean the map.
+    let t = std::thread::spawn(move || drop(permit));
+    t.join().expect("drop thread");
 
-    // After both drops, the map entry MUST be gone.
+    // After drop, the map entry MUST be gone — no leak.
     assert!(
         !lifecycle_is_active(home, agent),
-        "active map entry leaked after concurrent clone drops"
+        "active map entry leaked after permit drop on another thread"
     );
 
-    // A new permit for the same agent must be acquirable.
+    // A new permit for the same agent must be acquirable (not stuck).
     let permit2 = LifecyclePermit::acquire(home, agent, LifecycleOperation::Bind);
     assert!(
         permit2.is_ok(),
-        "second acquire after concurrent drops must succeed: {:?}",
+        "second acquire after drop must succeed: {:?}",
         permit2.err()
     );
     drop(permit2);
+
+    // Verify the cycle works repeatedly — no stale state accumulation.
+    for i in 0..5 {
+        let p = LifecyclePermit::acquire(home, agent, LifecycleOperation::Release)
+            .unwrap_or_else(|e| panic!("cycle {i} acquire failed: {e}"));
+        assert!(lifecycle_is_active(home, agent), "cycle {i} active");
+        drop(p);
+        assert!(!lifecycle_is_active(home, agent), "cycle {i} cleaned");
+    }
 }
 
 /// r6 RED: two release actors racing for the same agent — the second must be
@@ -4376,8 +4393,11 @@ fn r6_release_release_first_actor_owns_second_refuses_before_snapshot() {
     // Actor B: must be refused immediately by the lifecycle permit.
     let outcome_b = release_full(&home, "agent-rr", false);
     assert!(
-        outcome_b.error.as_deref().is_some_and(|e| e.contains("lifecycle transaction already in flight")
-            || e.contains("lifecycle permit")),
+        outcome_b
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("lifecycle transaction already in flight")
+                || e.contains("lifecycle permit")),
         "actor B must be refused before snapshot, got: {:?}",
         outcome_b
     );
@@ -4433,8 +4453,7 @@ fn r6_reverse_release_start_orders_serialize_without_barrier() {
     );
     let err = rv_result.unwrap_err();
     assert!(
-        err.contains("lifecycle transaction already in flight")
-            || err.contains("refused"),
+        err.contains("lifecycle transaction already in flight") || err.contains("refused"),
         "error must mention permit conflict: {err}"
     );
 
