@@ -678,7 +678,7 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     // next spawn's `ensure_project_root` would also do this, but doing it here
     // makes the revert self-contained + testable.
     let _ = std::fs::create_dir_all(&ws);
-    crate::instructions::ensure_project_root(&ws);
+    crate::instructions::ensure_project_root(&ws)?;
     Ok(())
 }
 

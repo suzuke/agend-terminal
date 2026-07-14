@@ -5,11 +5,13 @@ use std::path::Path;
 /// via `--append-system-prompt-file .claude/agend.md`, so keeping the old file
 /// around would cause Claude to auto-load stale content as a rule on top of
 /// the flag-provided version.
-fn migrate_claude_old_rules_file(working_dir: &Path) {
+fn migrate_claude_old_rules_file(working_dir: &Path) -> Result<(), String> {
     let old = working_dir.join(".claude").join("rules").join("agend.md");
     if old.exists() {
-        let _ = std::fs::remove_file(&old);
+        std::fs::remove_file(&old)
+            .map_err(|e| format!("migrate: cannot remove old {}: {e}", old.display()))?;
     }
+    Ok(())
 }
 
 /// Context for generating agent instructions.
@@ -60,30 +62,29 @@ mcp-config.json
 /// here instead of walking up to `$HOME`. No-op if `dir` already lives inside
 /// a git work tree (we never create nested repos). On a fresh init, also drops
 /// a minimal `.gitignore` for agend runtime artifacts.
-pub(crate) fn ensure_project_root(dir: &Path) {
+pub(crate) fn ensure_project_root(dir: &Path) -> Result<(), String> {
     if !dir.exists() {
-        return;
+        return Ok(());
     }
-    // W1.2: cwd=dir replaces `-C dir`; git_ok = spawn-and-exit-0 (bypass env +
-    // local timeout + process-group kill bundled). Local rev-parse.
     let inside = crate::git_helpers::git_ok(dir, &["rev-parse", "--is-inside-work-tree"]);
     if inside {
-        return;
+        return Ok(());
     }
 
-    // #2071: an un-redirected child in app mode inherits the TUI's TTY and `git
-    // init`'s hints/warnings garble the ratatui frame. git_ok runs git via
-    // git_bypass, which CAPTURES stdout/stderr (pipes — never the inherited TTY),
-    // so the explicit Stdio::null is no longer needed; we only read the exit
-    // status. W1.2: cwd=dir replaces `-C dir`.
     let init_ok = crate::git_helpers::git_ok(dir, &["init", "--quiet"]);
-
-    if init_ok {
-        let ignore_path = dir.join(".gitignore");
-        if !ignore_path.exists() {
-            let _ = std::fs::write(&ignore_path, AGEND_GITIGNORE);
-        }
+    if !init_ok {
+        return Err(format!(
+            "ensure_project_root: git init failed in {}",
+            dir.display()
+        ));
     }
+
+    let ignore_path = dir.join(".gitignore");
+    if !ignore_path.exists() {
+        std::fs::write(&ignore_path, AGEND_GITIGNORE)
+            .map_err(|e| format!("ensure_project_root: .gitignore write: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Markers for agend-owned block inside user-shared instructions files
@@ -614,12 +615,10 @@ pub fn generate_with_context(
     // Scope Gemini/Codex project-root discovery to this dir so the hierarchical
     // GEMINI.md / AGENTS.md search doesn't walk up into the user's $HOME.
     if backend.is_some() {
-        ensure_project_root(working_dir);
+        ensure_project_root(working_dir)?;
     }
-    // Codex trust-prompt handling is via CLI flag + dismiss_patterns — see
-    // `src/backend.rs`. We deliberately do not write to `~/.codex/config.toml`.
     if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
-        migrate_claude_old_rules_file(working_dir);
+        migrate_claude_old_rules_file(working_dir)?;
     }
     crate::mcp_config::configure(working_dir, command, ctx.map(|c| c.name))
         .map_err(|e| format!("provision: MCP config: {e}"))?;
@@ -977,7 +976,7 @@ mod tests {
     #[test]
     fn ensure_project_root_inits_fresh_dir_with_gitignore() {
         let dir = tmp_dir("ensure_root_fresh");
-        ensure_project_root(&dir);
+        ensure_project_root(&dir).unwrap();
         assert!(dir.join(".git").exists(), "missing .git after init");
         let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(ignore.contains("mcp-config.json"));
@@ -994,7 +993,7 @@ mod tests {
             .status();
         let inner = outer.join("subdir");
         std::fs::create_dir_all(&inner).unwrap();
-        ensure_project_root(&inner);
+        ensure_project_root(&inner).unwrap();
         assert!(
             !inner.join(".git").exists(),
             "should not create nested .git inside an existing repo"
@@ -1011,7 +1010,7 @@ mod tests {
         let dir = tmp_dir("ensure_root_user_ignore");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".gitignore"), "my-custom-rule\n").unwrap();
-        ensure_project_root(&dir);
+        ensure_project_root(&dir).unwrap();
         let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert_eq!(
             ignore, "my-custom-rule\n",

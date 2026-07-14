@@ -87,22 +87,18 @@ pub(crate) fn prepare_instructions(
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
         }
-        Err(_) if explicit_role.is_some() => {
+        Err(e) => {
+            let is_not_found = !fleet_path.exists();
+            if !is_not_found {
+                return Err(format!(
+                    "fleet.yaml unreadable/malformed — refusing provisioning: {e}"
+                ));
+            }
             let ctx = crate::instructions::AgentContext {
                 name,
                 role: explicit_role,
                 fleet_peers: &[],
                 team: team_ctx.as_ref(),
-                extra_instructions: None,
-            };
-            crate::instructions::generate_with_context(work_dir, command, Some(&ctx))
-        }
-        Err(_) => {
-            let ctx = crate::instructions::AgentContext {
-                name,
-                role: None,
-                fleet_peers: &[],
-                team: None,
                 extra_instructions: None,
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx))

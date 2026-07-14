@@ -139,6 +139,7 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         }
     }
 
+    let work_dir_preexisted = std::path::Path::new(&work_dir).exists();
     std::fs::create_dir_all(&work_dir).ok();
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
@@ -219,12 +220,15 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
         ..Default::default()
     };
     if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
-        // #46776 finding 2: roll back the worktree/dir created above so a refused
-        // admission (a race that slipped past the preflight, or a merge conflict)
-        // leaves NO partial filesystem/git state. The dir is not yet provisioned
-        // (no AGENTS.md/.codex identity), so cleanup finds no foreign owner.
-        let _ =
-            crate::agent_ops::cleanup_working_dir(home, name, &std::path::PathBuf::from(&work_dir));
+        // Only roll back filesystem state that THIS attempt created. A
+        // pre-existing dir (reused worktree or occupied workspace) must survive.
+        if !work_dir_preexisted {
+            let _ = crate::agent_ops::cleanup_working_dir(
+                home,
+                name,
+                &std::path::PathBuf::from(&work_dir),
+            );
+        }
         return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});
     }
 

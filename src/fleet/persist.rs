@@ -146,15 +146,23 @@ fn find_workspace_identity_collision(
     None
 }
 
-/// Read-only load of the parsed `instances` mapping from fleet.yaml (empty if the
-/// file is missing/unparseable). Best-effort — callers use it for a preflight;
-/// the atomic `add_instances_to_yaml` under the fleet lock stays the authority.
-fn load_instances_mapping(home: &Path) -> serde_yaml_ng::Mapping {
-    std::fs::read_to_string(fleet_yaml_path(home))
-        .ok()
-        .and_then(|c| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&c).ok())
-        .and_then(|doc| doc.get("instances").and_then(|v| v.as_mapping()).cloned())
-        .unwrap_or_default()
+/// Read-only load of the parsed `instances` mapping from fleet.yaml.
+/// Missing file → empty mapping (legitimate first-run).
+/// Opaque I/O or parse error → `Err` (callers must refuse — fail-closed).
+fn load_instances_mapping(home: &Path) -> Result<serde_yaml_ng::Mapping> {
+    let fleet_path = fleet_yaml_path(home);
+    if !fleet_path.exists() {
+        return Ok(serde_yaml_ng::Mapping::new());
+    }
+    let c = std::fs::read_to_string(&fleet_path)
+        .with_context(|| format!("fleet.yaml read: {}", fleet_path.display()))?;
+    let doc =
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&c).with_context(|| "fleet.yaml parse")?;
+    Ok(doc
+        .get("instances")
+        .and_then(|v| v.as_mapping())
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// Read-only workspace-identity collision preflight: returns a DIFFERENT existing
@@ -167,7 +175,10 @@ pub fn workspace_identity_collision(
     name: &str,
     candidate_wd: &Path,
 ) -> Option<String> {
-    find_workspace_identity_collision(home, &load_instances_mapping(home), name, candidate_wd)
+    match load_instances_mapping(home) {
+        Ok(mapping) => find_workspace_identity_collision(home, &mapping, name, candidate_wd),
+        Err(e) => Some(format!("fleet unreadable — refusing collision check: {e}")),
+    }
 }
 
 /// Boot/spawn admission for a PRE-EXISTING duplicate fleet (root finding 5): if
@@ -183,8 +194,12 @@ pub fn duplicate_identity_owner_before(
     candidate_wd: &Path,
 ) -> Option<String> {
     let candidate_id = crate::paths::workspace_identity(candidate_wd);
+    let mapping = match load_instances_mapping(home) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("fleet unreadable — refusing boot admission: {e}")),
+    };
     let mut earliest: Option<String> = None;
-    for (k, v) in &load_instances_mapping(home) {
+    for (k, v) in &mapping {
         let Some(existing_name) = k.as_str() else {
             continue;
         };

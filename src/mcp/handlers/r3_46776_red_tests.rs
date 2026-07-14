@@ -349,8 +349,8 @@ fn g5_handle_spawn_rejects_workspace_identity_collision() {
 /// unconditionally removes dirs under `$AGEND_HOME/worktrees/`. This destroys
 /// state that this attempt did NOT create.
 ///
-/// Setup: empty fleet (preflight passes), fleet.yaml made read-only so the
-/// write-back inside `mutate_fleet_yaml` fails → Err triggers rollback on the
+/// Setup: empty fleet (preflight passes), `fail_next_atomic_write_for_test`
+/// makes the fleet.yaml atomic write fail → Err triggers rollback on the
 /// pre-existing worktree dir.
 ///
 /// RED: FAILS because the rollback path has no provenance tracking — it
@@ -364,14 +364,10 @@ fn r4_admission_rollback_preserves_preexisting_worktree() {
 
     // Empty fleet → preflight collision check passes (no colliders).
     fleet_with_instances(&home, "instances: {}\n");
-    let fleet_path = crate::fleet::fleet_yaml_path(&home);
 
-    // Make fleet.yaml read-only → mutate_fleet_yaml write-back fails → Err.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fleet_path, std::fs::Permissions::from_mode(0o444)).unwrap();
-    }
+    // Force the fleet.yaml atomic write to fail → add_instance_to_yaml Err.
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    crate::store::fail_next_atomic_write_for_test(&fleet_path);
 
     let spawn_fn = |_h: &Path, _req: &serde_json::Value| -> anyhow::Result<serde_json::Value> {
         Ok(json!({"ok": true}))
@@ -387,13 +383,6 @@ fn r4_admission_rollback_preserves_preexisting_worktree() {
         }),
         &spawn_fn,
     );
-
-    // Restore permissions for cleanup.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fleet_path, std::fs::Permissions::from_mode(0o644)).ok();
-    }
 
     // The spawn must be refused (fleet.yaml write failure).
     assert!(
