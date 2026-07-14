@@ -26,7 +26,10 @@ pub(super) use anti_stall::enforce_send_invariants;
 pub(super) use request_kind_gate::validate_request_kind;
 
 // Delegate-task pre-send gates (handle_delegate_task / comms_delegate).
-pub(super) use dispatch::{run_dispatch_pre_checks, DispatchPreChecks};
+// #6: DispatchPreChecks promoted to pub(crate) so ci/review_workspace_tests can
+// construct it for bind-rejection tests.
+pub(super) use dispatch::run_dispatch_pre_checks;
+pub(crate) use dispatch::DispatchPreChecks;
 // t-…-17: `ReviewAuthor` is consumed by the reviewer-assignment marker gate in
 // `comms_delegate` AND persisted verbatim in the durable assignment store
 // (`crate::daemon::assignment_authority`, C8) — so it is crate-visible, not just

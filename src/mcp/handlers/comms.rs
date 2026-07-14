@@ -17,6 +17,9 @@ use super::{
 #[path = "comms_delegate/mod.rs"]
 mod comms_delegate;
 pub(crate) use comms_delegate::handle_delegate_task;
+// #6: re-export so ci/review_workspace_tests can drive bind rejection tests.
+#[cfg(test)]
+pub(crate) use comms_delegate::review_assignment;
 // p0c_tests (cfg test child) pin `super::dispatch_should_skip_auto_bind`.
 #[cfg(test)]
 pub(super) use comms_delegate::dispatch_should_skip_auto_bind;
