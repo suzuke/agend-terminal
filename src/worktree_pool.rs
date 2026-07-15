@@ -668,14 +668,20 @@ fn resolve_branch_cleanup(
                 )
                 .ok()
                 .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
-                crate::cleanup_intents::persist_intent(
+                if let Err(e) = crate::cleanup_intents::persist_intent(
                     home,
                     sr_str,
                     branch,
                     &tip,
                     task_id,
                     scm_slug.as_deref(),
-                );
+                    None,
+                ) {
+                    tracing::warn!(
+                        %branch, error = %e,
+                        "cleanup intent persistence failed — branch may leak"
+                    );
+                }
             }
         }
     } else if branch.is_empty() {

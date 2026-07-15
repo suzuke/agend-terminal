@@ -502,57 +502,70 @@ pub(crate) fn augment_binding_with_lease(
     Ok(())
 }
 
-/// Post-bind hook: if the agent has an active typed review assignment, augment
-/// the binding with the assignment's lease provenance (lease_kind +
-/// assignment_id + reviewed_head).
+/// Post-bind hook: if the agent has a receipt-capable typed review assignment
+/// for the given task, augment the binding with HMAC-signed lease provenance.
 ///
-/// Called from `handle_checkout_repo` after a successful `bind_full`. The
-/// authority source is the daemon's own assignment store — not caller-provided
-/// or inferred from branch prefix.
-pub(crate) fn try_augment_review_lease(home: &Path, agent: &str, branch: &str) {
-    let assignments =
-        match crate::daemon::assignment_authority::legacy_active_assignments_strict(home) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-    let matching = assignments.iter().find(|a| a.target == agent);
-    if let Some(assignment) = matching {
-        let reviewed_head = match &assignment.reviewed_head {
-            Some(h) if !h.is_empty() => h.as_str(),
-            _ => return,
-        };
-        // Use the checkout branch tip as expected_head for the CAS check.
-        // The reviewed_head is the PR head the assignment targets, which is
-        // the upstream reference; the checkout branch tip is what the
-        // reviewer will be working on locally.
-        let branch_tip = crate::git_helpers::git_cmd(
-            Path::new(
-                snapshot_guarded_binding(home, agent)
-                    .ok()
-                    .and_then(|g| match g {
-                        GuardedBinding::Known { value, .. } => {
-                            value["source_repo"].as_str().map(|s| s.to_string())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_default()
-                    .as_str(),
-            ),
-            &["rev-parse", branch],
-        )
-        .ok()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| reviewed_head.to_string());
-
-        if let Err(e) = augment_binding_with_lease(
-            home,
-            agent,
-            "review",
-            &assignment.assignment_id.to_string(),
-            &branch_tip,
-        ) {
-            tracing::warn!(%agent, error = %e, "review lease augmentation failed — review branch preserved on release");
-        }
+/// Authority chain: task_id → task.branch (subject branch) → SCM slug from
+/// source_repo → `assignment_authority::get(repo, subject_branch, agent)` →
+/// verify `is_receipt_capable()` + `reviewed_head` matches checkout tip →
+/// `augment_binding_with_lease`. Never infers from branch prefix or uses
+/// legacy/non-receipt-capable assignments.
+pub(crate) fn try_augment_review_lease(
+    home: &Path,
+    agent: &str,
+    task_id: &str,
+    checkout_branch: &str,
+    source_repo: &Path,
+) {
+    if task_id.is_empty() {
+        return;
+    }
+    let Ok(remote_url) = crate::git_helpers::git_cmd(source_repo, &["remote", "get-url", "origin"])
+    else {
+        return;
+    };
+    let Some(slug) = crate::branch_sweep::extract_github_repo_for_intent(&remote_url) else {
+        return;
+    };
+    let task = match crate::tasks::load_routed(home, task_id) {
+        Ok(rt) => rt.task,
+        Err(_) => return,
+    };
+    let Some(subject_branch) = task.branch.as_deref().filter(|b| !b.is_empty()) else {
+        return;
+    };
+    let Some(assignment) =
+        crate::daemon::assignment_authority::get(home, &slug, subject_branch, agent)
+    else {
+        return;
+    };
+    if !assignment.is_receipt_capable() {
+        return;
+    }
+    let Some(reviewed_head) = assignment
+        .reviewed_head
+        .as_deref()
+        .filter(|h| !h.is_empty())
+    else {
+        return;
+    };
+    let Ok(tip) = crate::git_helpers::git_cmd(source_repo, &["rev-parse", checkout_branch]) else {
+        return;
+    };
+    if tip.trim() != reviewed_head {
+        return;
+    }
+    if let Err(e) = augment_binding_with_lease(
+        home,
+        agent,
+        "review",
+        &assignment.assignment_id.to_string(),
+        tip.trim(),
+    ) {
+        tracing::warn!(
+            %agent, %task_id, error = %e,
+            "review lease augmentation failed — review branch preserved on release"
+        );
     }
 }
 

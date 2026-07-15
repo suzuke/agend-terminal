@@ -1738,23 +1738,27 @@ async fn check_and_remove_terminal_pr(
     if merged {
         crate::status_summary::auto_close_merged_tasks(ctx.home, ctx.branch);
         crate::daemon::auto_release::auto_release_for_merged_branch(ctx.home, ctx.repo, ctx.branch);
-        // Settle any cleanup intent for this branch (CAS-checked delete).
-        // The poller has the SCM slug (ctx.repo), not the canonical local path.
-        if let Some((deleted, reason)) =
-            crate::cleanup_intents::settle_by_scm_slug(ctx.home, ctx.repo, ctx.branch, true)
+        // Best-effort intent settlement. The watch is already being removed
+        // above; if settlement fails, the intent file survives on disk and
+        // the periodic branch sweep (which discovers repos via intent_repos)
+        // will retry on the next tick.
+        match crate::cleanup_intents::settle_by_scm_slug(ctx.home, ctx.repo, ctx.branch, true, None)
         {
-            if deleted {
+            Some(crate::cleanup_intents::SettleOutcome::Deleted) => {
                 tracing::info!(
                     repo = ctx.repo,
                     branch = ctx.branch,
                     "cleanup intent settled: branch deleted on pr-merged"
                 );
-            } else if !reason.is_empty() {
-                tracing::info!(
+            }
+            Some(crate::cleanup_intents::SettleOutcome::DeleteFailed(reason))
+            | Some(crate::cleanup_intents::SettleOutcome::GitError(reason)) => {
+                tracing::warn!(
                     repo = ctx.repo, branch = ctx.branch, %reason,
-                    "cleanup intent settlement skipped"
+                    "cleanup intent settlement failed — intent preserved for sweep retry"
                 );
             }
+            _ => {}
         }
     }
     Ok(true)

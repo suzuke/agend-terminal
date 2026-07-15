@@ -568,10 +568,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             }
             let mut bound_fingerprint = None;
             if bind {
-                // #2533: optional caller-supplied task_id — attributes this self-claim
-                // to a task (§3.19.1 reviewer checkout is the common case) so `bind_full`
-                // treats it as in-dispatch instead of warning. Absent → "" (unattributed,
-                // pre-#2533 behavior unchanged).
+                // #2533: optional task_id attributes self-claim to a task (in-dispatch).
                 let task_id = args["task_id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -609,10 +606,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         branch,
                     );
                 }
-                // Post-bind: augment with review-lease provenance if the agent
-                // has an active typed review assignment (authority from the
-                // daemon's assignment store, not caller-provided).
-                crate::binding::try_augment_review_lease(home, instance_name, branch);
+                crate::binding::try_augment_review_lease(
+                    home,
+                    instance_name,
+                    task_id,
+                    branch,
+                    &source_canonical,
+                );
                 bound_fingerprint =
                     match crate::binding::snapshot_guarded_binding(home, instance_name) {
                         Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
