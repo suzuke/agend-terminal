@@ -687,6 +687,18 @@ pub(crate) fn get(home: &Path, repo: &str, branch: &str, target: &str) -> Option
         .flatten()
 }
 
+/// Like [`get`] but surfaces corruption/unreadable errors instead of swallowing
+/// them. Used by `revoke_review_assignment` to distinguish genuine absence
+/// (`Ok(None)`) from a corrupt record (`Err`) after a retire returns no-op.
+pub(crate) fn get_strict(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+) -> anyhow::Result<Option<ActiveAssignment>> {
+    read_record(&record_file(home, repo, branch, target))
+}
+
 /// Strict store-wide lookup for a receipt's generation token. Missing,
 /// unreadable/corrupt, duplicated, terminal, revoked, and superseded assignments
 /// all fail closed. Unlike the lossy reconcile scans, one corrupt row aborts the
@@ -2702,6 +2714,99 @@ mod tests {
             get(&home, "o/r", "feat/x", "reviewer").is_none(),
             "record must be gone after operator revoke"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #2782 slice 1 r2: fail-closed integrity tests ──
+
+    /// t46: a LIVE matching assignment coexists with an UNRELATED corrupt record
+    /// file on the same branch. The strict lookup must surface the corruption
+    /// as a store integrity error, not silently collapse it into `already_absent`.
+    #[test]
+    fn t46_revoke_corrupt_coexisting_row_fails_closed() {
+        let home = tmp_home("t46-corrupt");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        // Inject a corrupt (non-JSON) record file alongside the valid one.
+        let bdir = branch_dir(&home, "o/r", "feat/x");
+        let corrupt_path = bdir.join("corrupt--aaaa.json");
+        std::fs::write(&corrupt_path, b"NOT VALID JSON").unwrap();
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &sender);
+
+        assert_eq!(
+            result["code"], "revoke_assignment_store_integrity",
+            "corrupt coexisting row must fail closed: {result}"
+        );
+        assert!(
+            get(&home, "o/r", "feat/x", "reviewer").is_some(),
+            "the live assignment must be preserved when revoke fails closed"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t47: duplicate assignment_id across two record files must fail closed
+    /// (the strict lookup detects ambiguity).
+    #[test]
+    fn t47_revoke_duplicate_uuid_fails_closed() {
+        let home = tmp_home("t47-dup-uuid");
+        seed_team_fleet(&home, "lead", "o/r");
+        let rec = mk_record("o/r", "feat/x", "reviewer-1", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+
+        // Write a second record file for a different target but with the SAME
+        // assignment_id — this is an integrity violation the lookup must catch.
+        let mut dup = rec.clone();
+        dup.target = "reviewer-2".to_string();
+        persist(&home, &dup).unwrap();
+
+        let sender = Some(Sender::new("lead").unwrap());
+        let args = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &sender);
+
+        assert_eq!(
+            result["code"], "revoke_assignment_store_integrity",
+            "duplicate UUID must fail closed: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// t48: missing assignment_id (never persisted) returns idempotent success,
+    /// and a stale/terminal assignment_id also returns idempotent success —
+    /// confirming the boundary between "absent → ok" and "corrupt → error".
+    #[test]
+    fn t48_revoke_missing_and_terminal_idempotent() {
+        let home = tmp_home("t48-missing-terminal");
+        seed_team_fleet(&home, "lead", "o/r");
+
+        // Case 1: completely unknown UUID → idempotent absent.
+        let sender = Some(Sender::new("lead").unwrap());
+        let unknown_id = uuid::Uuid::new_v4();
+        let args = serde_json::json!({"assignment_id": unknown_id.to_string()});
+        let result = handle_revoke_review_assignment(&home, &args, &sender);
+        assert_eq!(
+            result["ok"], true,
+            "unknown UUID must be idempotent success: {result}"
+        );
+        assert_eq!(result["already_absent"], true, "{result}");
+
+        // Case 2: terminal generation (record exists but PR is tombstoned).
+        let rec = mk_record("o/r", "feat/y", "reviewer", 42, "2026-07-15T00:00:00Z");
+        persist(&home, &rec).unwrap();
+        record_terminal(&home, "o/r", "feat/y", 42, TerminalKind::Merged).unwrap();
+
+        let args2 = serde_json::json!({"assignment_id": rec.assignment_id.to_string()});
+        let result2 = handle_revoke_review_assignment(&home, &args2, &sender);
+        assert_eq!(
+            result2["ok"], true,
+            "terminal generation must be idempotent success: {result2}"
+        );
+        assert_eq!(result2["already_absent"], true, "{result2}");
+
         std::fs::remove_dir_all(&home).ok();
     }
 }
