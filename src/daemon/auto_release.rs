@@ -217,19 +217,46 @@ fn close_grace_passed(closed_at: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// t-worktree-leak (PR-1) must-fix #4 + codex gap ①c: ALL tasks on (repo, branch)
-/// are terminal (Done | Cancelled). Tasks are branch-keyed (no `repo` field), so a
-/// same-named branch in a DIFFERENT repo could pollute the aggregation. We scope
-/// by deriving each PENDING task's repo from its owner's live binding: a pending
-/// task blocks release ONLY if it is confirmed to belong to THIS repo; a pending
-/// task confirmed in a DIFFERENT repo does not block; an UNresolvable pending task
-/// (owner unbound) blocks (conservative — never mis-release).
+/// t-worktree-leak (PR-1) must-fix #4 + codex gap ①c + P0 cross-lease fix:
+/// ALL tasks on (repo, branch) across EVERY project board are terminal
+/// (Done | Cancelled). Uses the strict cross-board aggregate that fails
+/// closed on enumeration/replay errors and rejects duplicate task ids.
+///
+/// Fails closed (returns false) when:
+///   - board enumeration or replay fails (cannot guarantee completeness)
+///   - zero tasks match the branch (no evidence of completion)
+///
+/// Tasks are branch-keyed (no `repo` field), so a same-named branch in a
+/// DIFFERENT repo could pollute the aggregation. We scope by deriving each
+/// PENDING task's repo from its owner's live binding: a pending task blocks
+/// release ONLY if it is confirmed to belong to THIS repo; a pending task
+/// confirmed in a DIFFERENT repo does not block; an UNresolvable pending
+/// task (owner unbound) blocks (conservative — never mis-release).
 fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
     use crate::task_events::TaskStatus;
-    crate::tasks::list_all(home)
+    let all_tasks = match crate::tasks::list_all_strict(home) {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(
+                branch = %branch, error = %e,
+                "all_branch_tasks_done: strict cross-board aggregate failed — fail closed"
+            );
+            return false;
+        }
+    };
+    let branch_tasks: Vec<_> = all_tasks
         .iter()
         .filter(|t| t.branch.as_deref() == Some(branch))
-        // Only non-terminal (pending) tasks can block; Done/Cancelled never do.
+        .collect();
+    if branch_tasks.is_empty() {
+        tracing::debug!(
+            branch = %branch,
+            "all_branch_tasks_done: zero tasks match branch — fail closed (no evidence of completion)"
+        );
+        return false;
+    }
+    branch_tasks
+        .iter()
         .filter(|t| !matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled))
         .all(|t| {
             let owner_repo = t
@@ -237,7 +264,6 @@ fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
                 .as_deref()
                 .and_then(|a| crate::binding::read(home, a))
                 .and_then(|b| repo_slug_from_binding(&b));
-            // "does NOT block" ⟺ this pending task is CONFIRMED in a different repo.
             matches!(&owner_repo, Some(r) if r != repo)
         })
 }
@@ -1630,10 +1656,12 @@ mod tests {
 
     #[test]
     fn invariant_no_pr_polled_is_releasable_when_tasks_done() {
-        // gh-poll ran, no PR found (pr_number 0) + no pending tasks (vacuous) →
+        // gh-poll ran, no PR found (pr_number 0) + task exists and is done →
         // releasable via the no-PR branch (covers tasks that never produce a PR).
+        // P0 cross-lease: zero-task vacuous truth removed; a done task is required.
         let home = tmp_home("inv-nopr");
         write_pr(&home, "feat/x", MergeState::NotReady, 0, true);
+        seed_task(&home, "t-nopr", "dev", "feat/x", true);
         let (r, c) = releasable_by_invariant(&home, "o/r", "feat/x");
         assert!(r, "no-PR + all-tasks-done is releasable");
         assert_eq!(c, PrConfidence::QueriedNone);
@@ -1658,7 +1686,9 @@ mod tests {
         // (gh_poll_failures == 0). The Err path (scanner.rs:387) ALSO sets
         // last_gh_poll_at, so a failed / cold-cache poll (failures>0) must be
         // ambiguous (Unknown), never a false "no PR" that releases the worktree.
+        // P0 cross-lease: zero-task vacuous truth removed; a done task is required.
         let home = tmp_home("qn-986");
+        seed_task(&home, "t-986", "dev", "feat/x", true);
         // Successful poll, pr_number 0 → positively no PR → releasable.
         write_pr(&home, "feat/x", MergeState::NotReady, 0, true);
         let (r, c) = releasable_by_invariant(&home, "o/r", "feat/x");
@@ -2382,7 +2412,14 @@ mod tests {
         let home = tmp_home("proj-board-blocks");
         let _repo = itest_source_repo(&home, "owner/repo");
         // Task on project board (not default) — in-progress, branch feat/x
-        seed_task_on_board(&home, "Hack_agend-terminal", "t-proj", "dev-2", "feat/x", false);
+        seed_task_on_board(
+            &home,
+            "Hack_agend-terminal",
+            "t-proj",
+            "dev-2",
+            "feat/x",
+            false,
+        );
         // Bind dev-2 so the repo-scoping in all_branch_tasks_done can resolve
         crate::binding::bind(&home, "dev-2", "t-proj", "feat/x");
         assert!(
